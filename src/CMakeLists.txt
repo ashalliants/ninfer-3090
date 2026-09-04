@@ -292,11 +292,21 @@ if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(86|89)$")
   list(FILTER ninfer_ops_sources EXCLUDE REGEX "nvfp4/.+_w4a4\\.cu$")
   list(FILTER ninfer_ops_sources EXCLUDE REGEX "fp8/.+_a8\\.cu$")
   list(FILTER ninfer_ops_sources EXCLUDE REGEX "causal_cache/(prompt|small_t)_fp8\\.cu$")
-  # NVFP4/K8V4 KV-cache causal attention and append kernels use cvt.rn.satfinite.e2m1x2, also
-  # Blackwell-only (confirmed: ptxas rejects it on sm_86). This fork recognizes but does not port
-  # these two KvCacheStorage selections; see ops/nvfp4_sm86_stubs.cpp for the link-boundary stubs.
-  list(FILTER ninfer_ops_sources EXCLUDE REGEX "causal_cache/(prompt|small_t)_(nvfp4|k8v4)\\.cu$")
-  list(FILTER ninfer_ops_sources EXCLUDE REGEX "kv_cache/append/(nvfp4|k8v4)_launch\\.cu$")
+  # K8V4 KV-cache causal attention still uses the FP8 mma.sync...kind::f8f6f4 tensor-core
+  # instruction on its key plane (same Blackwell-only qualifier as plain FP8 attention above); its
+  # nvfp4 value plane no longer needs an exclusion (nvfp4_codec.cuh's pack_nvfp4_e2m1x16 now
+  # encodes e2m1 in software instead of Blackwell's cvt.rn.satfinite.e2m1x2). See
+  # ops/nvfp4_sm86_stubs.cpp for the k8v4 link-boundary stubs.
+  list(FILTER ninfer_ops_sources EXCLUDE REGEX "causal_cache/(prompt|small_t)_k8v4\\.cu$")
+  list(FILTER ninfer_ops_sources EXCLUDE REGEX "kv_cache/append/k8v4_launch\\.cu$")
+  # NVFP4's causal prompt (long-context prefill) kernel is warp-specialized
+  # (setmaxnreg.{dec,inc}.sync.aligned, dynamic producer/consumer register reallocation), a
+  # genuine Hopper+ hardware feature with no sm_86/sm_89 equivalent -- unlike the value codec
+  # above, this is not portable by swapping an instruction. Its non-RDC companion translation
+  # unit (prompt_nvfp4_non_rdc.cu) is intentionally left out of the source list entirely, so
+  # prompt_nvfp4.cu itself must stay excluded too or it fails to link. small_t_nvfp4.cu (decode,
+  # T<=6) has no such dependency and is not excluded.
+  list(FILTER ninfer_ops_sources EXCLUDE REGEX "causal_cache/prompt_nvfp4\\.cu$")
   set_property(TARGET ninfer_ops PROPERTY SOURCES ${ninfer_ops_sources})
   target_sources(ninfer_ops PRIVATE ops/nvfp4_sm86_stubs.cpp ops/fp8_sm86_stubs.cpp)
   target_compile_definitions(ninfer_ops PUBLIC NINFER_SM8X_COMPAT=1)

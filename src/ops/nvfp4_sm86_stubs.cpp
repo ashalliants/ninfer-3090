@@ -16,21 +16,28 @@ namespace {
     throw std::runtime_error("NVFP4 A4 execution requires an sm_120a GPU");
 }
 
-// NVFP4/K8V4 KV-cache formats are recognized (parsed, formatted, logged) but not yet ported on
-// this fork: their causal-attention and kv_cache_append kernels use the Blackwell-only
-// cvt.rn.satfinite.e2m1x2 PTX instruction, which has no sm_86 encoding. d256_kv_cache_profile and
-// paged_kv_storage_layout already reject these KvCacheStorage selections before any cache reaches
-// these Ops, so the definitions below only guard the link boundary.
-[[noreturn]] void reject_nvfp4_kv() {
-    throw std::runtime_error(
-        "NVFP4 KV-cache attention requires an sm_100a or sm_120a GPU; use --kv-dtype bf16, int8, "
-        "or rk8v4");
-}
-
+// K8V4 (FP8 key / NVFP4 value) is recognized (parsed, formatted, logged) but not yet ported on
+// this fork: its causal-attention QK matmul uses the Blackwell-only mma.sync...kind::f8f6f4
+// tensor-core instruction on its FP8 key plane (the same qualifier that blocks plain FP8
+// attention). d256_kv_cache_profile and paged_kv_storage_layout already reject this KvCacheStorage
+// selection before any cache reaches these Ops, so the definitions below only guard the link
+// boundary. Nvfp4Group16 no longer needs a stub here: its value-only e2m1 codec is now a software
+// encode (nvfp4_codec.cuh), so its real causal-attention and kv_cache_append kernels are compiled.
 [[noreturn]] void reject_k8v4_kv() {
     throw std::runtime_error(
         "K8V4 (FP8 key / NVFP4 value) KV-cache attention requires an sm_100a or sm_120a GPU; use "
         "--kv-dtype bf16, int8, or rk8v4");
+}
+
+// NVFP4's causal-attention *prompt* (long-context prefill) kernel is warp-specialized
+// (setmaxnreg.{dec,inc}.sync.aligned dynamic producer/consumer register reallocation), a genuine
+// Hopper+ hardware feature with no sm_86/sm_89 fallback -- unlike the value codec, this is not a
+// swap-one-instruction port. Its decode kernel (small_t, T<=6) has no such dependency and is
+// compiled for real; only the prompt path is stubbed here.
+[[noreturn]] void reject_nvfp4_prompt_kv() {
+    throw std::runtime_error(
+        "NVFP4 KV-cache prompt (long-context) attention requires an sm_100a or sm_120a GPU; use "
+        "--kv-dtype bf16, int8, or rk8v4 for prompts longer than 6 tokens");
 }
 
 } // namespace
@@ -69,34 +76,21 @@ void nvfp4_gdn_input_w4a4_launch(const Tensor&, const Weight&, Tensor&, Tensor&,
     reject_nvfp4_a4();
 }
 
-// --- NVFP4/K8V4 KV-cache causal attention -------------------------------------------------------
-
-void causal_attention_small_t_nvfp4_launch(const Tensor&, const Tensor&, const Tensor&,
-                                           const Tensor&, const Tensor&, const Tensor&, float,
-                                           PagedKVBatchLayerView, CausalAttentionExecutionEnvelope,
-                                           std::int32_t, std::int32_t, Tensor&, Tensor&, Tensor&,
-                                           Tensor&, cudaStream_t) {
-    reject_nvfp4_kv();
-}
-
-void causal_attention_cached_small_t_nvfp4_launch(const Tensor&, const Tensor&, float,
-                                                  const PagedKVLayerView&,
-                                                  CausalAttentionExecutionEnvelope, Tensor&,
-                                                  Tensor&, Tensor&, Tensor&, cudaStream_t) {
-    reject_nvfp4_kv();
-}
+// --- NVFP4 causal-attention prompt path -----------------------------------------------------------
 
 void causal_attention_prompt_nvfp4_launch(const Tensor&, const Tensor&, const Tensor&,
                                           const Tensor&, const Tensor&, const Tensor&, float,
                                           PagedKVBatchLayerView, Tensor&, cudaStream_t) {
-    reject_nvfp4_kv();
+    reject_nvfp4_prompt_kv();
 }
 
 void causal_attention_prompt_nvfp4_attention_launch(const Tensor&, const Tensor&, float,
                                                     const PagedKVLayerView&, Tensor&,
                                                     cudaStream_t) {
-    reject_nvfp4_kv();
+    reject_nvfp4_prompt_kv();
 }
+
+// --- K8V4 KV-cache causal attention --------------------------------------------------------------
 
 void causal_attention_small_t_k8v4_launch(const Tensor&, const Tensor&, const Tensor&,
                                           const Tensor&, const Tensor&, const Tensor&, float,
@@ -124,17 +118,7 @@ void causal_attention_prompt_k8v4_attention_launch(const Tensor&, const Tensor&,
     reject_k8v4_kv();
 }
 
-// --- NVFP4/K8V4 KV-cache append ------------------------------------------------------------------
-
-void kv_cache_append_nvfp4_launch(const Tensor&, const Tensor&, const Tensor&, PagedKVLayerView,
-                                  cudaStream_t) {
-    reject_nvfp4_kv();
-}
-
-void kv_cache_append_nvfp4_batch_launch(const Tensor&, const Tensor&, const Tensor&, const Tensor&,
-                                        const Tensor&, PagedKVBatchLayerView, cudaStream_t) {
-    reject_nvfp4_kv();
-}
+// --- K8V4 KV-cache append -------------------------------------------------------------------------
 
 void kv_cache_append_k8v4_launch(const Tensor&, const Tensor&, const Tensor&, PagedKVLayerView,
                                  cudaStream_t) {

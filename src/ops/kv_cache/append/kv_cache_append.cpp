@@ -50,8 +50,8 @@ std::uint32_t validate_full_cache(const PagedKVLayerView& cache, std::int32_t kv
         cache.v_pages.dtype != profile.value_code_dtype) {
         throw std::invalid_argument("kv_cache_append: invalid cache code dtype");
     }
-    require_shape(cache.k_pages, kFullHeadDim, kPagedKVPageSize, kv_heads, physical_pages,
-                  kAppendOp, "cache k pages");
+    require_shape(cache.k_pages, profile.key_leading_extent, kPagedKVPageSize, kv_heads,
+                  physical_pages, kAppendOp, "cache k pages");
     require_shape(cache.v_pages, profile.value_leading_extent, kPagedKVPageSize, kv_heads,
                   physical_pages, kAppendOp, "cache v pages");
     require_contiguous_nonnull(cache.k_pages, kAppendOp, "cache k pages");
@@ -69,7 +69,8 @@ std::uint32_t validate_full_cache(const PagedKVLayerView& cache, std::int32_t kv
         return static_cast<std::uint32_t>(capacity);
     }
 
-    if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
+    if (cache.k_scale_pages.dtype != profile.key_scale_dtype ||
+        cache.v_scale_pages.dtype != profile.value_scale_dtype) {
         throw std::invalid_argument("kv_cache_append: invalid cache scale dtype");
     }
     require_shape(cache.k_scale_pages, profile.scale_leading_extent, kPagedKVPageSize, kv_heads,
@@ -193,8 +194,6 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
     if (static_cast<std::uint32_t>(tokens) > capacity) {
         throw std::invalid_argument("kv_cache_append: T exceeds cache capacity");
     }
-    // validate_full_cache above already rejects Nvfp4Group16/Fp8KeyNvfp4Value, so only the
-    // profiles this fork ports (bf16/int8/fp8/rk8v4) ever reach the launch below.
     detail::kv_cache_append_launch(k, v, positions, cache, stream);
 }
 

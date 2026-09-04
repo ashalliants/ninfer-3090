@@ -11,19 +11,25 @@ namespace ninfer::ops {
 
 inline constexpr std::int32_t kD256KVCacheHeadDim = 256;
 
-// K and V are described separately because the rk8v4 profile pairs a rotated INT8 key plane with
-// a packed signed int4 value plane. Every other profile stores both planes identically, so their
-// key and value fields agree.
+// K and V are described separately because the rk8v4 and nvfp4-family profiles pair differently
+// coded key and value planes (and, for k8v4, differently coded key and value *scale* planes too).
+// Every other profile stores both planes identically, so their key and value fields agree.
 //
-// A value plane of DType::U8 denotes two signed 4-bit codes per byte, low nibble first, which is
-// why its leading extent is half the head dimension. The G64 scale planes are shared unchanged.
+// A code plane of DType::U8 denotes two 4-bit codes per byte, low nibble first (signed int4 for
+// rk8v4's value plane, e2m1 for the nvfp4-family), which is why its leading extent is half the
+// head dimension. Scale dtype is FP16 for every family except nvfp4-family value planes, whose
+// group scale is a raw stored E4M3 byte (DType::U8).
 struct D256KVCacheProfile {
     DType key_code_dtype;
     DType value_code_dtype;
+    std::int32_t key_leading_extent;
     std::int32_t value_leading_extent;
     std::int32_t quant_group;
+    DType key_scale_dtype;
     std::int32_t scale_leading_extent;
-    // Values may use a finer group than keys, so their scale plane can be wider.
+    // Values may use a finer group (or a different scale coding) than keys, so their scale plane
+    // can differ in both dtype and width.
+    DType value_scale_dtype;
     std::int32_t value_scale_leading_extent;
 
     [[nodiscard]] bool packed_int4_values() const {
@@ -37,14 +43,22 @@ struct D256KVCacheProfile {
 inline D256KVCacheProfile d256_kv_cache_profile(DType dtype, DType value_code_dtype) {
     switch (dtype) {
     case DType::BF16:
-        return {DType::BF16, DType::BF16, kD256KVCacheHeadDim, 0, 0, 0};
+        return {DType::BF16, DType::BF16, kD256KVCacheHeadDim, kD256KVCacheHeadDim,
+                0,           DType::FP16, 0,                   DType::FP16,
+                0};
     case DType::I8:
         if (value_code_dtype == DType::U8) {
-            return {DType::I8, DType::U8, kD256KVCacheHeadDim / 2, 64, 4, 8};
+            return {DType::I8, DType::U8,   kD256KVCacheHeadDim, kD256KVCacheHeadDim / 2,
+                    64,        DType::FP16, 4,                   DType::FP16,
+                    8};
         }
-        return {DType::I8, DType::I8, kD256KVCacheHeadDim, 64, 4, 4};
+        return {DType::I8, DType::I8,   kD256KVCacheHeadDim, kD256KVCacheHeadDim,
+                64,        DType::FP16, 4,                   DType::FP16,
+                4};
     case DType::FP8_E4M3FN:
-        return {DType::FP8_E4M3FN, DType::FP8_E4M3FN, kD256KVCacheHeadDim, 256, 1, 1};
+        return {DType::FP8_E4M3FN, DType::FP8_E4M3FN, kD256KVCacheHeadDim, kD256KVCacheHeadDim,
+                256,               DType::FP16,        1,                   DType::FP16,
+                1};
     default:
         throw std::invalid_argument("unsupported D256 KV-cache dtype");
     }
@@ -56,9 +70,7 @@ inline D256KVCacheProfile d256_kv_cache_profile(DType dtype) {
 }
 
 // Overload for call sites that only carry the public KvCacheStorage selection (PagedKVLayerView
-// and friends). Nvfp4Group16 and Fp8KeyNvfp4Value are recognized upstream selections this fork has
-// not yet ported a kernel for; rejecting them here keeps that gap a single clear diagnostic instead
-// of a silent miscode if a caller ever reaches this profile lookup with one selected.
+// and friends).
 inline D256KVCacheProfile d256_kv_cache_profile(ninfer::KvCacheStorage storage) {
     switch (storage) {
     case ninfer::KvCacheStorage::BFloat16:
@@ -70,10 +82,17 @@ inline D256KVCacheProfile d256_kv_cache_profile(ninfer::KvCacheStorage storage) 
     case ninfer::KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
         return d256_kv_cache_profile(DType::I8, DType::U8);
     case ninfer::KvCacheStorage::Nvfp4Group16:
+        // Both planes are e2m1-coded (2 codes/byte, so half the head dimension) with a 16-value
+        // group and a raw E4M3 scale byte per group.
+        return {DType::U8, DType::U8, kD256KVCacheHeadDim / 2, kD256KVCacheHeadDim / 2,
+                16,        DType::U8, kD256KVCacheHeadDim / 16, DType::U8,
+                kD256KVCacheHeadDim / 16};
     case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
-        throw std::invalid_argument(
-            "KV-cache storage 'nvfp4'/'k8v4' requires an sm_100a or sm_120a GPU; use --kv-dtype "
-            "bf16, int8, fp8, or rk8v4.");
+        // Key plane matches Fp8E4M3Row256's coding (FP16 scale); value plane matches
+        // Nvfp4Group16's (raw E4M3 scale byte).
+        return {DType::FP8_E4M3FN, DType::U8, kD256KVCacheHeadDim, kD256KVCacheHeadDim / 2,
+                256,               DType::FP16, 1,                  DType::U8,
+                kD256KVCacheHeadDim / 16};
     }
     throw std::invalid_argument("unknown KV-cache storage profile");
 }
