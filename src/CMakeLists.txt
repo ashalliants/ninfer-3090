@@ -291,14 +291,6 @@ if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(86|89)$")
   # The A16 dequantizing routes for both formats are kept and remain fully functional.
   list(FILTER ninfer_ops_sources EXCLUDE REGEX "nvfp4/.+_w4a4\\.cu$")
   list(FILTER ninfer_ops_sources EXCLUDE REGEX "fp8/.+_a8\\.cu$")
-  # NVFP4's causal prompt (long-context prefill) kernel is warp-specialized
-  # (setmaxnreg.{dec,inc}.sync.aligned, dynamic producer/consumer register reallocation), a
-  # genuine Hopper+ hardware feature with no sm_86/sm_89 equivalent -- unlike the value codec
-  # above, this is not portable by swapping an instruction. Its non-RDC companion translation
-  # unit (prompt_nvfp4_non_rdc.cu) is intentionally left out of the source list entirely, so
-  # prompt_nvfp4.cu itself must stay excluded too or it fails to link. small_t_nvfp4.cu (decode,
-  # T<=6) has no such dependency and is not excluded.
-  list(FILTER ninfer_ops_sources EXCLUDE REGEX "causal_cache/prompt_nvfp4\\.cu$")
   set_property(TARGET ninfer_ops PROPERTY SOURCES ${ninfer_ops_sources})
   target_sources(ninfer_ops PRIVATE ops/nvfp4_sm86_stubs.cpp ops/fp8_sm86_stubs.cpp)
   target_compile_definitions(ninfer_ops PUBLIC NINFER_SM8X_COMPAT=1)
