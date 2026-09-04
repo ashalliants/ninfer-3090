@@ -3075,7 +3075,13 @@ int run_nvfp4_prompt_cases() {
     return failures;
 }
 
-int run_k8v4_cases() {
+// K8V4 decode attention (small_t, T<=6) dequantizes its FP8 key plane to BF16 before ordinary MMA
+// (same fallback pattern as plain FP8 above) and is ported to sm_86/sm_89; its value plane
+// (NVFP4) was already portable. The prompt (T>6) kernel still needs the same QK matmul rewrite as
+// plain FP8's prompt kernel. Split the same way and for the same reason as the FP8/NVFP4 cases
+// above: a still-rejected prompt case must not unwind past an already-ported decode case wrapped
+// in the same run_case_allowing_arch_skip.
+int run_k8v4_decode_cases() {
     int failures = 0;
     for (const Geometry& geometry : kGeometries) {
         failures += run_a1_case(geometry, KvCacheStorage::Fp8KeyNvfp4Value, {1, 0, 1, 801u},
@@ -3084,10 +3090,6 @@ int run_k8v4_cases() {
                                 MappingPattern::Fragmented);
         failures += run_a1_case(geometry, KvCacheStorage::Fp8KeyNvfp4Value, {6, 61, 192, 803u},
                                 MappingPattern::Fragmented);
-        failures += run_a1_case(geometry, KvCacheStorage::Fp8KeyNvfp4Value, {64, 0, 128, 804u},
-                                MappingPattern::Fragmented);
-        failures += run_a3_case(geometry, KvCacheStorage::Fp8KeyNvfp4Value, {65, 63, 192, 805u},
-                                MappingPattern::Offset);
         failures += run_a3_case(geometry, KvCacheStorage::Fp8KeyNvfp4Value, {1, 2048, 2049, 806u},
                                 MappingPattern::Fragmented);
     }
@@ -3097,16 +3099,27 @@ int run_k8v4_cases() {
                             {1, 64, 65, 808u, false, true}, MappingPattern::Fragmented);
     failures += run_a1_case(kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value, {5, 17, 22, 809u},
                             MappingPattern::Identity);
-    failures += run_a1_case(kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value, {7, 17, 24, 810u},
-                            MappingPattern::Identity);
-    failures += run_a1_case(kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value, {7, 511, 518, 811u},
-                            MappingPattern::Fragmented);
     failures += run_a3_case(kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value, {1, 8191, 8192, 812u},
                             MappingPattern::Fragmented);
     failures += run_a3_case(kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value,
                             {1, 16383, 16384, 813u}, MappingPattern::Fragmented);
     failures += run_a3_case(kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value,
                             {1, 65535, 65536, 814u}, MappingPattern::Fragmented);
+    return failures;
+}
+
+int run_k8v4_prompt_cases() {
+    int failures = 0;
+    for (const Geometry& geometry : kGeometries) {
+        failures += run_a1_case(geometry, KvCacheStorage::Fp8KeyNvfp4Value, {64, 0, 128, 804u},
+                                MappingPattern::Fragmented);
+        failures += run_a3_case(geometry, KvCacheStorage::Fp8KeyNvfp4Value, {65, 63, 192, 805u},
+                                MappingPattern::Offset);
+    }
+    failures += run_a1_case(kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value, {7, 17, 24, 810u},
+                            MappingPattern::Identity);
+    failures += run_a1_case(kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value, {7, 511, 518, 811u},
+                            MappingPattern::Fragmented);
     return failures;
 }
 
@@ -3177,14 +3190,19 @@ int run_softmax_attention_k8v4_tests() {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
-    return run_case_allowing_arch_skip("causal_softmax_attention k8v4 independent correctness", [] {
-        int failures = run_k8v4_cases();
-        failures += run_quantized_batch_cases(KvCacheStorage::Fp8KeyNvfp4Value, 815u);
-        failures += report_quantization_quality(KvCacheStorage::Fp8KeyNvfp4Value, 819u);
-        std::cout << (failures == 0 ? "PASS" : "FAIL")
-                  << " causal_softmax_attention k8v4 independent correctness\n";
-        return failures == 0 ? 0 : 1;
-    });
+    int failures = run_case_allowing_arch_skip(
+        "causal_softmax_attention k8v4 independent correctness (decode)", [] {
+            int decode_failures = run_k8v4_decode_cases();
+            decode_failures += run_quantized_batch_cases(KvCacheStorage::Fp8KeyNvfp4Value, 815u);
+            decode_failures += report_quantization_quality(KvCacheStorage::Fp8KeyNvfp4Value, 819u);
+            return decode_failures;
+        });
+    failures += run_case_allowing_arch_skip(
+        "causal_softmax_attention k8v4 independent correctness (prompt)",
+        [] { return run_k8v4_prompt_cases(); });
+    std::cout << (failures == 0 ? "PASS" : "FAIL")
+              << " causal_softmax_attention k8v4 independent correctness\n";
+    return failures == 0 ? 0 : 1;
 }
 
 int run_softmax_attention_causal_cache_tests() {
@@ -3202,12 +3220,14 @@ int run_softmax_attention_causal_cache_tests() {
     });
     failures += run_case_allowing_arch_skip("causal_softmax_attention nvfp4 KV cache (prompt)",
                                             [] { return run_nvfp4_prompt_cases(); });
-    failures += run_case_allowing_arch_skip("causal_softmax_attention k8v4 KV cache", [] {
-        int k8v4_failures = run_k8v4_cases();
+    failures += run_case_allowing_arch_skip("causal_softmax_attention k8v4 KV cache (decode)", [] {
+        int k8v4_failures = run_k8v4_decode_cases();
         k8v4_failures += run_quantized_batch_cases(KvCacheStorage::Fp8KeyNvfp4Value, 815u);
         k8v4_failures += report_quantization_quality(KvCacheStorage::Fp8KeyNvfp4Value, 819u);
         return k8v4_failures;
     });
+    failures += run_case_allowing_arch_skip("causal_softmax_attention k8v4 KV cache (prompt)",
+                                            [] { return run_k8v4_prompt_cases(); });
     for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
     failures += run_case_allowing_arch_skip("causal_softmax_attention FP8 KV cache (decode)",
                                             [&] { return run_fp8_decode_cases(); });

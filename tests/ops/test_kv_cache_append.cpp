@@ -626,21 +626,11 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
                                      {layout.value.scale_extent, kPage, kv_heads, physical_pages});
     }
 
-    // K8V4 (FP8 key / NVFP4 value) is a recognized KvCacheStorage selection but its causal
-    // attention QK matmul is not yet ported on this fork (its FP8 key plane needs the
-    // Blackwell-only mma.sync...kind::f8f6f4 tensor-core instruction) -- kv_cache_append rejects
-    // it before ever reaching a kernel. Confirm that clear rejection here instead of exercising
-    // numerical correctness this fork cannot run. Nvfp4Group16 (both planes e2m1-coded) has no
-    // such dependency in its append kernel and is fully ported, so it falls through to the real
-    // verification below instead of this early return.
-    if (storage == KvCacheStorage::Fp8KeyNvfp4Value) {
-        return run_case_allowing_arch_skip("kv_cache_append k8v4", [&] {
-            ops::kv_cache_append(k, v, position_tensor, cache, nullptr);
-            cuda_synchronize();
-            std::cerr << "kv_cache_append: k8v4 unexpectedly succeeded on this build\n";
-            return 1;
-        });
-    }
+    // K8V4 (FP8 key / NVFP4 value) causal-attention QK matmul is not yet ported on this fork (its
+    // FP8 key plane needs the Blackwell-only mma.sync...kind::f8f6f4 tensor-core instruction), but
+    // kv_cache_append never does any matmul at all, only quantize-on-write, so it has no such
+    // dependency and is fully ported. Falls through to the real verification below like every
+    // other storage.
 
     int failures = 0;
     if (storage == KvCacheStorage::BFloat16) {

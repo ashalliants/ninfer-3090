@@ -16,17 +16,16 @@ namespace {
     throw std::runtime_error("NVFP4 A4 execution requires an sm_120a GPU");
 }
 
-// K8V4 (FP8 key / NVFP4 value) is recognized (parsed, formatted, logged) but not yet ported on
-// this fork: its causal-attention QK matmul uses the Blackwell-only mma.sync...kind::f8f6f4
-// tensor-core instruction on its FP8 key plane (the same qualifier that blocks plain FP8
-// attention). d256_kv_cache_profile and paged_kv_storage_layout already reject this KvCacheStorage
-// selection before any cache reaches these Ops, so the definitions below only guard the link
-// boundary. Nvfp4Group16 no longer needs a stub here: its value-only e2m1 codec is now a software
-// encode (nvfp4_codec.cuh), so its real causal-attention and kv_cache_append kernels are compiled.
-[[noreturn]] void reject_k8v4_kv() {
+// K8V4 (FP8 key / NVFP4 value) causal-attention *prompt* (long-context) kernel is not yet ported:
+// like plain FP8's prompt kernel, its QK matmul uses the Blackwell-only mma.sync...kind::f8f6f4
+// tensor-core instruction on the FP8 key plane. K8V4's decode kernel (small_t, T<=6) and its
+// kv_cache_append (which never did any matmul, only quantize-on-write) have no such dependency
+// and are compiled for real; only the prompt path is stubbed here.
+[[noreturn]] void reject_k8v4_prompt_kv() {
     throw std::runtime_error(
-        "K8V4 (FP8 key / NVFP4 value) KV-cache attention requires an sm_100a or sm_120a GPU; use "
-        "--kv-dtype bf16, int8, or rk8v4");
+        "K8V4 (FP8 key / NVFP4 value) KV-cache prompt (long-context) attention requires an "
+        "sm_100a or sm_120a GPU; use --kv-dtype bf16, int8, or rk8v4 for prompts longer than 6 "
+        "tokens");
 }
 
 // NVFP4's causal-attention *prompt* (long-context prefill) kernel is warp-specialized
@@ -90,44 +89,17 @@ void causal_attention_prompt_nvfp4_attention_launch(const Tensor&, const Tensor&
     reject_nvfp4_prompt_kv();
 }
 
-// --- K8V4 KV-cache causal attention --------------------------------------------------------------
-
-void causal_attention_small_t_k8v4_launch(const Tensor&, const Tensor&, const Tensor&,
-                                          const Tensor&, const Tensor&, const Tensor&, float,
-                                          PagedKVBatchLayerView, CausalAttentionExecutionEnvelope,
-                                          std::int32_t, std::int32_t, Tensor&, Tensor&, Tensor&,
-                                          Tensor&, cudaStream_t) {
-    reject_k8v4_kv();
-}
-
-void causal_attention_cached_small_t_k8v4_launch(const Tensor&, const Tensor&, float,
-                                                 const PagedKVLayerView&,
-                                                 CausalAttentionExecutionEnvelope, Tensor&, Tensor&,
-                                                 Tensor&, Tensor&, cudaStream_t) {
-    reject_k8v4_kv();
-}
+// --- K8V4 causal-attention prompt path -------------------------------------------------------------
 
 void causal_attention_prompt_k8v4_launch(const Tensor&, const Tensor&, const Tensor&, const Tensor&,
                                          const Tensor&, const Tensor&, float, PagedKVBatchLayerView,
                                          Tensor&, cudaStream_t) {
-    reject_k8v4_kv();
+    reject_k8v4_prompt_kv();
 }
 
 void causal_attention_prompt_k8v4_attention_launch(const Tensor&, const Tensor&, float,
                                                    const PagedKVLayerView&, Tensor&, cudaStream_t) {
-    reject_k8v4_kv();
-}
-
-// --- K8V4 KV-cache append -------------------------------------------------------------------------
-
-void kv_cache_append_k8v4_launch(const Tensor&, const Tensor&, const Tensor&, PagedKVLayerView,
-                                 cudaStream_t) {
-    reject_k8v4_kv();
-}
-
-void kv_cache_append_k8v4_batch_launch(const Tensor&, const Tensor&, const Tensor&, const Tensor&,
-                                       const Tensor&, PagedKVBatchLayerView, cudaStream_t) {
-    reject_k8v4_kv();
+    reject_k8v4_prompt_kv();
 }
 
 } // namespace ninfer::ops::detail
