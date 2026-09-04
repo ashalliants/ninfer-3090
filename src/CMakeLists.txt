@@ -291,11 +291,6 @@ if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(86|89)$")
   # The A16 dequantizing routes for both formats are kept and remain fully functional.
   list(FILTER ninfer_ops_sources EXCLUDE REGEX "nvfp4/.+_w4a4\\.cu$")
   list(FILTER ninfer_ops_sources EXCLUDE REGEX "fp8/.+_a8\\.cu$")
-  # prompt_fp8.cu's kernel still uses the FP8 mma.sync...kind::f8f6f4 tensor-core instruction for
-  # QK; small_t_fp8.cu no longer does (dequantizes K to BF16 and V to FP16 before ordinary MMA,
-  # same fallback pattern this fork's INT8 path already uses -- see small_t_fp8.cuh's file
-  # comment). The prompt kernel needs the same dequant-then-MMA rewrite next.
-  list(FILTER ninfer_ops_sources EXCLUDE REGEX "causal_cache/prompt_fp8\\.cu$")
   # K8V4 causal-attention *prompt* kernel still uses the FP8 mma.sync...kind::f8f6f4 tensor-core
   # instruction on its key plane QK (same Blackwell-only qualifier as plain FP8 attention above).
   # small_t_k8v4.cu (decode) and kv_cache/append/k8v4_launch.cu (append never did any matmul at
