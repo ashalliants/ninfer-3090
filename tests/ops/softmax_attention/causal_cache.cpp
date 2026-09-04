@@ -2951,13 +2951,15 @@ int run_geometry(const Geometry& geometry) {
     return failures;
 }
 
-int run_fp8_cases() {
+// FP8 decode attention (small_t, T<=6) dequantizes K to BF16 and V to FP16 before ordinary MMA
+// and is ported to sm_86/sm_89; the prompt (T>6) kernel still needs the FP8 mma.sync...f8f6f4
+// QK matmul (Blackwell-only) rewritten the same way. Kept in separate functions -- rather than
+// one run_fp8_cases() wrapped by a single run_case_allowing_arch_skip -- so a still-rejected
+// prompt case can't unwind past (and hide the result of) an already-ported decode case that
+// happened to run first in the same try block.
+int run_fp8_decode_cases() {
     int failures = 0;
     for (const Geometry& geometry : kGeometries) {
-        failures += run_a1_case(geometry, kPlanFp8, {65, 63, 192, 601u},
-                                MappingPattern::Fragmented);
-        failures += run_a3_case(geometry, kPlanFp8, {65, 63, 192, 602u},
-                                MappingPattern::Fragmented);
         failures += run_a1_case(geometry, kPlanFp8, {1, 128, 192, 603u},
                                 MappingPattern::Fragmented);
         failures +=
@@ -2969,6 +2971,17 @@ int run_fp8_cases() {
                             MappingPattern::Identity);
     failures += run_a1_case(kGeometries[0], kPlanFp8, {1, 16384, 16385, 607u},
                             MappingPattern::Fragmented);
+    return failures;
+}
+
+int run_fp8_prompt_cases() {
+    int failures = 0;
+    for (const Geometry& geometry : kGeometries) {
+        failures += run_a1_case(geometry, kPlanFp8, {65, 63, 192, 601u},
+                                MappingPattern::Fragmented);
+        failures += run_a3_case(geometry, kPlanFp8, {65, 63, 192, 602u},
+                                MappingPattern::Fragmented);
+    }
     return failures;
 }
 
@@ -3004,7 +3017,13 @@ int run_rk8v4_cases() {
     return failures;
 }
 
-int run_nvfp4_cases() {
+// Nvfp4Group16 decode attention (small_t, T<=6) is ported to sm_86/sm_89 (its e2m1 codec is now
+// a software encode/decode, no Blackwell tensor-core dependency); the prompt (T>6) kernel is
+// warp-specialized (setmaxnreg dynamic producer/consumer register reallocation), a genuine
+// Hopper+ feature, and still isn't. Split the same way as the FP8 cases above, for the same
+// reason: a still-rejected prompt case must not unwind past an already-ported decode case
+// wrapped in the same run_case_allowing_arch_skip.
+int run_nvfp4_decode_cases() {
     int failures = 0;
     for (const Geometry& geometry : kGeometries) {
         failures += run_a1_case(geometry, KvCacheStorage::Nvfp4Group16, {1, 0, 1, 701u},
@@ -3023,10 +3042,6 @@ int run_nvfp4_cases() {
                                 MappingPattern::Identity);
         failures += run_a1_case(geometry, KvCacheStorage::Nvfp4Group16, {6, 61, 192, 703u},
                                 MappingPattern::Fragmented);
-        failures += run_a1_case(geometry, KvCacheStorage::Nvfp4Group16, {64, 0, 128, 704u},
-                                MappingPattern::Fragmented);
-        failures += run_a3_case(geometry, KvCacheStorage::Nvfp4Group16, {65, 63, 192, 705u},
-                                MappingPattern::Offset);
         failures += run_a3_case(geometry, KvCacheStorage::Nvfp4Group16, {1, 2048, 2049, 706u},
                                 MappingPattern::Fragmented);
     }
@@ -3036,10 +3051,6 @@ int run_nvfp4_cases() {
                             {1, 64, 65, 713u, false, true}, MappingPattern::Fragmented);
     failures += run_a1_case(kGeometries[1], KvCacheStorage::Nvfp4Group16, {5, 17, 22, 714u},
                             MappingPattern::Identity);
-    failures += run_a1_case(kGeometries[1], KvCacheStorage::Nvfp4Group16, {7, 17, 24, 715u},
-                            MappingPattern::Identity);
-    failures += run_a1_case(kGeometries[1], KvCacheStorage::Nvfp4Group16, {7, 511, 518, 716u},
-                            MappingPattern::Fragmented);
     failures += run_a3_case(kGeometries[1], KvCacheStorage::Nvfp4Group16, {1, 8191, 8192, 717u},
                             MappingPattern::Fragmented);
     failures += run_a3_case(kGeometries[1], KvCacheStorage::Nvfp4Group16, {1, 16383, 16384, 718u},
@@ -3049,7 +3060,28 @@ int run_nvfp4_cases() {
     return failures;
 }
 
-int run_k8v4_cases() {
+int run_nvfp4_prompt_cases() {
+    int failures = 0;
+    for (const Geometry& geometry : kGeometries) {
+        failures += run_a1_case(geometry, KvCacheStorage::Nvfp4Group16, {64, 0, 128, 704u},
+                                MappingPattern::Fragmented);
+        failures += run_a3_case(geometry, KvCacheStorage::Nvfp4Group16, {65, 63, 192, 705u},
+                                MappingPattern::Offset);
+    }
+    failures += run_a1_case(kGeometries[1], KvCacheStorage::Nvfp4Group16, {7, 17, 24, 715u},
+                            MappingPattern::Identity);
+    failures += run_a1_case(kGeometries[1], KvCacheStorage::Nvfp4Group16, {7, 511, 518, 716u},
+                            MappingPattern::Fragmented);
+    return failures;
+}
+
+// K8V4 decode attention (small_t, T<=6) dequantizes its FP8 key plane to BF16 before ordinary MMA
+// (same fallback pattern as plain FP8 above) and is ported to sm_86/sm_89; its value plane
+// (NVFP4) was already portable. The prompt (T>6) kernel still needs the same QK matmul rewrite as
+// plain FP8's prompt kernel. Split the same way and for the same reason as the FP8/NVFP4 cases
+// above: a still-rejected prompt case must not unwind past an already-ported decode case wrapped
+// in the same run_case_allowing_arch_skip.
+int run_k8v4_decode_cases() {
     int failures = 0;
     for (const Geometry& geometry : kGeometries) {
         failures += run_a1_case(geometry, KvCacheStorage::Fp8KeyNvfp4Value, {1, 0, 1, 801u},
@@ -3058,10 +3090,6 @@ int run_k8v4_cases() {
                                 MappingPattern::Fragmented);
         failures += run_a1_case(geometry, KvCacheStorage::Fp8KeyNvfp4Value, {6, 61, 192, 803u},
                                 MappingPattern::Fragmented);
-        failures += run_a1_case(geometry, KvCacheStorage::Fp8KeyNvfp4Value, {64, 0, 128, 804u},
-                                MappingPattern::Fragmented);
-        failures += run_a3_case(geometry, KvCacheStorage::Fp8KeyNvfp4Value, {65, 63, 192, 805u},
-                                MappingPattern::Offset);
         failures += run_a3_case(geometry, KvCacheStorage::Fp8KeyNvfp4Value, {1, 2048, 2049, 806u},
                                 MappingPattern::Fragmented);
     }
@@ -3071,16 +3099,27 @@ int run_k8v4_cases() {
                             {1, 64, 65, 808u, false, true}, MappingPattern::Fragmented);
     failures += run_a1_case(kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value, {5, 17, 22, 809u},
                             MappingPattern::Identity);
-    failures += run_a1_case(kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value, {7, 17, 24, 810u},
-                            MappingPattern::Identity);
-    failures += run_a1_case(kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value, {7, 511, 518, 811u},
-                            MappingPattern::Fragmented);
     failures += run_a3_case(kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value, {1, 8191, 8192, 812u},
                             MappingPattern::Fragmented);
     failures += run_a3_case(kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value,
                             {1, 16383, 16384, 813u}, MappingPattern::Fragmented);
     failures += run_a3_case(kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value,
                             {1, 65535, 65536, 814u}, MappingPattern::Fragmented);
+    return failures;
+}
+
+int run_k8v4_prompt_cases() {
+    int failures = 0;
+    for (const Geometry& geometry : kGeometries) {
+        failures += run_a1_case(geometry, KvCacheStorage::Fp8KeyNvfp4Value, {64, 0, 128, 804u},
+                                MappingPattern::Fragmented);
+        failures += run_a3_case(geometry, KvCacheStorage::Fp8KeyNvfp4Value, {65, 63, 192, 805u},
+                                MappingPattern::Offset);
+    }
+    failures += run_a1_case(kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value, {7, 17, 24, 810u},
+                            MappingPattern::Identity);
+    failures += run_a1_case(kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value, {7, 511, 518, 811u},
+                            MappingPattern::Fragmented);
     return failures;
 }
 
@@ -3131,14 +3170,19 @@ int run_softmax_attention_nvfp4_tests() {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
-    return run_case_allowing_arch_skip("causal_softmax_attention nvfp4 independent correctness", [] {
-        int failures = run_nvfp4_cases();
-        failures += run_quantized_batch_cases(KvCacheStorage::Nvfp4Group16, 720u);
-        failures += report_quantization_quality(KvCacheStorage::Nvfp4Group16, 724u);
-        std::cout << (failures == 0 ? "PASS" : "FAIL")
-                  << " causal_softmax_attention nvfp4 independent correctness\n";
-        return failures == 0 ? 0 : 1;
-    });
+    int failures = run_case_allowing_arch_skip(
+        "causal_softmax_attention nvfp4 independent correctness (decode)", [] {
+            int decode_failures = run_nvfp4_decode_cases();
+            decode_failures += run_quantized_batch_cases(KvCacheStorage::Nvfp4Group16, 720u);
+            decode_failures += report_quantization_quality(KvCacheStorage::Nvfp4Group16, 724u);
+            return decode_failures;
+        });
+    failures += run_case_allowing_arch_skip(
+        "causal_softmax_attention nvfp4 independent correctness (prompt)",
+        [] { return run_nvfp4_prompt_cases(); });
+    std::cout << (failures == 0 ? "PASS" : "FAIL")
+              << " causal_softmax_attention nvfp4 independent correctness\n";
+    return failures == 0 ? 0 : 1;
 }
 
 int run_softmax_attention_k8v4_tests() {
@@ -3146,14 +3190,19 @@ int run_softmax_attention_k8v4_tests() {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
-    return run_case_allowing_arch_skip("causal_softmax_attention k8v4 independent correctness", [] {
-        int failures = run_k8v4_cases();
-        failures += run_quantized_batch_cases(KvCacheStorage::Fp8KeyNvfp4Value, 815u);
-        failures += report_quantization_quality(KvCacheStorage::Fp8KeyNvfp4Value, 819u);
-        std::cout << (failures == 0 ? "PASS" : "FAIL")
-                  << " causal_softmax_attention k8v4 independent correctness\n";
-        return failures == 0 ? 0 : 1;
-    });
+    int failures = run_case_allowing_arch_skip(
+        "causal_softmax_attention k8v4 independent correctness (decode)", [] {
+            int decode_failures = run_k8v4_decode_cases();
+            decode_failures += run_quantized_batch_cases(KvCacheStorage::Fp8KeyNvfp4Value, 815u);
+            decode_failures += report_quantization_quality(KvCacheStorage::Fp8KeyNvfp4Value, 819u);
+            return decode_failures;
+        });
+    failures += run_case_allowing_arch_skip(
+        "causal_softmax_attention k8v4 independent correctness (prompt)",
+        [] { return run_k8v4_prompt_cases(); });
+    std::cout << (failures == 0 ? "PASS" : "FAIL")
+              << " causal_softmax_attention k8v4 independent correctness\n";
+    return failures == 0 ? 0 : 1;
 }
 
 int run_softmax_attention_causal_cache_tests() {
@@ -3163,21 +3212,27 @@ int run_softmax_attention_causal_cache_tests() {
     }
 
     int failures = verify_workspace_capacity_contract();
-    failures += run_case_allowing_arch_skip("causal_softmax_attention nvfp4 KV cache", [] {
-        int nvfp4_failures = run_nvfp4_cases();
+    failures += run_case_allowing_arch_skip("causal_softmax_attention nvfp4 KV cache (decode)", [] {
+        int nvfp4_failures = run_nvfp4_decode_cases();
         nvfp4_failures += run_quantized_batch_cases(KvCacheStorage::Nvfp4Group16, 720u);
         nvfp4_failures += report_quantization_quality(KvCacheStorage::Nvfp4Group16, 724u);
         return nvfp4_failures;
     });
-    failures += run_case_allowing_arch_skip("causal_softmax_attention k8v4 KV cache", [] {
-        int k8v4_failures = run_k8v4_cases();
+    failures += run_case_allowing_arch_skip("causal_softmax_attention nvfp4 KV cache (prompt)",
+                                            [] { return run_nvfp4_prompt_cases(); });
+    failures += run_case_allowing_arch_skip("causal_softmax_attention k8v4 KV cache (decode)", [] {
+        int k8v4_failures = run_k8v4_decode_cases();
         k8v4_failures += run_quantized_batch_cases(KvCacheStorage::Fp8KeyNvfp4Value, 815u);
         k8v4_failures += report_quantization_quality(KvCacheStorage::Fp8KeyNvfp4Value, 819u);
         return k8v4_failures;
     });
+    failures += run_case_allowing_arch_skip("causal_softmax_attention k8v4 KV cache (prompt)",
+                                            [] { return run_k8v4_prompt_cases(); });
     for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
-    failures += run_case_allowing_arch_skip("causal_softmax_attention FP8 KV cache",
-                                            [&] { return run_fp8_cases(); });
+    failures += run_case_allowing_arch_skip("causal_softmax_attention FP8 KV cache (decode)",
+                                            [&] { return run_fp8_decode_cases(); });
+    failures += run_case_allowing_arch_skip("causal_softmax_attention FP8 KV cache (prompt)",
+                                            [&] { return run_fp8_prompt_cases(); });
     failures += run_rk8v4_cases();
     failures += run_batch_cases();
     std::cout << (failures == 0 ? "PASS" : "FAIL")

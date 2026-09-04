@@ -65,8 +65,8 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
         cache.v_pages.dtype != profile.value_code_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
     }
-    require_shape(cache.k_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
-                  "cache k pages");
+    require_shape(cache.k_pages, profile.key_leading_extent, kPagedKVPageSize, kv_heads,
+                  physical_pages, op, "cache k pages");
     require_shape(cache.v_pages, profile.value_leading_extent, kPagedKVPageSize, kv_heads,
                   physical_pages, op, "cache v pages");
     require_contiguous_nonnull(cache.k_pages, op, "cache k pages");
@@ -84,7 +84,8 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
         return static_cast<std::uint32_t>(capacity);
     }
 
-    if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
+    if (cache.k_scale_pages.dtype != profile.key_scale_dtype ||
+        cache.v_scale_pages.dtype != profile.value_scale_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
     }
     require_shape(cache.k_scale_pages, profile.scale_leading_extent, kPagedKVPageSize, kv_heads,
@@ -117,8 +118,8 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
         cache.v_pages.dtype != profile.value_code_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
     }
-    require_shape(cache.k_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
-                  "cache k pages");
+    require_shape(cache.k_pages, profile.key_leading_extent, kPagedKVPageSize, kv_heads,
+                  physical_pages, op, "cache k pages");
     require_shape(cache.v_pages, profile.value_leading_extent, kPagedKVPageSize, kv_heads,
                   physical_pages, op, "cache v pages");
     require_contiguous_nonnull(cache.k_pages, op, "cache k pages");
@@ -136,7 +137,8 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
         return static_cast<std::uint32_t>(capacity);
     }
 
-    if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
+    if (cache.k_scale_pages.dtype != profile.key_scale_dtype ||
+        cache.v_scale_pages.dtype != profile.value_scale_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
     }
     require_shape(cache.k_scale_pages, profile.scale_leading_extent, kPagedKVPageSize, kv_heads,
@@ -351,9 +353,8 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     std::int32_t max_width) {
     require_causal_geometry(geometry, "causal_softmax_attention workspace");
     const std::int32_t q_heads = geometry.query_heads;
-    // Propagate d256_kv_cache_profile's own diagnostic (e.g. the "requires an sm_100a or
-    // sm_120a GPU" rejection for nvfp4/k8v4) rather than folding it into the generic message
-    // below, so callers that treat that rejection as an expected arch-skip can still match it.
+    // Propagate d256_kv_cache_profile's own diagnostic for an unrecognized storage selection
+    // rather than folding it into the generic message below.
     (void)d256_kv_cache_profile(cache_storage);
     if (batch_size <= 0 || batch_size > kMaximumBatchSize || min_width <= 0 ||
         max_width < min_width || (batch_size > 1 && max_width > kMaximumVerifyTokens) ||

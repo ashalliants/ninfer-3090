@@ -41,17 +41,14 @@ void test_topology() {
     }
 }
 
-q36::DecoderStateSpec decoder_spec(ninfer::DType dtype, std::int32_t quant_group, bool mtp,
-                                   bool packed_values = false) {
+q36::DecoderStateSpec decoder_spec(ninfer::KvCacheStorage storage, bool mtp) {
     return q36::DecoderStateSpec{
         .full_attention_layers     = 2,
         .mtp_layers                = 1,
         .capacity                  = 129,
         .kv_heads                  = 2,
         .attention_head_dim        = 256,
-        .kv_dtype                  = dtype,
-        .kv_quant_group            = quant_group,
-        .kv_packed_values          = packed_values,
+        .kv_storage                = storage,
         .enable_mtp                = mtp,
         .text_physical_page_groups = 5,
         .mtp_physical_page_groups  = mtp ? 4U : 0U,
@@ -60,8 +57,8 @@ q36::DecoderStateSpec decoder_spec(ninfer::DType dtype, std::int32_t quant_group
 
 void test_decoder_layout() {
     ninfer::LayoutBuilder bf16_builder;
-    const q36::DecoderStateLayout bf16 =
-        q36::plan_decoder_state(bf16_builder, decoder_spec(ninfer::DType::BF16, 0, false));
+    const q36::DecoderStateLayout bf16 = q36::plan_decoder_state(
+        bf16_builder, decoder_spec(ninfer::KvCacheStorage::BFloat16, false));
     (void)bf16_builder.finish(256);
     expect(bf16.text_kv.pages.planes.size() == 4, "BF16 Text KV has K/V planes per layer");
     expect(bf16.text_kv.pages.spec.page_group_count == 5 &&
@@ -77,8 +74,8 @@ void test_decoder_layout() {
     expect(bf16.kv_payload_bytes() == bf16.text_kv.payload_bytes(), "BF16 KV payload accounting");
 
     ninfer::LayoutBuilder int8_builder;
-    const q36::DecoderStateLayout int8 =
-        q36::plan_decoder_state(int8_builder, decoder_spec(ninfer::DType::I8, 64, true));
+    const q36::DecoderStateLayout int8 = q36::plan_decoder_state(
+        int8_builder, decoder_spec(ninfer::KvCacheStorage::Int8Group64, true));
     (void)int8_builder.finish(256);
     expect(int8.text_kv.pages.planes.size() == 8 &&
                int8.text_kv.pages.planes[2].geometry.dtype == ninfer::DType::FP16 &&
@@ -95,7 +92,7 @@ void test_decoder_layout() {
     expect(int8.kv_payload_bytes() == int8.text_kv.payload_bytes() + int8.mtp_kv->payload_bytes(),
            "INT8 Text/MTP KV payload accounting");
 
-    q36::DecoderStateSpec fp8_spec = decoder_spec(ninfer::DType::FP8_E4M3FN, 256, true);
+    q36::DecoderStateSpec fp8_spec = decoder_spec(ninfer::KvCacheStorage::Fp8E4M3Row256, true);
     ninfer::LayoutBuilder fp8_builder;
     const q36::DecoderStateLayout fp8 = q36::plan_decoder_state(fp8_builder, fp8_spec);
     (void)fp8_builder.finish(256);
@@ -111,17 +108,9 @@ void test_decoder_layout() {
     expect(fp8.kv_payload_bytes() == fp8.text_kv.payload_bytes() + fp8.mtp_kv->payload_bytes(),
            "FP8 Text/MTP KV payload accounting");
 
-    // NVFP4 and K8V4 (FP8 key / NVFP4 value) are recognized KvCacheStorage selections but are not
-    // yet ported on this fork (their attention/append kernels use the Blackwell-only
-    // cvt.rn.satfinite.e2m1x2 instruction, unavailable on sm_86). This fork's DecoderStateSpec
-    // plans layouts from a DType + quant_group + packed_values triple rather than a KvCacheStorage
-    // selection, and that triple has no representation for the NVFP4 E2M1 code family, so those
-    // two formats are rejected at engine-construction time (see target_kv_cache_profile in
-    // layouts_impl.h) rather than exercised at this lower layer.
-
     ninfer::LayoutBuilder rk8v4_builder;
     const q36::DecoderStateLayout rk8v4 = q36::plan_decoder_state(
-        rk8v4_builder, decoder_spec(ninfer::DType::I8, 64, true, /*packed_values=*/true));
+        rk8v4_builder, decoder_spec(ninfer::KvCacheStorage::RotatedInt8KeyInt4ValueGroup64, true));
     (void)rk8v4_builder.finish(256);
     expect(rk8v4.text_kv.pages.planes.size() == 8 &&
                rk8v4.text_kv.pages.planes[0].geometry.dtype == ninfer::DType::I8 &&
@@ -132,6 +121,43 @@ void test_decoder_layout() {
     expect(rk8v4.kv_payload_bytes() ==
                rk8v4.text_kv.payload_bytes() + rk8v4.mtp_kv->payload_bytes(),
            "rk8v4 Text/MTP KV payload accounting");
+
+    ninfer::LayoutBuilder nvfp4_builder;
+    const q36::DecoderStateLayout nvfp4 = q36::plan_decoder_state(
+        nvfp4_builder, decoder_spec(ninfer::KvCacheStorage::Nvfp4Group16, true));
+    (void)nvfp4_builder.finish(256);
+    expect(nvfp4.text_kv.pages.planes.size() == 8 &&
+               nvfp4.text_kv.pages.planes[0].geometry.dtype == ninfer::DType::U8 &&
+               nvfp4.text_kv.pages.planes[0].geometry.leading_extent == 128 &&
+               nvfp4.text_kv.pages.planes[1].geometry.dtype == ninfer::DType::U8 &&
+               nvfp4.text_kv.pages.planes[1].geometry.leading_extent == 128 &&
+               nvfp4.text_kv.pages.planes[2].geometry.dtype == ninfer::DType::U8 &&
+               nvfp4.text_kv.pages.planes[2].geometry.leading_extent == 16 &&
+               nvfp4.text_kv.pages.planes[3].geometry.dtype == ninfer::DType::U8 &&
+               nvfp4.text_kv.pages.planes[3].geometry.leading_extent == 16,
+           "NVFP4 Text KV has packed e2m1 key/value planes and raw-byte group-16 scale planes");
+    expect(nvfp4.kv_payload_bytes() ==
+               nvfp4.text_kv.payload_bytes() + nvfp4.mtp_kv->payload_bytes(),
+           "NVFP4 Text/MTP KV payload accounting");
+
+    ninfer::LayoutBuilder k8v4_builder;
+    const q36::DecoderStateLayout k8v4 = q36::plan_decoder_state(
+        k8v4_builder, decoder_spec(ninfer::KvCacheStorage::Fp8KeyNvfp4Value, true));
+    (void)k8v4_builder.finish(256);
+    expect(k8v4.text_kv.pages.planes.size() == 8 &&
+               k8v4.text_kv.pages.planes[0].geometry.dtype == ninfer::DType::FP8_E4M3FN &&
+               k8v4.text_kv.pages.planes[0].geometry.leading_extent == 256 &&
+               k8v4.text_kv.pages.planes[1].geometry.dtype == ninfer::DType::U8 &&
+               k8v4.text_kv.pages.planes[1].geometry.leading_extent == 128 &&
+               k8v4.text_kv.pages.planes[2].geometry.dtype == ninfer::DType::FP16 &&
+               k8v4.text_kv.pages.planes[2].geometry.leading_extent == 1 &&
+               k8v4.text_kv.pages.planes[3].geometry.dtype == ninfer::DType::U8 &&
+               k8v4.text_kv.pages.planes[3].geometry.leading_extent == 16,
+           "K8V4 Text KV has an FP8 key plane and a packed e2m1 value plane with mismatched "
+           "scale codings");
+    expect(k8v4.kv_payload_bytes() ==
+               k8v4.text_kv.payload_bytes() + k8v4.mtp_kv->payload_bytes(),
+           "K8V4 Text/MTP KV payload accounting");
 }
 
 void test_round_layout() {

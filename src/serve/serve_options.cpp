@@ -52,8 +52,6 @@ KvCacheStorage parse_kv_dtype(const char* text) {
     if (value == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
     // RotorQuant rk8v4: rotated INT8 keys with a packed signed int4 value plane. Opt-in.
     if (value == "rk8v4") { return KvCacheStorage::RotatedInt8KeyInt4ValueGroup64; }
-    // Recognized but not yet ported on this fork; d256_kv_cache_profile rejects these with a
-    // clear diagnostic at engine construction, matching how fp8 is rejected on SM86.
     if (value == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
     if (value == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
     throw std::invalid_argument("invalid kv-dtype: " + value);

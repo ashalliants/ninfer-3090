@@ -35,10 +35,9 @@ enum class KvCacheStorage : std::uint8_t {
     // scale. Ported onto the kv_cache_append Op that owns KV quantization, and opt-in through
     // --kv-dtype rk8v4. See docs/rtx-3090-windows.md.
     RotatedInt8KeyInt4ValueGroup64,
-    // Recognized (parsed, formatted) but not yet ported on this fork: the append/attention kernels
-    // for these two profiles are not implemented here. Selecting them fails with a clear
-    // diagnostic (see d256_kv_cache_profile's KvCacheStorage overload) rather than miscoding data.
+    // NVFP4 e2m1, group-16 scale, both K and V planes packed two codes per byte.
     Nvfp4Group16,
+    // K8V4: FP8 E4M3 key plane (same coding as Fp8E4M3Row256) paired with an NVFP4 value plane.
     Fp8KeyNvfp4Value,
 };
 

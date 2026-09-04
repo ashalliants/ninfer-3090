@@ -291,12 +291,6 @@ if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(86|89)$")
   # The A16 dequantizing routes for both formats are kept and remain fully functional.
   list(FILTER ninfer_ops_sources EXCLUDE REGEX "nvfp4/.+_w4a4\\.cu$")
   list(FILTER ninfer_ops_sources EXCLUDE REGEX "fp8/.+_a8\\.cu$")
-  list(FILTER ninfer_ops_sources EXCLUDE REGEX "causal_cache/(prompt|small_t)_fp8\\.cu$")
-  # NVFP4/K8V4 KV-cache causal attention and append kernels use cvt.rn.satfinite.e2m1x2, also
-  # Blackwell-only (confirmed: ptxas rejects it on sm_86). This fork recognizes but does not port
-  # these two KvCacheStorage selections; see ops/nvfp4_sm86_stubs.cpp for the link-boundary stubs.
-  list(FILTER ninfer_ops_sources EXCLUDE REGEX "causal_cache/(prompt|small_t)_(nvfp4|k8v4)\\.cu$")
-  list(FILTER ninfer_ops_sources EXCLUDE REGEX "kv_cache/append/(nvfp4|k8v4)_launch\\.cu$")
   set_property(TARGET ninfer_ops PROPERTY SOURCES ${ninfer_ops_sources})
   target_sources(ninfer_ops PRIVATE ops/nvfp4_sm86_stubs.cpp ops/fp8_sm86_stubs.cpp)
   target_compile_definitions(ninfer_ops PUBLIC NINFER_SM8X_COMPAT=1)

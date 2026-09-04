@@ -71,11 +71,10 @@ struct KVCacheAppendPrefixExecutionEnvelope {
  * plane/table are pairwise non-overlapping. The Op owns no persistent allocation, frontier,
  * request identity, or commit authority.
  *
- * neroued/master also adds NVFP4-G16 and K8V4 KV-cache profiles (see upstream
- * include/ninfer/ops/kv_cache_append.h for their encoding). This fork has not yet ported their
- * kernels; --kv-dtype nvfp4|k8v4 is recognized and rejected with a clear diagnostic rather than
- * silently miscoding data. Follow-up work should port them alongside the "centralize format
- * contracts" refactor (a2761ec1) they depend on.
+ * NVFP4-G16 and K8V4 KV-cache profiles are also ported on this fork: both planes use the e2m1
+ * codec (Nvfp4Group16) or an FP8 key paired with an e2m1 value plane (Fp8KeyNvfp4Value), each with
+ * a raw E4M3-byte group-16 scale on their e2m1 plane(s). See d256_kv_cache_profile's KvCacheStorage
+ * overload for the exact per-plane encoding.
  */
 void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
                      PagedKVLayerView cache, cudaStream_t stream);
