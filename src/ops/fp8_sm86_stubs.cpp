@@ -1,4 +1,5 @@
-// sm_86 replacements for the FP8 A8 compute path.
+// sm_86 replacements for the FP8 A8 compute path and the still-unported FP8 causal-attention
+// *prompt* (long-context) kernel.
 //
 // Every FP8 A8 route bottoms out in mma_fp8_e4m3, which emits
 // `mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e4m3.e4m3.f32`. The `kind::f8f6f4`
@@ -10,6 +11,11 @@
 // FP8 *weights* remain usable on sm_86: LinearPolicy::A16Only routes them through the A16
 // dequantizing GEMM (see kFp8TextPolicy in targets/qwen3_6_27b/impl/variant.cpp), whose
 // translation units are compiled normally. Only A8 activation compute is unavailable.
+//
+// FP8 KV-cache *decode* attention (small_t, T<=6) is ported: small_t_fp8.cuh now dequantizes K to
+// BF16 and V to FP16 before ordinary MMA instead of using mma_fp8_e4m3, the same fallback pattern
+// this fork's INT8 path already uses. Only the *prompt* (long-context prefill) kernel is still
+// stubbed here, pending the same dequant-then-MMA rewrite.
 
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
@@ -65,22 +71,7 @@ void fp8_linear_swiglu_a8_launch(const Tensor&, const Weight&, Tensor&, Workspac
     reject_fp8_a8();
 }
 
-// --- FP8 KV-cache causal attention -------------------------------------------------------------
-
-void causal_attention_small_t_fp8_launch(const Tensor&, const Tensor&, const Tensor&, const Tensor&,
-                                         const Tensor&, const Tensor&, float,
-                                         PagedKVBatchLayerView, CausalAttentionExecutionEnvelope,
-                                         std::int32_t, std::int32_t, Tensor&, Tensor&, Tensor&,
-                                         Tensor&, cudaStream_t) {
-    reject_fp8_kv();
-}
-
-void causal_attention_cached_small_t_fp8_launch(const Tensor&, const Tensor&, float,
-                                                const PagedKVLayerView&,
-                                                CausalAttentionExecutionEnvelope, Tensor&, Tensor&,
-                                                Tensor&, Tensor&, cudaStream_t) {
-    reject_fp8_kv();
-}
+// --- FP8 KV-cache causal-attention prompt path ---------------------------------------------------
 
 void causal_attention_prompt_fp8_launch(const Tensor&, const Tensor&, const Tensor&, const Tensor&,
                                         const Tensor&, const Tensor&, float, PagedKVBatchLayerView,
