@@ -639,9 +639,7 @@ public:
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
     const SpeculativeBackend speculative_backend;
-    const DType kv_dtype;
-    const std::int32_t kv_quant_group;
-    const bool kv_packed_values;
+    const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;
     const bool vision_enabled;
     // Non-null in overlay residency: pool, pinned tower and window layout from the model view.
@@ -1072,16 +1070,14 @@ private:
     [[nodiscard]] std::size_t host_kv_prefix_bytes(const KVAddressSpaceStore& addresses,
                                                    KVAddressSpaceHandle address,
                                                    std::uint32_t frontier) const noexcept;
-    // The value coding joins the tag because rk8v4 and plain INT8 share kv_dtype, and a
-    // checkpoint captured under one must never be replayed under the other. Capture and
-    // reuse-lookup must derive the tag from this one place: when the lookup side omitted the
-    // coding bit, every stored rk8v4 checkpoint carried a tag no lookup could ever produce, so
-    // prefix reuse missed unconditionally under that profile.
+    // kv_storage joins the tag because a checkpoint captured under one KV-cache coding must never
+    // be replayed under another. Capture and reuse-lookup must derive the tag from this one place:
+    // omitting this bit is what previously made every stored rk8v4 checkpoint carry a tag no
+    // lookup could ever produce, so prefix reuse missed unconditionally under that profile.
     [[nodiscard]] std::uint32_t capture_identity_tag() const noexcept {
         return static_cast<std::uint32_t>(speculative_backend) |
                (static_cast<std::uint32_t>(proposal_head) << 8U) |
-               (static_cast<std::uint32_t>(kv_dtype) << 16U) |
-               (kv_packed_values ? (1U << 24U) : 0U);
+               (static_cast<std::uint32_t>(kv_storage) << 16U);
     }
     [[nodiscard]] qwen3_6::CheckpointSummary
     checkpoint_summary(const SequenceState& sequence, runtime::CheckpointRef checkpoint,

@@ -80,11 +80,7 @@ struct SequencePlanningInputs {
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
-    DType kv_dtype                         = DType::BF16;
-    std::int32_t kv_quant_group            = 0;
-    // rk8v4 keeps kv_dtype at I8 for the key plane and stores values as packed signed int4, so
-    // the value coding has to travel beside the dtype rather than be implied by it.
-    bool kv_packed_values                  = false;
+    KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     std::uint32_t vision_max_merged = 16384;
@@ -108,11 +104,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
-    DType kv_dtype                         = DType::BF16;
-    std::int32_t kv_quant_group            = 0;
-    // rk8v4 keeps kv_dtype at I8 for the key plane and stores values as packed signed int4, so
-    // the value coding has to travel beside the dtype rather than be implied by it.
-    bool kv_packed_values                  = false;
+    KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     std::uint32_t vision_max_merged = 16384;

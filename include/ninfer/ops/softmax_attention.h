@@ -51,22 +51,23 @@ struct ContextAttentionExecutionEnvelope {
  * through the matching private Q/K profile. The fixed orthogonal preparation and transient Q
  * quantization are implementation details, not intermediate values in the ideal oracle above.
  *
- * neroued/master's NVFP4 and K8V4 profiles store R*V for the normalized Hadamard R=H256/16 and
- * apply R^T after the complete attention reduction; see upstream softmax_attention.h for their
- * full oracle. This fork has not yet ported their attention kernels alongside rk8v4 (see
- * kv_cache_append.h) -- --kv-dtype nvfp4|k8v4 is recognized and rejected with a clear diagnostic.
+ * NVFP4 and K8V4 profiles store R*V for the normalized Hadamard R=H256/16 and apply R^T after the
+ * complete attention reduction (both K and, for these two profiles, V are stored pre-rotated; a
+ * plain FP8 V plane is not rotated, so its reduction has no inverse-rotation step).
  *
  * The qualified BFloat16 compute profile keeps Q/K and persistent K at BF16 and uses native BF16
  * QK plus FP16 P/V MMA. INT8-G64 uses native signed-INT8 Q/K MMA; its prompt route uses FP16 P/V
- * MMA and its small-T route uses BF16 P/V MMA. FP8 and K8V4 use native E4M3FN QK MMA, while NVFP4
- * uses FP16 Q and exactly expanded FP16 K with native FP16 QK MMA in both prompt and small-T
- * routes. NVFP4 never quantizes Q to FP4 or FP8. INT8 QK accumulates each group in INT32 and
- * combines represented group products in FP32; the other QK profiles accumulate in FP32. Every
- * profile retains FP32 accumulation for PV, split state, merge, normalization, and applicable
- * Hadamard reductions. P is never quantized to FP8/FP4, and only the final public output is stored
- * as BF16. These arithmetic paths are implementation profiles rather than extra public tensor
- * boundaries. Every cache route has one named numerical criterion and is checked directly against
- * its independent oracle; route-to-route parity is only supplementary evidence.
+ * MMA and its small-T route uses BF16 P/V MMA. sm_100a/sm_120a use native E4M3FN QK MMA for FP8
+ * and K8V4's key plane; this fork's sm_86/sm_89 build has no FP8 tensor-core path at all (unlike
+ * INT8), so FP8, K8V4, and NVFP4 instead dequantize both K and V to BF16/FP16 up front and run QK
+ * on native BF16 MMA, exactly as the BFloat16 profile does. NVFP4 and K8V4 never quantize Q to
+ * FP4 or FP8 on any target. INT8 QK accumulates each group in INT32 and combines represented group
+ * products in FP32; the other QK profiles accumulate in FP32. Every profile retains FP32
+ * accumulation for PV, split state, merge, normalization, and applicable Hadamard reductions. P is
+ * never quantized to FP8/FP4, and only the final public output is stored as BF16. These arithmetic
+ * paths are implementation profiles rather than extra public tensor boundaries. Every cache route
+ * has one named numerical criterion and is checked directly against its independent oracle;
+ * route-to-route parity is only supplementary evidence.
  * Those criteria apply to the registered geometries, tested extents, conformance matrix, and
  * target-representative activation range; they are not universal error bounds for arbitrary
  * adversarial BF16 tensors.

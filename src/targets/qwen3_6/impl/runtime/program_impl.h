@@ -756,8 +756,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
       prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
-      speculative_backend(plan.speculative_backend), kv_dtype(plan.kv_dtype),
-      kv_quant_group(plan.kv_quant_group), kv_packed_values(plan.kv_packed_values),
+      speculative_backend(plan.speculative_backend), kv_storage(plan.kv_storage),
       proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision),
       vision_overlay(model.vision_overlay ? &*model.vision_overlay : nullptr),
@@ -12356,20 +12355,7 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.device      = device.device;
     out.max_context = capacity;
     out.kv_capacity = kv_capacity;
-    switch (kv_dtype) {
-    case DType::BF16:
-        out.kv_cache = KvCacheStorage::BFloat16;
-        break;
-    case DType::I8:
-        out.kv_cache = kv_packed_values ? KvCacheStorage::RotatedInt8KeyInt4ValueGroup64
-                                        : KvCacheStorage::Int8Group64;
-        break;
-    case DType::FP8_E4M3FN:
-        out.kv_cache = KvCacheStorage::Fp8E4M3Row256;
-        break;
-    default:
-        std::terminate();
-    }
+    out.kv_cache = kv_storage;
     DeviceArena& weights = *model.weights_arena;
     out.weights = ArenaMemorySummary{weights.capacity(), weights.used(), weights.peak_used()};
     out.sequence =

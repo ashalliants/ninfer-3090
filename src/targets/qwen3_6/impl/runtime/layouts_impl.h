@@ -4,6 +4,7 @@
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
 #include "core/device.h"
+#include "ops/kv_cache/d256_profile.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
@@ -59,64 +60,11 @@ std::uint32_t page_count(std::uint32_t capacity) {
     return 1U + (capacity - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
 }
 
-struct TargetKVCacheProfile {
-    DType dtype;
-    std::int32_t quant_group;
-    // rk8v4 stores keys as rotated INT8 and values as two signed 4-bit codes per byte, so the
-    // value coding is not implied by dtype.
-    bool packed_values = false;
-};
-
-TargetKVCacheProfile target_kv_cache_profile(KvCacheStorage storage) {
-    switch (storage) {
-    case KvCacheStorage::BFloat16:
-        return {DType::BF16, 0, false};
-    case KvCacheStorage::Int8Group64:
-        return {DType::I8, qwen3_6::kKvInt8QuantGroup, false};
-    case KvCacheStorage::Fp8E4M3Row256:
-#if defined(NINFER_SM8X_COMPAT)
-        // The FP8 KV profile is only consumable by the causal attention FP8 kernels, which use
-        // the Blackwell-only mma.sync...kind::f8f6f4 instruction and are excluded from the sm_86
-        // build. There is no dequantizing attention route for FP8 KV, so the profile is rejected
-        // at planning time rather than failing later inside the Op.
-        throw std::invalid_argument(
-            "KV-cache storage 'fp8' requires an sm_100a or sm_120a GPU: FP8 E4M3 causal "
-            "attention has no sm_86 implementation. Use --kv-dtype int8 or --kv-dtype bf16.");
-#else
-        return {DType::FP8_E4M3FN, qwen3_6::kKvFp8QuantGroup, false};
-#endif
-    case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
-        // RotorQuant rk8v4: the key plane is the same rotated INT8 representation Int8Group64
-        // uses, and the value plane holds two signed 4-bit codes per byte with the G64 scale
-        // plane unchanged. Values are not rotated, so the kv_cache_append contract's statement
-        // that values come from the represented BF16 source holds for this profile too.
-        return {DType::I8, qwen3_6::kKvInt8QuantGroup, true};
-    case KvCacheStorage::Nvfp4Group16:
-    case KvCacheStorage::Fp8KeyNvfp4Value:
-        // Recognized but not yet ported on this fork; see d256_kv_cache_profile's
-        // KvCacheStorage overload for the same rejection at engine-construction time.
-        throw std::invalid_argument(
-            "KV-cache storage 'nvfp4'/'k8v4' is not yet ported on this fork. Use --kv-dtype "
-            "bf16, int8, fp8, or rk8v4.");
-    }
-    throw std::invalid_argument("unknown KV-cache storage profile");
-}
-
-// Inverse of target_kv_cache_profile(), for call sites (workspace sizing) that only need the
-// public KvCacheStorage selection back from a resolved plan's dtype/packed_values pair.
-KvCacheStorage kv_cache_storage_of(DType dtype, bool packed_values) {
-    if (packed_values) { return KvCacheStorage::RotatedInt8KeyInt4ValueGroup64; }
-    switch (dtype) {
-    case DType::BF16:
-        return KvCacheStorage::BFloat16;
-    case DType::I8:
-        return KvCacheStorage::Int8Group64;
-    case DType::FP8_E4M3FN:
-        return KvCacheStorage::Fp8E4M3Row256;
-    default:
-        break;
-    }
-    throw std::invalid_argument("unrecognized Qwen3.6 KV-cache dtype");
+// Throws if storage isn't a recognized KV-cache profile; ops::d256_kv_cache_profile is the single
+// source of truth for what each storage means physically, so target planning defers to it instead
+// of keeping its own parallel copy of the same switch.
+void validate_kv_cache_storage(KvCacheStorage storage) {
+    (void)ops::d256_kv_cache_profile(storage);
 }
 
 template <class ProfileAllowance>
@@ -177,9 +125,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .capacity                  = plan.capacity,
                      .kv_heads                  = TextConfig::kv_heads,
                      .attention_head_dim        = TextConfig::head_dim,
-                     .kv_dtype                  = plan.kv_dtype,
-                     .kv_quant_group            = plan.kv_quant_group,
-                     .kv_packed_values          = plan.kv_packed_values,
+                     .kv_storage                = plan.kv_storage,
                      .enable_mtp                = plan.features.mtp(),
                      .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
                      .text_physical_page_groups = physical_pages,
@@ -253,8 +199,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 .max_context = plan.capacity,
                 .kv_heads    = DFlashConfig::kv_heads,
                 .head_dim    = DFlashConfig::head_dim,
-                .dtype       = DType::BF16,
-                .quant_group = 0,
+                .storage     = KvCacheStorage::BFloat16,
             };
             dflash.prefill_features = add_tensor(
                 builder, DType::BF16, {DFlashConfig::feature_rows, effective_prefill_chunk},
@@ -352,7 +297,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         (void)workspace_recipe::text_attention_results<TextConfig>(layout, last);
         scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
                             {TextConfig::head_dim, TextConfig::query_heads, TextConfig::kv_heads},
-                            kv_cache_storage_of(plan.kv_dtype, plan.kv_packed_values), envelope,
+                            plan.kv_storage, envelope,
                             batch_size, min_width, max_width));
         scratch(layout, Variant::attention_output_projection_workspace_capacity_bytes(
                             plan.weights_profile, phase, first, last));
@@ -420,7 +365,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         (void)workspace_recipe::mtp_attention_results<TextConfig>(layout, tokens);
         scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
                             {TextConfig::head_dim, TextConfig::query_heads, TextConfig::kv_heads},
-                            kv_cache_storage_of(plan.kv_dtype, plan.kv_packed_values), envelope, 1,
+                            plan.kv_storage, envelope, 1,
                             tokens, tokens));
         (void)workspace_recipe::mtp_post_attention<TextConfig>(layout, tokens);
         scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(tokens, tokens));
@@ -457,7 +402,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         matrix(layout, DType::BF16, TextConfig::query_size, 1);
         scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
                             {TextConfig::head_dim, TextConfig::query_heads, TextConfig::kv_heads},
-                            kv_cache_storage_of(plan.kv_dtype, plan.kv_packed_values),
+                            plan.kv_storage,
                             text_envelope, 1, 1, 1));
         matrix(layout, DType::BF16, TextConfig::hidden, 1);
         matrix(layout, DType::BF16, TextConfig::hidden, 1);
@@ -542,7 +487,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 scratch(layout,
                         ops::causal_softmax_attention_workspace_capacity_bytes(
                             {TextConfig::head_dim, TextConfig::query_heads, TextConfig::kv_heads},
-                            kv_cache_storage_of(plan.kv_dtype, plan.kv_packed_values),
+                            plan.kv_storage,
                             text_envelope, batch, width, width));
                 (void)workspace_recipe::mtp_post_attention<TextConfig>(layout, tokens);
                 scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(tokens, tokens));
@@ -743,9 +688,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->causal_scoring      = inputs.causal_scoring;
     impl->device              = inputs.device;
     impl->context_cache       = inputs.context_cache;
-    impl->kv_dtype            = inputs.kv_dtype;
-    impl->kv_quant_group      = inputs.kv_quant_group;
-    impl->kv_packed_values    = inputs.kv_packed_values;
+    impl->kv_storage          = inputs.kv_storage;
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
     if (impl->use_cuda_graph) {
@@ -812,7 +755,7 @@ std::unique_ptr<qwen3_6::detail::SequencePlannerImpl<Variant>>
 make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                            WeightsProfile weights_profile) {
     validate_target_options(device, options);
-    const TargetKVCacheProfile kv_profile = target_kv_cache_profile(options.kv_cache);
+    validate_kv_cache_storage(options.kv_cache);
     SequencePlanningInputs inputs{
         .weights_profile     = weights_profile,
         .capacity            = options.max_context,
@@ -820,9 +763,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
         .speculative_backend = options.speculative.backend,
-        .kv_dtype            = kv_profile.dtype,
-        .kv_quant_group      = kv_profile.quant_group,
-        .kv_packed_values    = kv_profile.packed_values,
+        .kv_storage          = options.kv_cache,
         .proposal_head       = options.speculative.proposal_head,
         .features            = qwen3_6::startup_features(options),
         .vision_max_merged   = std::max<std::uint32_t>(1, options.vision_max_merged_tokens),
