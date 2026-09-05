@@ -38,6 +38,21 @@ std::string responses_identifier(std::string_view prefix) {
 
 using Json = nlohmann::json;
 
+bool is_hosted_openai_tool_type(std::string_view type) noexcept {
+    // OpenAI versions some of these with a dated suffix (web_search_preview_2025_03_11), so match
+    // the family by prefix rather than pinning every spelling.
+    static constexpr std::string_view kHostedPrefixes[] = {
+        "web_search", "code_interpreter", "file_search",
+        "image_generation", "computer_use", "mcp",
+    };
+    for (const std::string_view prefix : kHostedPrefixes) {
+        if (type.size() >= prefix.size() && type.substr(0, prefix.size()) == prefix) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool parse_openai_prompt_cache_breakpoint(const RequestJson& value, std::string_view param) {
     if (!value.contains("prompt_cache_breakpoint") ||
         value.at("prompt_cache_breakpoint").is_null()) {

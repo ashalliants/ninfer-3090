@@ -186,6 +186,10 @@ struct GenerationRequest {
     ninfer::PromptContinuationMode continuation = ninfer::PromptContinuationMode::NewAssistantTurn;
     bool private_cache_boundary_at_prompt_end   = false;
     bool allow_engine_automatic_shared_prefixes = true;
+    // False asks for at most one tool call per assistant turn. Decoding is not constrained; the
+    // serving layer keeps the first call and drops the rest, which is the part of the contract a
+    // client can actually observe.
+    bool parallel_tool_calls = true;
     SamplingParams sampling;
 
     [[nodiscard]] bool uses_tools() const noexcept {

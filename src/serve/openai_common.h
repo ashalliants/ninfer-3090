@@ -28,6 +28,15 @@ struct OpenAIPromptCachePolicy {
 [[nodiscard]] OpenAIPromptCachePolicy parse_openai_prompt_cache_policy(const RequestJson& body);
 void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCachePolicy policy);
 
+// True for OpenAI tool types the *server* would have executed - hosted search, hosted code
+// execution, hosted file search and the like. NInfer has no executor for any of them, and a client
+// never waits on one itself, so declaring one is silently dropped rather than failing the request:
+// the model is simply never told the tool exists, which is the same outcome as not declaring it.
+//
+// Client-executed types stay rejected. Dropping one of those would leave the caller waiting for a
+// call that can never arrive, which is worse than a clear error.
+[[nodiscard]] bool is_hosted_openai_tool_type(std::string_view type) noexcept;
+
 std::string make_models_list(const std::string& model_id, std::int64_t created,
                              std::uint32_t max_model_len);
 std::string make_model_object(const std::string& model_id, std::int64_t created,

@@ -698,6 +698,26 @@ int test_namespace_tools() {
                       }) == "tool_type_not_supported",
                       "namespace custom tools remain explicitly unsupported");
 
+    // Hosted tools are dropped rather than rejected on this endpoint too.
+    Json hosted           = body;
+    hosted["tool_choice"] = "auto";
+    hosted["tools"]       = Json::array({Json{{"type", "web_search"}},
+                                         Json{{"type", "function"}, {"name", "weather"}}});
+    const auto hosted_parsed = parse_openai_responses_create_request(hosted, limits());
+    failures += check(hosted_parsed.prompt.generation.tools.size() == 1 &&
+                          hosted_parsed.prompt.generation.tools[0].name == "weather",
+                      "responses drops a hosted tool and keeps the function tool");
+
+    // parallel_tool_calls=false parses and is carried down to the generation request, which trims
+    // the finished response to a single call.
+    Json sequential                        = body;
+    sequential["tool_choice"]              = "auto";
+    sequential["parallel_tool_calls"]      = false;
+    const auto sequential_parsed           = parse_openai_responses_create_request(sequential, limits());
+    failures += check(!sequential_parsed.parallel_tool_calls &&
+                          !sequential_parsed.prompt.generation.parallel_tool_calls,
+                      "responses accepts parallel_tool_calls=false and propagates it");
+
     Json oversized           = body;
     oversized["tool_choice"] = "auto";
     oversized["tools"] =

@@ -296,12 +296,33 @@ int test_tools() {
     failures += check(api_error([&] { (void)parse(body); }).code == "tool_type_not_supported",
                       "custom tools rejected");
 
+    // A hosted tool is the server's to run. NInfer has no executor, and the caller is not waiting
+    // on one either, so the declaration is dropped instead of failing a request the client cannot
+    // change: agent harnesses declare web_search unconditionally.
+    body          = base_request();
+    body["tools"] = Json::array({Json{{"type", "web_search"}}, function_tool()});
+    const GenerationRequest hosted = parse(body).generation;
+    failures += check(hosted.tools.size() == 1 && hosted.tools[0].name == "weather",
+                      "hosted web_search is dropped and the function tool survives");
+    body["tools"] = Json::array({Json{{"type", "web_search_preview_2025_03_11"}}});
+    failures += check(parse(body).generation.tools.empty(),
+                      "dated hosted tool spellings are dropped by family");
+    body["tools"] = Json::array({Json{{"type", "web_search"}}});
+    failures += check(!parse(body).generation.uses_tools(),
+                      "a request whose only tool is hosted still parses, with no callable tools");
+
+    // parallel_tool_calls=false is honoured by trimming the response to one call rather than
+    // refused; the request must survive parsing for that to be possible.
     body                        = base_request();
     body["tools"]               = Json::array({function_tool()});
     body["parallel_tool_calls"] = false;
-    failures +=
-        check(api_error([&] { (void)parse(body); }).code == "parallel_tool_calls_not_supported",
-              "parallel_tool_calls=false rejected when tools exist");
+    const GenerationRequest sequential = parse(body).generation;
+    failures += check(!sequential.parallel_tool_calls && sequential.uses_tools(),
+                      "parallel_tool_calls=false is accepted alongside tools");
+    body["parallel_tool_calls"] = true;
+    failures += check(parse(body).generation.parallel_tool_calls,
+                      "parallel_tool_calls=true is the default contract");
+    body["parallel_tool_calls"] = false;
     body.erase("tools");
     failures += check(parse(body).generation.tools.empty(),
                       "parallel_tool_calls=false is neutral without tools");

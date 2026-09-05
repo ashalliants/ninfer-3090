@@ -346,6 +346,7 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
     prepared.thinking_budget            = request_options.execution.thinking.budget;
     prepared.effective_reasoning_effort = semantics.effective_reasoning_effort;
     prepared.preserve_thinking          = semantics.preserve_thinking;
+    prepared.parallel_tool_calls        = request.parallel_tool_calls;
     const bool request_has_media        = request.media_item_count() != 0;
     if (request_has_media && !options_.enable_vision) {
         const std::invalid_argument error("Vision is disabled for this server");
@@ -498,6 +499,13 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
 
     outcome.tool_calls      = std::move(result.tool_calls);
     outcome.tool_call_parse = result.tool_call_parse;
+    // parallel_tool_calls=false promises the caller at most one tool call per assistant turn.
+    // Decoding is not constrained, so enforce it here: keep the first call and drop the rest. The
+    // model can ask for the next one on the following turn, which is how a sequential executor
+    // consumes them anyway.
+    if (!prepared.parallel_tool_calls && outcome.tool_calls.size() > 1) {
+        outcome.tool_calls.resize(1);
+    }
     return outcome;
 }
 

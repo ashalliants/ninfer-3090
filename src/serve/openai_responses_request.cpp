@@ -800,6 +800,10 @@ void parse_tools(const Json& body, ParsedPromptFields& out) {
             continue;
         }
         if (type != "namespace") {
+            // Hosted tools are the server's to execute, and NInfer has no executor for any of
+            // them. Drop the declaration instead of failing the request: the model is never told
+            // the tool exists, and the client was never going to run it either.
+            if (is_hosted_openai_tool_type(type)) { continue; }
             bad_request("tool type '" + type +
                             "' requires an executor that NInfer does not provide",
                         "tools", "tool_type_not_supported");
@@ -1051,11 +1055,8 @@ ParsedPromptFields parse_prompt_fields(const Json& body, const RequestLimits& li
     parse_tools(body, out);
     parse_tool_choice(body, out);
     out.parallel_tool_calls = optional_bool(body, "parallel_tool_calls", true);
-    if (!out.parallel_tool_calls && out.prompt.generation.uses_tools()) {
-        bad_request("parallel_tool_calls=false cannot be guaranteed when callable tools are "
-                    "present",
-                    "parallel_tool_calls", "parallel_tool_calls_not_supported");
-    }
+    // Honoured by trimming the response to one tool call rather than refused; see the chat parser.
+    out.prompt.generation.parallel_tool_calls = out.parallel_tool_calls;
     parse_reasoning(body, out.prompt);
     parse_text(body);
     parse_truncation(body);
