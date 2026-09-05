@@ -112,7 +112,7 @@ script. Download scripts save models under `scripts/models` by default:
 
 ```bash
 ./scripts/download-qwen38-27b.sh
-./scripts/download-qwen36-35b-vision.sh
+./scripts/download-qwen36-35b-a3b.sh
 ```
 
 Set `NINFER_MODEL_DIR` to use another model directory. Each launcher also accepts a model path:

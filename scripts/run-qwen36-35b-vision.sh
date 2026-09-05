@@ -15,7 +15,7 @@ if [[ ! -x "$server" ]]; then
 fi
 if [[ ! -f "$model" ]]; then
   printf 'Missing model: %s\n' "$model" >&2
-  printf '%s\n' 'Run download-qwen36-35b-vision.sh or pass the model path.' >&2
+  printf '%s\n' 'Run download-qwen36-35b-a3b.sh or pass the model path.' >&2
   exit 1
 fi
 

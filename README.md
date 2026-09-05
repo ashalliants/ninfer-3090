@@ -47,7 +47,7 @@ grid) that takes prefix reuse from 8.4% to 98.3% on a multi-preamble workload.
 Download `ninfer-rtx3090-windows-x64-*.zip`, unzip it, and from that folder:
 
 ```powershell
-.\download-qwen36-35b-vision.bat          # downloads qwen3_6_35b_a3b.ninfer (~21 GB, resumable)
+.\download-qwen36-35b-a3b.bat            # downloads qwen3_6_35b_a3b.ninfer (~21 GB, resumable)
 .\run-qwen36-35b-a3b-c1-maxctx.bat        # serves on 0.0.0.0:8080, 114,688-token context
 ```
 
@@ -57,8 +57,8 @@ Download `ninfer-rtx3090-linux-x64-*.tar.gz`, unpack it, and from that folder:
 
 ```bash
 tar -xzf ninfer-rtx3090-linux-x64-*.tar.gz && cd ninfer-rtx3090-linux-x64-*/
-./download-qwen36-35b-vision.sh           # downloads qwen3_6_35b_a3b.ninfer (~21 GB, resumable)
-./run-qwen36-35b-a3b-c1-maxctx.sh         # 2 lanes, 262,144 tokens, MTP3 + draft head, vision
+./download-qwen36-35b-a3b.sh             # downloads qwen3_6_35b_a3b.ninfer (~21 GB, resumable)
+./run-qwen36-35b-a3b-c1-maxctx.sh        # 2 lanes, 262,144 tokens, MTP3 + draft head, vision
 ```
 
 That is the default on Linux because a headless 3090 fits it: two lanes at the native 262,144-token
@@ -167,7 +167,7 @@ Both platforms ship a prebuilt archive; building from source is optional and cov
 1. Download and unpack the latest
    [Linux release](https://github.com/ashalliants/ninfer-3090/releases/latest)
    (`ninfer-rtx3090-linux-x64-*.tar.gz`).
-2. Run `./download-qwen36-35b-vision.sh` or `./download-qwen38-27b.sh` to fetch a model. Interrupted
+2. Run `./download-qwen36-35b-a3b.sh` or `./download-qwen38-27b.sh` to fetch a model. Interrupted
    downloads resume.
 3. Run a launcher — `./run-qwen36-35b-a3b-c1-maxctx.sh` is the recommended one.
 
@@ -184,7 +184,7 @@ The Linux guide covers the GPU check, the native Ubuntu build, model mounts and 
 1. Download and unzip the latest
    [Windows release](https://github.com/ashalliants/ninfer-3090/releases/latest)
    (`ninfer-rtx3090-windows-x64-*.zip`).
-2. Double-click `download-qwen36-35b-vision.bat` or `download-qwen38-27b.bat` to download a model.
+2. Double-click `download-qwen36-35b-a3b.bat` or `download-qwen38-27b.bat` to download a model.
    Interrupted downloads resume.
 3. Double-click one launcher:
 

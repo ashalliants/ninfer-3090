@@ -12,7 +12,7 @@ if not exist "%SERVER%" (
 )
 if not exist "%MODEL%" (
   echo Missing model: %MODEL%
-  echo Run download-qwen36-35b-vision.bat first, or drag the model onto this launcher.
+  echo Run download-qwen36-35b-a3b.bat first, or drag the model onto this launcher.
   exit /b 1
 )
 

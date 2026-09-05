@@ -53,7 +53,7 @@ done
 CURL
 chmod +x "$tmp/bin/curl"
 PATH="$tmp/bin:$PATH" NINFER_MODEL_DIR="$tmp/models" "$root/download-qwen38-27b.sh" >/dev/null
-PATH="$tmp/bin:$PATH" NINFER_MODEL_DIR="$tmp/models" "$root/download-qwen36-35b-vision.sh" >/dev/null
+PATH="$tmp/bin:$PATH" NINFER_MODEL_DIR="$tmp/models" "$root/download-qwen36-35b-a3b.sh" >/dev/null
 [[ -f "$tmp/models/qwen3_8_27b.ninfer" ]]
 [[ -f "$tmp/models/qwen3_6_35b_a3b.ninfer" ]]
 
