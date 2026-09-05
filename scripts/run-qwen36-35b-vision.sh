@@ -24,6 +24,6 @@ printf '%s\n' 'Safe RTX 3090 profile: one request, 32K context, vision enabled, 
 exec "$server" "$model" \
   --host 127.0.0.1 --port 8080 \
   --max-context 32768 --kv-capacity 32768 \
-  --max-concurrency 1 --max-pending-requests 8 \
+  --max-concurrency 1 --max-pending-requests 8 --pending-timeout-ms 600000 \
   --prefill-chunk 512 --kv-dtype int8 --default-max-tokens 512 \
   --vision --no-thinking --temperature 0.2

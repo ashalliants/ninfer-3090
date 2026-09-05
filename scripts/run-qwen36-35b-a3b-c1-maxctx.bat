@@ -128,7 +128,7 @@ rem --- Profile A: speculation on. ~240 tok/s decode. ---
   --kv-dtype rk8v4 ^
   --spec mtp --draft-tokens 3 --lm-head-draft ^
   --prefill-chunk 512 ^
-  --max-pending-requests 16 ^
+  --max-pending-requests 16 --pending-timeout-ms 600000 ^
   --vision --vision-residency overlay ^
   --max-private-continuations 8 --max-shared-prefixes 4 --host-state-slots 16 --host-kv-mib 8192
 
@@ -140,6 +140,6 @@ rem   --max-context %CONTEXT% ^
 rem   --kv-capacity %CONTEXT% ^
 rem   --kv-dtype rk8v4 ^
 rem   --prefill-chunk 512 ^
-rem   --max-pending-requests 16
+rem   --max-pending-requests 16 --pending-timeout-ms 600000
 
 endlocal

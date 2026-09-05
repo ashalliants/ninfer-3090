@@ -218,11 +218,18 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
                                                             options_.response_store_max_bytes),
       operational_log_(logger),
       request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger)) {
-    const std::size_t queued_requests =
-        static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
-    const std::size_t worker_count = queued_requests + 1;
-    server_.new_task_queue         = [queued_requests, worker_count] {
-        return new httplib::ThreadPool(worker_count, worker_count, queued_requests);
+    // cpp-httplib is thread-per-connection: a worker is held for a connection's whole
+    // life, including the idle keep-alive window between requests. Sizing the pool to the
+    // request-lifetime capacity alone lets idle pooled connections occupy every worker, at
+    // which point a C8 server accepts and runs requests strictly one at a time. Base
+    // workers cover the admissible request capacity; the headroom is grown on demand for
+    // connections that are merely open, and those dynamic workers retire once idle.
+    constexpr std::size_t kKeepAliveWorkerHeadroom = 64;
+    const std::size_t request_workers =
+        static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests + 1;
+    const std::size_t worker_limit = request_workers + kKeepAliveWorkerHeadroom;
+    server_.new_task_queue         = [request_workers, worker_limit] {
+        return new httplib::ThreadPool(request_workers, worker_limit, worker_limit);
     };
     server_.set_socket_options(configure_http_server_socket);
     server_.set_payload_max_length(options_.max_request_bytes);

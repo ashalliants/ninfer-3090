@@ -24,6 +24,6 @@ printf '%s\n' 'Profile: up to eight requests, 8K context, MTP3, ReplaySSM'
 exec "$server" "$model" \
   --host 127.0.0.1 --port 8080 \
   --max-context 8192 --kv-capacity 16384 \
-  --max-concurrency 8 --max-pending-requests 32 \
-  --prefill-chunk 1024 --kv-dtype int8 \
+  --max-concurrency 8 --max-pending-requests 32 --pending-timeout-ms 600000 \
+  --prefill-chunk 512 --kv-dtype int8 \
   --spec mtp --draft-tokens 3 --lm-head-draft

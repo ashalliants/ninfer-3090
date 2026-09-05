@@ -31,7 +31,11 @@ struct ServeOptions {
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
-    std::uint32_t pending_timeout_ms   = 30000;
+    // Admission waits behind the active set, so the deadline has to cover the generation
+    // time of the requests ahead in the FIFO. One 1K-token response already runs past 15 s
+    // at C1 on an RTX 3090, and a 6.5K-token one past 100 s; a 30 s deadline expired those
+    // callers before they were ever admitted.
+    std::uint32_t pending_timeout_ms   = 600000;
     std::uint32_t prefill_chunk        = 1024;
     std::filesystem::path context_cost_presets;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs

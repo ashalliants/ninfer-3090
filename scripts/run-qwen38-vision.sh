@@ -24,6 +24,6 @@ printf '%s\n' 'Tested RTX 3090 profile: one request, 32K context, ReplaySSM and 
 exec "$server" "$model" \
   --host 127.0.0.1 --port 8080 \
   --max-context 32768 --kv-capacity 32768 \
-  --max-concurrency 1 --max-pending-requests 8 \
+  --max-concurrency 1 --max-pending-requests 8 --pending-timeout-ms 600000 \
   --prefill-chunk 512 --kv-dtype int8 --default-max-tokens 1024 \
   --vision --spec mtp --draft-tokens 3 --lm-head-draft
