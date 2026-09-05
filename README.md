@@ -114,12 +114,27 @@ eight-lane throughput profile.
 |---|---|---|---|---|---|---|
 | `run-qwen38-c1` (unchanged) | 1 | 65,536 | int8 | off | 2.73 GiB | 2.85 GiB |
 | **`run-qwen38-c1-maxctx`, Windows** | 1 | 131,072 | rk8v4 | overlay | 3.94 GiB | 1.59 GiB |
-| **`run-qwen38-c1-maxctx`, Linux** | 2 | 131,072 | rk8v4 | overlay | 4.32 GiB | 1.26 GiB |
+| **`run-qwen38-c1-maxctx`, Linux** | 2 | 196,608 | rk8v4 | overlay | 6.01 GiB* | headless only |
 | `NINFER_CONTEXT=163840` | 1 | 163,840 | rk8v4 | overlay | 4.78 GiB | 763 MiB |
 
 Vision is on in both. Overlay residency keeps the tower host-pinned and streams each image through
 a borrowed device window, so it costs about **10 MiB** of runtime reservation — measured 3.93 GiB
 without it against 3.94 GiB with, at the same context. There is no reason to trade it away.
+
+**Why the 27B stops short of 262,144 when the 35B-A3B reaches it.** The runtime reservation is
+linear in context: seven measured points from 49,152 to 163,840 fit
+`runtime = 0.553 GiB + 27,719 × context` with a worst residual of 3.9 MiB, and a second lane adds
+a flat 0.38 GiB. A headless 3090 has roughly 7.06 GiB for the reservation, so 262,144 would need
+7.32 GiB at one lane and 7.70 GiB at two — it does not fit either way, and the zero-margin
+ceilings are about 252,000 tokens at C1 and 237,000 at C2.
+
+That is the model, not the tuning. The 27B spends 16 full-attention layers × 4 kv_heads × 256
+head_dim per token against the 35B-A3B's 10 × 2 × 256 — **3.2× the KV per token**, 27.07 KiB
+against roughly 7.8. The 35B-A3B reaches the native maximum because its KV is cheap.
+
+So the Linux launcher defaults to **196,608**, the largest rung with real margin (+1.05 GiB
+predicted at two lanes); 212,992 also fits at +0.63 GiB. Those two are extrapolated rather than
+measured — a desktop machine cannot start them — so confirm on the box before relying on them.
 
 One thing to know: this model's StateImage is **147 MiB**, 2.4× the 35B-A3B's, because it has 48 GDN
 layers with 48 value heads. `--host-state-slots 32` therefore pins **4.59 GiB of host memory** — host,

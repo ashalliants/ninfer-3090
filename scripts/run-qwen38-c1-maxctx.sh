@@ -23,19 +23,38 @@
 #   lanes  KV      context   vision   runtime    free after startup
 #   ------------------------------------------------------------------
 #   1      int8     65,536   off      2.73 GiB   2.85 GiB   <- what run-qwen38-c1.sh does
+#   1      rk8v4    49,152   overlay  1.82 GiB   3.33 GiB
+#   1      rk8v4    98,304   overlay  3.09 GiB   2.07 GiB
 #   1      rk8v4   131,072   off      3.93 GiB   1.68 GiB
 #   1      rk8v4   131,072   overlay  3.94 GiB   1.59 GiB
-#   2      rk8v4   131,072   overlay  4.32 GiB   1.26 GiB   <- default here
+#   2      rk8v4   131,072   overlay  4.32 GiB   1.26 GiB
 #   1      rk8v4   163,840   overlay  4.78 GiB   763.2 MiB
 #
 # Vision is on: overlay residency costs about 10 MiB of runtime reservation, so there is no reason
 # to trade it away. run-qwen38-vision.sh remains for the plain 32K image profile.
-# Rungs if startup refuses: 163840 / 131072 / 114688 / 98304 / 65536.
+#
+# WHY NOT 262,144 LIKE THE 35B-A3B. The runtime reservation is dead linear in context - seven
+# points from 49,152 to 163,840 fit
+#
+#     runtime_bytes = 0.553 GiB + 27,719 x context        (worst residual 3.9 MiB)
+#
+# at 27.07 KiB/token, and a second lane adds a flat 0.38 GiB. A headless 3090 has about 7.06 GiB
+# for the reservation, so 262,144 needs 7.32 GiB at one lane and 7.70 GiB at two - it does not fit
+# either way. The zero-margin ceilings are roughly 252,000 tokens at C1 and 237,000 at C2.
+#
+# That is not a tuning failure, it is the model: the 27B spends 16 full-attention layers x 4
+# kv_heads x 256 head_dim per token against the 35B-A3B's 10 x 2 x 256, which is 3.2x the KV per
+# token - 27.07 KiB against roughly 7.8. The 35B-A3B reaches 262,144 because its KV is cheap.
+#
+# So the default below is 196,608, the largest rung with real margin (+1.05 GiB predicted at two
+# lanes). 212,992 also fits at +0.63 GiB if you want to push it. Both are extrapolated, not
+# measured - this machine cannot start them - so confirm on the box before relying on them.
+# Rungs: 212992 / 196608 / 163840 / 131072 / 114688 / 98304 / 65536.
 # ------------------------------------------------------------------------------------------------
 set -euo pipefail
 
 MODEL="${NINFER_MODEL:-${NINFER_MODEL_DIR:-/mnt/c/Ninefer-3090/models}/qwen3_8_27b.ninfer}"
-CONTEXT="${NINFER_CONTEXT:-131072}"
+CONTEXT="${NINFER_CONTEXT:-196608}"
 CONCURRENCY="${NINFER_CONCURRENCY:-2}"
 KV_CAPACITY="${NINFER_KV_CAPACITY:-$CONTEXT}"
 KV_DTYPE="${NINFER_KV_DTYPE:-rk8v4}"
