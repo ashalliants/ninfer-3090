@@ -71,19 +71,25 @@ the new sustained test: every request generated 1,024 tokens with CUDA Graphs en
 The prompts were **29-34 input tokens** and the server's maximum context window was **8,192 tokens
 per request**. Each measured sequence therefore reached roughly 1,053-1,058 tokens including its
 generated output. This is a long-output/decode benchmark, not an 8K-prompt or long-prefill test.
-C1-C4 used an 8,192-token shared KV pool; C8 used 16,384 tokens so all eight requested outputs
-could be admitted simultaneously.
+C1 used an 8,192-token shared KV pool; C2-C8 used 16,384 tokens so every requested output could be
+admitted simultaneously.
 
 | Cohort | Total output | End-to-end throughput | Decode throughput | MTP acceptance | Mean TTFT | Peak VRAM |
 |---:|---:|---:|---:|---:|---:|---:|
-| C1 | 1,024 tokens | **70.19 tok/s** | **71.00 tok/s** | 61.13% | 149 ms | 19,641 MiB |
-| C2 | 2,048 tokens | **89.43 tok/s** | **90.66 tok/s** | 59.66% | 262 ms | 20,022 MiB |
-| C4 | 4,096 tokens | **97.89 tok/s** | **100.28 tok/s** | 59.63% | 538 ms | 20,641 MiB |
-| C8 | 8,192 tokens | **161.28 tok/s** | **165.33 tok/s** | 56.84% | 1,215 ms | 22,138 MiB |
+| C1 | 1,024 tokens | **77.84 tok/s** | **78.71 tok/s** | 71.27% | 133 ms | 19,475 MiB |
+| C2 | 2,048 tokens | **94.75 tok/s** | **96.04 tok/s** | 62.17% | 225 ms | 19,919 MiB |
+| C4 | 4,096 tokens | **136.43 tok/s** | **139.91 tok/s** | 66.15% | 420 ms | 20,247 MiB |
+| C8 | 8,192 tokens | **240.34 tok/s** | **250.26 tok/s** | 69.74% | 866 ms | 20,903 MiB |
 
-C1 is the responsive choice for a single user. C8 delivers **2.3x the total throughput** when
+C1 is the responsive choice for a single user. C8 delivers **3.2x the total throughput** when
 several requests are active. The C8 long-output test uses a 16K shared KV pool so all eight
 1,024-token responses can be admitted together.
+
+Concurrent decode extents are what the sm_86 kernel routes are selected for. A decode round covers
+`concurrency x (draft window + 1)` token columns, and above the single-token point the cost of a
+route is set by its padded tile width rather than by the live column count. Selecting the narrowest
+tile that still covers each extent is worth 40% at C4 and C8; C1, whose four columns already sit on
+the exact-T routes, is unchanged.
 
 ### Prompt-processing speed
 

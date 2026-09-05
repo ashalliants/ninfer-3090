@@ -99,6 +99,13 @@ request is waiting or prefilling. A peer whose TCP stack remains connected and a
 cannot be distinguished from a reading application; proxies must close their upstream NInfer
 connection when the downstream client disappears.
 
+The HTTP transport is thread-per-connection, and a worker stays with a connection for its whole
+life, including the idle window between keep-alive requests. The pool therefore reserves one base
+worker per admissible request (`max_concurrency + max_pending_requests + 1`) and grows on demand up
+to 64 further workers for connections that are merely open; the extra workers retire once idle.
+Without that headroom a client-side connection pool of otherwise idle sockets occupies every worker
+and the server accepts real requests strictly one at a time.
+
 ## OpenAI Chat Completions
 
 ```bash
@@ -663,7 +670,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
 | `--max-concurrency N` | maximum admitted requests; valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
-| `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
+| `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `600000` |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--device N` | CUDA device index | `0` |
@@ -833,7 +840,20 @@ CPU/media preparation and completed model results whose response has not yet bee
 capacity returns HTTP 429 with code `server_overloaded`. The absolute
 `--pending-timeout-ms` deadline starts before preparation, covers media acquisition and Engine FIFO
 waiting, and returns HTTP 503 with code `request_queue_timeout` if admission does not occur in time.
-There is no admission ETA or unbounded overflow queue.
+There is no admission ETA or unbounded overflow queue. Because there is no preemption, a queued
+request waits out the generations ahead of it, so the deadline has to be scaled to the longest
+response the deployment allows rather than to a connection timeout: at C1 on an RTX 3090 a single
+6,500-token response occupies the engine for about 106 seconds. The 600,000 ms default admits a
+queued caller behind roughly ten such responses; lower it only to fail fast on purpose.
+
+One request owns the staged prefill at a time, and the executor alternates a single prefill chunk
+with a single decode round, so `--prefill-chunk` sets the worst-case pause every active stream sees
+while a new prompt is ingested. On an RTX 3090 ingesting a 4,900-token prompt behind four active
+streams, the largest inter-token gap measured 1,043 ms at chunk 1024, 515 ms at 512, and 312 ms at
+256, against an 82 ms median decode interval; the ingesting request's own prefill rate fell only
+from 1,135 to 1,130 to 1,110 tok/s. Prefill is not batched across requests at any chunk size, so a
+smaller chunk trades almost no ingestion throughput for a proportionally smaller stall. The shipped
+concurrent launcher uses 512.
 
 Input memory is bounded by the outstanding-request count and the per-request
 `--max-request-mib` limit. Media requests additionally share one preparation permit, so a waiting

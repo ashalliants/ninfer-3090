@@ -25,14 +25,25 @@ struct RouteSpec {
     Q4Q5GdnInputScheduleId schedule;
 };
 
-constexpr std::array<RouteSpec, 2> kRoutes{{
-    {{1, 16}, Q4Q5GdnInputScheduleId::IndependentDirectFixed},
-    {{17, kAnyCols}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128},
+// Above the direct route the cost of a grouped MMA tile is set by its padded column width,
+// not by the live token count, so the tile is chosen to be the narrowest one that still
+// covers the extent in a single pass. Decode extents (C8 with MTP3 is 32) get the 32-wide
+// tile; the 128-wide tile remains the prefill-chunk anchor.
+constexpr std::array<RouteSpec, 4> kRoutes{{
+    {{1, 6}, Q4Q5GdnInputScheduleId::IndependentDirectFixed},
+    {{7, 32}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C32},
+    {{33, 64}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C64},
+    {{65, kAnyCols}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128},
 }};
 
 constexpr bool catalog_is_closed() noexcept {
-    return kRoutes[0].cols.first == 1 && kRoutes[0].cols.last + 1 == kRoutes[1].cols.first &&
-           kRoutes[1].cols.last == kAnyCols;
+    std::int64_t expected = 1;
+    for (const RouteSpec& route : kRoutes) {
+        if (route.cols.first != expected || route.cols.last < route.cols.first) { return false; }
+        expected = static_cast<std::int64_t>(route.cols.last) + 1;
+    }
+    return kRoutes.back().cols.last == kAnyCols &&
+           expected == static_cast<std::int64_t>(kAnyCols) + 1;
 }
 
 static_assert(catalog_is_closed(), "GDN input routes must be exact and closed");
@@ -48,6 +59,10 @@ const char* q4_q5_gdn_input_schedule_name(Q4Q5GdnInputScheduleId schedule) noexc
     switch (schedule) {
     case Q4Q5GdnInputScheduleId::IndependentDirectFixed:
         return "gdn_input_proj.q4_q5.independent_direct_fixed";
+    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C32:
+        return "gdn_input_proj.q4_q5.grouped_mixed.mma.r64.c32";
+    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C64:
+        return "gdn_input_proj.q4_q5.grouped_mixed.mma.r64.c64";
     case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128:
         return "gdn_input_proj.q4_q5.grouped_mixed.mma.r64.c128";
     }
@@ -118,6 +133,12 @@ void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
         q4_q5_gdn_input_independent_launch(x, qk_weight, value_z_weight, qk, value, z, stream);
         return;
     }
+    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C32:
+        q4_q5_gdn_input_grouped_mma_c32_launch(x, qk_weight, value_z_weight, qkv, z, stream);
+        return;
+    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C64:
+        q4_q5_gdn_input_grouped_mma_c64_launch(x, qk_weight, value_z_weight, qkv, z, stream);
+        return;
     case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128:
         q4_q5_gdn_input_grouped_mma_launch(x, qk_weight, value_z_weight, qkv, z, stream);
         return;

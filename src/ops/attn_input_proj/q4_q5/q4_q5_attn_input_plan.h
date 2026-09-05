@@ -11,7 +11,7 @@ namespace ninfer::ops::detail {
 
 enum class Q4Q5AttnInputScheduleId {
     ParentSplitFixed,
-    GroupedHomogeneousPairMmaR16C64S3,
+    GroupedHomogeneousPairMmaR32C32S4,
     GroupedHomogeneousPairMmaR32C64S4,
 };
 

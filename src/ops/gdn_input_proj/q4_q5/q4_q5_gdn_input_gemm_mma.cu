@@ -33,10 +33,19 @@ RowSplitGroupedMmaJob make_job(const Weight& weight, std::int32_t weight_row_off
     };
 }
 
+// A block tile pads every column group to its full width, so the issued MMA work is set by
+// BN, not by the live token count. On sm_86 the 128-wide tile is issue-bound well before it
+// is bandwidth-bound, and a decode round never fills it: C8 with MTP3 is 32 columns. The
+// narrow tiles cut the padded work proportionally over the extents a decode round uses,
+// while the 128-wide tile stays the throughput anchor for prefill chunks.
+using GdnInputC32Schedule  = GemmCfg<64, 32, 64, 16, 8, 2, 2, false, true, true>;
+using GdnInputC64Schedule  = GemmCfg<64, 64, 64, 16, 16, 2, 2, false, true, true>;
+using GdnInputC128Schedule = GemmCfg<64, 128, 64, 64, 16, 2, 1, false, true, true>;
+
+template <class Schedule>
 void launch_slice(bool full, const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                   Tensor& qkv, Tensor& z, cudaStream_t stream) {
     constexpr std::int32_t kValueRows = 6144;
-    using Schedule                    = GemmCfg<64, 128, 64, 64, 16, 2, 1, false, true, true>;
     const RowSplitGroupedMmaJob qk    = make_job(qk_weight, 0, qk_weight.n, qkv, 0);
     const RowSplitGroupedMmaJob value = make_job(value_z_weight, 0, kValueRows, qkv, qk_weight.n);
     const RowSplitGroupedMmaJob output_gate =
@@ -62,19 +71,38 @@ void launch_slice(bool full, const Tensor& x, const Weight& qk_weight, const Wei
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace
-
-void q4_q5_gdn_input_grouped_mma_launch(const Tensor& x, const Weight& qk_weight,
-                                        const Weight& value_z_weight, Tensor& qkv, Tensor& z,
-                                        cudaStream_t stream) {
-    constexpr std::int32_t kTileCols = 128;
+template <class Schedule>
+void launch_route(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                  Tensor& qkv, Tensor& z, cudaStream_t stream) {
+    constexpr std::int32_t kTileCols = Schedule::BN;
     const bool full                  = (x.ne[1] % kTileCols) == 0;
     for_each_token_slice(x.ne[1], kTileCols, [&](std::int32_t offset, std::int32_t count) {
         const Tensor x_slice = x.slice(1, offset, count);
         Tensor qkv_slice     = qkv.slice(1, offset, count);
         Tensor z_slice       = z.slice(1, offset, count);
-        launch_slice(full, x_slice, qk_weight, value_z_weight, qkv_slice, z_slice, stream);
+        launch_slice<Schedule>(full, x_slice, qk_weight, value_z_weight, qkv_slice, z_slice,
+                               stream);
     });
+}
+
+} // namespace
+
+void q4_q5_gdn_input_grouped_mma_c32_launch(const Tensor& x, const Weight& qk_weight,
+                                            const Weight& value_z_weight, Tensor& qkv, Tensor& z,
+                                            cudaStream_t stream) {
+    launch_route<GdnInputC32Schedule>(x, qk_weight, value_z_weight, qkv, z, stream);
+}
+
+void q4_q5_gdn_input_grouped_mma_c64_launch(const Tensor& x, const Weight& qk_weight,
+                                            const Weight& value_z_weight, Tensor& qkv, Tensor& z,
+                                            cudaStream_t stream) {
+    launch_route<GdnInputC64Schedule>(x, qk_weight, value_z_weight, qkv, z, stream);
+}
+
+void q4_q5_gdn_input_grouped_mma_launch(const Tensor& x, const Weight& qk_weight,
+                                        const Weight& value_z_weight, Tensor& qkv, Tensor& z,
+                                        cudaStream_t stream) {
+    launch_route<GdnInputC128Schedule>(x, qk_weight, value_z_weight, qkv, z, stream);
 }
 
 } // namespace ninfer::ops::detail

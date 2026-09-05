@@ -18,4 +18,4 @@ if not exist "%MODEL%" (
 
 echo Starting Qwen3.8-27B Vision at http://127.0.0.1:8080/v1
 echo Tested RTX 3090 profile: one request, 32K context, ReplaySSM and MTP3
-"%SERVER%" "%MODEL%" --host 127.0.0.1 --port 8080 --max-context 32768 --kv-capacity 32768 --max-concurrency 1 --max-pending-requests 8 --prefill-chunk 512 --kv-dtype int8 --default-max-tokens 1024 --vision --spec mtp --draft-tokens 3 --lm-head-draft
+"%SERVER%" "%MODEL%" --host 127.0.0.1 --port 8080 --max-context 32768 --kv-capacity 32768 --max-concurrency 1 --max-pending-requests 8 --pending-timeout-ms 600000 --prefill-chunk 512 --kv-dtype int8 --default-max-tokens 1024 --vision --spec mtp --draft-tokens 3 --lm-head-draft

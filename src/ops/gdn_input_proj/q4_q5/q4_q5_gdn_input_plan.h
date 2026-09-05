@@ -11,6 +11,8 @@ namespace ninfer::ops::detail {
 
 enum class Q4Q5GdnInputScheduleId {
     IndependentDirectFixed,
+    GroupedMixedMmaR64C32,
+    GroupedMixedMmaR64C64,
     GroupedMixedMmaR64C128,
 };
 

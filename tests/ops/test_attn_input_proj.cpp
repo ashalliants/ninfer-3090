@@ -93,7 +93,9 @@ int run_q4_q5() {
         quantized_weight::make_patterned_weight(QType::Q5G64_F16S, kParent, kHidden, 107U));
 
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 16, 17, 21, 48}) {
+    // One exactly-filled and one partially-filled extent per route: parent-split (1, 2, 8),
+    // the 32-wide pair tile (9, 16, 32), and the 64-wide tile that carries prefill (33, 64, 65).
+    for (const std::int32_t tokens : {1, 2, 8, 9, 16, 32, 33, 64, 65}) {
         failures += run_q4_q5_case(query_key, gate_value, tokens);
     }
     return failures;
