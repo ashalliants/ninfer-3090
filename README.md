@@ -25,7 +25,7 @@ FP8 E4M3 *KV-cache* profile is not: its attention kernels have no SM86 implement
 
 The goal is the make the utmost rippin Qwen inference stack for the 3000 series. Gladly taking PR's, all help much appreciated. 
 
-Release notes for this branch: [v0.8.0](RELEASE_NOTES_0.8.0.md).
+Release notes for this branch: [v0.8.1](RELEASE_NOTES_0.8.1.md).
 
 ## Quick start
 
