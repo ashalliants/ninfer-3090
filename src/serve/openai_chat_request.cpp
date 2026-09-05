@@ -597,6 +597,11 @@ void parse_tools(const Json& body, GenerationRequest& output) {
         }
         const std::string type = item.at("type").get<std::string>();
         if (type != "function") {
+            // A hosted tool would have been executed by the server. NInfer cannot, and the client
+            // is not waiting on it either, so drop it and carry on: the model is never told the
+            // tool exists. Agent harnesses declare web_search unconditionally, and failing the
+            // whole request over one entry they cannot remove locked them out entirely.
+            if (is_hosted_openai_tool_type(type)) { continue; }
             bad_request(
                 "tool type '" + type +
                     "' requires a non-function output contract that NInfer does not provide",
@@ -737,19 +742,18 @@ void parse_tool_choice(const Json& body, GenerationRequest& output) {
     }
 }
 
-void parse_parallel_tool_calls(const Json& body, const GenerationRequest& output) {
+void parse_parallel_tool_calls(const Json& body, GenerationRequest& output) {
     if (!body.contains("parallel_tool_calls") || body.at("parallel_tool_calls").is_null()) {
         return;
     }
     if (!body.at("parallel_tool_calls").is_boolean()) {
         bad_request("parallel_tool_calls must be a boolean", "parallel_tool_calls");
     }
-    if (!body.at("parallel_tool_calls").get<bool>() && output.uses_tools()) {
-        bad_request(
-            "parallel_tool_calls=false requires the model to emit at most one tool call, which "
-            "NInfer cannot guarantee while tools are enabled",
-            "parallel_tool_calls", "parallel_tool_calls_not_supported");
-    }
+    // Honoured by keeping the first tool call and dropping the rest, rather than refused. The
+    // guarantee a client depends on is what the response contains, and that much is enforceable
+    // even though decoding itself is not constrained. Refusing instead broke agent harnesses that
+    // send parallel_tool_calls=false whenever any tool is available.
+    output.parallel_tool_calls = body.at("parallel_tool_calls").get<bool>();
 }
 
 void parse_stop(const Json& body, GenerationRequest& output) {
