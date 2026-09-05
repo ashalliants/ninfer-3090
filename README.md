@@ -46,34 +46,49 @@ grid) that takes prefix reuse from 8.4% to 98.3% on a multi-preamble workload.
 .\run-qwen36-35b-a3b-c1-maxctx.bat        # serves on 0.0.0.0:8080, 114,688-token context
 ```
 
-### Headless Linux — one or two users
+### Headless Linux — full 256K context, two users
 
 ```bash
 # 1. Unpack the latest Linux release, then from that folder:
 ./download-qwen36-35b-vision.sh           # downloads qwen3_6_35b_a3b.ninfer (~21 GB, resumable)
-./run-qwen36-35b-a3b-c1-maxctx.sh         # one user, 114,688-token context
 
-# two agents at 64K each, same box:
-NINFER_CONCURRENCY=2 NINFER_CONTEXT=65536 NINFER_KV_CAPACITY=131072 \
+# the native maximum: two agents, 262,144 tokens each, text only
+NINFER_SPEC=none NINFER_VISION=off NINFER_CONCURRENCY=2 NINFER_CONTEXT=262144 \
   ./run-qwen36-35b-a3b-c1-maxctx.sh
+
+# or keep speculation and images, at a third of the context
+./run-qwen36-35b-a3b-c1-maxctx.sh         # one user, 114,688 tokens, MTP3 + vision
 ```
 
-`NINFER_MODEL`, `NINFER_HOST` and `NINFER_PORT` override the rest. The Linux launcher binds
-`127.0.0.1` by default; set `NINFER_HOST=0.0.0.0` to expose it, which is unauthenticated.
+`NINFER_MODEL`, `NINFER_HOST`, `NINFER_PORT`, `NINFER_KV_CAPACITY` and `NINFER_DRAFT_TOKENS`
+override the rest. The Linux launcher binds `127.0.0.1` by default; set `NINFER_HOST=0.0.0.0`
+to expose it, which is unauthenticated.
 
 ### Which profile
 
-| | concurrency | per-request context | KV pool | measured free VRAM |
-|---|---|---|---|---|
-| Windows, one user | 1 | 114,688 | 114,688 | 492 MiB |
-| Linux, one user | 1 | 114,688 | 114,688 | 492 MiB |
-| Linux, two users | 2 | 65,536 | 131,072 | 201 MiB |
+Context is not free, and the two things that spend it are speculation and vision:
+
+- **Speculation** is 992 MiB of weights (MTP head 856 MiB, draft head 136 MiB) that would
+  otherwise be KV — about 130,000 rk8v4 tokens. It buys roughly 240-280 tok/s against 183.
+- **Vision** does not cost VRAM in overlay residency, but the overlay borrows an evictable KV
+  tail, and past roughly 131,072 tokens the server refuses to start with `evictable pool window
+  exceeds the evictable tail`. That is a policy limit, not memory: the 262,144 profile has
+  305 MiB free once vision is off.
+
+| Profile | lanes | context | speculation | vision | decode | measured free VRAM |
+|---|---|---|---|---|---|---|
+| **Headless Linux, max context** | 2 | 262,144 | none | off | ~183 tok/s | 305 MiB |
+| Headless Linux, one user, max context | 1 | 262,144 | none | off | ~183 tok/s | 448 MiB |
+| **Windows / Linux, one user** | 1 | 114,688 | MTP3 + draft | overlay | ~240-280 tok/s | 492 MiB |
+| Two users, speculation + vision | 2 | 65,536 | MTP3 + draft | overlay | ~240-280 tok/s | 201 MiB |
 
 `--kv-capacity` is the shared pool and `--max-context` is the per-request cap, so a second lane
-does not cost twice the memory unless you also want twice the per-request context. Free-VRAM
-figures are from a Windows desktop; a headless box has roughly 1.5 GiB more to spend, so the
-two-user profile has more room there than the table suggests. If a server refuses to start, drop
-one context rung (114688 / 98304 / 90112 / 81920) or drop `--vision` first.
+does not cost twice the memory unless you also want twice the per-request context.
+
+Every free-VRAM figure above was measured **with a Windows desktop running**, which holds about
+1.5 GiB; a headless box has that much again to spend, so these are the pessimistic numbers. If a
+server refuses to start, drop `--vision` first, then speculation, then a context rung
+(262144 / 196608 / 131072 / 114688 / 98304 / 81920).
 
 For Qwen3.8-27B instead, use `download-qwen38.bat`/`.sh` with `run-qwen38-c1` or `run-qwen38-c8`.
 

@@ -65,6 +65,31 @@ CONTEXT="${NINFER_CONTEXT:-114688}"
 CONCURRENCY="${NINFER_CONCURRENCY:-1}"
 KV_CAPACITY="${NINFER_KV_CAPACITY:-$CONTEXT}"
 
+# Speculation is not free context: the MTP head is 856 MiB of weights and the draft head another
+# 136 MiB, which is 992 MiB that would otherwise be KV. At rk8v4's ~7,969 B/token that is about
+# 130,000 tokens. So NINFER_SPEC=none is what reaches the native 262,144 maximum, at roughly
+# 183 tok/s decode instead of 240-280.
+#
+#   NINFER_SPEC=mtp   (default)  MTP3 + draft head, ~240-280 tok/s, context caps around 131,072
+#   NINFER_SPEC=none             no speculation,    ~183 tok/s,     context reaches 262,144
+SPEC="${NINFER_SPEC:-mtp}"
+case "$SPEC" in
+  mtp)  spec_args=(--spec mtp --draft-tokens "${NINFER_DRAFT_TOKENS:-3}" --lm-head-draft) ;;
+  none) spec_args=() ;;
+  *) printf 'NINFER_SPEC must be mtp or none, got %s\n' "$SPEC" >&2; exit 2 ;;
+esac
+
+# Vision costs context even in overlay residency, and not through VRAM: the overlay borrows an
+# evictable KV tail, and past roughly 131,072 tokens the server refuses to start with
+# "evictable pool window exceeds the evictable tail". That is a policy limit, not memory - a
+# 262,144 profile has 305 MiB free once vision is off. So the full-context profile is text-only.
+VISION="${NINFER_VISION:-on}"
+case "$VISION" in
+  on)  vision_args=(--vision --vision-residency "${NINFER_VISION_RESIDENCY:-overlay}") ;;
+  off) vision_args=() ;;
+  *) printf 'NINFER_VISION must be on or off, got %s\n' "$VISION" >&2; exit 2 ;;
+esac
+
 # 0.0.0.0 exposes an unauthenticated OpenAI-compatible endpoint to your whole LAN. Under WSL2 that
 # is the WSL virtual network rather than the host LAN unless you have set up port forwarding.
 HOST="${NINFER_HOST:-127.0.0.1}"
@@ -84,8 +109,10 @@ if [[ ! -f "$MODEL" ]]; then
   exit 1
 fi
 
-printf 'Qwen3.6-35B-A3B  |  C%s  |  context %s  |  KV pool %s  |  rk8v4  |  MTP3 + draft head  |  Vision (overlay)\n' \
-  "$CONCURRENCY" "$CONTEXT" "$KV_CAPACITY"
+if [[ "$SPEC" == 'mtp' ]]; then spec_label='MTP3 + draft head'; else spec_label='no speculation'; fi
+if [[ "$VISION" == 'on' ]]; then vision_label='vision (overlay)'; else vision_label='text only'; fi
+printf 'Qwen3.6-35B-A3B  |  C%s  |  context %s  |  KV pool %s  |  rk8v4  |  %s  |  %s\n' \
+  "$CONCURRENCY" "$CONTEXT" "$KV_CAPACITY" "$spec_label" "$vision_label"
 printf 'Cache: 8 shared / 8 private / 32 host states  |  automatic prefix grid on\n'
 printf 'API: http://%s:%s/v1\n\n' "$HOST" "$PORT"
 
@@ -95,9 +122,9 @@ exec "$server" "$MODEL" \
   --max-context "$CONTEXT" \
   --kv-capacity "$KV_CAPACITY" \
   --kv-dtype rk8v4 \
-  --spec mtp --draft-tokens 3 --lm-head-draft \
+  "${spec_args[@]}" \
   --prefill-chunk 512 \
   --max-pending-requests 16 --pending-timeout-ms 600000 \
-  --vision --vision-residency overlay \
+  "${vision_args[@]}" \
   --max-private-continuations 8 --max-shared-prefixes 8 --host-state-slots 32 --host-kv-mib 8192 \
   --auto-prefix-grid
