@@ -83,7 +83,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-dtype bf16|int8|fp8|rk8v4|nvfp4|k8v4] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision] [--vision-residency resident|overlay] [--vision-max-merged N] "
-           "[--no-cuda-graph] [--no-prefix-reuse] "
+           "[--no-cuda-graph] [--no-prefix-reuse] [--auto-prefix-grid] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -110,6 +110,9 @@ std::string serve_usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
+           "       --auto-prefix-grid offers shared candidates on a token grid so unrelated "
+           "callers whose prompts start alike share a cached prefix without any client hint; a grid "
+           "frontier is only published once two callers have both asked for it\n"
            "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
            "shared=max(max-concurrency,4), anchors=2; Host state=8 slots, Host KV=8192 MiB\n"
            "       --device-state-slots is extra checkpoint capacity beyond active lanes; "
@@ -312,6 +315,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
+        } else if (arg == "--auto-prefix-grid") {
+            options.auto_prefix_grid = true;
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {
@@ -356,6 +361,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         if (context_capacity_explicit) {
             throw std::invalid_argument(
                 "--no-prefix-reuse cannot be combined with context-cache capacity options");
+        }
+        if (options.auto_prefix_grid) {
+            throw std::invalid_argument(
+                "--no-prefix-reuse cannot be combined with --auto-prefix-grid");
         }
         options.context_cache.enabled                = false;
         options.context_cache.host_state_slots       = 0;

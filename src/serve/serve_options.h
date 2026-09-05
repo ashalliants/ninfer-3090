@@ -54,6 +54,10 @@ struct ServeOptions {
     std::uint32_t vision_max_merged_tokens = 16384;
     bool use_cuda_graph     = true;
     bool allow_prefix_reuse = true;
+    // Offer shared-prefix candidates on a content-independent token grid so unrelated callers whose
+    // prompts merely start alike converge on the same frontier. Off by default: it adds host-side
+    // candidate work to every request and only pays for itself on a multi-tenant preamble.
+    bool auto_prefix_grid = false;
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     bool preserve_thinking = false;

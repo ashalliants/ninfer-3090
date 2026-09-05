@@ -483,6 +483,18 @@ Shared prefix 的三个状态不能混为一谈：
 candidates：全部 tools 之后、连续 leading System/Developer 之后，以及 full prompt。相同 frontier 合并，
 因此每个请求最多七个 prepared candidates。这个固定上限不是启动配置。
 
+这三个 Engine candidates 由 `ContextCacheHints::allow_engine_automatic_shared_prefixes` 控制，默认开启。
+自带写入策略的协议（例如显式请求了 Anthropic 顶层 `cache_control` 的请求）可以关闭它们，但只应在该协议
+确实会把 marker 放在别的请求也能匹配的位置时关闭：协议的 automatic marker 通常落在自己 prompt 的末尾，
+任何内容不同的请求都无法匹配，因此关掉结构性 candidates 会让共享前缀永远不被发布。
+
+`ContextCacheHints::allow_engine_prefix_grid`（`ninfer-serve --auto-prefix-grid`，默认关闭）额外在与内容
+无关的 token 栅格上提供 candidates：步长从 256 tokens 起按 2 倍增长，直到栅格点不超过八个，frontier 取
+步长的绝对倍数而不是从 prompt 末尾倒推，因此长度不同的两个 prompt 在仍然一致的位置上会给出同一个
+frontier。栅格 candidate 只带 `EngineObserved`，既不是 declared 也不是 surplus，所以永远不会被投机性地
+占用空闲 shared slot；只有当两个独立 reuse domain 都提出同一个 key 时才会发布。开启后单请求最多十五个
+prepared candidates。
+
 Shared catalog 是 Engine-wide 公共容量，不是每条 lineage 的配额。启用 context cache 时，默认 logical
 capacity 同时覆盖 active concurrency 下限和单请求最多四个显式 markers，即
 `max(max_concurrency, kMaximumExplicitPromptCacheMarkers)`；显式配置仍完整覆盖默认值。这个下限允许较早的
@@ -495,9 +507,17 @@ Candidate 保存 evidence flags。策略含义为：
 |---|---|
 | `ExplicitBoundary` | 可以参与 pressure，但仍须有严格正净收益 |
 | `RequestedAutomatic` | 可以参与 pressure，但仍须有严格正净收益 |
-| `DefaultAutomatic` | 只能使用不降低现有 owner 的空余终态 |
+| `DefaultAutomatic` | 至少两个独立 reuse domains 观测到相同 key 后才可创建 |
 | `EngineStructural` | 只能使用不降低现有 owner 的空余终态 |
 | `EngineObserved` | 至少两个独立 reuse domains 观测到相同 key 后才可创建 |
+
+`EngineStructural` 标记的是 prompt 自身结构暴露的 frontier（leading instructions 之后、tools 之后），
+内容不同的请求也可能落在同一位置，因此用空余 slot 做投机是合理的。`DefaultAutomatic` 不是：协议按自己的
+策略放置它，而 OpenAI 与 Anthropic 都放在该请求 prompt 的末尾，每个请求的副本都位于任何内容不同的请求都
+无法匹配的 frontier 上。让它占用空余 slot 会把 shared catalog 填满一次性 checkpoint，并饿死结构性
+candidate——后者只能等到 catalog 没有空位、pressure 生效后才能被提升。实测（八个不同前缀轮询）：十六个
+slot 的 catalog 到第四轮才完全命中（整体 32.8%），反而不如八个 slot；同一请求流在抑制该 automatic marker
+后两种容量都在第二轮完全命中（98.3%）。该 marker 真正被共享时仍会通过 `repeated` 获得 slot。
 
 Marker、evidence 和 shortlist key 都不证明命中；Program 对 read、dedup 和 publication 重新验证完整
 identity。候选创建 source 的顺序为：exact shared owner 直接 dedup；selected exact private reuse base 在

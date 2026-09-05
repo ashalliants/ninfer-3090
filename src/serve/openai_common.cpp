@@ -172,9 +172,12 @@ void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCa
             *automatic_target = CacheBoundary{.evidence = evidence};
         }
     }
-    // OpenAI already defines the automatic/explicit write policy for every request. Existing
-    // exact shared residents are still considered by the Engine independently of this switch.
-    request.allow_engine_automatic_shared_prefixes = false;
+    // OpenAI's policy governs one boundary: the automatic marker this function just placed at the
+    // end of the prompt. It says nothing about where a prompt's structure already exposes a
+    // reusable prefix, so the Engine's structural boundaries stay enabled. Disabling them left a
+    // request whose only shared candidate sat at the end of its own prompt, which no differing
+    // request can ever match: ten identical-preamble requests each recomputed their whole prompt.
+    request.allow_engine_automatic_shared_prefixes = true;
 }
 
 std::string make_models_list(const std::string& model_id, std::int64_t created,

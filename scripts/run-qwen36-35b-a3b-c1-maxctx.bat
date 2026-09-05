@@ -74,6 +74,41 @@ rem acceptance rather than costing any. Note the spread in absolute terms: 320 t
 rem against 188 on mixed prose, because code is far more predictable. Any single decode figure for
 rem this model is really a statement about the text being generated.
 rem
+rem CONTEXT CACHE: the catalog defaults are too small and it does not show up as an error, only as
+rem prefill you keep paying. A checkpoint is a KV prefix plus a StateImage, and on this model the
+rem StateImage is 61.4 MiB *flat* regardless of prefix length -- 30 GDN layers of 128x128x32 FP32
+rem recurrent state plus conv. Unlike KV pages, which several checkpoints of one conversation share,
+rem it cannot be shared between two frontiers at all: the recurrent state at token N is a function
+rem of every token before it. That fixed cost is why the shipped catalog is small.
+rem
+rem Measured, eight distinct ~1430-token preambles round-robined four times, reuse after round one:
+rem
+rem   --max-shared-prefixes    reuse    what happens
+rem   ------------------------------------------------------------------------------------
+rem   4  (the old default)      8.4%    only one preamble ever stays cached; constant thrash
+rem   8                        98.3%    all eight stay; prefill 0.317 s -> 0.044 s
+rem   16                       98.3%    no better than 8 once the catalog fits the working set
+rem
+rem Sizing rule: --max-shared-prefixes should match the number of distinct preambles in play, and
+rem --host-state-slots roughly twice (shared + private). Raising them costs pinned HOST memory and
+rem nothing on the device -- measured on this exact profile, both settings resolve the full 114,688
+rem tokens with byte-identical 492.4 MiB free after startup; the only change is host state pinned
+rem 982.6 MiB -> 1.92 GiB and 26 ms more startup.
+rem
+rem --auto-prefix-grid offers shared candidates on a content-independent token grid, so two requests
+rem that merely start alike -- the same pasted document in two different chats, the same few-shot
+rem preamble inside one user message -- converge on the same frontier without any client hint. A
+rem grid point is only ever materialised once two independent callers have both asked for it, so it
+rem cannot waste a slot speculatively. Measured on a prompt with no structural boundary at all:
+rem 0% -> 82.6% reuse, prefill -71%, TTFT -64%, and the cold requests before it warms are unchanged.
+rem
+rem LONG CONVERSATIONS do not need any of the above -- they run on the private turn-closure path,
+rem which is what --max-private-continuations sizes. Measured with a 194-turn coding-agent loop
+rem (tool calls, file pastes, whole history resent each turn) growing to 64,668 tokens: exactly one
+rem cache miss, on turn 1. Computed prefill stayed flat at ~340 tokens per turn no matter how long
+rem the history got, and TTFT went 0.085 s at 3k to 0.177 s at 64k. The limit on turn count is
+rem --max-context, not the cache.
+rem
 rem VISION: on, via --vision-residency overlay (ported from Don-Chad/ninfer-3090#21). Resident
 rem residency cost 261 MiB of the ~450 MiB this profile has free after startup -- too tight to risk.
 rem Overlay keeps the Vision tower host-pinned and streams each image through a borrowed device
@@ -116,6 +151,7 @@ if not exist "%MODEL%" (
 )
 
 echo Qwen3.6-35B-A3B  ^|  C1  ^|  context %CONTEXT%  ^|  rk8v4 KV  ^|  MTP3 + draft head  ^|  Vision (overlay)
+echo Cache: 8 shared / 8 private / 32 host states  ^|  automatic prefix grid on
 echo API: http://%HOST%:%PORT%/v1
 echo.
 
@@ -130,7 +166,8 @@ rem --- Profile A: speculation on. ~240 tok/s decode. ---
   --prefill-chunk 512 ^
   --max-pending-requests 16 --pending-timeout-ms 600000 ^
   --vision --vision-residency overlay ^
-  --max-private-continuations 8 --max-shared-prefixes 4 --host-state-slots 16 --host-kv-mib 8192
+  --max-private-continuations 8 --max-shared-prefixes 8 --host-state-slots 32 --host-kv-mib 8192 ^
+  --auto-prefix-grid
 
 rem --- Profile B: maximum context, no speculation. ~183 tok/s decode. ---
 rem "%SERVER%" "%MODEL%" ^
@@ -140,6 +177,8 @@ rem   --max-context %CONTEXT% ^
 rem   --kv-capacity %CONTEXT% ^
 rem   --kv-dtype rk8v4 ^
 rem   --prefill-chunk 512 ^
-rem   --max-pending-requests 16 --pending-timeout-ms 600000
+rem   --max-pending-requests 16 --pending-timeout-ms 600000 ^
+rem   --max-private-continuations 8 --max-shared-prefixes 8 --host-state-slots 32 ^
+rem   --host-kv-mib 8192 --auto-prefix-grid
 
 endlocal

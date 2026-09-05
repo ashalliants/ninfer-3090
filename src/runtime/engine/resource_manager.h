@@ -1681,12 +1681,28 @@ private:
                 has_shared_candidate_evidence(opportunity.evidence,
                                               SharedCandidateEvidence::RequestedAutomatic);
             const bool repeated = matching_reuse_domains(*key, provisional_demand) >= 2U;
+            // EngineStructural marks a frontier the prompt's own shape exposes - after the
+            // leading instructions, after the tools - so a differing request can plausibly
+            // land on it, and spending a spare slot speculatively is a reasonable bet.
+            //
+            // DefaultAutomatic is not that. A protocol places it where its own policy says,
+            // which for both OpenAI and Anthropic is the end of the request's own prompt, and
+            // every request's copy sits at a frontier no differing request can match. Letting
+            // it take a spare slot filled the shared catalog with single-use checkpoints and
+            // starved the structural candidate, which then had to wait for the catalog to run
+            // out of vacancies before pressure could promote it. Measured with eight distinct
+            // preambles round-robined: a sixteen-slot catalog reached full reuse only in the
+            // fourth round (32.8% overall) and was beaten by an eight-slot one, while the same
+            // stream with the automatic marker suppressed was fully warm in the second round
+            // (98.3%) at both sizes.
+            //
+            // The marker still earns a slot the moment it is genuinely shared: `repeated` sees
+            // two distinct reuse domains asking for the same key, which is exactly the case
+            // where a conversational endpoint has become a common prefix.
             const bool surplus_candidate =
                 vacant_shared_slots != 0 &&
-                (has_shared_candidate_evidence(opportunity.evidence,
-                                               SharedCandidateEvidence::DefaultAutomatic) ||
-                 has_shared_candidate_evidence(opportunity.evidence,
-                                               SharedCandidateEvidence::EngineStructural));
+                has_shared_candidate_evidence(opportunity.evidence,
+                                              SharedCandidateEvidence::EngineStructural);
             if (!declared && !repeated && !surplus_candidate) { continue; }
             const std::optional<PrefillWork> rebuild =
                 base.shared_candidate_rebuild_work(opportunity.frontier);
