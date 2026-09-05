@@ -37,6 +37,10 @@ struct ServeOptions {
     // callers before they were ever admitted.
     std::uint32_t pending_timeout_ms   = 600000;
     std::uint32_t prefill_chunk        = 1024;
+    // A staged prefill chunk may share a device boundary with a decode round, each on its own
+    // stream and workspace arena. Disable to restore the strictly serial one-unit-per-boundary
+    // order.
+    bool prefill_overlap               = true;
     std::filesystem::path context_cost_presets;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;

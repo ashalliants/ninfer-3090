@@ -18,6 +18,16 @@ struct DeviceExecutionView {
     std::int32_t multiprocessor_count = 0;
 };
 
+// Scheduling rank of a context's compute stream. Two contexts on one device form the decode and
+// prefill execution lanes; when both have runnable kernels the decode lane must win the SMs,
+// because it owns every active stream's inter-token latency while prefill only owns one request's
+// ingestion rate.
+enum class StreamPriority {
+    Default,
+    High,
+    Low,
+};
+
 struct DeviceContext {
     int device                   = 0;
     cudaStream_t stream          = nullptr;
@@ -27,7 +37,7 @@ struct DeviceContext {
     cudaStream_t vision_stream = nullptr;
     cudaDeviceProp props{};
 
-    explicit DeviceContext(int device_id = 0);
+    explicit DeviceContext(int device_id = 0, StreamPriority priority = StreamPriority::Default);
     ~DeviceContext();
 
     DeviceContext(const DeviceContext&)            = delete;

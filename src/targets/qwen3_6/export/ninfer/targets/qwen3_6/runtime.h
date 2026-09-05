@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <array>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -913,9 +914,15 @@ public:
         const SharedPrefixHandle<Variant>* replacement,
         std::optional<runtime::CheckpointRef> private_replacement, bool permit_shared_publication,
         CapturePressurePlan<Variant>&& pressure, runtime::CancellationFlagView cancellation);
+// Host work to run while a decode round is in flight on the device. The Engine passes the
+// staged prefill chunk here: the decode graph is already launched on the decode stream, so a
+// chunk issued on the prefill lane's own stream and arena overlaps it instead of waiting for
+// the round boundary. Null restores the strictly serial unit order.
+    using DeviceBusyHook = std::function<void()>;
     [[nodiscard]] PendingBatch<Variant> decode(std::span<const SequenceHandle<Variant>> sequences,
                                                std::span<const runtime::RoundBudget> budgets,
-                                               runtime::ExecutionTiming* failed_timing = nullptr);
+                                               runtime::ExecutionTiming* failed_timing = nullptr,
+                                               const DeviceBusyHook* device_busy = nullptr);
     // Advance each live sequence with its exact target-owned token row. This does not sample or
     // advance sampler RNG/occurrence state; callers own output publication and budget accounting.
     // Each optional execution split is relative to its row's forced-token span.
@@ -951,7 +958,8 @@ private:
     template <class V>
     friend std::unique_ptr<Program<V>> create_program(const typename V::ModelView&,
                                                       typename V::WeightsProfile, SequencePlan<V>&&,
-                                                      DeviceContext&, const StartupObserver&);
+                                                      DeviceContext&, DeviceContext&,
+                                                      const StartupObserver&);
 };
 
 namespace detail {
@@ -1116,6 +1124,7 @@ template <class Variant>
 [[nodiscard]] std::unique_ptr<Program<Variant>>
 create_program(const typename Variant::ModelView& model,
                typename Variant::WeightsProfile weights_profile, SequencePlan<Variant>&& plan,
-               DeviceContext& device, const StartupObserver& startup_observer);
+               DeviceContext& device, DeviceContext& prefill_device,
+               const StartupObserver& startup_observer);
 
 } // namespace ninfer::targets::qwen3_6

@@ -750,8 +750,10 @@ std::unique_ptr<EvictableKVPool> make_kv_arena(DeviceContext& device,
 } // namespace
 
 ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const SequencePlanImpl& plan,
-                                 DeviceContext& device_in, const StartupObserver& startup_observer)
-    : model(model_in), device(device_in), capacity(plan.capacity), kv_capacity(plan.kv_capacity),
+                                 DeviceContext& device_in, DeviceContext& prefill_device_in,
+                                 const StartupObserver& startup_observer)
+    : model(model_in), device(device_in), prefill_device(prefill_device_in),
+      capacity(plan.capacity), kv_capacity(plan.kv_capacity),
       max_concurrency(plan.max_concurrency), context_cache(plan.context_cache),
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
@@ -767,6 +769,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       persistent(kv_arena ? DeviceArena(kv_arena->arena()) : DeviceArena(plan.persistent.bytes)),
       workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
+      prefill_workspace_storage(plan.workspace.prefill_lane_capacity),
+      prefill_work(
+          DeviceSpan{prefill_workspace_storage.base(), plan.workspace.prefill_lane_capacity}),
       continuation_states(continuation_capacity), continuation_slots(continuation_capacity),
       shared_prefix_states(shared_prefix_capacity), shared_prefix_slots(shared_prefix_capacity),
       round_host(sizeof(TokenId)),
@@ -8804,7 +8809,8 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
 
 PendingBatch ProgramImplCore::decode(std::span<const SequenceHandle> members,
                                      std::span<const runtime::RoundBudget> budgets,
-                                     runtime::ExecutionTiming* failed_timing) {
+                                     runtime::ExecutionTiming* failed_timing,
+                                     const DeviceBusyHook* device_busy) {
     if (pending_transaction_ || members.empty() || members.size() > max_concurrency ||
         budgets.size() != members.size()) {
         throw std::invalid_argument("decode membership is invalid");
@@ -8824,7 +8830,8 @@ PendingBatch ProgramImplCore::decode(std::span<const SequenceHandle> members,
     }
     const auto lane_span = std::span<const std::uint32_t>(lanes.data(), members.size());
     try {
-        runtime::BatchedGeneratedRound round = decode_raw(lane_span, budgets, failed_timing);
+        runtime::BatchedGeneratedRound round =
+            decode_raw(lane_span, budgets, failed_timing, device_busy);
         if (failed_timing != nullptr) { *failed_timing += round.timing; }
         return wrap_pending(lane_span, std::move(round));
     } catch (...) {
@@ -11365,9 +11372,12 @@ void ProgramImplCore::copy_tail(SequenceState& sequence, const Tensor& source) {
     sequence.tail_hidden_valid = true;
 }
 
+// The token this reads is produced by the staged prefill, which runs on the prefill lane, so
+// the copy and its wait belong to that stream. Issuing it on the decode stream would queue it
+// behind an overlapped round.
 void ProgramImplCore::copy_round_token() {
     CUDA_CHECK(cudaMemcpyAsync(host_tokens, io.token.data, sizeof(TokenId), cudaMemcpyDeviceToHost,
-                               device.stream));
+                               prefill_device.stream));
 }
 
 void ProgramImplCore::mark_workspace_usage(std::size_t phase_bytes) noexcept {
@@ -11505,7 +11515,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             rewrite_capture_hidden_ptr = &rewrite_capture_hidden;
         }
         schedule::PrefillContext schedule_state{
-            {device, model, work, state_images->linear(),
+            {prefill_device, model, prefill_work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
              proposal_head},
             text_kv_view(sequence),
@@ -11695,10 +11705,12 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
         if (staged.prepare_mtp && staged.initial_mtp_extent != 0) {
             CUDA_CHECK(cudaMemcpyAsync(initial_drafts.data(), io.mtp->draft_tokens.data,
                                        staged.initial_mtp_extent * sizeof(TokenId),
-                                       cudaMemcpyDeviceToHost, device.stream));
+                                       cudaMemcpyDeviceToHost, prefill_device.stream));
         }
         timing.begin_wait();
-        device.synchronize();
+        // Only this lane's stream: a decode round overlapping this chunk is awaited by its own
+        // caller, and waiting for it here would put the round back in front of the prefill.
+        prefill_device.synchronize();
         timing.end_wait();
         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
         const double vision_seconds       = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
@@ -11760,6 +11772,9 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
     } catch (...) {
         timing.begin_wait();
         try {
+            // Drain both lanes before tearing the sequence down: the failure may have left
+            // work queued on either, and the decode lane may hold an overlapped round.
+            prefill_device.synchronize();
             device.synchronize();
         } catch (...) {}
         timing.end_wait();
@@ -11772,7 +11787,8 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
 runtime::BatchedGeneratedRound
 ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                                        std::span<const runtime::RoundBudget> budgets,
-                                       runtime::ExecutionTiming* failed_timing) {
+                                       runtime::ExecutionTiming* failed_timing,
+                                       const DeviceBusyHook* device_busy) {
     nvtx::ScopedRange round_range(nvtx::Name::DecodeOrdinaryRound, nvtx::Category::Decode,
                                   static_cast<std::uint64_t>(lanes.size()));
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
@@ -11853,6 +11869,15 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         schedule::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                         envelope, executable);
         submit_range.reset();
+        // The round is launched; the device is busy until the wait below. Overlapped host
+        // work (a staged prefill chunk on the prefill lane) is issued here so it shares the
+        // device with the round instead of following it. Its own stream and arena keep the
+        // two units disjoint; its cost is not part of this round's submit or wait time.
+        if (device_busy != nullptr && *device_busy) {
+            timing.pause();
+            (*device_busy)();
+            timing.resume_submit();
+        }
         timing.begin_wait();
         {
             nvtx::ScopedRange wait_range(nvtx::Name::DecodeOrdinaryWait, nvtx::Category::Control,
@@ -11905,7 +11930,8 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
 runtime::BatchedGeneratedRound
 ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                   std::span<const runtime::RoundBudget> budgets,
-                                  runtime::ExecutionTiming* failed_timing) {
+                                  runtime::ExecutionTiming* failed_timing,
+                                  const DeviceBusyHook* device_busy) {
     nvtx::ScopedRange round_range(nvtx::Name::DecodeMtpRound, nvtx::Category::Mtp,
                                   static_cast<std::uint64_t>(lanes.size()));
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
@@ -12013,6 +12039,15 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                    draft_window, envelopes, executable);
         submit_range.reset();
+        // The round is launched; the device is busy until the wait below. Overlapped host
+        // work (a staged prefill chunk on the prefill lane) is issued here so it shares the
+        // device with the round instead of following it. Its own stream and arena keep the
+        // two units disjoint; its cost is not part of this round's submit or wait time.
+        if (device_busy != nullptr && *device_busy) {
+            timing.pause();
+            (*device_busy)();
+            timing.resume_submit();
+        }
         timing.begin_wait();
         {
             nvtx::ScopedRange wait_range(nvtx::Name::DecodeMtpWait, nvtx::Category::Control,
@@ -12089,7 +12124,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 runtime::BatchedGeneratedRound
 ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                      std::span<const runtime::RoundBudget> budgets,
-                                     runtime::ExecutionTiming* failed_timing) {
+                                     runtime::ExecutionTiming* failed_timing,
+                                     const DeviceBusyHook* device_busy) {
     nvtx::ScopedRange round_range(nvtx::Name::DecodeDFlashRound, nvtx::Category::DFlash,
                                   static_cast<std::uint64_t>(lanes.size()));
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
@@ -12200,6 +12236,15 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         schedule::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                       draft_window, envelopes, target_envelope, executable);
         submit_range.reset();
+        // The round is launched; the device is busy until the wait below. Overlapped host
+        // work (a staged prefill chunk on the prefill lane) is issued here so it shares the
+        // device with the round instead of following it. Its own stream and arena keep the
+        // two units disjoint; its cost is not part of this round's submit or wait time.
+        if (device_busy != nullptr && *device_busy) {
+            timing.pause();
+            (*device_busy)();
+            timing.resume_submit();
+        }
         timing.begin_wait();
         {
             nvtx::ScopedRange wait_range(nvtx::Name::DecodeDFlashWait, nvtx::Category::Control,
@@ -12275,14 +12320,15 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
 runtime::BatchedGeneratedRound
 ProgramImplCore::decode_raw(std::span<const std::uint32_t> lanes,
                             std::span<const runtime::RoundBudget> budgets,
-                            runtime::ExecutionTiming* failed_timing) {
+                            runtime::ExecutionTiming* failed_timing,
+                            const DeviceBusyHook* device_busy) {
     if (speculative_backend == SpeculativeBackend::None) {
-        return decode_ordinary_batch(lanes, budgets, failed_timing);
+        return decode_ordinary_batch(lanes, budgets, failed_timing, device_busy);
     }
     if (speculative_backend == SpeculativeBackend::Mtp) {
-        return decode_mtp_batch(lanes, budgets, failed_timing);
+        return decode_mtp_batch(lanes, budgets, failed_timing, device_busy);
     }
-    return decode_dflash_batch(lanes, budgets, failed_timing);
+    return decode_dflash_batch(lanes, budgets, failed_timing, device_busy);
 }
 
 runtime::ExecutionTiming ProgramImplCore::resolve_non_speculative_pending(

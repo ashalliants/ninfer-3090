@@ -26,6 +26,10 @@ public:
     enum class ExecutionAction : std::uint8_t {
         Prefill,
         Decode,
+        // One decode round and one staged prefill chunk issued together, on separate device
+        // lanes. Both complete before the next boundary, so every rule that holds for a single
+        // unit still holds for the pair.
+        PrefillAndDecode,
         Wait,
     };
 
@@ -237,8 +241,15 @@ public:
                (!have_decode || previous_unit_was_decode);
     }
 
+    // With overlap available the two runnable units no longer compete for the round boundary,
+    // so the 1:1 alternation that used to ration it is unnecessary: issue both. Without it the
+    // alternation stands, because one lane must still take turns.
     [[nodiscard]] ExecutionAction choose_execution(bool have_decode, bool prefill_runnable,
-                                                   bool previous_unit_was_decode) const noexcept {
+                                                   bool previous_unit_was_decode,
+                                                   bool overlap_available) const noexcept {
+        if (prefill_runnable && have_decode && overlap_available) {
+            return ExecutionAction::PrefillAndDecode;
+        }
         if (prefill_runnable) {
             return have_decode && !previous_unit_was_decode ? ExecutionAction::Decode
                                                             : ExecutionAction::Prefill;

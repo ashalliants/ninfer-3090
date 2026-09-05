@@ -585,6 +585,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     out.general_capacity =
         std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round,
                   out.dflash_context, out.dflash_round, out.causal_score});
+    // Only the units the staged-prefill lane issues; the decode-round peaks stay with the decode
+    // arena. Causal scoring is included because it runs through the same prefill entry point.
+    out.prefill_lane_capacity = std::max({out.text_prefill, out.mtp_prefill, out.dflash_context,
+                                          out.causal_score});
     out.capacity = out.general_capacity;
     if (plan.features.vision) {
         const std::uint32_t merged = static_cast<std::uint32_t>(std::min<std::uint64_t>(
@@ -743,8 +747,12 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         }
     }
 
+    // Both workspace arenas are resident for the Program's life, so KV sizing has to see them.
+    const std::size_t workspace_resident_bytes =
+        checked_add(impl->workspace.capacity, impl->workspace.prefill_lane_capacity,
+                    "prefill lane workspace");
     impl->device_reservation_bytes = checked_add(
-        checked_add(impl->persistent.bytes, impl->workspace.capacity, "sequence memory plan"),
+        checked_add(impl->persistent.bytes, workspace_resident_bytes, "sequence memory plan"),
         impl->graph_allowance_bytes, "sequence graph allowance");
     return impl;
 }

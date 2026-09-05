@@ -66,6 +66,9 @@ struct WorkspacePlan {
     std::size_t dflash_round     = 0;
     std::size_t causal_score     = 0;
     std::size_t general_capacity = 0;
+    // Scratch peak of the units the prefill lane issues. The lane holds its own arena so a
+    // prefill chunk can refill scratch while a captured decode graph is replaying.
+    std::size_t prefill_lane_capacity = 0;
     std::optional<VisionWorkspacePlan> vision;
     // False in overlay residency: the vision encode workspace and handoff are borrowed per
     // window instead of being folded into capacity.

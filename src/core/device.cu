@@ -27,6 +27,20 @@ void destroy_stream(cudaStream_t& stream) noexcept {
     }
 }
 
+// Compute-stream rank for a lane. CUDA orders priorities low-value-is-higher, and the usable
+// range is device-reported rather than fixed, so both ends are queried instead of assumed.
+int stream_priority_value(StreamPriority priority) {
+    if (priority == StreamPriority::Default) { return 0; }
+    int least    = 0;
+    int greatest = 0;
+    const cudaError_t err = cudaDeviceGetStreamPriorityRange(&least, &greatest);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+            cuda_error_message("cudaDeviceGetStreamPriorityRange failed", err));
+    }
+    return priority == StreamPriority::High ? greatest : least;
+}
+
 void destroy_event(cudaEvent_t& event) noexcept {
     if (event != nullptr) {
         log_cuda_error("cudaEventDestroy", cudaEventDestroy(event));
@@ -43,7 +57,7 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
     std::abort();
 }
 
-DeviceContext::DeviceContext(int device_id) : device(device_id) {
+DeviceContext::DeviceContext(int device_id, StreamPriority priority) : device(device_id) {
     int count       = 0;
     cudaError_t err = cudaGetDeviceCount(&count);
     if (err != cudaSuccess) {
@@ -62,10 +76,13 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
     cudaStream_t compute = nullptr;
     cudaStream_t load    = nullptr;
     cudaStream_t vision  = nullptr;
-    err                  = cudaStreamCreateWithFlags(&compute, cudaStreamNonBlocking);
+    // Only the compute stream is ranked. Transfers and vision encodes keep the default rank:
+    // they are already event-ordered against the lanes that consume them.
+    err = cudaStreamCreateWithPriority(&compute, cudaStreamNonBlocking,
+                                       stream_priority_value(priority));
     if (err != cudaSuccess) {
         throw std::runtime_error(
-            cuda_error_message("cudaStreamCreateWithFlags(stream) failed", err));
+            cuda_error_message("cudaStreamCreateWithPriority(stream) failed", err));
     }
 
     err = cudaStreamCreateWithFlags(&load, cudaStreamNonBlocking);

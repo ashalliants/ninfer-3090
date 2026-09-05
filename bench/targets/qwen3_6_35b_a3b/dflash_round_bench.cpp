@@ -213,6 +213,7 @@ int run(const Options& options) {
     engine.max_concurrency           = options.batch_size;
 
     ninfer::DeviceContext device(options.device);
+    ninfer::DeviceContext prefill_device(options.device, ninfer::StreamPriority::Low);
     ninfer::artifact::Reader reader(options.artifact);
     const auto weights_profile = target::Package::resolve_weights(reader.identity());
     ninfer::artifact::Binder binder(reader);
@@ -242,7 +243,8 @@ int run(const Options& options) {
     auto frontend = target::Package::make_frontend(*model, engine);
     const ninfer::StartupObserver startup_observer;
     auto program =
-        target::Package::create_program(*model, std::move(sequence), device, startup_observer);
+        target::Package::create_program(*model, std::move(sequence), device, prefill_device,
+                                        startup_observer);
     ninfer::runtime::ResolvedExecutionOptions execution;
     execution.requested_output_tokens = 1 + measured_rounds * (options.draft_tokens + 1);
     execution.allow_prefix_reuse      = false;

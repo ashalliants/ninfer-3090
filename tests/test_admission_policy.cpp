@@ -178,14 +178,27 @@ int main() {
                           !scheduler.should_attempt_admission(true, true, true, false, false) &&
                           scheduler.should_attempt_admission(true, true, true, true, false) &&
                           !scheduler.should_attempt_admission(true, true, false, false, true) &&
-                          scheduler.choose_execution(true, false, false) == ExecutionAction::Decode,
+                          scheduler.choose_execution(true, false, false, false) ==
+                              ExecutionAction::Decode &&
+                          scheduler.choose_execution(true, false, false, true) ==
+                              ExecutionAction::Decode,
                       "admission and GPU-unit fairness gates changed");
     scheduler.set_prefill_lane(0);
     failures +=
         check(!scheduler.should_attempt_admission(true, true, true, true, false) &&
-                  scheduler.choose_execution(true, true, false) == ExecutionAction::Decode &&
-                  scheduler.choose_execution(true, true, true) == ExecutionAction::Prefill,
+                  scheduler.choose_execution(true, true, false, false) == ExecutionAction::Decode &&
+                  scheduler.choose_execution(true, true, true, false) == ExecutionAction::Prefill,
               "prefill/decode alternation changed");
+    // With overlap the pair replaces the alternation, and a lone runnable unit is unaffected.
+    failures += check(scheduler.choose_execution(true, true, false, true) ==
+                              ExecutionAction::PrefillAndDecode &&
+                          scheduler.choose_execution(true, true, true, true) ==
+                              ExecutionAction::PrefillAndDecode &&
+                          scheduler.choose_execution(false, true, true, true) ==
+                              ExecutionAction::Prefill &&
+                          scheduler.choose_execution(true, false, true, true) ==
+                              ExecutionAction::Decode,
+                      "overlapped prefill/decode selection changed");
     scheduler.clear_prefill_lane(0);
 
     std::array<std::shared_ptr<SchedulerRequest>, ninfer::kMaximumConcurrency> slots{};
