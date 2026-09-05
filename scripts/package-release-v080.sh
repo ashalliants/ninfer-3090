@@ -25,7 +25,7 @@ for product in 'apps/ninfer:ninfer' 'apps/ninfer-serve:ninfer-serve' 'bench/ninf
 done
 cp -- "$repo_root/VERSION" "$repo_root/LICENSE" "$repo_root/RELEASE_NOTES_0.8.0.md" "$product_root/"
 cp -- "$repo_root/docs/rtx-3090-linux.md" "$product_root/README.md"
-cp -- "$repo_root"/scripts/{download-qwen38.sh,run-qwen38-c1.sh,run-qwen38-c8.sh,run-qwen38-vision.sh,download-qwen36-35b-vision.sh,run-qwen36-35b-vision.sh,run-qwen36-35b-a3b-c1-maxctx.sh,run-qwen38-c1-maxctx.sh} "$product_root/"
+cp -- "$repo_root"/scripts/{download-qwen38-27b.sh,run-qwen38-c1.sh,run-qwen38-c8.sh,run-qwen38-vision.sh,download-qwen36-35b-vision.sh,run-qwen36-35b-vision.sh,run-qwen36-35b-a3b-c1-maxctx.sh,run-qwen38-c1-maxctx.sh} "$product_root/"
 (
   cd -- "$product_root"
   mapfile -d '' files < <(find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -print0 | LC_ALL=C sort -z)

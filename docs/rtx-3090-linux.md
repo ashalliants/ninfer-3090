@@ -111,7 +111,7 @@ The `scripts/` directory contains Bash versions of each Windows download, launch
 script. Download scripts save models under `scripts/models` by default:
 
 ```bash
-./scripts/download-qwen38.sh
+./scripts/download-qwen38-27b.sh
 ./scripts/download-qwen36-35b-vision.sh
 ```
 

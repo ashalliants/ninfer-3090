@@ -22,7 +22,7 @@ if [[ ! -x "$server" ]]; then
 fi
 if [[ ! -f "$model" ]]; then
   printf 'ERROR: Model not found: %s\n' "$model" >&2
-  printf 'Download it first:  ./scripts/download-qwen38.sh\n' >&2
+  printf 'Download it first:  ./scripts/download-qwen38-27b.sh\n' >&2
   exit 1
 fi
 command -v uv >/dev/null || { printf 'ERROR: uv is not available in PATH.\n' >&2; exit 1; }

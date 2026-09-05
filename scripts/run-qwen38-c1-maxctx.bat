@@ -55,7 +55,7 @@ if not exist "%SERVER%" (
 )
 if not exist "%MODEL%" (
   echo Missing model: %MODEL%
-  echo Download it first:  download-qwen38.bat
+  echo Download it first:  download-qwen38-27b.bat
   exit /b 1
 )
 

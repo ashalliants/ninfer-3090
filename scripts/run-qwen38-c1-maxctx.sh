@@ -89,7 +89,7 @@ if [[ ! -x "$server" ]]; then
 fi
 if [[ ! -f "$MODEL" ]]; then
   printf 'Missing model: %s\n' "$MODEL" >&2
-  printf 'Download it first:  ./download-qwen38.sh\n' >&2
+  printf 'Download it first:  ./download-qwen38-27b.sh\n' >&2
   exit 1
 fi
 

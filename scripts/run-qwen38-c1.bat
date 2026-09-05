@@ -12,7 +12,7 @@ if not exist "%SERVER%" (
 )
 if not exist "%MODEL%" (
   echo Missing model: %MODEL%
-  echo Run download-qwen38.bat first, or drag a qwen3_8_27b.ninfer file onto this launcher.
+  echo Run download-qwen38-27b.bat first, or drag a qwen3_8_27b.ninfer file onto this launcher.
   exit /b 1
 )
 

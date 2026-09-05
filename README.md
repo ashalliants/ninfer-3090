@@ -29,8 +29,12 @@ Release notes for this branch: [v0.8.0](RELEASE_NOTES_0.8.0.md).
 
 ## Quick start
 
-Three commands, then point your harness at `http://127.0.0.1:8080/v1`. It is an OpenAI-compatible
-endpoint, so anything that speaks `/v1/chat/completions` works; leave the API key blank.
+**You do not need to build anything.** Grab the prebuilt archive for your platform from
+[the latest release](https://github.com/ashalliants/ninfer-3090/releases/latest) — Windows x64 and
+Linux x64 are both published, each with `ninfer-serve`, the CLI, the benchmark tool, every launcher
+and, on Windows, the DLLs. Unpack it, run two scripts, and point your harness at
+`http://127.0.0.1:8080/v1`. It is an OpenAI-compatible endpoint, so anything that speaks
+`/v1/chat/completions` works; leave the API key blank.
 
 The launchers below run **Qwen3.6-35B-A3B** with the settings this project measured as the best
 overall trade on one 24 GB RTX 3090: `rk8v4` KV (+33% context over INT8 for +0.082% perplexity),
@@ -40,16 +44,19 @@ grid) that takes prefix reuse from 8.4% to 98.3% on a multi-preamble workload.
 
 ### Windows 11 — one user
 
+Download `ninfer-rtx3090-windows-x64-*.zip`, unzip it, and from that folder:
+
 ```powershell
-# 1. Unzip the latest Windows release, then from that folder:
 .\download-qwen36-35b-vision.bat          # downloads qwen3_6_35b_a3b.ninfer (~21 GB, resumable)
 .\run-qwen36-35b-a3b-c1-maxctx.bat        # serves on 0.0.0.0:8080, 114,688-token context
 ```
 
 ### Headless Linux — full 256K context, two users, everything on
 
+Download `ninfer-rtx3090-linux-x64-*.tar.gz`, unpack it, and from that folder:
+
 ```bash
-# 1. Unpack the latest Linux release, then from that folder:
+tar -xzf ninfer-rtx3090-linux-x64-*.tar.gz && cd ninfer-rtx3090-linux-x64-*/
 ./download-qwen36-35b-vision.sh           # downloads qwen3_6_35b_a3b.ninfer (~21 GB, resumable)
 ./run-qwen36-35b-a3b-c1-maxctx.sh         # 2 lanes, 262,144 tokens, MTP3 + draft head, vision
 ```
@@ -96,12 +103,12 @@ The other common choice, and a dense model rather than an MoE, so it is slower p
 predictable. Same shape of command:
 
 ```powershell
-.\download-qwen38.bat                     # downloads qwen3_8_27b.ninfer (~17 GB, resumable)
+.\download-qwen38-27b.bat                 # downloads qwen3_8_27b.ninfer (~17 GB, resumable)
 .\run-qwen38-c1-maxctx.bat                # one user, 131,072 tokens, rk8v4, MTP3 + draft, vision
 ```
 
 ```bash
-./download-qwen38.sh
+./download-qwen38-27b.sh
 ./run-qwen38-c1-maxctx.sh                 # two users, 212,992 tokens each, same knobs
 ```
 
@@ -145,45 +152,40 @@ on RAM.
 Qwen3.8-27B reaches 171,648 INT8 tokens or 226,560 with `rk8v4`; the figures above are what fits
 alongside speculation and the tuned cache with a desktop running.
 
-### Building from source
-
-`scripts/build.ps1` (Windows) and `scripts/build.sh` (Linux/WSL) pin the toolchain this project
-needs — VS 2022 BuildTools MSVC 14.4x, CUDA 12.8, the Ninja generator — and fail with a message
-naming the real cause when one is missing:
-
-```powershell
-.\scripts\build.ps1                  # configure + build into build-ninja
-.\scripts\build.ps1 -Test            # ... and run the test suite
-.\scripts\build.ps1 -Package v080    # ... and build the release archive
-```
-
-```bash
-./scripts/build.sh --test --package v080
-```
-
 ## Choose a platform
+
+Both platforms ship a prebuilt archive; building from source is optional and covered
+[further down](#building-from-source).
 
 | Platform | Delivery | Guide |
 |---|---|---|
-| Linux | Docker image or native source build | [Linux build guide](docs/rtx-3090-linux.md) |
-| Windows 11 | Prebuilt release archive | [Windows guide](docs/rtx-3090-windows.md) |
+| Linux x64 | Prebuilt release archive, or Docker / native source build | [Linux guide](docs/rtx-3090-linux.md) |
+| Windows 11 x64 | Prebuilt release archive | [Windows guide](docs/rtx-3090-windows.md) |
 
 ### Linux
 
-The Dockerfile gives the shortest build path on Bazzite and other Linux distributions:
+1. Download and unpack the latest
+   [Linux release](https://github.com/ashalliants/ninfer-3090/releases/latest)
+   (`ninfer-rtx3090-linux-x64-*.tar.gz`).
+2. Run `./download-qwen36-35b-vision.sh` or `./download-qwen38-27b.sh` to fetch a model. Interrupted
+   downloads resume.
+3. Run a launcher — `./run-qwen36-35b-a3b-c1-maxctx.sh` is the recommended one.
+
+If you would rather build, the Dockerfile is the shortest path on Bazzite and other distributions:
 
 ```bash
 docker build --tag ninfer-3090:sm86 .
 ```
 
-The Linux guide contains the GPU check, native Ubuntu build, model mount, server command, and Bash
-launchers. The project does not publish a prebuilt Linux archive or qualified Linux performance
-results yet.
+The Linux guide covers the GPU check, the native Ubuntu build, model mounts and the server command.
 
 ### Windows 11
 
-1. Download and unzip the latest [Windows release](https://github.com/Don-Chad/ninfer-3090/releases/latest).
-2. Double-click `download-qwen38.bat` to download the model. Interrupted downloads resume.
+1. Download and unzip the latest
+   [Windows release](https://github.com/ashalliants/ninfer-3090/releases/latest)
+   (`ninfer-rtx3090-windows-x64-*.zip`).
+2. Double-click `download-qwen36-35b-vision.bat` or `download-qwen38-27b.bat` to download a model.
+   Interrupted downloads resume.
 3. Double-click one launcher:
 
 | Launcher | Best for |
@@ -197,6 +199,25 @@ results yet.
 
 The API is then available at `http://127.0.0.1:8080/v1`. The Windows archive includes the required
 applications and DLLs.
+
+## Building from source
+
+Only needed if you are changing the code — the release archives above are prebuilt for `sm_86`.
+
+`scripts/build.ps1` (Windows) and `scripts/build.sh` (Linux/WSL) pin the toolchain this project
+needs and fail with a message naming the real cause when one is missing. Three things are not the
+defaults on a typical machine: MSVC 14.4x from **VS 2022 BuildTools** (CUDA 12.8 rejects VS 2026's
+14.50), **CUDA 12.8** forced through `CUDACXX`, and the **Ninja** generator.
+
+```powershell
+.\scripts\build.ps1                  # configure + build into build-ninja
+.\scripts\build.ps1 -Test            # ... and run the test suite
+.\scripts\build.ps1 -Package v080    # ... and build the release archive
+```
+
+```bash
+./scripts/build.sh --test --package v080
+```
 
 ## Qwen3.8-27B support and RTX 3090 results
 
@@ -364,7 +385,7 @@ prebuilt archive, which includes the applications and required DLLs. Both platfo
 RTX 3090 or RTX 3090 Ti and a recent NVIDIA driver.
 
 Download the [official Qwen3.8 artifact](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) as
-`models/qwen3_8_27b.ninfer`. Windows users can run `download-qwen38.bat` instead.
+`models/qwen3_8_27b.ninfer`. Windows users can run `download-qwen38-27b.bat` instead.
 
 For Qwen3.6-35B-A3B, the smaller
 [pinned container-v1 artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/tree/c8b8c1c0df4c74df3c190c6aa3a7f24dc614721c)
