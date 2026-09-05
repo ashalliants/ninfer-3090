@@ -507,9 +507,17 @@ Candidate 保存 evidence flags。策略含义为：
 |---|---|
 | `ExplicitBoundary` | 可以参与 pressure，但仍须有严格正净收益 |
 | `RequestedAutomatic` | 可以参与 pressure，但仍须有严格正净收益 |
-| `DefaultAutomatic` | 只能使用不降低现有 owner 的空余终态 |
+| `DefaultAutomatic` | 至少两个独立 reuse domains 观测到相同 key 后才可创建 |
 | `EngineStructural` | 只能使用不降低现有 owner 的空余终态 |
 | `EngineObserved` | 至少两个独立 reuse domains 观测到相同 key 后才可创建 |
+
+`EngineStructural` 标记的是 prompt 自身结构暴露的 frontier（leading instructions 之后、tools 之后），
+内容不同的请求也可能落在同一位置，因此用空余 slot 做投机是合理的。`DefaultAutomatic` 不是：协议按自己的
+策略放置它，而 OpenAI 与 Anthropic 都放在该请求 prompt 的末尾，每个请求的副本都位于任何内容不同的请求都
+无法匹配的 frontier 上。让它占用空余 slot 会把 shared catalog 填满一次性 checkpoint，并饿死结构性
+candidate——后者只能等到 catalog 没有空位、pressure 生效后才能被提升。实测（八个不同前缀轮询）：十六个
+slot 的 catalog 到第四轮才完全命中（整体 32.8%），反而不如八个 slot；同一请求流在抑制该 automatic marker
+后两种容量都在第二轮完全命中（98.3%）。该 marker 真正被共享时仍会通过 `repeated` 获得 slot。
 
 Marker、evidence 和 shortlist key 都不证明命中；Program 对 read、dedup 和 publication 重新验证完整
 identity。候选创建 source 的顺序为：exact shared owner 直接 dedup；selected exact private reuse base 在
