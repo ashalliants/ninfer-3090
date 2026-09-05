@@ -77,7 +77,10 @@ int run_q4_q5() {
     DevicePackedWeight value_z_weight(
         quantized_weight::make_patterned_weight(QType::Q5G64_F16S, 12288, kHidden, 419U));
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 16, 17}) {
+    // One exactly-filled and one partially-filled extent per route: direct (1, 2, 6),
+    // the 32- and 64-wide grouped MMA tiles (7, 32, 33, 64), and the 128-wide tile
+    // that carries prefill chunks (65, 128).
+    for (const std::int32_t tokens : {1, 2, 6, 7, 16, 32, 33, 64, 65, 128}) {
         failures += run_q4_q5_case(query_key, value_z_weight, tokens);
     }
     return failures;

@@ -15,6 +15,11 @@ namespace {
 using MmaR64C16Schedule =
     Q5RowSplitMmaGemmSchedule<64, 16, 64, 16, 8, 2, 3, Q5FragmentPipeline::Serial, Cache::cg,
                               Cache::cg, Q5ScaleLoad::Pair32>;
+// A tile narrower than the live extent costs a full weight pass per column slice: at the 32
+// columns a C8 MTP3 round produces, the 16-wide tile reads the whole projection twice.
+using MmaR64C32Schedule =
+    Q5RowSplitMmaGemmSchedule<64, 32, 64, 16, 8, 2, 2, Q5FragmentPipeline::Serial, Cache::cg,
+                              Cache::cg, Q5ScaleLoad::Pair32>;
 using MmaR64C24Schedule =
     Q5RowSplitMmaGemmSchedule<64, 24, 64, 16, 8, 2, 2, Q5FragmentPipeline::Serial, Cache::cg,
                               Cache::cg, Q5ScaleLoad::Pair32>;
@@ -66,6 +71,11 @@ void launch_route(const Tensor& x, const Weight& w, Tensor& residual_out, cudaSt
 void q5_linear_add_mma_r64_c16_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                       cudaStream_t stream) {
     launch_route<MmaR64C16Schedule>(x, w, residual_out, stream);
+}
+
+void q5_linear_add_mma_r64_c32_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
+                                      cudaStream_t stream) {
+    launch_route<MmaR64C32Schedule>(x, w, residual_out, stream);
 }
 
 void q5_linear_add_mma_r64_c24_launch(const Tensor& x, const Weight& w, Tensor& residual_out,

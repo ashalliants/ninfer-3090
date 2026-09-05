@@ -33,8 +33,13 @@ constexpr Q4LinearSwiGluProblem kShape{34816, 17408, 5120, 5120, 1};
 
 constexpr std::array<RouteSpec, 10> kRoutes{{
     {{1, 1}, Q4LinearSwiGluScheduleId::GemvPair},
-    {{2, 32}, Q4LinearSwiGluScheduleId::SmallTExact},
-    {{33, 40}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C40},
+    // The exact-T route's cost rises with T; the 40-wide pair tile's is set by its padded
+    // width and is flat across the extents it covers. On sm_86 they cross at 25, inside the
+    // range a C8 MTP3 decode round uses. Tiles narrower than 40 were measured and are not
+    // worth routing: the split-half-pair kernel is not issue-bound at these widths, so a
+    // 16-wide tile only loses occupancy (+29.9% against the exact route at T=16).
+    {{2, 24}, Q4LinearSwiGluScheduleId::SmallTExact},
+    {{25, 40}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C40},
     {{41, 48}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C48},
     {{49, 128}, Q4LinearSwiGluScheduleId::Materialized},
     {{129, 256}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
