@@ -211,6 +211,18 @@ int main() {
     failures += check(disabled_cache_capacity_rejected,
                       "root-only server mode accepted context-cache capacity options");
 
+    failures += check(!parse({"ninfer-serve", "model.ninfer"}).auto_prefix_grid,
+                      "automatic prefix grid was on without --auto-prefix-grid");
+    failures +=
+        check(parse({"ninfer-serve", "model.ninfer", "--auto-prefix-grid"}).auto_prefix_grid,
+              "--auto-prefix-grid did not reach serving options");
+    bool grid_without_reuse_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--no-prefix-reuse", "--auto-prefix-grid"});
+    } catch (const std::invalid_argument&) { grid_without_reuse_rejected = true; }
+    failures += check(grid_without_reuse_rejected,
+                      "--auto-prefix-grid was accepted with prefix reuse disabled");
+
     const ServeOptions response_store =
         parse({"ninfer-serve", "model.ninfer", "--response-store-max-records", "42",
                "--response-store-max-mib", "8"});
@@ -325,6 +337,9 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--no-prefix-reuse") != std::string::npos,
               "serve help omits --no-prefix-reuse");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--auto-prefix-grid") != std::string::npos,
+              "serve help omits --auto-prefix-grid");
     failures += check(serve_usage_text("ninfer-serve").find("--host-kv-mib") != std::string::npos,
                       "serve help omits context-cache capacities");
     failures += check(serve_usage_text("ninfer-serve").find("device-state=max-concurrency") !=

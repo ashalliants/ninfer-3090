@@ -372,6 +372,8 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         input.context_cache.allow_engine_automatic_shared_prefixes =
             input.context_cache.allow_engine_automatic_shared_prefixes &&
             protocol_allows_engine_automatic;
+        input.context_cache.allow_engine_prefix_grid =
+            input.context_cache.allow_engine_prefix_grid || options_.auto_prefix_grid;
         trim_cache_markers(input.context_cache.markers,
                            engine_->options().context_cache.max_cache_markers_per_request.value());
         prepared.acquisition_seconds =

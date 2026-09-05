@@ -483,6 +483,18 @@ Shared prefix 的三个状态不能混为一谈：
 candidates：全部 tools 之后、连续 leading System/Developer 之后，以及 full prompt。相同 frontier 合并，
 因此每个请求最多七个 prepared candidates。这个固定上限不是启动配置。
 
+这三个 Engine candidates 由 `ContextCacheHints::allow_engine_automatic_shared_prefixes` 控制，默认开启。
+自带写入策略的协议（例如显式请求了 Anthropic 顶层 `cache_control` 的请求）可以关闭它们，但只应在该协议
+确实会把 marker 放在别的请求也能匹配的位置时关闭：协议的 automatic marker 通常落在自己 prompt 的末尾，
+任何内容不同的请求都无法匹配，因此关掉结构性 candidates 会让共享前缀永远不被发布。
+
+`ContextCacheHints::allow_engine_prefix_grid`（`ninfer-serve --auto-prefix-grid`，默认关闭）额外在与内容
+无关的 token 栅格上提供 candidates：步长从 256 tokens 起按 2 倍增长，直到栅格点不超过八个，frontier 取
+步长的绝对倍数而不是从 prompt 末尾倒推，因此长度不同的两个 prompt 在仍然一致的位置上会给出同一个
+frontier。栅格 candidate 只带 `EngineObserved`，既不是 declared 也不是 surplus，所以永远不会被投机性地
+占用空闲 shared slot；只有当两个独立 reuse domain 都提出同一个 key 时才会发布。开启后单请求最多十五个
+prepared candidates。
+
 Shared catalog 是 Engine-wide 公共容量，不是每条 lineage 的配额。启用 context cache 时，默认 logical
 capacity 同时覆盖 active concurrency 下限和单请求最多四个显式 markers，即
 `max(max_concurrency, kMaximumExplicitPromptCacheMarkers)`；显式配置仍完整覆盖默认值。这个下限允许较早的
