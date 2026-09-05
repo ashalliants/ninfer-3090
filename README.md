@@ -102,7 +102,7 @@ predictable. Same shape of command:
 
 ```bash
 ./download-qwen38.sh
-./run-qwen38-c1-maxctx.sh                 # two users, 131,072 tokens each, same knobs
+./run-qwen38-c1-maxctx.sh                 # two users, 196,608 tokens each, same knobs
 ```
 
 The plain `run-qwen38-c1` and `run-qwen38-c8` launchers are still there and unchanged. They are
@@ -114,7 +114,7 @@ eight-lane throughput profile.
 |---|---|---|---|---|---|---|
 | `run-qwen38-c1` (unchanged) | 1 | 65,536 | int8 | off | 2.73 GiB | 2.85 GiB |
 | **`run-qwen38-c1-maxctx`, Windows** | 1 | 131,072 | rk8v4 | overlay | 3.94 GiB | 1.59 GiB |
-| **`run-qwen38-c1-maxctx`, Linux** | 2 | 196,608 | rk8v4 | overlay | 6.01 GiB* | headless only |
+| **`run-qwen38-c1-maxctx`, Linux** | 2 | 196,608 | rk8v4 | overlay | 6.01 GiB (est.) | headless only |
 | `NINFER_CONTEXT=163840` | 1 | 163,840 | rk8v4 | overlay | 4.78 GiB | 763 MiB |
 
 Vision is on in both. Overlay residency keeps the tower host-pinned and streams each image through
