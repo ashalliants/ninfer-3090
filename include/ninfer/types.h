@@ -489,9 +489,17 @@ struct ContextCacheHints {
     std::optional<std::string> session_key;
     CacheRetentionHint retention = CacheRetentionHint::Default;
     std::vector<PromptCacheMarker> markers;
-    // Protocols with their own automatic/explicit write policy disable the Engine's structural
-    // candidates. Exact reads from already-published shared prefixes remain enabled.
+    // Structural shared candidates the Engine derives from the prompt's own shape: after the
+    // leading System/Developer block, after the tool definitions, and at the full prompt frontier.
+    // A protocol that carries its own write policy still wants these, because its policy only
+    // governs where *its* marker goes; turning them off leaves a request whose only candidate sits
+    // at the end of its own prompt, which no differing request can ever match.
     bool allow_engine_automatic_shared_prefixes = true;
+    // Propose additional shared candidates on a content-independent token grid so two prompts that
+    // merely start alike converge on the same frontier. Grid candidates carry EngineObserved
+    // evidence only, so they are never speculatively materialized: a grid frontier is published
+    // solely once two distinct reuse domains have both asked for it.
+    bool allow_engine_prefix_grid = false;
     // Advance the named session lineage when session_key is present. This does not require an
     // anonymous content-matched source to be retained.
     bool update_session_index = true;
