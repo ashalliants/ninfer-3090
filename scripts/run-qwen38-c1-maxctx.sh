@@ -46,15 +46,15 @@
 # kv_heads x 256 head_dim per token against the 35B-A3B's 10 x 2 x 256, which is 3.2x the KV per
 # token - 27.07 KiB against roughly 7.8. The 35B-A3B reaches 262,144 because its KV is cheap.
 #
-# So the default below is 196,608, the largest rung with real margin (+1.05 GiB predicted at two
-# lanes). 212,992 also fits at +0.63 GiB if you want to push it. Both are extrapolated, not
-# measured - this machine cannot start them - so confirm on the box before relying on them.
-# Rungs: 212992 / 196608 / 163840 / 131072 / 114688 / 98304 / 65536.
+# The default below is 212,992: 6.43 GiB predicted at two lanes, leaving +0.63 GiB. 196,608 is the
+# more cautious rung at +1.05 GiB. Both are extrapolated rather than measured - this machine cannot
+# start either - so treat the first headless start as the confirmation and drop a rung if it
+# refuses. Rungs: 229376 / 212992 / 196608 / 163840 / 131072 / 114688 / 98304 / 65536.
 # ------------------------------------------------------------------------------------------------
 set -euo pipefail
 
 MODEL="${NINFER_MODEL:-${NINFER_MODEL_DIR:-/mnt/c/Ninefer-3090/models}/qwen3_8_27b.ninfer}"
-CONTEXT="${NINFER_CONTEXT:-196608}"
+CONTEXT="${NINFER_CONTEXT:-212992}"
 CONCURRENCY="${NINFER_CONCURRENCY:-2}"
 KV_CAPACITY="${NINFER_KV_CAPACITY:-$CONTEXT}"
 KV_DTYPE="${NINFER_KV_DTYPE:-rk8v4}"

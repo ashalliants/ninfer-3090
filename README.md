@@ -102,7 +102,7 @@ predictable. Same shape of command:
 
 ```bash
 ./download-qwen38.sh
-./run-qwen38-c1-maxctx.sh                 # two users, 196,608 tokens each, same knobs
+./run-qwen38-c1-maxctx.sh                 # two users, 212,992 tokens each, same knobs
 ```
 
 The plain `run-qwen38-c1` and `run-qwen38-c8` launchers are still there and unchanged. They are
@@ -114,7 +114,7 @@ eight-lane throughput profile.
 |---|---|---|---|---|---|---|
 | `run-qwen38-c1` (unchanged) | 1 | 65,536 | int8 | off | 2.73 GiB | 2.85 GiB |
 | **`run-qwen38-c1-maxctx`, Windows** | 1 | 131,072 | rk8v4 | overlay | 3.94 GiB | 1.59 GiB |
-| **`run-qwen38-c1-maxctx`, Linux** | 2 | 196,608 | rk8v4 | overlay | 6.01 GiB (est.) | headless only |
+| **`run-qwen38-c1-maxctx`, Linux** | 2 | 212,992 | rk8v4 | overlay | 6.43 GiB (est.) | headless only |
 | `NINFER_CONTEXT=163840` | 1 | 163,840 | rk8v4 | overlay | 4.78 GiB | 763 MiB |
 
 Vision is on in both. Overlay residency keeps the tower host-pinned and streams each image through
@@ -132,9 +132,10 @@ That is the model, not the tuning. The 27B spends 16 full-attention layers × 4 
 head_dim per token against the 35B-A3B's 10 × 2 × 256 — **3.2× the KV per token**, 27.07 KiB
 against roughly 7.8. The 35B-A3B reaches the native maximum because its KV is cheap.
 
-So the Linux launcher defaults to **196,608**, the largest rung with real margin (+1.05 GiB
-predicted at two lanes); 212,992 also fits at +0.63 GiB. Those two are extrapolated rather than
-measured — a desktop machine cannot start them — so confirm on the box before relying on them.
+So the Linux launcher defaults to **212,992** — 6.43 GiB predicted at two lanes, leaving +0.63 GiB.
+`NINFER_CONTEXT=196608` is the more cautious rung at +1.05 GiB. Both are extrapolated rather than
+measured, since a desktop machine cannot start either, so treat the first headless start as the
+confirmation and drop a rung if it refuses.
 
 One thing to know: this model's StateImage is **147 MiB**, 2.4× the 35B-A3B's, because it has 48 GDN
 layers with 48 value heads. `--host-state-slots 32` therefore pins **4.59 GiB of host memory** — host,
