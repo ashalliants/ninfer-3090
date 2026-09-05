@@ -90,7 +90,40 @@ rk8v4 tokens) at the cost of dropping decode to ~183 tok/s. Drop `--vision` last
 residency it costs no resident capacity, and the `evictable pool window exceeds the evictable tail`
 message some boxes show is a symptom of the reservation already being tight, not a context ceiling.
 
-For Qwen3.8-27B instead, use `download-qwen38.bat`/`.sh` with `run-qwen38-c1` or `run-qwen38-c8`.
+### Or Qwen3.8-27B
+
+The other common choice, and a dense model rather than an MoE, so it is slower per token but more
+predictable. Same shape of command:
+
+```powershell
+.\download-qwen38.bat                     # downloads qwen3_8_27b.ninfer (~17 GB, resumable)
+.\run-qwen38-c1-maxctx.bat                # one user, 131,072 tokens, rk8v4, MTP3 + draft head
+```
+
+```bash
+./download-qwen38.sh
+./run-qwen38-c1-maxctx.sh                 # two users, 131,072 tokens each, same knobs
+```
+
+The plain `run-qwen38-c1` and `run-qwen38-c8` launchers are still there and unchanged. They are
+deliberately conservative — `c1` serves 65,536 tokens of INT8 and leaves 2.85 GiB of the card
+unused — so prefer the `-maxctx` pair unless you specifically want INT8's quality default or `c8`'s
+eight-lane throughput profile.
+
+| Profile | lanes | context | KV | runtime | free (desktop) |
+|---|---|---|---|---|---|
+| `run-qwen38-c1` (unchanged) | 1 | 65,536 | int8 | 2.73 GiB | 2.85 GiB |
+| **`run-qwen38-c1-maxctx`, Windows** | 1 | 131,072 | rk8v4 | 3.93 GiB | 1.68 GiB |
+| **`run-qwen38-c1-maxctx`, Linux** | 2 | 131,072 | rk8v4 | 4.31 GiB | 1.38 GiB |
+| `NINFER_CONTEXT=163840` | 1 | 163,840 | rk8v4 | 4.77 GiB | 854 MiB |
+
+One thing to know: this model's StateImage is **147 MiB**, 2.4× the 35B-A3B's, because it has 48 GDN
+layers with 48 value heads. `--host-state-slots 32` therefore pins **4.59 GiB of host memory** — host,
+not device, and the price of taking prefix reuse from 8.4% to 98.3%. Lower it if the box is short
+on RAM.
+
+Qwen3.8-27B reaches 171,648 INT8 tokens or 226,560 with `rk8v4`; the figures above are what fits
+alongside speculation and the tuned cache with a desktop running.
 
 ### Building from source
 
@@ -136,7 +169,8 @@ results yet.
 | Launcher | Best for |
 |---|---|
 | `run-qwen36-35b-a3b-c1-maxctx.bat` | **Recommended.** Qwen3.6-35B-A3B, one user, 114K context, rk8v4, vision, tuned cache |
-| `run-qwen38-c1.bat` | Qwen3.8-27B, one interactive user, lowest latency, up to 64K context |
+| `run-qwen38-c1-maxctx.bat` | **Recommended for 27B.** Qwen3.8-27B, one user, 131K context, rk8v4, tuned cache |
+| `run-qwen38-c1.bat` | Qwen3.8-27B, one interactive user, INT8 quality default, 64K context |
 | `run-qwen38-c8.bat` | Qwen3.8-27B, multiple users or agents, highest aggregate throughput, 8K context |
 | `run-qwen38-vision.bat` | Qwen3.8 image understanding, one user, 32K context, MTP3 |
 | `run-qwen36-35b-vision.bat` | Image understanding with Qwen3.6-35B-A3B, one user, 32K context |
