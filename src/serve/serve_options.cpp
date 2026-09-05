@@ -71,6 +71,7 @@ std::string serve_usage_text(const char* argv0) {
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
+           "[--no-prefill-overlap] "
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
            "[--context-cost-presets FILE] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
@@ -173,6 +174,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--max-pending-requests") {
             options.max_pending_requests = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--max-pending-requests"), "max-pending-requests"));
+        } else if (arg == "--no-prefill-overlap") {
+            options.prefill_overlap = false;
         } else if (arg == "--pending-timeout-ms") {
             options.pending_timeout_ms = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--pending-timeout-ms"), "pending-timeout-ms"));

@@ -40,6 +40,7 @@ struct Qwen3_6_27BInstance {
     Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stable_loaded,
                         runtime::KvCapacityResolution resolution,
                         Qwen3_6_27B::SequencePlan sequence_plan, DeviceContext& device,
+                        DeviceContext& prefill_device,
                         const StartupObserver& startup_observer);
     ~Qwen3_6_27BInstance();
 
@@ -70,6 +71,7 @@ struct Qwen3_6_35BA3BInstance {
     Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35BA3B> stable_loaded,
                            runtime::KvCapacityResolution resolution,
                            Qwen3_6_35BA3B::SequencePlan sequence_plan, DeviceContext& device,
+                           DeviceContext& prefill_device,
                            const StartupObserver& startup_observer);
     ~Qwen3_6_35BA3BInstance();
 
@@ -88,7 +90,8 @@ struct ConstructedTarget {
 };
 
 [[nodiscard]] ConstructedTarget construct_target(const EngineOptions& options,
-                                                 DeviceContext& device);
+                                                 DeviceContext& device,
+                                                 DeviceContext& prefill_device);
 
 } // namespace targets
 } // namespace ninfer

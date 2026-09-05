@@ -276,6 +276,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.max_concurrency          = options_.max_concurrency;
     engine_options.max_pending_requests     = options_.max_pending_requests;
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
+    engine_options.prefill_overlap          = options_.prefill_overlap;
     engine_options.prefill_chunk            = options_.prefill_chunk;
     engine_options.kv_cache                 = options_.kv_cache;
     engine_options.enable_vision            = options_.enable_vision;

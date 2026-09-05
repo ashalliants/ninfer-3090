@@ -520,8 +520,9 @@ runtime::ContextTransactionReserveStatus Program<Variant>::reserve_active_captur
 template <>
 PendingBatch<Variant> Program<Variant>::decode(std::span<const SequenceHandle<Variant>> sequences,
                                                std::span<const runtime::RoundBudget> budgets,
-                                               runtime::ExecutionTiming* failed_timing) {
-    return impl_->decode(sequences, budgets, failed_timing);
+                                               runtime::ExecutionTiming* failed_timing,
+                                               const DeviceBusyHook* device_busy) {
+    return impl_->decode(sequences, budgets, failed_timing, device_busy);
 }
 
 template <>
@@ -611,6 +612,7 @@ template <>
 std::unique_ptr<Program<Variant>>
 create_program<Variant>(const Variant::ModelView& model, Variant::WeightsProfile weights_profile,
                         SequencePlan<Variant>&& plan, DeviceContext& device,
+                        DeviceContext& prefill_device,
                         const StartupObserver& startup_observer) {
     if (plan.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
     if (plan.impl_->weights_profile != weights_profile) {
@@ -618,7 +620,7 @@ create_program<Variant>(const Variant::ModelView& model, Variant::WeightsProfile
             "loaded model weights profile does not match the sequence plan");
     }
     auto impl = std::make_unique<detail::ProgramImpl<Variant>>(model, *plan.impl_, device,
-                                                               startup_observer);
+                                                               prefill_device, startup_observer);
     plan.impl_.reset();
     return std::unique_ptr<Program<Variant>>(new Program<Variant>(std::move(impl)));
 }

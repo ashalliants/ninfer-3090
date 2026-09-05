@@ -168,6 +168,10 @@ struct EngineOptions {
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
+    // A staged prefill chunk may share a device boundary with a decode round, each on its own
+    // stream and workspace arena. Disable to restore the strictly serial one-unit-per-boundary
+    // order.
+    bool prefill_overlap               = true;
     std::uint32_t prefill_chunk        = 1024;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;

@@ -175,6 +175,7 @@ int verify_rejection() {
 
 int verify_profile_mismatch_rejection() {
     ninfer::DeviceContext device(0);
+    ninfer::DeviceContext prefill_device(0, ninfer::StreamPriority::Low);
     ninfer::EngineOptions options;
     options.max_context                      = 128;
     options.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(128);
@@ -189,7 +190,7 @@ int verify_profile_mismatch_rejection() {
     try {
         (void)ninfer::targets::qwen3_6::create_program<Variant>(
             empty_model, WeightsProfile::Qwen36Nvfp4, std::move(sequence), device,
-            ninfer::StartupObserver{});
+            prefill_device, ninfer::StartupObserver{});
     } catch (const std::invalid_argument& error) {
         if (std::string(error.what()).find("weights profile") != std::string::npos) { return 0; }
     }

@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <array>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -524,7 +525,8 @@ public:
     };
 
     ProgramImplCore(const LoadedModelData& model, const SequencePlanImpl& plan,
-                    DeviceContext& device, const StartupObserver& startup_observer);
+                    DeviceContext& device, DeviceContext& prefill_device,
+                    const StartupObserver& startup_observer);
     ~ProgramImplCore() noexcept;
 
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,
@@ -595,9 +597,15 @@ public:
         const SharedPrefixHandle* replacement,
         std::optional<runtime::CheckpointRef> private_replacement, bool permit_shared_publication,
         CapturePressureCandidate&& pressure, runtime::CancellationFlagView cancellation);
+    // Host work to run while a decode round is in flight on the device. The Engine passes the
+    // staged prefill chunk here: the decode graph is already launched on the decode stream, so a
+    // chunk issued on the prefill lane's own stream and arena overlaps it instead of waiting for
+    // the round boundary. Null restores the strictly serial unit order.
+    using DeviceBusyHook = std::function<void()>;
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,
                                       std::span<const runtime::RoundBudget> budgets,
-                                      runtime::ExecutionTiming* failed_timing);
+                                      runtime::ExecutionTiming* failed_timing,
+                                      const DeviceBusyHook* device_busy = nullptr);
     [[nodiscard]] runtime::ExecutionTiming
     append_forced_tokens(std::span<const SequenceHandle> sequences,
                          std::span<const TokenId> row_major_tokens, std::uint32_t row_stride,
@@ -630,6 +638,8 @@ public:
 
     const LoadedModelData& model;
     DeviceContext& device;
+    // The prefill lane's context. Same device, its own compute stream, ranked below decode.
+    DeviceContext& prefill_device;
     const std::uint32_t capacity;
     const std::uint32_t kv_capacity;
     const std::uint32_t max_concurrency;
@@ -656,6 +666,11 @@ public:
     DeviceArena persistent;
     DeviceArena workspace_storage;
     WorkspaceArena work;
+    // Scratch for the prefill lane. A prefill chunk resets and refills its arena while a decode
+    // graph is in flight, and the graph bakes the decode arena's addresses at capture, so the two
+    // lanes cannot share one.
+    DeviceArena prefill_workspace_storage;
+    WorkspaceArena prefill_work;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
     std::unique_ptr<HostKVArena> host_kv_arena;
     std::unique_ptr<LogicalKVPageStore> text_kv_pages;
@@ -1013,7 +1028,7 @@ private:
     advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_raw(std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget> budgets,
-               runtime::ExecutionTiming* failed_timing);
+               runtime::ExecutionTiming* failed_timing, const DeviceBusyHook* device_busy);
     [[nodiscard]] runtime::ExecutionTiming
     resolve_prefill_raw(std::uint32_t lane, bool terminal, runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::ExecutionTiming resolve_pending_raw(
@@ -1239,15 +1254,18 @@ private:
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                           std::span<const runtime::RoundBudget> budgets,
-                          runtime::ExecutionTiming* failed_timing);
+                          runtime::ExecutionTiming* failed_timing,
+                          const DeviceBusyHook* device_busy);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_mtp_batch(std::span<const std::uint32_t> lanes,
                      std::span<const runtime::RoundBudget> budgets,
-                     runtime::ExecutionTiming* failed_timing);
+                     runtime::ExecutionTiming* failed_timing,
+                     const DeviceBusyHook* device_busy);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets,
-                        runtime::ExecutionTiming* failed_timing);
+                        runtime::ExecutionTiming* failed_timing,
+                        const DeviceBusyHook* device_busy);
     void resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);

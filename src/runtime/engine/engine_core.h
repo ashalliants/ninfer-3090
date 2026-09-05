@@ -68,6 +68,7 @@ public:
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
+          prefill_overlap_(options.prefill_overlap),
           resources_(max_concurrency_, options.context_cache.max_private_continuations.value(),
                      options.context_cache.max_shared_prefixes.value(),
                      options.context_cache.enabled,
@@ -1790,6 +1791,54 @@ private:
         }
     }
 
+    // One boundary, two device lanes. The decode graph is launched first and the staged prefill
+    // chunk is issued from inside the round's device-busy window, so the chunk shares the device
+    // with the round instead of displacing it. Both units are complete before this returns, which
+    // is what lets every later boundary rule (capture ordering, cancellation sampling, admission)
+    // stay exactly as it is for a single unit.
+    void run_overlapped_round(const RoundMembership& membership,
+                              const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+        nvtx::ScopedRange range(nvtx::Name::Decode, nvtx::Category::Decode,
+                                static_cast<std::uint64_t>(membership.size));
+        const auto prefill_lane = scheduler_.prefill_lane();
+        if (!prefill_lane) { throw std::logic_error("no request owns staged prefill"); }
+        const std::uint32_t lane = *prefill_lane;
+        const auto request       = slots_[lane];
+        if (request == nullptr || !request->is_prefilling() || request->capture_pending ||
+            !request->sequence) {
+            throw std::logic_error("staged prefill lane has invalid request state");
+        }
+
+        using DeviceBusyHook =
+            typename std::remove_reference_t<decltype(*instance_.program)>::DeviceBusyHook;
+        std::exception_ptr prefill_error;
+        runtime::ExecutionTiming prefill_failed_timing;
+        // The chunk is both issued and resolved here. The Program carries one pending
+        // transaction at a time, so the prefill's has to be settled before the round claims
+        // its own; doing it inside the window is free, because the device is busy with the
+        // round while this host work runs.
+        DeviceBusyHook hook = [&] {
+            try {
+                auto progress =
+                    instance_.program->advance_prefill(*request->sequence, &prefill_failed_timing);
+                resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
+            } catch (...) {
+                // The round is already in flight; let it finish and commit, then fail the
+                // prefill request alone.
+                prefill_error = std::current_exception();
+            }
+        };
+
+        ProgramCallScope program_call(*this);
+        auto pending = instance_.program->decode(membership.sequence_span(),
+                                                 membership.budget_span(),
+                                                 &program_call.failed_timing(), &hook);
+        program_call.finish(pending.execution_timing());
+        commit_pending(std::move(pending), membership.lane_span(), true, cancelled_at_unit_start);
+        if (prefill_error) { complete_error(request, prefill_error); }
+        publish_runtime_stats();
+    }
+
     void run_decode_round(const RoundMembership& membership,
                           const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         nvtx::ScopedRange decode_range(nvtx::Name::Decode, nvtx::Category::Decode,
@@ -1995,8 +2044,9 @@ private:
                         !(slots_[*lane]->sequence &&
                           instance_.program->vision_pending(*slots_[*lane]->sequence));
                 }
-                const ExecutionAction action = scheduler_.choose_execution(
-                    !membership.empty(), prefill_runnable, previous_unit_was_decode);
+                const ExecutionAction action =
+                    scheduler_.choose_execution(!membership.empty(), prefill_runnable,
+                                                previous_unit_was_decode, prefill_overlap_);
                 if (action == ExecutionAction::Prefill) {
                     set_host_work_class(HostWorkClass::Prefill);
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
@@ -2008,6 +2058,15 @@ private:
                     set_host_work_class(HostWorkClass::Decode, membership.lane_span());
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_decode_round(membership, cancelled_at_unit_start);
+                    previous_unit_was_decode = true;
+                    continue;
+                }
+                if (action == ExecutionAction::PrefillAndDecode) {
+                    set_host_work_class(HostWorkClass::Decode, membership.lane_span());
+                    finish_engine_phase(boundary, EngineHostPhase::Boundary);
+                    run_overlapped_round(membership, cancelled_at_unit_start);
+                    // The pair contains a decode round, so admission treats it as one: a prefill
+                    // that shares a boundary with decode has not starved the decode lane.
                     previous_unit_was_decode = true;
                     continue;
                 }
@@ -2035,6 +2094,8 @@ private:
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
+    // Whether a staged prefill chunk may share a boundary with a decode round.
+    const bool prefill_overlap_ = true;
     ResourceManagement resources_;
 
     mutable std::mutex execution_mutex_;

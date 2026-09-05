@@ -143,6 +143,7 @@ int run(const Options& options) {
     engine.use_cuda_graph            = options.use_cuda_graph;
 
     ninfer::DeviceContext device(options.device);
+    ninfer::DeviceContext prefill_device(options.device, ninfer::StreamPriority::Low);
     ninfer::artifact::Reader reader(options.artifact);
     const auto weights_profile = target::Package::resolve_weights(reader.identity());
     ninfer::artifact::Binder binder(reader);
@@ -160,7 +161,8 @@ int run(const Options& options) {
     auto sequence = std::move(planner).finalize(resolution.main_page_groups);
     const ninfer::StartupObserver startup_observer;
     auto program =
-        target::Package::create_program(*model, std::move(sequence), device, startup_observer);
+        target::Package::create_program(*model, std::move(sequence), device, prefill_device,
+                                        startup_observer);
     ninfer::runtime::ResolvedExecutionOptions execution;
     execution.requested_output_tokens = 1 + measured_rounds * (options.draft_tokens + 1);
     execution.allow_prefix_reuse      = false;

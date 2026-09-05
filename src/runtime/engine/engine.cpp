@@ -94,9 +94,18 @@ EngineOptions normalize_engine_options(EngineOptions options) {
 
 DeviceContext initialize_device(const EngineOptions& options) {
     StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaInitialize);
-    DeviceContext device(options.device);
+    // Decode owns every active stream's inter-token latency, so its lane outranks prefill's
+    // whenever both have kernels queued.
+    DeviceContext device(options.device, StreamPriority::High);
     phase.complete();
     return device;
+}
+
+// The prefill lane. A second context on the same device is what lets a prefill chunk run beside
+// a decode round: it carries its own compute stream, and the Program gives it its own workspace
+// arena so the two units never share scratch.
+DeviceContext initialize_prefill_device(const EngineOptions& options) {
+    return DeviceContext(options.device, StreamPriority::Low);
 }
 
 runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefaults& defaults,
@@ -227,9 +236,10 @@ public:
 
     explicit Impl(EngineOptions engine_options)
         : options(normalize_engine_options(std::move(engine_options))),
-          device(initialize_device(options)) {
+          device(initialize_device(options)),
+          prefill_device(initialize_prefill_device(options)) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
-        auto constructed  = targets::construct_target(options, device);
+        auto constructed  = targets::construct_target(options, device, prefill_device);
         active            = std::move(constructed.active);
         load              = std::move(constructed.load);
         sampling_defaults = constructed.sampling_defaults;
@@ -266,6 +276,7 @@ public:
 
     EngineOptions options;
     DeviceContext device;
+    DeviceContext prefill_device;
     targets::ActiveTarget active;
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
