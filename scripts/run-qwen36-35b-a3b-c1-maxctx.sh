@@ -50,6 +50,21 @@ MODEL="${NINFER_MODEL:-/mnt/c/Ninefer-3090/models/qwen3_6_35b_a3b.ninfer}"
 # Rungs: 81920 / 90112 / 98304 / 114688 / 131072.
 CONTEXT="${NINFER_CONTEXT:-114688}"
 
+# One lane by default. --kv-capacity is the shared pool and --max-context is the per-request cap,
+# so two lanes do not need twice the memory unless you also want twice the per-request context.
+# Measured on a 3090 with the desktop running (a headless box has ~1.5 GiB more to spend):
+#
+#   NINFER_CONCURRENCY  NINFER_CONTEXT  NINFER_KV_CAPACITY  runtime    free after startup
+#   ---------------------------------------------------------------------------------------
+#   1 (default)             114,688            114,688      1.22 GiB        492.4 MiB
+#   2                        57,344            114,688      1.44 GiB        356.4 MiB
+#   2                        65,536            131,072      1.57 GiB        201.3 MiB
+#
+# So for two agents at 64K each:  NINFER_CONCURRENCY=2 NINFER_CONTEXT=65536 \
+#                                 NINFER_KV_CAPACITY=131072 ./run-qwen36-35b-a3b-c1-maxctx.sh
+CONCURRENCY="${NINFER_CONCURRENCY:-1}"
+KV_CAPACITY="${NINFER_KV_CAPACITY:-$CONTEXT}"
+
 # 0.0.0.0 exposes an unauthenticated OpenAI-compatible endpoint to your whole LAN. Under WSL2 that
 # is the WSL virtual network rather than the host LAN unless you have set up port forwarding.
 HOST="${NINFER_HOST:-127.0.0.1}"
@@ -69,15 +84,16 @@ if [[ ! -f "$MODEL" ]]; then
   exit 1
 fi
 
-printf 'Qwen3.6-35B-A3B  |  C1  |  context %s  |  rk8v4 KV  |  MTP3 + draft head  |  Vision (overlay)\n' "$CONTEXT"
+printf 'Qwen3.6-35B-A3B  |  C%s  |  context %s  |  KV pool %s  |  rk8v4  |  MTP3 + draft head  |  Vision (overlay)\n' \
+  "$CONCURRENCY" "$CONTEXT" "$KV_CAPACITY"
 printf 'Cache: 8 shared / 8 private / 32 host states  |  automatic prefix grid on\n'
 printf 'API: http://%s:%s/v1\n\n' "$HOST" "$PORT"
 
 exec "$server" "$MODEL" \
   --host "$HOST" --port "$PORT" \
-  --max-concurrency 1 \
+  --max-concurrency "$CONCURRENCY" \
   --max-context "$CONTEXT" \
-  --kv-capacity "$CONTEXT" \
+  --kv-capacity "$KV_CAPACITY" \
   --kv-dtype rk8v4 \
   --spec mtp --draft-tokens 3 --lm-head-draft \
   --prefill-chunk 512 \

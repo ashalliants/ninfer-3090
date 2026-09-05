@@ -9,7 +9,7 @@ set "COHORTS=1,2,4,8"
 set "KV_DTYPE=rk8v4"
 set "START_DELAY_SECONDS=10"
 set "MODEL=%~dp0..\..\qwen3_8_27b.ninfer"
-set "SERVER=%~dp0..\build-sm86-replayssm\apps\Release\ninfer-serve.exe"
+set "SERVER=%~dp0..\build-ninja\apps\ninfer-serve.exe"
 rem ==================================================================
 
 for %%I in ("%~dp0..") do set "REPO=%%~fI"

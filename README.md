@@ -25,7 +25,73 @@ FP8 E4M3 *KV-cache* profile is not: its attention kernels have no SM86 implement
 
 The goal is the make the utmost rippin Qwen inference stack for the 3000 series. Gladly taking PR's, all help much appreciated. 
 
-Release notes for this branch: [v0.6.1](RELEASE_NOTES_0.6.1.md).
+Release notes for this branch: [v0.8.0](RELEASE_NOTES_0.8.0.md).
+
+## Quick start
+
+Three commands, then point your harness at `http://127.0.0.1:8080/v1`. It is an OpenAI-compatible
+endpoint, so anything that speaks `/v1/chat/completions` works; leave the API key blank.
+
+The launchers below run **Qwen3.6-35B-A3B** with the settings this project measured as the best
+overall trade on one 24 GB RTX 3090: `rk8v4` KV (+33% context over INT8 for +0.082% perplexity),
+MTP3 speculation plus the draft head, vision through the overlay residency so it costs no resident
+capacity, and the tuned context cache (8 shared prefixes, 32 host state slots, automatic prefix
+grid) that takes prefix reuse from 8.4% to 98.3% on a multi-preamble workload.
+
+### Windows 11 — one user
+
+```powershell
+# 1. Unzip the latest Windows release, then from that folder:
+.\download-qwen36-35b-vision.bat          # downloads qwen3_6_35b_a3b.ninfer (~21 GB, resumable)
+.\run-qwen36-35b-a3b-c1-maxctx.bat        # serves on 0.0.0.0:8080, 114,688-token context
+```
+
+### Headless Linux — one or two users
+
+```bash
+# 1. Unpack the latest Linux release, then from that folder:
+./download-qwen36-35b-vision.sh           # downloads qwen3_6_35b_a3b.ninfer (~21 GB, resumable)
+./run-qwen36-35b-a3b-c1-maxctx.sh         # one user, 114,688-token context
+
+# two agents at 64K each, same box:
+NINFER_CONCURRENCY=2 NINFER_CONTEXT=65536 NINFER_KV_CAPACITY=131072 \
+  ./run-qwen36-35b-a3b-c1-maxctx.sh
+```
+
+`NINFER_MODEL`, `NINFER_HOST` and `NINFER_PORT` override the rest. The Linux launcher binds
+`127.0.0.1` by default; set `NINFER_HOST=0.0.0.0` to expose it, which is unauthenticated.
+
+### Which profile
+
+| | concurrency | per-request context | KV pool | measured free VRAM |
+|---|---|---|---|---|
+| Windows, one user | 1 | 114,688 | 114,688 | 492 MiB |
+| Linux, one user | 1 | 114,688 | 114,688 | 492 MiB |
+| Linux, two users | 2 | 65,536 | 131,072 | 201 MiB |
+
+`--kv-capacity` is the shared pool and `--max-context` is the per-request cap, so a second lane
+does not cost twice the memory unless you also want twice the per-request context. Free-VRAM
+figures are from a Windows desktop; a headless box has roughly 1.5 GiB more to spend, so the
+two-user profile has more room there than the table suggests. If a server refuses to start, drop
+one context rung (114688 / 98304 / 90112 / 81920) or drop `--vision` first.
+
+For Qwen3.8-27B instead, use `download-qwen38.bat`/`.sh` with `run-qwen38-c1` or `run-qwen38-c8`.
+
+### Building from source
+
+`scripts/build.ps1` (Windows) and `scripts/build.sh` (Linux/WSL) pin the toolchain this project
+needs — VS 2022 BuildTools MSVC 14.4x, CUDA 12.8, the Ninja generator — and fail with a message
+naming the real cause when one is missing:
+
+```powershell
+.\scripts\build.ps1                  # configure + build into build-ninja
+.\scripts\build.ps1 -Test            # ... and run the test suite
+.\scripts\build.ps1 -Package v080    # ... and build the release archive
+```
+
+```bash
+./scripts/build.sh --test --package v080
+```
 
 ## Choose a platform
 
@@ -54,8 +120,9 @@ results yet.
 
 | Launcher | Best for |
 |---|---|
-| `run-qwen38-c1.bat` | One interactive user, lowest latency, up to 64K context |
-| `run-qwen38-c8.bat` | Multiple users or agents, highest aggregate throughput, 8K context |
+| `run-qwen36-35b-a3b-c1-maxctx.bat` | **Recommended.** Qwen3.6-35B-A3B, one user, 114K context, rk8v4, vision, tuned cache |
+| `run-qwen38-c1.bat` | Qwen3.8-27B, one interactive user, lowest latency, up to 64K context |
+| `run-qwen38-c8.bat` | Qwen3.8-27B, multiple users or agents, highest aggregate throughput, 8K context |
 | `run-qwen38-vision.bat` | Qwen3.8 image understanding, one user, 32K context, MTP3 |
 | `run-qwen36-35b-vision.bat` | Image understanding with Qwen3.6-35B-A3B, one user, 32K context |
 
