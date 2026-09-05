@@ -46,49 +46,49 @@ grid) that takes prefix reuse from 8.4% to 98.3% on a multi-preamble workload.
 .\run-qwen36-35b-a3b-c1-maxctx.bat        # serves on 0.0.0.0:8080, 114,688-token context
 ```
 
-### Headless Linux — full 256K context, two users
+### Headless Linux — full 256K context, two users, everything on
 
 ```bash
 # 1. Unpack the latest Linux release, then from that folder:
 ./download-qwen36-35b-vision.sh           # downloads qwen3_6_35b_a3b.ninfer (~21 GB, resumable)
-
-# the native maximum: two agents, 262,144 tokens each, text only
-NINFER_SPEC=none NINFER_VISION=off NINFER_CONCURRENCY=2 NINFER_CONTEXT=262144 \
-  ./run-qwen36-35b-a3b-c1-maxctx.sh
-
-# or keep speculation and images, at a third of the context
-./run-qwen36-35b-a3b-c1-maxctx.sh         # one user, 114,688 tokens, MTP3 + vision
+./run-qwen36-35b-a3b-c1-maxctx.sh         # 2 lanes, 262,144 tokens, MTP3 + draft head, vision
 ```
 
-`NINFER_MODEL`, `NINFER_HOST`, `NINFER_PORT`, `NINFER_KV_CAPACITY` and `NINFER_DRAFT_TOKENS`
-override the rest. The Linux launcher binds `127.0.0.1` by default; set `NINFER_HOST=0.0.0.0`
-to expose it, which is unauthenticated.
+That is the default on Linux because a headless 3090 fits it: two lanes at the native 262,144-token
+maximum with `rk8v4`, MTP3 speculation plus the draft head, and vision in overlay residency, all at
+once. Nothing has to be traded away.
+
+`NINFER_CONTEXT`, `NINFER_CONCURRENCY`, `NINFER_KV_CAPACITY`, `NINFER_SPEC`, `NINFER_VISION`,
+`NINFER_MODEL`, `NINFER_HOST` and `NINFER_PORT` override it. The launcher binds `127.0.0.1`;
+set `NINFER_HOST=0.0.0.0` to expose it, which is unauthenticated.
 
 ### Which profile
 
-Context is not free, and the two things that spend it are speculation and vision:
+The headroom that makes the full profile fit is the ~1.5 GiB a desktop holds. Headless, the
+runtime reservation has roughly 3.7 GiB to work with against the 2.67 GiB the maximum profile
+asks for. **On a machine running a desktop that same profile does not fit**, and startup says so
+precisely:
 
-- **Speculation** is 992 MiB of weights (MTP head 856 MiB, draft head 136 MiB) that would
-  otherwise be KV — about 130,000 rk8v4 tokens. It buys roughly 240-280 tok/s against 183.
-- **Vision** does not cost VRAM in overlay residency, but the overlay borrows an evictable KV
-  tail, and past roughly 131,072 tokens the server refuses to start with `evictable pool window
-  exceeds the evictable tail`. That is a policy limit, not memory: the 262,144 profile has
-  305 MiB free once vision is off.
+```
+requested Engine runtime reservation requires 2864526592 bytes,
+but only 2375691264 bytes are available for runtime capacity
+```
 
-| Profile | lanes | context | speculation | vision | decode | measured free VRAM |
+| Profile | lanes | context | speculation | vision | decode | runtime |
 |---|---|---|---|---|---|---|
-| **Headless Linux, max context** | 2 | 262,144 | none | off | ~183 tok/s | 305 MiB |
-| Headless Linux, one user, max context | 1 | 262,144 | none | off | ~183 tok/s | 448 MiB |
-| **Windows / Linux, one user** | 1 | 114,688 | MTP3 + draft | overlay | ~240-280 tok/s | 492 MiB |
-| Two users, speculation + vision | 2 | 65,536 | MTP3 + draft | overlay | ~240-280 tok/s | 201 MiB |
+| **Headless Linux — default** | 2 | 262,144 | MTP3 + draft | overlay | ~240-280 tok/s | 2.67 GiB |
+| Headless Linux, one user | 1 | 262,144 | MTP3 + draft | overlay | ~240-280 tok/s | 2.46 GiB |
+| **Windows, one user** | 1 | 114,688 | MTP3 + draft | overlay | ~240-280 tok/s | 1.22 GiB |
+| Windows, two users | 2 | 65,536 | MTP3 + draft | overlay | ~240-280 tok/s | 1.57 GiB |
 
 `--kv-capacity` is the shared pool and `--max-context` is the per-request cap, so a second lane
 does not cost twice the memory unless you also want twice the per-request context.
 
-Every free-VRAM figure above was measured **with a Windows desktop running**, which holds about
-1.5 GiB; a headless box has that much again to spend, so these are the pessimistic numbers. If a
-server refuses to start, drop `--vision` first, then speculation, then a context rung
-(262144 / 196608 / 131072 / 114688 / 98304 / 81920).
+If startup refuses, drop a context rung first — 262144 / 196608 / 131072 / 114688 / 98304 / 81920.
+Speculation is the next lever, worth 992 MiB (MTP head 856 MiB, draft head 136 MiB, roughly 130,000
+rk8v4 tokens) at the cost of dropping decode to ~183 tok/s. Drop `--vision` last: in overlay
+residency it costs no resident capacity, and the `evictable pool window exceeds the evictable tail`
+message some boxes show is a symptom of the reservation already being tight, not a context ceiling.
 
 For Qwen3.8-27B instead, use `download-qwen38.bat`/`.sh` with `run-qwen38-c1` or `run-qwen38-c8`.
 

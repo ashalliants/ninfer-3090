@@ -47,22 +47,30 @@ set -euo pipefail
 # than reading 20.6 GiB across the 9p mount.
 MODEL="${NINFER_MODEL:-/mnt/c/Ninefer-3090/models/qwen3_6_35b_a3b.ninfer}"
 
-# Rungs: 81920 / 90112 / 98304 / 114688 / 131072.
-CONTEXT="${NINFER_CONTEXT:-114688}"
-
-# One lane by default. --kv-capacity is the shared pool and --max-context is the per-request cap,
-# so two lanes do not need twice the memory unless you also want twice the per-request context.
-# Measured on a 3090 with the desktop running (a headless box has ~1.5 GiB more to spend):
+# The native maximum, two lanes, everything on. This is the production headless profile: rk8v4 at
+# 262,144 tokens with MTP3 + draft head and vision overlay all enabled. It needs about 2.67 GiB of
+# runtime reservation, which a headless 3090 has comfortably.
 #
-#   NINFER_CONCURRENCY  NINFER_CONTEXT  NINFER_KV_CAPACITY  runtime    free after startup
-#   ---------------------------------------------------------------------------------------
-#   1 (default)             114,688            114,688      1.22 GiB        492.4 MiB
-#   2                        57,344            114,688      1.44 GiB        356.4 MiB
-#   2                        65,536            131,072      1.57 GiB        201.3 MiB
+# A box running a desktop does NOT have room for this: Windows holds roughly 1.5 GiB of the card,
+# leaving ~2.21 GiB, and startup fails with "requested Engine runtime reservation requires
+# 2864526592 bytes, but only 2375691264 bytes are available". Set NINFER_CONTEXT=114688 there.
 #
-# So for two agents at 64K each:  NINFER_CONCURRENCY=2 NINFER_CONTEXT=65536 \
-#                                 NINFER_KV_CAPACITY=131072 ./run-qwen36-35b-a3b-c1-maxctx.sh
-CONCURRENCY="${NINFER_CONCURRENCY:-1}"
+# Measured with a desktop running, so these are the pessimistic figures:
+#
+#   lanes  context   spec   vision   pages        runtime    free / shortfall
+#   -----------------------------------------------------------------------------
+#   2      262,144   MTP3   overlay  -            2.67 GiB   466 MiB SHORT (desktop)
+#   1      262,144   MTP3   overlay  -            2.46 GiB   251 MiB SHORT (desktop)
+#   2      262,144   none   off      4,096/8,192  2.31 GiB   305.4 MiB free
+#   1      114,688   MTP3   overlay  1,792/1,792  1.22 GiB   492.4 MiB free
+#   2       65,536   MTP3   overlay  2,048/2,048  1.57 GiB   201.3 MiB free
+#
+# --kv-capacity is the shared pool and --max-context is the per-request cap, so a second lane does
+# not cost twice the memory unless you also want twice the per-request context.
+#
+# Rungs if startup refuses: 262144 / 196608 / 131072 / 114688 / 98304 / 81920.
+CONTEXT="${NINFER_CONTEXT:-262144}"
+CONCURRENCY="${NINFER_CONCURRENCY:-2}"
 KV_CAPACITY="${NINFER_KV_CAPACITY:-$CONTEXT}"
 
 # Speculation is not free context: the MTP head is 856 MiB of weights and the draft head another
@@ -79,10 +87,13 @@ case "$SPEC" in
   *) printf 'NINFER_SPEC must be mtp or none, got %s\n' "$SPEC" >&2; exit 2 ;;
 esac
 
-# Vision costs context even in overlay residency, and not through VRAM: the overlay borrows an
-# evictable KV tail, and past roughly 131,072 tokens the server refuses to start with
-# "evictable pool window exceeds the evictable tail". That is a policy limit, not memory - a
-# 262,144 profile has 305 MiB free once vision is off. So the full-context profile is text-only.
+# Vision stays on. In overlay residency the Vision tower is host-pinned and each image streams
+# through a borrowed device window, so it costs no resident capacity at this context.
+#
+# On a memory-starved box you may instead see "evictable pool window exceeds the evictable tail":
+# the overlay borrows an evictable KV tail, and when the runtime reservation is already tight
+# there is nothing to borrow. That is a symptom of the box being short, not a context ceiling -
+# it does not appear on a headless machine at 262,144. Drop --vision only as a last resort.
 VISION="${NINFER_VISION:-on}"
 case "$VISION" in
   on)  vision_args=(--vision --vision-residency "${NINFER_VISION_RESIDENCY:-overlay}") ;;
