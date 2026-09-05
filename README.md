@@ -97,7 +97,7 @@ predictable. Same shape of command:
 
 ```powershell
 .\download-qwen38.bat                     # downloads qwen3_8_27b.ninfer (~17 GB, resumable)
-.\run-qwen38-c1-maxctx.bat                # one user, 131,072 tokens, rk8v4, MTP3 + draft head
+.\run-qwen38-c1-maxctx.bat                # one user, 131,072 tokens, rk8v4, MTP3 + draft, vision
 ```
 
 ```bash
@@ -110,12 +110,16 @@ deliberately conservative — `c1` serves 65,536 tokens of INT8 and leaves 2.85 
 unused — so prefer the `-maxctx` pair unless you specifically want INT8's quality default or `c8`'s
 eight-lane throughput profile.
 
-| Profile | lanes | context | KV | runtime | free (desktop) |
-|---|---|---|---|---|---|
-| `run-qwen38-c1` (unchanged) | 1 | 65,536 | int8 | 2.73 GiB | 2.85 GiB |
-| **`run-qwen38-c1-maxctx`, Windows** | 1 | 131,072 | rk8v4 | 3.93 GiB | 1.68 GiB |
-| **`run-qwen38-c1-maxctx`, Linux** | 2 | 131,072 | rk8v4 | 4.31 GiB | 1.38 GiB |
-| `NINFER_CONTEXT=163840` | 1 | 163,840 | rk8v4 | 4.77 GiB | 854 MiB |
+| Profile | lanes | context | KV | vision | runtime | free (desktop) |
+|---|---|---|---|---|---|---|
+| `run-qwen38-c1` (unchanged) | 1 | 65,536 | int8 | off | 2.73 GiB | 2.85 GiB |
+| **`run-qwen38-c1-maxctx`, Windows** | 1 | 131,072 | rk8v4 | overlay | 3.94 GiB | 1.59 GiB |
+| **`run-qwen38-c1-maxctx`, Linux** | 2 | 131,072 | rk8v4 | overlay | 4.32 GiB | 1.26 GiB |
+| `NINFER_CONTEXT=163840` | 1 | 163,840 | rk8v4 | overlay | 4.78 GiB | 763 MiB |
+
+Vision is on in both. Overlay residency keeps the tower host-pinned and streams each image through
+a borrowed device window, so it costs about **10 MiB** of runtime reservation — measured 3.93 GiB
+without it against 3.94 GiB with, at the same context. There is no reason to trade it away.
 
 One thing to know: this model's StateImage is **147 MiB**, 2.4× the 35B-A3B's, because it has 48 GDN
 layers with 48 value heads. `--host-state-slots 32` therefore pins **4.59 GiB of host memory** — host,

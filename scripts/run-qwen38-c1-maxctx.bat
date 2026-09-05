@@ -21,15 +21,18 @@ rem for it, so it cannot waste a slot speculatively.
 rem
 rem MEASURED on this machine with the desktop running, which is the pessimistic case:
 rem
-rem   lanes  KV      context   runtime    free after startup
-rem   ---------------------------------------------------------
-rem   1      int8     65,536   2.73 GiB   2.85 GiB   <- what run-qwen38-c1.bat does
-rem   1      rk8v4   131,072   3.93 GiB   1.68 GiB   <- default here
-rem   1      rk8v4   163,840   4.77 GiB   854.3 MiB
-rem   2      rk8v4   131,072   4.31 GiB   1.38 GiB
+rem   lanes  KV      context   vision   runtime    free after startup
+rem   ------------------------------------------------------------------
+rem   1      int8     65,536   off      2.73 GiB   2.85 GiB   <- what run-qwen38-c1.bat does
+rem   1      rk8v4   131,072   off      3.93 GiB   1.68 GiB
+rem   1      rk8v4   131,072   overlay  3.94 GiB   1.59 GiB   <- default here
+rem   2      rk8v4   131,072   overlay  4.32 GiB   1.26 GiB
+rem   1      rk8v4   163,840   overlay  4.78 GiB   763.2 MiB
 rem
 rem Windows keeps one lane by default: a desktop holds roughly 1.5 GiB of the card, so the
-rem headroom above is what you actually have. Text only -- run-qwen38-vision.bat covers images.
+rem headroom above is what you actually have. Vision is on -- overlay residency costs about 10 MiB
+rem of runtime reservation, so there is no reason to trade it away. run-qwen38-vision.bat remains
+rem for the plain 32K image profile.
 rem Rungs if startup refuses: 163840 / 131072 / 114688 / 98304 / 65536.
 rem ---------------------------------------------------------------------------------------------
 
@@ -56,7 +59,7 @@ if not exist "%MODEL%" (
   exit /b 1
 )
 
-echo Qwen3.8-27B  ^|  C%CONCURRENCY%  ^|  context %CONTEXT%  ^|  rk8v4 KV  ^|  MTP3 + draft head  ^|  text only
+echo Qwen3.8-27B  ^|  C%CONCURRENCY%  ^|  context %CONTEXT%  ^|  rk8v4 KV  ^|  MTP3 + draft head  ^|  Vision (overlay)
 echo Cache: 8 shared / 8 private / 32 host states  ^|  automatic prefix grid on
 echo API: http://%HOST%:%PORT%/v1
 echo.
@@ -70,6 +73,7 @@ echo.
   --spec mtp --draft-tokens 3 --lm-head-draft ^
   --prefill-chunk 1024 ^
   --max-pending-requests 16 --pending-timeout-ms 600000 ^
+  --vision --vision-residency overlay ^
   --max-private-continuations 8 --max-shared-prefixes 8 --host-state-slots 32 --host-kv-mib 8192 ^
   --auto-prefix-grid
 

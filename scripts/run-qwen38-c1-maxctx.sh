@@ -20,14 +20,16 @@
 #
 # MEASURED, with a Windows desktop running (a headless box has roughly 1.5 GiB more to spend):
 #
-#   lanes  KV      context   runtime    free after startup
-#   ---------------------------------------------------------
-#   1      int8     65,536   2.73 GiB   2.85 GiB   <- what run-qwen38-c1.sh does
-#   1      rk8v4   131,072   3.93 GiB   1.68 GiB
-#   1      rk8v4   163,840   4.77 GiB   854.3 MiB
-#   2      rk8v4   131,072   4.31 GiB   1.38 GiB   <- default here
+#   lanes  KV      context   vision   runtime    free after startup
+#   ------------------------------------------------------------------
+#   1      int8     65,536   off      2.73 GiB   2.85 GiB   <- what run-qwen38-c1.sh does
+#   1      rk8v4   131,072   off      3.93 GiB   1.68 GiB
+#   1      rk8v4   131,072   overlay  3.94 GiB   1.59 GiB
+#   2      rk8v4   131,072   overlay  4.32 GiB   1.26 GiB   <- default here
+#   1      rk8v4   163,840   overlay  4.78 GiB   763.2 MiB
 #
-# Text only: --vision costs context, and run-qwen38-vision.sh already covers image work at 32K.
+# Vision is on: overlay residency costs about 10 MiB of runtime reservation, so there is no reason
+# to trade it away. run-qwen38-vision.sh remains for the plain 32K image profile.
 # Rungs if startup refuses: 163840 / 131072 / 114688 / 98304 / 65536.
 # ------------------------------------------------------------------------------------------------
 set -euo pipefail
@@ -47,6 +49,16 @@ case "$SPEC" in
   *) printf 'NINFER_SPEC must be mtp or none, got %s\n' "$SPEC" >&2; exit 2 ;;
 esac
 
+# Vision stays on. Overlay residency keeps the tower host-pinned and streams each image through a
+# borrowed device window, so it costs essentially nothing resident: measured at 131,072 the runtime
+# reservation goes 3.93 -> 3.94 GiB with it enabled, about 10 MiB.
+VISION="${NINFER_VISION:-on}"
+case "$VISION" in
+  on)  vision_args=(--vision --vision-residency "${NINFER_VISION_RESIDENCY:-overlay}") ;;
+  off) vision_args=() ;;
+  *) printf 'NINFER_VISION must be on or off, got %s\n' "$VISION" >&2; exit 2 ;;
+esac
+
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 server="${NINFER_SERVER:-$root/build-linux/apps/ninfer-serve}"
 [[ -x "$server" ]] || server="$root/ninfer-serve"
@@ -63,8 +75,9 @@ if [[ ! -f "$MODEL" ]]; then
 fi
 
 if [[ "$SPEC" == 'mtp' ]]; then spec_label='MTP3 + draft head'; else spec_label='no speculation'; fi
-printf 'Qwen3.8-27B  |  C%s  |  context %s  |  KV pool %s  |  %s  |  %s  |  text only\n' \
-  "$CONCURRENCY" "$CONTEXT" "$KV_CAPACITY" "$KV_DTYPE" "$spec_label"
+if [[ "$VISION" == 'on' ]]; then vision_label='vision (overlay)'; else vision_label='text only'; fi
+printf 'Qwen3.8-27B  |  C%s  |  context %s  |  KV pool %s  |  %s  |  %s  |  %s\n' \
+  "$CONCURRENCY" "$CONTEXT" "$KV_CAPACITY" "$KV_DTYPE" "$spec_label" "$vision_label"
 printf 'Cache: 8 shared / 8 private / 32 host states  |  automatic prefix grid on\n'
 printf 'API: http://%s:%s/v1\n\n' "$HOST" "$PORT"
 
@@ -77,5 +90,6 @@ exec "$server" "$MODEL" \
   "${spec_args[@]}" \
   --prefill-chunk 1024 \
   --max-pending-requests 16 --pending-timeout-ms 600000 \
+  "${vision_args[@]}" \
   --max-private-continuations 8 --max-shared-prefixes 8 --host-state-slots 32 --host-kv-mib 8192 \
   --auto-prefix-grid
