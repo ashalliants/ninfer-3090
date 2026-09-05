@@ -16,10 +16,11 @@ void causal_attention_prompt_k8v4_attention_launch_for(const Tensor& q, const Te
                                                        float scale, const CacheView& cache,
                                                        Metadata metadata, Tensor& out,
                                                        cudaStream_t stream) {
-    static const cudaError_t attr = cudaFuncSetAttribute(
-        causal_attention_prompt_k8v4_kernel<Geometry, Metadata>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptK8V4SmemBytes);
-    CUDA_CHECK(attr);
+    configure_cuda_device_once([&] {
+        return cudaFuncSetAttribute(
+            causal_attention_prompt_k8v4_kernel<Geometry, Metadata>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptK8V4SmemBytes);
+    });
 
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     const dim3 grid(static_cast<unsigned>(div_up(tokens, kCausalPromptK8V4Br)),

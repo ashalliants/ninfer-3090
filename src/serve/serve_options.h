@@ -46,6 +46,9 @@ struct ServeOptions {
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;
+    // Ordered CUDA devices for model-parallel execution: primary first. Empty keeps the
+    // single-device route selected by `device`. Mutually exclusive with --device.
+    std::vector<int> devices;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     ContextCacheOptions context_cache;

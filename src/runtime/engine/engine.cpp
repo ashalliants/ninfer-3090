@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -94,7 +95,12 @@ EngineOptions normalize_engine_options(EngineOptions options) {
 
 DeviceContext initialize_device(const EngineOptions& options) {
     StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaInitialize);
-    DeviceContext device(options.device);
+    if (options.devices.empty()) {
+        DeviceContext device(options.device);
+        phase.complete();
+        return device;
+    }
+    DeviceContext device{std::span<const int>(options.devices)};
     phase.complete();
     return device;
 }

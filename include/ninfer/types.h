@@ -163,6 +163,10 @@ struct EngineOptions {
     std::filesystem::path artifact_path;
     EnginePurpose purpose              = EnginePurpose::Generation;
     int device                         = 0;
+    // Empty or one entry keeps the single-device route and `device` selects it. Two entries open a
+    // second endpoint for model-parallel execution, in the given order: primary first. Matching
+    // compute capability and bidirectional peer access are validated at construction.
+    std::vector<int> devices;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;
