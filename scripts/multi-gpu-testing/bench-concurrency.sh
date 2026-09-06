@@ -20,20 +20,28 @@ start_server() {   # devices concurrency context
     > /root/s.log 2>&1 &
   SERVER_PID=$!
   for _ in $(seq 1 120); do
-    grep -qE "listening on|error:" /root/s.log && break
+    grep -qE "listening on|startup failed|FATAL|^usage:" /root/s.log && break
     sleep 2
   done
   grep -q "listening on" /root/s.log
 }
 
 stop_server() {
+  # Kill the server itself, not just the `timeout` wrapper around it. Killing the wrapper leaves
+  # ninfer-serve alive holding its VRAM, and the next probe then fails to fit 2 GiB of weights on a
+  # 24 GiB card for no visible reason.
   kill "${SERVER_PID:-0}" 2>/dev/null
+  pkill -f "$SERVE" 2>/dev/null
   wait 2>/dev/null
+  for _ in $(seq 1 30); do
+    pgrep -f "$SERVE" >/dev/null || break
+    sleep 1
+  done
   sleep 2
 }
 
 capacity_line() { grep -E "capacity \| KV" /root/s.log | head -1 | sed 's/.*capacity | //'; }
-fail_line()     { grep -m1 "error:" /root/s.log | cut -c1-100; }
+fail_line()     { grep -m1 -E "startup failed|FATAL|^error:" /root/s.log | cut -c1-110; }
 
 probe() {          # devices concurrency context
   if start_server "$@"; then
@@ -98,15 +106,16 @@ case "${1:-all}" in
 ceiling)
   echo "=== context ceiling, single GPU ==="
   for c in "1 262144" "1 131072" "2 131072" "4 65536"; do probe 0 $c; done
+  # 8 is kMaximumConcurrency; higher is refused at argument parsing, not for want of memory.
   echo "=== context ceiling, expert offload ==="
-  for c in "16 65536" "16 131072" "16 262144" "8 262144"; do probe 0,1 $c; done
+  for c in "8 262144" "8 131072" "8 65536" "4 262144" "2 262144"; do probe 0,1 $c; done
   ;;
 throughput)
   echo "=== aggregate throughput ==="
-  bench 0   1  32768 80
-  bench 0,1 1  32768 80
-  bench 0,1 4  32768 80
-  bench 0,1 16 32768 80
+  bench 0   1 32768 80
+  bench 0,1 1 32768 80
+  bench 0,1 4 32768 80
+  bench 0,1 8 32768 80
   ;;
 *)
   bash "$0" ceiling
