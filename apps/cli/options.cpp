@@ -33,6 +33,31 @@ std::uint32_t parse_u32(const char* text, std::string_view label, bool allow_zer
     return static_cast<std::uint32_t>(value);
 }
 
+// Same shape as serve's --devices: one or two distinct ids. Existence is checked at engine
+// startup; this only parses the shape.
+std::vector<int> parse_device_list(std::string_view text) {
+    std::vector<int> devices;
+    std::size_t start = 0;
+    while (start <= text.size()) {
+        const std::size_t comma = text.find(',', start);
+        const std::string_view piece =
+            text.substr(start, comma == std::string_view::npos ? std::string_view::npos
+                                                               : comma - start);
+        if (piece.empty()) { throw std::invalid_argument("--devices entries must not be empty"); }
+        const std::string entry(piece);
+        devices.push_back(static_cast<int>(parse_u64(entry.c_str(), "devices")));
+        if (comma == std::string_view::npos) { break; }
+        start = comma + 1;
+    }
+    if (devices.empty() || devices.size() > 2) {
+        throw std::invalid_argument("--devices takes one or two CUDA device ids");
+    }
+    if (devices.size() == 2 && devices[0] == devices[1]) {
+        throw std::invalid_argument("--devices entries must be distinct");
+    }
+    return devices;
+}
+
 int parse_device(const char* text) {
     const std::uint64_t value = parse_u64(text, "device");
     if (value > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
@@ -81,7 +106,7 @@ std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
-           "       [--device N]\n"
+           "       [--device N] [--devices N,M]\n"
            "       [--kv-dtype bf16|int8|fp8|rk8v4|nvfp4|k8v4] [--spec mtp|dflash --draft-tokens N]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
@@ -101,6 +126,8 @@ std::string usage_text(const char* argv0) {
            "memory per image; --vision-max-merged bounds one item's merged tokens (default 16384).\n"
            "--thinking-budget caps model-origin thinking tokens; inserted control tokens count "
            "toward --max-new.\n"
+           "--devices N,M offloads the expert/MLP blocks to the second GPU; rank 0 keeps attention, "
+           "the KV cache and the head, so nearly all of its memory becomes KV.\n"
            "--kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom.\n"
@@ -140,6 +167,8 @@ Options parse_options(int argc, char** argv) {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {
             options.device = parse_device(value(arg));
+        } else if (arg == "--devices") {
+            options.devices = parse_device_list(value(arg));
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
         } else if (arg == "--spec") {
