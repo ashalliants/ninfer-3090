@@ -60,8 +60,8 @@ cmake -S /root/src -B /root/build -G Ninja \
 ram_gb=$(awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo)
 jobs=$(( ram_gb / 2 )); [[ "$jobs" -lt 4 ]] && jobs=4
 [[ "$jobs" -gt $(nproc) ]] && jobs=$(nproc)
-echo "--- building ninfer with -j${jobs} (${ram_gb} GB RAM, $(nproc) cores) ---"
-if ! cmake --build /root/build --target ninfer -j "$jobs" 2>&1 | tail -12; then
+echo "--- building ninfer + ninfer-serve with -j${jobs} (${ram_gb} GB RAM, $(nproc) cores) ---"
+if ! cmake --build /root/build --target ninfer ninfer-serve -j "$jobs" 2>&1 | tail -12; then
   echo "BUILD_FAILED"; exit 1
 fi
 
