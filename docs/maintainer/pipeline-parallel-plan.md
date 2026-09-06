@@ -20,18 +20,30 @@ An NVLink bridge is close to irrelevant to it -- one 13 us hop per token against
 step is 0.05%. The bridge is worth something to a *tensor* split, which is the other, harder port
 and the one that improves single-request latency.
 
-## What it buys
+## What it buys -- measured on hardware, not projected
 
-35B-A3B, int8 KV at ~10 KiB/token:
+Run on a rented 2x RTX 3090 box (2026-09-06), `--devices 0,1`, int8 KV:
+
+```
+loading weights | 9.82 GiB   ->  weights ready | 1.9s | 5.15 GiB/s
+loading weights | 9.78 GiB   ->  weights ready | 1.9s | 5.18 GiB/s
+
+rank 0 (cuda device 0): layers [0,20), weights 10052 MiB, free 13805 MiB
+rank 1 (cuda device 1): layers [20,40), weights 10011 MiB, free 13847 MiB
+```
+
+Single-device control on the same box: one card loads all 19.6 GiB and serves, leaving 3.37 GiB.
 
 | | single 3090 | two 3090s, layer split |
 |---|---|---|
-| weights resident | ~21 GB | ~10.5 GB per card |
-| free for KV | ~2.6 GB | ~12.5 GB per card, ~25 GB total |
-| total KV tokens | ~262k | **~2.5M** |
-| e.g. concurrent sessions | 2 x 128k | **16 x 150k** |
+| weights resident | 19.6 GiB | **9.82 + 9.78 GiB** |
+| free after weights | ~3.4 GiB | **13.5 + 13.5 = 27.0 GiB** |
+| KV tokens at ~10 KiB/token | ~262k | **~2.8M** |
 
-That is the goal, and it comes from the memory split rather than from interconnect speed.
+That is roughly **10x the KV**, and it comes from the memory split rather than from interconnect
+speed. The two halves came out within 41 MiB of each other, so the even layer split really is
+byte-balanced for this model -- as expected, since each rank gets five of the ten full-attention
+layers (layers 3,7,11,15,19 against 23,27,31,35,39).
 
 ## Why this is cheaper than the earlier assessment feared
 
@@ -111,7 +123,11 @@ works.
       quantified the loss. Either the round splits into a per-rank graph either side of the
       boundary, or capture is off for split decode and the cost has to be measured before anyone
       calls this a win.
-- [ ] 9. Hardware validation
+- [x] 9. Hardware validation **of the load half**. Confirmed on a rented 2x RTX 3090 (numbers
+      above): both ranks materialize on their own device, the layer split is byte-balanced to
+      within 41 MiB, and the combined KV headroom is 27.0 GiB against 3.4 GiB on one card. The
+      single-device control on the same box still loads 19.6 GiB and serves normally. Execution
+      remains unvalidated because it does not exist yet.
 
 ### Measured surface of item 6
 
