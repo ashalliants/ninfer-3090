@@ -212,10 +212,14 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
                                   NumericFormat::W8G32_F16S, mtp_placement);
     out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {2048});
 
+    // Vision produces the embeddings that enter at layer 0, so the backbone belongs with the rank
+    // that owns the embedding. HostPinned overlay weights are not device-resident at all, so they
+    // stay pinned on whichever rank owns them rather than being demoted to ValidateOnly.
     const artifact::TensorPlacement vision_placement =
-        overlay           ? artifact::TensorPlacement::HostPinned
-        : features.vision ? artifact::TensorPlacement::Device
-                          : artifact::TensorPlacement::ValidateOnly;
+        !ownership.owns_embedding() ? artifact::TensorPlacement::ValidateOnly
+        : overlay                   ? artifact::TensorPlacement::HostPinned
+        : features.vision           ? artifact::TensorPlacement::Device
+                                    : artifact::TensorPlacement::ValidateOnly;
     out.vision_backbone     = qwen3_6::bind_vision_backbone(binder, vision_placement);
     out.vision_merger_input = qwen3_6::bind_vision_merger_input(binder, vision_placement);
     out.vision_merger_fc2   = artifact::bind_tensor(
@@ -229,9 +233,10 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
         throw artifact::ArtifactError("DFlash was requested but this compact artifact has no DFlash weights");
     }
     if (artifact_has_dflash) {
+        // The DFlash draft model reads the final hidden state, so it lives with the head rank.
         const artifact::TensorPlacement dflash_placement =
-            features.dflash() ? artifact::TensorPlacement::Device
-                              : artifact::TensorPlacement::ValidateOnly;
+            (features.dflash() && ownership.owns_head()) ? artifact::TensorPlacement::Device
+                                                         : artifact::TensorPlacement::ValidateOnly;
         const auto bind_dflash = [&](std::string_view name, NumericFormat format,
                                      std::initializer_list<std::uint64_t> shape) {
             return artifact::bind_tensor(binder, name, format, shape, dflash_placement);
@@ -268,25 +273,61 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
     return load_plan;
 }
 
-LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
-    : backing(std::move(materialized)) {
-    frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
+namespace {
 
-    runtime.weights_arena = &backing.device_arena();
-    runtime.features      = plan.features;
+template <typename T>
+std::vector<T> single_element(T value) {
+    std::vector<T> out;
+    out.reserve(1);
+    out.push_back(std::move(value));
+    return out;
+}
+
+} // namespace
+
+LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
+    : LoadedModelData(single_element(std::move(plan)), single_element(std::move(materialized)),
+                      PipelineSplit(kTextLayers)) {}
+
+LoadedModelData::LoadedModelData(std::vector<BindingPlan> plans,
+                                 std::vector<artifact::MaterializedArtifact> materialized,
+                                 PipelineSplit split_in)
+    : backings(std::move(materialized)), split(std::move(split_in)) {
+    if (plans.empty() || plans.size() != backings.size()) {
+        throw std::invalid_argument("one binding plan is required per pipeline rank");
+    }
+    if (plans.size() != split.ranks()) {
+        throw std::invalid_argument("binding plans do not match the pipeline split");
+    }
+
+    // The embedding and the vision backbone feed layer 0; the head objects consume the final
+    // hidden state. Each therefore reads from the rank that owns that end of the model.
+    const BindingPlan& embed_plan               = plans.front();
+    const BindingPlan& head_plan                = plans.back();
+    artifact::MaterializedArtifact& embed_backing = backings.front();
+    artifact::MaterializedArtifact& head_backing  = backings.back();
+
+    frontend = qwen3_6::take_frontend_resources(embed_backing, embed_plan.frontend);
+
+    runtime.weights_arena = &embed_backing.device_arena();
+    runtime.features      = embed_plan.features;
     auto& token_embedding = runtime.token_embedding;
     auto& full_layers     = runtime.full_layers;
     auto& gdn_layers      = runtime.gdn_layers;
     auto& final_norm      = runtime.final_norm;
     auto& output_head     = runtime.output_head;
 
-    token_embedding = artifact::materialized_weight(backing, plan.token_embedding,
+    token_embedding = artifact::materialized_weight(embed_backing, embed_plan.token_embedding,
                                                     NumericFormat::W8G32_F16S, 248320, 2048);
 
     std::size_t full_index = 0;
     std::size_t gdn_index  = 0;
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
-        const TextLayerPlan& source = plan.text_layers[layer];
+        // Shadow `backing` and `source` with the owning rank's pair so the body below reads from
+        // whichever device holds this layer without any per-tensor branching.
+        const std::size_t owner                = split.placement(static_cast<std::uint32_t>(layer)).rank;
+        artifact::MaterializedArtifact& backing = backings[owner];
+        const TextLayerPlan& source             = plans[owner].text_layers[layer];
         if (source.is_full_attention) {
             FullAttentionWeights& target = full_layers.at(full_index++);
             target.input_norm            = artifact::materialized_tensor(backing, source.input_norm,
@@ -332,6 +373,12 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         throw std::logic_error("35B Text topology binding is incomplete");
     }
 
+    // Everything from here reads the final hidden state -- final norm, output head, proposal, MTP
+    // and DFlash -- so it comes from the head rank. Aliased rather than renamed at each use so the
+    // bodies stay identical to the single-rank versions they were.
+    artifact::MaterializedArtifact& backing = head_backing;
+    const BindingPlan& plan                 = head_plan;
+
     final_norm =
         artifact::materialized_tensor(backing, plan.final_norm, NumericFormat::BF16, {2048});
     output_head = artifact::materialized_weight(backing, plan.output_head,
@@ -371,6 +418,10 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                                        NumericFormat::BF16, {2048});
     }
 
+    // Vision feeds the embedding, so this one block reads from the embedding rank instead.
+    {
+    artifact::MaterializedArtifact& backing = embed_backing;
+    const BindingPlan& plan                 = embed_plan;
     if (plan.features.vision) {
         qwen3_6::VisionWeights vision;
         vision.common = qwen3_6::materialize_vision_common(
@@ -395,6 +446,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             runtime.vision = vision;
         }
     }
+    } // vision reads the embedding rank
 
     if (plan.features.dflash()) {
         DFlashWeights& target     = runtime.dflash.emplace();

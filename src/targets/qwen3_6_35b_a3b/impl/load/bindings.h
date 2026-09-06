@@ -144,14 +144,23 @@ using DFlashLayerWeights   = qwen3_6::DFlashLayerWeights;
 
 class LoadedModelData {
 public:
+    // Whole model on one device.
     LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized);
+    // One plan and one artifact per pipeline rank. Each layer's weights are read from the artifact
+    // belonging to the rank that owns it, so a single RuntimeModelView addresses tensors living in
+    // two device arenas -- which works because every layer lives wholly on one device, and is why
+    // a layer split needs no per-rank arena inside a single artifact.
+    LoadedModelData(std::vector<BindingPlan> plans,
+                    std::vector<artifact::MaterializedArtifact> materialized, PipelineSplit split);
 
     LoadedModelData(const LoadedModelData&)            = delete;
     LoadedModelData& operator=(const LoadedModelData&) = delete;
     LoadedModelData(LoadedModelData&&)                 = delete;
     LoadedModelData& operator=(LoadedModelData&&)      = delete;
 
-    artifact::MaterializedArtifact backing;
+    // One per rank; index with split.placement(layer).rank. Single-rank loads hold exactly one.
+    std::vector<artifact::MaterializedArtifact> backings;
+    PipelineSplit split{kTextLayers};
     qwen3_6::FrontendResources frontend;
     RuntimeModelView runtime;
 };
