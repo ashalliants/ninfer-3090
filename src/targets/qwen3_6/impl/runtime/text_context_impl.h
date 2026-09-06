@@ -993,6 +993,51 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
     Variant::post_mixer(h, *m.payload, x, ph, work_, s);
 }
 
+// Move bytes from one rank's device to another's, through pinned host.
+//
+// Deliberately not cudaMemcpyPeerAsync. On a bridgeless pair that call is about half the speed of
+// this pair of copies (0.69 ms against 0.33 ms for 4 MB, measured on 2x 3090), and -- far more
+// importantly -- it cannot be captured into a CUDA graph, while a memcpy to or from pinned host
+// is an ordinary graph node. Losing capture costs prefill a factor of 3.4, which dwarfs the
+// transfer itself.
+//
+// Ordering is by fence, never a host sync: the destination stream waits for the source's D2H
+// before its H2D, so the two devices stay correctly sequenced without stalling the CPU.
+inline void TextContext::cross_rank_copy(const void* source, std::size_t from_rank,
+                                         void* destination, std::size_t to_rank,
+                                         std::size_t bytes) {
+    const cudaStream_t from_stream = ctx_.stream_for_rank(from_rank);
+    const cudaStream_t to_stream   = ctx_.stream_for_rank(to_rank);
+
+    // Two ranks on one card (the single-GPU test mode) have nothing to stage through: a plain
+    // device-to-device copy is both far faster and equally capturable. Going via host here would
+    // make that mode misrepresent the cost of the real two-card path.
+    if (ctx_.device_ids()[from_rank] == ctx_.device_ids()[to_rank]) {
+        ScopedDeviceRank guard(ctx_, to_rank);
+        CUDA_CHECK(cudaEventRecord(ctx_.fence_for_rank(from_rank), from_stream));
+        CUDA_CHECK(cudaStreamWaitEvent(to_stream, ctx_.fence_for_rank(from_rank), 0));
+        CUDA_CHECK(
+            cudaMemcpyAsync(destination, source, bytes, cudaMemcpyDeviceToDevice, to_stream));
+        return;
+    }
+
+    void* staging = ctx_.crossing_staging();
+    if (staging == nullptr || bytes > ctx_.crossing_staging_bytes()) {
+        throw std::runtime_error("cross-rank staging buffer is too small for this transfer");
+    }
+
+    {
+        ScopedDeviceRank guard(ctx_, from_rank);
+        CUDA_CHECK(cudaMemcpyAsync(staging, source, bytes, cudaMemcpyDeviceToHost, from_stream));
+        CUDA_CHECK(cudaEventRecord(ctx_.fence_for_rank(from_rank), from_stream));
+    }
+    {
+        ScopedDeviceRank guard(ctx_, to_rank);
+        CUDA_CHECK(cudaStreamWaitEvent(to_stream, ctx_.fence_for_rank(from_rank), 0));
+        CUDA_CHECK(cudaMemcpyAsync(destination, staging, bytes, cudaMemcpyHostToDevice, to_stream));
+    }
+}
+
 // Run one layer's mlp tail, on another device when that layer's experts were offloaded.
 //
 // The whole tail moves, not just the expert matmul: post_attention_norm is bound alongside the
@@ -1020,10 +1065,7 @@ inline void TextContext::run_mlp_tail(const Tensor* post_norm, const MlpW& m, Te
         auto remote_scope = work_.scope();
 
         Tensor remote = work_.alloc(x.dtype, {x.ne[0], x.ne[1]});
-        CUDA_CHECK(cudaEventRecord(ctx_.fence_for_rank(0), home_stream));
-        CUDA_CHECK(cudaStreamWaitEvent(remote_stream, ctx_.fence_for_rank(0), 0));
-        CUDA_CHECK(cudaMemcpyPeerAsync(remote.data, ctx_.device_ids()[expert_rank], x.data,
-                                       ctx_.device_ids()[0], x.bytes(), remote_stream));
+        cross_rank_copy(x.data, 0, remote.data, expert_rank, x.bytes());
 
         mlp_tail(post_norm, m, remote, ph);
 
@@ -1032,10 +1074,7 @@ inline void TextContext::run_mlp_tail(const Tensor* post_norm, const MlpW& m, Te
         // expects. Issued before the scope closes, while `remote` is still live; the arena is a
         // bump allocator, so rolling back only moves the offset and the bytes stay valid until the
         // next allocation, which cannot happen before this copy is enqueued.
-        CUDA_CHECK(cudaEventRecord(ctx_.fence_for_rank(expert_rank), remote_stream));
-        CUDA_CHECK(cudaStreamWaitEvent(home_stream, ctx_.fence_for_rank(expert_rank), 0));
-        CUDA_CHECK(cudaMemcpyPeerAsync(x.data, ctx_.device_ids()[0], remote.data,
-                                       ctx_.device_ids()[expert_rank], x.bytes(), home_stream));
+        cross_rank_copy(remote.data, expert_rank, x.data, 0, x.bytes());
     }
     work_.activate_rank(0);
 }

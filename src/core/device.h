@@ -92,6 +92,17 @@ struct DeviceContext {
     [[nodiscard]] const std::vector<int>& device_ids() const noexcept;
     [[nodiscard]] cudaStream_t stream_for_rank(std::size_t rank) const;
     [[nodiscard]] cudaEvent_t fence_for_rank(std::size_t rank) const;
+    // Pinned host staging for cross-rank copies. Allocated only for a model-parallel context.
+    //
+    // cudaMemcpyPeerAsync is the obvious way to move a tensor between ranks and is the wrong one
+    // here on two counts, both measured on a bridgeless 2x 3090: it runs at roughly half the rate
+    // of an explicit D2H/H2D pair through pinned host (0.69 ms against 0.33 ms for 4 MB), and it
+    // cannot be captured into a CUDA graph at all -- capture fails with
+    // cudaErrorStreamCaptureUnsupported, whereas a memcpy to or from pinned host is an ordinary
+    // graph node. Losing capture costs prefill a factor of 3.4, which dwarfs the transfer itself,
+    // so being capturable matters far more than the copy rate.
+    [[nodiscard]] void* crossing_staging() const noexcept;
+    [[nodiscard]] std::size_t crossing_staging_bytes() const noexcept;
     void activate_rank(std::size_t rank);
     void synchronize_rank(std::size_t rank) const;
     void synchronize() const;
@@ -110,6 +121,8 @@ private:
     void refresh_active_aliases() noexcept;
     void release() noexcept;
 
+    void* crossing_staging_             = nullptr;
+    std::size_t crossing_staging_bytes_ = 0;
     std::vector<Endpoint> endpoints_;
     std::vector<int> device_ids_;
     std::size_t active_rank_ = 0;

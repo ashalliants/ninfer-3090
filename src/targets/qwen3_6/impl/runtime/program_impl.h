@@ -775,12 +775,12 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision),
       vision_overlay(model.vision_overlay ? &*model.vision_overlay : nullptr),
-      // A CUDA graph is captured on one device's stream, and a cross-device copy cannot be
-      // recorded into it -- cudaMemcpyPeerAsync during capture fails with
-      // cudaErrorStreamCaptureUnsupported. An expert-offload schedule crosses on every layer, so
-      // capture is off whenever the model is split. That is a real cost against the single-card
-      // baseline, which captures a whole MTP round, and it is measured rather than assumed.
-      use_cuda_graph(plan.use_cuda_graph && model_in.split.single_rank()),
+      // Capture stays on for a split. It was disabled when the crossings used
+      // cudaMemcpyPeerAsync, which capture rejects outright; they now stage through pinned host,
+      // and a memcpy to or from pinned host is an ordinary graph node. That matters far more than
+      // it first appeared -- losing capture costs prefill a factor of 3.4 (6.41k against 1.88k
+      // tok/s on a 3090), which dwarfs the transfers themselves.
+      use_cuda_graph(plan.use_cuda_graph),
       causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       kv_arena(make_kv_arena(device_in, model_in, plan)),

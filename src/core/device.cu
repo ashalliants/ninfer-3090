@@ -163,6 +163,23 @@ DeviceContext::DeviceContext(std::span<const int> device_ids) {
         throw;
     }
 
+    if (endpoints_.size() > 1) {
+        // Sized for the largest thing a crossing carries: one prefill chunk of the residual
+        // stream. 64 MiB covers 1024 tokens x hidden 5120 x BF16 (10 MiB) with generous room, and
+        // pinned host memory is cheap next to the weights either card holds.
+        constexpr std::size_t kCrossingStagingBytes = 64ULL << 20;
+        void* staging                               = nullptr;
+        const cudaError_t staging_err =
+            cudaHostAlloc(&staging, kCrossingStagingBytes, cudaHostAllocPortable);
+        if (staging_err != cudaSuccess) {
+            release();
+            throw std::runtime_error(
+                cuda_error_message("cudaHostAlloc(cross-rank staging) failed", staging_err));
+        }
+        crossing_staging_       = staging;
+        crossing_staging_bytes_ = kCrossingStagingBytes;
+    }
+
     active_rank_ = 0;
     err          = cudaSetDevice(endpoints_[0].device);
     if (err != cudaSuccess) {
@@ -175,6 +192,11 @@ DeviceContext::DeviceContext(std::span<const int> device_ids) {
 DeviceContext::~DeviceContext() { release(); }
 
 void DeviceContext::release() noexcept {
+    if (crossing_staging_ != nullptr) {
+        log_cuda_error("cudaFreeHost", cudaFreeHost(crossing_staging_));
+        crossing_staging_       = nullptr;
+        crossing_staging_bytes_ = 0;
+    }
     for (Endpoint& endpoint : endpoints_) {
         if (endpoint.stream != nullptr || endpoint.transfer_stream != nullptr ||
             endpoint.vision_stream != nullptr || endpoint.fence != nullptr) {
@@ -271,6 +293,12 @@ std::size_t DeviceContext::size() const noexcept { return endpoints_.size(); }
 bool DeviceContext::model_parallel() const noexcept { return endpoints_.size() == 2; }
 
 bool DeviceContext::peer_access() const noexcept { return peer_access_; }
+
+void* DeviceContext::crossing_staging() const noexcept { return crossing_staging_; }
+
+std::size_t DeviceContext::crossing_staging_bytes() const noexcept {
+    return crossing_staging_bytes_;
+}
 
 std::size_t DeviceContext::active_rank() const noexcept { return active_rank_; }
 
