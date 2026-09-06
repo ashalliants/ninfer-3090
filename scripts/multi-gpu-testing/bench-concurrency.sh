@@ -28,15 +28,15 @@ start_server() {   # devices concurrency context
 }
 
 stop_server() {
-  # Kill the server itself, not just the `timeout` wrapper around it. Killing the wrapper leaves
-  # ninfer-serve alive holding its VRAM, and the next probe then fails to fit 2 GiB of weights on a
-  # 24 GiB card for no visible reason.
-  kill "${SERVER_PID:-0}" 2>/dev/null
-  pkill -f "$SERVE" 2>/dev/null
-  wait 2>/dev/null
-  for _ in $(seq 1 30); do
-    pgrep -f "$SERVE" >/dev/null || break
+  # SIGKILL, and never a bare `wait`. ninfer-serve does not exit on SIGTERM, so the `timeout 900`
+  # wrapper keeps it alive for the full fifteen minutes and an unqualified `wait` blocks on that --
+  # which turned a 30 minute sweep into a three hour one, with each config idling after its
+  # requests had already finished.
+  pkill -9 -f "$SERVE" 2>/dev/null
+  local waited=0
+  while pgrep -f "$SERVE" >/dev/null && [ "$waited" -lt 20 ]; do
     sleep 1
+    waited=$(( waited + 1 ))
   done
   sleep 2
 }
