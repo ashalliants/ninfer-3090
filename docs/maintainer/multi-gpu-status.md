@@ -167,3 +167,57 @@ single-GPU engines behind one router** gives near-linear aggregate throughput fo
 requests with none of this complexity. It does not help single-request latency or let one model
 exceed one card's memory, which is what the graph split buys. Which of those matters should decide
 whether the port is worth doing at all.
+
+## Does any of this need NVLink?
+
+No, and the assumption that it did was wrong in two places in this tree -- both now fixed.
+
+`cudaDeviceCanAccessPeer` returning 0 does **not** mean the cards cannot exchange data.
+`cudaMemcpyPeer` works between any two devices; without peer access CUDA stages through host
+memory. NVIDIA disables P2P over PCIe on GeForce, so every 2x RTX 3090 without a physical bridge
+reports 0 -- and of 19 rentable 2x 3090 offers surveyed on vast.ai on 2026-09-06, **none** had a
+bridge. Treating peer access as mandatory therefore excluded the entire consumer dual-GPU market
+for no reason. `DeviceContext` now records it as a capability (`peer_access()`) and starts anyway.
+
+### What the fallback costs
+
+Measured on this fork's reference 3090, PCIe 4.0 x16, staged round trip (D2H + H2D), after
+forcing the link out of its idle gen1 state:
+
+| transfer | staged | note |
+|---|---|---|
+| 4 KiB | 13.6 us | 35B-A3B activation/token (hidden 2048, bf16) |
+| 10 KiB | 13.1 us | 27B activation/token (hidden 5120, bf16) |
+| 40 KiB | 13.4 us | |
+| 5 MiB | 409 us | 12.8 GB/s |
+| 64 MiB | 5.12 ms | 13.1 GB/s |
+
+The hop is **latency-bound, not bandwidth-bound**, at every size an activation actually is: flat
+~13 us from 4 KiB to 40 KiB. Bandwidth only starts to matter above ~320 KiB, i.e. at prefill batch
+sizes. So the cost of a schedule is set by **crossings per token**, not by how wide the link is:
+
+| scheme | crossings/token (27B, 64 layers) | link cost/token | share of a ~45 ms decode step |
+|---|---|---|---|
+| pipeline (split by layer) | 1 | ~13 us | 0.03% |
+| tensor split (their design) | 128 | ~1.7 ms | ~4% |
+
+Two caveats on those figures. The 13 us is a single-stream same-device D2H+H2D and omits
+cross-device event synchronisation, so a real staged hop is likely 20-40 us; and NVLink would cost
+a couple of us, so the *delta* a bridge buys a tensor split is on the order of 3-9% of a decode
+step. Their measured decode gain was +17.5% **with** a bridge, so the no-bridge version of the same
+design should still be net positive -- just less good. Prefill is bandwidth-bound rather than
+latency-bound and loses more, but starts from a much larger +41%.
+
+### Which implies pipeline parallelism, not tensor parallelism
+
+This inverts the priority in the port plan above. A layer split crosses **once per token** instead
+of twice per layer -- 128x fewer crossings for the 27B -- which makes it almost perfectly suited to
+a machine with no bridge, and it is the scheme nobody has built. It also captures the memory win,
+which is the larger prize and needs no interconnect speed at all: splitting the 35B-A3B's ~21 GB of
+weights across two 24 GB cards frees roughly 12.5 GB per card, taking total KV from ~2.6 GB to
+~25 GB. At 10 KiB/token that is ~262k tokens to several million -- an order of magnitude more
+context or concurrency.
+
+What it does not do is speed up a single request: the layers are sequential, so rank 1 idles while
+rank 0 works. The throughput gain needs concurrency >= 2 and micro-batching. That is the trade
+against the tensor split, which does help single-request latency and is the harder port.

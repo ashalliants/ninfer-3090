@@ -115,6 +115,18 @@ DeviceContext::DeviceContext(std::span<const int> device_ids) {
                 throw std::invalid_argument(
                     "model-parallel CUDA devices must have the same compute capability");
             }
+            // Peer access is a performance capability, not a requirement. NVIDIA disables P2P over
+            // PCIe on GeForce, so a pair of 3090s without an NVLink bridge reports can_access == 0
+            // -- but cudaMemcpyPeer still works there, staging through host memory. Refusing to
+            // start would rule out the most common consumer dual-GPU box for no reason, so record
+            // the capability and let callers choose a schedule that suits it.
+            //
+            // Measured on this fork's reference 3090 (PCIe 4.0 x16), a staged hop costs ~13us and
+            // is latency-bound: flat from 4KiB to 40KiB, which spans both models' per-token
+            // activation (35B-A3B hidden 2048 -> 4KiB, 27B hidden 5120 -> 10KiB). That is
+            // negligible for a schedule crossing once per token, and a few percent of a decode
+            // step for one crossing twice per layer.
+            peer_access_ = true;
             for (std::size_t source = 0; source < 2; ++source) {
                 const std::size_t destination = 1 - source;
                 int can_access                = 0;
@@ -125,8 +137,8 @@ DeviceContext::DeviceContext(std::span<const int> device_ids) {
                         cuda_error_message("cudaDeviceCanAccessPeer failed", err));
                 }
                 if (can_access == 0) {
-                    throw std::invalid_argument(
-                        "model-parallel CUDA devices do not support peer access");
+                    peer_access_ = false;
+                    continue;
                 }
                 err = cudaSetDevice(endpoints_[source].device);
                 if (err != cudaSuccess) {
@@ -136,8 +148,9 @@ DeviceContext::DeviceContext(std::span<const int> device_ids) {
                 if (err == cudaErrorPeerAccessAlreadyEnabled) {
                     (void)cudaGetLastError();
                 } else if (err != cudaSuccess) {
-                    throw std::runtime_error(
-                        cuda_error_message("cudaDeviceEnablePeerAccess failed", err));
+                    // Capability without a usable mapping: fall back rather than fail outright.
+                    (void)cudaGetLastError();
+                    peer_access_ = false;
                 }
             }
         }
@@ -252,6 +265,8 @@ std::size_t DeviceContext::total_vram() const noexcept { return props.totalGloba
 std::size_t DeviceContext::size() const noexcept { return endpoints_.size(); }
 
 bool DeviceContext::model_parallel() const noexcept { return endpoints_.size() == 2; }
+
+bool DeviceContext::peer_access() const noexcept { return peer_access_; }
 
 std::size_t DeviceContext::active_rank() const noexcept { return active_rank_; }
 

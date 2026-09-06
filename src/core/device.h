@@ -83,6 +83,11 @@ struct DeviceContext {
     std::size_t total_vram() const noexcept;
     [[nodiscard]] std::size_t size() const noexcept;
     [[nodiscard]] bool model_parallel() const noexcept;
+    // True when the devices can DMA directly to each other. False is not an error: cudaMemcpyPeer
+    // still works, staging through host memory at roughly 13us per hop instead of a couple. Only
+    // consult this to pick between schedules -- a design crossing once per token does not care,
+    // one crossing twice per layer does.
+    [[nodiscard]] bool peer_access() const noexcept;
     [[nodiscard]] std::size_t active_rank() const noexcept;
     [[nodiscard]] const std::vector<int>& device_ids() const noexcept;
     [[nodiscard]] cudaStream_t stream_for_rank(std::size_t rank) const;
@@ -108,6 +113,7 @@ private:
     std::vector<Endpoint> endpoints_;
     std::vector<int> device_ids_;
     std::size_t active_rank_ = 0;
+    bool peer_access_        = false;
 };
 
 // Binds a rank for the duration of a scope and restores the previous one, so a caller that has to
