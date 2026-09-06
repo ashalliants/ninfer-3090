@@ -218,31 +218,42 @@ void DeviceContext::release() noexcept {
 }
 
 DeviceContext::DeviceContext(DeviceContext&& other) noexcept
-    : endpoints_(std::move(other.endpoints_)), device_ids_(std::move(other.device_ids_)),
-      active_rank_(other.active_rank_) {
+    : crossing_staging_(other.crossing_staging_),
+      crossing_staging_bytes_(other.crossing_staging_bytes_),
+      endpoints_(std::move(other.endpoints_)), device_ids_(std::move(other.device_ids_)),
+      active_rank_(other.active_rank_), peer_access_(other.peer_access_) {
     refresh_active_aliases();
-    other.device          = 0;
-    other.stream          = nullptr;
-    other.transfer_stream = nullptr;
-    other.vision_stream   = nullptr;
-    other.props           = {};
-    other.active_rank_    = 0;
+    other.device                  = 0;
+    other.stream                  = nullptr;
+    other.transfer_stream         = nullptr;
+    other.vision_stream           = nullptr;
+    other.props                   = {};
+    other.active_rank_            = 0;
+    other.peer_access_            = false;
+    other.crossing_staging_       = nullptr;
+    other.crossing_staging_bytes_ = 0;
 }
 
 DeviceContext& DeviceContext::operator=(DeviceContext&& other) noexcept {
     if (this == &other) { return *this; }
 
     release();
-    endpoints_         = std::move(other.endpoints_);
-    device_ids_        = std::move(other.device_ids_);
-    active_rank_       = other.active_rank_;
+    endpoints_              = std::move(other.endpoints_);
+    device_ids_             = std::move(other.device_ids_);
+    active_rank_            = other.active_rank_;
+    peer_access_            = other.peer_access_;
+    crossing_staging_       = other.crossing_staging_;
+    crossing_staging_bytes_ = other.crossing_staging_bytes_;
     refresh_active_aliases();
-    other.device          = 0;
-    other.stream          = nullptr;
-    other.transfer_stream = nullptr;
-    other.vision_stream   = nullptr;
-    other.props           = {};
-    other.active_rank_    = 0;
+    other.device                  = 0;
+    other.stream                  = nullptr;
+    other.transfer_stream         = nullptr;
+    other.vision_stream           = nullptr;
+    other.props                   = {};
+    other.active_rank_            = 0;
+    other.peer_access_            = false;
+    other.crossing_staging_       = nullptr;
+    other.crossing_staging_bytes_ = 0;
     return *this;
 }
 
