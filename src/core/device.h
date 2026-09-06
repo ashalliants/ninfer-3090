@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -50,6 +51,15 @@ void configure_cuda_device_once(Configure&& configure) {
     }
     CUDA_CHECK(result);
 }
+
+// How many pieces one cross-rank transfer is split into.
+//
+// A crossing is a serial D2H then H2D, so the two halves never overlap: a 4 MB residual stream
+// costs ~0.765 ms measured, against the ~0.33 ms its bandwidth alone implies. Splitting the byte
+// range lets piece i+1 stream out of the source while piece i streams into the destination. It is
+// a pure byte-level pipeline -- the same bytes in the same order -- so it cannot affect which
+// kernels run or what they compute.
+inline constexpr std::size_t kCrossingPipelineDepth = 4;
 
 struct DeviceContext {
     int device                   = 0;
@@ -102,6 +112,8 @@ struct DeviceContext {
     // graph node. Losing capture costs prefill a factor of 3.4, which dwarfs the transfer itself,
     // so being capturable matters far more than the copy rate.
     [[nodiscard]] void* crossing_staging() const noexcept;
+    // Fence for one piece of a pipelined cross-rank transfer.
+    [[nodiscard]] cudaEvent_t piece_fence(std::size_t rank, std::size_t piece) const;
     [[nodiscard]] std::size_t crossing_staging_bytes() const noexcept;
     void activate_rank(std::size_t rank);
     void synchronize_rank(std::size_t rank) const;
@@ -115,6 +127,9 @@ private:
         cudaStream_t transfer_stream = nullptr;
         cudaStream_t vision_stream   = nullptr;
         cudaEvent_t fence            = nullptr;
+        // Fences for pipelining one cross-rank transfer in pieces. Pre-allocated because events
+        // cannot be created during CUDA graph capture.
+        std::array<cudaEvent_t, kCrossingPipelineDepth> piece_fences{};
         cudaDeviceProp props{};
     };
 

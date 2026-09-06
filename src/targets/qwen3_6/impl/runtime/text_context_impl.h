@@ -37,6 +37,7 @@
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
+#include <cstddef>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1028,15 +1029,37 @@ inline void TextContext::cross_rank_copy(const void* source, std::size_t from_ra
                                  std::to_string(ctx_.crossing_staging_bytes()));
     }
 
-    {
-        ScopedDeviceRank guard(ctx_, from_rank);
-        CUDA_CHECK(cudaMemcpyAsync(staging, source, bytes, cudaMemcpyDeviceToHost, from_stream));
-        CUDA_CHECK(cudaEventRecord(ctx_.fence_for_rank(from_rank), from_stream));
-    }
-    {
-        ScopedDeviceRank guard(ctx_, to_rank);
-        CUDA_CHECK(cudaStreamWaitEvent(to_stream, ctx_.fence_for_rank(from_rank), 0));
-        CUDA_CHECK(cudaMemcpyAsync(destination, staging, bytes, cudaMemcpyHostToDevice, to_stream));
+    // Split the byte range so the two halves of the crossing overlap. Done as one copy, D2H must
+    // finish before H2D starts and a 4 MB residual stream costs ~0.765 ms -- roughly twice what
+    // its bandwidth implies. In pieces, piece i+1 streams out of the source while piece i streams
+    // into the destination.
+    //
+    // Small transfers skip this: a decode crossing is ~4 KiB, where the per-piece launch and fence
+    // overhead would cost more than the overlap saves.
+    constexpr std::size_t kMinimumPipelinedBytes = 256U << 10;
+    const std::size_t pieces =
+        bytes >= kMinimumPipelinedBytes ? kCrossingPipelineDepth : std::size_t{1};
+    const std::size_t piece_bytes = (bytes + pieces - 1) / pieces;
+
+    for (std::size_t piece = 0; piece < pieces; ++piece) {
+        const std::size_t offset = piece * piece_bytes;
+        const std::size_t length = std::min(piece_bytes, bytes - offset);
+        if (length == 0) { break; }
+        auto* staged      = static_cast<std::byte*>(staging) + offset;
+        const auto* src   = static_cast<const std::byte*>(source) + offset;
+        auto* dst         = static_cast<std::byte*>(destination) + offset;
+        const cudaEvent_t fence = ctx_.piece_fence(from_rank, piece);
+        {
+            ScopedDeviceRank guard(ctx_, from_rank);
+            CUDA_CHECK(
+                cudaMemcpyAsync(staged, src, length, cudaMemcpyDeviceToHost, from_stream));
+            CUDA_CHECK(cudaEventRecord(fence, from_stream));
+        }
+        {
+            ScopedDeviceRank guard(ctx_, to_rank);
+            CUDA_CHECK(cudaStreamWaitEvent(to_stream, fence, 0));
+            CUDA_CHECK(cudaMemcpyAsync(dst, staged, length, cudaMemcpyHostToDevice, to_stream));
+        }
     }
 }
 
