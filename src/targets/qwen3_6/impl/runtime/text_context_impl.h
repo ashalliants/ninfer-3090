@@ -1023,7 +1023,9 @@ inline void TextContext::cross_rank_copy(const void* source, std::size_t from_ra
 
     void* staging = ctx_.crossing_staging();
     if (staging == nullptr || bytes > ctx_.crossing_staging_bytes()) {
-        throw std::runtime_error("cross-rank staging buffer is too small for this transfer");
+        throw std::runtime_error("cross-rank staging buffer is too small: need " +
+                                 std::to_string(bytes) + " bytes, have " +
+                                 std::to_string(ctx_.crossing_staging_bytes()));
     }
 
     {
