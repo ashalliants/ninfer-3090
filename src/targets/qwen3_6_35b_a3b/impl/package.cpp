@@ -6,6 +6,7 @@
 #include "targets/qwen3_6_35b_a3b/impl/load/bindings.h"
 #include "targets/qwen3_6_35b_a3b/impl/variant.h"
 
+#include <cstdlib>
 #include <stdexcept>
 #include <utility>
 
@@ -81,7 +82,15 @@ PipelineSplit Package::pipeline_split(std::size_t ranks) {
     // Offload every expert block. The MoE is ~88% of this model's weights (17.3 GiB of 19.6), so
     // moving all of it leaves rank 0 holding only embeddings, attention, GDN, norms and the head
     // -- roughly 2.3 GiB -- and turns the other ~21 GiB into KV on the card that serves attention.
-    return PipelineSplit::experts_on_last(static_cast<std::uint32_t>(detail::kTextLayers), ranks);
+    // NINFER_KEEP_EXPERTS keeps that many layers' expert blocks on rank 0. It trades KV room for
+    // fewer crossings: every layer left behind is one fewer round trip per forward pass, and one
+    // more expert block occupying the card that serves attention. 0 -- offload everything --
+    // maximises capacity and is the default.
+    std::uint32_t keep = 0;
+    if (const char* env = std::getenv("NINFER_KEEP_EXPERTS"); env != nullptr && env[0] != 0) {
+        keep = static_cast<std::uint32_t>(std::strtoul(env, nullptr, 10));
+    }
+    return PipelineSplit::experts_on_last(static_cast<std::uint32_t>(detail::kTextLayers), ranks, keep);
 }
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,

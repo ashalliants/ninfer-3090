@@ -245,10 +245,6 @@ private:
     void gdn_mix(const GdnLayerW& weights, Tensor& x, int index, Phase phase);
     void mlp_tail(const Tensor* post_norm, const MlpW& weights, Tensor& x, Phase phase);
     void run_layers(Tensor& x, Phase phase);
-    // Copy the residual stream between two ranks' devices and workspaces, returning the tensor in
-    // the destination rank's scratch.
-    [[nodiscard]] Tensor cross_to_rank(const Tensor& source, std::size_t from_rank,
-                                       std::size_t to_rank);
     // mlp_tail, run on the device holding this layer's experts.
     void run_mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph,
                       std::size_t expert_rank);

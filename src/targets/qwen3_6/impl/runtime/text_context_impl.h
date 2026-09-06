@@ -993,30 +993,6 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
     Variant::post_mixer(h, *m.payload, x, ph, work_, s);
 }
 
-// Move the residual stream to another rank's device and workspace.
-//
-// The copy is issued on the destination stream after waiting on the source's fence, so the two
-// cards stay ordered without a host sync. cudaMemcpyPeerAsync is correct whether or not peer
-// access is available -- without it CUDA stages through host memory, which is measurably slower
-// per hop but still only tens of microseconds at activation sizes.
-inline Tensor TextContext::cross_to_rank(const Tensor& source, std::size_t from_rank,
-                                         std::size_t to_rank) {
-    const cudaStream_t from_stream = ctx_.stream_for_rank(from_rank);
-    const cudaStream_t to_stream   = ctx_.stream_for_rank(to_rank);
-    const cudaEvent_t fence        = ctx_.fence_for_rank(from_rank);
-
-    CUDA_CHECK(cudaEventRecord(fence, from_stream));
-    CUDA_CHECK(cudaStreamWaitEvent(to_stream, fence, 0));
-
-    ScopedDeviceRank guard(ctx_, to_rank);
-    work_.activate_rank(to_rank);
-    Tensor destination = work_.alloc(source.dtype, {source.ne[0], source.ne[1]});
-
-    CUDA_CHECK(cudaMemcpyPeerAsync(destination.data, ctx_.device_ids()[to_rank], source.data,
-                                   ctx_.device_ids()[from_rank], source.bytes(), to_stream));
-    return destination;
-}
-
 // Run one layer's mlp tail, on another device when that layer's experts were offloaded.
 //
 // The whole tail moves, not just the expert matmul: post_attention_norm is bound alongside the
@@ -1030,23 +1006,38 @@ inline void TextContext::run_mlp_tail(const Tensor* post_norm, const MlpW& m, Te
         return;
     }
 
-    Tensor remote = cross_to_rank(x, 0, expert_rank);
+    const cudaStream_t home_stream   = ctx_.stream_for_rank(0);
+    const cudaStream_t remote_stream = ctx_.stream_for_rank(expert_rank);
     {
         ScopedDeviceRank guard(ctx_, expert_rank);
         work_.activate_rank(expert_rank);
+
+        // The scope must be taken on the expert rank, and must cover the inbound copy's buffer as
+        // well as the tail's scratch. The caller's enclosing scope was taken on rank 0 and rolls
+        // back rank 0 only, so without this the expert rank's bump pointer would climb for every
+        // layer of a forward pass and overflow -- which it did, as "bad allocation" on any prompt
+        // past a few hundred tokens.
+        auto remote_scope = work_.scope();
+
+        Tensor remote = work_.alloc(x.dtype, {x.ne[0], x.ne[1]});
+        CUDA_CHECK(cudaEventRecord(ctx_.fence_for_rank(0), home_stream));
+        CUDA_CHECK(cudaStreamWaitEvent(remote_stream, ctx_.fence_for_rank(0), 0));
+        CUDA_CHECK(cudaMemcpyPeerAsync(remote.data, ctx_.device_ids()[expert_rank], x.data,
+                                       ctx_.device_ids()[0], x.bytes(), remote_stream));
+
         mlp_tail(post_norm, m, remote, ph);
+
+        // Copy the finished residual back into the caller's rank-0 buffer, so everything
+        // downstream -- the next layer's attention, the head, sampling -- finds it where it
+        // expects. Issued before the scope closes, while `remote` is still live; the arena is a
+        // bump allocator, so rolling back only moves the offset and the bytes stay valid until the
+        // next allocation, which cannot happen before this copy is enqueued.
+        CUDA_CHECK(cudaEventRecord(ctx_.fence_for_rank(expert_rank), remote_stream));
+        CUDA_CHECK(cudaStreamWaitEvent(home_stream, ctx_.fence_for_rank(expert_rank), 0));
+        CUDA_CHECK(cudaMemcpyPeerAsync(x.data, ctx_.device_ids()[0], remote.data,
+                                       ctx_.device_ids()[expert_rank], x.bytes(), home_stream));
     }
     work_.activate_rank(0);
-
-    // Copy the finished residual back into the caller's rank-0 buffer, so everything downstream --
-    // the next layer's attention, the head, sampling -- finds it exactly where it expects.
-    const cudaStream_t remote_stream = ctx_.stream_for_rank(expert_rank);
-    const cudaStream_t home_stream   = ctx_.stream_for_rank(0);
-    const cudaEvent_t fence          = ctx_.fence_for_rank(expert_rank);
-    CUDA_CHECK(cudaEventRecord(fence, remote_stream));
-    CUDA_CHECK(cudaStreamWaitEvent(home_stream, fence, 0));
-    CUDA_CHECK(cudaMemcpyPeerAsync(x.data, ctx_.device_ids()[0], remote.data,
-                                   ctx_.device_ids()[expert_rank], x.bytes(), home_stream));
 }
 
 template <class Tap>
