@@ -444,8 +444,9 @@ See [HTTP serving](docs/serving.md) and [CLI usage](docs/cli.md).
 
 Qwen3.8-27B artifacts carrying the DFlash2 companion weights support
 `--spec dflash2 --draft-tokens 7`, with draft counts 1..15 and either full or optimized
-proposal heads. This fork rejects `--spec dflash` together with `--vision`; DFlash2 is
-Text-only here for the same reason.
+proposal heads. DFlash and DFlash2 both run with `--vision`: target verification carries its
+own continuation RoPE position, so a multimodal row keeps its per-sequence `rope_delta` through
+the verification step rather than being re-indexed by DFlash's logical positions.
 
 ## How cohort batching works
 

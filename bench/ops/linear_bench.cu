@@ -589,7 +589,7 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
     if (point.qtype == QType::BF16_CTRL && point.policy == LinearPolicy::A16Only &&
         point.n == 256 && point.k == 5120) {
         profile = "BF16_F32ACC";
-        return kRtx5090Bf16Fp32AccumulateTFLOPs;
+        return bench::device_specs().bf16_f32acc_tflops;
     }
     profile = "";
     return std::numeric_limits<double>::quiet_NaN();

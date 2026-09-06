@@ -388,8 +388,7 @@ int run_fp8_target() {
         const auto interval = ops::attn_input_proj_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, policy, 1, 128);
         if (interval != peak || (policy == ops::LinearPolicy::A16Only && interval != 0)) {
-            std::cerr << "FP8 attention projection workspace interval mismatch
-";
+            std::cerr << "FP8 attention projection workspace interval mismatch\n";
             ++failures;
         }
         for (int t : {129, 144, 145, 160, 161, 192, 193, 256, 257, 1024})

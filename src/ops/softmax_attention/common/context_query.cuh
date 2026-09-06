@@ -87,7 +87,10 @@ context_query_stage_tile(__nv_bfloat16* dst, const __nv_bfloat16* context,
     }
 }
 
-template <typename ContextPolicy, int Tokens, int WarpsPerCta, int KeyBlock, bool DirectOutput>
+// Partial is deduced from partial_acc: the split accumulator is FP32 on the sliding-window
+// route and BF16 on the dense-context route, and the body static_asserts on which it got.
+template <typename ContextPolicy, int Tokens, int WarpsPerCta, int KeyBlock, bool DirectOutput,
+          typename Partial>
 __device__ __forceinline__ void context_query_split_partial_body(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
     const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ valid_columns,

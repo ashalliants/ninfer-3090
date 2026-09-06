@@ -366,17 +366,17 @@ int run_profile(std::string_view label, const Profile& profile,
             }
         } catch (const std::exception& error) {
             if (unsupported_arch_refusal(error)) {
-                std::cout << "SKIP " << case_label << ": " << error.what() << '\n';
-                continue;
+                std::cout << "SKIP " << label_case << ": " << error.what() << '\n';
+                return;
             }
-            std::cerr << case_label << ": unexpected exception: " << error.what() << '\n';
+            std::cerr << label_case << ": unexpected exception: " << error.what() << '\n';
             ++failures;
-            continue;
+            return;
         }
         const std::size_t exact_workspace = ops::linear_swiglu_workspace_capacity_bytes(
             profile.qtype, profile.gate_up_rows, profile.input_rows, policy, tokens, tokens);
         if (workspace.used() != 0 || workspace.peak_used() != exact_workspace) {
-            std::cerr << case_label << ": exact workspace query/execution high-water mismatch\n";
+            std::cerr << label_case << ": exact workspace query/execution high-water mismatch\n";
             ++failures;
         }
     };

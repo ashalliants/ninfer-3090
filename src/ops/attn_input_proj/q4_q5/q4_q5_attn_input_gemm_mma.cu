@@ -88,15 +88,6 @@ void launch(const Tensor& x, const Weight& query_key_weight, const Weight& gate_
 using MmaR32C32S4 = GemmCfg<32, 32, 64, 16, 16, 4, 1, false, true, true>;
 using MmaR32C64S4 = GemmCfg<32, 64, 64, 16, 16, 4, 1, false, true, true>;
 
-} // namespace
-
-void q4_q5_attn_input_grouped_mma_r32_c32_s4_launch(const Tensor& x, const Weight& query_key_weight,
-                                                    const Weight& gate_value_weight, Tensor& q,
-                                                    Tensor& gate, Tensor& k, Tensor& v,
-                                                    cudaStream_t stream) {
-    launch<MmaR32C32S4>(x, query_key_weight, gate_value_weight, q, gate, k, v, stream);
-using MmaR32C64S4 = GemmCfg<32, 64, 64, 16, 16, 4, 1, false, true, true>;
-
 template <class S, bool Full>
 void mixed_slice(const Tensor& x, const Weight& w0, const Weight& w1, Tensor& q, Tensor& g,
                  Tensor& k, Tensor& v, cudaStream_t stream) {
@@ -122,7 +113,15 @@ void launch_mixed(const Tensor& x, const Weight& w0, const Weight& w1, Tensor& q
             mixed_slice<S, false>(xs, w0, w1, qs, gs, ks, vs, stream);
     });
 }
+
 } // namespace
+
+void q4_q5_attn_input_grouped_mma_r32_c32_s4_launch(const Tensor& x, const Weight& query_key_weight,
+                                                    const Weight& gate_value_weight, Tensor& q,
+                                                    Tensor& gate, Tensor& k, Tensor& v,
+                                                    cudaStream_t stream) {
+    launch<MmaR32C32S4>(x, query_key_weight, gate_value_weight, q, gate, k, v, stream);
+}
 
 void q4_q5_attn_input_grouped_mma_r32_c64_s4_launch(const Tensor& x, const Weight& query_key_weight,
                                                     const Weight& gate_value_weight, Tensor& q,

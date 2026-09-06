@@ -197,10 +197,10 @@ Options parse_options(int argc, char** argv) {
 CyclicKVCacheLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v, std::int32_t window,
                                          std::int32_t batch) {
     return {
-        .k               = Tensor(k.p, DType::BF16, {kHeadDim, kWindow, kKvHeads, 1}),
-        .v               = Tensor(v.p, DType::BF16, {kHeadDim, kWindow, kKvHeads, 1}),
-        .capacity        = kWindow,
-        .padded_capacity = kWindow,
+        .k               = Tensor(k.p, DType::BF16, {kHeadDim, window, kKvHeads, 1}),
+        .v               = Tensor(v.p, DType::BF16, {kHeadDim, window, kKvHeads, 1}),
+        .capacity        = static_cast<std::uint32_t>(window),
+        .padded_capacity = static_cast<std::uint32_t>(window),
         .num_kv_heads    = kKvHeads,
         .head_dim        = kHeadDim,
         .lane_capacity   = batch,

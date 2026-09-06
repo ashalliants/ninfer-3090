@@ -32,7 +32,7 @@ struct D256KVCacheProfile {
     DType value_scale_dtype;
     std::int32_t value_scale_leading_extent;
 
-    [[nodiscard]] bool packed_int4_values() const {
+    [[nodiscard]] constexpr bool packed_int4_values() const {
         return value_code_dtype == DType::U8;
     }
 };
@@ -40,7 +40,7 @@ struct D256KVCacheProfile {
 // value_code_dtype selects between the INT8 and packed int4 value codings inside the INT8 family;
 // callers pass the value plane's own dtype. Other families ignore it, because their value coding
 // is implied by the family.
-inline D256KVCacheProfile d256_kv_cache_profile(DType dtype, DType value_code_dtype) {
+inline constexpr D256KVCacheProfile d256_kv_cache_profile(DType dtype, DType value_code_dtype) {
     switch (dtype) {
     case DType::BF16:
         return {DType::BF16, DType::BF16, kD256KVCacheHeadDim, kD256KVCacheHeadDim,
@@ -65,13 +65,13 @@ inline D256KVCacheProfile d256_kv_cache_profile(DType dtype, DType value_code_dt
 }
 
 // Overload for call sites that describe a cache whose two planes share one coding.
-inline D256KVCacheProfile d256_kv_cache_profile(DType dtype) {
+inline constexpr D256KVCacheProfile d256_kv_cache_profile(DType dtype) {
     return d256_kv_cache_profile(dtype, dtype);
 }
 
 // Overload for call sites that only carry the public KvCacheStorage selection (PagedKVLayerView
 // and friends).
-inline D256KVCacheProfile d256_kv_cache_profile(ninfer::KvCacheStorage storage) {
+inline constexpr D256KVCacheProfile d256_kv_cache_profile(ninfer::KvCacheStorage storage) {
     switch (storage) {
     case ninfer::KvCacheStorage::BFloat16:
         return d256_kv_cache_profile(DType::BF16);

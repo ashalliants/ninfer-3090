@@ -139,8 +139,8 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
                     static_cast<const std::int32_t*>(lanes.data),
                     static_cast<const __nv_bfloat16*>(context.k.data),
                     static_cast<const __nv_bfloat16*>(context.v.data),
-                    static_cast<int>(context.padded_capacity), plan.max_context, 1, scale,
-                    static_cast<__nv_bfloat16*>(partial_acc.data),
+                    static_cast<int>(context.padded_capacity), plan.window - 1, plan.max_context,
+                    1, scale, static_cast<float*>(partial_acc.data),
                     static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
                     static_cast<__nv_bfloat16*>(out.data));
             CUDA_CHECK(cudaGetLastError());
@@ -161,8 +161,8 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
                 static_cast<const std::int32_t*>(lanes.data),
                 static_cast<const __nv_bfloat16*>(context.k.data),
                 static_cast<const __nv_bfloat16*>(context.v.data),
-                static_cast<int>(context.padded_capacity), plan.max_context, plan.split_capacity,
-                scale, static_cast<__nv_bfloat16*>(partial_acc.data),
+                static_cast<int>(context.padded_capacity), plan.window - 1, plan.max_context,
+                plan.split_capacity, scale, static_cast<float*>(partial_acc.data),
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
                 static_cast<__nv_bfloat16*>(out.data));
         CUDA_CHECK(cudaGetLastError());
@@ -172,12 +172,12 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
         const dim3 reduce_grid((ReduceRows + ReduceWarps - 1) / ReduceWarps, 1, q.ne[3]);
         sliding_window_attention_reduce_kernel<Tokens, KeyBlock, ReduceWarps>
             <<<reduce_grid, ReduceWarps * 32, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(partial_acc.data),
+                static_cast<const float*>(partial_acc.data),
                 static_cast<const float*>(partial_m.data),
                 static_cast<const float*>(partial_l.data),
                 static_cast<const std::int32_t*>(positions.data),
-                static_cast<const std::int32_t*>(valid_columns.data), plan.max_context,
-                plan.split_capacity, static_cast<__nv_bfloat16*>(out.data));
+                static_cast<const std::int32_t*>(valid_columns.data), plan.window - 1,
+                plan.max_context, plan.split_capacity, static_cast<__nv_bfloat16*>(out.data));
         CUDA_CHECK(cudaGetLastError());
     });
 }

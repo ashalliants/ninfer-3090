@@ -32,7 +32,14 @@ using Launch = W8Launch;
 template <int InputRows, int TileColumns>
 void tiled_projection(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     constexpr int Warps =
+#if defined(NINFER_SM8X_COMPAT)
+        // 8 warps at TileColumns=40 with InputRows=4096 needs 49664 B of static shared memory,
+        // over sm_86's 49152 B cap. Four warps is what the other w8 small-T schedules already
+        // fall back to on this architecture (see W8SmallTMmaDefaultSchedule).
+        InputRows == 4096 ? (TileColumns <= 24 ? 8 : 4) : (TileColumns <= 32 ? 8 : 4);
+#else
         InputRows == 4096 ? (TileColumns <= 40 ? 8 : 4) : (TileColumns <= 32 ? 8 : 4);
+#endif
     constexpr Cache Activation =
         InputRows == 4096 && ((TileColumns > 24 && TileColumns <= 40) || TileColumns > 48)
             ? Cache::cg

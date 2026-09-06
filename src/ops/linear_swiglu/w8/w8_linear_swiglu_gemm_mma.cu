@@ -117,7 +117,14 @@ void w8_dflash2_linear_swiglu_mma_r64_c80_k128_launch(const Tensor& x, const Wei
 
 void w8_dflash2_linear_swiglu_mma_r64_c96_k128_launch(const Tensor& x, const Weight& w, Tensor& out,
                                                       cudaStream_t stream) {
+#if defined(NINFER_SM8X_COMPAT)
+    // BK=128 costs 64*128*2 + 96*128*2 + 64*128 + 64*16 = 50176 B of static shared memory,
+    // over sm_86's 49152 B cap (the linker rejects it at 0xc400). Halving the K tile costs
+    // more K iterations but keeps the 96-wide output tile this route is selected for.
+    using Schedule = W8RowSplitMmaGemmSchedule<64, 96, 64, 8, 2, 2, 64, 1>;
+#else
     using Schedule = W8RowSplitMmaGemmSchedule<64, 96, 64, 8, 2, 2, 128, 1>;
+#endif
     launch_route<Schedule>(x, w, out, stream);
 }
 

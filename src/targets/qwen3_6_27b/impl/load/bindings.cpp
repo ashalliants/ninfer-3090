@@ -482,7 +482,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     const bool overlay  = features.overlay_vision();
     out.token_embedding =
         bind_weight(binder, "text/token_embedding", vocabulary_format, {248320, 5120},
-                    overlay ? kEvictRankEmbedding : 0);
+                    artifact::TensorPlacement::Device, overlay ? kEvictRankEmbedding : 0);
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
@@ -499,8 +499,9 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     }
     out.final_norm =
         artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16, {5120});
-    out.output_head = bind_weight(binder, "text/output_head", vocabulary_format, {248320, 5120},
-                                  overlay ? kEvictRankLmHead : 0);
+    out.output_head =
+        bind_weight(binder, "text/output_head", vocabulary_format, {248320, 5120},
+                    artifact::TensorPlacement::Device, overlay ? kEvictRankLmHead : 0);
     const artifact::TensorPlacement proposal_placement =
         features.optimized_proposal() ? artifact::TensorPlacement::Device
                                       : artifact::TensorPlacement::ValidateOnly;
