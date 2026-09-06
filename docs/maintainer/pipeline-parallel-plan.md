@@ -127,6 +127,57 @@ Counted rather than guessed, since it decides whether this is a day or a week:
 (`decode_impl.h:24`, `mtp_impl.h:25`, `mtp_impl.h:85`, `dflash_impl.h:377`), all of which are
 single-device today. Item 6 is therefore the large one, and items 4 and 5 are its prerequisites.
 
+## Implementation guide for items 4-6
+
+Written after reading the execution path, so the remaining work is mechanical rather than
+exploratory. The ordering matters: 4 and 5 are prerequisites of 6.
+
+### The resources that must become per-rank
+
+`Program` (`program.h:650-670`) holds a single set of device-resident members. For a split, these
+need one instance per rank:
+
+| member | why |
+|---|---|
+| `workspace_storage` (`DeviceArena`) | scratch must live on the device running the layer |
+| `work` (`WorkspaceArena`) | same |
+| `decoder` (`DecoderState`, holds `PagedKVCache`) | KV for a layer must sit with that layer |
+| `state_images` / `host_state_images` | GDN recurrent state is per layer |
+| `kv_arena`, `text_kv_pages`, `text_kv_addresses` | KV paging is per device |
+
+`PagedKVCache(DeviceSpan backing, layout)` already takes a layer count, so each rank constructs one
+sized to `split.rank_layers(rank)`. Every call site indexing KV by layer must switch from the
+global layer index to `split.placement(layer).local` -- that reindexing is the single most likely
+source of silent corruption in this whole change, and is why `PipelineSplit` returns both.
+
+### Threading the rank through execution
+
+`ExecutionCore` (`schedule.h:31`) is the natural carrier. It currently holds `DeviceContext&`,
+`WorkspaceArena&` and one `LoadedModelData&`; it should hold the per-rank workspace vector and the
+split, with a helper returning the right workspace and stream for a layer.
+
+`TextContext` is built on the stack per schedule (`decode_impl.h:24`, `mtp_impl.h:25`,
+`mtp_impl.h:85`, `dflash_impl.h:377`), which is convenient: it means the rank can be chosen at
+construction rather than threaded through every method. The 18 `ctx_.stream` uses inside
+`text_context_impl.h` become the active rank's stream, and `run_layers` gains, at each boundary
+`split.crosses_after(layer)`:
+
+1. record an event on the producing rank's stream,
+2. make the consuming rank's stream wait on it,
+3. `cudaMemcpyPeerAsync` the residual stream `x` (hidden x T, BF16) to the consuming rank's buffer,
+4. continue with the consuming rank's workspace and weights.
+
+`cudaMemcpyPeerAsync` is correct with or without peer access -- it stages through host memory when
+peer access is unavailable, confirmed on hardware.
+
+### The trap
+
+`x` is a workspace tensor. Each rank has its own workspace, so the destination is *not* the same
+allocation -- the copy is between two arenas, and the consuming rank's `run_layers` must continue
+from its own buffer rather than the pointer it was handed. Getting this wrong yields a program
+that runs, reads another device's memory through a stale pointer, and produces plausible-looking
+rubbish rather than crashing.
+
 ## A useful milestone short of execution
 
 Items 1-3 plus 7 give a build that **loads the model split across two cards and reports the KV
