@@ -311,9 +311,13 @@ LoadedModelData::LoadedModelData(std::vector<BindingPlan> plans,
     // The embedding and the vision backbone feed layer 0; the head objects consume the final
     // hidden state. Each therefore reads from the rank that owns that end of the model.
     const BindingPlan& embed_plan               = plans.front();
-    const BindingPlan& head_plan                = plans.back();
+    // Rank 0, not the last rank: the head is bound wherever owns_head() says, and that is rank 0
+    // because the final norm, output head, proposal and MTP all write round state and the
+    // persistent prefill buffer, which live there. Reading them from the last rank's artifact is
+    // what produced "object handle does not name a materialized tensor".
+    const BindingPlan& head_plan                = plans.front();
     artifact::MaterializedArtifact& embed_backing = backings.front();
-    artifact::MaterializedArtifact& head_backing  = backings.back();
+    artifact::MaterializedArtifact& head_backing  = backings.front();
 
     frontend = qwen3_6::take_frontend_resources(embed_backing, embed_plan.frontend);
 

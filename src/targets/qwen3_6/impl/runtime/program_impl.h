@@ -775,7 +775,12 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision),
       vision_overlay(model.vision_overlay ? &*model.vision_overlay : nullptr),
-      use_cuda_graph(plan.use_cuda_graph),
+      // A CUDA graph is captured on one device's stream, and a cross-device copy cannot be
+      // recorded into it -- cudaMemcpyPeerAsync during capture fails with
+      // cudaErrorStreamCaptureUnsupported. An expert-offload schedule crosses on every layer, so
+      // capture is off whenever the model is split. That is a real cost against the single-card
+      // baseline, which captures a whole MTP round, and it is measured rather than assumed.
+      use_cuda_graph(plan.use_cuda_graph && model_in.split.single_rank()),
       causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       kv_arena(make_kv_arena(device_in, model_in, plan)),

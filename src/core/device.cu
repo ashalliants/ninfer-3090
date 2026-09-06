@@ -65,10 +65,10 @@ DeviceContext::DeviceContext(std::span<const int> device_ids) {
                                      std::to_string(count) +
                                      (count == 1 ? " device is visible" : " devices are visible"));
         }
-        if (std::find(device_ids_.begin(), device_ids_.begin() + static_cast<std::ptrdiff_t>(i),
-                      id) != device_ids_.begin() + static_cast<std::ptrdiff_t>(i)) {
-            throw std::invalid_argument("CUDA device list contains a duplicate id");
-        }
+        // A repeated id is allowed on purpose. Two ranks on one card is not a useful deployment --
+        // it frees no memory -- but it exercises the entire split path (per-rank binding and
+        // materialization, per-rank workspaces, and the cross-rank copies) on a single-GPU
+        // machine. Every bug caught that way is one not caught by renting two cards.
     }
 
     endpoints_.resize(device_ids_.size());
@@ -107,7 +107,11 @@ DeviceContext::DeviceContext(std::span<const int> device_ids) {
             }
         }
 
-        if (endpoints_.size() == 2) {
+        // Two ranks on the same card need no peer setup: copies between them are ordinary
+        // device-to-device, and enabling peer access to self is an error.
+        if (endpoints_.size() == 2 && endpoints_[0].device == endpoints_[1].device) {
+            peer_access_ = true;
+        } else if (endpoints_.size() == 2) {
             const Endpoint& first  = endpoints_[0];
             const Endpoint& second = endpoints_[1];
             if (first.props.major != second.props.major ||

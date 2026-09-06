@@ -33,7 +33,8 @@ std::uint32_t parse_u32(const char* text, std::string_view label, bool allow_zer
     return static_cast<std::uint32_t>(value);
 }
 
-// Same shape as serve's --devices: one or two distinct ids. Existence is checked at engine
+// Same shape as serve's --devices: one or two ids. Repeating an id puts both ranks on one
+// card, which exercises the split path without a second GPU. Existence is checked at engine
 // startup; this only parses the shape.
 std::vector<int> parse_device_list(std::string_view text) {
     std::vector<int> devices;
@@ -53,7 +54,9 @@ std::vector<int> parse_device_list(std::string_view text) {
         throw std::invalid_argument("--devices takes one or two CUDA device ids");
     }
     if (devices.size() == 2 && devices[0] == devices[1]) {
-        throw std::invalid_argument("--devices entries must be distinct");
+        // Deliberately permitted: the same id twice puts both ranks on one card, which saves no
+        // memory but exercises the whole split path on a single-GPU machine.
+        (void)0;
     }
     return devices;
 }

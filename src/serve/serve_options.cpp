@@ -146,7 +146,9 @@ std::vector<int> parse_device_list(std::string_view value) {
         throw std::invalid_argument("--devices takes one or two CUDA device ids");
     }
     if (devices.size() == 2 && devices[0] == devices[1]) {
-        throw std::invalid_argument("--devices entries must be distinct");
+        // Deliberately permitted: the same id twice puts both ranks on one card, which saves no
+        // memory but exercises the whole split path on a single-GPU machine.
+        (void)0;
     }
     return devices;
 }

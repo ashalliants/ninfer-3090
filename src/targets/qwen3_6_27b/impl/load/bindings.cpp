@@ -268,12 +268,17 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out,
             target.gdn.output =
                 bind_weight(binder, prefix + "gdn/output", NumericFormat::Q5G64_F16S, {5120, 6144}, 0, core_place);
         }
+        // The mlp tail is what moves: ~15 GiB of this model's ~16 GiB of weights. Its
+        // post_attention_norm rides along so the offloaded card runs the whole tail in one go.
+        const auto expert = ownership.owns_layer_experts(static_cast<std::uint32_t>(layer))
+                                ? artifact::TensorPlacement::Device
+                                : artifact::TensorPlacement::ValidateOnly;
         target.post_attention_norm = artifact::bind_tensor(
-            binder, prefix + "post_attention_norm", NumericFormat::BF16, {5120}, core_place);
-        target.mlp.gate_up =
-            bind_weight(binder, prefix + "mlp/gate_up", NumericFormat::Q4G64_F16S, {34816, 5120}, 0, core_place);
-        target.mlp.down =
-            bind_weight(binder, prefix + "mlp/down", NumericFormat::Q5G64_F16S, {5120, 17408}, 0, core_place);
+            binder, prefix + "post_attention_norm", NumericFormat::BF16, {5120}, expert);
+        target.mlp.gate_up = bind_weight(binder, prefix + "mlp/gate_up",
+                                         NumericFormat::Q4G64_F16S, {34816, 5120}, 0, expert);
+        target.mlp.down    = bind_weight(binder, prefix + "mlp/down", NumericFormat::Q5G64_F16S,
+                                         {5120, 17408}, 0, expert);
     }
 }
 
