@@ -125,6 +125,45 @@ void even_splits_evenly() {
     check_throws([] { (void)ninfer::PipelineSplit::even(2, 3); }, "more ranks than layers");
 }
 
+// RankOwnership decides which tensors a binding pass uploads. Getting it wrong is expensive and
+// quiet -- a rank that claims nothing loads no weights, and one that claims everything defeats the
+// whole point by putting the full model on both cards.
+void ownership_defaults_to_the_whole_model() {
+    const ninfer::RankOwnership all;
+    check(all.whole_model(), "default ownership is the whole model");
+    check(all.owns_embedding(), "default owns the embedding");
+    check(all.owns_head(), "default owns the head");
+    for (std::uint32_t layer = 0; layer < 40; ++layer) {
+        check(all.owns_layer(layer), "default owns every layer");
+    }
+
+    // A single-rank split is also the whole model, which is what makes the one-GPU path a no-op.
+    const ninfer::PipelineSplit identity(40);
+    const ninfer::RankOwnership single{&identity, 0};
+    check(single.whole_model(), "a one-rank split owns the whole model");
+    check(single.owns_embedding() && single.owns_head(), "one rank owns both ends");
+}
+
+void ownership_partitions_across_two_ranks() {
+    const ninfer::PipelineSplit split(40, {20, 40});
+    const ninfer::RankOwnership first{&split, 0};
+    const ninfer::RankOwnership second{&split, 1};
+
+    check(!first.whole_model() && !second.whole_model(), "a two-rank split is not whole-model");
+
+    // The embedding feeds layer 0; the head consumes the last layer. They must land on opposite
+    // ranks, and each on exactly one.
+    check(first.owns_embedding() && !second.owns_embedding(), "only rank 0 owns the embedding");
+    check(second.owns_head() && !first.owns_head(), "only the last rank owns the head");
+
+    for (std::uint32_t layer = 0; layer < 40; ++layer) {
+        const bool a = first.owns_layer(layer);
+        const bool b = second.owns_layer(layer);
+        check(a != b, "every layer is owned by exactly one rank");
+        check(a == (layer < 20), "rank 0 owns the first half");
+    }
+}
+
 void rejects_incoherent_boundaries() {
     check_throws([] { (void)ninfer::PipelineSplit(40, {20, 30}); },
                  "boundaries must cover every layer");
@@ -146,6 +185,8 @@ int main() {
     balanced_by_bytes_equalises_bytes_not_layers();
     balanced_by_bytes_degenerates_safely();
     even_splits_evenly();
+    ownership_defaults_to_the_whole_model();
+    ownership_partitions_across_two_ranks();
     rejects_incoherent_boundaries();
 
     if (failures != 0) {
