@@ -90,12 +90,20 @@ works.
 
 ## Status
 
-- [ ] 1. Layer/rank mapping
-- [ ] 2. Rank-partitioned bindings
-- [ ] 3. Per-rank materialization
+- [x] 1. Layer/rank mapping -- `core/pipeline_split.h`, `PipelineSplit` + `RankOwnership`, tested
+      in `tests/test_pipeline_split.cpp`.
+- [~] 2. Rank-partitioned bindings -- done for **35B-A3B** only. `bind_artifact` takes a
+      `RankOwnership` defaulting to the whole model, and binds unowned layers `ValidateOnly`.
+      **27B is not done**: it has two separate layer-binding paths (`bind_groupwise_text_layers`
+      and `bind_nvfp4_text_layers`), so it is left until the plumbing is proven on the 35B. Item 3
+      must reject a pipeline split on the 27B loudly rather than let both ranks materialize the
+      whole model.
+- [ ] 3. Per-rank materialization -- two plans, two `materialize()` calls under `ScopedDeviceRank`,
+      driven from `registry.cpp:105-137`, which is single-device throughout today.
 - [ ] 4. Per-rank workspace
 - [ ] 5. Per-rank KV / GDN state
 - [ ] 6. run_layers split
-- [ ] 7. Memory accounting
+- [ ] 7. Memory accounting -- `resolve_kv_capacity` and `current_free_device_bytes()` both assume
+      one device; this is the item that actually delivers the KV capacity goal.
 - [ ] 8. CUDA graphs
 - [ ] 9. Hardware validation

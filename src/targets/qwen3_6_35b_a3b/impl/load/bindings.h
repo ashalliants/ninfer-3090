@@ -8,6 +8,7 @@
 
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
+#include "core/pipeline_split.h"
 #include "core/tensor.h"
 #include "ninfer/ops/sparse_moe.h"
 
@@ -110,7 +111,11 @@ struct ArtifactLoadPlan {
     artifact::MaterializationPlan materialization;
 };
 
-ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features);
+// ownership selects which layers this pass uploads to the current device. Default-constructed it
+// owns the whole model, which is the single-GPU path; for a pipeline split, call this once per
+// rank with that rank's ownership and materialize each plan on its own device.
+ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features,
+                               RankOwnership ownership = {});
 
 struct SparseMoePayload {
     ops::SparseMoeWeights op;

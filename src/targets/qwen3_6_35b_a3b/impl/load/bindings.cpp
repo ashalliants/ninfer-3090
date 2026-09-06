@@ -102,63 +102,82 @@ constexpr std::uint32_t kEvictRankDraftHead = 500;
 constexpr std::uint32_t kEvictRankEmbedding = 600;
 constexpr std::uint32_t kEvictRankLmHead    = 700;
 
-ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features) {
+ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features,
+                               RankOwnership ownership) {
     ArtifactLoadPlan load_plan;
-    BindingPlan& out    = load_plan.bindings;
-    out.frontend        = qwen3_6::bind_frontend_resources(binder);
-    out.features        = features;
-    const bool overlay  = features.overlay_vision();
-    out.token_embedding = artifact::bind_tensor(binder, "text/token_embedding",
-                                                NumericFormat::W8G32_F16S, {248320, 2048},
-                                                artifact::TensorPlacement::Device,
-                                                overlay ? kEvictRankEmbedding : 0);
+    BindingPlan& out   = load_plan.bindings;
+    out.frontend       = qwen3_6::bind_frontend_resources(binder);
+    out.features       = features;
+    const bool overlay = features.overlay_vision();
+
+    // Everything this rank does not own is still bound, but ValidateOnly: the artifact is checked
+    // in full against the file while only this rank's bytes are uploaded to this device.
+    const auto head_placement = ownership.owns_head() ? artifact::TensorPlacement::Device
+                                                      : artifact::TensorPlacement::ValidateOnly;
+    const auto embedding_placement = ownership.owns_embedding()
+                                         ? artifact::TensorPlacement::Device
+                                         : artifact::TensorPlacement::ValidateOnly;
+
+    out.token_embedding =
+        artifact::bind_tensor(binder, "text/token_embedding", NumericFormat::W8G32_F16S,
+                              {248320, 2048}, embedding_placement,
+                              overlay ? kEvictRankEmbedding : 0);
 
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
         const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
-        target.input_norm        = artifact::bind_device_tensor(binder, prefix + "input_norm",
-                                                                NumericFormat::BF16, {2048});
+        const auto place = ownership.owns_layer(static_cast<std::uint32_t>(layer))
+                               ? artifact::TensorPlacement::Device
+                               : artifact::TensorPlacement::ValidateOnly;
+        const auto bind_layer_tensor = [&](std::string_view name, NumericFormat format,
+                                           std::initializer_list<std::uint64_t> shape) {
+            return artifact::bind_tensor(binder, name, format, shape, place);
+        };
+
+        target.input_norm = bind_layer_tensor(prefix + "input_norm", NumericFormat::BF16, {2048});
         target.is_full_attention = is_full_layer(layer);
         if (target.is_full_attention) {
             target.attention.query_key_gate_value =
-                artifact::bind_device_tensor(binder, prefix + "attention/query_key_gate_value",
-                                             NumericFormat::W8G32_F16S, {9216, 2048});
-            target.attention.query_norm = artifact::bind_device_tensor(
-                binder, prefix + "attention/query_norm", NumericFormat::BF16, {256});
-            target.attention.key_norm = artifact::bind_device_tensor(
-                binder, prefix + "attention/key_norm", NumericFormat::BF16, {256});
-            target.attention.output = artifact::bind_device_tensor(
-                binder, prefix + "attention/output", NumericFormat::W8G32_F16S, {2048, 4096});
+                bind_layer_tensor(prefix + "attention/query_key_gate_value",
+                                  NumericFormat::W8G32_F16S, {9216, 2048});
+            target.attention.query_norm =
+                bind_layer_tensor(prefix + "attention/query_norm", NumericFormat::BF16, {256});
+            target.attention.key_norm =
+                bind_layer_tensor(prefix + "attention/key_norm", NumericFormat::BF16, {256});
+            target.attention.output = bind_layer_tensor(
+                prefix + "attention/output", NumericFormat::W8G32_F16S, {2048, 4096});
         } else {
-            target.gdn.a_log       = artifact::bind_device_tensor(binder, prefix + "gdn/a_log",
-                                                                  NumericFormat::FP32, {32});
-            target.gdn.dt_bias     = artifact::bind_device_tensor(binder, prefix + "gdn/dt_bias",
-                                                                  NumericFormat::FP32, {32});
-            target.gdn.convolution = artifact::bind_device_tensor(
-                binder, prefix + "gdn/convolution", NumericFormat::BF16, {4, 8192});
-            target.gdn.a_b_projection = artifact::bind_device_tensor(
-                binder, prefix + "gdn/a_b_projection", NumericFormat::BF16, {64, 2048});
-            target.gdn.query_key_value_z = artifact::bind_device_tensor(
-                binder, prefix + "gdn/query_key_value_z", NumericFormat::W8G32_F16S, {12288, 2048});
-            target.gdn.norm   = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
-                                                             NumericFormat::BF16, {128});
-            target.gdn.output = artifact::bind_device_tensor(
-                binder, prefix + "gdn/output", NumericFormat::W8G32_F16S, {2048, 4096});
+            target.gdn.a_log =
+                bind_layer_tensor(prefix + "gdn/a_log", NumericFormat::FP32, {32});
+            target.gdn.dt_bias =
+                bind_layer_tensor(prefix + "gdn/dt_bias", NumericFormat::FP32, {32});
+            target.gdn.convolution =
+                bind_layer_tensor(prefix + "gdn/convolution", NumericFormat::BF16, {4, 8192});
+            target.gdn.a_b_projection =
+                bind_layer_tensor(prefix + "gdn/a_b_projection", NumericFormat::BF16, {64, 2048});
+            target.gdn.query_key_value_z = bind_layer_tensor(
+                prefix + "gdn/query_key_value_z", NumericFormat::W8G32_F16S, {12288, 2048});
+            target.gdn.norm = bind_layer_tensor(prefix + "gdn/norm", NumericFormat::BF16, {128});
+            target.gdn.output =
+                bind_layer_tensor(prefix + "gdn/output", NumericFormat::W8G32_F16S, {2048, 4096});
         }
-        target.post_attention_norm = artifact::bind_device_tensor(
-            binder, prefix + "post_attention_norm", NumericFormat::BF16, {2048});
+        target.post_attention_norm =
+            bind_layer_tensor(prefix + "post_attention_norm", NumericFormat::BF16, {2048});
         target.moe = bind_moe(binder, prefix + "moe/", NumericFormat::Q4G64_F16S,
-                              routed_down_format(layer), artifact::TensorPlacement::Device);
+                              routed_down_format(layer), place);
     }
 
-    out.final_norm =
-        artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16, {2048});
+    out.final_norm = artifact::bind_tensor(binder, "text/final_norm", NumericFormat::BF16, {2048},
+                                           head_placement);
     out.output_head = artifact::bind_tensor(binder, "text/output_head", NumericFormat::Q6G64_F16S,
-                                            {248320, 2048}, artifact::TensorPlacement::Device,
+                                            {248320, 2048}, head_placement,
                                             overlay ? kEvictRankLmHead : 0);
+    // The proposal and MTP heads read the final hidden state, so they live with the rank that
+    // produces it -- gated by ownership as well as by the feature being enabled at all.
     const artifact::TensorPlacement proposal_placement =
-        features.optimized_proposal() ? artifact::TensorPlacement::Device
-                                      : artifact::TensorPlacement::ValidateOnly;
+        (features.optimized_proposal() && ownership.owns_head())
+            ? artifact::TensorPlacement::Device
+            : artifact::TensorPlacement::ValidateOnly;
     out.draft_head = artifact::bind_tensor(binder, "text/draft_head", NumericFormat::Q4G64_F16S,
                                            {131072, 2048}, proposal_placement,
                                            overlay ? kEvictRankDraftHead : 0);
@@ -166,9 +185,9 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
         binder, "text/draft_head_token_ids", NumericFormat::I32, {131072}, proposal_placement);
     validate_draft_ids(binder, out.draft_head_token_ids);
 
-    const artifact::TensorPlacement mtp_placement = features.mtp()
-                                                        ? artifact::TensorPlacement::Device
-                                                        : artifact::TensorPlacement::ValidateOnly;
+    const artifact::TensorPlacement mtp_placement =
+        (features.mtp() && ownership.owns_head()) ? artifact::TensorPlacement::Device
+                                                  : artifact::TensorPlacement::ValidateOnly;
     const auto bind_mtp                           = [&](std::string_view name, NumericFormat format,
                               std::initializer_list<std::uint64_t> shape) {
         return artifact::bind_tensor(binder, name, format, shape, mtp_placement,

@@ -147,4 +147,34 @@ private:
     std::vector<std::uint32_t> boundaries_;
 };
 
+// What a single binding/materialization pass owns.
+//
+// A rank uploads only its own layers; everything else is bound ValidateOnly, so the artifact is
+// still checked in full against the file while only this rank's bytes reach this device. That
+// reuses the placement mechanism already used for disabled features rather than inventing a
+// second one.
+//
+// Default-constructed it owns everything, which is what keeps the single-GPU path byte-identical.
+struct RankOwnership {
+    const PipelineSplit* split = nullptr;
+    std::size_t rank           = 0;
+
+    [[nodiscard]] bool whole_model() const noexcept {
+        return split == nullptr || split->single_rank();
+    }
+
+    [[nodiscard]] bool owns_layer(std::uint32_t layer) const {
+        return whole_model() || split->placement(layer).rank == rank;
+    }
+
+    // The embedding feeds layer 0, so it belongs with the first rank.
+    [[nodiscard]] bool owns_embedding() const noexcept { return whole_model() || rank == 0; }
+
+    // The final norm, output head, draft head and MTP all consume the last layer's hidden state,
+    // so they belong with the rank that produces it.
+    [[nodiscard]] bool owns_head() const noexcept {
+        return whole_model() || rank + 1 == split->ranks();
+    }
+};
+
 } // namespace ninfer
