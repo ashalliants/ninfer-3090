@@ -50,13 +50,15 @@ during each mlp tail and rank 1 idles the rest of the time. Total weight bytes r
 unchanged, so decode speed is roughly what one card gives, minus the crossing overhead. The win is
 capacity.
 
-**NVLink is nearly irrelevant to it.** A staged hop costs ~13 us at activation sizes (measured;
-latency-bound, flat from 4 KiB to 40 KiB), against a decode step of tens of milliseconds. A bridge
-would save a few microseconds per crossing. Bandwidth only starts to matter above ~320 KiB, i.e.
-at prefill batch sizes, where the crossings are larger and the cost is worth measuring separately.
+**Peer access is not required.** Crossings stage through pinned host memory, which works on any
+pair. Confirmed on a rented bridgeless 2x 3090, where `cudaDeviceCanAccessPeer` returns 0.
 
-Peer access is not required: `cudaMemcpyPeerAsync` stages through host memory when it is
-unavailable, confirmed on a rented bridgeless 2x 3090.
+**NVLink would help prefill, and barely touch decode.** Decode crossings are ~4 KiB and
+latency-bound, so a bridge saves microseconds against a decode step of tens of milliseconds --
+which is why decode reaches 90% of single-GPU with MTP and no bridge at all. Prefill crossings are
+~4 MB and bandwidth-bound: 336 MB per chunk is the whole of the remaining 16% gap, and that is
+where a bridge would pay. It is the one place the earlier "NVLink is irrelevant" claim was too
+broad -- true per token, not true per prefill chunk.
 
 ## How it works
 
@@ -92,7 +94,71 @@ That is why the hardware test compares **greedy text against the single-GPU refe
 checking that it starts. Clean startup and sensible memory figures are both compatible with a build
 that is silently reading the wrong device.
 
+## Measured on two RTX 3090s
+
+Bridgeless pair, PCIe, 4,000-token prompt, int8 KV. Output is byte-identical to the single-GPU
+reference in every split row, including with MTP and on both models.
+
+### Qwen3.6-35B-A3B
+
+| config | prefill | decode | free for KV |
+|---|---|---|---|
+| single GPU | 6.34k | 176.8 | 3.71 GiB |
+| single GPU + MTP3 | 6.31k | 267.1 | 2.87 GiB |
+| split | 5.30k (84%) | 137.1 (78%) | **21.1 GiB** |
+| **split + MTP3** | 5.25k (83%) | **240.5 (90%)** | **20.3 GiB** |
+
+**Run it with MTP.** Speculation processes several tokens per forward pass, so the same crossings
+serve four tokens instead of one and the decode penalty falls from 22% to 10%.
+
+### Qwen3.8-27B
+
+| config | prefill | decode | free for KV |
+|---|---|---|---|
+| single GPU | 1.14k | 37.0 | 7.38 GiB |
+| split | 1.04k (91%) | **37.6 (102%)** | **16.5 GiB** |
+
+Its decode is unaffected: the 27B is dense and compute-bound, so the crossings are cheap relative
+to the work. Its weights also divide less dramatically (6.79 / 9.13 GiB against 2.15 / 17.4 on the
+35B) because its attention and GDN projections at hidden 5120 are large next to its dense MLP.
+
+### Capacity, which is the point
+
+`--kv-capacity auto`, largest each mode resolves:
+
+| | max total KV | note |
+|---|---|---|
+| single GPU | 237,248 tokens | 262,144 context **fails to start at all** |
+| split, C=8 @ 262k | **1,929,728 tokens** | 8 sessions at ~241k each, 1.08 GiB spare |
+
+**8.1x the KV**, and a single 3090 cannot run 262k context at any concurrency.
+
+Concurrency is capped at 8 by `kMaximumConcurrency` (`include/ninfer/types.h`), which is a
+compile-time constant sizing arrays in the admission policy and engine core -- not a memory limit.
+Raising it is a separate, bounded change.
+
+## How performance got here
+
+Three findings, in order, because two of them contradicted the obvious guess:
+
+**The prefill loss was CUDA graphs, not the transfers.** The split disabled graph capture because
+`cudaMemcpyPeerAsync` cannot be recorded into a graph. The control that settled it:
+`NINFER_KEEP_EXPERTS=39`, two crossings per pass instead of eighty, still gave 1.90k prefill --
+and a single GPU with `--no-cuda-graph` gave 1.88k. The same number. Capture was worth a factor of
+3.4 on prefill and had been written off at 0.7% from a decode-only measurement.
+
+**Staging through pinned host fixes both problems at once.** A D2H/H2D pair is an ordinary graph
+node where the peer copy is not, and it is also about twice as fast on a bridgeless pair (0.33 ms
+against 0.69 ms for 4 MB). Prefill went 1.38k -> 4.27k.
+
+**A crossing is serial, so its halves never overlap.** Prefill scales linearly with crossing count
+at ~0.765 ms each for a 4 MB stream, against the ~0.33 ms bandwidth implies -- exactly what a
+strict D2H-then-H2D costs. Splitting the byte range into four pieces pipelines them: 4.27k -> 5.30k.
+
+The remaining gap is real PCIe traffic, 336 MB per prefill chunk.
+
 ## Status
+
 
 - [x] Layer/rank mapping, with tests (`tests/test_pipeline_split.cpp`).
 - [x] Per-rank arena switching, with tests (`tests/test_arena_ranks.cpp`).
