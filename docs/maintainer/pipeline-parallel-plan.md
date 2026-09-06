@@ -1,202 +1,126 @@
-# Pipeline parallelism: plan of record
+# Multi-GPU expert offload
 
-Goal, in the user's terms: run int8 KV with several large concurrent sessions, which a single
-24 GB 3090 cannot do. This document is the design and the running status.
+Goal, in the user's terms: run int8 KV with several large concurrent sessions, which a single 24 GB
+3090 cannot do. This is the design, the reasoning behind it, and the status.
 
-## Why a layer split rather than a tensor split
+## What it does
 
-Measured, not assumed (see `multi-gpu-status.md` for the numbers and the hardware runs):
+With `--devices 0,1`, the expert / MLP block of each layer is materialized on the second GPU.
+Rank 0 keeps everything else -- embeddings, attention, GDN, norms, the head -- and therefore keeps
+the KV cache, the GDN recurrent state, round state and the whole context-cache machinery. During a
+forward pass the residual stream crosses to rank 1 for each layer's mlp tail and comes straight
+back.
 
-- A cross-GPU hop without NVLink costs ~13 us and is **latency-bound**, flat from 4 KiB to 40 KiB,
-  which covers both models' per-token activation. Bandwidth only matters above ~320 KiB.
-- Cost is therefore set by **crossings per token**. A layer split crosses **once**. A tensor split
-  crosses twice per layer -- 128x more for the 27B.
-- Peer access is not required at all: `cudaMemcpyPeer` stages through host memory, confirmed on a
-  rented bridgeless 2x 3090.
+Every byte rank 0 sheds becomes KV, which is the entire point.
 
-**A layer split does not make one request faster.** Layers are sequential, so rank 1 is idle while
-rank 0 works. Its win is capacity, and throughput only with concurrency >= 2 and micro-batching.
-An NVLink bridge is close to irrelevant to it -- one 13 us hop per token against a ~25 ms decode
-step is 0.05%. The bridge is worth something to a *tensor* split, which is the other, harder port
-and the one that improves single-request latency.
+## Why the expert block, and not whole layers
 
-## What it buys -- measured on hardware, not projected
+The first plan was a layer split: layers `[0,k)` on one card, `[k,N)` on the other. Reading the
+execution path showed that is the expensive way to get what we want.
 
-Run on a rented 2x RTX 3090 box (2026-09-06), `--devices 0,1`, int8 KV:
+KV lives with attention, so the question is not "how do we divide the model" but "how much can we
+get **off** the card that serves attention". Three things are pinned to rank 0 regardless:
 
-```
-loading weights | 9.82 GiB   ->  weights ready | 1.9s | 5.15 GiB/s
-loading weights | 9.78 GiB   ->  weights ready | 1.9s | 5.18 GiB/s
+- **attention** needs its KV cache,
+- **GDN** needs its recurrent state,
+- **the head** writes round state and the persistent prefill-hidden buffer, which callers of
+  `run_layers` reach directly (`rmsnorm` into `prefill_hidden_`, then `io_.logits` / `io_.token`).
 
-rank 0 (cuda device 0): layers [0,20), weights 10052 MiB, free 13805 MiB
-rank 1 (cuda device 1): layers [20,40), weights 10011 MiB, free 13847 MiB
-```
+Moving whole layers drags KV pools, GDN state pools, decoder state, state images and the host
+offload / context cache along with them: 33 `decoder->` sites, 43 `state_images->` sites and ~198
+KV-paging sites, plus the planner.
 
-Single-device control on the same box: one card loads all 19.6 GiB and serves, leaving 3.37 GiB.
+The expert block is pinned to nothing, and it is **~88% of the weights** -- 17.3 GiB of 19.6 on the
+35B-A3B (465 MB per layer x 40), and a similar share of the 27B's dense MLP. Offloading only that
+leaves every one of those subsystems untouched.
 
-| | single 3090 | two 3090s, layer split |
-|---|---|---|
-| weights resident | 19.6 GiB | **9.82 + 9.78 GiB** |
-| free after weights | ~3.4 GiB | **13.5 + 13.5 = 27.0 GiB** |
-| KV tokens at ~10 KiB/token | ~262k | **~2.8M** |
+| | KV room on rank 0 | tokens at ~10 KiB | surface |
+|---|---|---|---|
+| single card today | ~3.4 GiB | ~262k | -- |
+| offload 20 layers' experts | ~12.6 GiB | ~1.3M | small |
+| **offload all experts (default)** | **~21.2 GiB** | **~2.2M** | small |
+| full layer split | ~26 GiB | ~2.7M | 274+ sites |
 
-That is roughly **10x the KV**, and it comes from the memory split rather than from interconnect
-speed. The two halves came out within 41 MiB of each other, so the even layer split really is
-byte-balanced for this model -- as expected, since each rank gets five of the ten full-attention
-layers (layers 3,7,11,15,19 against 23,27,31,35,39).
+83% of the benefit for a fraction of the risk.
 
-## Why this is cheaper than the earlier assessment feared
+## What it is not
 
-`multi-gpu-status.md` called the artifact layer "the piece that decides whether the rest is
-tractable", because their tensor split needs **per-rank arenas inside one artifact** for row-split
-weights. A layer split does not: every layer lives wholly on one device, so:
+**It does not make anything faster.** The two cards work in sequence, not in parallel: rank 0 idles
+during each mlp tail and rank 1 idles the rest of the time. Total weight bytes read per token are
+unchanged, so decode speed is roughly what one card gives, minus the crossing overhead. The win is
+capacity.
 
-- `Binder` builds a `MaterializationPlan` from whatever objects the caller requests
-  (`bindings.cpp:116` loops layers). Two binders filtered by rank produce two plans.
-- `materialize(reader, plan, DeviceContext&, ...)` already takes a device. Call it once per rank
-  under `ScopedDeviceRank`.
-- `PagedKVCache(DeviceSpan backing, layout)` is parameterised by layer count, so one cache per
-  rank on its own device backing.
+**NVLink is nearly irrelevant to it.** A staged hop costs ~13 us at activation sizes (measured;
+latency-bound, flat from 4 KiB to 40 KiB), against a decode step of tens of milliseconds. A bridge
+would save a few microseconds per crossing. Bandwidth only starts to matter above ~320 KiB, i.e.
+at prefill batch sizes, where the crossings are larger and the cost is worth measuring separately.
 
-The artifact layer needs **no redesign**. That is the difference that makes this worth doing now.
+Peer access is not required: `cudaMemcpyPeerAsync` stages through host memory when it is
+unavailable, confirmed on a rented bridgeless 2x 3090.
 
-## The seam
+## How it works
 
-`text_context_impl.h:997`:
+- **`PipelineSplit` / `RankOwnership`** (`core/pipeline_split.h`) answer which rank holds a layer's
+  expert block, and pin everything else to rank 0. A single-rank split is the identity mapping,
+  which keeps every consumer a no-op on one GPU. `experts_on_last` is the default; an empty rank 0
+  is the point of it, not a bug.
+- **`DeviceArena` carries one backing per rank** and switches between them, so one workspace serves
+  both cards and all 76 existing `work_` call sites are unchanged. `Scope` records the rank it was
+  taken on -- a scope opened on one rank legitimately outlives a switch to another, and restoring a
+  foreign bump pointer would hand out overlapping scratch. `reset()` clears every rank, since it
+  marks a round boundary.
+- **`Program`** allocates a workspace per rank, each while its own device is current.
+- **`run_mlp_tail`** crosses the residual stream to the card holding the experts, runs the whole
+  tail there, and copies the result back into the caller's rank-0 buffer.
+  `post_attention_norm` is bound *with* the expert block so the offloaded card does rmsnorm and the
+  expert matmuls back to back -- one crossing out and one back, rather than two of each.
+- **Ordering** uses per-rank streams and fences, never a host sync: record on the producer, wait on
+  the consumer, issue the copy on the consumer's stream.
+- **Loading** binds every rank against the same artifact, with the tensors a rank does not own
+  placed `ValidateOnly`: the file is validated in full on each rank while only that rank's bytes
+  are uploaded. `materialize()` already takes a `DeviceContext`, so each rank runs under
+  `ScopedDeviceRank`.
 
-```cpp
-template <class Tap>
-void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
-    for (int layer = 0; layer < kCfg.n_layers; ++layer) { ... }   // x is the residual stream
-}
-```
+## The trap
 
-`x` is `{hidden, T}` in BF16 and is the only value crossing layers. The split is: run
-`[0, boundary)` on rank 0, copy `x` to rank 1, run `[boundary, n_layers)` there.
+The residual stream is workspace memory and each rank has its own workspace, so a crossing is
+between two arenas. The offloaded rank must run against *its* buffer, and the result must land back
+in the caller's. Getting that wrong yields a program that runs, reads another device's memory
+through a stale pointer, and emits plausible rubbish rather than crashing.
 
-## Work items
-
-Each is verifiable on one GPU with rank count 1 as a no-op, except where noted.
-
-1. **Layer/rank mapping.** A single type owning boundary choice and global-layer -> (rank, local
-   index) translation. Everything else consumes it.
-2. **Rank-partitioned bindings.** Filter the layer loop in both targets'  `bindings.cpp` by rank;
-   embedding on rank 0, final norm + output head on rank 1.
-3. **Per-rank materialization.** Two plans, two `materialize()` calls under `ScopedDeviceRank`.
-4. **Per-rank workspace arenas.**
-5. **Per-rank KV and GDN state pools**, with global->local layer remapping at the call sites.
-6. **`run_layers` split** plus the boundary transfer, and the final hidden coming back for
-   sampling.
-7. **Per-device memory accounting** so `--kv-capacity auto` solves both cards.
-8. **CUDA graphs.** Capture is per-device; expect to disable across the boundary initially and
-   requalify, since the single-card baseline captures a whole MTP round.
-9. **Validate on rented dual 3090** (needs two GPUs).
-
-## Boundary choice
-
-Not necessarily `n_layers / 2`. The two halves should be balanced by **resident bytes**, not layer
-count, because MoE and attention layers differ in size, and because whatever is left over on each
-card becomes KV. The mapping type should take the per-layer byte costs and solve for the split
-that equalises free memory. Start with an even layer count, make it byte-aware once the plumbing
-works.
+That is why the hardware test compares **greedy text against the single-GPU reference** rather than
+checking that it starts. Clean startup and sensible memory figures are both compatible with a build
+that is silently reading the wrong device.
 
 ## Status
 
-- [x] 1. Layer/rank mapping -- `core/pipeline_split.h`, `PipelineSplit` + `RankOwnership`, tested
-      in `tests/test_pipeline_split.cpp`.
-- [~] 2. Rank-partitioned bindings -- done for **35B-A3B** only. `bind_artifact` takes a
-      `RankOwnership` defaulting to the whole model, and binds unowned layers `ValidateOnly`.
-      **27B is not done**: it has two separate layer-binding paths (`bind_groupwise_text_layers`
-      and `bind_nvfp4_text_layers`), so it is left until the plumbing is proven on the 35B. Item 3
-      must reject a pipeline split on the 27B loudly rather than let both ranks materialize the
-      whole model.
-- [ ] 3. Per-rank materialization -- two plans, two `materialize()` calls under `ScopedDeviceRank`,
-      driven from `registry.cpp:105-137`, which is single-device throughout today.
-- [ ] 4. Per-rank workspace
-- [ ] 5. Per-rank KV / GDN state
-- [ ] 6. run_layers split
-- [ ] 7. Memory accounting -- `resolve_kv_capacity` and `current_free_device_bytes()` both assume
-      one device; this is the item that actually delivers the KV capacity goal.
-- [ ] 8. CUDA graphs. **This is the item with a genuine unknown.** A CUDA graph is captured on one
-      device's stream, so a cross-device schedule cannot be one graph. Our decode path captures a
-      whole MTP round; their fork disabled capture for the cross-device schedule and never
-      quantified the loss. Either the round splits into a per-rank graph either side of the
-      boundary, or capture is off for split decode and the cost has to be measured before anyone
-      calls this a win.
-- [x] 9. Hardware validation **of the load half**. Confirmed on a rented 2x RTX 3090 (numbers
-      above): both ranks materialize on their own device, the layer split is byte-balanced to
-      within 41 MiB, and the combined KV headroom is 27.0 GiB against 3.4 GiB on one card. The
-      single-device control on the same box still loads 19.6 GiB and serves normally. Execution
-      remains unvalidated because it does not exist yet.
+- [x] Layer/rank mapping, with tests (`tests/test_pipeline_split.cpp`).
+- [x] Per-rank arena switching, with tests (`tests/test_arena_ranks.cpp`).
+- [x] Rank-partitioned bindings and per-rank materialization, both targets.
+- [x] Per-rank workspaces.
+- [x] Cross-device mlp tail execution.
+- [x] **27B**, all three of its layer-binding paths (groupwise, NVFP4, and the Qwen3.8 NVFP4/FP8
+      mix).
+- [x] `--devices N,M` on the CLI, so the split can be checked by output rather than by inspection.
+- [ ] Hardware equivalence run: greedy text from the split against the single-GPU reference.
+- [ ] KV capacity measured with `--kv-capacity auto` in both modes.
+- [ ] CUDA graphs across the boundary. Capture is per-device, so a cross-device schedule cannot be
+      one graph. Whether decode capture survives the offload, and what it costs if not, is
+      unmeasured.
+- [ ] Concurrency and context-cache behaviour under the split. These live entirely on rank 0 so
+      they should be unaffected, but "should be" is not "measured".
 
-### Measured surface of item 6
+## Earlier hardware runs
 
-Counted rather than guessed, since it decides whether this is a day or a week:
+A dual 3090 box (bridgeless, `nvidia-smi topo -m` reporting `PHB`) confirmed the pieces this is
+built on:
 
-| site | count |
-|---|---|
-| `ctx_.stream` in `text_context_impl.h` | 18 |
-| `work_` in `text_context_impl.h` | 76 |
-| stream references in `program_impl.h` | 58 |
+```
+peer 0->1=0
+enable_peer 0->1=peer access is not supported between these two devices
+memcpy_peer_1MiB=OK
+device_context=OK size=2 model_parallel=1 peer_access=0
+```
 
-`TextContext` is built on the stack per schedule from `state.execution.{device, model, work}`
-(`decode_impl.h:24`, `mtp_impl.h:25`, `mtp_impl.h:85`, `dflash_impl.h:377`), all of which are
-single-device today. Item 6 is therefore the large one, and items 4 and 5 are its prerequisites.
-
-## Implementation guide for items 4-6
-
-Written after reading the execution path, so the remaining work is mechanical rather than
-exploratory. The ordering matters: 4 and 5 are prerequisites of 6.
-
-### The resources that must become per-rank
-
-`Program` (`program.h:650-670`) holds a single set of device-resident members. For a split, these
-need one instance per rank:
-
-| member | why |
-|---|---|
-| `workspace_storage` (`DeviceArena`) | scratch must live on the device running the layer |
-| `work` (`WorkspaceArena`) | same |
-| `decoder` (`DecoderState`, holds `PagedKVCache`) | KV for a layer must sit with that layer |
-| `state_images` / `host_state_images` | GDN recurrent state is per layer |
-| `kv_arena`, `text_kv_pages`, `text_kv_addresses` | KV paging is per device |
-
-`PagedKVCache(DeviceSpan backing, layout)` already takes a layer count, so each rank constructs one
-sized to `split.rank_layers(rank)`. Every call site indexing KV by layer must switch from the
-global layer index to `split.placement(layer).local` -- that reindexing is the single most likely
-source of silent corruption in this whole change, and is why `PipelineSplit` returns both.
-
-### Threading the rank through execution
-
-`ExecutionCore` (`schedule.h:31`) is the natural carrier. It currently holds `DeviceContext&`,
-`WorkspaceArena&` and one `LoadedModelData&`; it should hold the per-rank workspace vector and the
-split, with a helper returning the right workspace and stream for a layer.
-
-`TextContext` is built on the stack per schedule (`decode_impl.h:24`, `mtp_impl.h:25`,
-`mtp_impl.h:85`, `dflash_impl.h:377`), which is convenient: it means the rank can be chosen at
-construction rather than threaded through every method. The 18 `ctx_.stream` uses inside
-`text_context_impl.h` become the active rank's stream, and `run_layers` gains, at each boundary
-`split.crosses_after(layer)`:
-
-1. record an event on the producing rank's stream,
-2. make the consuming rank's stream wait on it,
-3. `cudaMemcpyPeerAsync` the residual stream `x` (hidden x T, BF16) to the consuming rank's buffer,
-4. continue with the consuming rank's workspace and weights.
-
-`cudaMemcpyPeerAsync` is correct with or without peer access -- it stages through host memory when
-peer access is unavailable, confirmed on hardware.
-
-### The trap
-
-`x` is a workspace tensor. Each rank has its own workspace, so the destination is *not* the same
-allocation -- the copy is between two arenas, and the consuming rank's `run_layers` must continue
-from its own buffer rather than the pointer it was handed. Getting this wrong yields a program
-that runs, reads another device's memory through a stale pointer, and produces plausible-looking
-rubbish rather than crashing.
-
-## A useful milestone short of execution
-
-Items 1-3 plus 7 give a build that **loads the model split across two cards and reports the KV
-headroom on each**. That demonstrates the capacity claim -- the entire point of the exercise --
-and is verifiable on rented hardware before any of the execution rewrite exists. Worth reaching
-and validating first, precisely because it de-risks the expensive part.
+Peer access is unavailable on a consumer pair and irrelevant: the copy works anyway. `DeviceContext`
+constructs across both cards with distinct per-rank streams and fences.
