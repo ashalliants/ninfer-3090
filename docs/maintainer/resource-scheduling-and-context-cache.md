@@ -157,6 +157,13 @@ Used_r(S)=
 同一个物理 allocation 被多个 checkpoints 或 address spaces 引用时只计一次。已经物化的容量计
 allocation，尚未物化但被保护的容量计 reservation；同一容量单位不能同时计入两项。
 
+全局物理占用与 owner-exclusive resources 是两个不同视图。前者直接来自 State/KV stores 的 unique
+allocations 与 concrete reservations；后者只表示单独移除一个 owner 时能够结算的资源。一个同时被
+private checkpoint 与 shared prefix 引用的 allocation 在全局占用中计一次，但在任一 owner 的 exclusive
+resources 中都不计。Owner-exclusive resources 可用于 eviction effect、ownership transfer 和 active
+entitlement 校验，不能用于判断一个 checkpoint 是否具有 resident replica；后者只能查询对应 physical
+store。
+
 每个稳定状态和 transition 中间状态都必须满足：
 
 \[
@@ -369,6 +376,15 @@ State transition 的语义只有：
 Program 根据完整 post-state 选择 Move 或 Fork。Fork source 在 destination 首次 state-writing commit 完成前
 保持 pin；该结算属于 active model transaction，不能与新的 global resource transition 重叠。
 
+Active State binding 同时记录 read source 的生命周期归属。Root、Move、Restore 和 active-capture Fork
+的初始 read 由当前 sequence 提供；从 retained source 或仍有 surviving checkpoint reference 的 consumed
+source 建立 Fork 时，read 由 surviving owner/reference graph 保留，active primary binding 只拥有
+write destination。这个 borrowed read 参与全局物理占用并由 source pin 保护，但不能通过 primary binding
+再次计费，也不能仅凭 primary binding 在 abort/release 时释放；若 surviving checkpoint 本身是 active
+lineage 独占的 optional checkpoint，它只通过该 checkpoint ownership 计入 entitlement，并在该 ownership
+结算后决定 source 是否可释放。Fork settlement 后 read/write 都切换到 destination，生命周期重新归属
+active sequence。
+
 ### 5.2 Typed KV
 
 每个 continuation 对 Main KV 及 selected backend KV 分别持有 typed address space。各 pool 的 frontier、
@@ -422,6 +438,12 @@ required Device checkpoint prefix
 
 Active truncate 或 speculative rollback 可以解除 mappings，但对应容量仍属于该 active reservation。
 只有 terminal release 或明确缩减 active entitlement 的资源 transition 才能把容量归还全局。
+
+Active entitlement 只包含 active owner 的 destination、私有增长 reservation 和已归属于该 lineage 的
+exclusive optional resources。Fork 期间借用的 immutable StateImage/KV source 不能通过 primary binding
+再次计费：它若由其他 surviving owner 保留则只存在于全局 physical occupancy，若由 active lineage 的
+optional checkpoint 独占则只通过该 checkpoint 计一次。否则同一 allocation 会被重复收费，并把合法的
+Fork 错判为超出 active guarantee。
 
 ### 6.2 Terminal 与 capture
 

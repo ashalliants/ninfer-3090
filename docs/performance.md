@@ -1,7 +1,16 @@
 # Single-GPU serving performance
 
+> **DFlash2 is available but unmeasured here.** The upstream catch-up brought the DFlash2
+> speculative backend (`--spec dflash2 --draft-tokens 7`, Qwen3.8-27B only). Upstream publishes
+> DFlash2 numbers for their own hardware; those are deliberately not reproduced in this document,
+> because every figure here is measured on sm_86 and mixing in another architecture's results would
+> make the tables meaningless. DFlash2 rows will be added once measured on a 3090.
+
+
 Tested Git revisions:
 
+- Qwen3.8-27B NVFP4 and groupwise-int DFlash2 block=8 (`k=7`) single-request serving:
+  `03177b910e70f783b00c4f980ce0d1896a6b8592`;
 - Qwen3.8-27B NVFP4 MTP0 context-length serving:
   `f08597d6eaafce5b875934aaa85854fcd5426df8`;
 - Qwen3.8-27B NVFP4 MTP3 single-request and concurrent fixed-corpus serving:
@@ -52,6 +61,7 @@ the measured requests. The concurrent campaign has its own sustained-wave method
 | MTP0 | no `--spec` |
 | MTP3 | `--spec mtp --draft-tokens 3 --lm-head-draft` |
 | DFlash block=8 | `--spec dflash --draft-tokens 7 --lm-head-draft` |
+| DFlash2 block=8 | `--spec dflash2 --draft-tokens 7 --lm-head-draft` |
 
 The MTP0 profile uses four Long NIAH prompts with approximately 8K, 64K, 128K, and 256K tokens.
 Thinking is disabled and the output budget is 128 tokens. These runs measure prefill throughput,
@@ -109,6 +119,35 @@ batching and makes the end-to-end result slower than C=4. Sampling is stochastic
 and send order are fixed, but concurrency-specific numerical routes can change sampled
 continuations and their lengths. The makespan speedup is therefore a fixed-workload serving result
 rather than a fixed-token normalization; the exact decode-token totals are retained in the table.
+
+## Qwen3.8-27B DFlash2 single-request corpus makespan
+
+The 2026-09-06 campaign ran NVFP4 first, then groupwise-int, using the artifacts with the included
+DFlash2 companion weights and the KV terminal-settlement fix in the revision listed above. Each
+profile ran the complete 75-request corpus at C=1 with the same five seeds and shuffle seed
+`20260811` as the MTP3 corpus. Sampling, output limits, INT8 group-64 KV, CUDA Graphs, the
+1,024-token prefill chunk, disabled prefix reuse, and the 131,072-token context ceiling follow the
+single-request method. `--kv-capacity auto` resolved to 131,072 tokens for both profiles.
+
+Makespan covers client release through the final complete HTTP response. The decode rate below
+is total decode tokens divided by full makespan; the per-fixture tables later use server decode
+phase timings. Acceptance here is the ratio of summed accepted and drafted tokens, while the
+fixture/category tables report arithmetic mean ± sample standard deviation of per-request ratios.
+Each profile computed 15,460 prefill tokens, and the average decode batch was exactly 1.00.
+
+| Weights ID | Requests | Completion tokens | Decode tokens | Makespan (s) | Requests/s | Corpus decode tok/s | DFlash2 acceptance |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `nvfp4` | 75 | 695,432 | 695,357 | 3,611.52 | 0.0208 | 192.5 | 37.0% |
+| `groupwise-int` | 75 | 761,763 | 761,688 | 5,181.45 | 0.0145 | 147.0 | 39.2% |
+
+All 150 requests completed without request errors. The earlier interrupted NVFP4 run is excluded;
+these are two complete runs after the fix. Natural-stop and output-limit counts, including a
+repetition outlier, are recorded with the Qwen3.8 tables below.
+
+Against the historical C=1 MTP3 corpus, NVFP4's full-makespan decode rate rises 19.5% and makespan
+falls 22.7%; groupwise-int's rate falls 9.1% and makespan rises 12.1%. These compare the recorded
+campaigns, not an isolated backend change: revisions differ, and the stochastic backends produce
+different continuations and token totals. No fresh MTP3 baseline was run.
 
 ## Concurrent MTP3 decode saturation
 
@@ -208,6 +247,25 @@ python3 tools/bench/run_serve_concurrency.py \
   --output profiles/bench/concurrent_corpus_qwen3_8_27b_nvfp4_mtp3_20260817
 ```
 
+The DFlash2 C=1 campaign uses the two commands below in order. Each command runs 75 requests and
+also writes the complete responses and per-request phase summaries under `corpus/`:
+
+```bash
+python3 tools/bench/run_serve_concurrency.py \
+  --serve build/apps/ninfer-serve \
+  --artifact qwen3_8_27b=out/qwen3_8_27b_nvfp4.ninfer \
+  --mode dflash2_7 --sampling stochastic --suite corpus-makespan --concurrency 1 \
+  --max-context 131072 --kv-capacity auto --prefill-chunk 1024 --port 18080 \
+  --output profiles/bench/dflash2-single-kv-fix-20260906/nvfp4
+
+python3 tools/bench/run_serve_concurrency.py \
+  --serve build/apps/ninfer-serve \
+  --artifact qwen3_8_27b=out/qwen3_8_27b.ninfer \
+  --mode dflash2_7 --sampling stochastic --suite corpus-makespan --concurrency 1 \
+  --max-context 131072 --kv-capacity auto --prefill-chunk 1024 --port 18080 \
+  --output profiles/bench/dflash2-single-kv-fix-20260906/groupwise-int
+```
+
 The concurrent decode-saturation campaigns use:
 
 ```bash
@@ -236,8 +294,8 @@ python3 tools/bench/run_serve_concurrency.py \
   --output profiles/bench/concurrent_decode_35b_mtp3_20260811
 ```
 
-Use `--mode dflash7` for the corresponding DFlash block=8 campaign; add `--sampling greedy` for
-the exact-argmax profile.
+Use `--mode dflash7` for DFlash block=8 on Qwen3.6-35B-A3B and `--mode dflash2_7` for DFlash2
+block=8 on Qwen3.8-27B; add `--sampling greedy` for the exact-argmax profile.
 
 Omit `--mode` and supply the two measured Qwen3.6 groupwise-int artifacts to run the complete
 published Qwen3.6 MTP0/MTP3 campaign:

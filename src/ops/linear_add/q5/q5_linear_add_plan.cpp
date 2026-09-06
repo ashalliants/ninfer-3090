@@ -44,8 +44,8 @@ constexpr std::array<RouteSpec, 7> kK6144Routes{{
     {{11, 16}, Q5LinearAddScheduleId::MmaResidualR64C16},
     {{17, 32}, Q5LinearAddScheduleId::MmaResidualR64C32},
     {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
-    {{49, 128}, Q5LinearAddScheduleId::MmaResidualR64C64},
-    {{129, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
+    {{49, 192}, Q5LinearAddScheduleId::MmaResidualR64C32S4},
+    {{193, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
 }};
 
 constexpr std::array<RouteSpec, 6> kK17408Routes{{
@@ -53,8 +53,8 @@ constexpr std::array<RouteSpec, 6> kK17408Routes{{
     {{2, 10}, Q5LinearAddScheduleId::Split2ExactResidual},
     {{11, 32}, Q5LinearAddScheduleId::MmaResidualR64C32},
     {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
-    {{49, 128}, Q5LinearAddScheduleId::MmaResidualR64C64},
-    {{129, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
+    {{49, 192}, Q5LinearAddScheduleId::MmaResidualR64C32S3},
+    {{193, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
 }};
 
 template <std::size_t N>
@@ -97,6 +97,10 @@ const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept
         return "linear_add.q5.mma.r64.c32.cta_collective_residual";
     case Q5LinearAddScheduleId::MmaResidualR64C64:
         return "linear_add.q5.mma.r64.c64.cta_collective_residual";
+    case Q5LinearAddScheduleId::MmaResidualR64C32S3:
+        return "linear_add.q5.mma.r64.c32.s3.cta_collective_residual";
+    case Q5LinearAddScheduleId::MmaResidualR64C32S4:
+        return "linear_add.q5.mma.r64.c32.s4.cta_collective_residual";
     case Q5LinearAddScheduleId::MmaResidualR64C128:
         return "linear_add.q5.mma.r64.c128.cta_collective_residual";
     }
@@ -160,6 +164,11 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
         return;
     case Q5LinearAddScheduleId::MmaResidualR64C64:
         q5_linear_add_mma_r64_c64_launch(x, w, residual_out, stream);
+    case Q5LinearAddScheduleId::MmaResidualR64C32S3:
+        q5_linear_add_mma_r64_c32_s3_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::MmaResidualR64C32S4:
+        q5_linear_add_mma_r64_c32_s4_launch(x, w, residual_out, stream);
         return;
     case Q5LinearAddScheduleId::MmaResidualR64C128:
         q5_linear_add_mma_r64_c128_launch(x, w, residual_out, stream);

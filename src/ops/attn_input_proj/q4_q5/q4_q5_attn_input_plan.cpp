@@ -1,8 +1,6 @@
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_kernels.h"
-#include <array>
-#include <limits>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -52,6 +50,14 @@ const char* q4_q5_attn_input_schedule_name(Q4Q5AttnInputScheduleId schedule) noe
         return "attn_input_proj.q4_q5.grouped_homogeneous_pair.mma.r32.c32.s4";
     case Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR32C64S4:
         return "attn_input_proj.q4_q5.grouped_homogeneous_pair.mma.r32.c64.s4";
+    case Q4Q5AttnInputScheduleId::MixedR32C64S3:
+        return "attn_input_proj.q4_q5.mixed.r32.c64.s3";
+    case Q4Q5AttnInputScheduleId::PairR32C64S3:
+        return "attn_input_proj.q4_q5.pair.r32.c64.s3";
+    case Q4Q5AttnInputScheduleId::MixedR64C128S2:
+        return "attn_input_proj.q4_q5.mixed.r64.c128.s2";
+    case Q4Q5AttnInputScheduleId::PairR32C64S4:
+        return "attn_input_proj.q4_q5.pair.r32.c64.s4";
     }
     return "attn_input_proj.q4_q5.unknown";
 }
@@ -66,11 +72,12 @@ Q4Q5AttnInputPlan q4_q5_attn_input_resolve_plan(const Q4Q5AttnInputProblem& prob
             "Q4/Q5 attention input: exact problem or column count is not admitted");
     }
 
-    for (const RouteSpec& route : kRoutes) {
-        if (!route.cols.contains(problem.cols)) { continue; }
-        return {route.schedule};
-    }
-    throw std::logic_error("Q4/Q5 attention input: admitted problem has no covering route");
+    if (problem.cols <= 12) return {Q4Q5AttnInputScheduleId::ParentSplitFixed};
+    if (problem.cols <= 64) return {Q4Q5AttnInputScheduleId::MixedR32C64S3};
+    if (problem.cols <= 104) return {Q4Q5AttnInputScheduleId::PairR32C64S3};
+    if (problem.cols <= 128 || problem.cols >= 193)
+        return {Q4Q5AttnInputScheduleId::MixedR64C128S2};
+    return {Q4Q5AttnInputScheduleId::PairR32C64S4};
 }
 
 void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& x,
@@ -92,8 +99,19 @@ void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& 
     case Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR32C32S4:
         q4_q5_attn_input_grouped_mma_r32_c32_s4_launch(x, query_key_weight, gate_value_weight, q,
                                                        gate, k, v, stream);
+    case Q4Q5AttnInputScheduleId::MixedR32C64S3:
+        q4_q5_attn_input_mixed_r32_c64_s3_launch(x, query_key_weight, gate_value_weight, q, gate, k,
+                                                 v, stream);
         return;
-    case Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR32C64S4:
+    case Q4Q5AttnInputScheduleId::PairR32C64S3:
+        q4_q5_attn_input_pair_r32_c64_s3_launch(x, query_key_weight, gate_value_weight, q, gate, k,
+                                                v, stream);
+        return;
+    case Q4Q5AttnInputScheduleId::MixedR64C128S2:
+        q4_q5_attn_input_mixed_r64_c128_s2_launch(x, query_key_weight, gate_value_weight, q, gate,
+                                                  k, v, stream);
+        return;
+    case Q4Q5AttnInputScheduleId::PairR32C64S4:
         q4_q5_attn_input_grouped_mma_r32_c64_s4_launch(x, query_key_weight, gate_value_weight, q,
                                                        gate, k, v, stream);
         return;

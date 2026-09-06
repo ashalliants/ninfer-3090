@@ -13,6 +13,10 @@ enum class Q4Q5AttnInputScheduleId {
     ParentSplitFixed,
     GroupedHomogeneousPairMmaR32C32S4,
     GroupedHomogeneousPairMmaR32C64S4,
+    MixedR32C64S3,
+    PairR32C64S3,
+    MixedR64C128S2,
+    PairR32C64S4,
 };
 
 struct Q4Q5AttnInputProblem {

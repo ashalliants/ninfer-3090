@@ -68,6 +68,8 @@ struct ContextAttentionExecutionEnvelope {
  * paths are implementation profiles rather than extra public tensor boundaries. Every cache route
  * has one named numerical criterion and is checked directly against its independent oracle;
  * route-to-route parity is only supplementary evidence.
+ * Newly appended rows cross their specified persistent codec boundary before attention
+ * observes them.
  * Those criteria apply to the registered geometries, tested extents, conformance matrix, and
  * target-representative activation range; they are not universal error bounds for arbitrary
  * adversarial BF16 tensors.
@@ -142,7 +144,8 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  *
  * The caller guarantees that the maximum p+1 over live rows lies within envelope. The envelope is
  * a host launch/workspace resource promise over that batch maximum, not a mask and not persistent
- * state. Inputs, output, every cache plane/table, and live workspace suballocations are pairwise
+ * state. A masked physical width may exceed max_visible_keys when its live prefix is shorter.
+ * Inputs, output, every cache plane/table, and live workspace suballocations are pairwise
  * non-overlapping. The Op overwrites every addressed cache row but owns no cache allocation,
  * frontier, request identity, or commit authority.
  */

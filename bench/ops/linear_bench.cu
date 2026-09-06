@@ -107,6 +107,8 @@ struct Options {
     bool have_sweep     = false;
     bool have_suite     = false;
     bool profile        = false;
+    bool graph          = false;
+    int graph_calls     = 1;
     QType qtype         = QType::Q4G64_F16S;
     LinearPolicy policy = LinearPolicy::A16Only;
     std::int32_t n      = 0;
@@ -139,6 +141,9 @@ struct PointGroup {
 };
 
 struct Result {
+    const char* execution   = "eager";
+    std::size_t graph_nodes = 0;
+    int graph_calls         = 1;
     std::string labels;
     const char* qtype_name         = "";
     const char* policy_name        = "";
@@ -330,6 +335,8 @@ void usage(const char* argv0) {
                  "  %s --suite qwen3_6_27b|qwen3_6_35b_a3b|all [options]\n\n"
                  "Options:\n"
                  "  --policy a16|a8|a4 Activation-compute policy (default a16).\n"
+                 "  --execution MODE   eager (default) or graph; time the complete Op.\n"
+                 "  --graph-calls N    Calls per timed graph (1..64, default 1); report per call.\n"
                  "  --profile          Capture exactly one post-warmup public Linear call.\n"
                  "  --warmup N         Warmup calls per point (default %d).\n"
                  "  --repeat N         Measured cold-cache samples per point (default %d).\n"
@@ -367,6 +374,13 @@ Options parse_args(int argc, char** argv) {
         } else if (arg == "--suite") {
             opt.suite      = lower(next("suite"));
             opt.have_suite = true;
+        } else if (arg == "--execution") {
+            const std::string_view mode(next("execution"));
+            if (mode != "eager" && mode != "graph")
+                throw std::invalid_argument("execution must be eager or graph");
+            opt.graph = mode == "graph";
+        } else if (arg == "--graph-calls") {
+            opt.graph_calls = parse_nonnegative_int(next("graph-calls"), "graph-calls");
         } else if (arg == "--profile") {
             opt.profile = true;
         } else if (arg == "--warmup") {
@@ -387,6 +401,10 @@ Options parse_args(int argc, char** argv) {
     }
 
     if (argc == 1) { throw std::invalid_argument("select one exact point, sweep, or suite"); }
+    if (opt.graph_calls < 1 || opt.graph_calls > 64 ||
+        (opt.graph_calls != 1 && (!opt.graph || opt.profile)))
+        throw std::invalid_argument(
+            "graph-calls must be 1..64; multiple calls require graph timing without --profile");
     if (opt.repeat <= 0) { throw std::invalid_argument("--repeat must be positive"); }
     if (opt.flush_bytes == 0) { throw std::invalid_argument("--flush-mib must be positive"); }
     if (opt.have_t && opt.have_sweep) {
@@ -539,9 +557,8 @@ std::string join_labels(const std::vector<std::string>& labels) {
 }
 
 double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profile) {
-    // This mirrors the production FP8 selector. A permissive policy alone does not prove that an
-    // A8 route ran, so only the registered problem and extents currently dispatched to
-    // FP8/FP32-accumulate MMA get a Tensor Core utilization result.
+    // Report Tensor Core utilization only when the exact registered problem and extent determine
+    // that the public route executes the named MMA profile.
     const bool fp8_problem =
         (point.n == 14336 && point.k == 5120) || (point.n == 16384 && point.k == 5120) ||
         (point.n == 34816 && point.k == 5120) || (point.n == 5120 && point.k == 6144) ||
@@ -568,6 +585,11 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
             profile = "BF16_F32ACC";
             return peak;
         }
+    }
+    if (point.qtype == QType::BF16_CTRL && point.policy == LinearPolicy::A16Only &&
+        point.n == 256 && point.k == 5120) {
+        profile = "BF16_F32ACC";
+        return kRtx5090Bf16Fp32AccumulateTFLOPs;
     }
     profile = "";
     return std::numeric_limits<double>::quiet_NaN();
@@ -614,9 +636,13 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
     }
     result.memory_floor_us  = memory_floor_us;
     result.memory_floor_pct = memory_floor_us / timing.median_us * 100.0;
-    result.warmup           = opt.warmup;
-    result.repeat           = opt.repeat;
-    result.flush_bytes      = opt.flush_bytes;
+    if (opt.graph_calls > 1) {
+        result.dram_spec_pct = result.sustained_read_pct = result.memory_floor_us =
+            result.memory_floor_pct                      = std::numeric_limits<double>::quiet_NaN();
+    }
+    result.warmup      = opt.warmup;
+    result.repeat      = opt.repeat;
+    result.flush_bytes = opt.flush_bytes;
     return result;
 }
 
@@ -656,9 +682,21 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt, Devic
         const auto launch = [&](cudaStream_t launch_stream) {
             ops::linear(activation, weight.weight, output, group.policy, workspace, launch_stream);
         };
-        const bench::ColdTiming timing =
-            bench::measure_cold_launch(launch, flush, stream, opt.warmup, opt.repeat);
-        Result result = make_result(point, weight, timing, opt);
+        bench::TimedGraph graph;
+        if (opt.graph)
+            graph.capture(stream, [&](cudaStream_t launch_stream) {
+                for (int call = 0; call < opt.graph_calls; ++call) launch(launch_stream);
+            });
+        bench::ColdTiming timing =
+            opt.graph ? bench::measure_cold_graph(graph, flush, stream, opt.warmup, opt.repeat)
+                      : bench::measure_cold_launch(launch, flush, stream, opt.warmup, opt.repeat);
+        timing.median_us /= opt.graph_calls;
+        timing.min_us /= opt.graph_calls;
+        timing.p95_us /= opt.graph_calls;
+        Result result      = make_result(point, weight, timing, opt);
+        result.execution   = opt.graph ? "graph" : "eager";
+        result.graph_nodes = graph.nodes();
+        result.graph_calls = opt.graph_calls;
         if (point.t == 1) { t1_median = result.median_us; }
         if (std::isfinite(t1_median)) {
             result.t1_linear_extrapolation =
@@ -691,9 +729,18 @@ void run_profile(const BenchPoint& point, const Options& opt, DeviceBuffer& flus
 
     Tensor activation(x.p, DType::BF16, {point.k, point.t});
     Tensor output(out.p, DType::BF16, {point.n, point.t});
-    const auto launch = [&]() {
-        ops::linear(activation, weight.weight, output, point.policy, workspace, stream);
+    const auto body = [&](cudaStream_t launch_stream) {
+        ops::linear(activation, weight.weight, output, point.policy, workspace, launch_stream);
     };
+    bench::TimedGraph graph;
+    if (opt.graph) graph.capture(stream, body);
+    const auto launch = [&] {
+        if (opt.graph)
+            graph.launch(stream);
+        else
+            body(stream);
+    };
+    std::printf("# execution=%s graph_nodes=%zu\n", opt.graph ? "graph" : "eager", graph.nodes());
     for (int i = 0; i < opt.warmup; ++i) {
         bench::flush_l2(flush, stream);
         launch();
@@ -720,7 +767,9 @@ void run_profile(const BenchPoint& point, const Options& opt, DeviceBuffer& flus
     CUDA_CHECK(cudaProfilerStop());
 }
 
-void print_header() {
+void print_header(const Options& opt) {
+    std::printf("# execution=%s graph_calls=%d cuda_runtime=%d\n", opt.graph ? "graph" : "eager",
+                opt.graph_calls, CUDART_VERSION);
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
     cudaDeviceProp properties{};
@@ -791,7 +840,7 @@ void write_csv(const std::filesystem::path& path, const std::vector<Result>& res
            "sustained_read_gbs,sustained_read_pct,useful_tflops,tensor_profile,"
            "tensor_peak_tflops,tensor_peak_pct,memory_floor_us,memory_floor_pct,"
            "t1_linear_extrapolation,delta_pct,"
-           "warmup,repeat,flush_bytes\n";
+           "warmup,repeat,flush_bytes,execution,graph_nodes,graph_calls\n";
     for (const Result& result : results) {
         out << csv_quote(result.labels) << ',' << result.qtype_name << ',' << result.policy_name
             << ',' << result.n << ',' << result.k << ',' << result.t << ',' << result.weight_bytes
@@ -810,7 +859,10 @@ void write_csv(const std::filesystem::path& path, const std::vector<Result>& res
         }
         out << ',';
         if (std::isfinite(result.delta_pct)) { out << result.delta_pct; }
-        out << ',' << result.warmup << ',' << result.repeat << ',' << result.flush_bytes << '\n';
+        out << ',' << result.warmup << ',' << result.repeat << ',' << result.flush_bytes << ','
+            << result.execution << ',';
+        if (result.graph_nodes) out << result.graph_nodes;
+        out << ',' << result.graph_calls << '\n';
     }
 }
 
@@ -830,7 +882,7 @@ int main(int argc, char** argv) {
         DeviceBuffer flush(opt.flush_bytes);
         const std::vector<BenchPoint> points = expand_points(opt);
 
-        print_header();
+        print_header(opt);
         if (opt.profile) {
             run_profile(points.front(), opt, flush, stream);
             CUDA_CHECK(cudaStreamDestroy(stream));
