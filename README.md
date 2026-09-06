@@ -352,6 +352,84 @@ MTP is intentionally off for this profile. At 32K, speculative recurrent state w
 3090 memory budget; KV compression alone does not recover enough memory. Text-only 35B profiles can
 still use MTP3 as documented above.
 
+## Two GPUs: expert offload (`--devices 0,1`)
+
+With two cards, each layer's expert/MLP block is materialized on the second GPU. Rank 0 keeps
+everything else -- embeddings, attention, GDN, norms, the head -- and therefore keeps the KV cache,
+the GDN recurrent state and the context cache. Every byte rank 0 sheds becomes KV.
+
+Measured on a rented bridgeless 2x RTX 3090 (no NVLink; `nvidia-smi topo -m` reports PHB), int8 KV.
+Greedy output is byte-identical to the single-GPU reference in every split configuration, on both
+models, with and without MTP.
+
+### Capacity, which is the point
+
+| | max total KV | note |
+|---|---|---|
+| single GPU | 237,248 tokens | 262,144 context **fails to start at all** |
+| `--devices 0,1`, C=8 @ 262k | **1,929,728 tokens** | 8 sessions at ~241k each, 1.08 GiB spare |
+
+**8.1x the KV**, and a single 3090 cannot serve 262k context at any concurrency.
+
+| Qwen3.6-35B-A3B | weights on rank 0 | free for KV |
+|---|---|---|
+| single GPU | 19.6 GiB | 3.71 GiB |
+| `--devices 0,1` | **2.15 GiB** | **21.1 GiB** |
+
+| Qwen3.8-27B | weights on rank 0 | free for KV |
+|---|---|---|
+| single GPU | 15.9 GiB | 7.38 GiB |
+| `--devices 0,1` | **6.79 GiB** | **16.5 GiB** |
+
+The 27B divides less dramatically because its attention and GDN projections at hidden 5120 are
+large next to its dense MLP; the 35B's MoE is ~88% of its weights.
+
+### Aggregate throughput under concurrent load
+
+200 tokens per request, 16K context. This is the number that matters for serving, and it is not
+what single-stream decode suggests.
+
+| tok/s aggregate | C=1 | C=4 | C=8 |
+|---|---|---|---|
+| single GPU | 140.7 | 292.9 | 348.2 |
+| **`--devices 0,1`** | -- | 300.1 | **404.8** |
+| single GPU + MTP3 | 162.1 | 264.4 | -- |
+| `--devices 0,1` + MTP3 | **174.8** | **336.6** | 356.0 |
+
+**At C=8 the split is 16% faster than one card**, not slower. Decode at concurrency is
+bandwidth-bound, and the split reads expert weights from card 1's memory while reading KV from
+card 0's -- two memory systems in parallel. That outweighs the per-layer crossings once the batch
+is large enough to expose it.
+
+Single-stream is the opposite case and the split's worst one: 137 against 177 tok/s without
+speculation. Use MTP there (240.5 against 267.1, a 10% gap) and skip it under load, where drafting
+spends compute on tokens a full batch will reject.
+
+**Rule of thumb:** `--devices 0,1` alone for concurrent serving; add `--spec mtp --draft-tokens 3`
+for single-stream latency.
+
+Two cells above are blank because those runs failed to start with a runtime-planning error after a
+prior configuration had not released its VRAM. Both combinations work in isolation; they are left
+blank rather than filled in from a different run.
+
+### Prefill
+
+| | prefill tok/s |
+|---|---|
+| single GPU | 6.34k |
+| `--devices 0,1` | 5.30k (84%) |
+
+Prefill crossings carry a whole chunk (~4 MB) rather than one token's activation, so this is the
+one place a bridge would pay. Per token it would not: a decode crossing is ~4 KiB and
+latency-bound.
+
+Peer access is not required and is unavailable on a consumer pair anyway --
+`cudaDeviceCanAccessPeer` returns 0 between two GeForce cards. Crossings stage through pinned host
+memory, split into four pipelined pieces.
+
+`NINFER_KEEP_EXPERTS=N` keeps N layers' expert blocks on rank 0, trading KV room for fewer
+crossings. 0 (offload everything) is the default and maximises capacity.
+
 ## Capabilities
 
 - Native SM86 CLI and server applications for Linux and Windows.
