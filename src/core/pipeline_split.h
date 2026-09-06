@@ -99,6 +99,22 @@ public:
         return PipelineSplit(layer_count, std::move(boundaries));
     }
 
+    // Equal layer counts. Correct enough whenever layers are near-uniform in size -- which is the
+    // case for a model whose per-layer MoE dominates and is identical across layers -- and the
+    // sensible default before per-layer byte costs are available at planning time.
+    static PipelineSplit even(std::uint32_t layer_count, std::size_t ranks) {
+        if (ranks <= 1) { return PipelineSplit(layer_count); }
+        if (ranks > layer_count) { throw std::invalid_argument("more ranks than layers"); }
+        std::vector<std::uint32_t> boundaries;
+        boundaries.reserve(ranks);
+        for (std::size_t rank = 0; rank + 1 < ranks; ++rank) {
+            boundaries.push_back(static_cast<std::uint32_t>(
+                (static_cast<std::uint64_t>(layer_count) * (rank + 1)) / ranks));
+        }
+        boundaries.push_back(layer_count);
+        return PipelineSplit(layer_count, std::move(boundaries));
+    }
+
     [[nodiscard]] std::size_t ranks() const noexcept { return boundaries_.size(); }
     [[nodiscard]] std::uint32_t layer_count() const noexcept { return layer_count_; }
     [[nodiscard]] bool single_rank() const noexcept { return boundaries_.size() == 1; }

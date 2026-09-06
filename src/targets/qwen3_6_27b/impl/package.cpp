@@ -104,11 +104,36 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
                              "' is not supported by target '" + std::string(target_key) + "'");
 }
 
+PipelineSplit Package::pipeline_split(std::size_t ranks) {
+    if (ranks > 1) {
+        // Deliberately fatal. This target has two separate layer-binding paths (groupwise and
+        // NVFP4) and neither is rank-partitioned yet, so proceeding would materialize the whole
+        // model onto every card and exhaust device memory with a confusing error.
+        throw std::invalid_argument(
+            "the 27B target does not support a pipeline split across multiple devices yet; "
+            "run it with a single --devices entry");
+    }
+    return PipelineSplit(static_cast<std::uint32_t>(detail::kTextLayers));
+}
+
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
         weights_profile,
         detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options))));
+}
+
+Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
+                                     WeightsProfile weights_profile, RankOwnership ownership) {
+    // pipeline_split() above already rejects more than one rank for this target, so the only
+    // ownership that can reach here is the whole model. Assert it rather than silently ignoring a
+    // partition this target cannot honour.
+    if (!ownership.whole_model()) {
+        throw std::invalid_argument(
+            "the 27B target cannot bind a partial pipeline rank; its layer bindings are not "
+            "rank-partitioned");
+    }
+    return plan_load(binder, options, weights_profile);
 }
 
 std::unique_ptr<Package::LoadedModel>
@@ -118,6 +143,17 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
         plan.impl_->weights_profile, std::move(plan.impl_->plan.bindings), std::move(materialized));
     plan.impl_.reset();
     return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(impl)));
+}
+
+std::unique_ptr<Package::LoadedModel>
+Package::construct_loaded_model(std::vector<LoadPlan>&& plans,
+                                std::vector<artifact::MaterializedArtifact>&& materialized,
+                                PipelineSplit split) {
+    (void)plans;
+    (void)materialized;
+    (void)split;
+    throw std::invalid_argument(
+        "the 27B target does not support a pipeline split across multiple devices yet");
 }
 
 Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineOptions& options) {

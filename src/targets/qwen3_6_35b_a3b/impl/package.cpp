@@ -77,10 +77,23 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
                              "' is not supported by target '" + std::string(target_key) + "'");
 }
 
+PipelineSplit Package::pipeline_split(std::size_t ranks) {
+    // Equal layer counts are near enough to byte-balanced here: every layer carries the same MoE,
+    // which dominates its size, and an even split of 40 layers puts five full-attention layers on
+    // each of two ranks.
+    return PipelineSplit::even(static_cast<std::uint32_t>(detail::kTextLayers), ranks);
+}
+
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
+    return plan_load(binder, options, weights_profile, RankOwnership{});
+}
+
+Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
+                                     WeightsProfile weights_profile, RankOwnership ownership) {
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
-        weights_profile, detail::bind_artifact(binder, qwen3_6::startup_features(options))));
+        weights_profile,
+        detail::bind_artifact(binder, qwen3_6::startup_features(options), ownership)));
 }
 
 std::unique_ptr<Package::LoadedModel>
@@ -89,6 +102,32 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
     auto impl = std::make_unique<LoadedModel::Impl>(
         plan.impl_->weights_profile, std::move(plan.impl_->plan.bindings), std::move(materialized));
     plan.impl_.reset();
+    return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(impl)));
+}
+
+std::unique_ptr<Package::LoadedModel>
+Package::construct_loaded_model(std::vector<LoadPlan>&& plans,
+                                std::vector<artifact::MaterializedArtifact>&& materialized,
+                                PipelineSplit split) {
+    if (plans.empty()) { throw std::invalid_argument("target load plan is empty"); }
+    if (plans.size() != materialized.size()) {
+        throw std::invalid_argument("one materialized artifact is required per pipeline rank");
+    }
+
+    std::vector<detail::BindingPlan> bindings;
+    bindings.reserve(plans.size());
+    const WeightsProfile weights_profile = plans.front().impl_->weights_profile;
+    for (LoadPlan& plan : plans) {
+        if (plan.impl_ == nullptr) { throw std::invalid_argument("target load plan is empty"); }
+        if (plan.impl_->weights_profile != weights_profile) {
+            throw std::invalid_argument("pipeline ranks disagree on the weights profile");
+        }
+        bindings.push_back(std::move(plan.impl_->plan.bindings));
+        plan.impl_.reset();
+    }
+
+    auto impl = std::make_unique<LoadedModel::Impl>(weights_profile, std::move(bindings),
+                                                    std::move(materialized), std::move(split));
     return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(impl)));
 }
 

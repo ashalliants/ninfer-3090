@@ -108,6 +108,23 @@ void balanced_by_bytes_degenerates_safely() {
                  "more ranks than layers");
 }
 
+void even_splits_evenly() {
+    check(ninfer::PipelineSplit::even(40, 1).single_rank(), "one rank is the identity");
+    const auto two = ninfer::PipelineSplit::even(40, 2);
+    check(two.rank_layers(0) == 20 && two.rank_layers(1) == 20, "40 over 2 is 20 and 20");
+    // An odd count must still cover every layer and leave no rank empty.
+    const auto three = ninfer::PipelineSplit::even(40, 3);
+    check(three.ranks() == 3, "three ranks");
+    check(three.rank_end(2) == 40, "the last boundary covers every layer");
+    std::uint32_t total = 0;
+    for (std::size_t rank = 0; rank < 3; ++rank) {
+        check(three.rank_layers(rank) >= 1, "no empty rank");
+        total += three.rank_layers(rank);
+    }
+    check(total == 40, "layers are partitioned exactly once");
+    check_throws([] { (void)ninfer::PipelineSplit::even(2, 3); }, "more ranks than layers");
+}
+
 void rejects_incoherent_boundaries() {
     check_throws([] { (void)ninfer::PipelineSplit(40, {20, 30}); },
                  "boundaries must cover every layer");
@@ -128,6 +145,7 @@ int main() {
     even_split_maps_and_crosses_once();
     balanced_by_bytes_equalises_bytes_not_layers();
     balanced_by_bytes_degenerates_safely();
+    even_splits_evenly();
     rejects_incoherent_boundaries();
 
     if (failures != 0) {

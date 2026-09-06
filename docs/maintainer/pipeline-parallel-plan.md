@@ -105,5 +105,31 @@ works.
 - [ ] 6. run_layers split
 - [ ] 7. Memory accounting -- `resolve_kv_capacity` and `current_free_device_bytes()` both assume
       one device; this is the item that actually delivers the KV capacity goal.
-- [ ] 8. CUDA graphs
+- [ ] 8. CUDA graphs. **This is the item with a genuine unknown.** A CUDA graph is captured on one
+      device's stream, so a cross-device schedule cannot be one graph. Our decode path captures a
+      whole MTP round; their fork disabled capture for the cross-device schedule and never
+      quantified the loss. Either the round splits into a per-rank graph either side of the
+      boundary, or capture is off for split decode and the cost has to be measured before anyone
+      calls this a win.
 - [ ] 9. Hardware validation
+
+### Measured surface of item 6
+
+Counted rather than guessed, since it decides whether this is a day or a week:
+
+| site | count |
+|---|---|
+| `ctx_.stream` in `text_context_impl.h` | 18 |
+| `work_` in `text_context_impl.h` | 76 |
+| stream references in `program_impl.h` | 58 |
+
+`TextContext` is built on the stack per schedule from `state.execution.{device, model, work}`
+(`decode_impl.h:24`, `mtp_impl.h:25`, `mtp_impl.h:85`, `dflash_impl.h:377`), all of which are
+single-device today. Item 6 is therefore the large one, and items 4 and 5 are its prerequisites.
+
+## A useful milestone short of execution
+
+Items 1-3 plus 7 give a build that **loads the model split across two cards and reports the KV
+headroom on each**. That demonstrates the capacity claim -- the entire point of the exercise --
+and is verifiable on rented hardware before any of the execution rewrite exists. Worth reaching
+and validating first, precisely because it de-risks the expensive part.

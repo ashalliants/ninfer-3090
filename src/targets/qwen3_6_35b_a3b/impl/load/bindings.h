@@ -171,6 +171,11 @@ public:
          artifact::MaterializedArtifact materialized)
         : weights_profile(weights_profile_in), data(std::move(plan), std::move(materialized)) {}
 
+    Impl(WeightsProfile weights_profile_in, std::vector<BindingPlan> plans,
+         std::vector<artifact::MaterializedArtifact> materialized, PipelineSplit split)
+        : weights_profile(weights_profile_in),
+          data(std::move(plans), std::move(materialized), std::move(split)) {}
+
     WeightsProfile weights_profile;
     LoadedModelData data;
 };

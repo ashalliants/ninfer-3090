@@ -102,8 +102,14 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     runtime::ResolvedContextMachineCost context_cost = runtime::resolve_context_machine_cost(
         context_cost_identity, options.context_cost.preset_path);
 
+    // One rank per device. The target decides how its layers divide, and rejects the request if it
+    // has not been converted for a split -- which is why this is asked before any binding happens.
+    const std::size_t pipeline_ranks     = device.size();
+    const PipelineSplit pipeline_split   = Target::pipeline_split(pipeline_ranks);
+
     artifact::Binder binder(reader);
-    auto load_plan        = Target::plan_load(binder, options, weights_profile);
+    auto load_plan        = Target::plan_load(binder, options, weights_profile,
+                                              RankOwnership{&pipeline_split, 0});
     auto sequence_planner = Target::make_sequence_planner(device, options, weights_profile);
     const runtime::SequenceCapacityCurve curve = sequence_planner.capacity_curve();
     const std::size_t preflight_runtime_bytes =
@@ -144,7 +150,60 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     }
 
     StartupPhaseScope target_finalize_phase(options.startup_observer, StartupPhase::TargetFinalize);
-    auto model = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
+    std::unique_ptr<typename Target::LoadedModel> model;
+    if (pipeline_ranks > 1) {
+        // Rank 0's plan and artifact are the ones already built above. Bind and materialize the
+        // remaining ranks on their own devices, then hand the whole set over together.
+        std::vector<typename Target::LoadPlan> rank_plans;
+        std::vector<artifact::MaterializedArtifact> rank_artifacts;
+        rank_plans.reserve(pipeline_ranks);
+        rank_artifacts.reserve(pipeline_ranks);
+        rank_plans.push_back(std::move(load_plan));
+        rank_artifacts.push_back(std::move(materialized));
+
+        for (std::size_t rank = 1; rank < pipeline_ranks; ++rank) {
+            ScopedDeviceRank rank_guard(device, rank);
+            artifact::Binder rank_binder(reader);
+            auto rank_plan = Target::plan_load(rank_binder, options, weights_profile,
+                                               RankOwnership{&pipeline_split, rank});
+            rank_artifacts.push_back(artifact::materialize(reader, rank_plan.materialization(),
+                                                           device, &options.startup_observer,
+                                                           nullptr));
+            rank_plans.push_back(std::move(rank_plan));
+        }
+
+        // Report what each card actually holds before refusing to go further. These are the
+        // numbers the whole exercise is about -- weights resident per card and therefore how much
+        // is left for KV -- and they are worth having even though execution cannot run yet.
+        std::string report = "pipeline split loaded across " + std::to_string(pipeline_ranks) +
+                             " devices:\n";
+        for (std::size_t rank = 0; rank < pipeline_ranks; ++rank) {
+            std::size_t free_bytes  = 0;
+            std::size_t total_bytes = 0;
+            {
+                ScopedDeviceRank rank_guard(device, rank);
+                CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+            }
+            report += "  rank " + std::to_string(rank) + " (cuda device " +
+                      std::to_string(device.device_ids()[rank]) + "): layers [" +
+                      std::to_string(pipeline_split.rank_begin(rank)) + "," +
+                      std::to_string(pipeline_split.rank_end(rank)) + "), weights " +
+                      std::to_string(rank_artifacts[rank].stats().device_capacity_bytes >> 20) +
+                      " MiB, free " + std::to_string(free_bytes >> 20) + " MiB\n";
+        }
+
+        // Loading is only half of a pipeline split. Executing one needs per-rank workspaces, KV
+        // and GDN state, and a run_layers that crosses the boundary -- none of which exists yet.
+        // Constructing a program over these weights would run every layer on rank 0 against
+        // pointers into another device's arena, so fail here rather than emit wrong tokens.
+        throw std::invalid_argument(
+            report +
+            "pipeline-split execution is not implemented yet: weights load and divide correctly, "
+            "but per-rank workspace, KV and the cross-device run_layers are still missing. Run "
+            "with a single --devices entry.");
+    } else {
+        model = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
+    }
     device.synchronize();
     runtime::KvCapacityResolution capacity_resolution =
         runtime::resolve_kv_capacity(options.kv_capacity, curve, current_free_device_bytes());
