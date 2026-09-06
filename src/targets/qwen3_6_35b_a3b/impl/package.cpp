@@ -78,10 +78,10 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 }
 
 PipelineSplit Package::pipeline_split(std::size_t ranks) {
-    // Equal layer counts are near enough to byte-balanced here: every layer carries the same MoE,
-    // which dominates its size, and an even split of 40 layers puts five full-attention layers on
-    // each of two ranks.
-    return PipelineSplit::even(static_cast<std::uint32_t>(detail::kTextLayers), ranks);
+    // Offload every expert block. The MoE is ~88% of this model's weights (17.3 GiB of 19.6), so
+    // moving all of it leaves rank 0 holding only embeddings, attention, GDN, norms and the head
+    // -- roughly 2.3 GiB -- and turns the other ~21 GiB into KV on the card that serves attention.
+    return PipelineSplit::experts_on_last(static_cast<std::uint32_t>(detail::kTextLayers), ranks);
 }
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,

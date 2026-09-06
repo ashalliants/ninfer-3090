@@ -1,12 +1,20 @@
 #pragma once
 
-// Layer-to-rank mapping for pipeline (layer) parallelism.
+// Which device holds each layer's expert block.
 //
-// Every layer lives wholly on one device, so the whole scheme reduces to one question -- which
-// rank owns global layer L, and what is its index within that rank's arrays -- plus a boundary
-// choice. This type owns both, and is deliberately the only place that answers them: bindings,
-// materialization, KV allocation, GDN state and the execution loop all consume it rather than
-// recomputing a split each and deriving subtly different answers.
+// The point of a split here is KV capacity, not speed, so the question that matters is how much
+// room is left on the card that serves attention. For these models the expert / MLP block is
+// ~88% of the weights (17.3 GiB of 19.6 GiB on the 35B-A3B), and it is also the only part that can
+// move without dragging state with it: attention needs its KV cache, GDN needs its recurrent
+// state, and the head needs round state and the persistent prefill buffer -- all of which live on
+// rank 0 and are reached directly by callers of the layer loop.
+//
+// So the split moves expert blocks only. Everything else stays on rank 0, which means the KV
+// cache, GDN state pool, decoder state, state images and the whole context-cache machinery are
+// untouched by this feature. Offloading every expert block leaves ~21 GiB free on rank 0 against
+// ~3.4 GiB today -- about 2.2M int8 KV tokens against 262k -- for two crossings of the residual
+// stream per offloaded layer, tens of microseconds each against a decode step of tens of
+// milliseconds.
 //
 // A single-rank split is the identity mapping, which is what keeps every consumer a no-op on
 // one GPU.
@@ -39,13 +47,13 @@ public:
             throw std::invalid_argument("pipeline split must cover every layer");
         }
         if (layer_count_ == 0) { return; }
-        // Ascending and strictly non-empty: a rank owning zero layers would still pay for a
-        // context and a workspace while contributing nothing, which is always a planning bug
-        // rather than something to tolerate silently.
+        // Non-descending rather than strictly ascending: a rank owning zero expert blocks is the
+        // *default* here, not a bug. Putting every expert block on rank 1 leaves rank 0 with none
+        // and is exactly the configuration that maximises KV room on the card serving attention.
         std::uint32_t previous = 0;
         for (const std::uint32_t end : boundaries_) {
-            if (end <= previous) {
-                throw std::invalid_argument("pipeline split ranks must be non-empty and ascending");
+            if (end < previous) {
+                throw std::invalid_argument("pipeline split boundaries must be non-descending");
             }
             previous = end;
         }
@@ -94,6 +102,29 @@ public:
             }
             boundaries.push_back(best);
             previous_end = best;
+        }
+        boundaries.push_back(layer_count);
+        return PipelineSplit(layer_count, std::move(boundaries));
+    }
+
+    // Every expert block on the last rank, none on rank 0. This is the default for two devices:
+    // rank 0 then holds only embeddings, attention, GDN, norms and the head, and every byte it
+    // saves becomes KV.
+    //
+    // `keep_on_first` moves that many layers' experts back onto rank 0, trading KV room for fewer
+    // crossings; 0 is the configuration that maximises capacity.
+    static PipelineSplit experts_on_last(std::uint32_t layer_count, std::size_t ranks,
+                                         std::uint32_t keep_on_first = 0) {
+        if (ranks <= 1) { return PipelineSplit(layer_count); }
+        if (keep_on_first > layer_count) {
+            throw std::invalid_argument("cannot keep more expert blocks than there are layers");
+        }
+        std::vector<std::uint32_t> boundaries;
+        boundaries.reserve(ranks);
+        boundaries.push_back(keep_on_first);
+        // Any middle ranks stay empty; only the first and last are used for a two-device split.
+        for (std::size_t rank = 1; rank + 1 < ranks; ++rank) {
+            boundaries.push_back(keep_on_first);
         }
         boundaries.push_back(layer_count);
         return PipelineSplit(layer_count, std::move(boundaries));
@@ -179,18 +210,31 @@ struct RankOwnership {
         return split == nullptr || split->single_rank();
     }
 
-    [[nodiscard]] bool owns_layer(std::uint32_t layer) const {
+    // The expert / MLP block of a layer -- the only thing a split actually moves.
+    [[nodiscard]] bool owns_layer_experts(std::uint32_t layer) const {
         return whole_model() || split->placement(layer).rank == rank;
     }
 
-    // The embedding feeds layer 0, so it belongs with the first rank.
-    [[nodiscard]] bool owns_embedding() const noexcept { return whole_model() || rank == 0; }
+    // Everything that is not an expert block: embeddings, attention and GDN projections, norms,
+    // and the head. All of it stays on rank 0, because each piece is tied to state that cannot
+    // move with it -- the KV cache, the GDN recurrent state, round state and the persistent
+    // prefill buffer.
+    [[nodiscard]] bool owns_core() const noexcept { return whole_model() || rank == 0; }
 
-    // The final norm, output head, draft head and MTP all consume the last layer's hidden state,
-    // so they belong with the rank that produces it.
-    [[nodiscard]] bool owns_head() const noexcept {
-        return whole_model() || rank + 1 == split->ranks();
-    }
+    // The embedding feeds layer 0, so it belongs with the first rank.
+    [[nodiscard]] bool owns_embedding() const noexcept { return owns_core(); }
+
+    // The head -- final norm, output head, draft head, MTP -- stays on **rank 0**, not on the rank
+    // that produces the final hidden state.
+    //
+    // It looks natural to put it with the last layer, but the head does not just consume the
+    // hidden state: it writes into round state and the persistent prefill-hidden buffer, and feeds
+    // sampling, all of which live on rank 0 and are reached directly by callers of run_layers.
+    // Moving the head would strand those on the wrong device. Instead the residual stream comes
+    // back to rank 0 after the last layer, which costs one extra crossing per token -- tens of
+    // microseconds against a decode step of tens of milliseconds -- and leaves everything outside
+    // run_layers exactly as it was on one GPU.
+    [[nodiscard]] bool owns_head() const noexcept { return owns_core(); }
 };
 
 } // namespace ninfer

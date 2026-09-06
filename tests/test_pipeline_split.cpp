@@ -131,10 +131,11 @@ void even_splits_evenly() {
 void ownership_defaults_to_the_whole_model() {
     const ninfer::RankOwnership all;
     check(all.whole_model(), "default ownership is the whole model");
+    check(all.owns_core(), "default owns the core weights");
     check(all.owns_embedding(), "default owns the embedding");
     check(all.owns_head(), "default owns the head");
     for (std::uint32_t layer = 0; layer < 40; ++layer) {
-        check(all.owns_layer(layer), "default owns every layer");
+        check(all.owns_layer_experts(layer), "default owns every expert block");
     }
 
     // A single-rank split is also the whole model, which is what makes the one-GPU path a no-op.
@@ -151,24 +152,53 @@ void ownership_partitions_across_two_ranks() {
 
     check(!first.whole_model() && !second.whole_model(), "a two-rank split is not whole-model");
 
-    // The embedding feeds layer 0; the head consumes the last layer. They must land on opposite
-    // ranks, and each on exactly one.
+    // Both ends live on rank 0. The embedding feeds layer 0, and the head writes round state and
+    // the persistent prefill-hidden buffer, which callers of run_layers reach directly -- so the
+    // residual stream returns to rank 0 rather than the head moving to the last rank.
     check(first.owns_embedding() && !second.owns_embedding(), "only rank 0 owns the embedding");
-    check(second.owns_head() && !first.owns_head(), "only the last rank owns the head");
+    check(first.owns_head() && !second.owns_head(), "only rank 0 owns the head");
 
     for (std::uint32_t layer = 0; layer < 40; ++layer) {
-        const bool a = first.owns_layer(layer);
-        const bool b = second.owns_layer(layer);
-        check(a != b, "every layer is owned by exactly one rank");
-        check(a == (layer < 20), "rank 0 owns the first half");
+        const bool a = first.owns_layer_experts(layer);
+        const bool b = second.owns_layer_experts(layer);
+        check(a != b, "every expert block is owned by exactly one rank");
+        check(a == (layer < 20), "rank 0 owns the first half's experts");
     }
+    check(first.owns_core() && !second.owns_core(), "core weights stay on rank 0");
+}
+
+// The default two-device configuration: every expert block on the last rank, none on rank 0.
+// An empty first rank is the point here, not a bug -- it is what leaves rank 0 free for KV.
+void experts_on_last_offloads_everything() {
+    const auto all_off = ninfer::PipelineSplit::experts_on_last(40, 2);
+    check(all_off.ranks() == 2, "two ranks");
+    check(all_off.rank_layers(0) == 0, "rank 0 keeps no expert blocks by default");
+    check(all_off.rank_layers(1) == 40, "every expert block lands on rank 1");
+    for (std::uint32_t layer = 0; layer < 40; ++layer) {
+        check(all_off.placement(layer).rank == 1, "every layer's experts are on rank 1");
+    }
+    const ninfer::RankOwnership core{&all_off, 0};
+    const ninfer::RankOwnership experts{&all_off, 1};
+    check(core.owns_core() && core.owns_head() && core.owns_embedding(),
+          "rank 0 still owns embeddings, head and the rest of the core");
+    check(!experts.owns_core(), "the expert rank owns no core weights");
+    check(!core.owns_layer_experts(0) && experts.owns_layer_experts(0),
+          "expert ownership follows the split");
+
+    // Keeping some on rank 0 trades KV room for fewer crossings.
+    const auto keep_ten = ninfer::PipelineSplit::experts_on_last(40, 2, 10);
+    check(keep_ten.rank_layers(0) == 10 && keep_ten.rank_layers(1) == 30,
+          "keep_on_first moves that many expert blocks back");
+    check(ninfer::PipelineSplit::experts_on_last(40, 1).single_rank(), "one rank is the identity");
+    check_throws([] { (void)ninfer::PipelineSplit::experts_on_last(40, 2, 41); },
+                 "cannot keep more expert blocks than layers");
 }
 
 void rejects_incoherent_boundaries() {
     check_throws([] { (void)ninfer::PipelineSplit(40, {20, 30}); },
                  "boundaries must cover every layer");
-    check_throws([] { (void)ninfer::PipelineSplit(40, {20, 20, 40}); },
-                 "an empty rank is rejected");
+    // An empty rank is legal now: the default expert split leaves rank 0 with none.
+    check(ninfer::PipelineSplit(40, {20, 20, 40}).rank_layers(1) == 0, "an empty rank is allowed");
     check_throws([] { (void)ninfer::PipelineSplit(40, {30, 20, 40}); },
                  "descending boundaries are rejected");
     check_throws([] { (void)ninfer::PipelineSplit(40, {}); }, "no boundary is rejected");
@@ -185,6 +215,7 @@ int main() {
     balanced_by_bytes_equalises_bytes_not_layers();
     balanced_by_bytes_degenerates_safely();
     even_splits_evenly();
+    experts_on_last_offloads_everything();
     ownership_defaults_to_the_whole_model();
     ownership_partitions_across_two_ranks();
     rejects_incoherent_boundaries();

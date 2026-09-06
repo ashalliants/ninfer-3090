@@ -172,35 +172,11 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
             rank_plans.push_back(std::move(rank_plan));
         }
 
-        // Report what each card actually holds before refusing to go further. These are the
-        // numbers the whole exercise is about -- weights resident per card and therefore how much
-        // is left for KV -- and they are worth having even though execution cannot run yet.
-        std::string report = "pipeline split loaded across " + std::to_string(pipeline_ranks) +
-                             " devices:\n";
-        for (std::size_t rank = 0; rank < pipeline_ranks; ++rank) {
-            std::size_t free_bytes  = 0;
-            std::size_t total_bytes = 0;
-            {
-                ScopedDeviceRank rank_guard(device, rank);
-                CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-            }
-            report += "  rank " + std::to_string(rank) + " (cuda device " +
-                      std::to_string(device.device_ids()[rank]) + "): layers [" +
-                      std::to_string(pipeline_split.rank_begin(rank)) + "," +
-                      std::to_string(pipeline_split.rank_end(rank)) + "), weights " +
-                      std::to_string(rank_artifacts[rank].stats().device_capacity_bytes >> 20) +
-                      " MiB, free " + std::to_string(free_bytes >> 20) + " MiB\n";
-        }
-
-        // Loading is only half of a pipeline split. Executing one needs per-rank workspaces, KV
-        // and GDN state, and a run_layers that crosses the boundary -- none of which exists yet.
-        // Constructing a program over these weights would run every layer on rank 0 against
-        // pointers into another device's arena, so fail here rather than emit wrong tokens.
-        throw std::invalid_argument(
-            report +
-            "pipeline-split execution is not implemented yet: weights load and divide correctly, "
-            "but per-rank workspace, KV and the cross-device run_layers are still missing. Run "
-            "with a single --devices entry.");
+        // No per-rank logging here: the existing memory summary already reports rank 0, which is
+        // the number that matters. Rank 0 serves attention, so its free memory is exactly what is
+        // available for KV, and shedding the expert blocks is visible there directly.
+        model = Target::construct_loaded_model(std::move(rank_plans), std::move(rank_artifacts),
+                                               pipeline_split);
     } else {
         model = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
     }

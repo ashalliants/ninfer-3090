@@ -112,11 +112,14 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
 
     // Everything this rank does not own is still bound, but ValidateOnly: the artifact is checked
     // in full against the file while only this rank's bytes are uploaded to this device.
-    const auto head_placement = ownership.owns_head() ? artifact::TensorPlacement::Device
+    //
+    // Only the expert block moves. Attention, GDN, norms, the embedding and the head all stay on
+    // rank 0, because each is tied to state that cannot follow it -- the KV cache, the GDN
+    // recurrent state, round state and the persistent prefill buffer.
+    const auto core_placement = ownership.owns_core() ? artifact::TensorPlacement::Device
                                                       : artifact::TensorPlacement::ValidateOnly;
-    const auto embedding_placement = ownership.owns_embedding()
-                                         ? artifact::TensorPlacement::Device
-                                         : artifact::TensorPlacement::ValidateOnly;
+    const auto head_placement      = core_placement;
+    const auto embedding_placement = core_placement;
 
     out.token_embedding =
         artifact::bind_tensor(binder, "text/token_embedding", NumericFormat::W8G32_F16S,
@@ -126,12 +129,13 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
         const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
-        const auto place = ownership.owns_layer(static_cast<std::uint32_t>(layer))
-                               ? artifact::TensorPlacement::Device
-                               : artifact::TensorPlacement::ValidateOnly;
+        // The expert block follows the split; the rest of the layer stays on rank 0.
+        const auto expert_place = ownership.owns_layer_experts(static_cast<std::uint32_t>(layer))
+                                      ? artifact::TensorPlacement::Device
+                                      : artifact::TensorPlacement::ValidateOnly;
         const auto bind_layer_tensor = [&](std::string_view name, NumericFormat format,
                                            std::initializer_list<std::uint64_t> shape) {
-            return artifact::bind_tensor(binder, name, format, shape, place);
+            return artifact::bind_tensor(binder, name, format, shape, core_placement);
         };
 
         target.input_norm = bind_layer_tensor(prefix + "input_norm", NumericFormat::BF16, {2048});
@@ -161,10 +165,14 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
             target.gdn.output =
                 bind_layer_tensor(prefix + "gdn/output", NumericFormat::W8G32_F16S, {2048, 4096});
         }
+        // post_attention_norm is the first op of the mlp tail, so it rides with the expert block
+        // rather than staying on rank 0. At 4 KB the duplication is free, and it lets the
+        // offloaded rank run the whole tail without a second crossing.
         target.post_attention_norm =
-            bind_layer_tensor(prefix + "post_attention_norm", NumericFormat::BF16, {2048});
+            artifact::bind_tensor(binder, prefix + "post_attention_norm", NumericFormat::BF16,
+                                  {2048}, expert_place);
         target.moe = bind_moe(binder, prefix + "moe/", NumericFormat::Q4G64_F16S,
-                              routed_down_format(layer), place);
+                              routed_down_format(layer), expert_place);
     }
 
     out.final_norm = artifact::bind_tensor(binder, "text/final_norm", NumericFormat::BF16, {2048},
@@ -310,6 +318,12 @@ LoadedModelData::LoadedModelData(std::vector<BindingPlan> plans,
     frontend = qwen3_6::take_frontend_resources(embed_backing, embed_plan.frontend);
 
     runtime.weights_arena = &embed_backing.device_arena();
+    runtime.split         = split;
+    runtime.rank_weight_arenas.clear();
+    runtime.rank_weight_arenas.reserve(backings.size());
+    for (artifact::MaterializedArtifact& rank_backing : backings) {
+        runtime.rank_weight_arenas.push_back(&rank_backing.device_arena());
+    }
     runtime.features      = embed_plan.features;
     auto& token_embedding = runtime.token_embedding;
     auto& full_layers     = runtime.full_layers;
@@ -323,11 +337,16 @@ LoadedModelData::LoadedModelData(std::vector<BindingPlan> plans,
     std::size_t full_index = 0;
     std::size_t gdn_index  = 0;
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
-        // Shadow `backing` and `source` with the owning rank's pair so the body below reads from
-        // whichever device holds this layer without any per-tensor branching.
-        const std::size_t owner                = split.placement(static_cast<std::uint32_t>(layer)).rank;
-        artifact::MaterializedArtifact& backing = backings[owner];
-        const TextLayerPlan& source             = plans[owner].text_layers[layer];
+        // Core weights (norms, attention, GDN) always come from rank 0; only the expert block
+        // follows the split. Object handles are identical across ranks because every rank binds
+        // the same objects in the same order -- only the placement differs -- so the two plans
+        // index the same way.
+        const std::size_t expert_owner =
+            split.placement(static_cast<std::uint32_t>(layer)).rank;
+        artifact::MaterializedArtifact& backing        = embed_backing;
+        artifact::MaterializedArtifact& expert_backing = backings[expert_owner];
+        const TextLayerPlan& source                    = plans.front().text_layers[layer];
+        const TextLayerPlan& expert_source             = plans[expert_owner].text_layers[layer];
         if (source.is_full_attention) {
             FullAttentionWeights& target = full_layers.at(full_index++);
             target.input_norm            = artifact::materialized_tensor(backing, source.input_norm,
@@ -342,9 +361,9 @@ LoadedModelData::LoadedModelData(std::vector<BindingPlan> plans,
             target.output     = artifact::materialized_weight(backing, source.attention.output,
                                                               NumericFormat::W8G32_F16S, 2048, 4096);
             target.post_attention_norm = artifact::materialized_tensor(
-                backing, source.post_attention_norm, NumericFormat::BF16, {2048});
-            target.post_mixer =
-                load_moe(source.moe, backing, NumericFormat::Q4G64_F16S, routed_down_format(layer));
+                expert_backing, expert_source.post_attention_norm, NumericFormat::BF16, {2048});
+            target.post_mixer = load_moe(expert_source.moe, expert_backing,
+                                         NumericFormat::Q4G64_F16S, routed_down_format(layer));
         } else {
             GdnWeights& target = gdn_layers.at(gdn_index++);
             target.input_norm  = artifact::materialized_tensor(backing, source.input_norm,
@@ -364,9 +383,9 @@ LoadedModelData::LoadedModelData(std::vector<BindingPlan> plans,
             target.output              = artifact::materialized_weight(backing, source.gdn.output,
                                                                        NumericFormat::W8G32_F16S, 2048, 4096);
             target.post_attention_norm = artifact::materialized_tensor(
-                backing, source.post_attention_norm, NumericFormat::BF16, {2048});
-            target.post_mixer =
-                load_moe(source.moe, backing, NumericFormat::Q4G64_F16S, routed_down_format(layer));
+                expert_backing, expert_source.post_attention_norm, NumericFormat::BF16, {2048});
+            target.post_mixer = load_moe(expert_source.moe, expert_backing,
+                                         NumericFormat::Q4G64_F16S, routed_down_format(layer));
         }
     }
     if (full_index != full_layers.size() || gdn_index != gdn_layers.size()) {
