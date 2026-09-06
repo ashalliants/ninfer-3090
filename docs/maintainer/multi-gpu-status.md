@@ -170,7 +170,26 @@ whether the port is worth doing at all.
 
 ## Does any of this need NVLink?
 
-No, and the assumption that it did was wrong in two places in this tree -- both now fixed.
+No. **Confirmed on real hardware**, not inferred: a rented 2x RTX 3090 box (vast.ai instance
+50039003, `nvidia-smi topo -m` reporting `PHB` between the cards, i.e. PCIe host bridge, no
+bridge) runs the probe as:
+
+```
+devices=2
+cuda=0 bus=0000:04:00.0 name=NVIDIA GeForce RTX 3090 sm=86 vram_mib=24124
+cuda=1 bus=0000:09:00.0 name=NVIDIA GeForce RTX 3090 sm=86 vram_mib=24124
+peer 0->1=0
+peer 1->0=0
+enable_peer 0->1=peer access is not supported between these two devices
+memcpy_peer_1MiB=OK
+```
+
+`cudaDeviceCanAccessPeer` returns 0 and `cudaDeviceEnablePeerAccess` fails outright -- **and
+`cudaMemcpyPeer` succeeds anyway**, staging through host memory. That last line is the whole
+finding: the capability query and the ability to move data are different questions, and the code
+below was conflating them.
+
+The assumption that NVLink was required was wrong in two places in this tree -- both now fixed.
 
 `cudaDeviceCanAccessPeer` returning 0 does **not** mean the cards cannot exchange data.
 `cudaMemcpyPeer` works between any two devices; without peer access CUDA stages through host
