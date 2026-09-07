@@ -1,0 +1,44 @@
+name: CodePulse Review
+
+# Triggers a CodePulse AI review on a pull request. Authentication is GitHub OIDC, so there is no
+# secret to configure here -- but two things must be set up once, outside this file, or the job
+# will warn and do nothing:
+#
+#   1. the CodePulse GitHub App installed on this repo or the org, and
+#   2. Settings -> Triggers -> "GitHub Action trigger" enabled in the CodePulse dashboard.
+#
+# This repository currently has no other CI: building it needs CUDA 12.8 and the tests need a real
+# sm_86 device, neither of which a GitHub-hosted runner has, so there is nothing here to gate on
+# yet. The job therefore runs as soon as the pull request event fires.
+#
+# When CI does arrive, gating the review on it is a one-line change: add the job names to `needs:`
+# below, e.g. `needs: [build, test]`. That is the whole point of driving the review from an action
+# rather than a webhook -- the review waits for the same jobs everything else waits for, using the
+# ordinary `needs:` mechanism.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# Only the newest commit on a branch is worth reviewing; cancel a review queued for a commit that
+# has already been superseded.
+concurrency:
+  group: codepulse-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  codepulse:
+    name: Request review
+    # Fork pull requests are excluded deliberately. GitHub does not grant `id-token: write` to
+    # workflows running from a fork, so the action cannot mint the OIDC token and exits 1 -- a red
+    # check that a contributor has no way to fix from inside their PR. Fork PRs are still reviewed
+    # through the App's normal webhook path.
+    if: github.event_name == 'pull_request' && !github.event.pull_request.head.repo.fork
+    runs-on: ubuntu-latest
+    permissions:
+      # The only permission the action needs: it requests a short-lived JWT (audience pinned to
+      # `codepulse`) and POSTs it with the PR number and head SHA. It reads no code and writes no
+      # contents from here; the review itself is posted by the GitHub App.
+      id-token: write
+    steps:
+      - uses: codepulsehq/review-action@v1
