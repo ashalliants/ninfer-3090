@@ -243,6 +243,27 @@ about it fails on a different one.
       The relative-L2 field is the bound that actually constrains a kernel and should not be
       touched — those 330 cases all sit at 0.45-0.69 of it.
 
+## 5a. Sparse speculative raw-greedy has no finiteness guard
+
+- [ ] **Thread a per-row finiteness signal into `speculative_accept_sparse_warp_greedy_kernel`.**
+      Every other commit path now refuses to license a token chosen from a non-finite column:
+      the dense routes test `sampling_selected_logit_is_finite`/`sampling_value_is_finite`, and
+      `speculative_sparse_warp_accept` now tests the weight behind its chosen terminal. The
+      sparse **raw-greedy** route cannot: its kernel receives `target_tokens` (ints) and never
+      sees a float, so `speculative_sparse_warp_greedy` passes `true` with that stated at the
+      call site.
+
+      Closing it means changing `speculative_accept_sparse_drafts_launch` and the kernel
+      signature to carry either the verify logits or a precomputed per-row finite flag, plus its
+      callers, plus regression cases in `tests/ops/test_speculative_round.cpp` for both sparse
+      routes. That is a signature change across the launcher boundary, so it was descoped from
+      the catch-up PR rather than designed under review pressure — the bounded half (the accept
+      path, which has numerics in scope) is fixed there.
+
+      Worth knowing when prioritising: an all-NaN target column on this route licenses an
+      arbitrary token and advances the sequence length instead of returning
+      `kSamplerNonFiniteToken`. Raised by CodePulse on PR #16.
+
 ## 5b. Reproducibility
 
 - [ ] **fp8, k8v4 and nvfp4 causal attention are not run-to-run deterministic.** Running

@@ -116,12 +116,31 @@ __device__ __forceinline__ float speculative_sparse_probability(const std::int32
 
 // One warp owns a request. Each draft's acceptance event is independent given the provided
 // path and its conditional p/q distributions; the first failed event determines the prefix.
+// selection_is_finite has no default, for the same reason speculative_store_accept_result does not:
+// a diverged forward pass gives the selected column an all-NaN row, and a round that licenses a
+// plausible-looking token from it is worse than one that fails. Requiring the argument means a new
+// caller cannot compile without stating what it checked.
 __device__ __forceinline__ void speculative_sparse_warp_store(const int* drafts, int k, int row,
                                                               int accepted_count, int terminal,
                                                               int* lengths, int* anchors,
                                                               int* licensed_tokens,
-                                                              int* licensed_counts, int* accepted) {
+                                                              int* licensed_counts, int* accepted,
+                                                              bool selection_is_finite) {
     const int lane = threadIdx.x & 31;
+    if (!selection_is_finite) {
+        // Same sentinel shape as the dense path: one licensed token, nothing accepted, the length
+        // still advances by one so the caller's frontier stays consistent.
+        if (lane <= k) {
+            licensed_tokens[row * (k + 1) + lane] = lane == 0 ? kSamplerNonFiniteToken : 0;
+        }
+        if (lane == 0) {
+            licensed_counts[row] = 1;
+            accepted[row]        = 0;
+            anchors[row]         = kSamplerNonFiniteToken;
+            lengths[row] += 1;
+        }
+        return;
+    }
     if (lane <= k)
         licensed_tokens[row * (k + 1) + lane] = lane < accepted_count    ? drafts[row * k + lane]
                                                 : lane == accepted_count ? terminal
@@ -145,8 +164,11 @@ __device__ __forceinline__ void speculative_sparse_warp_greedy(const int* target
     const unsigned mask = __ballot_sync(0xffffffffU, reject);
     const int a         = mask ? __ffs(mask) - 1 : extent;
     const int terminal  = target_tokens[row * (k + 1) + a];
+    // No numeric in scope: this route receives target token ids, never logits, so there is nothing
+    // here to test for finiteness. Threading a per-row finite flag in needs a signature change
+    // across the launcher and its callers -- tracked in TODO.md rather than done under review.
     speculative_sparse_warp_store(drafts, k, row, a, terminal, lengths, anchors, licensed_tokens,
-                                  licensed_counts, accepted);
+                                  licensed_counts, accepted, true);
 }
 
 __global__ __launch_bounds__(256) void speculative_accept_sparse_warp_greedy_kernel(
@@ -189,9 +211,14 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
     const unsigned failures = __ballot_sync(0xffffffffU, reject);
     const int a             = failures ? __ffs(failures) - 1 : extent;
     int terminal;
-    if (greedy)
-        terminal = workspace.dist_idx[sampling_dist_offset(a, 0)];
-    else {
+    // The weight standing behind the chosen terminal, so the commit can be rejected when the
+    // target column is non-finite instead of licensing whatever index the selection happened to
+    // land on. Mirrors the dense route's sampling_value_is_finite(tstar_prob) check.
+    float terminal_weight;
+    if (greedy) {
+        terminal        = workspace.dist_idx[sampling_dist_offset(a, 0)];
+        terminal_weight = workspace.dist_prob[sampling_dist_offset(a, 0)];
+    } else {
         const int n  = workspace.dist_support[a];
         int token    = 0;
         float weight = 0.0f;
@@ -225,9 +252,14 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
                              : positive     ? 31 - __clz(positive)
                                             : 0;
         terminal           = __shfl_sync(0xffffffffU, token, selected);
+        // mass is the residual probability the selection drew from. A NaN column makes it NaN, and
+        // `!(mass > 0.0f)` above already forces `selected` to 0 -- committing lane 0's token would
+        // be exactly the arbitrary licence this guard exists to prevent.
+        terminal_weight = mass;
     }
     speculative_sparse_warp_store(drafts, k, row, a, terminal, lengths, anchors, licensed_tokens,
-                                  licensed_counts, accepted);
+                                  licensed_counts, accepted,
+                                  sampling_value_is_finite(terminal_weight));
 }
 
 // Commits the round's accepted tokens plus one correction/bonus token, then
