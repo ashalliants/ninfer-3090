@@ -314,6 +314,7 @@ int run_profile(std::string_view label, const Profile& profile,
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
 
     int failures        = 0;
+    bool any_graph_replay_ran = false;
     const auto run_case = [&](int tokens, bool replay) {
         const auto elements = checked_elements(profile.output_rows, tokens, "output size");
         test::GuardedDeviceBuffer output(elements * sizeof(std::uint16_t));
@@ -364,6 +365,7 @@ int run_profile(std::string_view label, const Profile& profile,
                                                  input_bits.data(),
                                                  input_bits.size() * sizeof(std::uint16_t));
             }
+            if (replay) any_graph_replay_ran = true;
         } catch (const std::exception& error) {
             if (unsupported_arch_refusal(error)) {
                 std::cout << "SKIP " << label_case << ": " << error.what() << '\n';
@@ -388,7 +390,7 @@ int run_profile(std::string_view label, const Profile& profile,
                                      host_activation.size() * sizeof(std::uint16_t));
     }
     for (int tokens : graph_cases) run_case(tokens, true);
-    const auto& final_input = graph_cases.empty() ? host_activation : negative_activation;
+    const auto& final_input = any_graph_replay_ran ? negative_activation : host_activation;
     failures += device_activation.verify_guards(std::string(label) + " activation");
     failures += device_weight.verify_guards(std::string(label) + " weight");
     failures += verify_unchanged(std::string(label) + " activation", device_activation,

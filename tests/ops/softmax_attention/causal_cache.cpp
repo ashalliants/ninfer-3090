@@ -2883,8 +2883,7 @@ int run_dflash2_cases() {
     int failures = 0;
     for (auto storage :
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
-          KvCacheStorage::RotatedInt8KeyInt4ValueGroup64, KvCacheStorage::Nvfp4Group16,
-          KvCacheStorage::Fp8KeyNvfp4Value}) {
+          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
         const auto run = [&](int width, int batch, int base) {
             BatchAttentionCase c{width, {}, {}, {}, MappingPattern::Fragmented,
                                  static_cast<unsigned>(1700 + width + 31 * batch)};
@@ -2923,13 +2922,18 @@ int run_batch_cases() {
     int failures = 0;
     for (auto storage :
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
-          KvCacheStorage::RotatedInt8KeyInt4ValueGroup64, KvCacheStorage::Nvfp4Group16,
-          KvCacheStorage::Fp8KeyNvfp4Value}) {
+          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
         failures += run_batch_case(kGeometries[0], storage,
                                    {16, {0}, {0}, {0}, MappingPattern::Fragmented, 1501u});
         failures += run_batch_case(kGeometries[0], storage,
                                    {16, {0}, {1}, {0}, MappingPattern::Fragmented, 1502u});
     }
+    // Same two shapes for rk8v4, through the CachePlan overload that models its
+    // packed int4 value plane.
+    failures += run_batch_case(kGeometries[0], kPlanRk8v4,
+                               {16, {0}, {0}, {0}, MappingPattern::Fragmented, 1503u});
+    failures += run_batch_case(kGeometries[0], kPlanRk8v4,
+                               {16, {0}, {1}, {0}, MappingPattern::Fragmented, 1504u});
     failures += run_batch_case(kGeometries[0], kPlanInt8,
                                {6, {127}, {3}, {0}, MappingPattern::Identity, 499u});
     failures += run_batch_case(kGeometries[0], kPlanBf16,

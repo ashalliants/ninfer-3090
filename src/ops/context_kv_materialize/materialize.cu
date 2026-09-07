@@ -5,6 +5,7 @@
 #include "ops/linear/w8/w8_small_t_mma.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/common/dflash_rope.cuh"
+#include "ops/kv_cache/plane_types.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -25,7 +26,14 @@ struct DeviceLayerView {
     const std::uint8_t* value_scales;
     const __nv_bfloat16* key_norm;
     __nv_bfloat16* cache_k;
-    __half* cache_v;
+    // BF16, symmetric with cache_k. Upstream stores this plane as FP16; this fork does not,
+    // and the two are byte-compatible, so the wrong type here would silently mis-decode.
+    __nv_bfloat16* cache_v;
+
+    static_assert(std::is_same_v<decltype(cache_k), KvKeyCodeT<KvCacheStorage::BFloat16>*>,
+                  "context KV cache K plane must match the declared BF16 cache storage");
+    static_assert(std::is_same_v<decltype(cache_v), KvValueCodeT<KvCacheStorage::BFloat16>*>,
+                  "context KV cache V plane must match the BF16 storage: V is symmetric with K here");
     std::int32_t padded_capacity;
 };
 
@@ -291,7 +299,7 @@ __global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mm
                 const auto dst     = row % 128 + 128LL * ((positions[column] & 2047) +
                                                       (long long)layer.padded_capacity *
                                                           (row / 128 + 8 * slots[request]));
-                layer.cache_v[dst] = __float2half_rn(__bfloat162float(__float2bfloat16_rn(result)));
+                layer.cache_v[dst] = __float2bfloat16_rn(result);
             }
         }
     }
@@ -335,7 +343,7 @@ struct MaterializeProjectionEpilogue {
             const auto dst     = row % 128 + 128LL * ((positions[column] & 2047) +
                                                   (long long)layer.padded_capacity *
                                                       (row / 128 + 8 * slots[request]));
-            layer.cache_v[dst] = __float2half_rn(__bfloat162float(__float2bfloat16_rn(result)));
+            layer.cache_v[dst] = __float2bfloat16_rn(result);
         }
     }
 
@@ -425,7 +433,7 @@ DeviceLayers make_device_layers(
             static_cast<const std::uint8_t*>(source.value_weight.scales),
             static_cast<const __nv_bfloat16*>(source.key_norm_weight.data),
             static_cast<__nv_bfloat16*>(source.cache.k.data),
-            static_cast<__half*>(source.cache.v.data),
+            static_cast<__nv_bfloat16*>(source.cache.v.data),
             static_cast<std::int32_t>(source.cache.padded_capacity),
         };
     }

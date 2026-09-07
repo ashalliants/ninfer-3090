@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <stdexcept>
 #include <limits>
 #include <string>
 #include <vector>
@@ -192,7 +193,8 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
         0, static_cast<std::uint32_t>(envelope_max)};
     const std::size_t workspace_bytes = ops::sliding_window_attention_workspace_capacity_bytes(
         kGeometry, kWindow, envelope, tokens, tokens, 1);
-    DeviceArena workspace(workspace_bytes);
+    // Direct-route shapes need no split partials, so this is legitimately zero.
+    DeviceArena workspace(std::max<std::size_t>(workspace_bytes, 1));
 
     ops::sliding_window_attention(q_tensor, query_k_tensor, query_v_tensor, positions_tensor,
                                   valid_tensor, lane_tensor, kGeometry, kWindow, kScale, context,
@@ -288,8 +290,8 @@ int run_batch_case() {
     Tensor lanes_tensor(d_lanes.p, DType::I32, {batch});
     Tensor out_tensor(d_out.data(), DType::BF16, {kD, kQHeads, tokens, batch});
     constexpr ops::SlidingWindowAttentionExecutionEnvelope envelope{0, 4096};
-    DeviceArena workspace(ops::sliding_window_attention_workspace_capacity_bytes(
-        kGeometry, kWindow, envelope, tokens, tokens, batch));
+    DeviceArena workspace(std::max<std::size_t>(ops::sliding_window_attention_workspace_capacity_bytes(
+        kGeometry, kWindow, envelope, tokens, tokens, batch), 1));
     auto context = make_context_view(d_context_k, d_context_v, batch);
 
     std::vector<double> expected(row_q_count * batch);
@@ -356,6 +358,9 @@ int main() {
         std::cerr << "sliding_window_attention accepted an invalid token interval\n";
         ++failures;
     } catch (const std::invalid_argument&) {}
+    // Report a throw instead of letting it reach terminate: an uncaught exception here exits
+    // with STATUS_STACK_BUFFER_OVERRUN and no output at all, which says nothing about the cause.
+    try {
     failures += run_case(1, 0);
     failures += run_case(16, 1);
     failures += run_case(8, 96, InputProfile::Random, 4096);
@@ -366,6 +371,10 @@ int main() {
     failures += run_case(8, 65, InputProfile::Random, 96, 0);
     failures += run_case(8, 4096, InputProfile::Random, 4096, 0);
     failures += run_batch_case();
+    } catch (const std::exception& error) {
+        std::cerr << "sliding_window_attention threw: " << error.what() << (char)10;
+        return 1;
+    }
 
     if (failures != 0) {
         std::cerr << "sliding_window_attention failures=" << failures << '\n';
