@@ -37,12 +37,34 @@ constexpr std::array<RouteSpec, 9> kCompanionRoutes{{
     {561, kAnyCols, W8AttnInputScheduleId::MmaR64C128},
 }};
 
-constexpr std::array<RouteSpec, 6> kDFlash2Routes{{
-    {1, 48, W8AttnInputScheduleId::DFlash2SmallT},
-    {49, 63, W8AttnInputScheduleId::DFlash2MmaR16C64K128},
-    {64, 96, W8AttnInputScheduleId::DFlash2MmaR32C32K128},
+// Measured on sm_86 by bench/ops/w8_dflash2_schedule_bench.cu, cold, median of 21. Upstream tuned
+// this table on sm_120; here SmallT was routed to 48 while losing 22-35% from T=17 on, and
+// R16C64K128 owned 49..63 while being the slowest kernel at every width measured.
+//
+// The R32C32K128 / R32C64K128 alternation below is not overfitting. The two kernels differ only in
+// column tile width, so their cost is quantised into ceil(T/32) and ceil(T/64) waves respectively,
+// and the wave boundaries interleave: c32 is ahead while it needs an odd number of waves for the
+// same work c64 does in a whole one, and behind on the next band. Measured per-band winners:
+//
+//   T      17-32   33-64   65-96   97-128   129-159   160-192   193+
+//   c32    77-82   131-160 163-184 214-245  250-281   313-340   365+
+//   c64k   105-123 105-123 208-211 193-220  289-292   294-309   372+
+//
+// R64C128 is a single c128 tile at T<=128 and is the best kernel at exactly 128 (217 us against
+// 220), but 129 costs it a second tile and it runs 356-361 through 192. The 1.4% it would gain at
+// exactly 128 is inside this bench's run-to-run spread, so 97..128 stays on one route rather than
+// carrying a single-width special case that a future merge would have to reason about.
+//
+// DFlash2MmaR16C64K128 is no longer selected at any width -- it never won one. It is kept rather
+// than deleted so the next catch-up merge does not have to re-add it.
+constexpr std::array<RouteSpec, 8> kDFlash2Routes{{
+    {1, 16, W8AttnInputScheduleId::DFlash2SmallT},
+    {17, 32, W8AttnInputScheduleId::DFlash2MmaR32C32K128},
+    {33, 64, W8AttnInputScheduleId::DFlash2MmaR32C64K128},
+    {65, 96, W8AttnInputScheduleId::DFlash2MmaR32C32K128},
     {97, 128, W8AttnInputScheduleId::DFlash2MmaR32C64K128},
-    {129, 192, W8AttnInputScheduleId::DFlash2MmaR32C64},
+    {129, 159, W8AttnInputScheduleId::DFlash2MmaR32C32K128},
+    {160, 192, W8AttnInputScheduleId::DFlash2MmaR32C64},
     {193, kAnyCols, W8AttnInputScheduleId::DFlash2MmaR64C128},
 }};
 

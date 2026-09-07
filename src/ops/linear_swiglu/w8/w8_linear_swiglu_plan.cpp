@@ -40,13 +40,32 @@ constexpr std::array<RouteSpec, 18> kCompanionRoutes{{
 }};
 
 // Small-T K-split followed by row-tiled MMA; live columns do not select exact-T kernels.
-constexpr std::array<RouteSpec, 6> kDFlash2Routes{{
-    {1, 40, W8LinearSwiGluScheduleId::DFlash2SmallT},
-    {41, 63, W8LinearSwiGluScheduleId::DFlash2MmaR32C64K128},
-    {64, 64, W8LinearSwiGluScheduleId::DFlash2MmaR64C64K128},
+//
+// Measured on sm_86 by bench/ops/w8_dflash2_schedule_bench.cu, cold, median of 21. This table
+// arrived whole from upstream tuned on sm_120 and was wrong here in three bands:
+//
+//   * SmallT was routed to 40. Its launcher is indexed by (T-1)/8, and the 33..40 specialisation
+//     costs 565-584 us against 460 for the MMA path -- so the last tile it owned was its worst.
+//     It wins cleanly through 32 (317 us at T=32 against 454) and loses from 33 on.
+//   * 41..63 went to R32C64K128; R64C64K128 is equal or better across that whole span and 4-7%
+//     better from 48 up, so the two routes collapse into one {33,64}.
+//   * 97..kAnyCols went to R64C128, which is a c128 column tile: it is the best kernel at 97..128
+//     (one tile) and the worst at 129..192 (two tiles, 1538-1551 us) where the c80 and c64 K-split
+//     kernels run 1109-1316. It becomes right again from ~208, once the second tile is paid for
+//     either way.
+//
+// DFlash2MmaR32C64K128 is no longer selected at any width. It is kept rather than deleted: it ties
+// R64C64K128 at 33..44 and removing an upstream schedule makes the next catch-up merge harder for
+// no measured gain.
+constexpr std::array<RouteSpec, 8> kDFlash2Routes{{
+    {1, 32, W8LinearSwiGluScheduleId::DFlash2SmallT},
+    {33, 64, W8LinearSwiGluScheduleId::DFlash2MmaR64C64K128},
     {65, 80, W8LinearSwiGluScheduleId::DFlash2MmaR64C80K128},
     {81, 96, W8LinearSwiGluScheduleId::DFlash2MmaR64C96K128},
-    {97, kAnyCols, W8LinearSwiGluScheduleId::DFlash2MmaR64C128},
+    {97, 128, W8LinearSwiGluScheduleId::DFlash2MmaR64C128},
+    {129, 175, W8LinearSwiGluScheduleId::DFlash2MmaR64C80K128},
+    {176, 207, W8LinearSwiGluScheduleId::DFlash2MmaR64C64K128},
+    {208, kAnyCols, W8LinearSwiGluScheduleId::DFlash2MmaR64C128},
 }};
 
 template <std::size_t N>
