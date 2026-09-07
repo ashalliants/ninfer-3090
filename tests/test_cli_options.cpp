@@ -82,5 +82,21 @@ int main() {
                   (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--top-k", "21"});
               }),
               "CLI accepted top_k beyond the executable candidate domain");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--device",
+                                       "1", "--devices", "0,1"});
+                      }),
+                      "--device and --devices were accepted together");
+    failures +=
+        check(rejects([] {
+                  (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--devices",
+                               "4294967296"});
+              }),
+              "--devices silently narrowed an out-of-range id instead of rejecting it");
+    const ninfer::cli::Options same_card = parse(
+        {"ninfer-cli", "model.ninfer", "--prompt", "hello", "--devices", "0,0"});
+    failures += check(same_card.devices.size() == 2 && same_card.devices[0] == 0 &&
+                           same_card.devices[1] == 0,
+                      "--devices 0,0 was not accepted for single-card split coverage");
     return failures == 0 ? 0 : 1;
 }

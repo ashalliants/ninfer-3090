@@ -61,6 +61,11 @@ void configure_cuda_device_once(Configure&& configure) {
 // kernels run or what they compute.
 inline constexpr std::size_t kCrossingPipelineDepth = 4;
 
+// Default pinned staging capacity: covers a 1024-token residual crossing (hidden 5120, BF16)
+// with generous headroom. A caller that configures a larger prefill chunk than this covers
+// should size the crossing staging buffer explicitly at construction instead of relying on this.
+inline constexpr std::size_t kDefaultCrossingStagingBytes = 64ULL << 20;
+
 struct DeviceContext {
     int device                   = 0;
     cudaStream_t stream          = nullptr;
@@ -72,9 +77,16 @@ struct DeviceContext {
 
     explicit DeviceContext(int device_id = 0);
     // One entry keeps the single-device route. Two entries hold a second endpoint open for
-    // model-parallel execution: matching compute capability and bidirectional peer access are
-    // validated here, before any weight is uploaded.
-    explicit DeviceContext(std::span<const int> device_ids);
+    // model-parallel execution: matching compute capability is required, before any weight is
+    // uploaded. Bidirectional peer access is only probed and recorded as a capability -- it is not
+    // required, since crossings stage through pinned host memory when it is unavailable.
+    //
+    // `min_crossing_staging_bytes` sizes the pinned cross-rank staging buffer (see
+    // `crossing_staging()`); the default covers only a modest residual crossing. A caller that
+    // configures a larger prefill chunk must size this explicitly, since one crossing has to fit
+    // in a single staged transfer.
+    explicit DeviceContext(std::span<const int> device_ids,
+                           std::size_t min_crossing_staging_bytes = kDefaultCrossingStagingBytes);
     ~DeviceContext();
 
     DeviceContext(const DeviceContext&)            = delete;

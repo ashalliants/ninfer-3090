@@ -137,6 +137,23 @@ Concurrency is capped at 8 by `kMaximumConcurrency` (`include/ninfer/types.h`), 
 compile-time constant sizing arrays in the admission policy and engine core -- not a memory limit.
 Raising it is a separate, bounded change.
 
+## Alternative considered: tensor-parallel MLP split
+
+[devon-caron/ninfer-dual-3090-nvlink](https://github.com/devon-caron/ninfer-dual-3090-nvlink)
+implements a working dual-3090 split on an older NInfer base, by physically sharding each MLP's
+packed Q4/Q5 weight matrices across both cards (partial tensor parallelism) rather than offloading
+whole expert blocks. Reported on their machine: prefill +41%, decode +17.5%, restricted to the
+dense 27B target.
+
+That design was not ported here, for three reasons. Their base and ours had diverged by 280
+commits against their 2 by the time it was evaluated, and a trial merge produced ~90 conflict
+hunks with no mechanical resolution -- the two trees had rewritten the same execution path
+(`program_impl.h`) for unrelated reasons. Their decode gain, on inspection, comes from a design
+that crosses the link twice per split MLP per layer (128 crossings/token for the 27B); ours crosses
+once per layer's mlp tail, and expert offload rather than weight sharding gets 83% of the KV-room
+win (see the table above) without needing NVLink or a rewrite of the execution path. Their design
+also excludes the 35B-A3B target this fork tunes for by default.
+
 ## How performance got here
 
 Three findings, in order, because two of them contradicted the obvious guess:
@@ -168,8 +185,9 @@ The remaining gap is real PCIe traffic, 336 MB per prefill chunk.
 - [x] **27B**, all three of its layer-binding paths (groupwise, NVFP4, and the Qwen3.8 NVFP4/FP8
       mix).
 - [x] `--devices N,M` on the CLI, so the split can be checked by output rather than by inspection.
-- [ ] Hardware equivalence run: greedy text from the split against the single-GPU reference.
-- [ ] KV capacity measured with `--kv-capacity auto` in both modes.
+- [x] Hardware equivalence run: greedy text from the split against the single-GPU reference,
+      byte-identical on both targets (see Measured on two RTX 3090s, above).
+- [x] KV capacity measured with `--kv-capacity auto` in both modes (see Capacity, above).
 - [ ] CUDA graphs across the boundary. Capture is per-device, so a cross-device schedule cannot be
       one graph. Whether decode capture survives the offload, and what it costs if not, is
       unmeasured.

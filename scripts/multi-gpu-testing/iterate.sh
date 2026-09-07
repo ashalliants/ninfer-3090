@@ -37,7 +37,7 @@ MODE="${1:-}"
 
 if [[ "$MODE" != "--run-only" ]]; then
   echo "==> pulling $BRANCH and rebuilding"
-  run "set -e
+  run "set -e -o pipefail
     cd /root/src
     git fetch --depth 1 origin '$BRANCH'
     git reset --hard FETCH_HEAD

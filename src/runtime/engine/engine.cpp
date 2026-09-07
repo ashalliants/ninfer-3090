@@ -100,7 +100,15 @@ DeviceContext initialize_device(const EngineOptions& options) {
         phase.complete();
         return device;
     }
-    DeviceContext device{std::span<const int>(options.devices)};
+    // A cross-rank crossing has to fit in one staged transfer, so size pinned staging from the
+    // configured prefill chunk conservatively against the largest shipped hidden size, rather
+    // than the fixed default -- otherwise a valid, large --prefill-chunk fails at runtime the
+    // first time a split forward pass crosses ranks.
+    const std::size_t crossing_bytes = static_cast<std::size_t>(options.prefill_chunk) *
+                                       kMaxSupportedResidualHiddenSize *
+                                       kResidualStreamBytesPerElement;
+    DeviceContext device{std::span<const int>(options.devices),
+                         std::max(crossing_bytes, kDefaultCrossingStagingBytes)};
     phase.complete();
     return device;
 }

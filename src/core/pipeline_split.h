@@ -119,6 +119,13 @@ public:
         if (keep_on_first > layer_count) {
             throw std::invalid_argument("cannot keep more expert blocks than there are layers");
         }
+        // Keeping every layer's experts on the first rank leaves the last rank with none, which
+        // has no device tensors to materialize -- not a valid reduced-offload configuration.
+        if (keep_on_first == layer_count) {
+            throw std::invalid_argument(
+                "cannot keep every expert block on the first rank: the last rank needs at least "
+                "one layer to materialize");
+        }
         std::vector<std::uint32_t> boundaries;
         boundaries.reserve(ranks);
         boundaries.push_back(keep_on_first);

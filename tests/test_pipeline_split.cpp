@@ -192,6 +192,9 @@ void experts_on_last_offloads_everything() {
     check(ninfer::PipelineSplit::experts_on_last(40, 1).single_rank(), "one rank is the identity");
     check_throws([] { (void)ninfer::PipelineSplit::experts_on_last(40, 2, 41); },
                  "cannot keep more expert blocks than layers");
+    // Keeping every layer's experts on rank 0 would leave rank 1 with none to materialize.
+    check_throws([] { (void)ninfer::PipelineSplit::experts_on_last(40, 2, 40); },
+                 "cannot keep every expert block on the first rank");
 }
 
 void rejects_incoherent_boundaries() {

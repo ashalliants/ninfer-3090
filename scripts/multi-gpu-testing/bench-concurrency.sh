@@ -15,9 +15,11 @@ MODEL_ID=${MODEL_ID:-qwen3.6-35b-a3b}
 SERVE=/root/build/apps/ninfer-serve
 PORT=18080
 
-start_server() {   # devices concurrency context
-  timeout 900 "$SERVE" "$MODEL" --devices "$1" --max-context "$3" --kv-capacity auto \
-    --kv-dtype int8 --max-concurrency "$2" --host 127.0.0.1 --port "$PORT" \
+start_server() {   # devices concurrency context [extra serve flags...]
+  local devices=$1 conc=$2 ctx=$3
+  shift 3
+  timeout 900 "$SERVE" "$MODEL" --devices "$devices" --max-context "$ctx" --kv-capacity auto \
+    --kv-dtype int8 --max-concurrency "$conc" --host 127.0.0.1 --port "$PORT" "$@" \
     > /root/s.log 2>&1 &
   SERVER_PID=$!
   for _ in $(seq 1 120); do
@@ -72,9 +74,10 @@ except Exception: print(0)
   python3 -c "print(f'{$toks} {$end - $start:.3f}')"
 }
 
-bench() {          # label devices concurrency context tokens_each [extra serve flags]
-  local label=$1 devices=$2 conc=$3 ctx=$4 tokens=$5 extra=${6:-}
-  if ! start_server "$devices" "$conc" "$ctx" "$extra"; then
+bench() {          # label devices concurrency context tokens_each [extra serve flags...]
+  local label=$1 devices=$2 conc=$3 ctx=$4 tokens=$5
+  shift 5
+  if ! start_server "$devices" "$conc" "$ctx" "$@"; then
     printf "  %-22s FAILED: %s
 " "$label" "$(fail_line)"
     stop_server
@@ -130,8 +133,8 @@ throughput)
   for c in 1 4 8; do bench "single GPU"  0   "$c" 16384 200; done
   for c in 1 4 8; do bench "split 0,1"   0,1 "$c" 16384 200; done
   echo "=== aggregate throughput, MTP3 ==="
-  for c in 1 4 8; do bench "single + MTP" 0   "$c" 16384 200 "--spec mtp --draft-tokens 3"; done
-  for c in 1 4 8; do bench "split + MTP"  0,1 "$c" 16384 200 "--spec mtp --draft-tokens 3"; done
+  for c in 1 4 8; do bench "single + MTP" 0   "$c" 16384 200 --spec mtp --draft-tokens 3; done
+  for c in 1 4 8; do bench "split + MTP"  0,1 "$c" 16384 200 --spec mtp --draft-tokens 3; done
   ;;
 *)
   bash "$0" ceiling

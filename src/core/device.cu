@@ -47,7 +47,8 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
 DeviceContext::DeviceContext(int device_id)
     : DeviceContext(std::span<const int>(&device_id, 1)) {}
 
-DeviceContext::DeviceContext(std::span<const int> device_ids) {
+DeviceContext::DeviceContext(std::span<const int> device_ids,
+                             std::size_t min_crossing_staging_bytes) {
     int count       = 0;
     cudaError_t err = cudaGetDeviceCount(&count);
     if (err != cudaSuccess) {
@@ -172,19 +173,19 @@ DeviceContext::DeviceContext(std::span<const int> device_ids) {
 
     if (endpoints_.size() > 1) {
         // Sized for the largest thing a crossing carries: one prefill chunk of the residual
-        // stream. 64 MiB covers 1024 tokens x hidden 5120 x BF16 (10 MiB) with generous room, and
-        // pinned host memory is cheap next to the weights either card holds.
-        constexpr std::size_t kCrossingStagingBytes = 64ULL << 20;
-        void* staging                               = nullptr;
+        // stream. The caller (which knows the configured prefill chunk and the model's hidden
+        // size) is responsible for passing a capacity that covers it; pinned host memory is cheap
+        // next to the weights either card holds.
+        void* staging                 = nullptr;
         const cudaError_t staging_err =
-            cudaHostAlloc(&staging, kCrossingStagingBytes, cudaHostAllocPortable);
+            cudaHostAlloc(&staging, min_crossing_staging_bytes, cudaHostAllocPortable);
         if (staging_err != cudaSuccess) {
             release();
             throw std::runtime_error(
                 cuda_error_message("cudaHostAlloc(cross-rank staging) failed", staging_err));
         }
         crossing_staging_       = staging;
-        crossing_staging_bytes_ = kCrossingStagingBytes;
+        crossing_staging_bytes_ = min_crossing_staging_bytes;
     }
 
     active_rank_ = 0;

@@ -46,7 +46,11 @@ std::vector<int> parse_device_list(std::string_view text) {
                                                                : comma - start);
         if (piece.empty()) { throw std::invalid_argument("--devices entries must not be empty"); }
         const std::string entry(piece);
-        devices.push_back(static_cast<int>(parse_u64(entry.c_str(), "devices")));
+        const std::uint64_t raw = parse_u64(entry.c_str(), "devices");
+        if (raw > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+            throw std::invalid_argument("invalid devices: " + entry);
+        }
+        devices.push_back(static_cast<int>(raw));
         if (comma == std::string_view::npos) { break; }
         start = comma + 1;
     }
@@ -147,6 +151,7 @@ Options parse_options(int argc, char** argv) {
     if (argc < 2) { throw std::invalid_argument(".ninfer model path is required"); }
     options.artifact_path     = argv[1];
     bool kv_capacity_explicit = false;
+    bool device_explicit      = false;
 
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -169,7 +174,8 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {
-            options.device = parse_device(value(arg));
+            options.device  = parse_device(value(arg));
+            device_explicit = true;
         } else if (arg == "--devices") {
             options.devices = parse_device_list(value(arg));
         } else if (arg == "--kv-dtype") {
@@ -252,6 +258,9 @@ Options parse_options(int argc, char** argv) {
 
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+    }
+    if (!options.devices.empty() && device_explicit) {
+        throw std::invalid_argument("--device and --devices are mutually exclusive");
     }
 
     const bool has_prompt   = !options.prompt.empty();

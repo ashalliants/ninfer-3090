@@ -355,7 +355,6 @@ int main() {
 
     for (const auto& [value, why] : std::vector<std::pair<std::string, const char*>>{
              {"0,1,2", "three devices"},
-             {"0,0", "duplicate devices"},
              {"", "an empty list"},
              {"1,", "a trailing comma"}}) {
         bool rejected = false;
@@ -364,6 +363,13 @@ int main() {
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, why);
     }
+
+    // "0,0" is deliberately permitted: it puts both ranks on one card so the split path can be
+    // exercised on a single-GPU machine.
+    const ServeOptions same_card = parse({"ninfer-serve", "model.ninfer", "--devices", "0,0"});
+    failures += check(same_card.devices.size() == 2 && same_card.devices[0] == 0 &&
+                           same_card.devices[1] == 0,
+                      "--devices 0,0 was not accepted for single-card split coverage");
 
     bool exclusive_rejected = false;
     try {
