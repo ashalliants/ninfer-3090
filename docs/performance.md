@@ -13,6 +13,23 @@
 > reductions run in a different order and a near-tie argmax can flip. MTP shows it identically,
 > so it is a property of the shared verification path rather than anything DFlash2 introduced.
 >
+> **Route boundaries are measured here, not inherited.** Two maintainer benches time every
+> schedule of an Op at the same column count, cold, so a boundary can be chosen from data rather
+> than from whichever table happened to be live:
+> `bench/ops/q4_q5_attn_input_schedule_bench.cu` and
+> `bench/ops/q4_linear_swiglu_schedule_bench.cu`. Both take an explicit per-schedule domain,
+> because a kernel handed more columns than it supports either corrupts memory (q4_q5
+> parent_split_fixed past 12) or silently does one column's work at a constant cost and appears to
+> win everywhere (q4 swiglu gemv_pair, registered for a single column). Cold is the production
+> regime for these: the Q4/Q5 attention projection alone streams ~35 MB of weights per call
+> against the 3090's 6 MB of L2.
+>
+> The Q4/Q5 attention-input table had been dead code since the catch-up -- `resolve_plan` was a
+> hardcoded chain of upstream's sm_120 boundaries -- and routing through the measured table
+> exposed a `switch` fallthrough that ran a second kernel over the first. Public-Op cost at T=16
+> fell 502.8 -> 226.3 us and at T=32 500.7 -> 217.1 us. Q4 SwiGLU's SmallTTiled bound returned to
+> 24, where the tiled kernel and the 40-wide pair tile actually cross (6% at T=25, 14% at T=32).
+>
 > **The upstream DFlash2 corpus numbers are still not reproduced here.** The upstream catch-up brought the DFlash2
 > speculative backend (`--spec dflash2 --draft-tokens 7`, Qwen3.8-27B only). Upstream publishes
 > DFlash2 numbers for their own hardware; those are deliberately not reproduced in this document,
