@@ -33,16 +33,17 @@ constexpr Q4LinearSwiGluProblem kShape{34816, 17408, 5120, 5120, 1};
 
 constexpr std::array<RouteSpec, 10> kRoutes{{
     {{1, 1}, Q4LinearSwiGluScheduleId::GemvPair},
-    // This boundary is upstream's, not a measured sm_86 result. The fork previously routed 2..24
-    // to SmallTExact because the exact-T route's cost rises with T while the 40-wide pair tile's
-    // is flat, and on sm_86 those crossed at 25. That kernel (q4_linear_swiglu_small_t_exact) was
-    // deleted upstream, so the crossover it described no longer exists and the old boundary has
-    // nothing behind it. SmallTTiled is a different kernel and has not been swept on sm_86 yet;
-    // 32 is upstream's measured value for it and is the better-founded default until it is.
-    // The narrow-tile finding still holds independently: tiles under 40 lose occupancy without
-    // being issue-bound (+29.9% against the exact route at T=16).
-    {{2, 32}, Q4LinearSwiGluScheduleId::SmallTTiled},
-    {{33, 40}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C40},
+    // Measured on sm_86 with bench/ops/q4_linear_swiglu_schedule_bench.cu (cold, median of 11):
+    // SmallTTiled and the 40-wide pair tile cross between 24 and 25, us --
+    //     T=22  373.8 vs 438.3   T=24  390.1 vs 434.2   T=25  464.9 vs 436.2   T=32  507.9 vs 437.2
+    // so the tile is 6% faster at 25 and 14% at 32. That restores the boundary this fork always
+    // had. Its original comment justified 24 by a crossover against q4_linear_swiglu_small_t_exact,
+    // which upstream deleted, so I had replaced it with upstream's 32; the number turns out to be
+    // right for the tiled kernel too, which nobody had measured. 32 is separately the largest
+    // width SmallTTiled accepts at all -- past it the launch fails, so it is a capability limit
+    // rather than a tuning choice, and upstream's table simply ran the route to that limit.
+    {{2, 24}, Q4LinearSwiGluScheduleId::SmallTTiled},
+    {{25, 40}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C40},
     {{41, 48}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C48},
     {{49, 128}, Q4LinearSwiGluScheduleId::Materialized},
     {{129, 256}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
