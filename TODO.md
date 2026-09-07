@@ -73,11 +73,17 @@ about it fails on a different one.
       both switch fallthroughs hide. Consider a test that *lists* unrouted schedules per Op, so the
       set is visible and deliberate rather than accidental.
 - [ ] **`w8_pair` k=2048 table (37 routes) is unmeasured on sm_86.** The merge did not touch it, so
-      it is not a new regression, but it is the largest route table in the tree and
-      `bench/ops/w8_pair_schedule_bench.cu` now only needs a second `sweep_for_k(2048, ...)` call
-      plus the split-K/concat schedules added to its list. Note the trap recorded in that bench:
-      those schedules assume the k=2048 geometry, and one run outside the shape it was written for
-      will fault rather than throw.
+      it is not a new regression, but it is the largest route table in the tree and sits on the 35B
+      DFlash path. `bench/ops/w8_pair_schedule_bench.cu` is the starting point but this is **more
+      than a second `sweep_for_k(2048, ...)` call**, which is what a first look suggested:
+      - `w8_pair_execute_schedule` calls `require_dflash_row_views` whenever `k == 2048`, so the two
+        weights cannot be standalone 1024-row matrices as they are for k=5120. They must be row
+        views into a 6144-row parent taken at rows 4096 and 5120. `PairFixture` in
+        `tests/ops/linear_pair/linear_pair_test_common.cpp` already builds exactly that and is the
+        thing to copy.
+      - The schedule list needs the split-K and concat families, and those are the ones that assume
+        the k=2048 geometry. A kernel run outside the shape it was written for faults rather than
+        throwing, and the sweep driver can only catch throws — add them a few at a time.
 - [ ] **q4 SwiGLU `Materialized` boundaries are unmeasured on sm_86**: routes `{49,128}`,
       `{257,384}`, `{513,640}`. `bench/ops/q4_linear_swiglu_schedule_bench.cu` deliberately excludes
       Materialized because it needs a workspace and has a different launch signature. Extending the
