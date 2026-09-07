@@ -4,6 +4,7 @@
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t_k8v4.cuh"
+#include "ops/kv_cache/plane_types.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -39,10 +40,13 @@ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positi
 
         const auto q_ptr         = static_cast<const __nv_bfloat16*>(q.data);
         const auto positions_ptr = static_cast<const std::int32_t*>(positions.data);
-        const auto cache_k_ptr   = static_cast<std::uint8_t*>(cache.k_pages.data);
-        const auto cache_v_ptr   = static_cast<std::uint8_t*>(cache.v_pages.data);
-        const auto k_scale_ptr   = static_cast<__half*>(cache.k_scale_pages.data);
-        const auto v_scale_ptr   = static_cast<std::uint8_t*>(cache.v_scale_pages.data);
+        constexpr auto kStorage  = KvCacheStorage::Fp8KeyNvfp4Value;
+        const auto cache_k_ptr   = static_cast<KvKeyCodeT<kStorage>*>(cache.k_pages.data);
+        const auto cache_v_ptr   = static_cast<KvValueCodeT<kStorage>*>(cache.v_pages.data);
+        const auto k_scale_ptr   = static_cast<KvKeyScaleT<kStorage>*>(cache.k_scale_pages.data);
+        const auto v_scale_ptr   = static_cast<KvValueScaleT<kStorage>*>(cache.v_scale_pages.data);
+        assert_kv_planes<kStorage, decltype(cache_k_ptr), decltype(cache_v_ptr),
+                         decltype(k_scale_ptr), decltype(v_scale_ptr)>();
         const auto tables_ptr    = static_cast<const std::int32_t*>(cache.block_tables.data);
         const auto valid_ptr =
             invocation.valid_columns == nullptr
