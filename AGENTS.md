@@ -30,7 +30,12 @@ approval requirements beyond the user's instructions and the actual execution en
 NInfer is a from-scratch C++/CUDA inference engine for maximum single-GPU performance on explicitly
 registered artifacts. Current identities are `qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`,
 `qwen3.8-27b/groupwise-int`, `qwen3.8-27b/nvfp4`, and `qwen3.6-35b-a3b/groupwise-int`.
-The implementation targets `sm_120a` and is tuned on NVIDIA GeForce RTX 5090.
+This fork targets **`sm_86`** and is tuned on **NVIDIA GeForce RTX 3090** (24 GB), built with
+CUDA 12.8. Upstream (`Neroued/ninfer`) targets `sm_120a` on RTX 5090; that is where its schedules,
+route tables and published measurements come from, and none of it is authoritative here — every
+route table this fork inherited and re-measured on sm_86 turned out to be wrong by 12-41%. Treat an
+upstream tuning constant as a hypothesis until measured on this card. The build environment and the
+compatibility constraints are in "Windows build environment (RTX 3090 fork host)" below.
 
 Generation uses one GPU, one resident model, startup-fixed concurrency of one to eight requests,
 bounded FIFO ingress, no active-request preemption, and one compact decode batch per round.

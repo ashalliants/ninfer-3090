@@ -82,10 +82,9 @@ adoption is the clean thing to split out — it is self-contained (merge `19c761
       k=15, **batch=8** (18,432-token KV) and 3 state slots, wanting 6.32 GB. Run it scaled and it
       passes end to end: `ninfer_qwen3_8_27b_dflash2_real_test.exe 7 1 1 2 int8 0 1` →
       `ok K=7 B=2 graph=1 optimized=1 accepted=20/20`.
-      **Still to do:** `ninfer_add_test` has no way to pass test arguments
-      (`add_test(NAME ${name} COMMAND ${name})`), so this cannot be wired into ctest without adding
-      a `TEST_ARGS` option to that helper. Worth doing — it turns a permanently-failing test into
-      real DFlash2 coverage on this box.
+      **Now wired into ctest.** `ninfer_add_test` gained a `TEST_ARGS` option and the test is
+      registered with `TEST_ARGS 7 1 1 2 int8 0 1`, so it runs that configuration by default and
+      passes; the executable still accepts any other configuration when run by hand.
 
 ### Running the real-model tests on this box (verified 2026-09-07, idle GPU)
 
@@ -242,6 +241,25 @@ about it fails on a different one.
       `NINFER_OP_REPORT_STATS=1` prints `gross_ratio` per case, which is how to check cheaply.
       The relative-L2 field is the bound that actually constrains a kernel and should not be
       touched — those 330 cases all sit at 0.45-0.69 of it.
+
+## 4a. Documents that still speak for the wrong GPU
+
+- [ ] **Audit `docs/performance.md` provenance.** `AGENTS.md` claimed the implementation targets
+      `sm_120a` on an RTX 5090 — corrected, since this fork is `sm_86`/RTX 3090 and the same file's
+      own build section already said so. Chasing that turned up a bigger question this branch has
+      not answered: `docs/performance.md` presents campaigns measured **on an RTX 5090 with CUDA
+      13.1** (lines ~63, ~80, ~131, ~190). Some of that is certainly upstream's, and the PR
+      description claims this fork "keeps this fork's sm_86 measurements" — those two statements
+      cannot both be fully true.
+
+      Deliberately **not** rewritten under review: sorting which tables are ours and which are
+      inherited needs the provenance of each campaign, not a search-and-replace, and getting it
+      wrong would replace one misleading claim with another. The bounded fix — label each campaign
+      with the hardware it ran on, the way `qwen3.8-27b-dflash2.md` now separates 上游证据 from
+      本 fork 证据 — is the shape to aim for.
+
+      `README.md` is already correct here: its "## Upstream" section contrasts upstream's
+      RTX 5090/`sm_120a` target with this fork's SM86 layer, so it needs no change.
 
 ## 5a. Sparse speculative raw-greedy has no finiteness guard
 
