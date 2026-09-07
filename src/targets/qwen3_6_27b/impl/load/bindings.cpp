@@ -425,7 +425,7 @@ DFlash2Plan bind_dflash2(artifact::Binder& binder, artifact::TensorPlacement pla
 
     DFlash2Plan out;
     out.feature_projection = bind_weight(binder, "dflash2/feature_projection",
-                                         NumericFormat::W8G32_F16S, {5120, 25600}, placement);
+                                         NumericFormat::W8G32_F16S, {5120, 25600}, 0, placement);
     out.context_norm       = bind_tensor("dflash2/context_norm", NumericFormat::BF16, {5120});
     for (std::size_t layer = 0; layer < out.layers.size(); ++layer) {
         DFlash2LayerPlan& target = out.layers[layer];
@@ -435,30 +435,30 @@ DFlash2Plan bind_dflash2(artifact::Binder& binder, artifact::TensorPlacement pla
             bind_tensor(prefix + "attention_conv/base_kernel", NumericFormat::BF16, {2, 2, 5120});
         target.attention_conv.kernel_projection =
             bind_weight(binder, prefix + "attention_conv/kernel_projection", NumericFormat::BF16,
-                        {1280, 5120}, placement);
+                        {1280, 5120}, 0, placement);
         target.query_key_value = bind_weight(binder, prefix + "attention/query_key_value",
-                                             NumericFormat::W8G32_F16S, {6144, 5120}, placement);
+                                             NumericFormat::W8G32_F16S, {6144, 5120}, 0, placement);
         target.query_norm =
             bind_tensor(prefix + "attention/query_norm", NumericFormat::BF16, {128});
         target.key_norm = bind_tensor(prefix + "attention/key_norm", NumericFormat::BF16, {128});
         target.attention_output = bind_weight(binder, prefix + "attention/output",
-                                              NumericFormat::W8G32_F16S, {5120, 4096}, placement);
+                                              NumericFormat::W8G32_F16S, {5120, 4096}, 0, placement);
         target.post_attention_norm =
             bind_tensor(prefix + "post_attention_norm", NumericFormat::BF16, {5120});
         target.mlp_conv.base_kernel =
             bind_tensor(prefix + "mlp_conv/base_kernel", NumericFormat::BF16, {2, 2, 5120});
         target.mlp_conv.kernel_projection =
             bind_weight(binder, prefix + "mlp_conv/kernel_projection", NumericFormat::BF16,
-                        {1280, 5120}, placement);
+                        {1280, 5120}, 0, placement);
         target.gate_up = bind_weight(binder, prefix + "mlp/gate_up", NumericFormat::W8G32_F16S,
-                                     {34816, 5120}, placement);
+                                     {34816, 5120}, 0, placement);
         target.down    = bind_weight(binder, prefix + "mlp/down", NumericFormat::W8G32_F16S,
-                                     {5120, 17408}, placement);
+                                     {5120, 17408}, 0, placement);
     }
     out.final_norm = bind_tensor("dflash2/final_norm", NumericFormat::BF16, {5120});
     out.candidate_selector.hidden_projection =
         bind_weight(binder, "dflash2/candidate_selector/hidden_projection", NumericFormat::BF16,
-                    {256, 5120}, placement);
+                    {256, 5120}, 0, placement);
     out.candidate_selector.predecessor_codebook = bind_tensor(
         "dflash2/candidate_selector/predecessor_codebook", NumericFormat::BF16, {248320, 256});
     out.candidate_selector.successor_codebook = bind_tensor(
