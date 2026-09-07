@@ -1,8 +1,12 @@
 # TODO
 
-State as of 2026-09-07, branch `sync/neroued-catchup-20260906` (96 commits ahead of `master`:
-86 from upstream, 10 ours). Full suite is **121/121 passing**, tree builds clean on sm_86, DFlash2
-works on the real 27B including with `--vision`.
+State as of 2026-09-07, branch `sync/neroued-catchup-20260906`, open as **PR #16**. Full suite is
+**121/121 passing**, tree builds clean on sm_86, DFlash2 works on the real 27B including with
+`--vision`.
+
+Since the PR was opened, all three route tables the merge changed have been re-measured on sm_86
+and retuned (12-41% faster at the widths that moved), a second switch fallthrough was found and
+fixed, and every KV plane cast now derives from `d256_kv_cache_profile`.
 
 Everything below is what is *not* done. Ordered by what blocks what.
 
@@ -10,10 +14,9 @@ Everything below is what is *not* done. Ordered by what blocks what.
 
 ## 1. Blocking — the work isn't shared yet
 
-- [ ] **Push the branch.** `sync/neroued-catchup-20260906` has never been pushed; there is no
-      remote tracking branch and no PR. 96 commits currently exist only on this machine.
-- [ ] **Open the PR.** Use `gh pr create --repo ashalliants/ninfer-3090 --base master` — `gh`
-      picks the fork parent as base otherwise and fails misleadingly.
+- [x] ~~Push the branch.~~ Pushed.
+- [x] ~~Open the PR.~~ **PR #16** — "Upstream catch-up: DFlash2, measured sm_86 route boundaries,
+      one KV plane declaration". Route retunes have landed on the branch since it was opened.
 - [ ] **PR #15 (multi-GPU expert offload) is still open** on `feat/dual-gpu-graph-mode`. Decide
       whether it lands before or after this catch-up; they touch different subsystems but both
       touch the engine layer.
@@ -55,6 +58,26 @@ Everything below is what is *not* done. Ordered by what blocks what.
 
 ## 4. Performance work left on the table
 
+**Every route table the catch-up merge changed has now been measured on sm_86 and retuned.**
+There were exactly three (`git diff master...HEAD` over the route arrays): W8 attention-input
+DFlash2, W8 SwiGLU DFlash2, and W8 linear-pair k=5120. All three were wrong here, by 12-41%.
+The other seven tables the merge left alone. The general lesson is in
+`ninfer-3090-route-tables-can-be-dead-code`: **after a catch-up, diff the route arrays first and
+re-measure every one that moved** — a table is tuning for the GPU it was tuned on, and nothing
+about it fails on a different one.
+
+- [ ] **Three schedules are now routed at no width**: `DFlash2MmaR16C64K128` (W8 attention input,
+      never won anywhere), `DFlash2MmaR32C64K128` (W8 SwiGLU, ties `R64C64K128` at 33..44), and
+      `MmaResidualR64C32` (Q5 linear-add). All are deliberately kept — deleting an upstream
+      schedule costs merge effort for no measured gain — but a schedule nothing selects is what let
+      both switch fallthroughs hide. Consider a test that *lists* unrouted schedules per Op, so the
+      set is visible and deliberate rather than accidental.
+- [ ] **`w8_pair` k=2048 table (37 routes) is unmeasured on sm_86.** The merge did not touch it, so
+      it is not a new regression, but it is the largest route table in the tree and
+      `bench/ops/w8_pair_schedule_bench.cu` now only needs a second `sweep_for_k(2048, ...)` call
+      plus the split-K/concat schedules added to its list. Note the trap recorded in that bench:
+      those schedules assume the k=2048 geometry, and one run outside the shape it was written for
+      will fault rather than throw.
 - [ ] **q4 SwiGLU `Materialized` boundaries are unmeasured on sm_86**: routes `{49,128}`,
       `{257,384}`, `{513,640}`. `bench/ops/q4_linear_swiglu_schedule_bench.cu` deliberately excludes
       Materialized because it needs a workspace and has a different launch signature. Extending the
@@ -63,11 +86,11 @@ Everything below is what is *not* done. Ordered by what blocks what.
       as `PairR32C64S4`) and `pair_r32_c64_s3`. They still occupy enum entries and switch cases.
       Either find the shape where they win, or delete them — dead schedules are what let the
       fallthrough bug hide.
-- [ ] **Audit other Ops for the dead-table pattern.** Only `attn_input_proj/q4_q5` and
-      `linear_swiglu/q4` were checked. In q4_q5 the tuned `kRoutes` array was dead code beside a
-      live hardcoded if-chain carrying upstream's sm_120 boundaries — nothing read the table except
-      a `static_assert`. Grep every `*_resolve_plan` and confirm it iterates its table. See
-      `ninfer-3090-route-tables-can-be-dead-code` in memory.
+- [x] ~~Audit other Ops for the dead-table pattern.~~ Done: all ten `*_resolve_plan` files were
+      checked and only `attn_input_proj/q4_q5` had a table nothing read. Both GDN resolvers, both
+      W8 attention/SwiGLU resolvers and `w8_pair` iterate theirs. The two switch fallthroughs found
+      along the way are fixed and `-Werror=implicit-fallthrough` now guards non-MSVC builds
+      (MSVC has no equivalent warning, so CI carries the guard for this host).
 - [ ] **The causal small-T subsystem is reverted to this fork's pre-merge version** (12 files under
       `src/ops/softmax_attention/dense/causal_cache/`). Upstream's rework of it produces
       garbage-magnitude output for the whole int8 family on sm_86 — both geometries, T=1..16,
@@ -75,7 +98,23 @@ Everything below is what is *not* done. Ordered by what blocks what.
       softmax denominator taken over the wrong split count looks like. Root-causing that would
       recover upstream's improvements instead of carrying a revert forward into every future merge.
 
-## 5. Measurement debt
+## 5. Test-criterion calibration
+
+- [ ] **Audit `gross_relative_to_max_reference` across the other Op tests.** The W8 linear-pair
+      A16 criterion was set at 3.8e-3, which is *below the floor its own output dtype can
+      represent*: BF16 has seven stored mantissa bits, so one ULP is 3.9e-3 to 7.8e-3 of the value
+      and correct rounding alone costs up to half of that. The bound therefore required the single
+      worst element in the tensor to round the way the FP32 oracle does. Over 330 sampled cases the
+      distribution was bimodal — bulk at 0.33-0.87 of the limit, then two outliers at 0.9997 and
+      1.0059 — so it was a coin flip, and the 0.9997 sample predates the route re-measurement.
+      Raised to 4.5e-3 with the reasoning recorded at the constant. **Any other reduction criterion
+      whose gross limit is under ~4e-3 against a BF16 output has the same latent flake**, and it
+      will surface as "your kernel change broke accuracy" the next time a route boundary moves.
+      `NINFER_OP_REPORT_STATS=1` prints `gross_ratio` per case, which is how to check cheaply.
+      The relative-L2 field is the bound that actually constrains a kernel and should not be
+      touched — those 330 cases all sit at 0.45-0.69 of it.
+
+## 6. Measurement debt
 
 - [ ] **DFlash2 corpus numbers on sm_86.** Only single-prompt smoke numbers are recorded (text
       20.0% / 2.38 tok-per-round, vision 85.7% / 7.00). `docs/performance.md` deliberately does not
@@ -87,13 +126,22 @@ Everything below is what is *not* done. Ordered by what blocks what.
       and a near-tie argmax flips. MTP reproduces it exactly, so it predates this merge — but
       nobody has decided whether that is acceptable or worth pinning down.
 
-## 6. Hygiene
+## 7. Hygiene
 
-- [ ] **`plane_types.h` wiring is partial.** Two files derive their KV plane cast types from the
-      profile (`kv_cache/append/launch.cu`, `context_kv_materialize/materialize.cu`); there are
-      ~76 KV plane cast sites across 12 files. The Op-level dtype validation is the real guard and
-      that is now correct everywhere, but extending the aliases would make a wrong cast impossible
-      rather than merely detected.
+- [x] ~~`plane_types.h` wiring is partial.~~ Extended to every plane-cast site that should have it,
+      and the earlier "~76 sites across 12 files" estimate was wrong: most `__half*`/`__nv_bfloat16*`
+      appearances under `softmax_attention/` are shared-memory arena partitioning or BF16 activation
+      inputs, not cache planes. The actual set is **ten** sites in eight files — the producer
+      (`kv_cache/append/{launch,k8v4_launch,nvfp4_launch}.cu`, `context_kv_materialize`) and the
+      consumer (`causal_cache/{prompt,small_t}_{fp8,k8v4,nvfp4}.cu`) halves of each storage — and
+      both halves now derive from `d256_kv_cache_profile`, so a producer/consumer disagreement is a
+      compile error. `assert_kv_scale_planes` / `assert_kv_planes` were added to cover the scale
+      planes, which needed it more than the code planes: across the six storages the value scale is
+      FP16, a raw E4M3 byte, or FP16-again, and `Fp8KeyNvfp4Value` mixes two within one cache.
+      **One deliberate exception**, commented at the site: the INT8 family in `causal_cache/prompt.cu`
+      and `small_t.cu` keeps `std::int8_t*` for both codings because a single kernel serves int8-g64
+      and rk8v4 and the packed-int4 path re-casts internally where it unpacks. Substituting
+      `KvValueCodeT<...>` there would change behaviour, not tidy it.
 - [ ] **Clean up the extra worktrees**: `C:/ninfer-fork/baseline-master` (created to get a
       pre-merge baseline; its purpose is served) and `C:/ninfer-fork/wt-readme`.
 - [ ] **Untracked clutter in the repo root**: `config.bat`, `config_exit.txt`, `repro/`,
