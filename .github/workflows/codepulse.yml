@@ -29,11 +29,17 @@ concurrency:
 jobs:
   codepulse:
     name: Request review
-    # Fork pull requests are excluded deliberately. GitHub does not grant `id-token: write` to
-    # workflows running from a fork, so the action cannot mint the OIDC token and exits 1 -- a red
-    # check that a contributor has no way to fix from inside their PR. Fork PRs are still reviewed
-    # through the App's normal webhook path.
-    if: github.event_name == 'pull_request' && !github.event.pull_request.head.repo.fork
+    # Cross-repository pull requests are excluded deliberately. GitHub does not grant
+    # `id-token: write` to a workflow running from another repository, so the action cannot mint
+    # the OIDC token and exits 1 -- a red check a contributor has no way to fix from inside their
+    # own PR. Those PRs are still reviewed through the App's normal webhook path.
+    #
+    # The test is head-repo-vs-base-repo, NOT `head.repo.fork`. The action's README suggests
+    # `!head.repo.fork`, but that flag means "the head repository is itself a fork" -- and this
+    # repository *is* a fork of Don-Chad/ninfer-3090. So `head.repo.fork` is true for every PR
+    # here including same-repo ones, and the job skipped every time. Comparing full names asks the
+    # question actually being asked: did this PR come from somewhere we control?
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       # The only permission the action needs: it requests a short-lived JWT (audience pinned to
