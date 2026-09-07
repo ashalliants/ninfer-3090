@@ -138,7 +138,8 @@ struct Fixture {
                 CyclicKVCacheLayerView{
                     .k               = Tensor(target.cache_k.data(), DType::BF16,
                                               {kHeadDim, kPaddedCapacity, kHeads, kLaneCapacity}),
-                    .v               = Tensor(target.cache_v.data(), DType::FP16,
+                    // BF16, symmetric with K: this fork does not store the V plane as FP16.
+                    .v               = Tensor(target.cache_v.data(), DType::BF16,
                                               {kHeadDim, kPaddedCapacity, kHeads, kLaneCapacity}),
                     .capacity        = kCapacity,
                     .padded_capacity = kPaddedCapacity,
@@ -291,9 +292,9 @@ int verify_numeric_samples(const std::string& label, const Fixture& fixture,
                 const int dim           = row - head * kHeadDim;
                 const float represented = represented_projection(source.value_host, row, input);
                 const std::uint16_t expected_bits =
-                    quantized_weight::detail::f32_to_f16(represented);
-                value_expected.push_back(quantized_weight::detail::f16_to_f32(expected_bits));
-                value_got.push_back(quantized_weight::detail::f16_to_f32(
+                    f32_to_bf16(represented);
+                value_expected.push_back(bf16_to_f32(expected_bits));
+                value_got.push_back(bf16_to_f32(
                     cache_v_bits[cache_index(lane, head, slot, dim)]));
             }
         }
