@@ -193,6 +193,13 @@ about it fails on a different one.
       and `small_t.cu` keeps `std::int8_t*` for both codings because a single kernel serves int8-g64
       and rk8v4 and the packed-int4 path re-casts internally where it unpacks. Substituting
       `KvValueCodeT<...>` there would change behaviour, not tidy it.
+- [ ] **Dedupe `prompt_i8.cuh`'s local f16 dequant helpers.** It defines its own
+      `causal_prompt_i8_dequant_f16x8` / `causal_prompt_i4_dequant_f16x8` because the shared codec
+      had no f16 variants for the INT8 codings. It does now
+      (`kv_cache_int8_dequant_f16x8_from` / `kv_cache_int4_dequant_f16x8_from`), so the locals are
+      redundant. That missing pair is exactly what made upstream's small-T reach for the bf16
+      helper and silently reinterpret every value, so collapsing them removes the trap rather than
+      just tidying.
 - [ ] **Clean up the extra worktrees**: `C:/ninfer-fork/baseline-master` (created to get a
       pre-merge baseline; its purpose is served) and `C:/ninfer-fork/wt-readme`.
 - [ ] **Untracked clutter in the repo root**: `config.bat`, `config_exit.txt`, `repro/`,
