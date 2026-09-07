@@ -32,20 +32,24 @@ template <>
 struct KvPlaneStorage<DType::BF16> {
     using type = __nv_bfloat16;
 };
+
 template <>
 struct KvPlaneStorage<DType::FP16> {
     using type = __half;
 };
+
 template <>
 struct KvPlaneStorage<DType::I8> {
     using type = std::int8_t;
 };
+
 // Byte planes: U8 carries two 4-bit codes (signed int4 for rk8v4, e2m1 for the nvfp4 family) and
 // FP8_E4M3FN carries one raw E4M3 byte. Both are addressed as bytes and decoded by their codec.
 template <>
 struct KvPlaneStorage<DType::U8> {
     using type = std::uint8_t;
 };
+
 template <>
 struct KvPlaneStorage<DType::FP8_E4M3FN> {
     using type = std::uint8_t;
@@ -81,6 +85,27 @@ constexpr void assert_kv_code_planes() {
                   "KV value code plane type does not match the declared cache storage. This fork "
                   "stores V symmetrically with K (BF16); upstream stores V as FP16, and that "
                   "difference is byte-compatible, so it will not fail any other way.");
+}
+
+// The scale planes need the same treatment and for a sharper reason: across the six storages the
+// same role takes three different types. The value scale is FP16 for the INT8 family, a raw E4M3
+// byte for the NVFP4 family, and FP16 again for rk8v4 while its *key* scale is also FP16 -- so
+// "the scale plane is __half" is true often enough to look like a rule and wrong on two storages.
+// Fp8KeyNvfp4Value mixes them within one cache: FP16 key scale, byte value scale.
+template <ninfer::KvCacheStorage S, typename KeyScale, typename ValueScale>
+constexpr void assert_kv_scale_planes() {
+    static_assert(std::is_same_v<KvPlaneElementT<KeyScale>, KvKeyScaleT<S>>,
+                  "KV key scale plane type does not match the declared cache storage");
+    static_assert(std::is_same_v<KvPlaneElementT<ValueScale>, KvValueScaleT<S>>,
+                  "KV value scale plane type does not match the declared cache storage");
+}
+
+// All four planes at once, which is what a launcher wants.
+template <ninfer::KvCacheStorage S, typename KeyCode, typename ValueCode, typename KeyScale,
+          typename ValueScale>
+constexpr void assert_kv_planes() {
+    assert_kv_code_planes<S, KeyCode, ValueCode>();
+    assert_kv_scale_planes<S, KeyScale, ValueScale>();
 }
 
 // This fork's invariant, stated once where it can be checked rather than only in prose: the

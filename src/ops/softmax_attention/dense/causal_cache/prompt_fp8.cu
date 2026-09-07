@@ -5,6 +5,7 @@
 #include "ops/common/math.h"
 #include "ops/kv_cache/append/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_fp8.cuh"
+#include "ops/kv_cache/plane_types.h"
 
 #include <cstdint>
 
@@ -21,17 +22,20 @@ void causal_attention_prompt_fp8_attention_launch_for(const Tensor& q, const Ten
         cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptFp8SmemBytes);
     CUDA_CHECK(attr);
 
+    constexpr auto kStorage = KvCacheStorage::Fp8E4M3Row256;
+    const auto* cache_k_ptr = static_cast<const KvKeyCodeT<kStorage>*>(cache.k_pages.data);
+    const auto* cache_v_ptr = static_cast<const KvValueCodeT<kStorage>*>(cache.v_pages.data);
+    const auto* k_scale_ptr = static_cast<const KvKeyScaleT<kStorage>*>(cache.k_scale_pages.data);
+    const auto* v_scale_ptr = static_cast<const KvValueScaleT<kStorage>*>(cache.v_scale_pages.data);
+    assert_kv_planes<kStorage, decltype(cache_k_ptr), decltype(cache_v_ptr), decltype(k_scale_ptr),
+                     decltype(v_scale_ptr)>();
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     const dim3 grid(static_cast<unsigned>(div_up(tokens, kCausalPromptFp8Br)),
                     static_cast<unsigned>(Geometry::QHeads), 1u);
     causal_attention_prompt_fp8_kernel<Geometry, Metadata>
         <<<grid, kCausalPromptFp8Threads, kCausalPromptFp8SmemBytes, stream>>>(
-            static_cast<const __nv_bfloat16*>(q.data),
-            static_cast<const std::uint8_t*>(cache.k_pages.data),
-            static_cast<const std::uint8_t*>(cache.v_pages.data),
-            static_cast<const __half*>(cache.k_scale_pages.data),
-            static_cast<const __half*>(cache.v_scale_pages.data), metadata,
-            static_cast<const std::int32_t*>(positions.data), scale,
+            static_cast<const __nv_bfloat16*>(q.data), cache_k_ptr, cache_v_ptr, k_scale_ptr,
+            v_scale_ptr, metadata, static_cast<const std::int32_t*>(positions.data), scale,
             static_cast<__nv_bfloat16*>(out.data), tokens);
     CUDA_CHECK(cudaGetLastError());
 }
