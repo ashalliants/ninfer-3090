@@ -39,7 +39,7 @@ struct ContextKVMaterializeExecutionEnvelope {
  * W=1..16,B=1..8 and single-request prefill B=1,W=1..2048. W is the physical context width,
  * independent of the draft width and the device-selected committed prefix. Each of the five layer
  * views contains independent RowSplit W8G32_F16S key/value weights [1024,5120], a BF16 key norm
- * weight [128], and a capacity-2048 D128/H8 cyclic cache with BF16 K and FP16 V. All five caches
+ * weight [128], and a capacity-2048 D128/H8 cyclic cache with BF16 K and V. All five caches
  * share padded capacity and lane capacity.
  *
  * For every layer l, row b, and i in [0,counts[b]), the complete operation is

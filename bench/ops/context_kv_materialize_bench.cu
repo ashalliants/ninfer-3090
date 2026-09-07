@@ -155,7 +155,9 @@ struct Fixture {
                 CyclicKVCacheLayerView{
                      .k        = Tensor(cache_k[static_cast<std::size_t>(layer)].p, DType::BF16,
                                         {kHeadDim, kCapacity, kHeads, kLaneCapacity}),
-                     .v        = Tensor(cache_v[static_cast<std::size_t>(layer)].p, DType::FP16,
+                     // BF16, symmetric with K. The Op validates both planes against
+                     // d256_kv_cache_profile, so an FP16 V here fails every nonzero case.
+                     .v        = Tensor(cache_v[static_cast<std::size_t>(layer)].p, DType::BF16,
                                         {kHeadDim, kCapacity, kHeads, kLaneCapacity}),
                      .capacity = kCapacity,
                      .padded_capacity = kCapacity,

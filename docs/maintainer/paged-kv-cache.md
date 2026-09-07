@@ -79,8 +79,8 @@ MTP 与 DFlash 在一个 Engine 内互斥，因此当前最多有两个 growing 
 | DFlash Full | DFlash persistent full-context K/V | DFlash context frontier |
 
 Main Text 与 MTP 使用 Engine 选择的 BF16、INT8-G64、FP8-E4M3FN-row256、NVFP4-G16 或 K8V4
-KV profile；DFlash Full 使用自己的 BF16 profile。`BFloat16` 名称下的物理 layout 为 BF16 K、FP16 V，
-写入端将 BF16 V 一次转换为 FP16。K8V4 是封闭的非对称 profile，不是运行时 bit-width 组合：K 固定为
+KV profile；DFlash Full 使用自己的 BF16 profile。`BFloat16` 名称下的物理 layout 为 BF16 K、BF16 V（对称），
+写入端不做 FP16 转换。K8V4 是封闭的非对称 profile，不是运行时 bit-width 组合：K 固定为
 FP8-E4M3FN-row256，V 固定为 NVFP4-G16。
 
 `PagedKVStorageLayout` 将选定的 closed profile 解析为 K/V data/scale plane schema；target planner 按

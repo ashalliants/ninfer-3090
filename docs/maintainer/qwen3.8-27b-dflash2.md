@@ -410,7 +410,7 @@ DFlash2 pending features 都以 `N` 为提交量。Target 物理 column `Q..W-1`
 StateImage 中 DFlash2-private payload 是五层已 materialize 的 cyclic context K/V：
 
 ```text
-five layers x (BF16 K + FP16 V) x 8 heads x 128 x 2048 = 40 MiB
+five layers x (BF16 K + BF16 V) x 8 heads x 128 x 2048 = 40 MiB
 ```
 
 该持久 payload 与 K 无关；增大 K 扩展的是 proposal、verify 和 pending 的 transient capacity。

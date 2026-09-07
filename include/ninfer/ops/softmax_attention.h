@@ -186,7 +186,7 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
  * The registered profile is D=128, Hq=32, Hkv=8 (group 4), scale=1/sqrt(128), T=1..16, and
  * B=1..8. q/out are contiguous BF16 [128,32,T,B], query_k/query_v are contiguous BF16
  * [128,8,T,B], and context_lengths, valid_columns, and table_rows are contiguous device I32 [B].
- * The read-only paged BFloat16 context uses head-major BF16 K and FP16 V planes
+ * The read-only paged BFloat16 context uses head-major BF16 K and V planes
  * [128,64,Nphysical,8].
  *
  * For row b, let L=context_lengths[b] and V=valid_columns[b]. Every live query i<V attends the
