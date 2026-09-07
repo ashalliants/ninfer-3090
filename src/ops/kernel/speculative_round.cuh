@@ -211,13 +211,16 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
     const unsigned failures = __ballot_sync(0xffffffffU, reject);
     const int a             = failures ? __ffs(failures) - 1 : extent;
     int terminal;
-    // The weight standing behind the chosen terminal, so the commit can be rejected when the
-    // target column is non-finite instead of licensing whatever index the selection happened to
-    // land on. Mirrors the dense route's sampling_value_is_finite(tstar_prob) check.
-    float terminal_weight;
+    // Whether the commit is backed by a finite selection. Tracked as a bool, not as the weight
+    // itself, because the greedy branch has no weight to carry: its producer writes only
+    // dist_idx (see the greedy store in the SparseProposal finalize kernel), so dist_prob at
+    // this offset is caller-owned scratch that this round never wrote. Reading it would make the
+    // guard depend on stale memory and could reject a perfectly good terminal -- worse than the
+    // gap it closes. Per-row greedy inside a mixed batch is a supported route, not a corner.
+    bool terminal_is_finite;
     if (greedy) {
-        terminal        = workspace.dist_idx[sampling_dist_offset(a, 0)];
-        terminal_weight = workspace.dist_prob[sampling_dist_offset(a, 0)];
+        terminal           = workspace.dist_idx[sampling_dist_offset(a, 0)];
+        terminal_is_finite = true;
     } else {
         const int n  = workspace.dist_support[a];
         int token    = 0;
@@ -252,14 +255,14 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
                              : positive     ? 31 - __clz(positive)
                                             : 0;
         terminal           = __shfl_sync(0xffffffffU, token, selected);
-        // mass is the residual probability the selection drew from. A NaN column makes it NaN, and
-        // `!(mass > 0.0f)` above already forces `selected` to 0 -- committing lane 0's token would
-        // be exactly the arbitrary licence this guard exists to prevent.
-        terminal_weight = mass;
+        // mass is the residual probability the selection drew from, and the stochastic branch does
+        // write dist_prob, so this one is real. A NaN column makes mass NaN, and `!(mass > 0.0f)`
+        // above already forces `selected` to 0 -- committing lane 0's token would be exactly the
+        // arbitrary licence this guard exists to prevent.
+        terminal_is_finite = sampling_value_is_finite(mass);
     }
     speculative_sparse_warp_store(drafts, k, row, a, terminal, lengths, anchors, licensed_tokens,
-                                  licensed_counts, accepted,
-                                  sampling_value_is_finite(terminal_weight));
+                                  licensed_counts, accepted, terminal_is_finite);
 }
 
 // Commits the round's accepted tokens plus one correction/bonus token, then
@@ -690,11 +693,11 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                     // Greedy branch writes only dist_idx, so no probability is available to test;
                     // see the note on the target-token greedy path above.
                     // Dense only: this statement lives in the else of `if constexpr (SparseProposal)`, so it
-                // is instantiated with SparseProposal == false and token counts are updated.
-                // Spelled `true` rather than `!SparseProposal` because the double negative
-                // reads as if it could disable the counts here, which it cannot.
-                static_assert(!SparseProposal, "dense finalize path only");
-                speculative_store_accept_result<true>(
+                    // is instantiated with SparseProposal == false and token counts are updated.
+                    // Spelled `true` rather than `!SparseProposal` because the double negative
+                    // reads as if it could disable the counts here, which it cannot.
+                    static_assert(!SparseProposal, "dense finalize path only");
+                    speculative_store_accept_result<true>(
                         row_drafts, k, row, a, tstar, lengths, anchors, row_tokens, licensed_counts,
                         accepted, &cfg, true);
                     *workspace.speculative_finalize_count = 0;
