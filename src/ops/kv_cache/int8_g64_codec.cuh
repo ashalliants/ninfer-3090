@@ -158,4 +158,46 @@ __device__ __forceinline__ int4 kv_cache_int8_dequant_i8x8_from(const std::int8_
                      static_cast<int>(packed[2]), static_cast<int>(packed[3]));
 }
 
+// FP16 counterparts of the two loaders above.
+//
+// A kernel that stages V for an f16 PV MMA needs f16 codes, and the bf16 loaders cannot serve it:
+// both plane types are sixteen bits wide, so storing a bf16 result through a __half* compiles,
+// runs, and silently reinterprets every value. That is not hypothetical -- it is what upstream's
+// int8 small-T kernel does today, and it is why the whole INT8 family (int8-g64 and rk8v4 alike,
+// since both go through these two helpers) comes out 3-11x the reference with a ratio that varies
+// per value. Nothing else in the pipeline can catch it: the sizes match, so no allocation, no
+// dtype validation and no compiler diagnostic fires.
+//
+// int8 codes carry at most eight significant bits and a scale, so f16's narrower exponent is not a
+// constraint here while its wider mantissa is a small gain on the P*V product.
+__device__ __forceinline__ int4 kv_cache_int4_dequant_f16x8_from(const std::uint8_t* packed4,
+                                                                 float s) {
+    const unsigned raw        = load_vec<unsigned>(packed4);
+    const std::uint8_t* bytes = reinterpret_cast<const std::uint8_t*>(&raw);
+    unsigned out[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float x0 = static_cast<float>(kv_cache_int4_unpack(bytes[i], 0)) * s;
+        const float x1 = static_cast<float>(kv_cache_int4_unpack(bytes[i], 1)) * s;
+        out[i]         = pack_f16x2(x0, x1);
+    }
+    return make_int4(static_cast<int>(out[0]), static_cast<int>(out[1]), static_cast<int>(out[2]),
+                     static_cast<int>(out[3]));
+}
+
+__device__ __forceinline__ int4 kv_cache_int8_dequant_f16x8_from(const std::int8_t* codes8,
+                                                                 float s) {
+    const int2 raw       = load_vec<int2>(codes8);
+    const std::int8_t* c = reinterpret_cast<const std::int8_t*>(&raw);
+    unsigned packed[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float x0 = static_cast<float>(c[2 * i]) * s;
+        const float x1 = static_cast<float>(c[2 * i + 1]) * s;
+        packed[i]      = pack_f16x2(x0, x1);
+    }
+    return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
+                     static_cast<int>(packed[2]), static_cast<int>(packed[3]));
+}
+
 } // namespace ninfer::ops

@@ -4,7 +4,6 @@
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t_fp8.cuh"
-#include "ops/kv_cache/plane_types.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -41,14 +40,11 @@ void launch_fp8_partial(const Tensor& q, CacheInput input, const Tensor& positio
 
         const auto q_ptr         = static_cast<const __nv_bfloat16*>(q.data);
         const auto positions_ptr = static_cast<const std::int32_t*>(positions.data);
-        constexpr auto kStorage  = KvCacheStorage::Fp8E4M3Row256;
-        const auto cache_k_ptr   = static_cast<KvKeyCodeT<kStorage>*>(cache.k_pages.data);
-        const auto cache_v_ptr   = static_cast<KvValueCodeT<kStorage>*>(cache.v_pages.data);
-        const auto k_scale_ptr   = static_cast<KvKeyScaleT<kStorage>*>(cache.k_scale_pages.data);
-        const auto v_scale_ptr   = static_cast<KvValueScaleT<kStorage>*>(cache.v_scale_pages.data);
-        assert_kv_planes<kStorage, decltype(cache_k_ptr), decltype(cache_v_ptr),
-                         decltype(k_scale_ptr), decltype(v_scale_ptr)>();
-        const auto tables_ptr = static_cast<const std::int32_t*>(cache.block_tables.data);
+        const auto cache_k_ptr   = static_cast<std::uint8_t*>(cache.k_pages.data);
+        const auto cache_v_ptr   = static_cast<std::uint8_t*>(cache.v_pages.data);
+        const auto k_scale_ptr   = static_cast<__half*>(cache.k_scale_pages.data);
+        const auto v_scale_ptr   = static_cast<__half*>(cache.v_scale_pages.data);
+        const auto tables_ptr    = static_cast<const std::int32_t*>(cache.block_tables.data);
         const auto valid_ptr =
             invocation.valid_columns == nullptr
                 ? nullptr
@@ -74,27 +70,27 @@ template <typename Geometry, bool MultiBatch, bool Masked>
 void launch_fp8_reduce(const Tensor& positions, const CausalSmallTInvocation& invocation,
                        std::int32_t splits, const Tensor& partial_acc, const Tensor& partial_m,
                        const Tensor& partial_l, Tensor& out, cudaStream_t stream) {
-    constexpr int Block  = 256;
-    constexpr int DChunk = 64;
-    const dim3 grid(Geometry::QHeads, div_up(kCausalHeadDim, DChunk),
-                    invocation.width * invocation.batch_size);
-    const auto launch = [&]<bool Offset>() {
+    constexpr int Block = 256;
+
+    constexpr int DChunk = Geometry::QHeads == 24 ? 256 : 64;
+    const auto launch    = [&]<bool Offset>() {
+        const dim3 grid(Geometry::QHeads, div_up(kCausalHeadDim, DChunk),
+                           invocation.width * invocation.batch_size);
         causal_attention_small_t_fp8_reduce_output_kernel<Geometry, DChunk, MultiBatch, Masked,
-                                                          Offset><<<grid, Block, 0, stream>>>(
+                                                             Offset><<<grid, Block, 0, stream>>>(
             static_cast<const float*>(partial_acc.data), static_cast<const float*>(partial_m.data),
             static_cast<const float*>(partial_l.data),
             static_cast<const std::int32_t*>(positions.data),
             invocation.valid_columns == nullptr
-                ? nullptr
-                : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+                   ? nullptr
+                   : static_cast<const std::int32_t*>(invocation.valid_columns->data),
             invocation.width, invocation.full_width, invocation.column_begin, invocation.batch_size,
             splits, static_cast<__nv_bfloat16*>(out.data));
     };
-    if (invocation.column_begin == 0) {
+    if (invocation.column_begin == 0)
         launch.template operator()<false>();
-    } else {
+    else
         launch.template operator()<true>();
-    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -107,8 +103,8 @@ void causal_attention_small_t_fp8_launch_for(const Tensor& q, CacheInput input,
                                              Tensor& partial_acc, Tensor& partial_m,
                                              Tensor& partial_l, Tensor& out, cudaStream_t stream) {
     const auto logical_capacity = static_cast<std::int32_t>(envelope.max_visible_keys);
-    const auto splits = causal_attention_split_capacity(Geometry::QHeads, invocation.width,
-                                                        cache.storage, envelope);
+    const auto splits           = causal_attention_split_capacity(
+        Geometry::QHeads, invocation.width, cache.storage, envelope, invocation.batch_size);
 
     const auto launch_partial = [&]<int Tokens, bool MultiBatch, bool Masked>() {
         launch_fp8_partial<Geometry, Tokens, MultiBatch, Masked>(
@@ -149,6 +145,18 @@ void causal_attention_small_t_fp8_launch_for(const Tensor& q, CacheInput input,
     case 6:
         dispatch_metadata.template operator()<6>();
         break;
+    case 7:
+        if constexpr (Geometry::QHeads == 24) {
+            dispatch_metadata.template operator()<7>();
+            break;
+        }
+        throw std::invalid_argument("unsupported query-row tile");
+    case 8:
+        if constexpr (Geometry::QHeads == 24) {
+            dispatch_metadata.template operator()<8>();
+            break;
+        }
+        throw std::invalid_argument("unsupported query-row tile");
     default:
         throw std::invalid_argument("causal_attention_small_t_fp8_launch: unsupported T");
     }
