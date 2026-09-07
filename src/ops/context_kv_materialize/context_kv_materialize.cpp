@@ -2,6 +2,7 @@
 
 #include "core/layout.h"
 #include "ops/context_kv_materialize/launch.h"
+#include "ops/kv_cache/d256_profile.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -94,10 +95,17 @@ void validate_cache(const CyclicKVCacheLayerView& cache, std::int32_t padded,
         cache.lane_capacity != lane_capacity || padded < kCapacity || lane_capacity <= 0) {
         throw std::invalid_argument("context_kv_materialize: invalid cyclic cache geometry");
     }
-    require_tensor(cache.k, DType::BF16, kHeadDim, padded, kKVHeads, lane_capacity, 16, "cache K");
-    // Symmetric with K. Upstream requires FP16 here; this fork stores both planes as BF16,
-    // and requiring FP16 is what made DFlash2 fail with "invalid cache V".
-    require_tensor(cache.v, DType::BF16, kHeadDim, padded, kKVHeads, lane_capacity, 16, "cache V");
+    // Both plane dtypes come from d256_kv_cache_profile rather than being named here. This Op
+    // arrived from upstream restating them -- BF16 for K, FP16 for V -- which is how the value
+    // plane's width got out of step with the rest of the fork and made DFlash2 fail at startup
+    // with "invalid cache V". kv_cache_append has always derived its dtypes from the profile and
+    // has never drifted; this now matches. The head dimension stays local because this cache is
+    // DFlash2's 128-wide cyclic cache, not the D256 paged layout.
+    constexpr auto kProfile = d256_kv_cache_profile(KvCacheStorage::BFloat16);
+    require_tensor(cache.k, kProfile.key_code_dtype, kHeadDim, padded, kKVHeads, lane_capacity, 16,
+                   "cache K");
+    require_tensor(cache.v, kProfile.value_code_dtype, kHeadDim, padded, kKVHeads, lane_capacity,
+                   16, "cache V");
 }
 
 } // namespace
