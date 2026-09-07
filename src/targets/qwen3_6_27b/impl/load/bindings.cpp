@@ -94,8 +94,13 @@ WeightPlan bind_nvfp4_weight(artifact::Binder& binder, std::string_view name, st
     const artifact::ObjectHandle parent      = binder.require_tensor(
         name, NumericFormat::NVFP4, artifact::StorageLayout::BlockScaleK16M128x4V1, shape);
     // The divisors below are still read from the file either way; only the upload is skipped when
-    // this rank does not own the tensor.
-    if (placement == artifact::TensorPlacement::Device) { binder.materialize_on_device(parent); }
+    // this rank does not own the tensor. A non-owning rank still must plan the parent object, or
+    // `Binder::finish()` rejects the plan as incomplete.
+    if (placement == artifact::TensorPlacement::Device) {
+        binder.materialize_on_device(parent);
+    } else {
+        binder.validate_only(parent);
+    }
 
     const artifact::ObjectHandle input_divisor =
         artifact::bind_tensor(binder, input_divisor_name, NumericFormat::FP32, {},
@@ -363,13 +368,14 @@ void bind_qwen38_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out,
         target.is_full_attention = is_full_layer(layer);
         if (target.is_full_attention) {
             target.attention.projection = FusedAttentionProjectionPlan{
-                .query_key_gate_value = bind_weight(
-                    binder, prefix + "attention/query_key_gate_value", kFp8, {14336, 5120}),
+                .query_key_gate_value =
+                    bind_weight(binder, prefix + "attention/query_key_gate_value", kFp8,
+                               {14336, 5120}, 0, core_place),
             };
             target.attention.query_norm = artifact::bind_tensor(binder, prefix + "attention/query_norm", NumericFormat::BF16, {256}, core_place);
             target.attention.key_norm = artifact::bind_tensor(binder, prefix + "attention/key_norm", NumericFormat::BF16, {256}, core_place);
             target.attention.output =
-                bind_weight(binder, prefix + "attention/output", kFp8, {5120, 6144});
+                bind_weight(binder, prefix + "attention/output", kFp8, {5120, 6144}, 0, core_place);
         } else {
             target.gdn.a_log       = artifact::bind_tensor(binder, prefix + "gdn/a_log",
                                                                   NumericFormat::FP32, {48}, core_place);
@@ -380,12 +386,13 @@ void bind_qwen38_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out,
                 .a_b_projection = bind_weight(binder, prefix + "gdn/a_b_projection", NumericFormat::BF16, {96, 5120}, 0, core_place),
             };
             target.gdn.input_projection = FusedGdnInputProjectionPlan{
-                .query_key_value_z =
-                    bind_weight(binder, prefix + "gdn/query_key_value_z", kFp8, {16384, 5120}),
+                .query_key_value_z = bind_weight(binder, prefix + "gdn/query_key_value_z", kFp8,
+                                                 {16384, 5120}, 0, core_place),
             };
             target.gdn.norm   = artifact::bind_tensor(binder, prefix + "gdn/norm",
                                                              NumericFormat::BF16, {128}, core_place);
-            target.gdn.output = bind_weight(binder, prefix + "gdn/output", kFp8, {5120, 6144});
+            target.gdn.output =
+                bind_weight(binder, prefix + "gdn/output", kFp8, {5120, 6144}, 0, core_place);
         }
         // The mlp tail is what moves: ~17 GiB of this model's ~19 GiB of weights. Its
         // post_attention_norm rides along so the offloaded card runs the whole tail in one go.

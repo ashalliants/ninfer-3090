@@ -80,11 +80,15 @@ int main() {
         return 0;
     }
 
+    bool peer_copy_ok = true;
     for (int source = 0; source < 2; ++source) {
         for (int destination = 0; destination < 2; ++destination) {
-            if (source != destination) { check_peer_copy(source, destination); }
+            if (source != destination) {
+                peer_copy_ok = check_peer_copy(source, destination) && peer_copy_ok;
+            }
         }
     }
+    if (!peer_copy_ok) { return 3; }
 
     // The real construction. A bridgeless pair must reach here and report peer_access=0 rather
     // than throwing, which is exactly what this branch changed.
