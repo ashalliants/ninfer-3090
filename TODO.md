@@ -76,11 +76,35 @@ adoption is the clean thing to split out — it is self-contained (merge `19c761
       *Note the trap: rk8v4 is only constructible through the `CachePlan` overload of `make_cache`;
       the `KvCacheStorage` overload has no packed-int4 branch and silently builds an unpacked INT8
       value plane that the kernel then reads as packed and runs off the end of.*
-- [ ] **`ninfer_qwen3_8_27b_dflash2_real_test` cannot run on a 24 GB card.** With
-      `NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS` set it gets past the skip and then fails: *"requested
-      Engine runtime reservation requires 6320667392 bytes, but only 4785954304 bytes are available
-      for runtime capacity"*. The test's reservation is fixed. Either parameterise it or document
-      it as a >24 GB test.
+- [x] ~~`ninfer_qwen3_8_27b_dflash2_real_test` cannot run on a 24 GB card.~~ **It can — it just
+      defaults to a maximum configuration.** The test already takes argv
+      (`k graph optimized batch kv vision state_slots`) but `add_test` passes none, so it runs
+      k=15, **batch=8** (18,432-token KV) and 3 state slots, wanting 6.32 GB. Run it scaled and it
+      passes end to end: `ninfer_qwen3_8_27b_dflash2_real_test.exe 7 1 1 2 int8 0 1` →
+      `ok K=7 B=2 graph=1 optimized=1 accepted=20/20`.
+      **Still to do:** `ninfer_add_test` has no way to pass test arguments
+      (`add_test(NAME ${name} COMMAND ${name})`), so this cannot be wired into ctest without adding
+      a `TEST_ARGS` option to that helper. Worth doing — it turns a permanently-failing test into
+      real DFlash2 coverage on this box.
+
+- [ ] **The real-model tests fail on their *maximum* configurations, not on this box's capability.**
+      Measured 2026-09-07 via the CLI, which is the honest way to size them:
+      | model | configuration | result |
+      |---|---|---|
+      | 27B | 131,072 ctx, int8 | **works** — 4.44 GiB reservation, 449 MiB spare |
+      | 27B | 32,768 ctx, int8, `--vision` | **works** — 2.01 GiB reservation, 2.54 GiB spare |
+      | 35B-A3B | 32,768 ctx, int8 | **works** — 513.7 MiB reservation, 726 MiB spare |
+
+      So there is plenty of room for meaningful end-to-end coverage; the tests simply pin
+      262,144-context/vision/batch-8 layouts. `NINFER_REAL_TEST_MAX_CONTEXT` now lowers the ceiling
+      the 35B test's `exercise_maximum_configuration` asks for (unset, the pinned 256K layout is
+      exercised exactly as before).
+      **The 35B's remaining blocker is its *base* engine, not the maximum one:** 20.8 GiB of weights
+      plus a 472 MB runtime reservation against ~21.4 GiB free leaves it **~93 MB short**, because
+      the desktop is holding ~2.4 GB (Chrome, Steam, Ferdium, Docker…). Closing a couple of GPU
+      clients is enough to run it. Worth deciding whether the base config should also honour
+      `NINFER_REAL_TEST_MAX_CONTEXT`, or whether the test should skip with a clear message when the
+      reservation genuinely will not fit rather than failing.
 - [ ] **Six other real-model tests skip** for want of artifacts/env vars: `27b_prefix_real`,
       `27b_score_real`, `27b_load_plan`, `35b_a3b_real`, `35b_a3b_dflash_real`,
       `35b_a3b_dflash_load_plan`. See `ninfer-3090-35b-real-tests-environmental` in memory — some
