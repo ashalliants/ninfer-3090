@@ -527,7 +527,9 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
 
     load_plan.materialization =
         binder.finish(overlay ? ninfer::EvictableWeightPool::kChunkBytes : 1);
-    if (overlay) {
+    // Only the owning rank's vision tensors are host-pinned (see vision_placement above); a
+    // secondary rank's plan must stay ValidateOnly without deriving pinned ranges from it.
+    if (overlay && ownership.owns_core()) {
         out.vision_overlay = qwen3_6::compute_vision_overlay_layout(
             out.vision_backbone, out.vision_merger_input, out.vision_merger_fc2,
             out.vision_merger_fc2_bias, out.vision_merger_norm, load_plan.materialization);

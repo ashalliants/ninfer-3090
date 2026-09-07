@@ -117,6 +117,12 @@ private:
     std::size_t off_  = 0;
     std::size_t peak_ = 0;
     bool owns_        = true;
+    // The allocation this arena itself owns (rank 0's), independent of which rank's storage
+    // `base_` currently aliases. `activate_rank` only ever swaps `base_`/`cap_`/`off_`/`peak_`, so
+    // cleanup must free this instead of `base_` -- otherwise destroying or move-assigning the
+    // arena while a borrowed rank is active frees storage this arena does not own and leaks the
+    // rank-0 allocation it does.
+    void* owned_base_ = nullptr;
 
     // Empty until a second rank is attached, so the single-device path carries no extra state and
     // no extra work.
@@ -143,5 +149,22 @@ private:
 };
 
 using WorkspaceArena = DeviceArena;
+
+// Binds a rank for the duration of a scope and restores the previous one, so an exception thrown
+// while the arena is switched away from its caller's rank cannot leave it there -- unlike
+// DeviceContext, DeviceArena has no device to fall back on, so an unrestored rank silently hands
+// out the wrong device's scratch to the next allocation.
+class ScopedArenaRank {
+public:
+    ScopedArenaRank(DeviceArena& arena, std::size_t rank);
+    ~ScopedArenaRank() noexcept;
+
+    ScopedArenaRank(const ScopedArenaRank&)            = delete;
+    ScopedArenaRank& operator=(const ScopedArenaRank&) = delete;
+
+private:
+    DeviceArena& arena_;
+    std::size_t previous_rank_ = 0;
+};
 
 } // namespace ninfer

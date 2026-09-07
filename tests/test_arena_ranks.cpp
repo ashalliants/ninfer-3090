@@ -135,7 +135,11 @@ int main() {
         check(arena.used() == rank0_before, "rank 0 rolled back to the scope's entry offset");
     }
 
-    cudaFree(second);
+    // Block 2 left `arena` active on rank 1 -- attached, non-owning storage -- when it went out of
+    // scope. The arena must have freed only its own rank-0 allocation, not `second`: a double free
+    // here would make this cudaFree fail (or corrupt the allocator silently), not the destructor.
+    check(cudaFree(second) == cudaSuccess,
+         "destroying an arena left active on a borrowed rank freed storage it does not own");
 
     if (failures != 0) {
         std::cerr << failures << " check(s) failed\n";

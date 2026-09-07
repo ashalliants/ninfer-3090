@@ -1080,7 +1080,10 @@ inline void TextContext::run_mlp_tail(const Tensor* post_norm, const MlpW& m, Te
     const cudaStream_t remote_stream = ctx_.stream_for_rank(expert_rank);
     {
         ScopedDeviceRank guard(ctx_, expert_rank);
-        work_.activate_rank(expert_rank);
+        // RAII, not a manual activate_rank(0) after the block: an exception from allocation or
+        // cross_rank_copy must not leave work_ pointed at rank 1's storage, or the next request
+        // runs rank-0 attention with scratch allocated from rank 1's device.
+        ScopedArenaRank arena_guard(work_, expert_rank);
 
         // The scope must be taken on the expert rank, and must cover the inbound copy's buffer as
         // well as the tail's scratch. The caller's enclosing scope was taken on rank 0 and rolls
@@ -1101,7 +1104,6 @@ inline void TextContext::run_mlp_tail(const Tensor* post_norm, const MlpW& m, Te
         // next allocation, which cannot happen before this copy is enqueued.
         cross_rank_copy(remote.data, expert_rank, x.data, 0, x.bytes());
     }
-    work_.activate_rank(0);
 }
 
 template <class Tap>

@@ -154,9 +154,10 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
         throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
     }
 
-    base_ = ptr;
-    cap_  = capacity_bytes;
-    off_  = 0;
+    base_       = ptr;
+    owned_base_ = ptr;
+    cap_        = capacity_bytes;
+    off_        = 0;
 }
 
 DeviceArena::DeviceArena(DeviceSpan storage)
@@ -167,17 +168,19 @@ DeviceArena::DeviceArena(DeviceSpan storage)
 }
 
 DeviceArena::~DeviceArena() {
-    if (owns_) { free_device(base_); }
+    if (owns_) { free_device(owned_base_); }
 }
 
 DeviceArena::DeviceArena(DeviceArena&& other) noexcept
     : base_(other.base_), cap_(other.cap_), off_(other.off_), peak_(other.peak_),
-      owns_(other.owns_), ranks_(std::move(other.ranks_)), active_rank_(other.active_rank_) {
+      owns_(other.owns_), owned_base_(other.owned_base_), ranks_(std::move(other.ranks_)),
+      active_rank_(other.active_rank_) {
     other.base_        = nullptr;
     other.cap_         = 0;
     other.off_         = 0;
     other.peak_        = 0;
     other.owns_        = true;
+    other.owned_base_  = nullptr;
     other.ranks_.clear();
     other.active_rank_ = 0;
 }
@@ -185,12 +188,13 @@ DeviceArena::DeviceArena(DeviceArena&& other) noexcept
 DeviceArena& DeviceArena::operator=(DeviceArena&& other) noexcept {
     if (this == &other) { return *this; }
 
-    if (owns_) { free_device(base_); }
-    base_ = other.base_;
-    cap_  = other.cap_;
-    off_  = other.off_;
-    peak_ = other.peak_;
-    owns_ = other.owns_;
+    if (owns_) { free_device(owned_base_); }
+    base_       = other.base_;
+    cap_        = other.cap_;
+    off_        = other.off_;
+    peak_       = other.peak_;
+    owns_       = other.owns_;
+    owned_base_ = other.owned_base_;
 
     ranks_       = std::move(other.ranks_);
     active_rank_ = other.active_rank_;
@@ -200,6 +204,7 @@ DeviceArena& DeviceArena::operator=(DeviceArena&& other) noexcept {
     other.off_         = 0;
     other.peak_        = 0;
     other.owns_        = true;
+    other.owned_base_  = nullptr;
     other.ranks_.clear();
     other.active_rank_ = 0;
     return *this;
@@ -316,6 +321,15 @@ std::size_t DeviceArena::peak_used_for_rank(std::size_t rank) const {
     }
     // The active rank's live counters have not been written back yet.
     return rank == active_rank_ ? peak_ : ranks_[rank].peak;
+}
+
+ScopedArenaRank::ScopedArenaRank(DeviceArena& arena, std::size_t rank)
+    : arena_(arena), previous_rank_(arena.active_rank()) {
+    arena_.activate_rank(rank);
+}
+
+ScopedArenaRank::~ScopedArenaRank() noexcept {
+    if (arena_.active_rank() != previous_rank_) { arena_.activate_rank(previous_rank_); }
 }
 
 PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
