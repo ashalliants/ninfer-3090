@@ -21,10 +21,33 @@ struct W8PairRouteSpec {
     W8PairScheduleId schedule;
 };
 
+// Measured on sm_86 by bench/ops/w8_pair_schedule_bench.cu, cold, median of 21-31.
+//
+// The catch-up merge had to rewrite this table rather than keep it: the fork's old middle route
+// used TwoSimtR8C8, which upstream deleted along with DualMmaR32C80/C96/C112. The replacement was
+// tuned on sm_120 and put both boundaries far out of place here -- SIMT owned everything to 85
+// columns while losing 41% at that width, and the c128 tile did not start until 961 while being
+// 35% faster from 464 on.
+//
+//   T           64      80      85     464     480     512     576     640
+//   simt     218.1   265.2   291.8       -       -       -       -       -
+//   c64      159.7   169.0   171.0   414.7   437.2   403.5   409.6   426.0
+//   c128     173.1   179.2   181.2   268.3   270.3   260.1   269.3   276.5
+//
+// SIMT is sawtoothed below the boundary because tiled_use_full() takes the full-tile variant only
+// when cols % 4 == 0, so unaligned widths take the slower path: at 31 reps it wins at 40, 44 and
+// 48 and loses by ~1% at 45 and 46. 48 is the last width where the aligned case is ahead, and the
+// unaligned cost of putting the boundary there is inside the run-to-run spread.
+//
+// c64 steps from 239.6us at 448 to 414.7 at 464 and never recovers, which is what fixes the upper
+// boundary at 448. There is a shallow band around 944..960 where c64 comes back by ~4%; it is not
+// routed, because at 31 reps it is barely outside the noise and a route that exists only for a
+// 16-column window is a liability at the next merge. Every prefill width proper is a multiple of
+// 128 (--prefill-chunk requires it) and c128 wins at all of them from 512 up.
 constexpr std::array<W8PairRouteSpec, 3> kK5120Routes{{
-    {1, 85, W8PairScheduleId::TwoSimtR8C4},
-    {86, 960, W8PairScheduleId::DualMmaR32C64},
-    {961, kAnyCols, W8PairScheduleId::DualMmaR32C128},
+    {1, 48, W8PairScheduleId::TwoSimtR8C4},
+    {49, 448, W8PairScheduleId::DualMmaR32C64},
+    {449, kAnyCols, W8PairScheduleId::DualMmaR32C128},
 }};
 
 constexpr std::array<W8PairRouteSpec, 37> kK2048Routes{{
@@ -517,19 +540,27 @@ void w8_pair_execute_plan(W8PairPlan plan, const Tensor& x, const Weight& first_
     if (resolved.schedule != plan.schedule) {
         throw std::invalid_argument("w8 pair: plan does not match the exact problem");
     }
+    w8_pair_execute_schedule(plan.schedule, x, first_weight, second_weight, first_out, second_out,
+                             stream);
+}
+
+void w8_pair_execute_schedule(W8PairScheduleId schedule, const Tensor& x,
+                              const Weight& first_weight, const Weight& second_weight,
+                              Tensor& first_out, Tensor& second_out, cudaStream_t stream) {
+    const W8PairProblem problem = w8_pair_problem(x, first_weight, first_out);
 
     require_pair_weights(first_weight, second_weight, x.ne[0]);
     if (problem.k == 2048) { require_dflash_row_views(first_weight, second_weight); }
     require_pair_operands(x, first_weight, second_weight, first_out, second_out,
-                          uses_mma(plan.schedule));
+                          uses_mma(schedule));
 
-    if (is_exact_tail_schedule(plan.schedule)) {
-        launch_exact_tail(plan.schedule, problem, x, first_weight, second_weight, first_out,
-                          second_out, stream);
+    if (is_exact_tail_schedule(schedule)) {
+        launch_exact_tail(schedule, problem, x, first_weight, second_weight, first_out, second_out,
+                          stream);
         return;
     }
 
-    switch (plan.schedule) {
+    switch (schedule) {
     case W8PairScheduleId::DualDecodeR4:
         w8_pair_decode_r4_launch(x, first_weight, second_weight, first_out, second_out, stream);
         return;
@@ -555,12 +586,12 @@ void w8_pair_execute_plan(W8PairPlan plan, const Tensor& x, const Weight& first_
     case W8PairScheduleId::DualSplitKMediumC192:
     case W8PairScheduleId::DualSplitKMediumC224:
     case W8PairScheduleId::DualSplitKMediumC256:
-        w8_pair_splitk_medium_launch(plan.schedule, x, first_weight, second_weight, first_out,
+        w8_pair_splitk_medium_launch(schedule, x, first_weight, second_weight, first_out,
                                      second_out, stream);
         return;
     default:
-        launch_tiled(plan.schedule, tiled_use_full(plan.schedule, problem), x, first_weight,
-                     second_weight, first_out, second_out, stream);
+        launch_tiled(schedule, tiled_use_full(schedule, problem), x, first_weight, second_weight,
+                     first_out, second_out, stream);
         return;
     }
 }

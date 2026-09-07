@@ -11,8 +11,14 @@ using ninfer::test::linear_pair::ShapeCase;
 int w8_a16_conformance() {
     int failures = 0;
 
-    constexpr std::array<std::int32_t, 2> kK5120RouteStarts{86, 961};
-    constexpr std::array<std::int32_t, 3> kK5120RouteInteriors{24, 512, 1024};
+    // These track kK5120Routes in w8_pair_plan.cpp, which was re-measured on sm_86; the previous
+    // {86, 961} were upstream's sm_120 boundaries.
+    constexpr std::array<std::int32_t, 2> kK5120RouteStarts{49, 449};
+    // 85 is kept as an explicit interior although it is no longer a boundary. It is the width that
+    // exposed how tightly the gross-error limit was calibrated (see kLinearPairA16Tolerance in
+    // linear_pair_test_common.cpp), and dropping it once it stopped being a route start would have
+    // quietly retired the only case that covers that edge.
+    constexpr std::array<std::int32_t, 4> kK5120RouteInteriors{24, 85, 512, 1024};
     failures += ninfer::test::linear_pair::run_w8_a16_shape(
         "W8_A16 LinearPair", ShapeCase{5120, 431U, kK5120RouteStarts, kK5120RouteInteriors});
 

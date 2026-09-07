@@ -78,6 +78,19 @@ W8PairPlan w8_pair_resolve_plan(const W8PairProblem& problem);
 void w8_pair_execute_plan(W8PairPlan plan, const Tensor& x, const Weight& first_weight,
                           const Weight& second_weight, Tensor& first_out, Tensor& second_out,
                           cudaStream_t stream);
+
+// Runs a schedule without first checking that it is the one resolve_plan would pick;
+// w8_pair_execute_plan is exactly this plus that check.
+//
+// It exists so a bench can time every candidate schedule at the same column count, which is the
+// only way to tell whether a route boundary sits in the right place. The alternative -- a bench
+// that reimplements the tiling and full-tile decisions this dispatch makes -- measures a replica
+// of the Op rather than the Op, and a replica that drifts is worse than no measurement at all.
+// Nothing on the inference path should call this: the check that execute_plan adds is what keeps
+// a plan from being executed against a problem it was not resolved for.
+void w8_pair_execute_schedule(W8PairScheduleId schedule, const Tensor& x,
+                              const Weight& first_weight, const Weight& second_weight,
+                              Tensor& first_out, Tensor& second_out, cudaStream_t stream);
 void w8_pair_dispatch(const Tensor& x, const Weight& first_weight, const Weight& second_weight,
                       Tensor& first_out, Tensor& second_out, cudaStream_t stream);
 

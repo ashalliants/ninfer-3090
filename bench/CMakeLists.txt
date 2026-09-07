@@ -62,6 +62,8 @@ ninfer_add_op_bench(ninfer_q5_linear_add_schedule_bench
   SOURCES ops/q5_linear_add_schedule_bench.cu)
 ninfer_add_op_bench(ninfer_w8_dflash2_schedule_bench
   SOURCES ops/w8_dflash2_schedule_bench.cu)
+ninfer_add_op_bench(ninfer_w8_pair_schedule_bench
+  SOURCES ops/w8_pair_schedule_bench.cu)
 ninfer_add_op_bench(ninfer_bf16_linear_add_bench SOURCES ops/bf16_linear_add_bench.cu)
 ninfer_add_op_bench(ninfer_nvfp4_linear_add_bench SOURCES ops/nvfp4_linear_add_bench.cu)
 ninfer_add_op_bench(ninfer_fp8_linear_add_bench SOURCES ops/fp8_linear_add_bench.cu)
