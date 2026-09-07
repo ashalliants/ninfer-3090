@@ -55,6 +55,13 @@ endfunction()
 ninfer_add_test(ninfer_wide_math_test
   SOURCES test_wide_math.cpp
   LIBRARIES ninfer_core)
+ninfer_add_test(ninfer_pipeline_split_test
+  SOURCES test_pipeline_split.cpp
+  LIBRARIES ninfer_core)
+ninfer_add_test(ninfer_arena_ranks_test
+  SOURCES test_arena_ranks.cpp
+  LIBRARIES ninfer_core)
+set_tests_properties(ninfer_arena_ranks_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_artifact_reader_test
   SOURCES test_ninfer_artifact_reader.cpp
   LIBRARIES ninfer_artifact)

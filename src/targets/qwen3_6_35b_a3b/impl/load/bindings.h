@@ -8,6 +8,7 @@
 
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
+#include "core/pipeline_split.h"
 #include "core/tensor.h"
 #include "ninfer/ops/sparse_moe.h"
 
@@ -110,7 +111,11 @@ struct ArtifactLoadPlan {
     artifact::MaterializationPlan materialization;
 };
 
-ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features);
+// ownership selects which layers this pass uploads to the current device. Default-constructed it
+// owns the whole model, which is the single-GPU path; for a pipeline split, call this once per
+// rank with that rank's ownership and materialize each plan on its own device.
+ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features,
+                               RankOwnership ownership = {});
 
 struct SparseMoePayload {
     ops::SparseMoeWeights op;
@@ -139,14 +144,23 @@ using DFlashLayerWeights   = qwen3_6::DFlashLayerWeights;
 
 class LoadedModelData {
 public:
+    // Whole model on one device.
     LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized);
+    // One plan and one artifact per pipeline rank. Each layer's weights are read from the artifact
+    // belonging to the rank that owns it, so a single RuntimeModelView addresses tensors living in
+    // two device arenas -- which works because every layer lives wholly on one device, and is why
+    // a layer split needs no per-rank arena inside a single artifact.
+    LoadedModelData(std::vector<BindingPlan> plans,
+                    std::vector<artifact::MaterializedArtifact> materialized, PipelineSplit split);
 
     LoadedModelData(const LoadedModelData&)            = delete;
     LoadedModelData& operator=(const LoadedModelData&) = delete;
     LoadedModelData(LoadedModelData&&)                 = delete;
     LoadedModelData& operator=(LoadedModelData&&)      = delete;
 
-    artifact::MaterializedArtifact backing;
+    // One per rank; index with split.placement(layer).rank. Single-rank loads hold exactly one.
+    std::vector<artifact::MaterializedArtifact> backings;
+    PipelineSplit split{kTextLayers};
     qwen3_6::FrontendResources frontend;
     RuntimeModelView runtime;
 };
@@ -156,6 +170,11 @@ public:
     Impl(WeightsProfile weights_profile_in, BindingPlan plan,
          artifact::MaterializedArtifact materialized)
         : weights_profile(weights_profile_in), data(std::move(plan), std::move(materialized)) {}
+
+    Impl(WeightsProfile weights_profile_in, std::vector<BindingPlan> plans,
+         std::vector<artifact::MaterializedArtifact> materialized, PipelineSplit split)
+        : weights_profile(weights_profile_in),
+          data(std::move(plans), std::move(materialized), std::move(split)) {}
 
     WeightsProfile weights_profile;
     LoadedModelData data;

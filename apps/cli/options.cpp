@@ -33,6 +33,38 @@ std::uint32_t parse_u32(const char* text, std::string_view label, bool allow_zer
     return static_cast<std::uint32_t>(value);
 }
 
+// Same shape as serve's --devices: one or two ids. Repeating an id puts both ranks on one
+// card, which exercises the split path without a second GPU. Existence is checked at engine
+// startup; this only parses the shape.
+std::vector<int> parse_device_list(std::string_view text) {
+    std::vector<int> devices;
+    std::size_t start = 0;
+    while (start <= text.size()) {
+        const std::size_t comma = text.find(',', start);
+        const std::string_view piece =
+            text.substr(start, comma == std::string_view::npos ? std::string_view::npos
+                                                               : comma - start);
+        if (piece.empty()) { throw std::invalid_argument("--devices entries must not be empty"); }
+        const std::string entry(piece);
+        const std::uint64_t raw = parse_u64(entry.c_str(), "devices");
+        if (raw > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+            throw std::invalid_argument("invalid devices: " + entry);
+        }
+        devices.push_back(static_cast<int>(raw));
+        if (comma == std::string_view::npos) { break; }
+        start = comma + 1;
+    }
+    if (devices.empty() || devices.size() > 2) {
+        throw std::invalid_argument("--devices takes one or two CUDA device ids");
+    }
+    if (devices.size() == 2 && devices[0] == devices[1]) {
+        // Deliberately permitted: the same id twice puts both ranks on one card, which saves no
+        // memory but exercises the whole split path on a single-GPU machine.
+        (void)0;
+    }
+    return devices;
+}
+
 int parse_device(const char* text) {
     const std::uint64_t value = parse_u64(text, "device");
     if (value > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
@@ -81,8 +113,10 @@ std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
-           "       [--device N]\n"
-           "       [--kv-dtype bf16|int8|fp8|rk8v4|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N]\n"
+           "       [--device N] [--devices N,M]
+"
+           "       [--kv-dtype bf16|int8|fp8|rk8v4|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N]
+"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -101,6 +135,8 @@ std::string usage_text(const char* argv0) {
            "memory per image; --vision-max-merged bounds one item's merged tokens (default 16384).\n"
            "--thinking-budget caps model-origin thinking tokens; inserted control tokens count "
            "toward --max-new.\n"
+           "--devices N,M offloads the expert/MLP blocks to the second GPU; rank 0 keeps attention, "
+           "the KV cache and the head, so nearly all of its memory becomes KV.\n"
            "--kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom.\n"
@@ -117,6 +153,7 @@ Options parse_options(int argc, char** argv) {
     if (argc < 2) { throw std::invalid_argument(".ninfer model path is required"); }
     options.artifact_path     = argv[1];
     bool kv_capacity_explicit = false;
+    bool device_explicit      = false;
 
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -139,7 +176,10 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {
-            options.device = parse_device(value(arg));
+            options.device  = parse_device(value(arg));
+            device_explicit = true;
+        } else if (arg == "--devices") {
+            options.devices = parse_device_list(value(arg));
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
         } else if (arg == "--spec") {
@@ -220,6 +260,9 @@ Options parse_options(int argc, char** argv) {
 
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+    }
+    if (!options.devices.empty() && device_explicit) {
+        throw std::invalid_argument("--device and --devices are mutually exclusive");
     }
 
     const bool has_prompt   = !options.prompt.empty();

@@ -102,8 +102,14 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     runtime::ResolvedContextMachineCost context_cost = runtime::resolve_context_machine_cost(
         context_cost_identity, options.context_cost.preset_path);
 
+    // One rank per device. The target decides how its layers divide, and rejects the request if it
+    // has not been converted for a split -- which is why this is asked before any binding happens.
+    const std::size_t pipeline_ranks     = device.size();
+    const PipelineSplit pipeline_split   = Target::pipeline_split(pipeline_ranks);
+
     artifact::Binder binder(reader);
-    auto load_plan        = Target::plan_load(binder, options, weights_profile);
+    auto load_plan        = Target::plan_load(binder, options, weights_profile,
+                                              RankOwnership{&pipeline_split, 0});
     auto sequence_planner = Target::make_sequence_planner(device, options, weights_profile);
     const runtime::SequenceCapacityCurve curve = sequence_planner.capacity_curve();
     const std::size_t preflight_runtime_bytes =
@@ -144,7 +150,36 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     }
 
     StartupPhaseScope target_finalize_phase(options.startup_observer, StartupPhase::TargetFinalize);
-    auto model = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
+    std::unique_ptr<typename Target::LoadedModel> model;
+    if (pipeline_ranks > 1) {
+        // Rank 0's plan and artifact are the ones already built above. Bind and materialize the
+        // remaining ranks on their own devices, then hand the whole set over together.
+        std::vector<typename Target::LoadPlan> rank_plans;
+        std::vector<artifact::MaterializedArtifact> rank_artifacts;
+        rank_plans.reserve(pipeline_ranks);
+        rank_artifacts.reserve(pipeline_ranks);
+        rank_plans.push_back(std::move(load_plan));
+        rank_artifacts.push_back(std::move(materialized));
+
+        for (std::size_t rank = 1; rank < pipeline_ranks; ++rank) {
+            ScopedDeviceRank rank_guard(device, rank);
+            artifact::Binder rank_binder(reader);
+            auto rank_plan = Target::plan_load(rank_binder, options, weights_profile,
+                                               RankOwnership{&pipeline_split, rank});
+            rank_artifacts.push_back(artifact::materialize(reader, rank_plan.materialization(),
+                                                           device, &options.startup_observer,
+                                                           nullptr));
+            rank_plans.push_back(std::move(rank_plan));
+        }
+
+        // No per-rank logging here: the existing memory summary already reports rank 0, which is
+        // the number that matters. Rank 0 serves attention, so its free memory is exactly what is
+        // available for KV, and shedding the expert blocks is visible there directly.
+        model = Target::construct_loaded_model(std::move(rank_plans), std::move(rank_artifacts),
+                                               pipeline_split);
+    } else {
+        model = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
+    }
     device.synchronize();
     runtime::KvCapacityResolution capacity_resolution =
         runtime::resolve_kv_capacity(options.kv_capacity, curve, current_free_device_bytes());

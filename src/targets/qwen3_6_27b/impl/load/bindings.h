@@ -8,12 +8,14 @@
 
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
+#include "core/pipeline_split.h"
 #include "core/tensor.h"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <vector>
 #include <utility>
 #include <variant>
 
@@ -163,8 +165,11 @@ struct ArtifactLoadPlan {
     artifact::MaterializationPlan materialization;
 };
 
+// ownership selects which layers' mlp tails this pass uploads. Default-constructed it owns the
+// whole model, which is the single-GPU path.
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
-                               qwen3_6::StartupFeatures features);
+                               qwen3_6::StartupFeatures features,
+                               RankOwnership ownership = {});
 
 struct DensePostMixerPayload {
     Weight gate_up;
@@ -233,13 +238,18 @@ using MtpWeights           = RuntimeModelView::MtpLayer;
 class LoadedModelData {
 public:
     LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized);
+    // One plan and one artifact per pipeline rank; the mlp tail of each layer is read from the
+    // rank that owns it, everything else from rank 0.
+    LoadedModelData(std::vector<BindingPlan> plans,
+                    std::vector<artifact::MaterializedArtifact> materialized, PipelineSplit split);
 
     LoadedModelData(const LoadedModelData&)            = delete;
     LoadedModelData& operator=(const LoadedModelData&) = delete;
     LoadedModelData(LoadedModelData&&)                 = delete;
     LoadedModelData& operator=(LoadedModelData&&)      = delete;
 
-    artifact::MaterializedArtifact backing;
+    std::vector<artifact::MaterializedArtifact> backings;
+    PipelineSplit split{kTextLayers};
     qwen3_6::FrontendResources frontend;
     RuntimeModelView runtime;
 };
@@ -249,6 +259,11 @@ public:
     Impl(WeightsProfile weights_profile_in, BindingPlan plan,
          artifact::MaterializedArtifact materialized)
         : weights_profile(weights_profile_in), data(std::move(plan), std::move(materialized)) {}
+
+    Impl(WeightsProfile weights_profile_in, std::vector<BindingPlan> plans,
+         std::vector<artifact::MaterializedArtifact> materialized, PipelineSplit split)
+        : weights_profile(weights_profile_in),
+          data(std::move(plans), std::move(materialized), std::move(split)) {}
 
     WeightsProfile weights_profile;
     LoadedModelData data;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/pipeline_split.h"
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 #include <ninfer/targets/qwen3_6/frontend.h>
@@ -8,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <string_view>
+#include <vector>
 
 namespace ninfer {
 
@@ -125,12 +127,24 @@ struct Package {
     using ReleaseResult              = qwen3_6::ReleaseResult<detail::Variant>;
     using Program                    = qwen3_6::Program<detail::Variant>;
 
+    // How this target's layers divide across `ranks` devices. Targets that have not been
+    // converted for a pipeline split reject anything but a single rank here, so an unsupported
+    // combination fails at load with a clear message rather than silently loading the whole model
+    // onto every card.
+    [[nodiscard]] static PipelineSplit pipeline_split(std::size_t ranks);
     [[nodiscard]] static ModelSamplingDefaults sampling_defaults(std::string_view model);
     [[nodiscard]] static WeightsProfile resolve_weights(const artifact::ArtifactIdentity& identity);
     [[nodiscard]] static LoadPlan plan_load(artifact::Binder& binder, const EngineOptions& options,
                                             WeightsProfile weights_profile);
+    [[nodiscard]] static LoadPlan plan_load(artifact::Binder& binder, const EngineOptions& options,
+                                            WeightsProfile weights_profile,
+                                            RankOwnership ownership);
     [[nodiscard]] static std::unique_ptr<LoadedModel>
     construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized);
+    [[nodiscard]] static std::unique_ptr<LoadedModel>
+    construct_loaded_model(std::vector<LoadPlan>&& plans,
+                           std::vector<artifact::MaterializedArtifact>&& materialized,
+                           PipelineSplit split);
     [[nodiscard]] static Frontend make_frontend(const LoadedModel& model,
                                                 const EngineOptions& options);
     [[nodiscard]] static SequencePlanner make_sequence_planner(DeviceContext& device,

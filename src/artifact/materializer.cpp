@@ -80,21 +80,41 @@ struct ReadSpan {
 
 } // namespace
 
+namespace {
+
+// Name the handle. With a multi-rank load the overwhelmingly likely cause is reading a tensor from
+// the wrong rank's artifact -- it was bound ValidateOnly there, so it has no device pointer -- and
+// an unadorned message turns a one-line mistake into a bisect.
+std::string unmaterialized_message(ObjectHandle handle, std::size_t object_count) {
+    std::string message = "object handle " + std::to_string(handle.index) + " of " +
+                          std::to_string(object_count) + " does not name a materialized tensor";
+    if (handle.index < object_count) {
+        message +=
+            " (it was bound ValidateOnly or host-pinned in this artifact; with --devices, check "
+            "the rank whose artifact is being read)";
+    } else {
+        message += " (index is out of range for this artifact)";
+    }
+    return message;
+}
+
+} // namespace
+
 void* MaterializedArtifact::device_data(ObjectHandle handle) const {
     if (handle.index >= objects_.size() || objects_[handle.index].device == nullptr) {
-        throw ArtifactError("object handle does not name a materialized tensor");
+        throw ArtifactError(unmaterialized_message(handle, objects_.size()));
     }
     return objects_[handle.index].device;
 }
 
 void* MaterializedArtifact::storage_data(ObjectHandle handle) const {
     if (handle.index >= objects_.size()) {
-        throw ArtifactError("object handle does not name a materialized tensor");
+        throw ArtifactError(unmaterialized_message(handle, objects_.size()));
     }
     const ObjectStorage& storage = objects_[handle.index];
     if (storage.device != nullptr) { return storage.device; }
     if (storage.pinned != nullptr) { return storage.pinned; }
-    throw ArtifactError("object handle does not name a materialized tensor");
+    throw ArtifactError(unmaterialized_message(handle, objects_.size()));
 }
 
 bool MaterializedArtifact::is_host_pinned(ObjectHandle handle) const noexcept {

@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <vector>
 
 namespace ninfer {
 
@@ -57,6 +58,10 @@ public:
 
         DeviceArena* arena_       = nullptr;
         std::size_t saved_offset_ = 0;
+        // Which rank's offset `saved_offset_` refers to. A scope opened on one rank can outlive a
+        // switch to another -- the pipeline split walks ranks inside an enclosing scope -- and
+        // restoring the wrong rank's bump pointer would hand out overlapping workspace.
+        std::size_t saved_rank_ = 0;
     };
 
     explicit DeviceArena(std::size_t capacity_bytes);
@@ -80,12 +85,49 @@ public:
     std::size_t peak_used() const noexcept;
     void reset_peak() noexcept;
 
+    // --- pipeline split support -------------------------------------------------------------
+    //
+    // A layer split runs each layer on the device that holds its weights, so scratch has to come
+    // from that device too. Rather than thread a different arena through every call site, one
+    // arena carries a backing per rank and switches between them: the bump pointer, capacity and
+    // peak are saved and restored per rank, so callers keep using the same arena object and only
+    // the execution loop knows about ranks.
+    //
+    // Rank 0 is this arena's original storage. Storage attached here is non-owning, exactly like
+    // the DeviceSpan constructor, and must live on the device belonging to that rank.
+    void attach_rank_storage(DeviceSpan storage);
+    void activate_rank(std::size_t rank);
+    [[nodiscard]] std::size_t active_rank() const noexcept;
+    [[nodiscard]] std::size_t rank_count() const noexcept;
+    // Peak for a specific rank, for reporting each card's workspace high-water mark.
+    [[nodiscard]] std::size_t peak_used_for_rank(std::size_t rank) const;
+
 private:
+    struct RankBacking {
+        void* base       = nullptr;
+        std::size_t cap  = 0;
+        std::size_t off  = 0;
+        std::size_t peak = 0;
+    };
+
+    void store_active_rank() noexcept;
+
     void* base_       = nullptr;
     std::size_t cap_  = 0;
     std::size_t off_  = 0;
     std::size_t peak_ = 0;
     bool owns_        = true;
+    // The allocation this arena itself owns (rank 0's), independent of which rank's storage
+    // `base_` currently aliases. `activate_rank` only ever swaps `base_`/`cap_`/`off_`/`peak_`, so
+    // cleanup must free this instead of `base_` -- otherwise destroying or move-assigning the
+    // arena while a borrowed rank is active frees storage this arena does not own and leaks the
+    // rank-0 allocation it does.
+    void* owned_base_ = nullptr;
+
+    // Empty until a second rank is attached, so the single-device path carries no extra state and
+    // no extra work.
+    std::vector<RankBacking> ranks_;
+    std::size_t active_rank_ = 0;
 };
 
 class PinnedHostBuffer {
@@ -107,5 +149,22 @@ private:
 };
 
 using WorkspaceArena = DeviceArena;
+
+// Binds a rank for the duration of a scope and restores the previous one, so an exception thrown
+// while the arena is switched away from its caller's rank cannot leave it there -- unlike
+// DeviceContext, DeviceArena has no device to fall back on, so an unrestored rank silently hands
+// out the wrong device's scratch to the next allocation.
+class ScopedArenaRank {
+public:
+    ScopedArenaRank(DeviceArena& arena, std::size_t rank);
+    ~ScopedArenaRank() noexcept;
+
+    ScopedArenaRank(const ScopedArenaRank&)            = delete;
+    ScopedArenaRank& operator=(const ScopedArenaRank&) = delete;
+
+private:
+    DeviceArena& arena_;
+    std::size_t previous_rank_ = 0;
+};
 
 } // namespace ninfer
