@@ -193,6 +193,20 @@ about it fails on a different one.
       The relative-L2 field is the bound that actually constrains a kernel and should not be
       touched — those 330 cases all sit at 0.45-0.69 of it.
 
+## 5b. Reproducibility
+
+- [ ] **fp8, k8v4 and nvfp4 causal attention are not run-to-run deterministic.** Running
+      `ninfer_softmax_attention_test` twice from the *same binary* produces ~36 differing
+      `OP_ERROR_STATS` lines, always in those three storage families (plus a couple of bf16
+      geometry lines); int8-g64 and rk8v4 are byte-identical across runs. All of it stays well
+      inside tolerance, so nothing fails — but it means **those cases cannot be used for
+      exact-match regression checks**, and it cost a real detour: after a change that touched only
+      the INT8 prompt loader, 34 stat lines moved and looked like collateral damage until a
+      same-binary control run showed the same 36 lines moving on their own.
+      Worth understanding rather than assuming: a split reduction whose order varies, or an atomic
+      accumulation, would both explain it. Until then, diff *only the storage family you changed*
+      when using these stats to prove a change is neutral.
+
 ## 6. Measurement debt
 
 - [ ] **DFlash2 corpus numbers on sm_86.** Only single-prompt smoke numbers are recorded (text
