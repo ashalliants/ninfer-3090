@@ -38,23 +38,40 @@ constexpr std::array<SupportSpec, 2> kSupports{{
 
 // A tile narrower than the live extent repeats the whole weight pass per column slice, so
 // above 16 columns the 32-wide tile covers a decode round in one pass instead of two.
-constexpr std::array<RouteSpec, 7> kK6144Routes{{
+// Measured on sm_86 with bench/ops/q5_linear_add_schedule_bench.cu, cold, medians of 9-15.
+// Upstream's table sent 49..192 to R64C32S4 here; on this architecture that loses 17-23% from
+// ~88 upward and 31% at 128 (us): T=88 s4 249.9 vs s3 201.7; T=104 s4 306.2 vs c64 236.5;
+// T=128 s4 285.7 vs c128 236.5; T=192 s4 436.2 vs c128 292.9.
+//
+// The 104..127 band goes to R64C64 and everything from 128 to R64C128 rather than splitting the
+// band around C64's spike at exactly 128 (c64 309.2 there against 239.6 at 126 and 272.4 at 130).
+// 128 is not an arbitrary point: --prefill-chunk is required to be a multiple of 128, so every
+// full prefill chunk lands exactly on it, and C128 also wins outright at 192/256/384. C64 keeps
+// the 104..127 band, which only a prompt's ragged tail chunk reaches.
+constexpr std::array<RouteSpec, 8> kK6144Routes{{
     {{1, 1}, Q5LinearAddScheduleId::GemvResidual},
     {{2, 10}, Q5LinearAddScheduleId::Split2ExactResidual},
     {{11, 16}, Q5LinearAddScheduleId::MmaResidualR64C16},
-    {{17, 32}, Q5LinearAddScheduleId::MmaResidualR64C32},
-    {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
-    {{49, 192}, Q5LinearAddScheduleId::MmaResidualR64C32S4},
-    {{193, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
+    {{17, 24}, Q5LinearAddScheduleId::MmaResidualR64C24},
+    {{25, 32}, Q5LinearAddScheduleId::MmaResidualR64C32S4},
+    {{33, 103}, Q5LinearAddScheduleId::MmaResidualR64C32S3},
+    {{104, 127}, Q5LinearAddScheduleId::MmaResidualR64C64},
+    {{128, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
 }};
 
-constexpr std::array<RouteSpec, 6> kK17408Routes{{
+// Same sweep, k=17408. This table had no 16-wide route at all, so 11..16 paid C32's cost for a
+// C16-shaped extent (T=16: c16 270.3 vs c32 300.0). Above that the story matches k=6144, with the
+// S4/S3 crossover later: T=48 s4 437.2 vs c24 474.1; T=96 s3 629.8 vs s4 683.0; T=128 c128 665.6
+// vs s3 817.2; T=192 c128 798.7 vs s3 1359.9.
+constexpr std::array<RouteSpec, 8> kK17408Routes{{
     {{1, 1}, Q5LinearAddScheduleId::GemvResidual},
     {{2, 10}, Q5LinearAddScheduleId::Split2ExactResidual},
-    {{11, 32}, Q5LinearAddScheduleId::MmaResidualR64C32},
-    {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
-    {{49, 192}, Q5LinearAddScheduleId::MmaResidualR64C32S3},
-    {{193, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
+    {{11, 16}, Q5LinearAddScheduleId::MmaResidualR64C16},
+    {{17, 24}, Q5LinearAddScheduleId::MmaResidualR64C24},
+    {{25, 64}, Q5LinearAddScheduleId::MmaResidualR64C32S4},
+    {{65, 103}, Q5LinearAddScheduleId::MmaResidualR64C32S3},
+    {{104, 127}, Q5LinearAddScheduleId::MmaResidualR64C64},
+    {{128, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
 }};
 
 template <std::size_t N>
@@ -164,6 +181,7 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
         return;
     case Q5LinearAddScheduleId::MmaResidualR64C64:
         q5_linear_add_mma_r64_c64_launch(x, w, residual_out, stream);
+        return;
     case Q5LinearAddScheduleId::MmaResidualR64C32S3:
         q5_linear_add_mma_r64_c32_s3_launch(x, w, residual_out, stream);
         return;
