@@ -15,6 +15,25 @@ Everything below is what is *not* done. Ordered by what blocks what.
 
 ---
 
+## 0. Next up, in this order
+
+1. **Dedupe `prompt_i8.cuh`'s local f16 dequant helpers** (section 7). ~15 minutes, and it closes
+   the exact gap that caused the small-T bug: the shared codec had no f16 variant for the INT8
+   codings, so upstream's kernel reached for the bf16 one. Removing the local copies removes the
+   trap.
+2. **Measure the `w8_pair` k=2048 table** (section 4). The best remaining pure-speed bet — 37
+   routes, the largest table in the tree, on the 35B DFlash path, never measured on sm_86.
+3. **Audit the gross-error limits** (section 5). Cheap insurance: any criterion under ~4e-3 against
+   a BF16 output will read as an accuracy regression the next time a route boundary moves.
+
+**PR #16 scope.** It is now substantially bigger than when it was opened: the catch-up itself, plus
+four measured route retunes, two switch-fallthrough fixes, the KV plane typing, the `master`/PR #15
+merge, and the causal small-T adoption. If that is too much to review in one pass, the small-T
+adoption is the clean thing to split out — it is self-contained (merge `19c7617c` and its parents on
+`investigate/small-t-upstream`) and carries its own measured justification.
+
+---
+
 ## 1. Blocking — the work isn't shared yet
 
 - [x] ~~Push the branch.~~ Pushed.
@@ -46,6 +65,14 @@ Everything below is what is *not* done. Ordered by what blocks what.
       through this fork's causal-cache fixture **segfaults** — it uses shapes the fixture does not
       model, and because it is a memory fault rather than a throw, no try/catch reports it. Each
       shape needs validating against this fixture's geometry and storage overloads first.
+      **Narrowed 2026-09-07:** it fails on the *first* case of the sweep — BF16, `width=2`,
+      `batch=1`, `base=0` — not on some exotic later shape, and it fails before reaching any
+      attention call (neither `causal_attention_resolve_route` nor
+      `causal_softmax_attention_workspace_capacity_bytes` is entered). The symptom varies run to run
+      ("vector too long", "bad allocation", "invalid naive Softmax Attention geometry", a raw access
+      violation), and `compute-sanitizer` reports **0 device errors**, so it is host-side. Start
+      from that one case rather than the whole sweep; `cdbX64.exe` is available for it (see
+      `windows-cdb-debugger-available` in memory).
       *Note the trap: rk8v4 is only constructible through the `CachePlan` overload of `make_cache`;
       the `KvCacheStorage` overload has no packed-int4 branch and silently builds an unpacked INT8
       value plane that the kernel then reads as packed and runs off the end of.*
@@ -67,7 +94,8 @@ Everything below is what is *not* done. Ordered by what blocks what.
       the sort of thing that will not show up until someone tries it.
 - [ ] **DFlash2 + multi-GPU expert offload.** This host has one 3090; the offload path degenerates
       to the single-rank identity mapping, so nothing meaningful was tested. Needs the two-card
-      box (vast) or a second local GPU.
+      box (vast) or a second local GPU. **More interesting now that PR #15 has landed on `master`**
+      — the offload path is no longer hypothetical, and this branch has merged it.
 - [ ] **`--spec dflash` (v1) on 35B-A3B.** Refused by the 27B artifact ("selected masked draft
       backend is not supported by this target") because v1 is a 35B backend — correct behaviour,
       but it means v1 itself is untested this cycle. Needs the 35B DFlash artifact.
@@ -217,3 +245,24 @@ believing a test result.** And a build that looks hung is almost always just slo
 ~0.1s CPU while its `cicc` child does the work, and `small_t_fp8.cu` legitimately burns 170+
 seconds in `cicc`. Check `cicc`, not `nvcc`. Full details in the
 `ninfer-3090-windows-build-recipe` memory.
+
+Two more that cost real time on 2026-09-07:
+
+- **Never truncate a build pipeline.** `cmake --build ... | Select-Object -First N` (or `| head`)
+  returns while `ninja` keeps running detached, and the next build collides with it —
+  `ninja: error: opening deps log: Permission denied`, i.e. self-inflicted concurrent-ninja
+  corruption. Redirect the whole build to a file and grep the file afterwards. Before assuming the
+  build directory is free: `Get-Process ninja,cmake,cicc`.
+- **Buffered stdout lies about where a crash happened.** The last flushed line is *not* the last
+  line executed; a truncated trailing line named the wrong function twice during the small-T
+  investigation. Add explicit `<< std::flush` markers around candidate regions instead. Note also
+  that `cdb` does not capture the debuggee's **stderr** — put diagnostics on stdout.
+
+## Debugging note
+
+A scriptable console debugger is installed: `%LOCALAPPDATA%\Microsoft\WindowsApps\cdbX64.exe`
+(from the Store WinDbg package — there is no plain `cdb.exe`, and the Windows Kits `Debuggers\x64`
+directory holds only DLLs). `compute-sanitizer` sees device memory only, so
+`ERROR SUMMARY: 0 errors` on a process that still dies is positive evidence of a **host-side**
+fault — switch to cdb at that point. See `windows-cdb-debugger-available` in memory for the
+invocations.
