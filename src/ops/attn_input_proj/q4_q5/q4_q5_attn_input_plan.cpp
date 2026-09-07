@@ -24,15 +24,40 @@ struct RouteSpec {
     Q4Q5AttnInputScheduleId schedule;
 };
 
-constexpr std::array<RouteSpec, 3> kRoutes{{
+// Measured on an RTX 3090 (sm_86) with bench/ops/q4_q5_attn_input_schedule_bench.cu, which times
+// every schedule at the same column count. Medians of 9-11, cold, us:
+//
+//     T      parent  grp_c32  grp_c64  mix_c64  pair_c64  mix_c128
+//     8       191.5    230.4    392.1    286.6     286.7     458.8
+//     9       333.8    231.4    392.2    287.7     288.8     459.8
+//    32           -    223.2    401.3    293.9     295.9     458.8
+//    34           -    384.0    352.3    257.0     258.0     398.1
+//    64           -    417.8    372.7    301.1     305.2     464.9
+//    68           -    577.5    586.8    458.8     507.9     416.8
+//   124           -    742.4    615.4    478.2     525.3     427.0
+//   128           -    678.9    567.3    475.1     505.8     526.3
+//   192           -   1027.1    867.1    716.8     742.4     740.4
+//   208           -   1340.4   1137.7    924.5     973.8     748.5
+//
+// parent_split_fixed is only defined for cols <= 12 (q4_q5_attn_input_small_t.cu) but already
+// loses to the 32-wide grouped tile at 9. grouped_r32_c64_s4 and pair_r32_c64_s3 never win at any
+// width measured; they stay in the enum because the schedule-name and execute switches list them.
+constexpr std::array<RouteSpec, 6> kRoutes{{
     {{1, 8}, Q4Q5AttnInputScheduleId::ParentSplitFixed},
     {{9, 32}, Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR32C32S4},
-    {{33, kAnyCols}, Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR32C64S4},
+    {{33, 64}, Q4Q5AttnInputScheduleId::MixedR32C64S3},
+    {{65, 127}, Q4Q5AttnInputScheduleId::MixedR64C128S2},
+    {{128, 192}, Q4Q5AttnInputScheduleId::MixedR32C64S3},
+    {{193, kAnyCols}, Q4Q5AttnInputScheduleId::MixedR64C128S2},
 }};
 
 constexpr bool catalog_is_closed() noexcept {
-    return kRoutes[0].cols.first == 1 && kRoutes[0].cols.last + 1 == kRoutes[1].cols.first &&
-           kRoutes[1].cols.last + 1 == kRoutes[2].cols.first && kRoutes[2].cols.last == kAnyCols;
+    std::int64_t expected = 1;
+    for (const RouteSpec& route : kRoutes) {
+        if (route.cols.first != expected || route.cols.last < route.cols.first) { return false; }
+        expected = static_cast<std::int64_t>(route.cols.last) + 1;
+    }
+    return kRoutes[kRoutes.size() - 1].cols.last == kAnyCols;
 }
 
 static_assert(catalog_is_closed(), "attention input routes must be exact and closed");
@@ -74,12 +99,12 @@ Q4Q5AttnInputPlan q4_q5_attn_input_resolve_plan(const Q4Q5AttnInputProblem& prob
             "Q4/Q5 attention input: exact problem or column count is not admitted");
     }
 
-    if (problem.cols <= 12) return {Q4Q5AttnInputScheduleId::ParentSplitFixed};
-    if (problem.cols <= 64) return {Q4Q5AttnInputScheduleId::MixedR32C64S3};
-    if (problem.cols <= 104) return {Q4Q5AttnInputScheduleId::PairR32C64S3};
-    if (problem.cols <= 128 || problem.cols >= 193)
-        return {Q4Q5AttnInputScheduleId::MixedR64C128S2};
-    return {Q4Q5AttnInputScheduleId::PairR32C64S4};
+    // One source of truth: the table above. It used to sit here as dead code next to a hardcoded
+    // if-chain carrying upstream's sm_120 boundaries, so the tuned table was never consulted.
+    for (const RouteSpec& route : kRoutes) {
+        if (route.cols.contains(problem.cols)) { return {route.schedule}; }
+    }
+    throw std::invalid_argument("Q4/Q5 attention input: column count is not covered by any route");
 }
 
 void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& x,
@@ -101,6 +126,11 @@ void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& 
     case Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR32C32S4:
         q4_q5_attn_input_grouped_mma_r32_c32_s4_launch(x, query_key_weight, gate_value_weight, q,
                                                        gate, k, v, stream);
+        return;
+    case Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR32C64S4:
+        q4_q5_attn_input_grouped_mma_r32_c64_s4_launch(x, query_key_weight, gate_value_weight, q,
+                                                       gate, k, v, stream);
+        return;
     case Q4Q5AttnInputScheduleId::MixedR32C64S3:
         q4_q5_attn_input_mixed_r32_c64_s3_launch(x, query_key_weight, gate_value_weight, q, gate, k,
                                                  v, stream);
