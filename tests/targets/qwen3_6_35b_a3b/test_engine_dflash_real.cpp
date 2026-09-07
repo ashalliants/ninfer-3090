@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <iostream>
 #include <string>
 #include <utility>
@@ -373,7 +374,11 @@ int exercise_vision_dflash(const char* artifact, const std::vector<ninfer::Token
 
 } // namespace
 
-int main() {
+// Real-model mains report what went wrong instead of dying silently. Without this an engine
+// throw becomes an unhandled-exception fastfail (0xc0000409) with *no output at all*, which
+// reads like memory corruption and is really a clean, explanatory error -- usually a runtime
+// reservation this box cannot satisfy. Diagnosing that cost real time more than once.
+int run_main() {
     const char* artifact = std::getenv("NINFER_QWEN3_6_35B_A3B_WEIGHTS");
     if (artifact == nullptr || *artifact == '\0') {
         std::cout << "skip: NINFER_QWEN3_6_35B_A3B_WEIGHTS is not set\n";
@@ -438,4 +443,16 @@ int main() {
 
     std::cout << "ok\n";
     return 0;
+}
+
+int main() {
+    try {
+        return run_main();
+    } catch (const std::exception& error) {
+        std::cerr << "FATAL: " << error.what() << '\n';
+        return 1;
+    } catch (...) {
+        std::cerr << "FATAL: non-std exception\n";
+        return 1;
+    }
 }

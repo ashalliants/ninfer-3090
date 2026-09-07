@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -2141,7 +2142,11 @@ int exercise_artifact(const char* artifact, std::string_view expected_target) {
     return 0;
 }
 
-int main() {
+// Real-model mains report what went wrong instead of dying silently. Without this an engine
+// throw becomes an unhandled-exception fastfail (0xc0000409) with *no output at all*, which
+// reads like memory corruption and is really a clean, explanatory error -- usually a runtime
+// reservation this box cannot satisfy. Diagnosing that cost real time more than once.
+int run_main() {
     const char* groupwise        = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
     const char* nvfp4            = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
     const char* qwen38_groupwise = std::getenv("NINFER_QWEN3_8_27B_WEIGHTS");
@@ -2298,4 +2303,16 @@ int main() {
     }
     std::cout << "ok\n";
     return 0;
+}
+
+int main() {
+    try {
+        return run_main();
+    } catch (const std::exception& error) {
+        std::cerr << "FATAL: " << error.what() << '\n';
+        return 1;
+    } catch (...) {
+        std::cerr << "FATAL: non-std exception\n";
+        return 1;
+    }
 }
