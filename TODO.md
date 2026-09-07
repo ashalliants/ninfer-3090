@@ -87,6 +87,32 @@ adoption is the clean thing to split out — it is self-contained (merge `19c761
       a `TEST_ARGS` option to that helper. Worth doing — it turns a permanently-failing test into
       real DFlash2 coverage on this box.
 
+### Running the real-model tests on this box (verified 2026-09-07, idle GPU)
+
+```
+NINFER_QWEN3_8_27B_WEIGHTS=C:\Ninefer-3090\models\qwen3_8_27b.ninfer
+NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS=C:\Ninefer-3090\models\qwen3_8_27b_dflash2.ninfer
+NINFER_QWEN3_6_35B_A3B_WEIGHTS=C:\Ninefer-3090\models\qwen3_6_35b_a3b.ninfer
+NINFER_REAL_TEST_MAX_CONTEXT=8192      # only needed for the 35B
+```
+
+| test | with an idle GPU |
+|---|---|
+| `27b_prefix_real` | **passes** (10.4 s) |
+| `27b_dflash2_real` | **passes** (23.6 s) — wired via `TEST_ARGS` |
+| `35b_a3b_real` | **passes** with `NINFER_REAL_TEST_MAX_CONTEXT=8192` |
+| the other four | skip — need a Qwen3.6 27B artifact, or a DFlash-carrying 35B artifact |
+
+**Free VRAM is the whole story, and it is not marginal — it is decisive.** With the desktop
+busy (~4.4 GiB free) `27b_prefix_real` skips; idle (~21.9 GiB free) it passes. For the 35B the
+runtime reservation the maximum-configuration exercise asks for scales with the ceiling:
+262,144 → 4.15 GB, 32,768 → 1.48 GB, 16,384 → 1.29 GB, 8,192 → fits. Available runtime capacity
+on an idle box is ~1.02 GiB once the 20.8 GiB of weights are resident.
+
+The default stays 262,144 deliberately: on a machine that can hold it, that is the configuration
+worth pinning. The env var is for boxes that cannot, and the test now *skips* rather than fails
+when it genuinely will not fit.
+
 - [ ] **The real-model tests fail on their *maximum* configurations, not on this box's capability.**
       Measured 2026-09-07 via the CLI, which is the honest way to size them:
       | model | configuration | result |
