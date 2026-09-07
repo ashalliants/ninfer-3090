@@ -132,7 +132,7 @@ k_ctx^l(t) = rope_1d(
 v_ctx^l(t) = W_v^l c_t
 
 K_ctx_store^l(t) = BF16(k_ctx^l(t))
-V_ctx_store^l(t) = FP16_RNE(BF16(v_ctx^l(t)))
+V_ctx_store^l(t) = BF16(v_ctx^l(t))
 ```
 
 Context 不经过 draft layer input norm、dynamic convolution、Q projection、attention output
@@ -142,8 +142,8 @@ local window；若一个 prefill chunk 超过 2048 行，只 materialize 该 chu
 个绝对位置，ring 保留新的最后 2048 行，而逻辑 context frontier 按整个 chunk 前进。
 
 上述公式没有在 K projection 与 head norm 之间定义可观察的 BF16 cast；融合 materialization
-的 raw K 精度属于实现 profile。最终 K 的 BF16 store 和 V 的 `FP16_RNE(BF16)` storage
-转换保持显式边界。Context materialization 的合同和独立数学 oracle 直接使用上述完整
+的 raw K 精度属于实现 profile。最终 K 与 V 的 BF16 store 保持显式边界（本 fork 的 BF16
+profile 对称，V 不再经 FP16 转换）。Context materialization 的合同和独立数学 oracle 直接使用上述完整
 公式。可变 context 宽度、count envelope 及实现路线的当前验收状态统一见 Op checklist，
 算法文档不维护逐 Op 完成进度。
 
@@ -546,10 +546,19 @@ Sparse accept 保留实际 q 且只读 token counts。Frontend preview 后，Pro
 选 N−1。terminal、checkpoint 和保留状态的 context materialization 包含全部已提交输入。
 
 真实 Engine 验证入口为 `ninfer_qwen3_8_27b_dflash2_real_test`，命令和所覆盖行为见
-[tests README](../../tests/README.md)。RTX 5090、sm_120a、CUDA 13.1 上已验证两种本地
+[tests README](../../tests/README.md)。
+
+**上游证据（非本 fork 硬件）**：RTX 5090、sm_120a、CUDA 13.1 上已验证两种本地
 companion artifact、K=1/2/7/15、full/optimized head、BF16/INT8 target KV、eager/Graph、
 B=1/2/8、penalty counts、固定 seed 重放、partial terminal、超过 2048 token 的 ring
-替换/续接、image/video 及 Host State restore。固定贪心 fixture 与 ordinary decoding
+替换/续接、image/video 及 Host State restore。本 fork 不支持 sm_120a，该行保留仅作上游
+参考，不代表本 fork 已验证的范围。
+
+**本 fork 证据（sm_86 / RTX 3090 / CUDA 12.8）**：`ninfer_qwen3_8_27b_dflash2_real_test`
+以 `7 1 1 2 int8 0 1`（K=7、B=2、Graph、optimized head、INT8 target KV、单 state slot）
+通过，accepted=20/20；该配置已接入 ctest 的 `TEST_ARGS`。argv 默认值（K=15、B=8、3 个
+state slot）需 6.32 GB runtime reservation，24 GB 卡上放不下 20.4 GB artifact 之后的余量，
+故默认值不在本机运行。单请求 DFlash2 冒烟结果见 `docs/performance.md`。固定贪心 fixture 与 ordinary decoding
 比较用于检测接线/状态回归；它不把不同浮点执行路线的任意输入都要求为 token parity。
 各 Op 的数学或 exact-state 判据仍由对应 qualification 定义。
 
