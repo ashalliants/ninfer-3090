@@ -2883,8 +2883,7 @@ int run_dflash2_cases() {
     int failures = 0;
     for (auto storage :
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
-          KvCacheStorage::RotatedInt8KeyInt4ValueGroup64, KvCacheStorage::Nvfp4Group16,
-          KvCacheStorage::Fp8KeyNvfp4Value}) {
+          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
         const auto run = [&](int width, int batch, int base) {
             BatchAttentionCase c{width, {}, {}, {}, MappingPattern::Fragmented,
                                  static_cast<unsigned>(1700 + width + 31 * batch)};
@@ -2923,13 +2922,22 @@ int run_batch_cases() {
     int failures = 0;
     for (auto storage :
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
-          KvCacheStorage::RotatedInt8KeyInt4ValueGroup64, KvCacheStorage::Nvfp4Group16,
-          KvCacheStorage::Fp8KeyNvfp4Value}) {
+          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
         failures += run_batch_case(kGeometries[0], storage,
                                    {16, {0}, {0}, {0}, MappingPattern::Fragmented, 1501u});
         failures += run_batch_case(kGeometries[0], storage,
                                    {16, {0}, {1}, {0}, MappingPattern::Fragmented, 1502u});
     }
+    // rk8v4 is deliberately absent from the loop above and driven here instead. That loop uses the
+    // KvCacheStorage overload of make_cache, which has no packed-int4 branch: handed
+    // RotatedInt8KeyInt4ValueGroup64 it silently builds an *unpacked* INT8 value plane, which the
+    // kernel then reads as packed and runs off the end of. It does not fail the comparison, it
+    // takes the process down with an access violation several cases later. Only the CachePlan
+    // overload models the packed plane, so rk8v4 must come in as kPlanRk8v4.
+    failures += run_batch_case(kGeometries[0], kPlanRk8v4,
+                               {16, {0}, {0}, {0}, MappingPattern::Fragmented, 1503u});
+    failures += run_batch_case(kGeometries[0], kPlanRk8v4,
+                               {16, {0}, {1}, {0}, MappingPattern::Fragmented, 1504u});
     failures += run_batch_case(kGeometries[0], kPlanInt8,
                                {6, {127}, {3}, {0}, MappingPattern::Identity, 499u});
     failures += run_batch_case(kGeometries[0], kPlanBf16,
