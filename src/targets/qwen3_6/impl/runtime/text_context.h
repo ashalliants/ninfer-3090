@@ -245,6 +245,12 @@ private:
     void gdn_mix(const GdnLayerW& weights, Tensor& x, int index, Phase phase);
     void mlp_tail(const Tensor* post_norm, const MlpW& weights, Tensor& x, Phase phase);
     void run_layers(Tensor& x, Phase phase);
+    // Copy between two ranks' devices through pinned host staging.
+    void cross_rank_copy(const void* source, std::size_t from_rank, void* destination,
+                         std::size_t to_rank, std::size_t bytes);
+    // mlp_tail, run on the device holding this layer's experts.
+    void run_mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph,
+                      std::size_t expert_rank);
     template <class Tap>
     void run_layers(Tensor& x, Phase phase, Tap& tap);
     template <class Tap>

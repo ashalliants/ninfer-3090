@@ -37,6 +37,7 @@
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
+#include <cstddef>
 #include <string>
 #include <utility>
 #include <vector>
@@ -993,10 +994,133 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
     Variant::post_mixer(h, *m.payload, x, ph, work_, s);
 }
 
+// Move bytes from one rank's device to another's, through pinned host.
+//
+// Deliberately not cudaMemcpyPeerAsync. On a bridgeless pair that call is about half the speed of
+// this pair of copies (0.69 ms against 0.33 ms for 4 MB, measured on 2x 3090), and -- far more
+// importantly -- it cannot be captured into a CUDA graph, while a memcpy to or from pinned host
+// is an ordinary graph node. Losing capture costs prefill a factor of 3.4, which dwarfs the
+// transfer itself.
+//
+// Ordering is by fence, never a host sync: the destination stream waits for the source's D2H
+// before its H2D, so the two devices stay correctly sequenced without stalling the CPU.
+inline void TextContext::cross_rank_copy(const void* source, std::size_t from_rank,
+                                         void* destination, std::size_t to_rank,
+                                         std::size_t bytes) {
+    const cudaStream_t from_stream = ctx_.stream_for_rank(from_rank);
+    const cudaStream_t to_stream   = ctx_.stream_for_rank(to_rank);
+
+    // Two ranks on one card (the single-GPU test mode) have nothing to stage through: a plain
+    // device-to-device copy is both far faster and equally capturable. Going via host here would
+    // make that mode misrepresent the cost of the real two-card path.
+    if (ctx_.device_ids()[from_rank] == ctx_.device_ids()[to_rank]) {
+        ScopedDeviceRank guard(ctx_, to_rank);
+        CUDA_CHECK(cudaEventRecord(ctx_.fence_for_rank(from_rank), from_stream));
+        CUDA_CHECK(cudaStreamWaitEvent(to_stream, ctx_.fence_for_rank(from_rank), 0));
+        CUDA_CHECK(
+            cudaMemcpyAsync(destination, source, bytes, cudaMemcpyDeviceToDevice, to_stream));
+        return;
+    }
+
+    void* staging = ctx_.crossing_staging();
+    if (staging == nullptr || bytes > ctx_.crossing_staging_bytes()) {
+        throw std::runtime_error("cross-rank staging buffer is too small: need " +
+                                 std::to_string(bytes) + " bytes, have " +
+                                 std::to_string(ctx_.crossing_staging_bytes()));
+    }
+
+    // Split the byte range so the two halves of the crossing overlap. Done as one copy, D2H must
+    // finish before H2D starts and a 4 MB residual stream costs ~0.765 ms -- roughly twice what
+    // its bandwidth implies. In pieces, piece i+1 streams out of the source while piece i streams
+    // into the destination.
+    //
+    // Small transfers skip this: a decode crossing is ~4 KiB, where the per-piece launch and fence
+    // overhead would cost more than the overlap saves.
+    constexpr std::size_t kMinimumPipelinedBytes = 256U << 10;
+    const std::size_t pieces =
+        bytes >= kMinimumPipelinedBytes ? kCrossingPipelineDepth : std::size_t{1};
+    const std::size_t piece_bytes = (bytes + pieces - 1) / pieces;
+
+    for (std::size_t piece = 0; piece < pieces; ++piece) {
+        const std::size_t offset = piece * piece_bytes;
+        const std::size_t length = std::min(piece_bytes, bytes - offset);
+        if (length == 0) { break; }
+        auto* staged      = static_cast<std::byte*>(staging) + offset;
+        const auto* src   = static_cast<const std::byte*>(source) + offset;
+        auto* dst         = static_cast<std::byte*>(destination) + offset;
+        const cudaEvent_t fence = ctx_.piece_fence(from_rank, piece);
+        {
+            ScopedDeviceRank guard(ctx_, from_rank);
+            CUDA_CHECK(
+                cudaMemcpyAsync(staged, src, length, cudaMemcpyDeviceToHost, from_stream));
+            CUDA_CHECK(cudaEventRecord(fence, from_stream));
+        }
+        {
+            ScopedDeviceRank guard(ctx_, to_rank);
+            CUDA_CHECK(cudaStreamWaitEvent(to_stream, fence, 0));
+            CUDA_CHECK(cudaMemcpyAsync(dst, staged, length, cudaMemcpyHostToDevice, to_stream));
+        }
+    }
+}
+
+// Run one layer's mlp tail, on another device when that layer's experts were offloaded.
+//
+// The whole tail moves, not just the expert matmul: post_attention_norm is bound alongside the
+// expert block precisely so the offloaded card can do rmsnorm and the expert block back to back
+// and hand back a finished residual, which costs one crossing out and one back instead of two of
+// each.
+inline void TextContext::run_mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph,
+                                      std::size_t expert_rank) {
+    if (expert_rank == 0) {
+        mlp_tail(post_norm, m, x, ph);
+        return;
+    }
+
+    const cudaStream_t home_stream   = ctx_.stream_for_rank(0);
+    const cudaStream_t remote_stream = ctx_.stream_for_rank(expert_rank);
+    {
+        ScopedDeviceRank guard(ctx_, expert_rank);
+        // RAII, not a manual activate_rank(0) after the block: an exception from allocation or
+        // cross_rank_copy must not leave work_ pointed at rank 1's storage, or the next request
+        // runs rank-0 attention with scratch allocated from rank 1's device.
+        ScopedArenaRank arena_guard(work_, expert_rank);
+
+        // The scope must be taken on the expert rank, and must cover the inbound copy's buffer as
+        // well as the tail's scratch. The caller's enclosing scope was taken on rank 0 and rolls
+        // back rank 0 only, so without this the expert rank's bump pointer would climb for every
+        // layer of a forward pass and overflow -- which it did, as "bad allocation" on any prompt
+        // past a few hundred tokens.
+        auto remote_scope = work_.scope();
+
+        Tensor remote = work_.alloc(x.dtype, {x.ne[0], x.ne[1]});
+        cross_rank_copy(x.data, 0, remote.data, expert_rank, x.bytes());
+
+        mlp_tail(post_norm, m, remote, ph);
+
+        // Copy the finished residual back into the caller's rank-0 buffer, so everything
+        // downstream -- the next layer's attention, the head, sampling -- finds it where it
+        // expects. Issued before the scope closes, while `remote` is still live; the arena is a
+        // bump allocator, so rolling back only moves the offset and the bytes stay valid until the
+        // next allocation, which cannot happen before this copy is enqueued.
+        cross_rank_copy(remote.data, expert_rank, x.data, 0, x.bytes());
+    }
+}
+
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     const bool prefill = ph == Phase::Prefill;
+
+    // Single-rank is the overwhelmingly common path and must cost nothing: the split is the
+    // identity mapping, so this stays false and the loop below never touches a rank.
+    const PipelineSplit& split = weights_.split;
+    const bool split_execution = !split.single_rank();
+
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
+        // The mixer half of every layer runs on rank 0, where the KV cache and the GDN recurrent
+        // state live. Only the expert block may sit elsewhere, and run_mlp_tail below crosses to
+        // it and back.
+        const std::size_t expert_rank =
+            split_execution ? split.placement(static_cast<std::uint32_t>(layer)).rank : 0U;
         if (ModelConfig::is_full(layer)) {
             const int fidx         = ModelConfig::full_idx(layer);
             const FullLayerW& full = full_.at(static_cast<std::size_t>(fidx));
@@ -1015,7 +1139,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 auto mlp_scope = work_.scope();
-                mlp_tail(full.post_attn_norm, full.mlp, x, ph);
+                run_mlp_tail(full.post_attn_norm, full.mlp, x, ph, expert_rank);
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
         } else {
@@ -1036,11 +1160,14 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 auto mlp_scope = work_.scope();
-                mlp_tail(gdn.post_attn_norm, gdn.mlp, x, ph);
+                run_mlp_tail(gdn.post_attn_norm, gdn.mlp, x, ph, expert_rank);
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
         }
     }
+
+    // No epilogue: execution never leaves rank 0 except inside run_mlp_tail, which puts the
+    // residual stream back in the caller's own buffer before returning.
 }
 
 void TextContext::run_layers(Tensor& x, Phase ph) {

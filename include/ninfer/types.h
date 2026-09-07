@@ -26,6 +26,13 @@ inline constexpr std::size_t kDefaultMediaCacheBytes     = 1ULL << 30;
 inline constexpr std::size_t kDefaultMediaLiveBytes      = 2ULL << 30;
 inline constexpr std::uint32_t kDefaultHostStateSlots    = 8;
 inline constexpr std::size_t kDefaultHostKvCapacityBytes = 8ULL << 30;
+// Largest text hidden size among shipped targets (27B). Used only to conservatively size the
+// pinned cross-rank staging buffer for a model-parallel `DeviceContext` from the configured
+// prefill chunk, before the target's actual hidden size is known; a wider future target just
+// widens this.
+inline constexpr std::size_t kMaxSupportedResidualHiddenSize = 5120;
+// BF16: the residual stream's dtype for every shipped target, independent of KV cache storage.
+inline constexpr std::size_t kResidualStreamBytesPerElement = 2;
 
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
@@ -163,6 +170,11 @@ struct EngineOptions {
     std::filesystem::path artifact_path;
     EnginePurpose purpose              = EnginePurpose::Generation;
     int device                         = 0;
+    // Empty or one entry keeps the single-device route and `device` selects it. Two entries open a
+    // second endpoint for model-parallel execution, in the given order: primary first. Matching
+    // compute capability is required at construction; peer access is only probed and recorded as a
+    // capability -- crossings stage through pinned host memory when it is unavailable.
+    std::vector<int> devices;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;

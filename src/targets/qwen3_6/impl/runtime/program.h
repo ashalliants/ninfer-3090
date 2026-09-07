@@ -655,6 +655,9 @@ public:
     std::unique_ptr<EvictableKVPool> kv_arena;
     DeviceArena persistent;
     DeviceArena workspace_storage;
+    // Scratch for ranks 1..N-1 of a pipeline split, each allocated on its own device. Empty on a
+    // single-device load. Declared before `work` so it is alive when `work` borrows from it.
+    std::vector<DeviceArena> workspace_storage_by_rank;
     WorkspaceArena work;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
     std::unique_ptr<HostKVArena> host_kv_arena;

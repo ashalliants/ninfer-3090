@@ -83,7 +83,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-dtype bf16|int8|fp8|rk8v4|nvfp4|k8v4] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision] [--vision-residency resident|overlay] [--vision-max-merged N] "
-           "[--no-cuda-graph] [--no-prefix-reuse] [--auto-prefix-grid] "
+           "[--no-cuda-graph] [--no-prefix-reuse] [--auto-prefix-grid] [--devices N,M] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -125,6 +125,34 @@ std::string serve_usage_text(const char* argv0) {
            "       --greedy forces temperature 0 (exact argmax).\n";
 }
 
+// "1,2" selects an ordered primary/secondary pair. One entry is accepted and is equivalent to
+// --device. The engine validates matching compute capability and bidirectional peer access at
+// startup; this only parses the shape.
+std::vector<int> parse_device_list(std::string_view value) {
+    std::vector<int> devices;
+    std::size_t start = 0;
+    while (start <= value.size()) {
+        const std::size_t comma = value.find(',', start);
+        const std::string_view piece =
+            value.substr(start, comma == std::string_view::npos ? std::string_view::npos
+                                                                : comma - start);
+        if (piece.empty()) { throw std::invalid_argument("--devices entries must not be empty"); }
+        const std::string entry(piece);
+        devices.push_back(parse_nonnegative_int(entry.c_str(), "devices"));
+        if (comma == std::string_view::npos) { break; }
+        start = comma + 1;
+    }
+    if (devices.empty() || devices.size() > 2) {
+        throw std::invalid_argument("--devices takes one or two CUDA device ids");
+    }
+    if (devices.size() == 2 && devices[0] == devices[1]) {
+        // Deliberately permitted: the same id twice puts both ranks on one card, which saves no
+        // memory but exercises the whole split path on a single-GPU machine.
+        (void)0;
+    }
+    return devices;
+}
+
 ServeOptions parse_serve_options(int argc, char** argv) {
     ServeOptions options;
     options.startup_argv.reserve(static_cast<std::size_t>(argc));
@@ -140,6 +168,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     bool default_max_tokens_explicit = false;
     bool kv_capacity_explicit        = false;
+    bool device_explicit             = false;
     bool context_capacity_explicit   = false;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
@@ -274,6 +303,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.response_store_max_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
+            device_explicit = true;
+        } else if (arg == "--devices") {
+            options.devices = parse_device_list(require_value("--devices"));
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--spec") {
@@ -369,6 +401,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         options.context_cache.enabled                = false;
         options.context_cache.host_state_slots       = 0;
         options.context_cache.host_kv_capacity_bytes = 0;
+    }
+    if (!options.devices.empty() && device_explicit) {
+        throw std::invalid_argument("--device and --devices are mutually exclusive");
     }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");

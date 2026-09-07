@@ -6,6 +6,7 @@
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
 #include "targets/qwen3_6_27b/impl/variant.h"
 
+#include <cstdlib>
 #include <stdexcept>
 #include <utility>
 
@@ -104,11 +105,33 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
                              "' is not supported by target '" + std::string(target_key) + "'");
 }
 
+PipelineSplit Package::pipeline_split(std::size_t ranks) {
+    // Offload every mlp tail. The dense MLP is ~17 GiB of this model's ~19 GiB of weights, so
+    // moving all of it leaves rank 0 holding embeddings, attention, GDN, norms and the head, and
+    // turns the rest into KV on the card that serves attention.
+    // NINFER_KEEP_EXPERTS keeps that many layers' expert blocks on rank 0. It trades KV room for
+    // fewer crossings: every layer left behind is one fewer round trip per forward pass, and one
+    // more expert block occupying the card that serves attention. 0 -- offload everything --
+    // maximises capacity and is the default.
+    std::uint32_t keep = 0;
+    if (const char* env = std::getenv("NINFER_KEEP_EXPERTS"); env != nullptr && env[0] != 0) {
+        keep = static_cast<std::uint32_t>(std::strtoul(env, nullptr, 10));
+    }
+    return PipelineSplit::experts_on_last(static_cast<std::uint32_t>(detail::kTextLayers), ranks, keep);
+}
+
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
         weights_profile,
         detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options))));
+}
+
+Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
+                                     WeightsProfile weights_profile, RankOwnership ownership) {
+    return LoadPlan(std::make_unique<LoadPlan::Impl>(
+        weights_profile, detail::bind_artifact(binder, weights_profile,
+                                               qwen3_6::startup_features(options), ownership)));
 }
 
 std::unique_ptr<Package::LoadedModel>
@@ -117,6 +140,32 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
     auto impl = std::make_unique<LoadedModel::Impl>(
         plan.impl_->weights_profile, std::move(plan.impl_->plan.bindings), std::move(materialized));
     plan.impl_.reset();
+    return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(impl)));
+}
+
+std::unique_ptr<Package::LoadedModel>
+Package::construct_loaded_model(std::vector<LoadPlan>&& plans,
+                                std::vector<artifact::MaterializedArtifact>&& materialized,
+                                PipelineSplit split) {
+    if (plans.empty()) { throw std::invalid_argument("target load plan is empty"); }
+    if (plans.size() != materialized.size()) {
+        throw std::invalid_argument("one materialized artifact is required per pipeline rank");
+    }
+
+    std::vector<detail::BindingPlan> bindings;
+    bindings.reserve(plans.size());
+    const WeightsProfile weights_profile = plans.front().impl_->weights_profile;
+    for (LoadPlan& plan : plans) {
+        if (plan.impl_ == nullptr) { throw std::invalid_argument("target load plan is empty"); }
+        if (plan.impl_->weights_profile != weights_profile) {
+            throw std::invalid_argument("pipeline ranks disagree on the weights profile");
+        }
+        bindings.push_back(std::move(plan.impl_->plan.bindings));
+        plan.impl_.reset();
+    }
+
+    auto impl = std::make_unique<LoadedModel::Impl>(weights_profile, std::move(bindings),
+                                                    std::move(materialized), std::move(split));
     return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(impl)));
 }
 

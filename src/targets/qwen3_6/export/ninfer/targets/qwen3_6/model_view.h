@@ -3,11 +3,13 @@
 #include <ninfer/targets/qwen3_6/startup_features.h>
 #include <ninfer/targets/qwen3_6/vision.h>
 
+#include "core/pipeline_split.h"
 #include "core/tensor.h"
 
 #include <array>
 #include <cstddef>
 #include <optional>
+#include <vector>
 
 namespace ninfer {
 
@@ -88,6 +90,12 @@ struct ModelView {
     using DFlash    = DFlashPayload;
 
     DeviceArena* weights_arena = nullptr;
+    // Which device holds each layer. A single-rank split is the identity mapping, so everything
+    // downstream reads this unconditionally and the one-GPU path is unaffected.
+    PipelineSplit split{FullAttentionLayers + GdnLayers};
+    // Per-rank weight arenas for a pipeline split, index-aligned with `split`. Empty on a
+    // single-device load, where `weights_arena` is the only arena.
+    std::vector<DeviceArena*> rank_weight_arenas;
     Weight token_embedding;
     std::array<FullLayer, FullAttentionLayers> full_layers;
     std::array<GdnLayer, GdnLayers> gdn_layers;
