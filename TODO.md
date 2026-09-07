@@ -17,9 +17,22 @@ Everything below is what is *not* done. Ordered by what blocks what.
 - [x] ~~Push the branch.~~ Pushed.
 - [x] ~~Open the PR.~~ **PR #16** — "Upstream catch-up: DFlash2, measured sm_86 route boundaries,
       one KV plane declaration". Route retunes have landed on the branch since it was opened.
-- [ ] **PR #15 (multi-GPU expert offload) is still open** on `feat/dual-gpu-graph-mode`. Decide
-      whether it lands before or after this catch-up; they touch different subsystems but both
-      touch the engine layer.
+- [x] ~~Decide whether PR #15 lands before or after this catch-up.~~ **PR #15 goes first — it is
+      safe.** Trial-merged with `git merge-tree --write-tree`: 25 files are touched by both branches
+      but only **four conflict**, and none of them is in this branch's route tables, KV plane
+      typing, or the causal small-T revert. All seven `causal_cache/*.cu` files auto-merge cleanly.
+      Once #15 is on `master`, this branch merges `master` and resolves:
+      - `apps/cli/options.cpp` (1 hunk, 7 lines) — usage string. Take the union:
+        `[--device N] [--devices N,M]` *and* `--spec mtp|dflash|dflash2`.
+      - `src/ops/attn_input_proj/fp8/fp8_attn_input_a8.cu` (1 hunk, 12 lines) — take **#15's**
+        version. It opts into >48 KB dynamic shared memory at runtime where ours only had a
+        `static_assert`. Confirm the sm_86 schedule stays under the ~99 KB opt-in ceiling.
+      - `src/targets/qwen3_6_27b/impl/load/bindings.cpp` (3 hunks, 36 lines) — take **#15's**: it
+        reorders `bind_weight`'s defaults to `(evict_rank, placement)` and threads `core_placement`.
+        All three hunks are the same change; apply it at every call site consistently.
+      - `tests/targets/qwen3_6_35b_a3b/test_dflash_load_plan.cpp` (1 hunk, 18 lines) — take **#15's**
+        richer failure message, but keep whichever label matches the enclosing block (the two sides
+        name different branches of the same test).
 - [ ] PR #12 is a `DO NOT MERGE` draft recording the prefill/decode overlap negative result. Close
       it or leave it as the record — it should not merge either way.
 
