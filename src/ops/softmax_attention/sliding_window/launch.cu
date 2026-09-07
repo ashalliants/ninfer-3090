@@ -167,17 +167,27 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
                 static_cast<__nv_bfloat16*>(out.data));
         CUDA_CHECK(cudaGetLastError());
 
-        constexpr int ReduceWarps = 1;
-        constexpr int ReduceRows  = kContextQueryQHeads * Tokens;
-        const dim3 reduce_grid((ReduceRows + ReduceWarps - 1) / ReduceWarps, 1, q.ne[3]);
-        sliding_window_attention_reduce_kernel<Tokens, KeyBlock, ReduceWarps>
-            <<<reduce_grid, ReduceWarps * 32, 0, stream>>>(
-                static_cast<const float*>(partial_acc.data),
-                static_cast<const float*>(partial_m.data),
-                static_cast<const float*>(partial_l.data),
-                static_cast<const std::int32_t*>(positions.data),
-                static_cast<const std::int32_t*>(valid_columns.data), plan.window - 1,
-                plan.max_context, plan.split_capacity, static_cast<__nv_bfloat16*>(out.data));
+        // Honour plan.reduce_warps rather than hardcoding one warp. The planner sets four for
+        // window 2048 and validate_plan() checks it, but the launch used to ignore it, so the
+        // tuned route was never executed and the bench printed reduce_warps=4 for a run that used
+        // one. ReduceWarps is a template parameter, so the runtime value is dispatched here.
+        const auto launch_reduce = [&]<int ReduceWarps>() {
+            constexpr int ReduceRows = kContextQueryQHeads * Tokens;
+            const dim3 reduce_grid((ReduceRows + ReduceWarps - 1) / ReduceWarps, 1, q.ne[3]);
+            sliding_window_attention_reduce_kernel<Tokens, KeyBlock, ReduceWarps>
+                <<<reduce_grid, ReduceWarps * 32, 0, stream>>>(
+                    static_cast<const float*>(partial_acc.data),
+                    static_cast<const float*>(partial_m.data),
+                    static_cast<const float*>(partial_l.data),
+                    static_cast<const std::int32_t*>(positions.data),
+                    static_cast<const std::int32_t*>(valid_columns.data), plan.window - 1,
+                    plan.max_context, plan.split_capacity, static_cast<__nv_bfloat16*>(out.data));
+        };
+        if (plan.reduce_warps == 4) {
+            launch_reduce.template operator()<4>();
+        } else {
+            launch_reduce.template operator()<1>();
+        }
         CUDA_CHECK(cudaGetLastError());
     });
 }
