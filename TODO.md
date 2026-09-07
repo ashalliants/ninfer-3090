@@ -110,12 +110,42 @@ about it fails on a different one.
       W8 attention/SwiGLU resolvers and `w8_pair` iterate theirs. The two switch fallthroughs found
       along the way are fixed and `-Werror=implicit-fallthrough` now guards non-MSVC builds
       (MSVC has no equivalent warning, so CI carries the guard for this host).
-- [ ] **The causal small-T subsystem is reverted to this fork's pre-merge version** (12 files under
-      `src/ops/softmax_attention/dense/causal_cache/`). Upstream's rework of it produces
-      garbage-magnitude output for the whole int8 family on sm_86 — both geometries, T=1..16,
-      int8-g64 and rk8v4 alike, roughly 3-8x the reference with a varying ratio, which is what a
-      softmax denominator taken over the wrong split count looks like. Root-causing that would
-      recover upstream's improvements instead of carrying a revert forward into every future merge.
+- [ ] **The causal small-T subsystem is still reverted** (12 files under
+      `src/ops/softmax_attention/dense/causal_cache/`), but the INT8-family corruption is now
+      **root-caused and fixed** on branch `investigate/small-t-upstream` (commit `c044640b`).
+
+      The revert commit guessed at "a softmax denominator over the wrong split count". That was
+      wrong. Upstream's `small_t_i8.cuh` stages V for an **f16** PV MMA — `dst` is `__half*`, read
+      by `ldmatrix` and consumed by `mma_f16` — but fills it using
+      `kv_cache_int8_dequant_i8x8_from` / `_int4_dequant_i4x8_from`, both of which pack with
+      `pack_bf16x2`. Both types are sixteen bits, so it compiles, runs, and reinterprets every
+      value. Both affected storages (int8-g64 and rk8v4) go through exactly those two helpers,
+      which is precisely why the symptom was "the INT8 family" and nothing else. It reproduced at
+      3.1x/4.0x/7.9x/11.1x with a varying ratio — **including at `keys=1`**, where there is one
+      split, one key and no denominator arithmetic at all, which is what disproves the split
+      theory.
+
+      The rest of the tree already had the convention right and unambiguous: every kernel staging V
+      for `mma_f16` uses an explicit `_f16x8`/`_f16x16` loader, and `_bf16x8` appears only on the K
+      tile feeding `mma_bf16`. `prompt_i8.cuh` even carries its own local
+      `causal_prompt_i8_dequant_f16x8`, because the shared codec had no f16 variant for the INT8
+      codings — that gap is what let the wrong helper look right. The fix adds
+      `kv_cache_int8_dequant_f16x8_from` / `kv_cache_int4_dequant_f16x8_from` beside their bf16
+      counterparts. `ninfer_softmax_attention_test` then reports **zero criterion failures across
+      179 cases**.
+
+      Two things still block adopting upstream's version and dropping the revert:
+      - [ ] **A separate segfault** on the last case, `rk8v4 T=1 keys=16385` (`run_a1_case`,
+            `causal_cache.cpp:3070`). It is a host SIGSEGV, it survives the dequant fix, and the
+            equivalent FP8 case at the same shape (line 3027) passes. `compute-sanitizer memcheck`
+            is the tool; host and device split counts were checked and do agree for that shape, so
+            it is not the split-count mismatch either.
+      - [ ] **Benchmark upstream's small-T against this fork's on sm_86.** Upstream's rework also
+            extends small-T to T=8 for QHeads=24 and adds a batch-size grid clamp. The revert is
+            only worth undoing if the rework is actually faster here — it was tuned on sm_120, and
+            every other thing tuned there has been wrong on this card.
+      - [ ] Once adopted, dedupe `prompt_i8.cuh`'s local f16 dequant helpers against the shared
+            codec ones.
 
 ## 5. Test-criterion calibration
 
