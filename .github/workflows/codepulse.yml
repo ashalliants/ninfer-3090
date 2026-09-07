@@ -47,4 +47,11 @@ jobs:
       # contents from here; the review itself is posted by the GitHub App.
       id-token: write
     steps:
-      - uses: codepulsehq/review-action@v1
+      # Pinned to an immutable commit, not the mutable `v1` tag. This job holds `id-token: write`,
+      # so whatever this reference resolves to can mint an OIDC token in this repository's name --
+      # and a tag can be repointed at any commit by whoever owns the action. The SHA cannot.
+      #
+      # 4b874cb is what `v1` resolved to at the time of pinning (release v1.0.4). Updating is
+      # deliberate: check what the tag points at, read the diff, then bump both the SHA and the
+      # version in the trailing comment together.
+      - uses: codepulsehq/review-action@4b874cbef6665a3c74baa015962d5ab60bf6d082 # v1.0.4
