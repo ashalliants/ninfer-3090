@@ -7,7 +7,7 @@ target_include_directories(ninfer_public_api_test PRIVATE ${PROJECT_SOURCE_DIR}/
 add_test(NAME ninfer_public_api_test COMMAND ninfer_public_api_test)
 
 function(ninfer_add_test name)
-  cmake_parse_arguments(arg "NEEDS_SOURCE_DIR" "" "SOURCES;LIBRARIES" ${ARGN})
+  cmake_parse_arguments(arg "NEEDS_SOURCE_DIR" "" "SOURCES;LIBRARIES;TEST_ARGS" ${ARGN})
   add_executable(${name} ${arg_SOURCES})
   target_include_directories(${name} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -25,7 +25,12 @@ function(ninfer_add_test name)
       NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
       NINFER_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}")
   endif()
-  add_test(NAME ${name} COMMAND ${name})
+  # TEST_ARGS lets a test that takes a configuration on the command line run something this box can
+  # actually fit. Without it a test defaults to whatever its argv fallbacks are, which for the
+  # real-model tests is a maximum layout that no single 24 GB card can hold -- so the test fails
+  # permanently and stops being read. The executable still accepts any other configuration when run
+  # by hand.
+  add_test(NAME ${name} COMMAND ${name} ${arg_TEST_ARGS})
 endfunction()
 
 function(ninfer_add_op_test name)
@@ -161,9 +166,14 @@ ninfer_add_test(ninfer_qwen3_6_27b_score_real_test
   SOURCES targets/qwen3_6_27b/test_engine_score_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_27b_score_real_test PROPERTIES SKIP_RETURN_CODE 77)
+# k=7 graph=1 optimized=1 batch=2 kv=int8 vision=0 state_slots=1. The argv fallbacks are k=15,
+# batch=8 (an 18,432-token KV) and 3 state slots, which wants 6.32 GB of runtime reservation and
+# cannot fit beside the 20.4 GB artifact on a 24 GB card. This configuration exercises the same
+# DFlash2 accept/rollback path and fits, so the test is coverage rather than a standing failure.
 ninfer_add_test(ninfer_qwen3_8_27b_dflash2_real_test
   SOURCES targets/qwen3_6_27b/test_engine_dflash2_real.cpp
-  LIBRARIES ninfer_engine)
+  LIBRARIES ninfer_engine
+  TEST_ARGS 7 1 1 2 int8 0 1)
 set_tests_properties(ninfer_qwen3_8_27b_dflash2_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_27b_load_plan_test
   SOURCES targets/qwen3_6_27b/test_load_plan.cpp

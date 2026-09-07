@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <string_view>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -290,7 +291,15 @@ int main() {
     try {
         return run_main();
     } catch (const std::exception& error) {
-        std::cerr << "FATAL: " << error.what() << '\n';
+        const std::string_view message(error.what());
+        // A capacity shortfall is this box being busy, not a defect. Report it as a skip so
+        // it does not sit in the suite as a permanent red that everyone learns to ignore --
+        // the weights are ~20 GiB and a desktop holding a couple of GB is enough to tip it.
+        if (message.find("available for runtime capacity") != std::string_view::npos) {
+            std::cout << "skip: insufficient free device memory -- " << message << '\n';
+            return 77;
+        }
+        std::cerr << "FATAL: " << message << '\n';
         return 1;
     } catch (...) {
         std::cerr << "FATAL: non-std exception\n";

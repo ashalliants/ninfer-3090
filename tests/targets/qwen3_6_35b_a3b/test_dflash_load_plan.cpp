@@ -37,6 +37,16 @@ int main() {
     ninfer::artifact::Reader reader(path);
     {
         ninfer::artifact::Binder binder(reader);
+        // These counts pin a DFlash-carrying artifact. A compact artifact without the DFlash bundle
+        // is a different variant on disk, not a regression, and it trips every pinned number at
+        // once -- so say so and skip instead of failing. The numbers that actually move when
+        // bindings change are device_objects and device_capacity_bytes; object_count and the dflash
+        // handles only reflect which variant was loaded.
+        if (!binder.has_object("dflash/feature_projection")) {
+            std::cout << "skip: this artifact carries no DFlash bundle, so the pinned "
+                         "DFlash-enabled plan cannot be checked against it\n";
+            return 77;
+        }
         const auto plan = ninfer::targets::qwen3_6_35b_a3b::detail::bind_artifact(
             binder, load_features(true, ninfer::SpeculativeBackend::Mtp));
         if (plan.materialization.object_count != 940 ||
