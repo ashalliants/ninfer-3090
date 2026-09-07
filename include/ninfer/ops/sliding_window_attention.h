@@ -37,7 +37,7 @@ struct SlidingWindowAttentionExecutionEnvelope {
  * head h reads KV head floor(h/4).
  *
  * The independent oracle evaluates the complete formula naively in FP64 from represented BF16
- * query/context K and BF16 query V / FP16 cached V, using a stable Softmax over exactly that
+ * query/context K and BF16 query V / BF16 cached V, using a stable Softmax over exactly that
  * visible set. BF16 out is promoted for comparison; storage rounding belongs to the Op criterion.
  * q/query_k/query_v/positions/valid_columns/lanes, every cyclic-cache byte, out, and live workspace
  * allocations are pairwise non-overlapping. Inputs and context remain unchanged; out is the only

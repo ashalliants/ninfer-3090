@@ -519,7 +519,12 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                 // No numeric in scope: this kernel receives target token ids, not logits, and the
                 // greedy comparison is int-vs-int. Divergence is caught by the finiteness checks
                 // on the logit-bearing dense kernels.
-                speculative_store_accept_result<!SparseProposal>(
+                // Dense only: this statement lives in the else of `if constexpr (SparseProposal)`, so it
+                // is instantiated with SparseProposal == false and token counts are updated.
+                // Spelled `true` rather than `!SparseProposal` because the double negative
+                // reads as if it could disable the counts here, which it cannot.
+                static_assert(!SparseProposal, "dense finalize path only");
+                speculative_store_accept_result<true>(
                     row_drafts, k, row, a, t_star, lengths, anchors, row_tokens, licensed_counts,
                     accepted, &cfg, true);
             }
@@ -652,7 +657,12 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                     }
                     // Greedy branch writes only dist_idx, so no probability is available to test;
                     // see the note on the target-token greedy path above.
-                    speculative_store_accept_result<!SparseProposal>(
+                    // Dense only: this statement lives in the else of `if constexpr (SparseProposal)`, so it
+                // is instantiated with SparseProposal == false and token counts are updated.
+                // Spelled `true` rather than `!SparseProposal` because the double negative
+                // reads as if it could disable the counts here, which it cannot.
+                static_assert(!SparseProposal, "dense finalize path only");
+                speculative_store_accept_result<true>(
                         row_drafts, k, row, a, tstar, lengths, anchors, row_tokens, licensed_counts,
                         accepted, &cfg, true);
                     *workspace.speculative_finalize_count = 0;
@@ -711,7 +721,12 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                     tstar         = sampling_pick_from_support(dist_idx, dist_prob, n, -1, u);
                     tstar_prob    = dist_prob[0];
                 }
-                speculative_store_accept_result<!SparseProposal>(
+                // Dense only: this statement lives in the else of `if constexpr (SparseProposal)`, so it
+                // is instantiated with SparseProposal == false and token counts are updated.
+                // Spelled `true` rather than `!SparseProposal` because the double negative
+                // reads as if it could disable the counts here, which it cannot.
+                static_assert(!SparseProposal, "dense finalize path only");
+                speculative_store_accept_result<true>(
                     row_drafts, k, row, a, tstar, lengths, anchors, row_tokens, licensed_counts,
                     accepted, &cfg, sampling_value_is_finite(tstar_prob));
                 *workspace.speculative_finalize_count = 0;

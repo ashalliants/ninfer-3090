@@ -30,8 +30,8 @@ struct ContextAttentionExecutionEnvelope {
  *
  * Every entry computes stable scaled dot-product Softmax Attention. Query head h reads KV head
  * floor(h / (Hq/Hkv)). Public BF16 inputs and persistent cache rows are interpreted after their
- * storage boundary. In the BFloat16 cache profile, K is stored as BF16 and V as
- * FP16_RNE(BF16 input). For a declared visible key set J, the independent mathematical oracle is
+ * storage boundary. In the BFloat16 cache profile, K and V are both stored as BF16.
+ * For a declared visible key set J, the independent mathematical oracle is
  *
  *   score[j]       = scale * dot(FP64(q[:,h,i]), FP64(k[:,kvh,j]))
  *   probability[j] = exp(score[j] - max(score)) / sum_x exp(score[x] - max(score))

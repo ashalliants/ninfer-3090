@@ -52,8 +52,8 @@ struct ContextKVMaterializeExecutionEnvelope {
  *   k[j]     = n[j]    * cos(angle(j)) - n[j+64] * sin(angle(j))
  *   k[j+64]  = n[j+64] * cos(angle(j)) + n[j]    * sin(angle(j))
  *
- * K is stored as BF16 and V as FP16_RNE from represented BF16 v_raw at absolute position
- * positions[i,b] modulo 2048 in lane state_slots[b]. Columns i>=counts[b] have no state effect.
+ * K and V are both stored as BF16 (round-to-nearest-even) from represented BF16 v_raw at
+ * absolute position positions[i,b] modulo 2048 in lane state_slots[b]. Columns i>=counts[b] have no state effect.
  * Existing cache values outside the addressed rows and all read-only inputs are unchanged. The Op
  * emits no raw K/V and owns no logical frontier, commit, rollback, request identity, or persistent
  * allocation.
