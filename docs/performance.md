@@ -1,6 +1,19 @@
 # Single-GPU serving performance
 
-> **DFlash2 is available but unmeasured here.** The upstream catch-up brought the DFlash2
+> **DFlash2 measured on this fork (RTX 3090, Qwen3.8-27B groupwise-int, `--kv-dtype int8`,
+> `--draft-tokens 7`, greedy, 96 new tokens).** Text: 20.0% acceptance, 2.38 tok/round.
+> Vision (`--vision`, the committed `image_chart` fixture): 85.7% acceptance, 7.00 tok/round,
+> and byte-identical output to the non-speculative vision run. These are single-prompt smoke
+> numbers, not a campaign; the tables below remain the measured corpus results.
+>
+> **Speculative decoding is not bit-identical to non-speculative decoding here, and that is not
+> new.** On the text prompt, DFlash2 and MTP produce the *same* output as each other and both
+> differ from the width-1 greedy path a hundred tokens in (`数学上是未定义的` vs `不确定的`).
+> Verification evaluates k+1 columns in one pass while plain decode evaluates one, so the
+> reductions run in a different order and a near-tie argmax can flip. MTP shows it identically,
+> so it is a property of the shared verification path rather than anything DFlash2 introduced.
+>
+> **The upstream DFlash2 corpus numbers are still not reproduced here.** The upstream catch-up brought the DFlash2
 > speculative backend (`--spec dflash2 --draft-tokens 7`, Qwen3.8-27B only). Upstream publishes
 > DFlash2 numbers for their own hardware; those are deliberately not reproduced in this document,
 > because every figure here is measured on sm_86 and mixing in another architecture's results would

@@ -444,9 +444,12 @@ See [HTTP serving](docs/serving.md) and [CLI usage](docs/cli.md).
 
 Qwen3.8-27B artifacts carrying the DFlash2 companion weights support
 `--spec dflash2 --draft-tokens 7`, with draft counts 1..15 and either full or optimized
-proposal heads. DFlash and DFlash2 both run with `--vision`: target verification carries its
-own continuation RoPE position, so a multimodal row keeps its per-sequence `rope_delta` through
-the verification step rather than being re-indexed by DFlash's logical positions.
+proposal heads. **DFlash2 runs with `--vision`**, verified on a 3090 against the committed
+`image_chart` fixture: target verification carries its own continuation RoPE position, so a
+multimodal row keeps its per-sequence `rope_delta` through verification rather than being
+re-indexed by DFlash's logical positions. On that fixture it accepts 85.7% of drafts (7.00
+tokens/round) and produces byte-identical output to the non-speculative vision run. `--spec
+dflash` (v1) is a 35B-A3B backend and is refused by a 27B artifact, with or without vision.
 
 ## How cohort batching works
 
