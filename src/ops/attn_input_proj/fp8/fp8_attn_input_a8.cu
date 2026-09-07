@@ -30,7 +30,14 @@ void launch_mma(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor
         static_cast<__nv_bfloat16*>(v.data),
     };
 
-    static_assert(Schedule::kSharedBytes <= 48 * 1024);
+    if constexpr (Schedule::kSharedBytes > 48 * 1024) {
+        configure_cuda_device_once([&] {
+            return cudaFuncSetAttribute(
+                fp8_mma_kernel<Geometry, Schedule, FullTokens, Fp8IdentityEpilogue,
+                               Fp8AttentionInputOutput>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes);
+        });
+    }
     fp8_mma_kernel<Geometry, Schedule, FullTokens>
         <<<blocks, Schedule::kThreads, Schedule::kSharedBytes, stream>>>(
             workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),

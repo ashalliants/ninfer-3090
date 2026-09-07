@@ -45,7 +45,20 @@ int main() {
             plan.materialization.device_capacity_bytes != 22'360'207'360ULL ||
             plan.bindings.dflash.feature_projection.index != 889 ||
             plan.bindings.dflash.final_norm.index != 939) {
-            std::cerr << "MTP+Vision materialization plan changed resident weights\n";
+            // Print the actuals: this test pins exact plan numbers, so when it trips the only
+            // useful next question is which of them moved and by how much.
+            std::cerr << "MTP+Vision materialization plan changed resident weights\n"
+                      << "  object_count=" << plan.materialization.object_count << " (want 940)\n"
+                      << "  device_objects=" << plan.materialization.device_objects.size()
+                      << " (want 883)\n"
+                      << "  host_objects=" << plan.materialization.host_objects.size()
+                      << " (want 6)\n"
+                      << "  device_bytes=" << plan.materialization.device_capacity_bytes
+                      << " (want 22360207360)\n"
+                      << "  dflash.feature_projection=" << plan.bindings.dflash.feature_projection.index
+                      << " (want 889)\n"
+                      << "  dflash.final_norm=" << plan.bindings.dflash.final_norm.index
+                      << " (want 939)\n";
             return 1;
         }
     }

@@ -32,11 +32,12 @@ void launch_mma(const Weight& weight, Tensor& out, Fp8A8Workspace workspace, std
     const Fp8SwiGluOutput output{static_cast<__nv_bfloat16*>(out.data), kIntermediate};
 
     if constexpr (Schedule::kSharedBytes > 48 * 1024) {
-        static const cudaError_t attribute = cudaFuncSetAttribute(
-            fp8_mma_kernel<Geometry, Schedule, FullTokens, Fp8IdentityEpilogue, Fp8SwiGluOutput,
-                           Rows, true>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes);
-        CUDA_CHECK(attribute);
+        configure_cuda_device_once([&] {
+            return cudaFuncSetAttribute(
+                fp8_mma_kernel<Geometry, Schedule, FullTokens, Fp8IdentityEpilogue, Fp8SwiGluOutput,
+                               Rows, true>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes);
+        });
     }
     fp8_mma_kernel<Geometry, Schedule, FullTokens, Fp8IdentityEpilogue, Fp8SwiGluOutput, Rows, true>
         <<<blocks, Schedule::kThreads, Schedule::kSharedBytes, stream>>>(

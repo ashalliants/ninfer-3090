@@ -747,6 +747,21 @@ std::unique_ptr<EvictableKVPool> make_kv_arena(DeviceContext& device,
                 });
 }
 
+// Scratch for the ranks beyond the first. Each is allocated while its own device is current, so
+// the arena lands in that card's memory; `work` then borrows a slice of each and switches between
+// them as the layer loop walks ranks.
+std::vector<DeviceArena> make_rank_workspaces(DeviceContext& device, const PipelineSplit& split,
+                                              std::size_t capacity_bytes) {
+    std::vector<DeviceArena> out;
+    if (split.single_rank()) { return out; }
+    out.reserve(split.ranks() - 1);
+    for (std::size_t rank = 1; rank < split.ranks(); ++rank) {
+        ScopedDeviceRank guard(device, rank);
+        out.emplace_back(capacity_bytes);
+    }
+    return out;
+}
+
 } // namespace
 
 ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const SequencePlanImpl& plan,
@@ -760,12 +775,19 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision),
       vision_overlay(model.vision_overlay ? &*model.vision_overlay : nullptr),
+      // Capture stays on for a split. It was disabled when the crossings used
+      // cudaMemcpyPeerAsync, which capture rejects outright; they now stage through pinned host,
+      // and a memcpy to or from pinned host is an ordinary graph node. That matters far more than
+      // it first appeared -- losing capture costs prefill a factor of 3.4 (6.41k against 1.88k
+      // tok/s on a 3090), which dwarfs the transfers themselves.
       use_cuda_graph(plan.use_cuda_graph),
       causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       kv_arena(make_kv_arena(device_in, model_in, plan)),
       persistent(kv_arena ? DeviceArena(kv_arena->arena()) : DeviceArena(plan.persistent.bytes)),
       workspace_storage(plan.workspace.capacity),
+      workspace_storage_by_rank(
+          make_rank_workspaces(device_in, model_in.split, plan.workspace.capacity)),
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
       continuation_states(continuation_capacity), continuation_slots(continuation_capacity),
       shared_prefix_states(shared_prefix_capacity), shared_prefix_slots(shared_prefix_capacity),
@@ -792,6 +814,13 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                                CudaEventTimer(device_in, device_in.transfer_stream)} {
     if (model.weights_arena == nullptr) {
         throw std::invalid_argument("Qwen3.6 model view has no owning weight arena");
+    }
+    // Hand `work` the extra ranks' storage. From here a single arena serves every device: the
+    // layer loop calls activate_rank alongside ScopedDeviceRank and every existing workspace call
+    // site keeps working unchanged.
+    for (DeviceArena& rank_storage : workspace_storage_by_rank) {
+        work.attach_rank_storage(
+            DeviceSpan{rank_storage.base(), workspace_plan.general_capacity});
     }
     if (model.features != plan.features || model.mtp.has_value() != plan.features.mtp() ||
         model.dflash.has_value() != plan.features.masked_draft() ||

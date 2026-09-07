@@ -17,10 +17,11 @@ void causal_attention_prompt_fp8_attention_launch_for(const Tensor& q, const Ten
                                                       float scale, const CacheView& cache,
                                                       Metadata metadata, Tensor& out,
                                                       cudaStream_t stream) {
-    static const cudaError_t attr = cudaFuncSetAttribute(
-        causal_attention_prompt_fp8_kernel<Geometry, Metadata>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptFp8SmemBytes);
-    CUDA_CHECK(attr);
+    configure_cuda_device_once([&] {
+        return cudaFuncSetAttribute(
+            causal_attention_prompt_fp8_kernel<Geometry, Metadata>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptFp8SmemBytes);
+    });
 
     constexpr auto kStorage = KvCacheStorage::Fp8E4M3Row256;
     const auto* cache_k_ptr = static_cast<const KvKeyCodeT<kStorage>*>(cache.k_pages.data);

@@ -349,6 +349,45 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--auto-prefix-grid") != std::string::npos,
               "serve help omits --auto-prefix-grid");
+
+    // --devices selects ordered CUDA devices for model-parallel execution. Only the shape is
+    // parsed here; matching compute capability and peer access are the engine's to validate,
+    // because they need real devices.
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).devices.empty(),
+                      "devices defaulted to a non-empty list");
+    const ServeOptions one_device = parse({"ninfer-serve", "model.ninfer", "--devices", "3"});
+    failures += check(one_device.devices.size() == 1 && one_device.devices[0] == 3,
+                      "--devices with one entry did not reach serving options");
+    const ServeOptions pair = parse({"ninfer-serve", "model.ninfer", "--devices", "1,2"});
+    failures += check(pair.devices.size() == 2 && pair.devices[0] == 1 && pair.devices[1] == 2,
+                      "--devices did not preserve the ordered pair");
+
+    for (const auto& [value, why] : std::vector<std::pair<std::string, const char*>>{
+             {"0,1,2", "three devices"},
+             {"", "an empty list"},
+             {"1,", "a trailing comma"}}) {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--devices", value});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, why);
+    }
+
+    // "0,0" is deliberately permitted: it puts both ranks on one card so the split path can be
+    // exercised on a single-GPU machine.
+    const ServeOptions same_card = parse({"ninfer-serve", "model.ninfer", "--devices", "0,0"});
+    failures += check(same_card.devices.size() == 2 && same_card.devices[0] == 0 &&
+                           same_card.devices[1] == 0,
+                      "--devices 0,0 was not accepted for single-card split coverage");
+
+    bool exclusive_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--device", "0", "--devices", "0,1"});
+    } catch (const std::invalid_argument&) { exclusive_rejected = true; }
+    failures += check(exclusive_rejected, "--device and --devices were accepted together");
+
+    failures += check(serve_usage_text("ninfer-serve").find("--devices") != std::string::npos,
+                      "serve help omits --devices");
     failures += check(serve_usage_text("ninfer-serve").find("--host-kv-mib") != std::string::npos,
                       "serve help omits context-cache capacities");
     failures += check(serve_usage_text("ninfer-serve").find("device-state=max-concurrency") !=

@@ -54,10 +54,11 @@ void launch_variant(const Tensor& x, const Weight& weight, Tensor& q, Tensor& ga
     };
 
     if constexpr (Schedule::kSharedBytes > 48 * 1024) {
-        static const cudaError_t attr = cudaFuncSetAttribute(
-            bf16_gemm_mma_kernel<Geometry, Schedule, FullTokens, Bf16AttentionInputMmaOutput>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes);
-        CUDA_CHECK(attr);
+        configure_cuda_device_once([&] {
+            return cudaFuncSetAttribute(
+                bf16_gemm_mma_kernel<Geometry, Schedule, FullTokens, Bf16AttentionInputMmaOutput>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes);
+        });
     }
     bf16_gemm_mma_kernel<Geometry, Schedule, FullTokens>
         <<<blocks, Schedule::kThreads, Schedule::kSharedBytes, stream>>>(
