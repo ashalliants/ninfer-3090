@@ -421,13 +421,39 @@ Ordered by how much they could bite. The first is a possible correctness defect 
       *loosened* by the section 5 floor and still fails loudly, which rules out tolerance as the
       cause — the values are ~10x off.
 
-      **The contention hypothesis is untested, not disproven.** Two reproduction attempts looked
-      clean and were worthless: they shelled out to `ninfer_softmax_attention_nvfp4_test.exe` and
-      `ninfer_softmax_attention_k8v4_test.exe`, which do not exist — those are *ctest* entries that
-      share `ninfer_softmax_attention_test.exe` with `--nvfp4-only` / `--k8v4-only`. `Start-Process`
-      failed silently, no concurrent load ever ran, and `gpu_used=1782 MiB` in the log should have
-      given it away. Redo it with the real binary plus arguments, taken from
-      `build-ninja/tests/CTestTestfile.cmake`.
+      **Investigated 2026-09-08. Four hypotheses ruled out; it needs the full suite.** Do not repeat
+      these — 80+ targeted iterations, all clean:
+
+      | experiment | iterations | reproduced |
+      |---|---|---|
+      | full `ctest -j2` | 6 (across two builds) | **2** |
+      | `-R` subset of 11 related tests, `-j2` | 6 | 0 |
+      | full attn test vs one long-lived partner | 14 | 0 |
+      | `--dflash2-only` vs one long-lived partner | 40 | 0 |
+      | attn test alone | 3 | 0 |
+
+      What that rules out:
+      - **Not tolerance.** One of the two failures was on the section 5 loosened-floor build, and
+        the values are ~10x off — two orders of magnitude past any plausible bound.
+      - **Not memory pressure**, which was the original assumption. The partner tests peak at
+        ~2.1 GiB against a 1.78 GiB idle baseline, i.e. ~350 MiB of load with **22.8 GiB free**.
+      - **Not single-partner compute contention**, across 54 iterations that provably covered the
+        case (`NINFER_OP_REPORT_STATS=1` confirms `--dflash2-only` runs all three of q/k/value at
+        `T=112 graph phase=1`).
+      - **Not modest process churn** — 11 tests under `-j2`, six times, stayed clean.
+
+      So the trigger is something only the *full* 123-test run supplies: cumulative allocator state
+      across many processes, a specific predecessor test, or simply duration. Next step is not
+      another contention harness — it is to catch a failing full-suite run with instrumentation
+      already attached (dump the failing tile's inputs, or run the suite in a loop overnight
+      capturing `NINFER_OP_REPORT_STATS=1` for this Op only).
+
+      *Method note, because it wasted two attempts:* the first harnesses shelled out to
+      `ninfer_softmax_attention_nvfp4_test.exe` / `_k8v4_test.exe`, which **do not exist** — those
+      are ctest entries sharing `ninfer_softmax_attention_test.exe` with `--nvfp4-only` /
+      `--k8v4-only`. `Start-Process` failed silently, no load ever ran, and the "clean" results were
+      meaningless. Resolve binaries with `Resolve-Path` and assert the partner is alive; take the
+      real argument lists from `build-ninja/tests/CTestTestfile.cmake`.
 
 - [ ] **`--spec mtp` cannot start with default host-KV sizing.** It reserves **8 GiB of pinned host
       memory** and dies during startup:
