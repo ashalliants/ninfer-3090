@@ -1,14 +1,18 @@
 $ErrorActionPreference = 'Continue'
-Set-Location 'C:\ninfer-fork\ninfer-3090'
+# Run from the repository root regardless of where this is invoked from, rather than a hardcoded
+# path: these are committed, and the next person's checkout will not be at C:\ninfer-fork.
+Set-Location (Resolve-Path (Join-Path $PSScriptRoot '..\..'))
 
-# Model directory, overridable so these are not welded to one machine.
+# Both overridable so this is not welded to one machine. The output directory is created here
+# because it does not exist in a clean checkout -- profiles/ is gitignored.
 $modelDir = if ($env:NINFER_MODEL_DIR) { $env:NINFER_MODEL_DIR } else { 'C:\Ninefer-3090\models' }
+$out      = if ($env:NINFER_SWEEP_OUT) { $env:NINFER_SWEEP_OUT } else { 'profiles\sweeps' }
+New-Item -ItemType Directory -Force -Path $out | Out-Null
+
 
 # Same corpus, mode and window as the three already recorded in README.md, so the new rows are
 # directly comparable rather than a separate experiment: ninfer-ppl-1m-v1, --quick, 4096/2048.
 $dtypes = @('fp8','nvfp4','k8v4')
-$out = if ($env:NINFER_SWEEP_OUT) { $env:NINFER_SWEEP_OUT } else { "profiles\sweeps" }
-New-Item -ItemType Directory -Force -Path $out | Out-Null
 
 foreach ($d in $dtypes) {
     $log = "$out\$d.log"

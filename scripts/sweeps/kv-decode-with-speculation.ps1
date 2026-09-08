@@ -1,10 +1,14 @@
 $ErrorActionPreference = 'Continue'
-Set-Location 'C:\ninfer-fork\ninfer-3090'
+# Run from the repository root regardless of where this is invoked from, rather than a hardcoded
+# path: these are committed, and the next person's checkout will not be at C:\ninfer-fork.
+Set-Location (Resolve-Path (Join-Path $PSScriptRoot '..\..'))
 
-# Model directory, overridable so these are not welded to one machine.
+# Both overridable so this is not welded to one machine. The output directory is created here
+# because it does not exist in a clean checkout -- profiles/ is gitignored.
 $modelDir = if ($env:NINFER_MODEL_DIR) { $env:NINFER_MODEL_DIR } else { 'C:\Ninefer-3090\models' }
-$out = if ($env:NINFER_SWEEP_OUT) { $env:NINFER_SWEEP_OUT } else { "profiles\sweeps" }
+$out      = if ($env:NINFER_SWEEP_OUT) { $env:NINFER_SWEEP_OUT } else { 'profiles\sweeps' }
 New-Item -ItemType Directory -Force -Path $out | Out-Null
+
 
 # The second channel by which KV dtype moves decode speed. README already records that rk8v4 drops
 # MTP acceptance 71.27% -> 65.86% on the 27B: a coarser value plane changes which tokens the draft
