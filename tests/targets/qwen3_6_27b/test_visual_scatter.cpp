@@ -1,3 +1,4 @@
+#include "targets/guarded_main.h"
 #include "ops/op_tester.h"
 #include "targets/qwen3_6_27b/impl/config.h"
 #include "targets/qwen3_6/impl/runtime/visual_scatter.h"
@@ -10,7 +11,7 @@
 using namespace ninfer;
 using namespace ninfer::test;
 
-int main() {
+int run_visual_scatter_checks() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
@@ -67,3 +68,5 @@ int main() {
     std::cout << (failures ? "FAIL" : "OK") << " shifted visual composition\n";
     return failures ? 1 : 0;
 }
+
+NINFER_GUARDED_TEST_MAIN(run_visual_scatter_checks)

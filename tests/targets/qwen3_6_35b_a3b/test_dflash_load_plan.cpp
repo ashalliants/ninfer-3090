@@ -1,3 +1,4 @@
+#include "targets/guarded_main.h"
 #include "artifact/binder.h"
 #include "artifact/reader.h"
 #include "targets/qwen3_6_35b_a3b/impl/load/bindings.h"
@@ -27,7 +28,7 @@ ninfer::targets::qwen3_6::StartupFeatures load_features(bool vision,
 
 } // namespace
 
-int main() {
+int run_dflash_load_plan_checks() {
     const std::filesystem::path path = artifact_path();
     if (!std::filesystem::is_regular_file(path)) {
         std::cerr << "skip: real 35B artifact is unavailable at " << path << '\n';
@@ -102,3 +103,5 @@ int main() {
     }
     return 0;
 }
+
+NINFER_GUARDED_TEST_MAIN(run_dflash_load_plan_checks)

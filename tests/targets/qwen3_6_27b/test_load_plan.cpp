@@ -1,3 +1,4 @@
+#include "targets/guarded_main.h"
 #include "artifact/binder.h"
 #include "artifact/reader.h"
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
@@ -14,6 +15,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <variant>
 
 namespace {
@@ -315,6 +317,35 @@ int verify_vision_workspace_planning() {
         return std::move(planner).finalize(pages).workspace_capacity_bytes();
     };
 
+#if defined(NINFER_SM8X_COMPAT)
+    // This case plans the *NVFP4-weight* profile at a 1,024-token prefill chunk, and on sm_86 that
+    // cannot exist. NVFP4 weights need A4 execution, whose instructions are sm_100a/sm_120a only,
+    // so the policy degrades to A16Only -- and NVFP4 A16 linear_swiglu is registered through T=16
+    // and no further (src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp). Any prefill chunk
+    // above 16 tokens is therefore unroutable, which is a property of the hardware rather than a
+    // defect.
+    //
+    // Assert the refusal instead of skipping it. Pinning the message keeps the limitation a stated
+    // contract: if NVFP4 A16 ever gains a wider registration this fails, and the numeric check
+    // below becomes reachable, which is exactly when someone should look at it. Skipping silently
+    // would leave the rest of this file unrun on this box -- it already was, and it was hiding an
+    // uncaught throw that CTest reported only as `Exit code 0xc0000409`.
+    try {
+        (void)workspace_capacity(16384);
+    } catch (const std::invalid_argument& error) {
+        const std::string_view message(error.what());
+        if (message.find("nvfp4 linear_swiglu A16 is registered only through T=16") ==
+            std::string_view::npos) {
+            std::cerr << "NVFP4 planning on sm_86 failed for an unexpected reason: " << message
+                      << '\n';
+            return 1;
+        }
+        return 0;
+    }
+    std::cerr << "NVFP4 vision workspace planning succeeded on sm_86, where A4 execution does not "
+                 "exist; the A16 T<=16 registration bound must have changed\n";
+    return 1;
+#else
     const std::size_t at_item_limit    = workspace_capacity(16384);
     const std::size_t above_item_limit = workspace_capacity(131072);
     if (at_item_limit != kExpectedMaximumItemWorkspace ||
@@ -325,11 +356,12 @@ int verify_vision_workspace_planning() {
         return 1;
     }
     return 0;
+#endif
 }
 
 } // namespace
 
-int main() {
+int run_load_plan_checks() {
     const std::filesystem::path groupwise =
         artifact_path("NINFER_QWEN3_6_27B_WEIGHTS", "qwen3_6_27b.ninfer");
     const std::filesystem::path nvfp4 =
@@ -386,3 +418,5 @@ int main() {
     }
     return 0;
 }
+
+NINFER_GUARDED_TEST_MAIN(run_load_plan_checks)
