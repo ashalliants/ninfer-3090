@@ -49,15 +49,13 @@ first and check `nvidia-smi`.
 
 ### Open pull requests
 
-- **#32 — `docs/config-calculator.html`.** Open and now `APPROVED`, but **approved is not finished
-  here**: three of the six confirmed defects are fixed on that branch and two are not. The branch
-  itself says so, carrying a `KNOWN GAP (see TODO.md)` comment where speculative memory should be
-  modelled. See §2b for which is which. Merging it is a judgement call — the page is useful and
-  honest about its gap, but nothing anywhere links to it yet, deliberately, so that master carries
-  no pointer to a page that undercounts speculative configurations by ~170 MiB. **If you merge it,
-  close the speculation gap first, then add the links** (README "Choosing a KV format",
-  `docs/cli.md`, `docs/perplexity.md`, `docs/rtx-3090-windows.md`). The multiplier needed for that
-  fix is measured and recorded in §2b.
+- **#32 — `docs/config-calculator.html` — merged, but not finished.** Three of the six confirmed
+  defects were fixed before it landed and **two were not**; the file itself says so, carrying a
+  `KNOWN GAP (see TODO.md)` comment where speculative memory should be modelled. See §2b. So the
+  page is live on master, README and `docs/cli.md` link to it, and **it still undercounts any
+  speculative configuration by roughly 170 MiB.** Closing that is the top non-correctness item in
+  §0, and the multiplier it needs is already measured in §2b. Until then, treat its speculative
+  rows as optimistic.
 - **#34 — shell-script line endings.** Small and self-contained. Two launchers did not parse on
   Linux at all; see the note below. Merge this one first, it touches nothing else.
 - A worktree at `.claude/worktrees/eager-baking-cascade` exists and has been used by a second agent
@@ -101,9 +99,9 @@ question, and which one produced a wrong answer and why.
 1. **The `T=112` graph-replay failure** (§1.1). The only open item that could be a correctness
    defect in *released* code. Four hypotheses are already ruled out — read that entry first, it
    will save a day.
-2. **The calculator's speculative-memory gap** (§2b). The one remaining correctness defect on #32,
-   and the multiplier that fixes it is already measured — implementing, not investigating. Worth
-   doing before anything links to that page.
+2. **The calculator's speculative-memory gap** (§2b). Now shipped on master and linked from
+   README, so it is live: every speculative configuration it reports is roughly 170 MiB optimistic.
+   The multiplier that fixes it is already measured — implementing, not investigating.
 3. **Re-run the six real-model tests** (§1.2, §2). Their artifact blockers are gone as of #31 and
    nobody has looked since; at least one is expected to fail rather than skip.
 4. **The two test-criterion outliers** (§4). Small, the last loose ends from the §5 audit, and
@@ -280,13 +278,15 @@ recurs, and because the follow-on work below only exists now that they are gone.
 
 ## 2b. `docs/config-calculator.html` is advertised as authoritative and is not yet correct
 
-Added by #32. Six defects were raised in review and confirmed by measurement; **three are fixed on
-that branch and two are not**, so read the checkboxes rather than assuming the PR being approved
-means it is done. The evidence is kept with each entry so nobody has to re-derive it.
+Added by #32, **which merged with two of its six confirmed defects still open.** README and
+`docs/cli.md` link to the page, so those two are live rather than theoretical. Read the checkboxes
+rather than assuming a merged PR means a finished page; the file itself agrees, carrying a
+`KNOWN GAP (see TODO.md)` comment where speculative memory should be modelled.
 
-Fixed on #32 as it stands: KV page rounding, sub-4,096 decode (now labelled a lower bound held at
-the shallowest measurement rather than claimed as interpolated), and per-row weight-artifact
-labelling. The doc contradictions were fixed separately in #33.
+Closed before it landed: KV page rounding, sub-4,096 decode (now labelled a lower bound held at the
+shallowest measurement rather than claimed as interpolated), and per-row weight-artifact labelling.
+The doc contradictions were fixed separately in #33. The evidence for each is kept below so nobody
+has to re-derive it.
 
 - [ ] **Speculative modes undercount memory by roughly 170 MiB, plus a per-token term.** The page
       models speculation as a weights delta only. Measured on the 27B at `--max-ctx 40960`, INT8,
