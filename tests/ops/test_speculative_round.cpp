@@ -375,10 +375,17 @@ struct SparseAcceptSuite {
         const std::vector<std::int32_t>& initial_anchors,
         const std::vector<ops::SamplingConfig>& host_configs,
         const std::vector<std::int32_t>& token_counts,
-        ops::SpeculativeAcceptExecutionEnvelope envelope) {
+        ops::SpeculativeAcceptExecutionEnvelope envelope,
+        const SparseExpected* expected_override = nullptr) {
+        // The oracle derives the greedy terminal from the truncated logit distribution. The
+        // non-finite fixture deliberately poisons that same logit, so the oracle cannot describe
+        // it -- those cases state their expectation directly instead. Graph replay is skipped with
+        // an override for the same reason: it re-runs the oracle against mutated extents.
         const SparseExpected expected =
-            sparse_accept_oracle(logits, drafts, candidate_ids, proposal_q, extents,
-                                 initial_lengths, host_configs, token_counts);
+            expected_override != nullptr
+                ? *expected_override
+                : sparse_accept_oracle(logits, drafts, candidate_ids, proposal_q, extents,
+                                       initial_lengths, host_configs, token_counts);
 
         DeviceBuffer d_target_tokens                    = to_device(target_tokens);
         DeviceBuffer d_logits                           = to_device(logits);
@@ -455,7 +462,7 @@ struct SparseAcceptSuite {
         if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) ++failures;
         failures += scratch.verify_guards(label + " workspace");
         observed_workspace = std::max(observed_workspace, workspace.peak_used());
-        if (kSparseBatch == 1 || kSparseBatch == 8) {
+        if (expected_override == nullptr && (kSparseBatch == 1 || kSparseBatch == 8)) {
             cudaStream_t stream = nullptr;
             cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
                        "sparse graph stream");
@@ -608,6 +615,93 @@ struct SparseAcceptSuite {
                                               " B=" + std::to_string(kSparseBatch),
                                           targets, logits, drafts, ids, q, extents, lengths,
                                           anchors, configs, history, {!general});
+    }
+
+    // Regression for the gap CodePulse raised on PR #16: a greedy sparse round used to license
+    // whatever token sat at the divergence column even when the verify pass had produced an
+    // all-NaN row there, advancing the sequence with an arbitrary token instead of returning the
+    // non-finite sentinel. `poison` selects which rows get the NaN column, so a mixed batch proves
+    // the refusal is per row rather than a blanket one -- the unpoisoned rows must still commit
+    // normally in the same launch. Runs on both greedy sparse routes: raw (the dedicated warp
+    // kernel) and the multiblock group-finalize kernel's SparseProposal branch.
+    int sparse_non_finite_terminal_case(bool raw_greedy, int poison) {
+        std::vector<std::int32_t> targets(kSparseColumns * kSparseBatch),
+            drafts(kSparseDrafts * kSparseBatch);
+        std::vector<std::uint16_t> logits(static_cast<std::size_t>(kSparsePhysicalRows) *
+                                              kSparseColumns * kSparseBatch,
+                                          f32_to_bf16(-20.0f));
+        std::vector<int> ids(kSparseCandidates * kSparseDrafts * kSparseBatch),
+            extents(kSparseBatch, kSparseDrafts), lengths(kSparseBatch), anchors(kSparseBatch, -1);
+        std::vector<float> q(ids.size(), 0.0f);
+        // temperature 0 everywhere: this is the greedy contract, and the raw route requires it.
+        std::vector<ops::SamplingConfig> configs(kSparseBatch);
+        std::vector<int> history(kSparseTokenDomain * kSparseBatch, 3);
+
+        SparseExpected expected{
+            .licensed_tokens = std::vector<std::int32_t>(kSparseColumns * kSparseBatch, 0),
+            .licensed_counts = std::vector<std::int32_t>(kSparseBatch),
+            .accepted        = std::vector<std::int32_t>(kSparseBatch),
+            .lengths         = std::vector<std::int32_t>(kSparseBatch),
+            .anchors         = std::vector<std::int32_t>(kSparseBatch),
+        };
+
+        const float quiet_nan = std::numeric_limits<float>::quiet_NaN();
+        for (int row = 0; row < kSparseBatch; ++row) {
+            // Diverge at a different column per row so the poisoned column is not always the same
+            // one, and full acceptance (reject == kSparseDrafts) is covered too.
+            const int reject = (row + poison) % (kSparseDrafts + 1);
+            lengths[row]     = 4096 + row * 13;
+            for (int col = 0; col < kSparseColumns; ++col) {
+                const int target                             = 100000 + row * 128 + col;
+                targets[row * kSparseColumns + col]          = target;
+                logits[sparse_logit_index(row, col, target)] = f32_to_bf16(20.0f);
+                for (int v = kSparseTokenDomain; v < kSparsePhysicalRows; ++v)
+                    logits[sparse_logit_index(row, col, v)] = f32_to_bf16(100.0f);
+            }
+            for (int col = 0; col < kSparseDrafts; ++col) {
+                const int base = sparse_candidate_index(row, col, 0);
+                for (int rank = 0; rank < kSparseCandidates; ++rank)
+                    ids[base + rank] = 30000 + row * 1024 + col * 16 + rank;
+                ids[base]                         = targets[row * kSparseColumns + col];
+                const int rank                    = col == reject ? 15 : 0;
+                drafts[row * kSparseDrafts + col] = ids[base + rank];
+                q[base + rank]                    = 1.0f;
+            }
+            // Poison every other row. The NaN goes on the exact logit the kernel tests: the
+            // divergence column's target token.
+            const bool poisoned = (row & 1) == (poison & 1);
+            if (poisoned) {
+                logits[sparse_logit_index(row, reject, targets[row * kSparseColumns + reject])] =
+                    f32_to_bf16(quiet_nan);
+            }
+
+            const std::size_t row_base = static_cast<std::size_t>(row) * kSparseColumns;
+            if (poisoned) {
+                // The sentinel shape from speculative_sparse_warp_store: one licensed token,
+                // nothing accepted, and the length still advances by one so the caller's frontier
+                // stays consistent.
+                expected.licensed_tokens[row_base] = ops::kSamplerNonFiniteToken;
+                expected.licensed_counts[row]      = 1;
+                expected.accepted[row]             = 0;
+                expected.anchors[row]              = ops::kSamplerNonFiniteToken;
+                expected.lengths[row]              = lengths[row] + 1;
+            } else {
+                for (int item = 0; item < reject; ++item)
+                    expected.licensed_tokens[row_base + item] = drafts[row * kSparseDrafts + item];
+                expected.licensed_tokens[row_base + reject] =
+                    targets[row * kSparseColumns + reject];
+                expected.licensed_counts[row] = reject + 1;
+                expected.accepted[row]        = reject;
+                expected.anchors[row]         = targets[row * kSparseColumns + reject];
+                expected.lengths[row]         = lengths[row] + reject + 1;
+            }
+        }
+        return execute_sparse_accept_case(
+            "sparse non-finite terminal K=" + std::to_string(kSparseDrafts) + " B=" +
+                std::to_string(kSparseBatch) + (raw_greedy ? " raw" : " general") + " p" +
+                std::to_string(poison),
+            targets, logits, drafts, ids, q, extents, lengths, anchors, configs, history,
+            {raw_greedy}, &expected);
     }
 
     int generated_general_case() {
@@ -1266,6 +1360,20 @@ int main(int argc, char** argv) {
         failures += suite.sparse_greedy_direct_case(0, true);
         failures += SparseAcceptSuite(k, 1).repeated_history_case(false);
         failures += SparseAcceptSuite(k, 1).repeated_history_case(true);
+    }
+    // A greedy sparse round must refuse to license a token whose verify logit is non-finite. Both
+    // greedy sparse routes are covered -- raw (the dedicated warp kernel) and the multiblock
+    // group-finalize kernel -- and each batch mixes poisoned with clean rows, so a blanket refusal
+    // fails just as loudly as no refusal at all.
+    for (int k : {1, 7, 15}) {
+        for (int batch : {1, 8}) {
+            for (bool raw : {true, false}) {
+                for (int poison = 0; poison < 2; ++poison) {
+                    failures +=
+                        SparseAcceptSuite(k, batch).sparse_non_finite_terminal_case(raw, poison);
+                }
+            }
+        }
     }
 
     if (failures != 0) {
