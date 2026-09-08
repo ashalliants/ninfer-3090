@@ -903,8 +903,22 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             plan.context_cache.host_state_slots;
         StartupPhaseScope host_state_phase(startup_observer, StartupPhase::HostStatePin,
                                            StartupProgressUnit::Bytes, host_state_bytes);
-        host_state_images = std::make_unique<qwen3_6::HostStatePool>(
-            state_images->host_layout(), plan.context_cache.host_state_slots);
+        // The other large pinned-host allocation, and it scales with the model: a StateImage is
+        // 61.4 MiB on the 35B-A3B and 147 MiB on the 27B, so the default eight slots is 1.15 GiB
+        // there. Same reasoning as the host KV arena below -- name the knob, because the CUDA
+        // error underneath says only "out of memory".
+        try {
+            host_state_images = std::make_unique<qwen3_6::HostStatePool>(
+                state_images->host_layout(), plan.context_cache.host_state_slots);
+        } catch (const std::exception& error) {
+            throw std::runtime_error(
+                std::string("failed to reserve host StateImage slots: ") + error.what() +
+                "\nThis is the context cache's pinned StateImage pool, " +
+                std::to_string(plan.context_cache.host_state_slots) + " slots of " +
+                std::to_string((state_images->host_layout().image_bytes + (1ULL << 20) - 1) >> 20) +
+                " MiB, sized by --host-state-slots. Lower it to use less system RAM, or pass "
+                "--no-prefix-reuse to disable the context cache entirely.");
+        }
         host_state_phase.complete(host_state_bytes, host_state_bytes);
     }
     const std::uint64_t logical_state_capacity =
@@ -968,9 +982,22 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         StartupPhaseScope host_kv_phase(
             startup_observer, StartupPhase::HostKvPin, StartupProgressUnit::Bytes,
             static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes));
-        host_kv_arena = std::make_unique<HostKVArena>(
-            plan.context_cache.host_kv_capacity_bytes,
-            std::span<const HostKVPageLayout>(layouts.data(), layouts.size()));
+        // Name the knob. This is the largest pinned-host allocation the server makes -- 8 GiB by
+        // default (kDefaultHostKvCapacityBytes) regardless of how much RAM the machine has -- so it
+        // is the first thing to fail on a box with a modest amount free, and the underlying CUDA
+        // error says only "out of memory" with no hint that it means system RAM or which flag
+        // shrinks it. Prefix reuse degrades gracefully at a smaller size; it does not need 8 GiB.
+        try {
+            host_kv_arena = std::make_unique<HostKVArena>(
+                plan.context_cache.host_kv_capacity_bytes,
+                std::span<const HostKVPageLayout>(layouts.data(), layouts.size()));
+        } catch (const std::exception& error) {
+            throw std::runtime_error(
+                std::string("failed to reserve the host KV cache: ") + error.what() +
+                "\nThis is the context cache's pinned host buffer, sized by --host-kv-mib "
+                "(default 8192). Lower it (for example --host-kv-mib 512) to use less system RAM, "
+                "or pass --no-prefix-reuse to disable the context cache entirely.");
+        }
         host_kv_phase.complete(
             static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes),
             static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes));
