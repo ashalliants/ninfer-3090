@@ -1,27 +1,24 @@
 @echo off
 setlocal enabledelayedexpansion
 
-rem Revision 560f227e, not c8b8c1c0. The older pin predates the DFlash bundle: its
-rem artifact-manifest.json has no "dflash" source at all, so an artifact fetched with it cannot run
-rem --spec dflash and makes ninfer_qwen3_6_35b_a3b_dflash_load_plan_test skip with "this artifact
-rem carries no DFlash bundle". 560f227e adds it (from z-lab/Qwen3.6-35B-A3B-DFlash) for 0.38 GB
-rem more. If you repin this, check the manifest still lists a dflash source, and update the size
-rem and checksum below along with it.
-set "REVISION=560f227e5a7104756d1a108201a8aa75654ea688"
-set "EXPECTED_SIZE=22783246080"
-set "EXPECTED_SHA256=1fb9ea0b5b8561e49d9604115ec89e5d9f2b6f6434e32c37c57fffd480a325d2"
+rem The Qwen3.6 27B groupwise-int artifact, target_key qwen3_6_27b. This is a different model
+rem family from qwen3_8_27b, which is why having the latter does not satisfy the former: four
+rem real-model tests -- ninfer_qwen3_6_27b_prefix_real_test, _score_real_test, _load_plan_test and
+rem the Qwen3.6 27B half of the engine suite -- skip without it.
+set "REVISION=faaa0c140d0a92743872256a8b78a954b3984018"
+set "EXPECTED_SIZE=17495365888"
+set "EXPECTED_SHA256=7b51600ffd10632b9660f56085efdd9b751d79733ad32036a652234b64bebe7b"
 
 set "ROOT=%~dp0"
 set "MODEL_DIR=%ROOT%models"
 if defined NINFER_MODEL_DIR set "MODEL_DIR=%NINFER_MODEL_DIR%"
-set "MODEL=%MODEL_DIR%\qwen3_6_35b_a3b.ninfer"
+set "MODEL=%MODEL_DIR%\qwen3_6_27b.ninfer"
 
-rem curl -C - resumes by appending at the current file length, without checking what wrote those
-rem bytes. Because the pinned revision changed, a partial download of the *previous* artifact sits
-rem at exactly this path on any machine that ran the older script, and resuming onto it would splice
-rem the tail of one artifact onto the head of another: a file of entirely plausible size that is
-rem corrupt throughout. Staging under a name that carries the revision means a resume can only ever
-rem continue the same artifact, and the checks below are what promote it to the final name.
+rem Staged under a revision-scoped name so that curl -C - can only ever resume the same artifact.
+rem Resuming straight onto the final path appends at the current length without checking what wrote
+rem those bytes, so a leftover partial from a different revision would be spliced into this one and
+rem produce a plausibly sized, wholly corrupt file. See download-qwen36-35b-a3b.bat, where changing
+rem the pin made that a live hazard rather than a hypothetical one.
 set "PART=%MODEL%.%REVISION%.part"
 
 if not exist "%MODEL_DIR%" mkdir "%MODEL_DIR%"
@@ -35,8 +32,8 @@ if exist "%MODEL%" (
   echo Existing %MODEL% did not verify against revision %REVISION%; fetching the pinned one.
 )
 
-echo Downloading the RTX 3090-compatible Qwen3.6-35B-A3B vision model (21.2 GiB)...
-curl.exe -L -C - --fail --output "%PART%" "https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/resolve/%REVISION%/qwen3_6_35b_a3b.ninfer"
+echo Downloading the Qwen3.6-27B model (16.3 GiB)...
+curl.exe -L -C - --fail --output "%PART%" "https://huggingface.co/neroued/Qwen3.6-27B-NInfer/resolve/%REVISION%/qwen3_6_27b.ninfer"
 if errorlevel 1 (
   echo Download failed. Run this file again to resume.
   exit /b 1
@@ -50,6 +47,7 @@ if not "!VERIFY_OK!"=="1" (
 
 move /y "%PART%" "%MODEL%" >nul
 echo Model ready: %MODEL%
+echo Point the tests at it with:  set NINFER_QWEN3_6_27B_WEIGHTS=%MODEL%
 exit /b 0
 
 rem Verifies %1 against EXPECTED_SIZE and, unless NINFER_SKIP_SHA256=1, EXPECTED_SHA256, setting

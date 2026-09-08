@@ -76,14 +76,80 @@
       # One resumable downloader per registered artifact, mirroring
       # scripts/download-*.sh. NINFER_MODEL_DIR overrides the target directory.
       mkDownload =
-        { name, filename, url, description }:
+        {
+          name,
+          filename,
+          url,
+          description,
+          revision ? null,
+          expectedSize ? null,
+          expectedSha256 ? null,
+        }:
         pkgs.writeShellScriptBin name ''
           set -euo pipefail
+          expected_size='${if expectedSize == null then "" else toString expectedSize}'
+          expected_sha256='${if expectedSha256 == null then "" else expectedSha256}'
+          stage='${if revision == null then "latest" else revision}'
+          resumable=${if revision == null then "0" else "1"}
+
           model_dir=''${NINFER_MODEL_DIR:-$HOME/models}
           model="$model_dir/${filename}"
+
+          # curl -C - resumes by appending at the current file length, without checking what wrote
+          # those bytes. Downloading straight onto "$model" therefore splices a leftover partial
+          # from one revision into another whenever a pin changes -- a file of plausible size that
+          # is corrupt throughout. Staging under a name that carries the revision means a resume
+          # can only ever continue the same artifact -- but an unpinned URL (revision == null,
+          # resolving whatever upstream currently calls "main") has no immutable name to stage
+          # under: "main" can move between two invocations of this same command, so a leftover
+          # ".latest.part" could belong to an older "main" than the one this run would fetch.
+          # Unpinned entries therefore never resume: any existing partial is discarded first and
+          # the download restarts from zero, at the cost of resumability.
+          part="$model.$stage.part"
           mkdir -p "$model_dir"
-          echo "Downloading ${description} to $model (resumable)..."
-          ${pkgs.curl}/bin/curl -L -C - --fail --output "$model" '${url}'
+
+          # Verifies a path against expected_size and, unless NINFER_SKIP_SHA256=1,
+          # expected_sha256 (either check is skipped if its expected value is empty, i.e. for the
+          # unpinned entries, which supply neither). Used both for an existing "$model" -- so a
+          # same-sized-but-corrupt file is not accepted forever just because it happened to pass
+          # once, or was replaced out from under this script -- and for a freshly downloaded
+          # "$part", as one check that cannot drift out of sync with itself.
+          verify() {
+            if [ -n "$expected_size" ]; then
+              [ "$(wc -c < "$1" | tr -d '[:space:]')" = "$expected_size" ] || return 1
+            fi
+            if [ -n "$expected_sha256" ] && [ "''${NINFER_SKIP_SHA256:-0}" != '1' ]; then
+              local actual_sha256
+              actual_sha256="$(sha256sum -- "$1" | cut -d' ' -f1)"
+              [ "$actual_sha256" = "$expected_sha256" ] || return 1
+            fi
+            return 0
+          }
+
+          # Only short-circuit when there is metadata to verify against: an unpinned entry
+          # (expected_size empty) has nothing for verify() to check, so it would return success
+          # for any existing regular file -- including an empty or corrupt one left over from an
+          # interrupted run -- and this path explicitly does not resume those (see above).
+          if [ -n "$expected_size" ] && [ -f "$model" ] && verify "$model"; then
+            echo "Model already present: $model"
+            exit 0
+          fi
+
+          if [ "$resumable" = "1" ]; then
+            echo "Downloading ${description} to $model (resumable)..."
+            ${pkgs.curl}/bin/curl -L -C - --fail --output "$part" '${url}'
+          else
+            echo "Downloading ${description} to $model (unpinned URL, not resumable)..."
+            rm -f -- "$part"
+            ${pkgs.curl}/bin/curl -L --fail --output "$part" '${url}'
+          fi
+
+          if ! verify "$part"; then
+            echo "Downloaded file at $part failed verification. Delete it and retry." >&2
+            exit 1
+          fi
+
+          mv -f -- "$part" "$model"
           echo "Model ready: $model"
         '';
 
@@ -95,28 +161,42 @@
         description = "Qwen3.8-27B NInfer model";
       };
 
-      # Qwen3.6-27B (groupwise artifact).
+      # Qwen3.6-27B (groupwise artifact), pinned to match scripts/download-qwen36-27b.sh.
       download-qwen36-27b = mkDownload {
         name = "download-qwen36-27b";
         filename = "qwen3_6_27b.ninfer";
-        url = "https://huggingface.co/neroued/Qwen3.6-27B-NInfer/resolve/main/qwen3_6_27b.ninfer";
+        revision = "faaa0c140d0a92743872256a8b78a954b3984018";
+        url = "https://huggingface.co/neroued/Qwen3.6-27B-NInfer/resolve/faaa0c140d0a92743872256a8b78a954b3984018/qwen3_6_27b.ninfer";
+        expectedSize = 17495365888;
+        expectedSha256 = "7b51600ffd10632b9660f56085efdd9b751d79733ad32036a652234b64bebe7b";
         description = "Qwen3.6-27B NInfer model";
       };
 
-      # Qwen3.6-35B-A3B compact v1 (pinned revision; the measured 24 GB profile).
+      # Qwen3.6-35B-A3B, pinned to match scripts/download-qwen36-35b-a3b.sh. 560f227e carries the
+      # DFlash bundle; the older c8b8c1c0 pin predates DFlash, so an artifact fetched with it
+      # cannot run --spec dflash. Its extra 0.38 GiB on disk costs nothing in VRAM unless
+      # --spec dflash is actually selected (byte-identical 21,038,469,632-byte resident weights
+      # otherwise), so the published RTX 3090 concurrency measurements -- taken against
+      # c8b8c1c0 -- still apply. See README.md and docs/rtx-3090-windows.md.
       download-qwen36-35b = mkDownload {
         name = "download-qwen36-35b";
         filename = "qwen3_6_35b_a3b.ninfer";
-        url = "https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/resolve/c8b8c1c0df4c74df3c190c6aa3a7f24dc614721c/qwen3_6_35b_a3b.ninfer";
-        description = "Qwen3.6-35B-A3B compact v1 (pinned) model";
+        revision = "560f227e5a7104756d1a108201a8aa75654ea688";
+        url = "https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/resolve/560f227e5a7104756d1a108201a8aa75654ea688/qwen3_6_35b_a3b.ninfer";
+        expectedSize = 22783246080;
+        expectedSha256 = "1fb9ea0b5b8561e49d9604115ec89e5d9f2b6f6434e32c37c57fffd480a325d2";
+        description = "Qwen3.6-35B-A3B (pinned, with DFlash) model";
       };
 
-      # Qwen3.6-35B-A3B upstream v2 (includes DFlash payload; not the measured artifact).
+      # Whatever the repository currently calls main. Kept as an escape hatch for trying a newer
+      # upstream artifact, so it is deliberately unpinned and deliberately writes to its own
+      # filename: it is not the measured profile and it is not what the tests expect. Now that
+      # download-qwen36-35b carries DFlash, this no longer exists to supply it.
       download-qwen36-35b-v2 = mkDownload {
         name = "download-qwen36-35b-v2";
         filename = "qwen3_6_35b_a3b_v2.ninfer";
         url = "https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/resolve/main/qwen3_6_35b_a3b.ninfer";
-        description = "Qwen3.6-35B-A3B upstream v2 (with DFlash) model";
+        description = "Qwen3.6-35B-A3B upstream main (unpinned) model";
       };
     in
     {
@@ -155,12 +235,12 @@
         download-qwen36-35b = {
           type = "app";
           program = "${download-qwen36-35b}/bin/download-qwen36-35b";
-          meta.description = "Download the Qwen3.6-35B-A3B compact v1 .ninfer artifact (21 GB)";
+          meta.description = "Download the pinned Qwen3.6-35B-A3B .ninfer artifact, with DFlash (21 GB)";
         };
         download-qwen36-35b-v2 = {
           type = "app";
           program = "${download-qwen36-35b-v2}/bin/download-qwen36-35b-v2";
-          meta.description = "Download the Qwen3.6-35B-A3B upstream v2 .ninfer artifact (21 GB)";
+          meta.description = "Download the Qwen3.6-35B-A3B upstream main (unpinned) .ninfer artifact (21 GB)";
         };
       };
 
@@ -180,8 +260,8 @@
           echo "  nix run .#serve -- <serve args>          -> run the HTTP server"
           echo "  nix run .#download-qwen38-27b            -> Qwen3.8-27B artifact (17 GB)"
           echo "  nix run .#download-qwen36-27b            -> Qwen3.6-27B artifact"
-          echo "  nix run .#download-qwen36-35b           -> Qwen3.6-35B-A3B compact v1 (21 GB)"
-          echo "  nix run .#download-qwen36-35b-v2       -> Qwen3.6-35B-A3B upstream v2 (21 GB)"
+          echo "  nix run .#download-qwen36-35b           -> Qwen3.6-35B-A3B pinned, with DFlash (21 GB)"
+          echo "  nix run .#download-qwen36-35b-v2       -> Qwen3.6-35B-A3B upstream main, unpinned (21 GB)"
         '';
       };
     };

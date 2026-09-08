@@ -17,27 +17,34 @@ not included in the release archive.
 
 ## Download the compatible Qwen3.6-35B artifact
 
-The published RTX 3090 measurements use the compact 20.84 GiB container-v1 artifact. Pin its
-revision because the Hugging Face repository's unpinned `main` file is now the larger 21.22 GiB
-container-v2 artifact with DFlash weights:
+`scripts/download-qwen36-35b-a3b.bat` fetches this pinned revision and is the recommended way to
+get it. Pin the revision explicitly because the Hugging Face repository's unpinned `main` file can
+move:
 
 ```powershell
 hf download neroued/Qwen3.6-35B-A3B-NInfer `
   qwen3_6_35b_a3b.ninfer `
-  --revision c8b8c1c0df4c74df3c190c6aa3a7f24dc614721c `
+  --revision 560f227e5a7104756d1a108201a8aa75654ea688 `
   --local-dir models
 
 Get-FileHash .\models\qwen3_6_35b_a3b.ninfer -Algorithm SHA256
 ```
 
 Expected SHA-256:
-`9e8378398d2b789a77224b5110c7590adbbc6fd4accd139b918157b2b9da7163`.
+`1fb9ea0b5b8561e49d9604115ec89e5d9f2b6f6434e32c37c57fffd480a325d2`.
 
-The v0.5 runtime reader accepts both v1 and v2 containers. An error that says only
-`artifact magic is not NInfer version 1` comes from an older executable; replace it with the
+This is the 21.22 GiB container-v2 artifact, carrying the DFlash bundle needed for `--spec dflash`
+(the older `c8b8c1c0` pin predates it). The v0.5 runtime reader accepts both v1 and v2 containers.
+An error that says only `artifact magic is not NInfer version 1` comes from an older executable;
+replace it with the
 [v0.5.0 Windows release](https://github.com/Don-Chad/ninfer-3090/releases/tag/v0.5.0-rtx3090).
-Although v2 is readable, its DFlash-bearing payload is not the artifact used to qualify the 24 GB
-3090 cohort profiles, so pinned v1 remains the recommended download.
+
+**The extra 0.38 GiB costs nothing in VRAM unless you ask for DFlash.** The published RTX 3090
+concurrency measurements were taken against the smaller `c8b8c1c0` artifact, so the obvious worry
+is that this pin eats into the profiles they established. Measured, it does not: loading either
+revision with `--spec` unset reports byte-identical resident weights of **21,038,469,632 bytes**.
+Selecting `--spec dflash` is what maps the additional 410,053,632 bytes, and only then. The
+concurrency table below therefore still applies.
 
 ## Run the concurrent server
 
@@ -57,8 +64,8 @@ Prefix reuse is enabled by default; `--no-prefix-reuse` disables it. The server 
 Responses, OpenAI Chat Completions, and Anthropic Messages-compatible endpoints. Run
 `.\ninfer-serve.exe --help` for the complete option list.
 
-The compact 35B artifact does not contain DFlash weights. Do not select `--spec dflash`; the
-runtime reports the missing optional weights explicitly.
+`--spec dflash` needs the pinned `560f227e` artifact above. On the older compact `c8b8c1c0` one it
+is refused explicitly, with `DFlash was requested but this compact artifact has no DFlash weights`.
 
 ## Qwen3.8-27B C8/8K profile
 
