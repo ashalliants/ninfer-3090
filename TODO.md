@@ -1,6 +1,7 @@
 # TODO
 
-State as of 2026-09-08, after a clearing pass that closed fourteen items.
+State as of 2026-09-08, after a clearing pass that closed fourteen items and a KV-format
+measurement pass that produced §2b.
 
 Released: **v0.9.0-rtx3090** (Windows + Linux). Full suite **125/125** on this box, now including
 upstream's DFlash2 attention sweep, which had been skipped since the catch-up merge.
@@ -9,8 +10,85 @@ upstream's DFlash2 attention sweep, which had been skipped since the catch-up me
 body of work and it is finished. What remains is correctness, coverage needing hardware this box
 does not have, and measurement debt.
 
-In flight: #21 (this file), #26 (503 during startup), #27 (q4 SwiGLU retune), #29 (housekeeping),
-#30 (DFlash2 sweep).
+---
+
+## Start here if you are new to this box
+
+Written as a handoff. Everything below is state you cannot recover by reading the code or the git
+log, and getting it wrong costs hours.
+
+### The models on disk, and which is which
+
+`C:\Ninefer-3090\models\` — 111 GiB total, and only ~38 GiB free on `C:`, so **check free space
+before downloading anything**. Nothing here is in git; `models/` is gitignored.
+
+| file | bytes | what it is |
+|---|---:|---|
+| `qwen3_8_27b.ninfer` | 18,210,531,328 | Qwen3.**8**-27B dense. The default 27B for benchmarks. |
+| `qwen3_8_27b_dflash2.ninfer` | 20,437,336,576 | Same model **with the DFlash2 bundle**. Only artifact that can run `--spec dflash2`. |
+| `qwen3_6_35b_a3b.ninfer` | 22,783,246,080 | Qwen3.6-35B-A3B MoE at revision `560f227e`, **with DFlash**. The recommended one. |
+| `qwen3_6_35b_a3b_v1_no_dflash.ninfer` | 22,373,184,256 | The superseded `c8b8c1c0` revision. **Renamed from a `.pre-dflash.bak` suffix** — the loader rejects anything not ending `.ninfer`, which is why it could not be benchmarked until it was renamed. Kept only to re-run the DFlash-residency comparison; **20.84 GiB reclaimable** if that is not needed again. |
+| `qwen3_6_27b.ninfer` | 17,495,365,888 | Qwen3.**6**-27B at `faaa0c14`. A **different model family** from `qwen3_8_27b` — having one does not satisfy tests wanting the other. |
+| `qwen3_6_27b_nvfp4.ninfer` | 18,324,064,000 | NVFP4-*weight* variant of the above. Note this is a weight profile, unrelated to `--kv-dtype nvfp4`. |
+
+The `qwen3_8_` versus `qwen3_6_` prefix is the single easiest thing to get wrong here, and the
+failure mode is a test skipping rather than erroring.
+
+### Environment for the real-model tests
+
+```
+NINFER_QWEN3_8_27B_WEIGHTS=C:\Ninefer-3090\models\qwen3_8_27b.ninfer
+NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS=C:\Ninefer-3090\models\qwen3_8_27b_dflash2.ninfer
+NINFER_QWEN3_6_35B_A3B_WEIGHTS=C:\Ninefer-3090\models\qwen3_6_35b_a3b.ninfer
+NINFER_QWEN3_6_27B_WEIGHTS=C:\Ninefer-3090\models\qwen3_6_27b.ninfer
+NINFER_REAL_TEST_MAX_CONTEXT=8192      # only needed for the 35B
+```
+
+**Free VRAM decides whether these pass or skip**, not correctness — see §1.2. Close GPU clients
+first and check `nvidia-smi`.
+
+### Open pull requests
+
+- **#32 — `docs/config-calculator.html`.** Open, `CHANGES_REQUESTED`, and the review is right:
+  §2b lists its confirmed defects. Do not merge it as-is; README deliberately does **not** link to
+  it yet, precisely so master carries no pointer to a page that undercounts speculative memory.
+  Land §2b's fixes first, then add the links (README "Choosing a KV format", `docs/cli.md`,
+  `docs/perplexity.md`, `docs/rtx-3090-windows.md`).
+- **#34 — shell-script line endings.** Small and self-contained. Two launchers did not parse on
+  Linux at all; see the note below. Merge this one first, it touches nothing else.
+- A worktree at `.claude/worktrees/eager-baking-cascade` exists and has been used by a second agent
+  working the same branches. **Check `git worktree list` before assuming a branch is free**, and
+  `git fetch` before pushing: concurrent work on `fix/artifact-download-revisions` was duplicated
+  once this cycle because of exactly that.
+
+### Windows tooling hides Linux breakage, and did
+
+`scripts/run-qwen36-35b-a3b-c1-maxctx.sh` and `scripts/run-qwen38-c1-maxctx.sh` — the two launchers
+README recommends as *the* Linux entry point, both shipped in the Linux release archive — had CRLF
+committed and **would not parse on Linux at all**:
+
+```
+run-qwen36-35b-a3b-c1-maxctx.sh: line 84: syntax error near unexpected token `$'in\r''
+```
+
+Inside a `case` block the stray CR joins the `in` token. Those two files are the only ones with a
+`case`, which is why only they were fatal while the tree looked healthy. Fixed in #34, with the
+policy pinned in `.gitattributes` and a guard added to `check-linux-scripts.sh`.
+
+**The lesson is the part worth keeping.** Every tool on this box reported the tree clean: Git Bash
+strips CR on read so `bash -n` passed, `check-linux-scripts.sh` passed, and Git Bash's `grep`
+translates CR away so searching for them returned nothing — a loop using it called all 26 shell
+scripts clean while two were 141 and 114 CRLF pairs deep. `core.autocrlf=input` was already set and
+did not help, because the blobs predate it. It was visible only from **real Linux bash under WSL**,
+or by reading bytes with .NET. When something is claimed to work on Linux and has only been checked
+here, run it under `wsl -e bash` before believing it.
+
+### Measurement scripts
+
+`scripts/sweeps/` holds the PowerShell that produced every number in §2b, README's KV table and the
+calculator. They are committed because §2b asks for re-measurement and reconstructing them is an
+hour of work. Read `scripts/sweeps/README.md` first — it records which of them answer which
+question, and which one produced a wrong answer and why.
 
 ---
 
@@ -213,10 +291,24 @@ listed with the evidence so nobody has to re-derive it.
       | CUDA graph allowance | 12,582,912 | 90,177,536 | +74 MiB | **no** |
       | workspace | 159,981,568 | 159,981,568 | 0 | n/a |
 
-      `graphBytes` is hardcoded at 12,582,912, which is only right with speculation off. The
-      sequence delta contains an extra KV component that appears to scale with capacity rather than
-      being constant, so this cannot be patched as a flat per-mode offset — measure whether the
-      speculative KV term is per-token before choosing a shape for it.
+      `graphBytes` is hardcoded at 12,582,912, which is only right with speculation off.
+
+      **The speculative KV term is per-token, and it is one constant.** Measured across all six
+      formats on the 27B, MTP3 + draft head raises KV bytes/token by the same **6.26%** every time:
+
+      | format | none | mtp3+head | ratio |
+      |---|---:|---:|---:|
+      | `bf16` | 65,536 | 69,638.4 | 1.0626 |
+      | `int8` | 33,792 | 35,907.3 | 1.0626 |
+      | `fp8` | 33,024 | 35,091.2 | 1.0626 |
+      | `rk8v4` | 26,112 | 27,746.6 | 1.0626 |
+      | `k8v4` | 25,728 | 27,338.5 | 1.0626 |
+      | `nvfp4` | 18,432 | 19,585.8 | 1.0626 |
+
+      So the fix is a per-token multiplier on the cache plus a per-mode constant for the graph
+      allowance and sequence delta, not a flat offset. Only MTP3 + draft head was swept; DFlash and
+      DFlash2 need the same treatment before their rows can be trusted. Raw CSVs come from
+      `scripts/sweeps/kv-decode-with-speculation.ps1`.
 
 - [ ] **KV is allocated in 64-token pages; the page charges exact tokens.** `KV page groups
       4096 / 4096` at a 262,144 context is 64 tokens per group. A context just past a page boundary
@@ -285,6 +377,17 @@ doing:
 ---
 
 ## 5. Reproducibility
+
+- [ ] **The speculative decode sweep measures acceptance, not depth, and cannot be read like the
+      non-speculative one.** `scripts/sweeps/kv-decode-with-speculation.ps1` produced 35B INT8 at
+      212.19 tok/s on a 4,096-token cache and **316.83 tok/s on a 32,768-token one** — faster
+      deeper, which is not physical. Acceptance went 58.3% → 100% between those two points, and on
+      the fixed `bench_corpus.ids` a draft can simply be right every time on a repetitive stretch.
+      Several rows sit at exactly 100%. So those tok/s figures describe what the corpus does to the
+      draft, not what depth does to attention, and none of them are in README or the calculator for
+      that reason. Speculative throughput needs a corpus with realistic diversity, or many more
+      repetitions, before it means anything. The memory columns from the same run **are** sound —
+      they are read at load and do not depend on the corpus.
 
 - [ ] **The published perplexity figures for fp8, k8v4 and nvfp4 are single runs of a
       non-deterministic path.** README's six-format table and the calculator both carry

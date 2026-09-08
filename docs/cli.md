@@ -247,9 +247,15 @@ Use `--kv-dtype int8` for the recommended large-context quality profile; BF16 is
 Artifact identity selects the weight profile; `--kv-dtype` selects runtime KV storage. All six
 formats — `bf16`, `int8`, `fp8`, `rk8v4`, `k8v4`, `nvfp4` — are accepted on SM86; measured size,
 decode speed and perplexity for each are in
-[`docs/config-calculator.html`](config-calculator.html). `rk8v4` (RotorQuant: rotated INT8 keys
-with a packed signed int4 value plane) is the best all-round choice — about 23% smaller than int8
-with the flattest decode falloff measured, for about 0.08% perplexity. The prepared prompt must fit
+[`docs/config-calculator.html`](config-calculator.html). The Blackwell-only
+`mma.sync...kind::f8f6f4` restriction applies to FP8/NVFP4 *weights and activations*, not to KV
+storage, which is why this paragraph used to say `fp8` KV was rejected here.
+
+`rk8v4` is the best all-round choice: rotated INT8 keys with a packed signed int4 value plane,
+about 23% smaller than INT8 for about 0.082% perplexity, and the flattest decode curve of any
+format measured. `nvfp4` buys the most context — 45% smaller than INT8 — at about 13% of decode
+speed at a 32K cache depth. `fp8` and `k8v4` are each beaten by `rk8v4` on size, speed and quality
+together, so neither has a niche. The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.
 `--kv-capacity N` controls the shared physical Main Text KV pool independently and is rounded up to
 the 64-token page size. `--kv-capacity auto` loads the selected weights, measures the remaining GPU
