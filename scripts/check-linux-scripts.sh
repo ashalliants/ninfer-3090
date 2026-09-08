@@ -121,20 +121,38 @@ if [[ -n "${NINFER_TEST_FAKE_SIZE:-}" ]]; then
 fi
 CURL
 chmod +x "$tmp/bin/curl"
-PATH="$tmp/bin:$PATH" NINFER_MODEL_DIR="$tmp/models" "$root/download-qwen38-27b.sh" >/dev/null
-qwen36_35b_expected_size="$(sed -n 's/^expected_size=\([0-9]\+\)$/\1/p' "$root/download-qwen36-35b-a3b.sh")"
-PATH="$tmp/bin:$PATH" NINFER_MODEL_DIR="$tmp/models" NINFER_SKIP_SHA256=1   NINFER_TEST_FAKE_SIZE="$qwen36_35b_expected_size" "$root/download-qwen36-35b-a3b.sh" >/dev/null
-[[ -f "$tmp/models/qwen3_8_27b.ninfer" ]]
-[[ -f "$tmp/models/qwen3_6_35b_a3b.ninfer" ]]
+# Every downloader now pins a revision and verifies size and sha256 before promoting, so they are
+# all driven the same way: hand the fixture the script's own expected_size and skip the hash, which
+# proves the promotion path without needing a real 17 GB payload.
+expected_size_of() { sed -n 's/^expected_size=\([0-9]\+\)$/\1/p' "$root/$1.sh"; }
+for downloader in download-qwen38-27b download-qwen36-27b download-qwen36-35b-a3b; do
+  case "$downloader" in
+    download-qwen38-27b) model='qwen3_8_27b.ninfer' ;;
+    download-qwen36-27b) model='qwen3_6_27b.ninfer' ;;
+    download-qwen36-35b-a3b) model='qwen3_6_35b_a3b.ninfer' ;;
+  esac
+  size="$(expected_size_of "$downloader")"
+  if [[ -z "$size" ]]; then
+    printf '%s has no expected_size to verify against\n' "$downloader" >&2
+    exit 1
+  fi
+  PATH="$tmp/bin:$PATH" NINFER_MODEL_DIR="$tmp/models" NINFER_SKIP_SHA256=1 \
+    NINFER_TEST_FAKE_SIZE="$size" "$root/$downloader.sh" >/dev/null
+  if [[ ! -f "$tmp/models/$model" ]]; then
+    printf '%s did not promote a payload matching its pin to %s\n' "$downloader" "$model" >&2
+    exit 1
+  fi
+done
 
 # The other half of the contract. Above proves a payload matching the pin is promoted; this proves
 # one that does not is refused, which is the property the staging and checksum work exists for and
 # the one a regression would silently remove. Without NINFER_TEST_FAKE_SIZE the fixture writes an
 # empty file, so every pinned downloader should reject it, leave the real artifact path alone, and
 # keep the revision-scoped .part it was told to delete.
-rm -f -- "$tmp/models/qwen3_6_35b_a3b.ninfer"
-for downloader in download-qwen36-35b-a3b download-qwen36-27b; do
+rm -f -- "$tmp/models"/*.ninfer
+for downloader in download-qwen38-27b download-qwen36-35b-a3b download-qwen36-27b; do
   case "$downloader" in
+    download-qwen38-27b) model='qwen3_8_27b.ninfer' ;;
     download-qwen36-35b-a3b) model='qwen3_6_35b_a3b.ninfer' ;;
     download-qwen36-27b) model='qwen3_6_27b.ninfer' ;;
   esac

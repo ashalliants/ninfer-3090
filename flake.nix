@@ -153,11 +153,19 @@
           echo "Model ready: $model"
         '';
 
-      # Qwen3.8-27B (official artifact; validated at C1/C2/C4/C8 on RTX 3090).
+      # Qwen3.8-27B (official artifact; validated at C1/C2/C4/C8 on RTX 3090), pinned to match
+      # scripts/download-qwen38-27b.{sh,bat}. Those two already pinned this revision in their URL
+      # while this entry tracked main, so the same `nix run` and shell script could fetch different
+      # artifacts -- and neither verified what arrived. 18dfc887 is the revision every published
+      # 27B measurement in this repository was taken against: the local artifact hashes to the
+      # sha256 below, which is also what HuggingFace reports for it.
       download-qwen38-27b = mkDownload {
         name = "download-qwen38-27b";
         filename = "qwen3_8_27b.ninfer";
-        url = "https://huggingface.co/neroued/Qwen3.8-27B-NInfer/resolve/main/qwen3_8_27b.ninfer";
+        revision = "18dfc887423fa5aabf3cb56fac41490e462b3fab";
+        url = "https://huggingface.co/neroued/Qwen3.8-27B-NInfer/resolve/18dfc887423fa5aabf3cb56fac41490e462b3fab/qwen3_8_27b.ninfer";
+        expectedSize = 18210531328;
+        expectedSha256 = "eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e";
         description = "Qwen3.8-27B NInfer model";
       };
 
@@ -192,6 +200,14 @@
       # upstream artifact, so it is deliberately unpinned and deliberately writes to its own
       # filename: it is not the measured profile and it is not what the tests expect. Now that
       # download-qwen36-35b carries DFlash, this no longer exists to supply it.
+      #
+      # It is now the only downloader in the tree that cannot verify what it fetches, and that is
+      # inherent rather than an oversight: `main` can move between runs, so there is no size or
+      # hash to state and no safe way to resume a partial file. mkDownload therefore refuses to
+      # resume this one at all (see `resumable` above) -- an interrupted fetch restarts from zero
+      # rather than being spliced. A truncated download that still reaches the end of the stream
+      # cannot be detected here. Prefer download-qwen36-35b unless you are specifically testing a
+      # newer upstream artifact.
       download-qwen36-35b-v2 = mkDownload {
         name = "download-qwen36-35b-v2";
         filename = "qwen3_6_35b_a3b_v2.ninfer";

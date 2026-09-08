@@ -181,8 +181,9 @@ Both platforms ship a prebuilt archive; building from source is optional and cov
 1. Download and unpack the latest
    [Linux release](https://github.com/ashalliants/ninfer-3090/releases/latest)
    (`ninfer-rtx3090-linux-x64-*.tar.gz`).
-2. Run `./download-qwen36-35b-a3b.sh` or `./download-qwen38-27b.sh` to fetch a model. Interrupted
-   downloads resume.
+2. Run `./download-qwen36-35b-a3b.sh` or `./download-qwen38-27b.sh` to fetch a model. Both pin a
+   HuggingFace revision, stage under a revision-scoped name so a resume can only ever continue the
+   same artifact, and verify size and SHA-256 before promoting it. Interrupted downloads resume.
 3. Run a launcher — `./run-qwen36-35b-a3b-c1-maxctx.sh` is the recommended one.
 
 If you would rather build, the Dockerfile is the shortest path on Bazzite and other distributions:
@@ -199,7 +200,9 @@ The Linux guide covers the GPU check, the native Ubuntu build, model mounts and 
    [Windows release](https://github.com/ashalliants/ninfer-3090/releases/latest)
    (`ninfer-rtx3090-windows-x64-*.zip`).
 2. Double-click `download-qwen36-35b-a3b.bat` or `download-qwen38-27b.bat` to download a model.
-   Interrupted downloads resume.
+   Both pin a HuggingFace revision, stage under a revision-scoped name so a resume can only ever
+   continue the same artifact, and verify size and SHA-256 before promoting it. Interrupted
+   downloads resume.
 3. Double-click one launcher:
 
 | Launcher | Best for |
@@ -510,8 +513,18 @@ Linux users build the applications from source or use the Docker image. Windows 
 prebuilt archive, which includes the applications and required DLLs. Both platforms require an
 RTX 3090 or RTX 3090 Ti and a recent NVIDIA driver.
 
-Download the [official Qwen3.8 artifact](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) as
-`models/qwen3_8_27b.ninfer`. Windows users can run `download-qwen38-27b.bat` instead.
+Download the
+[pinned Qwen3.8 artifact](https://huggingface.co/neroued/Qwen3.8-27B-NInfer/tree/18dfc887423fa5aabf3cb56fac41490e462b3fab)
+as `models/qwen3_8_27b.ninfer`, or run `download-qwen38-27b.sh`/`.bat`, which verifies size and
+SHA-256 before putting the file in place. `18dfc887` is the revision every 27B number in this
+repository was measured against.
+
+**Every downloader shipped here is pinned and verified, with one deliberate exception.** The Nix
+app `download-qwen36-35b-v2` tracks upstream `main`, which is what it is for — trying a newer
+artifact than the measured one — and that is exactly why it cannot verify anything: a moving
+reference has no size or hash to state, and no partial file can be safely resumed against it. It
+writes to its own filename, refuses to resume, and is not the artifact the tests or the published
+figures use. Prefer a pinned downloader unless you specifically want a newer upstream build.
 
 For Qwen3.6-35B-A3B, download the
 [pinned container-v2 artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/tree/560f227e5a7104756d1a108201a8aa75654ea688)
