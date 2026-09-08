@@ -84,14 +84,44 @@ DeviceBuffer& DeviceBuffer::operator=(DeviceBuffer&& other) noexcept {
     return *this;
 }
 
+// The same contract for a fill: CUDA documents `cudaMemset` on device memory as asynchronous with
+// respect to the host, and it completes on the legacy stream, which a non-blocking stream does not
+// wait for. Unlike `copy_from_host` below this one has *not* been observed to race on this box --
+// tests/test_device_buffer_visibility.cu exercises it 90 times per run and has never caught it, so
+// on this driver the memset appears to complete before the call returns. That is an implementation
+// detail rather than a guarantee, and the sync costs nothing on a path every caller uses at setup,
+// so make the contract explicit rather than depend on the observation.
 void DeviceBuffer::fill(int byte_value) {
     if (bytes == 0) { return; }
     const cudaError_t err = cudaMemset(p, byte_value, bytes);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaMemset failed", err));
     }
+    const cudaError_t sync = cudaStreamSynchronize(nullptr);
+    if (sync != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("fill completion sync failed", sync));
+    }
 }
 
+// `cudaMemcpy` does not finish the transfer before it returns. CUDA's documented
+// synchronization behaviour for a host-to-device copy out of *pageable* memory is that the call
+// returns once the source has been staged for DMA, "but the DMA to final destination may not have
+// completed". That trailing DMA rides the legacy stream, and a stream created with
+// `cudaStreamNonBlocking` -- which is every stream `DeviceContext` owns -- is exempt from the
+// legacy stream's implicit ordering. So work enqueued on one of those streams immediately after
+// this call can, and does, read the destination before the copy lands.
+//
+// Measured on this RTX 3090 with a faithful replica of the sequence
+// tests/ops/test_attn_input_proj.cpp runs at graph replay phase 1 -- a 1,146,880-byte pageable
+// H2D, three `cudaMemsetAsync` on a non-blocking stream, then a captured graph launched on it --
+// the reader saw stale bytes in 146 of 200 iterations, up to 17.8% of the buffer, on an
+// *otherwise idle* GPU. Copies at or below ~256 KiB never raced; every size above it did.
+// tests/test_device_buffer_visibility.cu is that experiment, reduced.
+//
+// Synchronizing the legacy stream here costs one round trip on a path that is load-time setup in
+// every caller, and makes the method mean what its name says: on return, the bytes are visible to
+// any stream. Callers wanting an overlapped copy should use an explicitly stream-ordered one
+// (`cudaMemcpy2DAsync`, as the paged-KV and state-image pools already do) rather than this.
 void DeviceBuffer::copy_from_host(const void* source, std::size_t count, std::size_t byte_offset) {
     require_range(byte_offset, count, "host-to-device copy");
     if (count == 0) { return; }
@@ -99,6 +129,11 @@ void DeviceBuffer::copy_from_host(const void* source, std::size_t count, std::si
     const cudaError_t err = cudaMemcpy(destination, source, count, cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaMemcpy host-to-device failed", err));
+    }
+    const cudaError_t sync = cudaStreamSynchronize(nullptr);
+    if (sync != cudaSuccess) {
+        throw std::runtime_error(
+            cuda_error_message("host-to-device copy completion sync failed", sync));
     }
 }
 
