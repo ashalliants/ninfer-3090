@@ -521,6 +521,13 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         }
         if (has_next) {
             ninfer::ops::cp_wait<0>();
+            // `cp_wait<0>()` retires only the *calling thread's* cp.async group. Every thread in
+            // the block then walks the whole tile in dequant_k_tile(), reading bytes issued by
+            // other threads, so the wait has to be followed by a block barrier before the read --
+            // exactly as the prologue above does, and as the lambda's own comment requires. This
+            // one was missing it, and the same three kernels that omitted it (fp8, nvfp4, k8v4)
+            // are the three storage families recorded as not run-to-run deterministic.
+            __syncthreads();
             dequant_k_tile();
         }
         __syncthreads();

@@ -1,3 +1,4 @@
+#include "targets/guarded_main.h"
 #include "ninfer/engine.h"
 
 #include <algorithm>
@@ -7,7 +8,7 @@
 #include <string>
 #include <vector>
 
-int main() {
+int run_score_checks() {
     const char* artifact = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
     if (artifact == nullptr || *artifact == '\0') {
         std::cout << "SKIP: NINFER_QWEN3_6_27B_WEIGHTS is not set\n";
@@ -50,6 +51,9 @@ int main() {
         return 1;
     }
     float maximum_overlap_error = 0.0F;
+    float maximum_repeat_error  = 0.0F;
+    std::size_t repeat_differences = 0;
+    std::size_t first_repeat_index = suffix.size();
     for (std::size_t i = 0; i < suffix.size(); ++i) {
         if (!std::isfinite(all[i + 512]) || !std::isfinite(suffix[i])) {
             std::cerr << "causal scoring returned a non-finite logprob\n";
@@ -57,9 +61,24 @@ int main() {
         }
         maximum_overlap_error = std::max(maximum_overlap_error, std::abs(all[i + 512] - suffix[i]));
         if (suffix[i] != repeated[i]) {
-            std::cerr << "a repeated score window inherited prior State/KV\n";
-            return 1;
+            ++repeat_differences;
+            if (first_repeat_index == suffix.size()) { first_repeat_index = i; }
+            maximum_repeat_error =
+                std::max(maximum_repeat_error, std::abs(suffix[i] - repeated[i]));
         }
+    }
+    // Two windows scored identically must agree, but "disagree" has two very different causes and
+    // the old message asserted the worse one without measuring. State/KV leaking between windows
+    // moves logprobs by a visible amount; the reduction order varying between two runs of the same
+    // fp8 kernel moves them in the last bits. Print enough to tell them apart -- how many elements
+    // moved, by how much, and where the first one is -- instead of one sentence naming a cause.
+    if (repeat_differences != 0) {
+        std::cerr << "a repeated score window did not reproduce: " << repeat_differences << " of "
+                  << suffix.size() << " logprobs differ, worst |delta|=" << maximum_repeat_error
+                  << " first at index " << first_repeat_index << " (suffix="
+                  << suffix[first_repeat_index] << " repeated=" << repeated[first_repeat_index]
+                  << ")\n";
+        return 1;
     }
     if (maximum_overlap_error > 0.25F) {
         std::cerr << "overlapping target suffix changed by " << maximum_overlap_error << '\n';
@@ -68,3 +87,5 @@ int main() {
     std::cout << "OK causal_score_real max_overlap_error=" << maximum_overlap_error << '\n';
     return 0;
 }
+
+NINFER_GUARDED_TEST_MAIN(run_score_checks)
