@@ -228,12 +228,12 @@
         download-qwen36-35b = {
           type = "app";
           program = "${download-qwen36-35b}/bin/download-qwen36-35b";
-          meta.description = "Download the Qwen3.6-35B-A3B compact v1 .ninfer artifact (21 GB)";
+          meta.description = "Download the pinned Qwen3.6-35B-A3B .ninfer artifact, with DFlash (21 GB)";
         };
         download-qwen36-35b-v2 = {
           type = "app";
           program = "${download-qwen36-35b-v2}/bin/download-qwen36-35b-v2";
-          meta.description = "Download the Qwen3.6-35B-A3B upstream v2 .ninfer artifact (21 GB)";
+          meta.description = "Download the Qwen3.6-35B-A3B upstream main (unpinned) .ninfer artifact (21 GB)";
         };
       };
 
@@ -253,8 +253,8 @@
           echo "  nix run .#serve -- <serve args>          -> run the HTTP server"
           echo "  nix run .#download-qwen38-27b            -> Qwen3.8-27B artifact (17 GB)"
           echo "  nix run .#download-qwen36-27b            -> Qwen3.6-27B artifact"
-          echo "  nix run .#download-qwen36-35b           -> Qwen3.6-35B-A3B compact v1 (21 GB)"
-          echo "  nix run .#download-qwen36-35b-v2       -> Qwen3.6-35B-A3B upstream v2 (21 GB)"
+          echo "  nix run .#download-qwen36-35b           -> Qwen3.6-35B-A3B pinned, with DFlash (21 GB)"
+          echo "  nix run .#download-qwen36-35b-v2       -> Qwen3.6-35B-A3B upstream main, unpinned (21 GB)"
         '';
       };
     };
