@@ -14,7 +14,7 @@ echo "=== pipeline execution test $(date -u +%FT%TZ) ==="
 
 BRANCH="${NINFER_BRANCH:-feat/dual-gpu-graph-mode}"
 REPO="${NINFER_REPO:-https://github.com/ashalliants/ninfer-3090.git}"
-MODEL_URL="${MODEL_URL:-https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/resolve/c8b8c1c0df4c74df3c190c6aa3a7f24dc614721c/qwen3_6_35b_a3b.ninfer}"
+MODEL_URL="${MODEL_URL:-https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/resolve/560f227e5a7104756d1a108201a8aa75654ea688/qwen3_6_35b_a3b.ninfer}"
 MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-7200}"
 PROMPT="${PROMPT:-List the first eight prime numbers, then explain briefly why 1 is not prime.}"
 MAX_NEW="${MAX_NEW:-120}"

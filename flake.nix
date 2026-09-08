@@ -76,14 +76,61 @@
       # One resumable downloader per registered artifact, mirroring
       # scripts/download-*.sh. NINFER_MODEL_DIR overrides the target directory.
       mkDownload =
-        { name, filename, url, description }:
+        {
+          name,
+          filename,
+          url,
+          description,
+          revision ? null,
+          expectedSize ? null,
+          expectedSha256 ? null,
+        }:
         pkgs.writeShellScriptBin name ''
           set -euo pipefail
+          expected_size='${if expectedSize == null then "" else toString expectedSize}'
+          expected_sha256='${if expectedSha256 == null then "" else expectedSha256}'
+          stage='${if revision == null then "latest" else revision}'
+
           model_dir=''${NINFER_MODEL_DIR:-$HOME/models}
           model="$model_dir/${filename}"
+
+          # curl -C - resumes by appending at the current file length, without checking what wrote
+          # those bytes. Downloading straight onto "$model" therefore splices a leftover partial
+          # from one revision into another whenever a pin changes -- a file of plausible size that
+          # is corrupt throughout. Staging under a name that carries the revision means a resume
+          # can only ever continue the same artifact.
+          part="$model.$stage.part"
           mkdir -p "$model_dir"
+
+          if [ -n "$expected_size" ] && [ -f "$model" ] &&
+             [ "$(wc -c < "$model" | tr -d '[:space:]')" = "$expected_size" ]; then
+            echo "Model already present: $model"
+            exit 0
+          fi
+
           echo "Downloading ${description} to $model (resumable)..."
-          ${pkgs.curl}/bin/curl -L -C - --fail --output "$model" '${url}'
+          ${pkgs.curl}/bin/curl -L -C - --fail --output "$part" '${url}'
+
+          if [ -n "$expected_size" ]; then
+            actual_size="$(wc -c < "$part" | tr -d '[:space:]')"
+            if [ "$actual_size" != "$expected_size" ]; then
+              echo "Expected $expected_size bytes, got $actual_size. Delete $part and retry." >&2
+              exit 1
+            fi
+          fi
+
+          # Set NINFER_SKIP_SHA256=1 to skip: it costs a full re-read of the artifact. The size
+          # check above already rejects a truncated or spliced file.
+          if [ -n "$expected_sha256" ] && [ "''${NINFER_SKIP_SHA256:-0}" != '1' ]; then
+            actual_sha256="$(sha256sum -- "$part" | cut -d' ' -f1)"
+            if [ "$actual_sha256" != "$expected_sha256" ]; then
+              echo "Checksum mismatch (expected $expected_sha256, got $actual_sha256)." >&2
+              echo "Delete $part and retry." >&2
+              exit 1
+            fi
+          fi
+
+          mv -f -- "$part" "$model"
           echo "Model ready: $model"
         '';
 
@@ -95,28 +142,39 @@
         description = "Qwen3.8-27B NInfer model";
       };
 
-      # Qwen3.6-27B (groupwise artifact).
+      # Qwen3.6-27B (groupwise artifact), pinned to match scripts/download-qwen36-27b.sh.
       download-qwen36-27b = mkDownload {
         name = "download-qwen36-27b";
         filename = "qwen3_6_27b.ninfer";
-        url = "https://huggingface.co/neroued/Qwen3.6-27B-NInfer/resolve/main/qwen3_6_27b.ninfer";
+        revision = "faaa0c140d0a92743872256a8b78a954b3984018";
+        url = "https://huggingface.co/neroued/Qwen3.6-27B-NInfer/resolve/faaa0c140d0a92743872256a8b78a954b3984018/qwen3_6_27b.ninfer";
+        expectedSize = 17495365888;
+        expectedSha256 = "7b51600ffd10632b9660f56085efdd9b751d79733ad32036a652234b64bebe7b";
         description = "Qwen3.6-27B NInfer model";
       };
 
-      # Qwen3.6-35B-A3B compact v1 (pinned revision; the measured 24 GB profile).
+      # Qwen3.6-35B-A3B, pinned to match scripts/download-qwen36-35b-a3b.sh. 560f227e is the
+      # measured 24 GB profile *and* carries the DFlash bundle; the older c8b8c1c0 pin predates
+      # DFlash, so an artifact fetched with it cannot run --spec dflash.
       download-qwen36-35b = mkDownload {
         name = "download-qwen36-35b";
         filename = "qwen3_6_35b_a3b.ninfer";
-        url = "https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/resolve/c8b8c1c0df4c74df3c190c6aa3a7f24dc614721c/qwen3_6_35b_a3b.ninfer";
-        description = "Qwen3.6-35B-A3B compact v1 (pinned) model";
+        revision = "560f227e5a7104756d1a108201a8aa75654ea688";
+        url = "https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/resolve/560f227e5a7104756d1a108201a8aa75654ea688/qwen3_6_35b_a3b.ninfer";
+        expectedSize = 22783246080;
+        expectedSha256 = "1fb9ea0b5b8561e49d9604115ec89e5d9f2b6f6434e32c37c57fffd480a325d2";
+        description = "Qwen3.6-35B-A3B (pinned, with DFlash) model";
       };
 
-      # Qwen3.6-35B-A3B upstream v2 (includes DFlash payload; not the measured artifact).
+      # Whatever the repository currently calls main. Kept as an escape hatch for trying a newer
+      # upstream artifact, so it is deliberately unpinned and deliberately writes to its own
+      # filename: it is not the measured profile and it is not what the tests expect. Now that
+      # download-qwen36-35b carries DFlash, this no longer exists to supply it.
       download-qwen36-35b-v2 = mkDownload {
         name = "download-qwen36-35b-v2";
         filename = "qwen3_6_35b_a3b_v2.ninfer";
         url = "https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/resolve/main/qwen3_6_35b_a3b.ninfer";
-        description = "Qwen3.6-35B-A3B upstream v2 (with DFlash) model";
+        description = "Qwen3.6-35B-A3B upstream main (unpinned) model";
       };
     in
     {
