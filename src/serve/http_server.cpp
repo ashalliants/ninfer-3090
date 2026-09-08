@@ -535,8 +535,17 @@ void HttpServer::start_serving_during_startup() {
     // auth/request-ID middleware for the remainder of the process's life.
     startup_listener_ = std::thread([this] {
         // listen_after_bind() blocks here for the whole life of the server, spanning the switch
-        // from 503 to serving. stop() is what ends it.
-        startup_listener_result_.store(server_.listen_after_bind(), std::memory_order_release);
+        // from 503 to serving. stop() is what ends it. It can also throw before ever reaching
+        // that loop -- the task queue's thread pool spawns its worker threads here, and
+        // std::thread's constructor throws std::system_error under resource exhaustion. An
+        // exception escaping a thread function is std::terminate, so it is caught and folded into
+        // the same false result a synchronous listen() failure already produces.
+        bool result = false;
+        try {
+            result = server_.listen_after_bind();
+        } catch (const std::exception&) {
+        }
+        startup_listener_result_.store(result, std::memory_order_release);
     });
 }
 
