@@ -2,8 +2,13 @@ $ErrorActionPreference = 'Continue'
 Set-Location (Resolve-Path (Join-Path $PSScriptRoot '..\..'))
 $d = if ($env:NINFER_SWEEP_OUT) { $env:NINFER_SWEEP_OUT } else { 'profiles\sweeps' }
 
-# Reads the CSVs that kv-decode-vs-depth.ps1 leaves behind -- run that first. Pure arithmetic, no
-# GPU needed.
+# Reads the per-run CSVs that kv-decode-vs-depth.ps1 leaves in $NINFER_SWEEP_OUT -- run that first.
+# Pure arithmetic, no GPU needed.
+#
+# Note those CSVs are ninfer_bench's own full output, written by --output-file, and carry every
+# column including weights_capacity_bytes. They are NOT the six-column summary that sweep prints to
+# stdout; that summary is a convenience for reading progress and drops most of the fields. The
+# files are the artifact. (kv-decode-vs-depth.ps1 writes "<model>_<kv>.csv"; this reads the same.)
 #
 # RTX 3090: 384-bit GDDR6X at 19.5 Gbps = 936.2 GB/s theoretical. Decode is memory-bound: every
 # token streams the resident weights once, plus the KV it attends over. So achieved bandwidth
