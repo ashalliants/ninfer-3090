@@ -24,12 +24,12 @@ set "PART=%MODEL%.%REVISION%.part"
 if not exist "%MODEL_DIR%" mkdir "%MODEL_DIR%"
 
 if exist "%MODEL%" (
-  for %%A in ("%MODEL%") do set "FOUND_SIZE=%%~zA"
-  if "!FOUND_SIZE!"=="%EXPECTED_SIZE%" (
+  call :verify "%MODEL%"
+  if "!VERIFY_OK!"=="1" (
     echo Model already present: %MODEL%
     exit /b 0
   )
-  echo Existing %MODEL% is not revision %REVISION%; fetching the pinned one.
+  echo Existing %MODEL% did not verify against revision %REVISION%; fetching the pinned one.
 )
 
 echo Downloading the Qwen3.6-27B model (16.3 GiB)...
@@ -39,26 +39,37 @@ if errorlevel 1 (
   exit /b 1
 )
 
-for %%A in ("%PART%") do set "ACTUAL_SIZE=%%~zA"
-if not "!ACTUAL_SIZE!"=="%EXPECTED_SIZE%" (
-  echo Expected %EXPECTED_SIZE% bytes, got !ACTUAL_SIZE!. Delete "%PART%" and run this file again.
+call :verify "%PART%"
+if not "!VERIFY_OK!"=="1" (
+  echo Downloaded file at "%PART%" failed verification against revision %REVISION%. Delete it and run this file again.
   exit /b 1
-)
-
-rem Set NINFER_SKIP_SHA256=1 to skip this: it costs a full re-read of 16.3 GiB. The size check above
-rem already rejects a truncated or spliced file, so this one is here for silent corruption.
-if not "%NINFER_SKIP_SHA256%"=="1" (
-  for /f "skip=1 delims=" %%H in ('certutil -hashfile "%PART%" SHA256') do (
-    if not defined ACTUAL_SHA256 set "ACTUAL_SHA256=%%H"
-  )
-  set "ACTUAL_SHA256=!ACTUAL_SHA256: =!"
-  if /i not "!ACTUAL_SHA256!"=="%EXPECTED_SHA256%" (
-    echo Checksum mismatch ^(expected %EXPECTED_SHA256%, got !ACTUAL_SHA256!^).
-    echo Delete "%PART%" and run this file again.
-    exit /b 1
-  )
 )
 
 move /y "%PART%" "%MODEL%" >nul
 echo Model ready: %MODEL%
 echo Point the tests at it with:  set NINFER_QWEN3_6_27B_WEIGHTS=%MODEL%
+exit /b 0
+
+rem Verifies %1 against EXPECTED_SIZE and, unless NINFER_SKIP_SHA256=1, EXPECTED_SHA256, setting
+rem VERIFY_OK to 1 or 0. Used both for an existing MODEL (so a same-sized-but-corrupt file is not
+rem accepted forever just because it happened to pass once, or was replaced out from under this
+rem script) and for a freshly downloaded PART -- one check that cannot drift out of sync with
+rem itself. ACTUAL_SHA256 is cleared before the for /f loop below: setlocal inherits existing
+rem environment variables, so a stale ACTUAL_SHA256 left over from outside this script would
+rem otherwise survive "if not defined" and be compared unchanged.
+:verify
+set "VERIFY_OK=0"
+set "VERIFY_PATH=%~1"
+for %%A in ("%VERIFY_PATH%") do set "VERIFY_SIZE=%%~zA"
+if not "!VERIFY_SIZE!"=="%EXPECTED_SIZE%" exit /b 0
+if "%NINFER_SKIP_SHA256%"=="1" (
+  set "VERIFY_OK=1"
+  exit /b 0
+)
+set "ACTUAL_SHA256="
+for /f "skip=1 delims=" %%H in ('certutil -hashfile "%VERIFY_PATH%" SHA256') do (
+  if not defined ACTUAL_SHA256 set "ACTUAL_SHA256=%%H"
+)
+set "ACTUAL_SHA256=!ACTUAL_SHA256: =!"
+if /i "!ACTUAL_SHA256!"=="%EXPECTED_SHA256%" set "VERIFY_OK=1"
+exit /b 0

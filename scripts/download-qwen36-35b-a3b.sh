@@ -25,14 +25,36 @@ part="$model.$revision.part"
 
 file_size() { wc -c < "$1" | tr -d '[:space:]'; }
 
+# Verifies a file against expected_size and, unless NINFER_SKIP_SHA256=1, expected_sha256.
+# Used both for an existing "$model" (so a same-sized-but-corrupt file is not accepted forever
+# just because it happened to pass once, or was replaced out from under this script) and for a
+# freshly downloaded "$part" -- one check that cannot drift out of sync with itself. A missing
+# sha256sum/shasum fails closed rather than silently promoting an unverified file: the whole
+# reason this artifact is checksummed is to catch a same-sized-but-corrupt file, and silently
+# skipping that would defeat it, not just once, but for every future run on that host.
+verify() {
+  [ "$(file_size "$1")" = "$expected_size" ] || return 1
+  [ "${NINFER_SKIP_SHA256:-0}" = '1' ] && return 0
+  local actual
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum -- "$1" | cut -d' ' -f1)"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 -- "$1" | cut -d' ' -f1)"
+  else
+    printf 'No sha256sum or shasum found; cannot verify %s. Set NINFER_SKIP_SHA256=1 to accept it unverified.\n' "$1" >&2
+    return 1
+  fi
+  [ "$actual" = "$expected_sha256" ]
+}
+
 mkdir -p -- "$model_dir"
 
 if [ -f "$model" ]; then
-  if [ "$(file_size "$model")" = "$expected_size" ]; then
+  if verify "$model"; then
     printf 'Model already present: %s\n' "$model"
     exit 0
   fi
-  printf '%s\n' "Existing $model is not revision $revision; fetching the pinned one." >&2
+  printf '%s\n' "Existing $model did not verify against revision $revision; fetching the pinned one." >&2
 fi
 
 printf '%s\n' 'Downloading the RTX 3090-compatible Qwen3.6-35B-A3B vision model (21.2 GiB)...'
@@ -42,29 +64,10 @@ if ! curl -L -C - --fail --output "$part" \
   exit 1
 fi
 
-actual_size="$(file_size "$part")"
-if [ "$actual_size" != "$expected_size" ]; then
-  printf 'Expected %s bytes, got %s. Delete %s and run this script again.\n' \
-    "$expected_size" "$actual_size" "$part" >&2
+if ! verify "$part"; then
+  printf 'Downloaded file at %s failed verification against revision %s. Delete it and run this script again.\n' \
+    "$part" "$revision" >&2
   exit 1
-fi
-
-# Set NINFER_SKIP_SHA256=1 to skip this: it costs a full re-read of 21.2 GiB. The size check above
-# already rejects a truncated or spliced file, so this one is here for silent corruption.
-if [ "${NINFER_SKIP_SHA256:-0}" != '1' ]; then
-  if command -v sha256sum >/dev/null 2>&1; then
-    actual_sha256="$(sha256sum -- "$part" | cut -d' ' -f1)"
-  elif command -v shasum >/dev/null 2>&1; then
-    actual_sha256="$(shasum -a 256 -- "$part" | cut -d' ' -f1)"
-  else
-    actual_sha256=''
-    printf '%s\n' 'No sha256sum or shasum found; skipping the checksum.' >&2
-  fi
-  if [ -n "$actual_sha256" ] && [ "$actual_sha256" != "$expected_sha256" ]; then
-    printf 'Checksum mismatch (expected %s, got %s). Delete %s and run this script again.\n' \
-      "$expected_sha256" "$actual_sha256" "$part" >&2
-    exit 1
-  fi
 fi
 
 mv -f -- "$part" "$model"

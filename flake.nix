@@ -108,8 +108,25 @@
           part="$model.$stage.part"
           mkdir -p "$model_dir"
 
-          if [ -n "$expected_size" ] && [ -f "$model" ] &&
-             [ "$(wc -c < "$model" | tr -d '[:space:]')" = "$expected_size" ]; then
+          # Verifies a path against expected_size and, unless NINFER_SKIP_SHA256=1,
+          # expected_sha256 (either check is skipped if its expected value is empty, i.e. for the
+          # unpinned entries, which supply neither). Used both for an existing "$model" -- so a
+          # same-sized-but-corrupt file is not accepted forever just because it happened to pass
+          # once, or was replaced out from under this script -- and for a freshly downloaded
+          # "$part", as one check that cannot drift out of sync with itself.
+          verify() {
+            if [ -n "$expected_size" ]; then
+              [ "$(wc -c < "$1" | tr -d '[:space:]')" = "$expected_size" ] || return 1
+            fi
+            if [ -n "$expected_sha256" ] && [ "''${NINFER_SKIP_SHA256:-0}" != '1' ]; then
+              local actual_sha256
+              actual_sha256="$(sha256sum -- "$1" | cut -d' ' -f1)"
+              [ "$actual_sha256" = "$expected_sha256" ] || return 1
+            fi
+            return 0
+          }
+
+          if [ -f "$model" ] && verify "$model"; then
             echo "Model already present: $model"
             exit 0
           fi
@@ -123,23 +140,9 @@
             ${pkgs.curl}/bin/curl -L --fail --output "$part" '${url}'
           fi
 
-          if [ -n "$expected_size" ]; then
-            actual_size="$(wc -c < "$part" | tr -d '[:space:]')"
-            if [ "$actual_size" != "$expected_size" ]; then
-              echo "Expected $expected_size bytes, got $actual_size. Delete $part and retry." >&2
-              exit 1
-            fi
-          fi
-
-          # Set NINFER_SKIP_SHA256=1 to skip: it costs a full re-read of the artifact. The size
-          # check above already rejects a truncated or spliced file.
-          if [ -n "$expected_sha256" ] && [ "''${NINFER_SKIP_SHA256:-0}" != '1' ]; then
-            actual_sha256="$(sha256sum -- "$part" | cut -d' ' -f1)"
-            if [ "$actual_sha256" != "$expected_sha256" ]; then
-              echo "Checksum mismatch (expected $expected_sha256, got $actual_sha256)." >&2
-              echo "Delete $part and retry." >&2
-              exit 1
-            fi
+          if ! verify "$part"; then
+            echo "Downloaded file at $part failed verification. Delete it and retry." >&2
+            exit 1
           fi
 
           mv -f -- "$part" "$model"
