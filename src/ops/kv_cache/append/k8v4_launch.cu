@@ -4,6 +4,7 @@
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/kv_cache/append/k8v4_kernel.cuh"
+#include "ops/kv_cache/plane_types.h"
 
 #include <cstdint>
 
@@ -15,11 +16,19 @@ constexpr int kBlock = 256;
 template <typename Geometry, typename CacheView, typename Metadata>
 void launch_k8v4_for(const Tensor& k, const Tensor& v, const Tensor& positions, CacheView cache,
                      Metadata metadata, cudaStream_t stream) {
-    const auto tokens = static_cast<std::int32_t>(k.ne[2]);
-    auto* cache_k     = static_cast<std::uint8_t*>(cache.k_pages.data);
-    auto* cache_v     = static_cast<std::uint8_t*>(cache.v_pages.data);
-    auto* scale_k     = static_cast<__half*>(cache.k_scale_pages.data);
-    auto* scale_v     = static_cast<std::uint8_t*>(cache.v_scale_pages.data);
+    // K8V4 is the one storage that mixes scale codings within a single cache: an FP16 scale over
+    // the FP8 key plane and a raw E4M3 byte over the NVFP4 value plane. Naming these from the
+    // profile keeps that asymmetry in one place -- and note that "k8v4" here means
+    // Fp8KeyNvfp4Value, not the similarly abbreviated rk8v4 (RotatedInt8KeyInt4ValueGroup64),
+    // whose key plane is INT8 and whose value scale is FP16.
+    constexpr auto kStorage = KvCacheStorage::Fp8KeyNvfp4Value;
+    const auto tokens       = static_cast<std::int32_t>(k.ne[2]);
+    auto* cache_k           = static_cast<KvKeyCodeT<kStorage>*>(cache.k_pages.data);
+    auto* cache_v           = static_cast<KvValueCodeT<kStorage>*>(cache.v_pages.data);
+    auto* scale_k           = static_cast<KvKeyScaleT<kStorage>*>(cache.k_scale_pages.data);
+    auto* scale_v           = static_cast<KvValueScaleT<kStorage>*>(cache.v_scale_pages.data);
+    assert_kv_planes<kStorage, decltype(cache_k), decltype(cache_v), decltype(scale_k),
+                     decltype(scale_v)>();
     if (tokens >= 128 && Geometry::KVHeads == 2) {
         constexpr int TokensPerTile = 8;
         const int max_tiles         = div_up(tokens + TokensPerTile - 1, TokensPerTile);

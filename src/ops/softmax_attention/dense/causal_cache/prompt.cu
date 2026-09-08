@@ -41,6 +41,13 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
         const Tensor& cache_k_scale = cache.k_scale_pages;
         const Tensor& cache_v_scale = cache.v_scale_pages;
+        // The INT8 family is the one place that deliberately does not take its plane types from
+        // ops/kv_cache/plane_types.h. One kernel serves both codings, so its value parameter is
+        // std::int8_t* for int8-g64 and for rk8v4 alike, and the packed-int4 path re-casts to
+        // std::uint8_t where it unpacks (causal_prompt_i4_dequant_f16x8). Substituting
+        // KvValueCodeT<RotatedInt8KeyInt4ValueGroup64>, which is U8 because the profile describes
+        // the plane's storage rather than this kernel's signature, would not be a cleanup. Leave
+        // it; the dtype check below is the guard that matters here.
         // A U8 value plane is the rk8v4 packed signed int4 coding.
         if (cache_v.dtype == DType::U8) {
             causal_attention_prompt_i8_kernel<Geometry, Metadata, true>

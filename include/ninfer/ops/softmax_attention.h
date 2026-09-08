@@ -30,8 +30,8 @@ struct ContextAttentionExecutionEnvelope {
  *
  * Every entry computes stable scaled dot-product Softmax Attention. Query head h reads KV head
  * floor(h / (Hq/Hkv)). Public BF16 inputs and persistent cache rows are interpreted after their
- * storage boundary. In the BFloat16 cache profile, K is stored as BF16 and V as
- * FP16_RNE(BF16 input). For a declared visible key set J, the independent mathematical oracle is
+ * storage boundary. In the BFloat16 cache profile, K and V are both stored as BF16.
+ * For a declared visible key set J, the independent mathematical oracle is
  *
  *   score[j]       = scale * dot(FP64(q[:,h,i]), FP64(k[:,kvh,j]))
  *   probability[j] = exp(score[j] - max(score)) / sum_x exp(score[x] - max(score))
@@ -68,6 +68,8 @@ struct ContextAttentionExecutionEnvelope {
  * paths are implementation profiles rather than extra public tensor boundaries. Every cache route
  * has one named numerical criterion and is checked directly against its independent oracle;
  * route-to-route parity is only supplementary evidence.
+ * Newly appended rows cross their specified persistent codec boundary before attention
+ * observes them.
  * Those criteria apply to the registered geometries, tested extents, conformance matrix, and
  * target-representative activation range; they are not universal error bounds for arbitrary
  * adversarial BF16 tensors.
@@ -142,7 +144,8 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  *
  * The caller guarantees that the maximum p+1 over live rows lies within envelope. The envelope is
  * a host launch/workspace resource promise over that batch maximum, not a mask and not persistent
- * state. Inputs, output, every cache plane/table, and live workspace suballocations are pairwise
+ * state. A masked physical width may exceed max_visible_keys when its live prefix is shorter.
+ * Inputs, output, every cache plane/table, and live workspace suballocations are pairwise
  * non-overlapping. The Op overwrites every addressed cache row but owns no cache allocation,
  * frontier, request identity, or commit authority.
  */
@@ -183,7 +186,7 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
  * The registered profile is D=128, Hq=32, Hkv=8 (group 4), scale=1/sqrt(128), T=1..16, and
  * B=1..8. q/out are contiguous BF16 [128,32,T,B], query_k/query_v are contiguous BF16
  * [128,8,T,B], and context_lengths, valid_columns, and table_rows are contiguous device I32 [B].
- * The read-only paged BFloat16 context uses head-major BF16 K and FP16 V planes
+ * The read-only paged BFloat16 context uses head-major BF16 K and V planes
  * [128,64,Nphysical,8].
  *
  * For row b, let L=context_lengths[b] and V=valid_columns[b]. Every live query i<V attends the

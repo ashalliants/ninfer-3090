@@ -51,6 +51,20 @@ if(MSVC)
   # CUDA's static runtime requests LIBCMT even when the application and vcpkg dependencies use
   # the project-wide /MD runtime. Keep one CRT in the final process.
   add_link_options(/NODEFAULTLIB:LIBCMT)
+else()
+  # Schedule dispatch in this project is a switch per Op mapping a schedule id to a kernel launch,
+  # and a missing `return` there is close to invisible: the Op runs the intended kernel and then
+  # the next case's kernel over the top of it. Both compute the same result, so the output stays
+  # correct, every test passes, and the only symptom is that the Op costs twice what it should.
+  # Two of these shipped in the last catch-up merge (q4_q5 attention input, q5 linear add) and
+  # both were dormant because the live route table never selected the affected schedule.
+  #
+  # MSVC has no cheap equivalent -- C26819 needs /analyze -- so on Windows this is caught by
+  # review and by comparing an Op's measured cost against its chosen kernel's. On every other
+  # toolchain, and therefore in the direction upstream merges arrive from, it is a build error.
+  add_compile_options(
+    $<$<COMPILE_LANGUAGE:C,CXX>:-Wimplicit-fallthrough>
+    $<$<COMPILE_LANGUAGE:C,CXX>:-Werror=implicit-fallthrough>)
 endif()
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)

@@ -73,9 +73,9 @@ output capacity for the inserted suffix and the answer:
 
 GPU residency is frozen when the Engine starts:
 
-- no `--spec` omits MTP/DFlash weights and state and the optimized proposal head;
-- `--spec mtp` loads only MTP, while `--spec dflash` loads only the 35B-A3B text-only DFlash
-  backend;
+- no `--spec` omits MTP/DFlash/DFlash2 weights and state and the optimized proposal head;
+- `--spec mtp`, `--spec dflash` (35B-A3B), and `--spec dflash2` (Qwen3.8-27B) load only
+  the selected speculative backend;
 - a speculative backend with the full proposal head omits the optimized proposal head;
 - Vision is disabled by default, omitting its weights and Vision-specific unified-workspace extent;
 - `--vision` loads the weights, expands the one Program workspace for Vision encode/handoff, and
@@ -83,9 +83,11 @@ GPU residency is frozen when the Engine starts:
 - the one-request CLI uses root-only context mode, so it does not reserve an extra Device
   checkpoint StateImage or capture a continuation that no later request could consume.
 
-The complete `.ninfer` inventory is still validated. These choices are not lazy loading: a
-text-only Engine rejects media and cannot enable Vision later. DFlash and Vision are mutually
-exclusive. The default speculative and Vision settings produce the smallest resident profile.
+The complete `.ninfer` inventory is still validated. These choices are not lazy loading: an Engine
+started without Vision rejects media and cannot enable Vision later. DFlash/DFlash2 and Vision may
+be enabled together; these backends apply to generated-text decode after multimodal prefill and does not
+accelerate Vision encode. The default speculative and Vision settings produce the smallest resident
+profile.
 
 ## Structured messages
 
@@ -149,8 +151,9 @@ long-decode, and long-context inputs.
 ## Speculative decoding
 
 Speculative decoding is disabled by default. Select MTP with one to five draft positions, or the
-35B-A3B text-only DFlash backend with one to fifteen. `--lm-head-draft` selects the optimized
-proposal head and requires a selected backend:
+35B-A3B DFlash or Qwen3.8-27B DFlash2 backend with one to fifteen. Both masked-draft backends
+may be combined with `--vision`.
+`--lm-head-draft` selects the optimized proposal head and requires a selected backend:
 
 ```bash
 ./build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
@@ -172,10 +175,17 @@ For DFlash:
   --spec dflash --draft-tokens 7 --lm-head-draft
 ```
 
-MTP and DFlash cannot be enabled together. The published [performance results](performance.md)
+For Qwen3.8-27B artifacts containing the DFlash2 companion weights, select
+`--spec dflash2 --draft-tokens 7`, optionally with `--lm-head-draft` and `--vision`.
+DFlash2 accepts every draft count from 1 through 15; seven is the checkpoint recommendation.
+Both `groupwise-int` and `nvfp4` artifacts use the same Engine route, including CUDA Graph,
+concurrent requests, sampling penalties, and prefix reuse. An artifact without the companion
+weights reports a missing DFlash2 capability when selected.
+
+Only one speculative backend can be enabled per Engine. The published [performance results](performance.md)
 use MTP with three draft tokens and DFlash with seven draft tokens (block length eight), both with
 the optimized proposal head. DFlash accepts one to fifteen draft tokens; seven forms the measured
-block length eight, while fifteen uses the full native block.
+block length eight, while fifteen uses the maximum supported block length sixteen.
 
 ## Common options
 
@@ -188,9 +198,9 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
-| `--kv-dtype bf16\|int8\|rk8v4` | KV-cache storage. `rk8v4` is opt-in RotorQuant; `fp8` parses but is rejected on SM86 | `bf16` |
-| `--spec mtp\|dflash` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
+| `--kv-dtype bf16\|int8\|fp8\|rk8v4\|nvfp4\|k8v4` | KV-cache storage. `rk8v4` is opt-in RotorQuant; all six are accepted on this fork's sm_86/sm_89 targets | `bf16` |
+| `--spec mtp\|dflash\|dflash2` | speculative backend | off |
+| `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--vision-residency resident\|overlay` | `overlay` keeps the Vision tower host-pinned and borrows device memory per image from the evictable text weight tail (no resident Vision cost; needs CUDA VMM) | `resident` |

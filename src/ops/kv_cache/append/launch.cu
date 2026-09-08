@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/kv_cache/append/kernel.cuh"
+#include "ops/kv_cache/plane_types.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -120,11 +121,13 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
     const std::int64_t elements = static_cast<std::int64_t>(tokens) * Geometry::KVHeads *
                                   (kKVCacheAppendFullHeadDim / VecElems);
     const int fill_grid = static_cast<int>(div_up(elements, static_cast<std::int64_t>(Block)));
+    using CacheKey   = KvKeyCodeT<KvCacheStorage::BFloat16>;
+    using CacheValue = KvValueCodeT<KvCacheStorage::BFloat16>;
+    assert_kv_code_planes<KvCacheStorage::BFloat16, CacheKey, CacheValue>();
     kv_cache_append_full_bf16_kernel<Geometry, Metadata><<<fill_grid, Block, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
         static_cast<const std::int32_t*>(positions.data), metadata,
-        static_cast<__nv_bfloat16*>(cache_k.data), static_cast<__nv_bfloat16*>(cache_v.data),
-        tokens);
+        static_cast<CacheKey*>(cache_k.data), static_cast<CacheValue*>(cache_v.data), tokens);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -140,8 +143,10 @@ void launch_paged(const Tensor& k, const Tensor& v, const Tensor& positions, con
                   const KVCacheAppendPrefixPlan& plan, cudaStream_t stream) {
     validate_plan(k, plan);
     if (plan.max_count == 0) return;
-    auto* cache_k       = static_cast<__nv_bfloat16*>(cache.k_pages.data);
-    auto* cache_v       = static_cast<__nv_bfloat16*>(cache.v_pages.data);
+    assert_kv_code_planes<KvCacheStorage::BFloat16, KvKeyCodeT<KvCacheStorage::BFloat16>,
+                          KvValueCodeT<KvCacheStorage::BFloat16>>();
+    auto* cache_k       = static_cast<KvKeyCodeT<KvCacheStorage::BFloat16>*>(cache.k_pages.data);
+    auto* cache_v       = static_cast<KvValueCodeT<KvCacheStorage::BFloat16>*>(cache.v_pages.data);
     const auto* input_k = static_cast<const __nv_bfloat16*>(k.data);
     const auto* input_v = static_cast<const __nv_bfloat16*>(v.data);
     const auto* pos     = static_cast<const std::int32_t*>(positions.data);
@@ -156,10 +161,10 @@ void launch_paged(const Tensor& k, const Tensor& v, const Tensor& positions, con
     CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_cyclic(const Tensor& k, const Tensor& v, const Tensor& positions, const Tensor& counts,
-                   const Tensor& lanes, CyclicKVCacheLayerView cache,
-                   const KVCacheAppendPrefixPlan& plan, cudaStream_t stream) {
-    validate_plan(k, plan);
+template <int Capacity>
+void launch_cyclic_profile(const Tensor& k, const Tensor& v, const Tensor& positions,
+                           const Tensor& counts, const Tensor& lanes, CyclicKVCacheLayerView cache,
+                           const KVCacheAppendPrefixPlan& plan, cudaStream_t stream) {
     if (plan.max_count == 0) return;
     auto* cache_k       = static_cast<__nv_bfloat16*>(cache.k.data);
     auto* cache_v       = static_cast<__nv_bfloat16*>(cache.v.data);
@@ -170,11 +175,36 @@ void launch_cyclic(const Tensor& k, const Tensor& v, const Tensor& positions, co
     const auto* lane    = static_cast<const std::int32_t*>(lanes.data);
     const int padded    = static_cast<int>(cache.padded_capacity);
 
-    const dim3 grid(1 + (plan.max_count - 1) / 4, k.ne[3], 1);
-    kv_cache_append_prefix_cyclic_kernel<<<grid, kBlock, 0, stream>>>(
-        input_k, input_v, pos, count, lane, cache_k, cache_v, plan.min_count, plan.max_count,
-        plan.tokens, padded);
-    CUDA_CHECK(cudaGetLastError());
+    const auto launch = [&]<int Threads>() {
+        constexpr int UnitsPerToken = 128;
+        const dim3 grid((plan.max_count * UnitsPerToken + Threads - 1) / Threads, k.ne[3], 1);
+        kv_cache_append_prefix_cyclic_kernel<Capacity, Threads>
+            <<<grid, Threads, 0, stream>>>(input_k, input_v, pos, count, lane, cache_k, cache_v,
+                                           plan.min_count, plan.max_count, plan.tokens, padded);
+        CUDA_CHECK(cudaGetLastError());
+    };
+    // A half-token per CTA exposes enough independent copies for decode prefixes. At
+    // larger envelopes, one token per CTA reduces scheduling cost without serializing copies.
+    if (plan.max_count * k.ne[3] <= 128)
+        launch.template operator()<64>();
+    else
+        launch.template operator()<128>();
+}
+
+void launch_cyclic(const Tensor& k, const Tensor& v, const Tensor& positions, const Tensor& counts,
+                   const Tensor& lanes, CyclicKVCacheLayerView cache,
+                   const KVCacheAppendPrefixPlan& plan, cudaStream_t stream) {
+    validate_plan(k, plan);
+    switch (cache.capacity) {
+    case 2048:
+        launch_cyclic_profile<2048>(k, v, positions, counts, lanes, cache, plan, stream);
+        return;
+    case 4096:
+        launch_cyclic_profile<4096>(k, v, positions, counts, lanes, cache, plan, stream);
+        return;
+    default:
+        throw std::invalid_argument("kv_cache_append_prefix: unsupported cyclic capacity");
+    }
 }
 
 } // namespace

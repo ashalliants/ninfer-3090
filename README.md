@@ -520,6 +520,15 @@ The server supports:
 
 See [HTTP serving](docs/serving.md) and [CLI usage](docs/cli.md).
 
+Qwen3.8-27B artifacts carrying the DFlash2 companion weights support
+`--spec dflash2 --draft-tokens 7`, with draft counts 1..15 and either full or optimized
+proposal heads. **DFlash2 runs with `--vision`**, verified on a 3090 against the committed
+`image_chart` fixture: target verification carries its own continuation RoPE position, so a
+multimodal row keeps its per-sequence `rope_delta` through verification rather than being
+re-indexed by DFlash's logical positions. On that fixture it accepts 85.7% of drafts (7.00
+tokens/round) and produces byte-identical output to the non-speculative vision run. `--spec
+dflash` (v1) is a 35B-A3B backend and is refused by a 27B artifact, with or without vision.
+
 ## How cohort batching works
 
 The C number is the maximum number of requests NInfer can run together. C1 favors one interactive
@@ -588,6 +597,16 @@ See [CONTRIBUTORS.md](CONTRIBUTORS.md) for the complete, maintained credit list.
 Please read the [Pull Request Policy](PR_POLICY.md) before opening an issue or pull request.
 It explains how to keep changes focused and how to document correctness, performance, VRAM, and
 compatibility evidence.
+
+## Support
+
+NInfer is a personal project that I develop out of interest. If you find it useful and would like
+to support its continued development, you can [support the project on Ko-fi](https://ko-fi.com/neroued).
+
+Support is entirely voluntary. It is not a purchase or investment and does not come with financial
+returns, promised services or features, or a role in project decisions. The project's direction,
+priorities, technical choices, and release schedule remain independently determined by the
+maintainer.
 
 ## License
 

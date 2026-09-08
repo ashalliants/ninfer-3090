@@ -54,43 +54,19 @@ static_assert(kCausalPromptI8Groups == 4);
 static_assert(kCausalPromptI8DConsumers == 4);
 static_assert(kCausalPromptI8SmemBytes == 93184);
 
-__device__ __forceinline__ int4 causal_prompt_i8_dequant_f16x8(const std::int8_t* codes8,
-                                                               __half scale) {
-    const int2 raw       = load_vec<int2>(codes8);
-    const std::int8_t* c = reinterpret_cast<const std::int8_t*>(&raw);
-    const __half2 s2     = __halves2half2(scale, scale);
-    unsigned packed[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const __half2 code2 =
-            __floats2half2_rn(static_cast<float>(c[2 * i]), static_cast<float>(c[2 * i + 1]));
-        const __half2 value2 = __hmul2(code2, s2);
-        packed[i]            = *reinterpret_cast<const unsigned*>(&value2);
-    }
-    return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
-                     static_cast<int>(packed[2]), static_cast<int>(packed[3]));
-}
-
-// rk8v4 values arrive as two signed 4-bit codes per byte, low nibble first, so the eight
-// dimensions the INT8 helper reads from eight bytes come from four. Output is the same packed
-// FP16 int4, which keeps the PV stage identical for both codings.
-__device__ __forceinline__ int4 causal_prompt_i4_dequant_f16x8(const std::uint8_t* packed4,
-                                                               __half scale) {
-    const unsigned raw        = load_vec<unsigned>(packed4);
-    const std::uint8_t* bytes = reinterpret_cast<const std::uint8_t*>(&raw);
-    const __half2 s2          = __halves2half2(scale, scale);
-    unsigned packed[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const __half2 code2 = __floats2half2_rn(
-            static_cast<float>(kv_cache_int4_unpack(bytes[i], 0)),
-            static_cast<float>(kv_cache_int4_unpack(bytes[i], 1)));
-        const __half2 value2 = __hmul2(code2, s2);
-        packed[i]            = *reinterpret_cast<const unsigned*>(&value2);
-    }
-    return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
-                     static_cast<int>(packed[2]), static_cast<int>(packed[3]));
-}
+// The f16 value loaders this kernel needs now live in ops/kv_cache/int8_g64_codec.cuh, beside their
+// bf16 counterparts: kv_cache_int8_dequant_f16x8_from and kv_cache_int4_dequant_f16x8_from. They
+// used to be defined locally here, which is precisely why upstream's small-T kernel reached for the
+// *bf16* loader when it needed f16 codes -- the shared codec looked like it had no f16 variant for
+// the INT8 codings, and bf16 and f16 are the same width, so the mistake compiled and silently
+// reinterpreted every value.
+//
+// The shared versions take a float scale and multiply in FP32 before the single rounding to f16,
+// where these took a __half and multiplied in half2. That is the same result, not an approximation
+// of it: an int8 code carries at most 8 significant bits and an f16 scale at most 11, so their
+// product needs at most 19 and is exact in FP32's 24-bit mantissa. Both forms therefore round
+// exactly once, to the same value. Verified empirically as well -- every OP_ERROR_STATS line in
+// ninfer_softmax_attention_test is byte-identical across the change.
 
 // PackedValues selects the rk8v4 half-width value plane. Packed bytes are staged into the leading
 // half of the same V slot the INT8 coding uses, so the shared-memory footprint and therefore the
@@ -445,13 +421,15 @@ __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
                         vs = v_scale_s[key_l * VGroups + grp];
                     }
                     vs = __shfl_sync(FullMask, vs, lane & ~(VLanesPerGroup - 1));
+                    const float vsf = __half2float(vs);
                     if constexpr (PackedValues) {
-                        store_vec(dst, causal_prompt_i4_dequant_f16x8(
+                        store_vec(dst, kv_cache_int4_dequant_f16x8_from(
                                            reinterpret_cast<const std::uint8_t*>(v_i8) +
                                                key_l * D + (d >> 1),
-                                           vs));
+                                           vsf));
                     } else {
-                        store_vec(dst, causal_prompt_i8_dequant_f16x8(&v_i8[key_l * D + d], vs));
+                        store_vec(dst,
+                                  kv_cache_int8_dequant_f16x8_from(&v_i8[key_l * D + d], vsf));
                     }
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));

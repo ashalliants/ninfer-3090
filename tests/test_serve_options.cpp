@@ -127,12 +127,21 @@ int main() {
     failures += check(dflash.speculative.proposal_head == ninfer::ProposalHead::Optimized,
                       "--lm-head-draft did not select the optimized proposal head");
 
-    bool dflash_vision_rejected = false;
-    try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--spec", "dflash", "--draft-tokens", "15",
-                     "--vision"});
-    } catch (const std::invalid_argument&) { dflash_vision_rejected = true; }
-    failures += check(dflash_vision_rejected, "DFlash and Vision were accepted together");
+    for (const auto k : {1U, 2U, 7U, 15U}) {
+        const auto options = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2",
+                                    "--draft-tokens", std::to_string(k), "--lm-head-draft"});
+        failures += check(options.speculative.backend == ninfer::SpeculativeBackend::DFlash2 &&
+                              options.speculative.draft_tokens == k &&
+                              options.speculative.proposal_head == ninfer::ProposalHead::Optimized,
+                          "serve options did not preserve DFlash2 configuration");
+    }
+
+    const ServeOptions dflash_vision = parse(
+        {"ninfer-serve", "model.ninfer", "--spec", "dflash", "--draft-tokens", "15", "--vision"});
+    failures += check(dflash_vision.enable_vision &&
+                          dflash_vision.speculative.backend == ninfer::SpeculativeBackend::DFlash &&
+                          dflash_vision.speculative.draft_tokens == 15,
+                      "serve options did not preserve combined DFlash and Vision features");
 
     bool implicit_backend_rejected = false;
     try {

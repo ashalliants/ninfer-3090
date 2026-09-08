@@ -23,7 +23,7 @@ struct KVCacheAppendPrefixExecutionEnvelope {
  * Append every K/V row to single-sequence paged growing-cache storage.
  *
  * k/v are contiguous BF16 [256,4|2,T] and positions is contiguous sequential device I32 [T].
- * BF16 cache mode copies K bit-for-bit and stores V as FP16_RNE(BF16 input). INT8-G64 cache rows
+ * BF16 cache mode copies K and V bit-for-bit; both planes are BF16. INT8-G64 cache rows
  * use one scale for each contiguous 64-value group. For codec input values x, the persistent
  * INT8 group encoding is
  *
@@ -84,7 +84,7 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
  *
  * k/v are contiguous BF16 [128,8,T,B], positions is contiguous device I32 [T,B], and counts and
  * table_rows are contiguous device I32 [B]. For row b and i in [0,counts[b]), k/v[:, :, i, b]
- * store K bit-for-bit and V as FP16_RNE(BF16 input) at logical position positions[i,b] through
+ * store K and V bit-for-bit, both BF16, at logical position positions[i,b] through
  * table row table_rows[b]. The paged planes use head-major order [128,64,Nphysical,8]. No byte
  * belonging only to the rejected physical tail [counts[b],T) is written. Inputs are unchanged,
  * and the Op neither decides nor publishes a committed frontier.
@@ -102,10 +102,12 @@ void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& posi
  * Append device-selected BF16 prefixes to lane-owned cyclic storage.
  *
  * k/v, positions, counts, and their storage-conversion and mutation contracts match the paged
- * overload; lanes[b] selects the destination lane. The fixed geometry is D=128, Hkv=8,
- * capacity=4096, and absolute position p maps to slot p mod 4096. The caller guarantees that each
- * row's existing live interval ends immediately before positions[0,b], advancing it by counts[b]
- * makes every overwritten old slot dead, and one row commits at most the ring capacity.
+ * overload; lanes[b] selects the destination lane. The registered profiles have fixed geometry
+ * D=128, Hkv=8 and capacity 2048 or 4096. Absolute position p maps to slot p mod capacity.
+ * For a nonempty prefix, the caller guarantees that the row's existing live interval ends
+ * immediately before positions[0,b]. Advancing it by counts[b] makes every overwritten old slot
+ * dead, and one row commits at most the ring capacity. A zero count reads no positions or K/V
+ * and changes no cache bytes. Physical T is independent of the committed prefix length.
  * Consequently, no two live writes race for one physical slot. The Op does not own or publish the
  * lane frontier.
  */

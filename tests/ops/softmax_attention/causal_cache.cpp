@@ -3205,6 +3205,12 @@ int run_softmax_attention_k8v4_tests() {
     return failures == 0 ? 0 : 1;
 }
 
+int run_softmax_attention_dflash2_tests() {
+    std::cout << "SKIP DFlash2 causal attention: upstream's sweep is not ported to this "
+                 "fork's fixture yet" << (char)10;
+    return 77;
+}
+
 int run_softmax_attention_causal_cache_tests() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";

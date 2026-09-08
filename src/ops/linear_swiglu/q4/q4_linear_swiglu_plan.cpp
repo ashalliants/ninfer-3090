@@ -33,12 +33,16 @@ constexpr Q4LinearSwiGluProblem kShape{34816, 17408, 5120, 5120, 1};
 
 constexpr std::array<RouteSpec, 10> kRoutes{{
     {{1, 1}, Q4LinearSwiGluScheduleId::GemvPair},
-    // The exact-T route's cost rises with T; the 40-wide pair tile's is set by its padded
-    // width and is flat across the extents it covers. On sm_86 they cross at 25, inside the
-    // range a C8 MTP3 decode round uses. Tiles narrower than 40 were measured and are not
-    // worth routing: the split-half-pair kernel is not issue-bound at these widths, so a
-    // 16-wide tile only loses occupancy (+29.9% against the exact route at T=16).
-    {{2, 24}, Q4LinearSwiGluScheduleId::SmallTExact},
+    // Measured on sm_86 with bench/ops/q4_linear_swiglu_schedule_bench.cu (cold, median of 11):
+    // SmallTTiled and the 40-wide pair tile cross between 24 and 25, us --
+    //     T=22  373.8 vs 438.3   T=24  390.1 vs 434.2   T=25  464.9 vs 436.2   T=32  507.9 vs 437.2
+    // so the tile is 6% faster at 25 and 14% at 32. That restores the boundary this fork always
+    // had. Its original comment justified 24 by a crossover against q4_linear_swiglu_small_t_exact,
+    // which upstream deleted, so I had replaced it with upstream's 32; the number turns out to be
+    // right for the tiled kernel too, which nobody had measured. 32 is separately the largest
+    // width SmallTTiled accepts at all -- past it the launch fails, so it is a capability limit
+    // rather than a tuning choice, and upstream's table simply ran the route to that limit.
+    {{2, 24}, Q4LinearSwiGluScheduleId::SmallTTiled},
     {{25, 40}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C40},
     {{41, 48}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C48},
     {{49, 128}, Q4LinearSwiGluScheduleId::Materialized},
@@ -84,8 +88,8 @@ const char* q4_linear_swiglu_schedule_name(Q4LinearSwiGluScheduleId schedule) no
     switch (schedule) {
     case Q4LinearSwiGluScheduleId::GemvPair:
         return "linear_swiglu.q4.gemv.paired_rows";
-    case Q4LinearSwiGluScheduleId::SmallTExact:
-        return "linear_swiglu.q4.mma.small_t.exact";
+    case Q4LinearSwiGluScheduleId::SmallTTiled:
+        return "linear_swiglu.q4.mma.small_t.tiled";
     case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C40:
         return "linear_swiglu.q4.mma.split_half_pair.r32.c40";
     case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C48:
@@ -116,7 +120,7 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
         };
         switch (route.schedule) {
         case Q4LinearSwiGluScheduleId::GemvPair:
-        case Q4LinearSwiGluScheduleId::SmallTExact:
+        case Q4LinearSwiGluScheduleId::SmallTTiled:
         case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C40:
         case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C48:
             return plan;
@@ -163,8 +167,8 @@ void q4_linear_swiglu_execute_plan(const Q4LinearSwiGluPlan& plan, const Tensor&
     case Q4LinearSwiGluScheduleId::GemvPair:
         q4_linear_swiglu_gemv_pair_launch(x, w, out, stream);
         return;
-    case Q4LinearSwiGluScheduleId::SmallTExact:
-        q4_linear_swiglu_small_t_exact_launch(x, w, out, stream);
+    case Q4LinearSwiGluScheduleId::SmallTTiled:
+        q4_linear_swiglu_small_t_tiled_launch(x, w, out, stream);
         return;
     case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C40:
         q4_linear_swiglu_mma_split_half_pair_r32_c40_launch(x, w, out, stream);
