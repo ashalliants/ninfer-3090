@@ -413,8 +413,10 @@ Ordered by how much they could bite. The first is a possible correctness defect 
 
 - [ ] **`attn_input_proj` produces grossly wrong values at `W8 DFlash2 A16 T=112 graph phase=1`.**
       Not a tolerance miss — `actual=34` against `reference=-65.9`, `actual=4.09` against `67.15`,
-      on q, k *and* value. Seen in **2 of 3 full-suite runs** (`ctest -j2`), always that exact case
-      and always the graph-replay phase; passes 3/3 in isolation.
+      on q, k *and* value. Seen in **2 of 6 full-suite runs** (`ctest -j2`), always that exact case
+      and always the graph-replay phase; passes 3/3 in isolation. (The rate was 2 of 3 when this
+      entry was first written; three further full-suite runs on the section 5 build were clean,
+      which is the figure the investigation table below reports.)
 
       Two reasons this matters more than a normal flake. **`T=112` sits in the `{97,128}` →
       `R32C64K128` band retuned in PR #16**, which shipped in v0.9.0. And the criterion involved was
