@@ -49,11 +49,15 @@ first and check `nvidia-smi`.
 
 ### Open pull requests
 
-- **#32 — `docs/config-calculator.html`.** Open, `CHANGES_REQUESTED`, and the review is right:
-  §2b lists its confirmed defects. Do not merge it as-is; README deliberately does **not** link to
-  it yet, precisely so master carries no pointer to a page that undercounts speculative memory.
-  Land §2b's fixes first, then add the links (README "Choosing a KV format", `docs/cli.md`,
-  `docs/perplexity.md`, `docs/rtx-3090-windows.md`).
+- **#32 — `docs/config-calculator.html`.** Open and now `APPROVED`, but **approved is not finished
+  here**: three of the six confirmed defects are fixed on that branch and two are not. The branch
+  itself says so, carrying a `KNOWN GAP (see TODO.md)` comment where speculative memory should be
+  modelled. See §2b for which is which. Merging it is a judgement call — the page is useful and
+  honest about its gap, but nothing anywhere links to it yet, deliberately, so that master carries
+  no pointer to a page that undercounts speculative configurations by ~170 MiB. **If you merge it,
+  close the speculation gap first, then add the links** (README "Choosing a KV format",
+  `docs/cli.md`, `docs/perplexity.md`, `docs/rtx-3090-windows.md`). The multiplier needed for that
+  fix is measured and recorded in §2b.
 - **#34 — shell-script line endings.** Small and self-contained. Two launchers did not parse on
   Linux at all; see the note below. Merge this one first, it touches nothing else.
 - A worktree at `.claude/worktrees/eager-baking-cascade` exists and has been used by a second agent
@@ -97,9 +101,9 @@ question, and which one produced a wrong answer and why.
 1. **The `T=112` graph-replay failure** (§1.1). The only open item that could be a correctness
    defect in *released* code. Four hypotheses are already ruled out — read that entry first, it
    will save a day.
-2. **The calculator's speculative and page-rounding errors** (§2b). README now points people at
-   that page to size configurations, so it being wrong is a live defect rather than documentation
-   debt. The two memory ones are measured and specified; they need implementing, not investigating.
+2. **The calculator's speculative-memory gap** (§2b). The one remaining correctness defect on #32,
+   and the multiplier that fixes it is already measured — implementing, not investigating. Worth
+   doing before anything links to that page.
 3. **Re-run the six real-model tests** (§1.2, §2). Their artifact blockers are gone as of #31 and
    nobody has looked since; at least one is expected to fail rather than skip.
 4. **The two test-criterion outliers** (§4). Small, the last loose ends from the §5 audit, and
@@ -276,9 +280,13 @@ recurs, and because the follow-on work below only exists now that they are gone.
 
 ## 2b. `docs/config-calculator.html` is advertised as authoritative and is not yet correct
 
-Added by #32, and README now points people at it to size configurations, which raises the bar for
-its arithmetic. Three of these were found by review and then confirmed by measurement; they are
-listed with the evidence so nobody has to re-derive it.
+Added by #32. Six defects were raised in review and confirmed by measurement; **three are fixed on
+that branch and two are not**, so read the checkboxes rather than assuming the PR being approved
+means it is done. The evidence is kept with each entry so nobody has to re-derive it.
+
+Fixed on #32 as it stands: KV page rounding, sub-4,096 decode (now labelled a lower bound held at
+the shallowest measurement rather than claimed as interpolated), and per-row weight-artifact
+labelling. The doc contradictions were fixed separately in #33.
 
 - [ ] **Speculative modes undercount memory by roughly 170 MiB, plus a per-token term.** The page
       models speculation as a weights delta only. Measured on the 27B at `--max-ctx 40960`, INT8,
@@ -310,18 +318,18 @@ listed with the evidence so nobody has to re-derive it.
       DFlash2 need the same treatment before their rows can be trusted. Raw CSVs come from
       `scripts/sweeps/kv-decode-with-speculation.ps1`.
 
-- [ ] **KV is allocated in 64-token pages; the page charges exact tokens.** `KV page groups
+- [x] **KV is allocated in 64-token pages; the page charges exact tokens.** Fixed on #32. `KV page groups
       4096 / 4096` at a 262,144 context is 64 tokens per group. A context just past a page boundary
       reserves a whole further page, so both the memory figure and the largest-context result
       should round to a page. Every context measured so far happens to be page-aligned, which is
       why this never showed up in the validation against the engine's own refusal message.
 
-- [ ] **Sub-4,096 decode is reported at the wrong depth.** `decodeAtDepth` returns the 4,096-token
+- [x] **Sub-4,096 decode is reported at the wrong depth.** Fixed on #32, by labelling rather than by measuring — it now reads "lower bound, held at the 4,096-token measurement". Measuring 1,024 and 2,048 would still be better and is cheap. `decodeAtDepth` returns the 4,096-token
       measurement for every context from 256 up, and the UI then labels it `interpolated` when no
       interpolation happened. The honest fix is to measure: 1,024 and 2,048 are cheap, and short
       contexts are exactly where a casual user starts.
 
-- [ ] **The model selector does not name the artifact each row was measured against.** `27b` means
+- [x] **The model selector does not name the artifact each row was measured against.** Fixed on #32. `27b` means
       `qwen3_8_27b.ninfer` specifically; the runtime has separate load plans and device capacities
       per weight profile, so `weightsBytes` is not transferable to, say, the NVFP4-weight variant.
       Either add the weight-profile dimension or label each row with its artifact.
@@ -331,7 +339,7 @@ listed with the evidence so nobody has to re-derive it.
       speculative reservations and the interpolation boundaries would catch all of the above
       silently regressing.
 
-- [ ] **Active docs still contradict the six-format claim.** #32 fixed README's `Current limits`
+- [x] **Active docs still contradict the six-format claim.** Fixed in #33, across four places. #32 fixed README's `Current limits`
       and `docs/perplexity.md`, but README's *opening* summary still says the FP8 E4M3 KV profile
       "is not" admitted on SM86, and `docs/cli.md` and `docs/serving.md` were not touched. All six
       formats are measured and working; the Blackwell restriction applies to FP8/NVFP4 *weights and
