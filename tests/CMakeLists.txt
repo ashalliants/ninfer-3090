@@ -406,6 +406,10 @@ ninfer_add_fused_linear_test(
   ninfer_linear_pair_w8_a16_test
   ops/linear_pair/test_w8_a16.cpp
   ops/linear_pair/linear_pair_test_common.cpp)
+# Pure host resolution -- no device work, so it runs on a machine with no GPU at all.
+ninfer_add_op_test(ninfer_route_coverage_test
+  SOURCES ops/test_route_coverage.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_fused_linear_test(
   ninfer_linear_swiglu_q4_a16_test
   ops/linear_swiglu/test_q4_a16.cpp
