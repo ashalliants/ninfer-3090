@@ -19,9 +19,11 @@ On an RTX 3090, Qwen3.8-27B supports a measured **171K-token INT8 context** with
 > KV the INT8 profile spends on 171,648 tokens, for **+0.082% perplexity**. It is opt-in; INT8
 > remains the default and the quality-default profile.
 
-This fork targets `sm_86`. Blackwell-only NVFP4/W4A4 and FP8 A8 tensor-core execution are
-unavailable. FP8 and NVFP4 *weights* are admitted through their A16 dequantizing routes, but the
-FP8 E4M3 *KV-cache* profile is not: its attention kernels have no SM86 implementation. 
+This fork targets `sm_86`. Blackwell-only NVFP4/W4A4 and FP8 A8 tensor-core *weight and
+activation* execution are unavailable. FP8 and NVFP4 weights are admitted through their A16
+dequantizing routes. The paged runtime's KV-cache storage is a separate axis from weight/activation
+kernels: all six KV formats, including row-scaled FP8 E4M3, are measured and available on SM86 —
+see [`docs/config-calculator.html`](docs/config-calculator.html).
 
 The goal is the make the utmost rippin Qwen inference stack for the 3000 series. Gladly taking PR's, all help much appreciated. 
 

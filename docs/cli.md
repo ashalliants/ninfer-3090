@@ -244,14 +244,12 @@ Run `./build/apps/ninfer --help` for the exact option contract.
 The registered model IDs have a native context limit of 262,144 tokens. The practical allocation
 on one RTX 3090 depends on the selected artifact, media workload, output budget, and KV-cache type.
 Use `--kv-dtype int8` for the recommended large-context quality profile; BF16 is also available.
-Artifact identity selects the weight profile; `--kv-dtype` selects runtime KV storage.
-
-Upstream's row-scaled `fp8` E4M3 KV profile is **not available on SM86**: its causal attention
-kernels use the Blackwell-only `mma.sync...kind::f8f6f4` instruction and there is no dequantizing
-attention route for FP8 KV. It parses and then fails at engine construction with a specific
-diagnostic. The experimental `rk8v4` RotorQuant profile is available and opt-in: it stores rotated
-INT8 keys with a packed signed int4 value plane, buying about 32% more context for about 0.082%
-perplexity. The prepared prompt must fit
+Artifact identity selects the weight profile; `--kv-dtype` selects runtime KV storage. All six
+formats — `bf16`, `int8`, `fp8`, `rk8v4`, `k8v4`, `nvfp4` — are accepted on SM86; measured size,
+decode speed and perplexity for each are in
+[`docs/config-calculator.html`](config-calculator.html). `rk8v4` (RotorQuant: rotated INT8 keys
+with a packed signed int4 value plane) is the best all-round choice — about 23% smaller than int8
+with the flattest decode falloff measured, for about 0.08% perplexity. The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.
 `--kv-capacity N` controls the shared physical Main Text KV pool independently and is rounded up to
 the 64-token page size. `--kv-capacity auto` loads the selected weights, measures the remaining GPU
