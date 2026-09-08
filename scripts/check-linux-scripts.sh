@@ -17,9 +17,23 @@ done
 #
 # -U forces binary matching. Without it, Git Bash's grep translates CR away and reports every file
 # clean on a Windows checkout, which is how this survived as long as it did.
-crlf="$(LC_ALL=C grep -lU $'\r' "$root"/*.sh "$root"/*/*.sh 2>/dev/null || true)"
+#
+# Scoped to the whole repository rather than scripts/, because .gitattributes states the policy
+# repository-wide and eval/ already holds three shell scripts that a scripts/-only check would
+# never look at. Driven off `git ls-files` so a new directory is covered the day it appears
+# instead of the day someone remembers to add a glob here.
+repo_root="$(git -C "$root" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$root/..")"
+crlf=''
+while IFS= read -r candidate; do
+  [[ -f "$repo_root/$candidate" ]] || continue
+  if LC_ALL=C grep -qU $'\r' "$repo_root/$candidate"; then
+    crlf+="  $candidate"$'\n'
+  fi
+done < <(git -C "$repo_root" ls-files '*.sh' '*.bash' 2>/dev/null)
+
 if [[ -n "$crlf" ]]; then
-  printf 'Shell scripts with CRLF line endings (must be LF; see .gitattributes):\n%s\n' "$crlf" >&2
+  printf 'Shell scripts with CRLF line endings (must be LF; see .gitattributes):\n%s' "$crlf" >&2
+  printf 'Linux bash rejects these outright inside a `case` block.\n' >&2
   exit 1
 fi
 # Deliberately Windows-only, so exempt from the counterpart rule. Named individually rather than
