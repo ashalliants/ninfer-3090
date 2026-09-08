@@ -506,6 +506,41 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
 
 bool HttpServer::bind() { return server_.bind_to_port(options_.host, options_.port); }
 
+void HttpServer::start_serving_during_startup() {
+    if (startup_listener_.joinable()) {
+        throw std::logic_error("HTTP startup listener is already running");
+    }
+
+    // One guard for every route, rather than thirteen. A pre-routing handler runs before dispatch,
+    // so a route added later is covered without anyone remembering to add a check to it.
+    server_.set_pre_routing_handler(
+        [this](const httplib::Request&, httplib::Response& res) -> httplib::Server::HandlerResponse {
+            if (ready_.load(std::memory_order_acquire)) {
+                return httplib::Server::HandlerResponse::Unhandled;
+            }
+            res.status = 503;
+            // Weight load plus warmup measured ~10s on the 27B and longer on the 35B. Two seconds
+            // is a polite poll interval rather than a promise about when readiness arrives.
+            res.set_header("Retry-After", "2");
+            res.set_content(
+                R"({"error":{"message":"The model is still loading. Retry shortly.",)"
+                R"("type":"service_unavailable","code":"model_loading"}})",
+                "application/json");
+            return httplib::Server::HandlerResponse::Handled;
+        });
+
+    startup_listener_ = std::thread([this] {
+        // listen_after_bind() blocks here for the whole life of the server, spanning the switch
+        // from 503 to serving. stop() is what ends it.
+        startup_listener_result_.store(server_.listen_after_bind(), std::memory_order_release);
+    });
+}
+
+bool HttpServer::await_startup_listener() {
+    if (startup_listener_.joinable()) { startup_listener_.join(); }
+    return startup_listener_result_.load(std::memory_order_acquire);
+}
+
 void HttpServer::attach(GenerationService& service) {
     if (service_ != nullptr) {
         throw std::logic_error("HTTP generation service is already attached");
@@ -516,6 +551,9 @@ void HttpServer::attach(GenerationService& service) {
     request_jsonl_.write_server_start(options_, service.engine_options(),
                                       service.sampling_defaults(), public_model_id_, load,
                                       service.memory_summary());
+    // Release: everything above must be visible to a handler that observes ready_ as true. This is
+    // the only write, and handlers acquire it in the pre-routing guard before touching service_.
+    ready_.store(true, std::memory_order_release);
 }
 
 bool HttpServer::listen() {
@@ -528,7 +566,11 @@ bool HttpServer::listen() {
         stats_thread_   = std::thread([this] { run_stats_reporter(); });
     }
     try {
-        const bool result = server_.listen_after_bind();
+        // When the startup listener is running, the accept loop is already live on its thread and
+        // has been since bind(); calling listen_after_bind() again would try to accept on the same
+        // socket from two threads. Wait for that loop instead.
+        const bool result =
+            startup_listener_.joinable() ? await_startup_listener() : server_.listen_after_bind();
         stop_stats_reporter();
         return result;
     } catch (...) {
@@ -538,5 +580,13 @@ bool HttpServer::listen() {
 }
 
 void HttpServer::stop() { server_.stop(); }
+
+HttpServer::~HttpServer() {
+    if (startup_listener_.joinable()) {
+        server_.stop();
+        startup_listener_.join();
+    }
+    stop_stats_reporter();
+}
 
 } // namespace ninfer::serve
