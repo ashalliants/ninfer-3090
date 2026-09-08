@@ -288,6 +288,16 @@ about it fails on a different one.
       and clean rows mixed in one batch. Verified adversarially: reverting the guard produces 60
       failures. The last two routes were found by CodePulse review on PR #18.
 
+      *Also found while adding coverage for the dense multiblock routes:* `sampling_adjusted_logit`
+      applied presence/frequency penalty subtraction to non-finite raw logits unconditionally.
+      CUDA's NaN canonicalization on that subtraction produces a different bit pattern than an
+      untouched NaN, which the total-order sort key (`score_id_order_key`) ranks as strictly higher
+      -- so a poisoned verify column's already-drafted (penalized) token could spuriously win the
+      greedy top-1 selection and get accepted, moving the terminal to a later, clean column and
+      evading the finiteness guard entirely. `sampling_adjusted_logit` now returns a non-finite raw
+      value unperturbed, so every non-finite entry in a poisoned column stays bit-identical and the
+      guard sees whichever one the id tie-break selects.
+
 ## 5b. Reproducibility
 
 - [ ] **fp8, k8v4 and nvfp4 causal attention are not run-to-run deterministic.** Running

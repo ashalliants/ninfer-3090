@@ -942,6 +942,21 @@ AcceptExpected accept_state_oracle(const std::vector<std::int32_t>& drafts, std:
     return expected;
 }
 
+// The refusal shape from speculative_store_accept_result's non-finite branch: one licensed
+// sentinel token, nothing accepted, length still advances by one so the caller's frontier stays
+// consistent.
+AcceptExpected non_finite_accept_oracle(int k, std::int32_t initial_length) {
+    AcceptExpected expected{
+        .sampled     = std::vector<std::int32_t>(static_cast<std::size_t>(k + 1), 0),
+        .num_sampled = 1,
+        .accepted    = 0,
+        .length      = initial_length + 1,
+        .token       = ops::kSamplerNonFiniteToken,
+    };
+    expected.sampled[0] = ops::kSamplerNonFiniteToken;
+    return expected;
+}
+
 int execute_accept_case(const std::string& label, const std::vector<std::int32_t>& target_tokens,
                         const std::vector<std::uint16_t>& logits_bits, int physical_rows,
                         const std::vector<std::int32_t>& drafts, std::int32_t initial_length,
@@ -1009,8 +1024,14 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
                              config_before);
 
     auto expected_counts = initial_token_counts;
-    for (int i = 0; i < expected.num_sampled; ++i) {
-        ++expected_counts[static_cast<std::size_t>(expected.sampled[static_cast<std::size_t>(i)])];
+    // The non-finite sentinel branch returns before speculative_store_accept_result's
+    // UpdateTokenCounts block, so counts must stay untouched -- indexing token_counts by
+    // kSamplerNonFiniteToken (-1) would be out of bounds.
+    if (expected.token != ops::kSamplerNonFiniteToken) {
+        for (int i = 0; i < expected.num_sampled; ++i) {
+            ++expected_counts[static_cast<std::size_t>(
+                expected.sampled[static_cast<std::size_t>(i)])];
+        }
     }
     failures +=
         verify_exact((label + " token counts").c_str(),
@@ -1117,6 +1138,83 @@ int greedy_penalty_case(int token_domain) {
     return execute_accept_case(
         "speculative greedy penalty token-domain=" + std::to_string(token_domain), raw_targets,
         bits, token_domain, drafts, 100, token_domain, config, counts, expected);
+}
+
+// Regression for the gap CodePulse raised on PR #18: the sparse suite below covers the sparse
+// greedy non-finite guards, but nothing exercised the dense guards at
+// speculative_sampling_group_finalize_kernel<false> -- reachable only when token_domain exceeds
+// kSamplerTileItems, which routes execution off the single-block kernel above and onto the
+// partial/group top-k pipeline. `poison` off reruns the ordinary accept/divergence shape (a
+// cross-check that the harness change here does not itself alter a passing case); `poison` on
+// makes the licensed terminal's own verify logit NaN and expects the refusal sentinel instead.
+int greedy_multiblock_non_finite_case(int accepted_count, int token_domain, bool poison) {
+    constexpr int k = 3;
+    std::vector<std::int32_t> targets(static_cast<std::size_t>(k + 1));
+    std::vector<std::int32_t> drafts(static_cast<std::size_t>(k));
+    for (int i = 0; i <= k; ++i) {
+        targets[static_cast<std::size_t>(i)] = 3 + 2 * i;
+        if (i < k) drafts[static_cast<std::size_t>(i)] = targets[static_cast<std::size_t>(i)];
+    }
+    if (accepted_count < k) {
+        drafts[static_cast<std::size_t>(accepted_count)] =
+            targets[static_cast<std::size_t>(accepted_count)] + 1;
+    }
+    const std::int32_t initial_length = 500;
+    const std::int32_t terminal       = targets[static_cast<std::size_t>(accepted_count)];
+    std::vector<float> logits(static_cast<std::size_t>(token_domain) * (k + 1), -20.0f);
+    if (poison) {
+        logits[static_cast<std::size_t>(accepted_count) * static_cast<std::size_t>(token_domain) +
+               static_cast<std::size_t>(terminal)] = std::numeric_limits<float>::quiet_NaN();
+    }
+    std::vector<std::uint16_t> bits(logits.size());
+    for (std::size_t i = 0; i < logits.size(); ++i) bits[i] = f32_to_bf16(logits[i]);
+    std::vector<std::int32_t> token_counts(static_cast<std::size_t>(token_domain), 0);
+    const auto expected =
+        poison ? non_finite_accept_oracle(k, initial_length)
+               : accept_state_oracle(drafts, accepted_count, terminal, initial_length);
+    return execute_accept_case(
+        "speculative greedy multiblock no-penalty token-domain=" + std::to_string(token_domain) +
+            " A=" + std::to_string(accepted_count) + " poison=" + std::to_string(poison), targets,
+        bits, token_domain, drafts, initial_length, token_domain, ops::SamplingConfig{},
+        token_counts, expected);
+}
+
+// Same regression, for the penalized dense multiblock branch fixed alongside its sparse
+// counterpart in 7107528f. That route picks the terminal from the *penalized* top-k rather than
+// reading target_tokens, and a NaN does not sort predictably against finite candidates, so poison
+// the entire divergence column (index 1, where drafts[1] fails to survive the presence penalty)
+// rather than one logit -- an all-NaN column is also what a diverged forward pass actually
+// produces. This mirrors sparse_non_finite_terminal_case's penalized poisoning exactly.
+int greedy_penalty_non_finite_case(int token_domain, bool poison) {
+    constexpr int k = 2;
+    const std::vector<std::int32_t> drafts{1, 1};
+    const std::vector<std::int32_t> raw_targets{1, 1, 3};
+    std::vector<float> logits(static_cast<std::size_t>(token_domain) * (k + 1), -20.0F);
+    logits[1]                    = 5.0F;
+    logits[token_domain + 1]     = 5.0F;
+    logits[token_domain + 4]     = 4.5F;
+    logits[2 * token_domain + 3] = 5.0F;
+    if (poison) {
+        for (int v = 0; v < token_domain; ++v) {
+            logits[static_cast<std::size_t>(token_domain) + static_cast<std::size_t>(v)] =
+                std::numeric_limits<float>::quiet_NaN();
+        }
+    }
+    std::vector<std::uint16_t> bits(logits.size());
+    for (std::size_t index = 0; index < logits.size(); ++index) {
+        bits[index] = f32_to_bf16(logits[index]);
+    }
+
+    ops::SamplingConfig config{};
+    config.temperature      = 0.0F;
+    config.presence_penalty = 1.0F;
+    const std::vector<std::int32_t> counts(static_cast<std::size_t>(token_domain), 0);
+    const auto expected =
+        poison ? non_finite_accept_oracle(k, 100) : accept_state_oracle(drafts, 1, 4, 100);
+    return execute_accept_case(
+        "speculative greedy penalty multiblock non-finite token-domain=" +
+            std::to_string(token_domain) + " poison=" + std::to_string(poison),
+        raw_targets, bits, token_domain, drafts, 100, token_domain, config, counts, expected);
 }
 
 int batched_sampling_workspace_stride_case() {
@@ -1344,6 +1442,13 @@ int main(int argc, char** argv) {
     failures += greedy_accept_case(15, 7, 257);
     failures += greedy_penalty_case(64);
     failures += greedy_penalty_case(257);
+    // Dense multiblock greedy non-finite guards (token_domain=257 > kSamplerTileItems=256):
+    // no-penalty and penalized branches, each with a clean cross-check and a poisoned refusal.
+    for (bool poison : {false, true}) {
+        failures += greedy_multiblock_non_finite_case(0, 257, poison);
+        failures += greedy_multiblock_non_finite_case(3, 257, poison);
+        failures += greedy_penalty_non_finite_case(257, poison);
+    }
     failures += deterministic_sampling_case();
     failures += batched_sampling_workspace_stride_case();
     std::size_t sparse_peak = 0;

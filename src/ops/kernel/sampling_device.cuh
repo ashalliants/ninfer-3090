@@ -259,6 +259,17 @@ __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
 __device__ __forceinline__ float sampling_adjusted_logit(float raw, int v, const SamplingConfig& c,
                                                          const std::int32_t* overlay = nullptr,
                                                          int overlay_len             = 0) {
+    // A non-finite raw logit must sort as itself, unperturbed. Penalty subtraction on NaN is legal
+    // IEEE-754 but not required to preserve the operand's bit pattern, and CUDA's hardware NaN
+    // canonicalization does not: `NaN - presence_penalty` comes back as a different NaN encoding
+    // than an untouched NaN, which score_id_order_key's total-order key treats as a *different,
+    // higher* score. Since the penalty overlay is round-local (only already-drafted tokens get
+    // subtracted), a poisoned verify column would then rank its drafted token above every other
+    // (untouched-NaN) candidate in that same column -- letting a diverged forward pass spuriously
+    // "match" the draft and licensing it as accepted instead of tripping the finiteness guard.
+    // Returning raw unchanged keeps every non-finite entry in a column bit-identical, so ties fall
+    // back to the id tie-break and the guard sees whichever one wins.
+    if (!sampling_value_is_finite(raw)) { return raw; }
     float x = raw;
     if (c.presence_penalty == 0.0f && c.frequency_penalty == 0.0f) { return x; }
     int cnt = c.token_counts != nullptr ? c.token_counts[v] : 0;
