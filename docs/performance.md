@@ -1,5 +1,21 @@
 # Single-GPU serving performance
 
+> **Read the hardware label before the numbers.** This document carries measurements from two
+> different GPUs, and they must not be read against each other:
+>
+> | section | hardware | measured by |
+> |---|---|---|
+> | The findings immediately below | RTX 3090, `sm_86`, CUDA 12.8 | this fork |
+> | [Vision residency on RTX 3090](#vision-residency-on-rtx-3090-groupwise-int-sm_86) | RTX 3090, `sm_86` | this fork |
+> | Everything else — the tested-revision list, both method tables, and every corpus, makespan and saturation table | **RTX 5090, `sm_120a`, CUDA 13.1** | upstream |
+>
+> The upstream campaign is kept because it is the only corpus-scale evidence published for these
+> artifact profiles, and all ten of its tested revisions are reachable in this fork's history. It is
+> **not** a statement about how this fork performs on an RTX 3090. The two parts answer different
+> questions: upstream's tables characterise the artifact profiles, and this fork's measurements
+> characterise `sm_86` kernel behaviour — where upstream's inherited route boundaries were wrong by
+> 12–41%.
+
 > **DFlash2 measured on this fork (RTX 3090, Qwen3.8-27B groupwise-int, `--kv-dtype int8`,
 > `--draft-tokens 7`, greedy, 96 new tokens).** Text: 20.0% acceptance, 2.38 tok/round.
 > Vision (`--vision`, the committed `image_chart` fixture): 85.7% acceptance, 7.00 tok/round,
@@ -30,12 +46,18 @@
 > fell 502.8 -> 226.3 us and at T=32 500.7 -> 217.1 us. Q4 SwiGLU's SmallTTiled bound returned to
 > 24, where the tiled kernel and the 40-wide pair tile actually cross (6% at T=25, 14% at T=32).
 >
-> **The upstream DFlash2 corpus numbers are still not reproduced here.** The upstream catch-up brought the DFlash2
-> speculative backend (`--spec dflash2 --draft-tokens 7`, Qwen3.8-27B only). Upstream publishes
-> DFlash2 numbers for their own hardware; those are deliberately not reproduced in this document,
-> because every figure here is measured on sm_86 and mixing in another architecture's results would
-> make the tables meaningless. DFlash2 rows will be added once measured on a 3090.
+> **The upstream DFlash2 corpus numbers are still not reproduced here.** The upstream catch-up
+> brought the DFlash2 speculative backend (`--spec dflash2 --draft-tokens 7`, Qwen3.8-27B only), and
+> upstream publishes DFlash2 corpus numbers for their own hardware. Those are deliberately not
+> added to the sm_86 findings in this section: only single-prompt smoke numbers exist on a 3090 so
+> far, and pasting another architecture's corpus results beside them would read as agreement that
+> has not been measured. DFlash2 rows will be added here once measured on a 3090.
 
+
+**The campaign below was measured by upstream on an RTX 5090 (`sm_120a`, CUDA 13.1).** Its tested
+revisions are all reachable in this fork's history, so the code is shared; the hardware is not.
+Every results heading carries the GPU it was measured on, so a reader arriving from the table of
+contents sees it without scrolling back here.
 
 Tested Git revisions:
 
@@ -73,7 +95,7 @@ over the loopback OpenAI-compatible HTTP endpoint. Each reported corpus fixture 
 seeds. Values are arithmetic mean ± sample standard deviation, and server warm-up completes before
 the measured requests. The concurrent campaign has its own sustained-wave method below.
 
-## Single-request serving performance method
+## Single-request serving performance method (RTX 5090)
 
 | Setting | Value |
 |---|---|
@@ -119,7 +141,7 @@ finish reason, and fixture-level structural requirements are audited separately 
 that exhausts its output budget or enters a repetition loop remains useful as a sustained-decode
 stress sample, but is not presented as a successfully completed task.
 
-## Qwen3.8-27B NVFP4 concurrent MTP3 corpus makespan
+## Qwen3.8-27B NVFP4 concurrent MTP3 corpus makespan (RTX 5090)
 
 This campaign uses the complete speculative-decode corpus described above: three long-reasoning
 fixtures and twelve cross-scenario fixtures, each with five fixed seeds, for 75 requests. The
@@ -150,7 +172,7 @@ and send order are fixed, but concurrency-specific numerical routes can change s
 continuations and their lengths. The makespan speedup is therefore a fixed-workload serving result
 rather than a fixed-token normalization; the exact decode-token totals are retained in the table.
 
-## Qwen3.8-27B DFlash2 single-request corpus makespan
+## Qwen3.8-27B DFlash2 single-request corpus makespan (RTX 5090)
 
 The 2026-09-06 campaign ran NVFP4 first, then groupwise-int, using the artifacts with the included
 DFlash2 companion weights and the KV terminal-settlement fix in the revision listed above. Each
@@ -179,7 +201,7 @@ falls 22.7%; groupwise-int's rate falls 9.1% and makespan rises 12.1%. These com
 campaigns, not an isolated backend change: revisions differ, and the stochastic backends produce
 different continuations and token totals. No fresh MTP3 baseline was run.
 
-## Concurrent MTP3 decode saturation
+## Concurrent MTP3 decode saturation (RTX 5090)
 
 The concurrent campaign uses the `long_decode_aime26_15` fixture with thinking enabled. The
 rendered prompt is 293 tokens, and every request has an 8,192-token output budget. For each
@@ -355,7 +377,7 @@ PYTHONPATH=eval eval/.venv/bin/python -m ninfer_eval run \
   --suite reasoning_full
 ```
 
-## `qwen3_6_35b_a3b`
+## `qwen3_6_35b_a3b` (RTX 5090)
 
 ### MTP0 context-length profile
 
@@ -523,7 +545,7 @@ The exact-line and repeated-token scan found no other response with a short-cycl
 to greedy AIME 30. Output-limit and prompt-compliance failures above remain material even when no
 repetition loop is present.
 
-## `qwen3_6_27b`
+## `qwen3_6_27b` (RTX 5090)
 
 ### EvalScope reasoning accuracy
 
@@ -607,7 +629,7 @@ Each category contains three fixtures and five seeds per fixture, for 15 samples
 The baseline and speculative-decode suites intentionally measure different supported workloads.
 No per-scenario baseline/speculative speedup is reported.
 
-## `qwen3_8_27b`
+## `qwen3_8_27b` (RTX 5090)
 
 ### `nvfp4`
 
