@@ -33,7 +33,7 @@ constexpr std::array<std::int32_t, 27> kSampledRows{
     319, 320, 639, 640, 1023, 1024, 2047, 2048, 2559, 2560, 4095, 4096, 5119};
 constexpr ReductionCriterion kCriterion{/*relative_l2=*/3.2e-3,
                                         /*gross_absolute=*/1.0e-3,
-                                        /*gross_relative=*/2.0e-3};
+                                        /*gross_relative=*/kBf16GrossRelativeFloor};
 
 std::uint32_t mix32(std::uint32_t value) {
     value ^= value >> 16;

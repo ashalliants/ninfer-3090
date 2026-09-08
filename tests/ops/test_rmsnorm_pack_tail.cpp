@@ -19,7 +19,7 @@ using namespace ninfer::test::norm;
 constexpr std::int32_t kRows = 5120;
 constexpr ReductionCriterion kCriterion{/*relative_l2*/ 1.85e-3,
                                         /*gross_absolute*/ 1.0e-5,
-                                        /*gross_relative_to_max_reference*/ 3.4e-3};
+                                        /*gross_relative_to_max_reference*/ kBf16GrossRelativeFloor};
 
 std::vector<double> oracle(const std::vector<float>& input, const std::vector<float>& weight,
                            std::int32_t width, std::int32_t batch) {

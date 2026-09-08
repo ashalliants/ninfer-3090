@@ -30,7 +30,7 @@ constexpr ops::AttentionHeadGeometry kGeometry{kD, kQHeads, kKVHeads};
 constexpr ReductionCriterion kSlidingWindowBf16Criterion{
     .relative_l2                     = 3.95e-3,
     .gross_absolute                  = 3e-4,
-    .gross_relative_to_max_reference = 3.0e-3,
+    .gross_relative_to_max_reference = kBf16GrossRelativeFloor,
 };
 
 std::size_t q_index(int d, int q_head, int token) {

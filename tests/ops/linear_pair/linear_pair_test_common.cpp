@@ -30,19 +30,18 @@ constexpr std::int32_t kDFlashSecondRow  = 5120;
 // Both observable projections use the same A16 arithmetic profile. T and the selected pair
 // launcher never select another correctness criterion.
 //
-// The third field, the gross limit relative to the largest reference value, was 3.8e-3 and is
-// raised to 4.5e-3. That is not a concession to a less accurate kernel; it is a bound that was
-// below the floor its own output dtype can represent. Outputs are BF16 with seven stored mantissa
-// bits, so one ULP is between 3.9e-3 and 7.8e-3 of the value and correct rounding alone costs up
-// to half of that. A limit of 3.8e-3 therefore demanded that the single worst element in the whole
-// tensor round the same way the FP32 oracle does, which is luck rather than a property of the
-// kernel.
+// The third field, the gross limit relative to the largest reference value, was 3.8e-3, then
+// 4.5e-3, and now takes the shared kBf16GrossRelativeFloor. Neither raise was a concession to a
+// less accurate kernel; the bound was below the floor its own output dtype can represent. Outputs
+// are BF16, so correct rounding alone costs up to 2^-8 of the value and a limit under that demands
+// the single worst element in the tensor round the same way the FP32 oracle does.
 //
-// Measured over 330 cases spanning both shapes and ~32 token widths, the distribution says the
-// same thing: the bulk of cases sit at 0.33-0.87 of the limit, then nothing until two outliers at
-// 0.9997 and 1.0059. A check with two samples inside 0.1% of its threshold is a coin flip, and the
-// 0.9997 one was already there before the sm_86 route re-measurement moved which kernel runs at
-// T=85. 4.5e-3 clears the observed edge with margin while staying well inside a single ULP.
+// The 4.5e-3 step was derived from 330 cases here -- bulk at 0.33-0.87 of the limit, then two
+// outliers at 0.9997 and 1.0059 -- and it cleared that observed edge. It was still inside a single
+// rounding step, and the tree-wide audit shows why that was not enough: this criterion's worst case
+// sits at exactly 1.00 of a step, i.e. the kernel is as accurate as BF16 permits and the bound was
+// still measuring the dtype rather than the kernel. See op_check.h for the derivation and for the
+// measured distribution across every Op.
 //
 // The bound that actually constrains the kernel is the first field, the relative L2 error, and it
 // is untouched: every one of those 330 cases sits at 0.45-0.69 of it, including the case that
@@ -50,7 +49,7 @@ constexpr std::int32_t kDFlashSecondRow  = 5120;
 constexpr ReductionCriterion kLinearPairA16Tolerance{
     2.9e-3,
     4.0e-3,
-    4.5e-3,
+    kBf16GrossRelativeFloor,
 };
 
 struct PairFixture {

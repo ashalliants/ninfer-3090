@@ -226,21 +226,53 @@ about it fails on a different one.
       kernels and keep this fork's tests.**
 
 
-## 5. Test-criterion calibration
+## 5. Test-criterion calibration — done
 
-- [ ] **Audit `gross_relative_to_max_reference` across the other Op tests.** The W8 linear-pair
-      A16 criterion was set at 3.8e-3, which is *below the floor its own output dtype can
-      represent*: BF16 has seven stored mantissa bits, so one ULP is 3.9e-3 to 7.8e-3 of the value
-      and correct rounding alone costs up to half of that. The bound therefore required the single
-      worst element in the tensor to round the way the FP32 oracle does. Over 330 sampled cases the
-      distribution was bimodal — bulk at 0.33-0.87 of the limit, then two outliers at 0.9997 and
-      1.0059 — so it was a coin flip, and the 0.9997 sample predates the route re-measurement.
-      Raised to 4.5e-3 with the reasoning recorded at the constant. **Any other reduction criterion
-      whose gross limit is under ~4e-3 against a BF16 output has the same latent flake**, and it
-      will surface as "your kernel change broke accuracy" the next time a route boundary moves.
-      `NINFER_OP_REPORT_STATS=1` prints `gross_ratio` per case, which is how to check cheaply.
-      The relative-L2 field is the bound that actually constrains a kernel and should not be
-      touched — those 330 cases all sit at 0.45-0.69 of it.
+- [x] ~~Audit `gross_relative_to_max_reference` across the other Op tests.~~ **Done, and the
+      prediction held across the whole tree.** Measured every Op test with
+      `NINFER_OP_REPORT_STATS=1` and expressed both the bound and the observed error in BF16
+      rounding steps (2^-8 of the tensor maximum):
+
+      | gross limit | worst observed error | worst / limit | criteria |
+      |---|---|---|---|
+      | 0.51-1.61 steps | 0.66-1.53 | **0.54-0.99** | 24 |
+      | 2.00 steps | 0.09-1.51 | **0.05-0.71** | 16 |
+
+      The bound and the error being measured were the same quantity: these kernels are accurate to
+      about one rounding step, as good as the dtype permits, so a bound of that magnitude measures
+      BF16 rather than the kernel. Two attention criteria were set *below* their own observed error
+      and passed only because `gross_absolute` carried them.
+
+      The fix was not a new number. `kBf16UnitRoundoff = 1/256` already existed and
+      `2.0 * kBf16UnitRoundoff` was already the bound in `linear/`, `test_attn_input_proj.cpp`,
+      `test_gdn_input_proj.cpp`, `test_gdn_input_proj_conv_snapshot.cpp` and `test_linear_topk.cu`.
+      Half the tree followed the convention; the other half picked numbers by hand.
+      `kBf16GrossRelativeFloor` names it once with the derivation. `relative_l2` untouched
+      everywhere — it is what constrains kernel accuracy.
+
+      **Two criteria deliberately left out**, because the BF16 floor argument does not reach
+      either. Both still want doing, so they stay open here rather than being pointed at a section
+      this branch does not carry:
+
+      - [ ] **`sparse_moe` sits at 0.92 of its limit** with `gross_relative_to_max_reference = 0.0`,
+            so its bound is pure `gross_absolute` and the floor cannot apply. It also carries the
+            largest observed BF16 error in the tree — **3.64 rounding steps**, against 0.09–1.53
+            everywhere else. Both facts want explaining before the bound is touched: either that
+            kernel is genuinely less accurate than every other BF16 Op, or its criterion measures
+            something different.
+      - [ ] **`gated_delta_net`'s state criterion sits at 0.87** and compares an **FP32** output, so
+            dtype rounding is not its floor; the error arrives from BF16 inputs propagating. Needs
+            its own derivation rather than the BF16 one.
+
+      **The earlier 4.5e-3 step for linear_pair is superseded.** It derived the ULP argument
+      correctly but stopped *inside* a single rounding step, and that criterion's worst case is
+      exactly 1.00 of one — so it cleared the two observed outliers without removing the cause.
+      A one-off adjustment where the rule was needed.
+
+      One thing the sweep itself got wrong first time, worth remembering: grepping for
+      `gross_relative_to_max_reference` only matches designated initializers and silently misses
+      every criterion written positionally, `{2.9e-3, 4.0e-3, 4.5e-3}`. That undercounted the set
+      by a third. Enumerate `ReductionCriterion` instead.
 
 ## 4a. Documents that still speak for the wrong GPU
 
