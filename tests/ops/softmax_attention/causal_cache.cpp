@@ -2477,6 +2477,20 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     return failures;
 }
 
+// One batched attention launch.
+//
+// The three vectors are parallel and one entry long per *request*, so their common length is the
+// batch size. `table_rows` is the one that trips people up: its entries are indices into the KV
+// cache table, not positions in the batch, and they are chosen independently of the batch size.
+// A single request addressing table row 7 is a legitimate and interesting case -- it is a server
+// with eight cache slots serving one request that happens to live in slot 7 -- so the cache table
+// is sized from the rows addressed (cache_table_row_count), never from the batch.
+//
+// Getting that wrong is not a clean failure. Sizing the table by the batch made
+// upstream's DFlash2 sweep index a one-element vector at [7], unchecked, and the resulting
+// undefined behaviour presented as a different symptom on almost every run -- "vector too long",
+// "bad allocation", an access violation, or a nonsense geometry error -- none of which pointed at
+// the fixture. validate_batch_case below exists so a malformed profile says so instead.
 struct BatchAttentionCase {
     std::int32_t width;
     std::vector<std::int32_t> contexts;
@@ -2526,12 +2540,74 @@ int verify_invalid_columns_zero(const std::string& label, std::span<const std::u
     return failures;
 }
 
-int run_batch_case(const Geometry& geometry, const CachePlan& plan, const BatchAttentionCase& test_case) {
-    const std::int32_t batch = static_cast<std::int32_t>(test_case.contexts.size());
-    if (batch <= 0 || test_case.valid_columns.size() != static_cast<std::size_t>(batch) ||
-        test_case.table_rows.size() != static_cast<std::size_t>(batch)) {
-        throw std::invalid_argument("invalid causal-attention batch test profile");
+// How many rows the cache table needs to hold every row this case addresses. Deliberately not the
+// batch size: table_rows carries indices into the table, so a batch of one addressing row 7 needs
+// eight rows, not one.
+std::size_t cache_table_row_count(const std::vector<std::int32_t>& table_rows) {
+    std::size_t highest = 0;
+    for (const std::int32_t row : table_rows) {
+        highest = std::max(highest, static_cast<std::size_t>(row));
     }
+    return highest + 1;
+}
+
+// Reject a malformed profile with a message naming the field and the offending value, rather than
+// letting it become undefined behaviour somewhere downstream. Both run_batch_case overloads call
+// this; it replaces the size-only check they each used to carry.
+//
+// The distinctness rule on table_rows is the non-obvious one. Two requests in one launch writing
+// the same cache row is not merely unusual, it has no defined answer: the host reference appends
+// them one after another in request order, while the kernel writes both concurrently. A case like
+// that would fail as an intermittent numeric mismatch, which is a bad way to learn the profile was
+// wrong.
+void validate_batch_case(const BatchAttentionCase& test_case) {
+    const std::size_t batch = test_case.contexts.size();
+    const auto fail         = [](const std::string& detail) {
+        throw std::invalid_argument("causal-attention batch test profile: " + detail);
+    };
+
+    if (batch == 0) { fail("empty batch"); }
+    if (test_case.valid_columns.size() != batch) {
+        fail("valid_columns has " + std::to_string(test_case.valid_columns.size()) +
+             " entries for a batch of " + std::to_string(batch));
+    }
+    if (test_case.table_rows.size() != batch) {
+        fail("table_rows has " + std::to_string(test_case.table_rows.size()) +
+             " entries for a batch of " + std::to_string(batch));
+    }
+    if (test_case.width <= 0) { fail("width " + std::to_string(test_case.width) + " is not positive"); }
+
+    std::vector<std::int32_t> seen;
+    seen.reserve(batch);
+    for (std::size_t request = 0; request < batch; ++request) {
+        const std::int32_t context = test_case.contexts[request];
+        const std::int32_t valid   = test_case.valid_columns[request];
+        const std::int32_t row     = test_case.table_rows[request];
+        const std::string at       = " at request " + std::to_string(request);
+
+        if (context < 0) { fail("negative context " + std::to_string(context) + at); }
+        if (valid < 0 || valid > test_case.width) {
+            fail("valid_columns " + std::to_string(valid) + at + " is outside [0, width=" +
+                 std::to_string(test_case.width) + "]");
+        }
+        if (row < 0) { fail("negative table row " + std::to_string(row) + at); }
+        // A request with valid == 0 writes nothing: the small-T kernels return with neutral
+        // output before touching the cache for it. Two such requests sharing a table row is not a
+        // race -- neither is a writer -- so only requests that actually write are checked against
+        // (and added to) the distinctness set.
+        if (valid > 0) {
+            if (std::find(seen.begin(), seen.end(), row) != seen.end()) {
+                fail("table row " + std::to_string(row) + " is addressed twice" + at +
+                     "; two requests writing one cache row in a single launch has no defined result");
+            }
+            seen.push_back(row);
+        }
+    }
+}
+
+int run_batch_case(const Geometry& geometry, const CachePlan& plan, const BatchAttentionCase& test_case) {
+    validate_batch_case(test_case);
+    const std::int32_t batch = static_cast<std::int32_t>(test_case.contexts.size());
 
     std::int32_t maximum_visible = 1;
     for (std::int32_t row = 0; row < batch; ++row) {
@@ -2567,10 +2643,18 @@ int run_batch_case(const Geometry& geometry, const CachePlan& plan, const BatchA
         }
     }
 
+    // The cache table is sized by the rows the batch *addresses*, not by the batch size. Those are
+    // different numbers: a case may run one request against table row 7, which is the realistic
+    // shape -- a server with eight cache slots serving a single request that lives in slot 7.
+    // Sizing this by `batch` is what made upstream's DFlash2 sweep die on its very first case,
+    // B=1 with table_rows={7}: expected[7] on a one-element vector, unchecked, so the symptom
+    // varied run to run and never pointed at the real fault.
+    const std::size_t table_rows = cache_table_row_count(test_case.table_rows);
     std::vector<HostCache> initial;
-    initial.reserve(static_cast<std::size_t>(batch));
-    for (std::int32_t row = 0; row < batch; ++row) {
-        initial.push_back(make_cache(geometry, plan, max_context, test_case.seed + 20u + 3u * row));
+    initial.reserve(table_rows);
+    for (std::size_t row = 0; row < table_rows; ++row) {
+        initial.push_back(make_cache(geometry, plan, max_context,
+                                     test_case.seed + 20u + 3u * static_cast<unsigned>(row)));
     }
     std::vector<HostCache> expected = initial;
     std::vector<double> reference(q_column_elements * columns, 0.0);
@@ -2587,9 +2671,9 @@ int run_batch_case(const Geometry& geometry, const CachePlan& plan, const BatchA
             extract_request_columns(k, kv_column_elements, test_case.width, request, valid);
         const std::vector<float> row_v =
             extract_request_columns(v, kv_column_elements, test_case.width, request, valid);
-        append_cache(expected[static_cast<std::size_t>(table_row)], row_k, row_v, row_positions);
+        append_cache(expected.at(static_cast<std::size_t>(table_row)), row_k, row_v, row_positions);
         insert_request_columns(
-            ideal_attention(row_q, expected[static_cast<std::size_t>(table_row)], row_positions),
+            ideal_attention(row_q, expected.at(static_cast<std::size_t>(table_row)), row_positions),
             q_column_elements, test_case.width, request, reference);
     }
 
@@ -2667,11 +2751,8 @@ int run_batch_case(const Geometry& geometry, const CachePlan& plan, const BatchA
 
 int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
                    const BatchAttentionCase& test_case) {
+    validate_batch_case(test_case);
     const std::int32_t batch = static_cast<std::int32_t>(test_case.contexts.size());
-    if (batch <= 0 || test_case.valid_columns.size() != static_cast<std::size_t>(batch) ||
-        test_case.table_rows.size() != static_cast<std::size_t>(batch)) {
-        throw std::invalid_argument("invalid causal-attention batch test profile");
-    }
 
     std::int32_t maximum_visible = 1;
     for (std::int32_t row = 0; row < batch; ++row) {
@@ -2707,11 +2788,14 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
         }
     }
 
+    // Sized by the table rows the batch addresses, not by the batch. See the note on the CachePlan
+    // overload above for why those differ and what it cost.
+    const std::size_t table_rows = cache_table_row_count(test_case.table_rows);
     std::vector<HostCache> initial;
-    initial.reserve(static_cast<std::size_t>(batch));
-    for (std::int32_t row = 0; row < batch; ++row) {
-        initial.push_back(
-            make_cache(geometry, storage, max_context, test_case.seed + 20u + 3u * row));
+    initial.reserve(table_rows);
+    for (std::size_t row = 0; row < table_rows; ++row) {
+        initial.push_back(make_cache(geometry, storage, max_context,
+                                     test_case.seed + 20u + 3u * static_cast<unsigned>(row)));
     }
     std::vector<HostCache> expected = initial;
     std::vector<double> reference(q_column_elements * columns, 0.0);
@@ -2728,9 +2812,9 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
             extract_request_columns(k, kv_column_elements, test_case.width, request, valid);
         const std::vector<float> row_v =
             extract_request_columns(v, kv_column_elements, test_case.width, request, valid);
-        append_cache(expected[static_cast<std::size_t>(table_row)], row_k, row_v, row_positions);
+        append_cache(expected.at(static_cast<std::size_t>(table_row)), row_k, row_v, row_positions);
         insert_request_columns(
-            ideal_attention(row_q, expected[static_cast<std::size_t>(table_row)], row_positions),
+            ideal_attention(row_q, expected.at(static_cast<std::size_t>(table_row)), row_positions),
             q_column_elements, test_case.width, request, reference);
     }
 
@@ -3211,10 +3295,141 @@ int run_softmax_attention_k8v4_tests() {
     return failures == 0 ? 0 : 1;
 }
 
+// DFlash2 verification shapes: narrow widths over many batch rows, ragged valid-column counts and
+// fragmented page mappings, swept across every registered cache storage. Ported from upstream and
+// adapted to this fork's fixture: rk8v4 is added (upstream has no such storage), and the batch
+// cases drop upstream's per-case graph flag because run_batch_case here has no graph-replay path.
+// Graph coverage is retained through the a1/a3 cases below, whose AttentionCase does carry it.
+//
+// `order` is a permutation of table rows, so a case with batch < 8 still addresses rows up to 7 --
+// which is the point: it exercises a request sitting in a high cache slot. That is what
+// cache_table_row_count exists for.
+int run_dflash2_cases() {
+    constexpr int order[]{7, 0, 4, 2, 6, 1, 5, 3};
+    // run_batch_case/run_a1_case/run_a3_case are each overloaded on KvCacheStorage and CachePlan,
+    // so one generic sweep body covers every registered profile -- including rk8v4, which the
+    // public KvCacheStorage enum cannot select and only the CachePlan overload builds.
+    const auto sweep = [](auto storage) {
+        int failures = 0;
+        const auto run = [&](int width, int batch, int base) {
+            BatchAttentionCase c{width, {}, {}, {}, MappingPattern::Fragmented,
+                                 static_cast<unsigned>(1700 + width + 31 * batch)};
+            for (int b = 0; b < batch; ++b) {
+                c.contexts.push_back(base + (b % 3 == 0 ? 0 : b % 3 == 1 ? 17 : 61));
+                c.valid_columns.push_back(b % 4 == 0   ? width
+                                          : b % 4 == 1 ? width - 1
+                                          : b % 4 == 2 ? 1
+                                                       : 0);
+                c.table_rows.push_back(order[b]);
+            }
+            return run_batch_case(kGeometries[0], storage, c);
+        };
+        for (int width = 2; width <= 16; ++width)
+            for (int batch : {1, 8}) failures += run(width, batch, 0);
+        for (int width : {2, 8, 16})
+            for (int batch = 2; batch <= 7; ++batch) failures += run(width, batch, 0);
+        for (int width : {7, 8, 9, 16})
+            for (int batch : {1, 8}) failures += run(width, batch, 127);
+        failures += run(16, 8, 2048);
+        for (int width : {8, 9, 16}) {
+            failures +=
+                run_a1_case(kGeometries[0], storage,
+                            {width, 2048, static_cast<unsigned>(2048 + width), 1801u, false, true},
+                            MappingPattern::Fragmented);
+            failures +=
+                run_a3_case(kGeometries[0], storage,
+                            {width, 8192, static_cast<unsigned>(8192 + width), 1802u, false, true},
+                            MappingPattern::Fragmented);
+        }
+        return failures;
+    };
+
+    int failures = 0;
+    for (auto storage :
+         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+        failures += sweep(storage);
+    }
+    failures += sweep(kPlanRk8v4);
+    return failures;
+}
+
+// The validator is the thing standing between a mistyped profile and undefined behaviour, so it
+// gets its own coverage. Needs no GPU: every case here must be rejected before any device work.
+int run_batch_profile_validation_cases() {
+    struct Rejected {
+        const char* what;
+        BatchAttentionCase profile;
+    };
+    const Rejected rejected[]{
+        {"empty batch", {2, {}, {}, {}, MappingPattern::Identity, 1u}},
+        {"valid_columns length", {2, {0, 0}, {2}, {0, 1}, MappingPattern::Identity, 2u}},
+        {"table_rows length", {2, {0, 0}, {2, 2}, {0}, MappingPattern::Identity, 3u}},
+        {"non-positive width", {0, {0}, {0}, {0}, MappingPattern::Identity, 4u}},
+        {"negative context", {2, {-1}, {2}, {0}, MappingPattern::Identity, 5u}},
+        {"valid_columns above width", {2, {0}, {3}, {0}, MappingPattern::Identity, 6u}},
+        {"negative table row", {2, {0}, {2}, {-1}, MappingPattern::Identity, 7u}},
+        {"duplicate table row", {2, {0, 0}, {2, 2}, {3, 3}, MappingPattern::Identity, 8u}},
+    };
+
+    int failures = 0;
+    for (const Rejected& item : rejected) {
+        bool threw = false;
+        try {
+            validate_batch_case(item.profile);
+        } catch (const std::invalid_argument&) { threw = true; }
+        if (!threw) {
+            std::cerr << "validate_batch_case accepted a profile it must reject: " << item.what
+                      << '\n';
+            ++failures;
+        }
+    }
+
+    // And the shape the DFlash2 sweep actually uses -- one request addressing a high table row --
+    // must be accepted, or the validator has over-corrected into rejecting the real cases.
+    try {
+        validate_batch_case({2, {0}, {2}, {7}, MappingPattern::Fragmented, 9u});
+        if (cache_table_row_count({7}) != 8) {
+            std::cerr << "cache_table_row_count({7}) must be 8, not the batch size\n";
+            ++failures;
+        }
+    } catch (const std::invalid_argument& error) {
+        std::cerr << "validate_batch_case rejected the DFlash2 shape it must accept: "
+                  << error.what() << '\n';
+        ++failures;
+    }
+
+    // Two requests sharing a table row where neither is a writer -- valid_columns == 0 -- is not a
+    // race and must be accepted. This is exactly the shape run_dflash2_cases sweeps: every fourth
+    // batch row is zero-valid, and order[] repeats table rows across the b%4==3 (zero-valid) and
+    // other cases at different batch positions.
+    try {
+        validate_batch_case({2, {0, 2}, {0, 2}, {3, 3}, MappingPattern::Fragmented, 10u});
+    } catch (const std::invalid_argument& error) {
+        std::cerr << "validate_batch_case rejected a zero-valid row sharing a table row with a "
+                     "writer: "
+                  << error.what() << '\n';
+        ++failures;
+    }
+    return failures;
+}
+
 int run_softmax_attention_dflash2_tests() {
-    std::cout << "SKIP DFlash2 causal attention: upstream's sweep is not ported to this "
-                 "fork's fixture yet" << (char)10;
-    return 77;
+    // Profile validation first, and without a GPU: it is pure host logic, and if it is broken the
+    // sweep below is the thing it was meant to protect.
+    int failures = run_batch_profile_validation_cases();
+    if (failures != 0) {
+        std::cout << "FAIL causal_softmax_attention DFlash2 (profile validation)\n";
+        return 1;
+    }
+    if (cuda_unavailable()) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
+    }
+    failures += run_case_allowing_arch_skip("causal_softmax_attention DFlash2 verification",
+                                            [] { return run_dflash2_cases(); });
+    std::cout << (failures == 0 ? "PASS" : "FAIL") << " causal_softmax_attention DFlash2\n";
+    return failures == 0 ? 0 : 1;
 }
 
 int run_softmax_attention_causal_cache_tests() {
