@@ -90,6 +90,7 @@
           expected_size='${if expectedSize == null then "" else toString expectedSize}'
           expected_sha256='${if expectedSha256 == null then "" else expectedSha256}'
           stage='${if revision == null then "latest" else revision}'
+          resumable=${if revision == null then "0" else "1"}
 
           model_dir=''${NINFER_MODEL_DIR:-$HOME/models}
           model="$model_dir/${filename}"
@@ -98,7 +99,12 @@
           # those bytes. Downloading straight onto "$model" therefore splices a leftover partial
           # from one revision into another whenever a pin changes -- a file of plausible size that
           # is corrupt throughout. Staging under a name that carries the revision means a resume
-          # can only ever continue the same artifact.
+          # can only ever continue the same artifact -- but an unpinned URL (revision == null,
+          # resolving whatever upstream currently calls "main") has no immutable name to stage
+          # under: "main" can move between two invocations of this same command, so a leftover
+          # ".latest.part" could belong to an older "main" than the one this run would fetch.
+          # Unpinned entries therefore never resume: any existing partial is discarded first and
+          # the download restarts from zero, at the cost of resumability.
           part="$model.$stage.part"
           mkdir -p "$model_dir"
 
@@ -108,8 +114,14 @@
             exit 0
           fi
 
-          echo "Downloading ${description} to $model (resumable)..."
-          ${pkgs.curl}/bin/curl -L -C - --fail --output "$part" '${url}'
+          if [ "$resumable" = "1" ]; then
+            echo "Downloading ${description} to $model (resumable)..."
+            ${pkgs.curl}/bin/curl -L -C - --fail --output "$part" '${url}'
+          else
+            echo "Downloading ${description} to $model (unpinned URL, not resumable)..."
+            rm -f -- "$part"
+            ${pkgs.curl}/bin/curl -L --fail --output "$part" '${url}'
+          fi
 
           if [ -n "$expected_size" ]; then
             actual_size="$(wc -c < "$part" | tr -d '[:space:]')"
