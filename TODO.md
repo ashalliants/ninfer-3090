@@ -298,6 +298,27 @@ about it fails on a different one.
       value unperturbed, so every non-finite entry in a poisoned column stays bit-identical and the
       guard sees whichever one the id tie-break selects.
 
+## 5c. Greedy acceptance only tests the divergence column, not accepted matches
+
+- [ ] Every greedy route (`speculative_accept_greedy_drafts_kernel`'s no-penalty and penalized
+      paths, `speculative_sampling_group_finalize_kernel<false>`'s no-penalty and penalized paths,
+      and both sparse warp routes closed by 5a) walks `while (a < extent && row_targets[a] ==
+      row_drafts[a]) ++a;` and tests `sampling_selected_logit_is_finite` only at column `a`, the
+      divergence/terminal column. **A column before `a` is never checked.** If a diverged forward
+      pass produces an all-NaN row whose argmax (undefined under NaN comparisons -- see
+      `sampling_better`) happens to equal that column's draft token, the round accepts it as a
+      match and folds it into `licensed_tokens` with no finiteness check at all; the guard only
+      ever sees whichever later, possibly-clean column becomes the terminal.
+      **Raised by CodePulse on PR #18, against 5a's new sparse-greedy code** (`speculative_round.cuh:178`),
+      but confirmed to be the pre-existing shape of `speculative_accept_greedy_drafts_kernel`'s
+      no-penalty path already on `master` before PR #18 -- 5a made the other three routes match
+      this pattern, not introduce it. **Descoped from PR #18**: closing it means validating
+      finiteness of every accepted column in all four greedy routes (an extra
+      `sampling_selected_logit_is_finite` read per accepted column, not just the terminal), which
+      touches code PR #18 never modified and changes the acceptance protocol uniformly rather than
+      guarding one more call site. That is a distinct effort from "make the new routes match the
+      established pattern," which is what PR #18 shipped.
+
 ## 5b. Reproducibility
 
 - [ ] **fp8, k8v4 and nvfp4 causal attention are not run-to-run deterministic.** Running
