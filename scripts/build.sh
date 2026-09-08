@@ -9,6 +9,7 @@
 #   ./scripts/build.sh                 configure + build into build-linux
 #   ./scripts/build.sh --test          ... then run the test suite
 #   ./scripts/build.sh --package v080  ... then build the release archive
+#   ./scripts/build.sh --benchmarks    ... include bench/ (implied by --package)
 #   ./scripts/build.sh --clean         delete the build directory first
 #   ./scripts/build.sh --target ninfer-serve
 #
@@ -24,19 +25,31 @@ run_tests=0
 clean=0
 package=''
 target=''
+benchmarks=0
 
 while (( $# )); do
   case "$1" in
     --test) run_tests=1; shift ;;
     --clean) clean=1; shift ;;
+    --benchmarks) benchmarks=1; shift ;;
     --package) package="${2:-}"; shift 2 ;;
     --target) target="${2:-}"; shift 2 ;;
     --build-dir) build_dir="${2:-}"; shift 2 ;;
     --arch) arch="${2:-}"; shift 2 ;;
-    -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    # Print the header comment block, stopping at the first line that is not a comment. A pinned
+    # line range drifts every time the block grows: it was '2,20p' against a block ending at 17,
+    # so --help trailed `set -euo pipefail` and a blank line.
+    -h|--help) sed -n '2,${/^#/!q;p;}' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) printf 'Unknown argument: %s\n' "$1" >&2; exit 2 ;;
   esac
 done
+
+# Every packaging script ships bench/ninfer_bench alongside the CLI and the server, but benchmarks
+# are an opt-in subdirectory (NINFER_BUILD_BENCHMARKS defaults to OFF). Configuring without them and
+# then packaging fails late, after the whole tree has been built, with "Missing release product:
+# .../bench/ninfer_bench" - so make --package imply the option rather than leaving the two settings
+# to be kept consistent by hand.
+if [[ -n "$package" ]]; then benchmarks=1; fi
 
 case "$arch" in 86|89) ;; *) printf 'CUDA arch must be 86 or 89, got %s\n' "$arch" >&2; exit 2 ;; esac
 
@@ -74,7 +87,11 @@ if (( clean )) && [[ -d "$build_dir" ]]; then
 fi
 
 cd -- "$repo_root"
-cmake -S . -B "$build_dir" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="$arch"
+benchmarks_option=OFF
+if (( benchmarks )); then benchmarks_option=ON; fi
+
+cmake -S . -B "$build_dir" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="$arch" \
+      -DNINFER_BUILD_BENCHMARKS="$benchmarks_option"
 if [[ -n "$target" ]]; then
   cmake --build "$build_dir" --target "$target"
 else

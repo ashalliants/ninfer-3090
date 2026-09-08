@@ -19,6 +19,7 @@
 #   .\scripts\build.ps1                  configure + build into build-ninja
 #   .\scripts\build.ps1 -Test            ... then run the test suite
 #   .\scripts\build.ps1 -Package v080    ... then build the release archive
+#   .\scripts\build.ps1 -Benchmarks      ... include bench\ (implied by -Package)
 #   .\scripts\build.ps1 -Clean           delete the build directory first
 #   .\scripts\build.ps1 -Target ninfer-serve
 [CmdletBinding()]
@@ -26,6 +27,7 @@ param(
     [switch]$Test,
     [string]$Package,
     [switch]$Clean,
+    [switch]$Benchmarks,
     [string]$Target,
     [string]$BuildDir,
     [ValidateSet('86', '89')][string]$Arch = '86'
@@ -35,6 +37,13 @@ $ErrorActionPreference = 'Stop'
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $BuildDir) { $BuildDir = Join-Path $RepoRoot 'build-ninja' }
+
+# Every packaging script ships bench\ninfer_bench.exe alongside the CLI and the server, but
+# benchmarks are an opt-in subdirectory (NINFER_BUILD_BENCHMARKS defaults to OFF). Configuring
+# without them and then packaging fails late, after the whole tree has been built, with
+# "Missing release product: ...\bench\ninfer_bench.exe" - so make -Package imply the option rather
+# than leaving the two settings to be kept consistent by hand.
+$BuildBenchmarks = $Benchmarks -or [bool]$Package
 
 # --- locate the toolchain ---------------------------------------------------------------------
 
@@ -90,7 +99,9 @@ Push-Location $RepoRoot
 try {
     # Quote the -D arguments: PowerShell does not reliably expand a variable inside a bare token
     # that begins with "-D", and cmake then sees the literal "$Arch".
-    cmake -S . -B $BuildDir -G Ninja '-DCMAKE_BUILD_TYPE=Release' "-DCMAKE_CUDA_ARCHITECTURES=$Arch"
+    $BenchmarksOption = if ($BuildBenchmarks) { 'ON' } else { 'OFF' }
+    cmake -S . -B $BuildDir -G Ninja '-DCMAKE_BUILD_TYPE=Release' "-DCMAKE_CUDA_ARCHITECTURES=$Arch" `
+          "-DNINFER_BUILD_BENCHMARKS=$BenchmarksOption"
     if ($LASTEXITCODE -ne 0) { throw "configure failed ($LASTEXITCODE)" }
 
     $buildArgs = @('--build', $BuildDir)
@@ -108,8 +119,16 @@ try {
     if ($Package) {
         $packager = Join-Path $PSScriptRoot "package-release-$Package.ps1"
         if (-not (Test-Path -LiteralPath $packager)) { throw "No packaging script: $packager" }
-        & $packager
-        if ($LASTEXITCODE -ne 0) { throw "packaging failed ($LASTEXITCODE)" }
+        # The packagers default to build-ninja\; point them at the tree we actually built, so
+        # -BuildDir and -Package agree. build.sh already does this for the Linux packagers.
+        $PreviousBuildRoot = $env:NINFER_BUILD_ROOT
+        $env:NINFER_BUILD_ROOT = $BuildDir
+        try {
+            & $packager
+            if ($LASTEXITCODE -ne 0) { throw "packaging failed ($LASTEXITCODE)" }
+        } finally {
+            $env:NINFER_BUILD_ROOT = $PreviousBuildRoot
+        }
     }
 } finally {
     Pop-Location
