@@ -3309,7 +3309,11 @@ int run_dflash2_cases() {
     // run_batch_case/run_a1_case/run_a3_case are each overloaded on KvCacheStorage and CachePlan,
     // so one generic sweep body covers every registered profile -- including rk8v4, which the
     // public KvCacheStorage enum cannot select and only the CachePlan overload builds.
-    const auto sweep = [](auto storage) {
+    // `order` has to be captured explicitly: reading `order[b]` at a runtime index odr-uses it,
+    // and a lambda with no default capture cannot reach an automatic variable of the enclosing
+    // function however constant it is. Introducing this lambda without the capture is why this
+    // translation unit stopped compiling.
+    const auto sweep = [&order](auto storage) {
         int failures = 0;
         const auto run = [&](int width, int batch, int base) {
             BatchAttentionCase c{width, {}, {}, {}, MappingPattern::Fragmented,
