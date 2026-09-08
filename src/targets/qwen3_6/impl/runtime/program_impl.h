@@ -979,34 +979,92 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                 plan_host_kv_page_layout(backend->page_pool().geometry());
             if (backend_layout != layouts.front()) { layouts.push_back(std::move(backend_layout)); }
         }
-        StartupPhaseScope host_kv_phase(
-            startup_observer, StartupPhase::HostKvPin, StartupProgressUnit::Bytes,
-            static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes));
-        // Name the knob. This is the largest pinned-host allocation the server makes -- 8 GiB by
-        // default (kDefaultHostKvCapacityBytes) regardless of how much RAM the machine has -- so it
-        // is the first thing to fail on a box with a modest amount free, and the underlying CUDA
-        // error says only "out of memory" with no hint that it means system RAM or which flag
-        // shrinks it. Prefix reuse degrades gracefully at a smaller size; it does not need 8 GiB.
-        try {
-            host_kv_arena = std::make_unique<HostKVArena>(
-                plan.context_cache.host_kv_capacity_bytes,
-                std::span<const HostKVPageLayout>(layouts.data(), layouts.size()));
-        } catch (const std::exception& error) {
-            throw std::runtime_error(
-                std::string("failed to reserve the host KV cache: ") + error.what() +
-                "\nThis is the context cache's pinned host buffer, sized by --host-kv-mib "
-                "(default 8192). Lower it (for example --host-kv-mib 512) to use less system RAM, "
-                "or pass --no-prefix-reuse to disable the context cache entirely.");
-        }
-        host_kv_phase.complete(
-            static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes),
-            static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes));
         std::size_t minimum_stride = layouts.front().page_stride;
         for (const HostKVPageLayout& layout : layouts) {
             minimum_stride = std::min(minimum_stride, layout.page_stride);
         }
+
+        // The pinned host KV buffer competes with the model for *device* memory, and on Windows
+        // that is what actually stops it.
+        //
+        // Measured on an RTX 3090 (24,576 MiB), one process, allocating N MiB on the device and
+        // then finding the largest cudaMallocHost that succeeds:
+        //
+        //     device resident   VRAM free   largest pin
+        //         15,360 MiB     7,972 MiB     8,192 MiB
+        //         17,408 MiB     5,924 MiB     6,656 MiB
+        //         19,456 MiB     3,876 MiB     3,840 MiB
+        //         21,504 MiB     1,828 MiB     2,816 MiB
+        //         22,528 MiB       804 MiB     1,536 MiB
+        //
+        // Resident-device plus pinned-host lands within a few hundred MiB of the card's capacity
+        // every time: WDDM maps pinned host memory into the GPU's address space and charges it
+        // against the same budget. The failure is `cudaErrorAlreadyMapped`, not out-of-memory, and
+        // it arrives with tens of GiB of system RAM free. The default 8 GiB therefore could not be
+        // reserved beside any model this project ships, and the server refused to start -- which
+        // is why every real-model test on this box failed here rather than skipping.
+        //
+        // **Asking and backing off does not work.** One failed cudaMallocHost poisons every later
+        // one in the process: with 2,852 MiB free, 1,024 MiB succeeded twice, then a deliberate
+        // 8,192 MiB failure made 1,024, 256 and even 64 MiB fail with the same
+        // `cudaErrorAlreadyMapped`, and `cudaGetLastError` did not clear it. So the size has to be
+        // chosen before the first attempt, not discovered by halving after one.
+        //
+        // Clamp to free VRAM less a margin. Windows only: the coupling is a WDDM property and this
+        // has not been measured on Linux, where shrinking the buffer would cost prefix reuse for
+        // no reason. Clamping to zero is a supported outcome -- prefix reuse then works from
+        // device pages alone rather than the server failing to start.
+        std::size_t reserved_bytes = plan.context_cache.host_kv_capacity_bytes;
+#if defined(_WIN32)
+        std::size_t free_device = 0, total_device = 0;
+        if (cudaMemGetInfo(&free_device, &total_device) == cudaSuccess) {
+            // Two terms, both learned the hard way. The 1 GiB floor is memory the run still needs
+            // after this point and that no plan accounts for: module loads, graph instantiation
+            // and the local-memory backing a launch requires. Clamping only to "free minus a few
+            // hundred MiB" got startup past the pin and then failed at the first kernel launch
+            // with `cudaErrorMemoryAllocation` from `cudaGetLastError`, which is a far worse
+            // failure than not starting.
+            //
+            // Halving what remains is the conservative split when the requirement on the other
+            // side is not known precisely: the cache never takes more headroom than it leaves.
+            constexpr std::size_t kPinnedHostReserveBytes = 1ULL << 30;
+            const std::size_t budget =
+                free_device > kPinnedHostReserveBytes ? (free_device - kPinnedHostReserveBytes) / 2
+                                                      : 0;
+            if (reserved_bytes > budget) {
+                reserved_bytes = budget - (budget % minimum_stride);
+            }
+        }
+#endif
+
+        StartupPhaseScope host_kv_phase(
+            startup_observer, StartupPhase::HostKvPin, StartupProgressUnit::Bytes,
+            static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes));
+        if (reserved_bytes >= minimum_stride) {
+            try {
+                host_kv_arena = std::make_unique<HostKVArena>(
+                    reserved_bytes,
+                    std::span<const HostKVPageLayout>(layouts.data(), layouts.size()));
+            } catch (const std::exception& error) {
+                throw std::runtime_error(
+                    std::string("failed to reserve the host KV cache: ") + error.what() +
+                    "\nThis is the context cache's pinned host buffer, sized by --host-kv-mib "
+                    "(default 8192) and clamped at startup to the device memory still free. On "
+                    "Windows the allocation is mapped into the GPU's address space and competes "
+                    "with the model for VRAM, so this is a full card rather than short system RAM: "
+                    "free VRAM, lower --max-context, or pass --no-prefix-reuse to disable the "
+                    "context cache entirely.");
+            }
+        } else {
+            // Nothing was pinned. Prefix reuse still works from device pages; only the host-side
+            // spill is gone. `host_kv_arena` stays null, which every user of it already handles.
+            reserved_bytes = 0;
+        }
+        host_kv_phase.complete(
+            static_cast<std::uint64_t>(reserved_bytes),
+            static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes));
         const std::size_t extent_capacity =
-            plan.context_cache.host_kv_capacity_bytes / minimum_stride;
+            reserved_bytes == 0 ? 0 : reserved_bytes / minimum_stride;
         if (extent_capacity > std::numeric_limits<std::uint32_t>::max()) {
             throw std::overflow_error("Qwen3.6 Host KV extent capacity exceeds uint32");
         }

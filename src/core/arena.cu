@@ -370,17 +370,39 @@ ScopedArenaRank::~ScopedArenaRank() noexcept {
 PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
     if (size_bytes == 0) { throw std::invalid_argument("PinnedHostBuffer size must be nonzero"); }
 
+    // A pending error from an earlier call is returned by whatever runs next, so read and clear it
+    // first. Without this, a failure here can be somebody else's error wearing this message.
+    const cudaError_t pending = cudaGetLastError();
+
     void* ptr             = nullptr;
     const cudaError_t err = cudaMallocHost(&ptr, size_bytes);
     if (err != cudaSuccess) {
-        // Say the size, and say *host*. The bare CUDA text is
-        // "cudaErrorMemoryAllocation: out of memory", which reads as a VRAM shortfall and sends
-        // people to look at nvidia-smi -- but this allocation is pinned system RAM and can fail
-        // with the card almost entirely free. The caller adds which knob shrinks it.
-        const std::string prefix =
-            "cudaMallocHost failed to pin " +
-            std::to_string((size_bytes + (1ULL << 20) - 1) >> 20) +
-            " MiB of host memory (this is system RAM, not VRAM)";
+        // Say the size, and say which memory. `cudaErrorMemoryAllocation: out of memory` reads as
+        // a VRAM shortfall and sends people to nvidia-smi when the shortfall is pinned system RAM.
+        // But the converse also happens and used to be asserted away here: on Windows/WDDM this
+        // allocation is mapped into the GPU's address space and charged against the card, so a
+        // large pin fails once the device is nearly full even with tens of GiB of system RAM free
+        // -- measured on a 24 GiB RTX 3090, where resident-device plus pinned-host lands within a
+        // few hundred MiB of the card's capacity every time. `cudaErrorAlreadyMapped` is the
+        // failure that shape produces. Report free VRAM so the two are distinguishable rather than
+        // asserting which one it is.
+        std::size_t free_device = 0, total_device = 0;
+        const cudaError_t info = cudaMemGetInfo(&free_device, &total_device);
+        std::string prefix     = "cudaMallocHost failed to pin " +
+                             std::to_string((size_bytes + (1ULL << 20) - 1) >> 20) +
+                             " MiB of host memory";
+        if (info == cudaSuccess) {
+            prefix += " (device has " + std::to_string(free_device >> 20) + " MiB of " +
+                      std::to_string(total_device >> 20) + " MiB free; on Windows a pinned host "
+                      "allocation is mapped into the GPU address space and competes with it)";
+        } else {
+            prefix += " (system RAM, pinned)";
+        }
+        if (pending != cudaSuccess) {
+            prefix += ", after an unretrieved earlier error (";
+            prefix += cudaGetErrorName(pending);
+            prefix += ")";
+        }
         throw std::runtime_error(cuda_error_message(prefix.c_str(), err));
     }
 
