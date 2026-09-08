@@ -401,11 +401,17 @@ about it fails on a different one.
       redundant. That missing pair is exactly what made upstream's small-T reach for the bf16
       helper and silently reinterpret every value, so collapsing them removes the trap rather than
       just tidying.
-- [ ] **Clean up the extra worktrees**: `C:/ninfer-fork/baseline-master` (created to get a
-      pre-merge baseline; its purpose is served) and `C:/ninfer-fork/wt-readme`.
-- [ ] **Untracked clutter in the repo root**: `config.bat`, `config_exit.txt`, `repro/`,
-      `scripts/download-ornith-1.5-35b-a3b.bat`. Decide keep-and-commit or delete.
-      `build_merge.bat` *is* committed and carries the toolchain pinning this host needs.
+- [x] ~~Clean up the extra worktrees.~~ **Done.** `baseline-master` was already gone; `wt-readme`
+      removed after checking clean status and confirming `feat/dual-gpu-graph-mode` is fully merged
+      into master with nothing unpushed. The branch is kept, so the history survives.
+- [x] ~~Untracked clutter in the repo root.~~ **Decided, per file:** `config.bat`/`config_exit.txt`
+      deleted (a failed VS 2026/MSVC 14.50 configure attempt, superseded by `scripts/build.ps1`
+      documenting exactly why CUDA 12.8 rejects that compiler); `scripts/download-ornith-1.5-35b-a3b.bat`
+      deleted (byte-identical to the tracked `download-qwen36-35b-a3b.bat` but named for a model it
+      does not download, and never shipped); `repro/` gitignored rather than deleted (two captured
+      Responses-API payloads carrying third-party prompt text, not this repo's data to bin).
+      `build_merge.bat` *is* committed and carries the toolchain pinning this host needs. PR #12
+      closed as the record of the abandoned dual-GPU overlap experiment.
 
 ---
 

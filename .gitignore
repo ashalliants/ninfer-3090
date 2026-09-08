@@ -70,3 +70,8 @@ dist/*
 
 # Claude Code personal/local settings (may contain API tokens)
 .claude/settings.local.json
+
+# Captured request payloads kept for reproducing a specific investigation locally. Deliberately not
+# committed: they are whole real prompts, so they carry third-party system-prompt text and are
+# large (100 KB+ each) for something only the person who captured them can act on.
+repro/
