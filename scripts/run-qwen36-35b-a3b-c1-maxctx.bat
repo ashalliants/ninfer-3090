@@ -121,23 +121,39 @@ rem tighter on a given boot and the server refuses to start, drop --vision first
 rem context rung -- it is the newest addition, not the load-bearing one.
 rem ---------------------------------------------------------------------------------------------
 
-set "MODEL=C:\Ninefer-3090\models\qwen3_6_35b_a3b.ninfer"
+rem Every setting below can be overridden from the environment without editing this file:
+rem
+rem   set NINFER_CONTEXT=196608 && run-qwen36-35b-a3b-c1-maxctx.bat
+rem
+rem The default model path matches what download-qwen36-35b-a3b.bat writes and how the release
+rem archive is laid out: this launcher sits beside models\.
+set "MODEL=%~dp0models\qwen3_6_35b_a3b.ninfer"
 
 rem Profile A (active): speculation on. Rungs: 81920 / 90112 / 98304 / 114688 / 131072.
-rem set "CONTEXT=81920"
-set "CONTEXT=114688"
-rem Profile B: comment out the line above, uncomment this, and swap the commands at the bottom.
+rem Profile B: set NINFER_CONTEXT to a 196608+ rung and swap the commands at the bottom.
 rem Rungs: 196608 / 212992 / 229376 / 245760 / 262144.
-rem set "CONTEXT=196608"
+set "CONTEXT=114688"
 
-rem Bind address. 0.0.0.0 exposes an unauthenticated OpenAI-compatible endpoint to your whole LAN,
-rem which is what the qwen38 launcher does; use 127.0.0.1 to keep it on this machine only.
-set "HOST=0.0.0.0"
+rem Loopback by default. 0.0.0.0 publishes an unauthenticated OpenAI-compatible endpoint to every
+rem network this machine is on, so it is opt-in per run rather than the shipped default:
+rem   set NINFER_HOST=0.0.0.0
+set "HOST=127.0.0.1"
 set "PORT=8080"
+set "KV_DTYPE=rk8v4"
 
-rem scripts\ -> repo root -> the Ninja build output.
+if not "%NINFER_MODEL%"=="" set "MODEL=%NINFER_MODEL%"
+if not "%NINFER_CONTEXT%"=="" set "CONTEXT=%NINFER_CONTEXT%"
+if not "%NINFER_HOST%"=="" set "HOST=%NINFER_HOST%"
+if not "%NINFER_PORT%"=="" set "PORT=%NINFER_PORT%"
+if not "%NINFER_KV_DTYPE%"=="" set "KV_DTYPE=%NINFER_KV_DTYPE%"
+
+rem In the repo, scripts\ -> repo root -> the Ninja build output. In a release archive this
+rem launcher sits beside ninfer-serve.exe instead, which is the fallback -- without it the shipped
+rem copy of this script could never find the server.
 set "ROOT=%~dp0.."
 set "SERVER=%ROOT%\build-ninja\apps\ninfer-serve.exe"
+if not exist "%SERVER%" set "SERVER=%~dp0ninfer-serve.exe"
+if not "%NINFER_SERVER%"=="" set "SERVER=%NINFER_SERVER%"
 
 if not exist "%SERVER%" (
   echo Missing %SERVER%
@@ -161,7 +177,7 @@ rem --- Profile A: speculation on. ~240 tok/s decode. ---
   --max-concurrency 1 ^
   --max-context %CONTEXT% ^
   --kv-capacity %CONTEXT% ^
-  --kv-dtype rk8v4 ^
+  --kv-dtype %KV_DTYPE% ^
   --spec mtp --draft-tokens 3 --lm-head-draft ^
   --prefill-chunk 512 ^
   --max-pending-requests 16 --pending-timeout-ms 600000 ^

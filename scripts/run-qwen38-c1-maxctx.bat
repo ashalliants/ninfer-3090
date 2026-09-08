@@ -36,17 +36,32 @@ rem for the plain 32K image profile.
 rem Rungs if startup refuses: 163840 / 131072 / 114688 / 98304 / 65536.
 rem ---------------------------------------------------------------------------------------------
 
-set "MODEL=%~dp0..\..\qwen3_8_27b.ninfer"
-if not "%NINFER_MODEL%"=="" set "MODEL=%NINFER_MODEL%"
-
+rem Every setting below can be overridden from the environment without editing this file:
+rem
+rem   set NINFER_HOST=0.0.0.0 && run-qwen38-c1-maxctx.bat
+rem
+rem The default model path matches what download-qwen38-27b.bat writes and how the release archive
+rem is laid out: this launcher sits beside models\.
+set "MODEL=%~dp0models\qwen3_8_27b.ninfer"
 set "CONTEXT=131072"
 set "CONCURRENCY=1"
+rem Loopback by default. 0.0.0.0 publishes an unauthenticated OpenAI-compatible endpoint to every
+rem network this machine is on, so it is opt-in per run rather than the shipped default.
 set "HOST=127.0.0.1"
 set "PORT=8080"
+set "KV_DTYPE=rk8v4"
+
+if not "%NINFER_MODEL%"=="" set "MODEL=%NINFER_MODEL%"
+if not "%NINFER_CONTEXT%"=="" set "CONTEXT=%NINFER_CONTEXT%"
+if not "%NINFER_CONCURRENCY%"=="" set "CONCURRENCY=%NINFER_CONCURRENCY%"
+if not "%NINFER_HOST%"=="" set "HOST=%NINFER_HOST%"
+if not "%NINFER_PORT%"=="" set "PORT=%NINFER_PORT%"
+if not "%NINFER_KV_DTYPE%"=="" set "KV_DTYPE=%NINFER_KV_DTYPE%"
 
 set "ROOT=%~dp0.."
 set "SERVER=%ROOT%\build-ninja\apps\ninfer-serve.exe"
 if not exist "%SERVER%" set "SERVER=%~dp0ninfer-serve.exe"
+if not "%NINFER_SERVER%"=="" set "SERVER=%NINFER_SERVER%"
 
 if not exist "%SERVER%" (
   echo Missing %SERVER%
@@ -69,7 +84,7 @@ echo.
   --max-concurrency %CONCURRENCY% ^
   --max-context %CONTEXT% ^
   --kv-capacity %CONTEXT% ^
-  --kv-dtype rk8v4 ^
+  --kv-dtype %KV_DTYPE% ^
   --spec mtp --draft-tokens 3 --lm-head-draft ^
   --prefill-chunk 1024 ^
   --max-pending-requests 16 --pending-timeout-ms 600000 ^

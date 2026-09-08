@@ -49,8 +49,11 @@ Download `ninfer-rtx3090-windows-x64-*.zip`, unzip it, and from that folder:
 
 ```powershell
 .\download-qwen36-35b-a3b.bat            # downloads qwen3_6_35b_a3b.ninfer (~21 GB, resumable)
-.\run-qwen36-35b-a3b-c1-maxctx.bat        # serves on 0.0.0.0:8080, 114,688-token context
+.\run-qwen36-35b-a3b-c1-maxctx.bat        # serves on 127.0.0.1:8080, 114,688-token context
 ```
+
+`NINFER_HOST`, `NINFER_PORT`, `NINFER_MODEL` and `NINFER_SERVER` override it without editing the
+file; `set NINFER_HOST=0.0.0.0` exposes it to the LAN, unauthenticated.
 
 ### Headless Linux — full 256K context, two users, everything on
 
@@ -113,10 +116,11 @@ predictable. Same shape of command:
 ./run-qwen38-c1-maxctx.sh                 # two users, 212,992 tokens each, same knobs
 ```
 
-The plain `run-qwen38-c1` and `run-qwen38-c8` launchers are still there and unchanged. They are
-deliberately conservative — `c1` serves 65,536 tokens of INT8 and leaves 2.85 GiB of the card
-unused — so prefer the `-maxctx` pair unless you specifically want INT8's quality default or `c8`'s
-eight-lane throughput profile.
+The plain `run-qwen38-c1` and `run-qwen38-c8` launchers are still there, with the same profile
+defaults as before — `c1` serves 65,536 tokens of INT8 and leaves 2.85 GiB of the card unused — so
+prefer the `-maxctx` pair unless you specifically want INT8's quality default or `c8`'s eight-lane
+throughput profile. Like every launcher here, their host and port now default to `127.0.0.1:8080`
+and accept the same `NINFER_HOST`/`NINFER_PORT` overrides.
 
 | Profile | lanes | context | KV | vision | runtime | free (desktop) |
 |---|---|---|---|---|---|---|
