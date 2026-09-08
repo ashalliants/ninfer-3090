@@ -127,18 +127,31 @@ once the 20.8 GiB of weights are resident.
 
 ---
 
-## 2. Blocked on hardware or artifacts
+## 2. Genuinely blocked, and what by
 
-- [ ] **`--vision-residency overlay` + DFlash2.** Planned in the test matrix, never run. Overlay
-      borrows device memory per image from the evictable text-weight tail, and DFlash2 binds its
-      own weight bundle, so the interaction with the eviction ladder will not show up until
-      someone tries it.
-- [ ] **DFlash2 + multi-GPU expert offload.** One 3090 here, so the offload path degenerates to the
-      single-rank identity mapping. Needs the two-card box or a second local GPU. More interesting
-      now that PR #15 has landed and the offload path is no longer hypothetical.
+This section previously read "blocked on hardware or artifacts" and lumped three items together.
+That was wrong on one of them and imprecise on another — **only one needs hardware this box does
+not have.** Check before assuming an entry here is unreachable.
+
+### Needs a second GPU — one item
+
+- [ ] **DFlash2 + multi-GPU expert offload.** `nvidia-smi` reports exactly one device here, so the
+      offload path degenerates to the single-rank identity mapping and there is nothing to
+      exercise. Needs the two-card box or a second local GPU. More interesting now that PR #15 has
+      landed and the offload path is no longer hypothetical.
+
+### Needs an artifact we do not have — not a hardware limit
+
 - [ ] **`--spec dflash` (v1) on 35B-A3B.** Refused by the 27B artifact ("selected masked draft
-      backend is not supported by this target") because v1 is a 35B backend — correct behaviour,
-      but it leaves v1 untested this cycle. Needs the 35B DFlash artifact.
+      backend is not supported by this target") because v1 is a 35B backend — correct behaviour.
+      The local `qwen3_6_35b_a3b.ninfer` (20.84 GB, revision `c8b8c1c0`) carries **no DFlash
+      bundle**: `ninfer_qwen3_6_35b_a3b_dflash_load_plan_test` skips with "this artifact carries no
+      DFlash bundle". So this needs a DFlash-carrying 35B artifact, not a bigger card. Worth
+      checking whether `neroued/Qwen3.6-35B-A3B-NInfer` publishes one at another revision before
+      treating it as out of reach.
+The six skipping real-model tests in §1.2 are mostly this same shape — four of them want a
+Qwen3.6 27B artifact, a different model family from the `qwen3_8_27b` held locally. Tracked there
+rather than duplicated here.
 
 ---
 
@@ -230,6 +243,25 @@ Kept because the reasoning is what stops the same investigation being repeated.
 | #29 | repo housekeeping | worktrees removed, dead files deleted, `repro/` ignored rather than binned, PR #12 closed as the record |
 | #30 | DFlash2 attention sweep | the fixture sized the cache table by the **batch**, but `table_rows` are indices *into* the table; B=1 addressing row 7 indexed a one-element vector, unchecked |
 | — | §7 `prompt_i8` dedupe | already landed with the small-T adoption; the entry was simply stale |
+| — | `--vision-residency overlay` + DFlash2 | **was never blocked** — it runs on this one 3090 and always could have. See below |
+
+### `--vision-residency overlay` + DFlash2 — verified working, 2026-09-08
+
+Listed for weeks as needing hardware. It does not. On this single 3090, with
+`qwen3_8_27b_dflash2.ninfer`, `--vision --vision-residency overlay --spec dflash2 --draft-tokens 7`:
+
+- starts cleanly — 18.0 GiB of weights, runtime 1.03 GiB, **2.30 GiB still free**, ready in 9.0 s;
+- answers four *different* images in sequence (2.4–2.7 s each), describing each correctly and
+  reading its embedded label with the index incrementing 00 → 01 → 02 → 03;
+- the server is still healthy afterwards and the log carries no `ERROR`, `FATAL` or eviction line.
+
+The worry in the old entry — overlay borrows device memory per image from the evictable
+text-weight tail while DFlash2 holds its own weight bundle, so the eviction ladder is untested —
+is exactly what the four-image sequence exercises, because the borrow-and-release has to happen
+more than once. It holds.
+
+**The lesson is about the list, not the feature**: "never run" had drifted into "cannot be run".
+Try it before writing it off; this took one command.
 
 Two recurring lessons worth carrying forward:
 
