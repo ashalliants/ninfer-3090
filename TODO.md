@@ -27,20 +27,34 @@ Everything below is what is *not* done. Ordered by what blocks what.
 
 ## 0. Next up, in this order
 
-1. **Chase the `T=112` graph-replay failure** (section 8). It is the only open item that could be a
+1. **Chase the `T=112` graph-replay failure** (section 8). Still the only open item that could be a
    correctness defect in *released* code, and the band it lands in was retuned by this fork.
-2. **Measure the `w8_pair` k=2048 table** (section 4). The best remaining pure-speed bet — 37
-   routes, the largest table in the tree, on the 35B DFlash path, never measured on sm_86.
-3. **A test that lists unrouted schedules per Op** (section 4). Cheap, and a schedule nothing
-   selects is what let both switch fallthroughs hide.
+   Four hypotheses are already ruled out — read that entry before starting.
+2. **The two shipped-launcher findings in section 8**: `--spec mtp` cannot start with default
+   host-KV sizing (8 GiB of pinned host memory, and the error names CUDA for a host shortfall), and
+   `/v1/models` answers before startup finishes. Both are small and both affect people running the
+   release.
+3. **The remaining section 4 boundary measurements**: q4 SwiGLU `Materialized`, and the two q4_q5
+   schedules that win at no measured width.
 
-Then, in no fixed order: the remaining section 4 boundary measurements, the section 8 startup
-findings, and the DFlash2 attention sweep (section 2), which is narrowed to a single case.
+Then, in no fixed order: the DFlash2 attention sweep (section 2, narrowed to a single case), the
+real-model maximum-configuration decision (section 2), the two criteria section 5 deliberately left
+alone (section 8), and the housekeeping in sections 1 and 7.
 
-**Cleared since the v0.9.0 release**, all with measurements recorded in their PRs: the section 5
-gross-error audit (#20), the section 5a finiteness guard (#18, which turned out to be four routes
-rather than one), the section 4a docs provenance (#19), the release-build gap (#17), and the
-section 7 `prompt_i8` dedupe (which had already landed — the entry was simply stale).
+**Cleared since the v0.9.0 release**, each with its measurements recorded in its PR:
+
+| | |
+|---|---|
+| #17 | the release scripts could not cut a release at all |
+| #19 | section 4a — `docs/performance.md` labelled per campaign with the GPU that measured it |
+| #22 | section 4 — `w8_pair` k=2048 retuned, **up to 52.8% at T=192**, 37 routes down to 29 |
+| #23 | section 4 — unrouted schedules are now listed and pinned by name, not just counted |
+| #24 | the shipped launchers: a LAN bind, two broken model paths, and no env overrides |
+| #18 | sections 5a and 5c — the greedy finiteness guard, **five routes**, span-wide not terminal-only |
+| #20 | section 5 — every BF16 gross-error bound floored at two rounding steps *(open, awaiting re-review)* |
+
+Section 7's `prompt_i8` dedupe is also ticked: it had already landed with the small-T adoption and
+the entry was simply stale.
 
 **Keep `investigate/small-t-upstream` until the next catch-up.** It is merged, but it is also the
 clean, self-contained record of how upstream's small-T was adopted and what had to be fixed to make
@@ -309,6 +323,11 @@ about it fails on a different one.
       signal the single-block dense kernel has always used. Penalties change the score that selects
       the terminal but not the logit behind it, and a diverged pass makes the whole column NaN
       before any penalty applies.
+
+      **Section 5c then widened this again**, to the whole committed span rather than the terminal
+      alone, and in doing so brought in the single-block dense kernel that had held the original
+      pattern — five sites in total. Read 5c together with this entry; on its own this one
+      understates what the guard now covers.
 
       Regression cases in `tests/ops/test_speculative_round.cpp` cover every route with poisoned
       and clean rows mixed in one batch. Verified adversarially: reverting the guard produces 60
