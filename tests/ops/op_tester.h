@@ -310,6 +310,9 @@ public:
             cuda_check(cudaMemset(data(), byte_value, payload_bytes_),
                        "cudaMemset guarded payload");
         }
+        // See DeviceBuffer::fill in src/core/arena.cu: a device memset runs on the legacy stream
+        // and non-blocking streams do not wait for it.
+        cuda_check(cudaStreamSynchronize(nullptr), "guarded fill completion");
     }
 
     void copy_from_host(const void* source, std::size_t count, std::size_t byte_offset = 0) {
@@ -318,6 +321,9 @@ public:
         auto* destination = static_cast<std::uint8_t*>(data()) + byte_offset;
         cuda_check(cudaMemcpy(destination, source, count, cudaMemcpyHostToDevice),
                    "cudaMemcpy host-to-guarded-device");
+        // See DeviceBuffer::copy_from_host in src/core/arena.cu: a pageable H2D returns before
+        // the DMA lands, and the DMA rides the legacy stream.
+        cuda_check(cudaStreamSynchronize(nullptr), "host-to-guarded-device completion");
     }
 
     void copy_to_host(void* destination, std::size_t count, std::size_t byte_offset = 0) const {
