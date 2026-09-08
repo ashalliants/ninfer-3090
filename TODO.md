@@ -60,22 +60,13 @@ subsystem.
 
 ## 2. Correctness and coverage gaps
 
-- [ ] **Port upstream's DFlash2 attention sweep.** `run_softmax_attention_dflash2_tests` currently
-      returns 77 with a message saying it is not ported. Driving upstream's `run_dflash2_cases`
-      through this fork's causal-cache fixture **segfaults** — it uses shapes the fixture does not
-      model, and because it is a memory fault rather than a throw, no try/catch reports it. Each
-      shape needs validating against this fixture's geometry and storage overloads first.
-      **Narrowed 2026-09-07:** it fails on the *first* case of the sweep — BF16, `width=2`,
-      `batch=1`, `base=0` — not on some exotic later shape, and it fails before reaching any
-      attention call (neither `causal_attention_resolve_route` nor
-      `causal_softmax_attention_workspace_capacity_bytes` is entered). The symptom varies run to run
-      ("vector too long", "bad allocation", "invalid naive Softmax Attention geometry", a raw access
-      violation), and `compute-sanitizer` reports **0 device errors**, so it is host-side. Start
-      from that one case rather than the whole sweep; `cdbX64.exe` is available for it (see
-      `windows-cdb-debugger-available` in memory).
-      *Note the trap: rk8v4 is only constructible through the `CachePlan` overload of `make_cache`;
-      the `KvCacheStorage` overload has no packed-int4 branch and silently builds an unpacked INT8
-      value plane that the kernel then reads as packed and runs off the end of.*
+- [x] ~~Port upstream's DFlash2 attention sweep.~~ **Done.** The segfault was in the fixture, not
+      the sweep: `BatchAttentionCase::table_rows` are indices *into* the cache table, not the batch
+      size, but the fixture sized the table by batch, so a batch of one addressing row 7 indexed a
+      one-element vector — `cache_table_row_count` now sizes it correctly. The sweep is registered
+      as `ninfer_softmax_attention_dflash2_test` (`--dflash2-only`) and runs BF16, INT8, FP8,
+      NVFP4, K8V4, and this fork's own rk8v4 (via the `CachePlan` overload, since the public
+      `KvCacheStorage` enum cannot select it).
 - [x] ~~`ninfer_qwen3_8_27b_dflash2_real_test` cannot run on a 24 GB card.~~ **It can — it just
       defaults to a maximum configuration.** The test already takes argv
       (`k graph optimized batch kv vision state_slots`) but `add_test` passes none, so it runs

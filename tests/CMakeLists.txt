@@ -307,9 +307,10 @@ add_test(NAME ninfer_softmax_attention_nvfp4_test
   COMMAND ninfer_softmax_attention_test --nvfp4-only)
 add_test(NAME ninfer_softmax_attention_k8v4_test
   COMMAND ninfer_softmax_attention_test --k8v4-only)
-# Upstream's DFlash2 verification sweep. ~460 s: five storage families over every narrow width,
-# batch and base offset, so it gets a timeout well clear of the default 1500 s only if the machine
-# is slow -- left at the default here because it finishes in under a third of it.
+# Upstream's DFlash2 verification sweep. ~460 s: six storage families (five upstream, plus this
+# fork's rk8v4) over every narrow width, batch and base offset, so it gets a timeout well clear of
+# the default 1500 s only if the machine is slow -- left at the default here because it finishes in
+# under a third of it.
 add_test(NAME ninfer_softmax_attention_dflash2_test
   COMMAND ninfer_softmax_attention_test --dflash2-only)
 set_tests_properties(

@@ -2591,11 +2591,17 @@ void validate_batch_case(const BatchAttentionCase& test_case) {
                  std::to_string(test_case.width) + "]");
         }
         if (row < 0) { fail("negative table row " + std::to_string(row) + at); }
-        if (std::find(seen.begin(), seen.end(), row) != seen.end()) {
-            fail("table row " + std::to_string(row) + " is addressed twice" + at +
-                 "; two requests writing one cache row in a single launch has no defined result");
+        // A request with valid == 0 writes nothing: the small-T kernels return with neutral
+        // output before touching the cache for it. Two such requests sharing a table row is not a
+        // race -- neither is a writer -- so only requests that actually write are checked against
+        // (and added to) the distinctness set.
+        if (valid > 0) {
+            if (std::find(seen.begin(), seen.end(), row) != seen.end()) {
+                fail("table row " + std::to_string(row) + " is addressed twice" + at +
+                     "; two requests writing one cache row in a single launch has no defined result");
+            }
+            seen.push_back(row);
         }
-        seen.push_back(row);
     }
 }
 
@@ -3300,10 +3306,11 @@ int run_softmax_attention_k8v4_tests() {
 // cache_table_row_count exists for.
 int run_dflash2_cases() {
     constexpr int order[]{7, 0, 4, 2, 6, 1, 5, 3};
-    int failures = 0;
-    for (auto storage :
-         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
-          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+    // run_batch_case/run_a1_case/run_a3_case are each overloaded on KvCacheStorage and CachePlan,
+    // so one generic sweep body covers every registered profile -- including rk8v4, which the
+    // public KvCacheStorage enum cannot select and only the CachePlan overload builds.
+    const auto sweep = [](auto storage) {
+        int failures = 0;
         const auto run = [&](int width, int batch, int base) {
             BatchAttentionCase c{width, {}, {}, {}, MappingPattern::Fragmented,
                                  static_cast<unsigned>(1700 + width + 31 * batch)};
@@ -3334,7 +3341,16 @@ int run_dflash2_cases() {
                             {width, 8192, static_cast<unsigned>(8192 + width), 1802u, false, true},
                             MappingPattern::Fragmented);
         }
+        return failures;
+    };
+
+    int failures = 0;
+    for (auto storage :
+         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+        failures += sweep(storage);
     }
+    failures += sweep(kPlanRk8v4);
     return failures;
 }
 
@@ -3379,6 +3395,19 @@ int run_batch_profile_validation_cases() {
         }
     } catch (const std::invalid_argument& error) {
         std::cerr << "validate_batch_case rejected the DFlash2 shape it must accept: "
+                  << error.what() << '\n';
+        ++failures;
+    }
+
+    // Two requests sharing a table row where neither is a writer -- valid_columns == 0 -- is not a
+    // race and must be accepted. This is exactly the shape run_dflash2_cases sweeps: every fourth
+    // batch row is zero-valid, and order[] repeats table rows across the b%4==3 (zero-valid) and
+    // other cases at different batch positions.
+    try {
+        validate_batch_case({2, {0, 2}, {0, 2}, {3, 3}, MappingPattern::Fragmented, 10u});
+    } catch (const std::invalid_argument& error) {
+        std::cerr << "validate_batch_case rejected a zero-valid row sharing a table row with a "
+                     "writer: "
                   << error.what() << '\n';
         ++failures;
     }
