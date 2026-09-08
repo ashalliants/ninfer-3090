@@ -37,9 +37,14 @@ This is the 21.22 GiB container-v2 artifact, carrying the DFlash bundle needed f
 (the older `c8b8c1c0` pin predates it). The v0.5 runtime reader accepts both v1 and v2 containers.
 An error that says only `artifact magic is not NInfer version 1` comes from an older executable;
 replace it with the
-[v0.5.0 Windows release](https://github.com/Don-Chad/ninfer-3090/releases/tag/v0.5.0-rtx3090). The
-published RTX 3090 concurrency measurements were taken against the smaller 20.84 GiB container-v1
-artifact (`c8b8c1c0`) and have not been re-measured against this DFlash-bearing v2 pin.
+[v0.5.0 Windows release](https://github.com/Don-Chad/ninfer-3090/releases/tag/v0.5.0-rtx3090).
+
+**The extra 0.38 GiB costs nothing in VRAM unless you ask for DFlash.** The published RTX 3090
+concurrency measurements were taken against the smaller `c8b8c1c0` artifact, so the obvious worry
+is that this pin eats into the profiles they established. Measured, it does not: loading either
+revision with `--spec` unset reports byte-identical resident weights of **21,038,469,632 bytes**.
+Selecting `--spec dflash` is what maps the additional 410,053,632 bytes, and only then. The
+concurrency table below therefore still applies.
 
 ## Run the concurrent server
 
@@ -59,8 +64,8 @@ Prefix reuse is enabled by default; `--no-prefix-reuse` disables it. The server 
 Responses, OpenAI Chat Completions, and Anthropic Messages-compatible endpoints. Run
 `.\ninfer-serve.exe --help` for the complete option list.
 
-The compact 35B artifact does not contain DFlash weights. Do not select `--spec dflash`; the
-runtime reports the missing optional weights explicitly.
+`--spec dflash` needs the pinned `560f227e` artifact above. On the older compact `c8b8c1c0` one it
+is refused explicitly, with `DFlash was requested but this compact artifact has no DFlash weights`.
 
 ## Qwen3.8-27B C8/8K profile
 
