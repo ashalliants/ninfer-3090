@@ -451,15 +451,14 @@ crossings. 0 (offload everything) is the default and maximises capacity.
 
 | Model | Artifact | Size | Notes |
 |---|---|---:|---|
-| Qwen3.6-35B-A3B v1 | [pinned compact artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/tree/c8b8c1c0df4c74df3c190c6aa3a7f24dc614721c) | 20.84 GiB | **Recommended for RTX 3090; text C1-C6 at 4K and vision C1 at 32K** |
-| Qwen3.6-35B-A3B v2 | [current upstream artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | 21.22 GiB | Reader supported by v0.5+; includes DFlash payload and is not the measured 3090 artifact |
+| Qwen3.6-35B-A3B v2 | [pinned DFlash artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/tree/560f227e5a7104756d1a108201a8aa75654ea688) | 21.22 GiB | **Recommended; fetched by `download-qwen36-35b-a3b.{bat,sh}`. Carries the DFlash bundle for `--spec dflash`** |
+| Qwen3.6-35B-A3B v1 | [pinned compact artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/tree/c8b8c1c0df4c74df3c190c6aa3a7f24dc614721c) | 20.84 GiB | No DFlash bundle; the artifact used for the published RTX 3090 concurrency results (text C1-C6 at 4K and vision C1 at 32K) |
 | Qwen3.6-27B | [groupwise artifact](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | 16.29 GiB | Supported with more runtime headroom |
 | **Qwen3.8-27B** | [official NInfer groupwise artifact](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 16.96 GiB | **Validated at C1, C2, C4 and C8/MTP3 with ReplaySSM** |
 
-NInfer-3090 v0.5 and newer recognize both v1 and v2 container magic. The current 21.22 GiB v2
-artifact contains additional DFlash weights and is not the artifact used for the published RTX
-3090 concurrency results. The pinned compact v1 artifact keeps the measured model payload and
-omits DFlash, providing the known 24 GB memory profile.
+NInfer-3090 v0.5 and newer recognize both v1 and v2 container magic. The 21.22 GiB v2 artifact adds
+DFlash weights and is what the download scripts now fetch; the published RTX 3090 concurrency
+results were measured against the smaller v1 artifact and have not been re-measured against v2.
 
 ## Models and platform support
 
@@ -470,11 +469,13 @@ RTX 3090 or RTX 3090 Ti and a recent NVIDIA driver.
 Download the [official Qwen3.8 artifact](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) as
 `models/qwen3_8_27b.ninfer`. Windows users can run `download-qwen38-27b.bat` instead.
 
-For Qwen3.6-35B-A3B, the smaller
-[pinned container-v1 artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/tree/c8b8c1c0df4c74df3c190c6aa3a7f24dc614721c)
-is recommended on a 24 GB card. Releases v0.5 and newer also read the larger container-v2 file.
-An `artifact magic is not NInfer version 1` message means the executable is outdated, not that the
-current model download is necessarily corrupt.
+For Qwen3.6-35B-A3B, download the
+[pinned container-v2 artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/tree/560f227e5a7104756d1a108201a8aa75654ea688)
+for DFlash support, or run `download-qwen36-35b-a3b.bat`/`.sh` instead. Releases v0.5 and newer
+also read the smaller container-v1 file, which lacks DFlash but is the artifact the published RTX
+3090 concurrency results were measured against. An `artifact magic is not NInfer version 1`
+message means the executable is outdated, not that the current model download is necessarily
+corrupt.
 
 Developers can build from source on Windows or Linux. Windows uses Visual Studio 2022 and vcpkg.
 Linux uses GCC 13 with system packages or the pinned vcpkg manifest. Both builds require CUDA 12.8
