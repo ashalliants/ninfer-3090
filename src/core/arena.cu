@@ -338,7 +338,15 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
     void* ptr             = nullptr;
     const cudaError_t err = cudaMallocHost(&ptr, size_bytes);
     if (err != cudaSuccess) {
-        throw std::runtime_error(cuda_error_message("cudaMallocHost failed", err));
+        // Say the size, and say *host*. The bare CUDA text is
+        // "cudaErrorMemoryAllocation: out of memory", which reads as a VRAM shortfall and sends
+        // people to look at nvidia-smi -- but this allocation is pinned system RAM and can fail
+        // with the card almost entirely free. The caller adds which knob shrinks it.
+        const std::string prefix =
+            "cudaMallocHost failed to pin " +
+            std::to_string((size_bytes + (1ULL << 20) - 1) >> 20) +
+            " MiB of host memory (this is system RAM, not VRAM)";
+        throw std::runtime_error(cuda_error_message(prefix.c_str(), err));
     }
 
     data_ = ptr;
