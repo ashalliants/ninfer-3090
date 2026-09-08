@@ -95,6 +95,13 @@ but only 2375691264 bytes are available for runtime capacity
 `--kv-capacity` is the shared pool and `--max-context` is the per-request cap, so a second lane
 does not cost twice the memory unless you also want twice the per-request context.
 
+**To size a profile that is not in this table, open
+[`docs/config-calculator.html`](docs/config-calculator.html) in a browser.** It is a single
+self-contained file in this repository — no network access needed — that takes a model, a KV
+format and a context length and tells you whether it fits in 24 GiB, what the largest context you
+could run instead would be, and what the choice costs in decode speed and perplexity. Every
+constant in it is measured on an RTX 3090 against this fork.
+
 If startup refuses, drop a context rung first — 262144 / 196608 / 131072 / 114688 / 98304 / 81920.
 Speculation is the next lever, worth 992 MiB (MTP head 856 MiB, draft head 136 MiB, roughly 130,000
 rk8v4 tokens) at the cost of dropping decode to ~183 tok/s. Drop `--vision` last: in overlay
@@ -290,15 +297,46 @@ output. Upstream's `kv_cache_append` contract stores values from the represented
 directly, and measurement showed that is sufficient, so this port keeps it: there is no
 inverse-rotation kernel and no extra pass over the output.
 
-| KV profile | Automatic-sizing context | KV bytes at 2,048 tokens | Perplexity |
-|---|---:|---:|---:|
-| `bf16` | — | 128.00 MiB | 4.343225 |
-| `int8` | 171,648 tokens | 66.00 MiB | 4.343263 |
-| `rk8v4` | **226,560 tokens** | **51.00 MiB** | 4.346811 |
+### Choosing a KV format
+
+All six SM86 KV formats, measured on Qwen3.8-27B. Size and perplexity are what most people weigh;
+the decode column is the one that surprises, because the smallest formats are not the fastest.
+
+| KV profile | Bytes/token | KV at 2,048 tokens | Perplexity | vs `bf16` | Decode at 32K depth |
+|---|---:|---:|---:|---:|---:|
+| `bf16` | 65,536 | 128.00 MiB | 4.343225 | — | 32.50 tok/s |
+| `int8` | 33,792 | 66.00 MiB | 4.343263 | +0.0009% | **33.86 tok/s** |
+| `fp8` | 33,024 | 64.50 MiB | 4.347181 | +0.0911% | 30.13 tok/s |
+| `rk8v4` | 26,112 | 51.00 MiB | 4.346811 | +0.0826% | 33.54 tok/s |
+| `k8v4` | 25,728 | 50.25 MiB | 4.347596 | +0.1006% | 28.61 tok/s |
+| `nvfp4` | **18,432** | **36.00 MiB** | 4.358924 | +0.3615% | 29.62 tok/s |
 
 Perplexity is `ninfer-perplexity` on the fixed `ninfer-ppl-1m-v1` corpus, `--quick`, context/stride
-4096/2048, 261,167 scored tokens. **32% more context costs 0.082% perplexity.** INT8 spends
-5.40 GiB of KV on its 171,648 tokens; rk8v4 spends 5.51 GiB on 226,560.
+4096/2048, 261,167 scored tokens — the same corpus and window for every row. Decode is 128 timed
+steps on top of a 32,768-token prefill, no speculation; attention re-reads the whole cache each
+step, so a format's cost only shows at depth.
+
+Three of these six are worth using:
+
+- **`int8`** is the default for good reason. Its perplexity cost is +0.0009%, which is nothing, and
+  it has the second-flattest decode curve.
+- **`rk8v4`** is the best all-round choice: 23% smaller than INT8 for +0.08% perplexity, and the
+  flattest decode curve measured (−6.2% from 4K to 32K, against INT8's −6.3%).
+- **`nvfp4`** buys the most context by a wide margin — 45% smaller than INT8. On the 35B with MTP3
+  and the draft head, on a machine running a desktop, it is the only format that still reaches the
+  full 262,144 native context: `rk8v4` gets to about 231,000 and INT8 to about 179,000 there.
+  Headless, `rk8v4` clears 262,144 as well. It costs about 13% of decode speed at 32K and +0.36%
+  perplexity.
+
+`fp8` and `k8v4` have no niche. `fp8` is larger, slower at depth *and* worse quality than `rk8v4`;
+`k8v4` is within 1.5% of `rk8v4`'s size but has the worst decode falloff of any format measured
+(−17.9% on the 27B, −25.2% on the 35B) and slightly worse perplexity.
+
+Per-format numbers for the 35B, plus a fit calculator that solves for context and memory, are in
+[`docs/config-calculator.html`](docs/config-calculator.html).
+
+At the 1 GiB automatic-sizing boundary INT8 spends 5.40 GiB of KV on 171,648 tokens; rk8v4 spends
+5.51 GiB on 226,560.
 
 Decode cost depends on whether you speculate. The packed value plane halves value traffic but adds
 an unpack, and those very nearly cancel: without speculation, decode measured 39.07 tok/s on INT8
@@ -563,9 +601,11 @@ a 24 GB card and the server can reuse fast CUDA Graphs instead of rebuilding wor
 - Tool calls are returned to the client but are not executed by NInfer.
 - NVFP4 A4, FP8 A8, and TMA kernels require Blackwell and are unavailable on SM86. FP8 and NVFP4
   weights are admitted through their A16 dequantizing routes.
-- The paged runtime exposes BF16, INT8 group-64 and RotorQuant `rk8v4` KV; INT8 remains the
-  quality-default path and `rk8v4` is opt-in. Upstream's row-scaled FP8 E4M3 KV profile parses but
-  is rejected on SM86, because its causal-attention kernels are Blackwell-only.
+- The paged runtime exposes six KV formats on SM86 — `bf16`, `int8` group-64, row-scaled FP8 E4M3
+  `fp8`, RotorQuant `rk8v4`, `k8v4` and `nvfp4`. INT8 remains the quality default and the rest are
+  opt-in; [`docs/config-calculator.html`](docs/config-calculator.html) has the measured size,
+  speed and perplexity of each. Note that this is KV storage only: NVFP4 A4 and FP8 A8 *weight and
+  activation* kernels still require Blackwell and are unavailable here.
 
 ## Validation
 
