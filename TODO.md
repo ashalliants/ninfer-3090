@@ -1,83 +1,110 @@
 # TODO
 
-State as of 2026-09-08. **PR #16 is approved and merged to `master`**, and released as
-**v0.9.0-rtx3090** (Windows + Linux). Full suite **123/123**, plus three real-model tests passing
-on an idle GPU. The branch carried the upstream catch-up, PR #15's multi-GPU expert offload, four
-measured route retunes, two switch-fallthrough fixes, profile-derived KV plane typing, and the
-adoption of upstream's causal small-T.
+State as of 2026-09-08, after a clearing pass that closed fourteen items.
 
-What landed, with numbers:
+Released: **v0.9.0-rtx3090** (Windows + Linux). Full suite **125/125** on this box, now including
+upstream's DFlash2 attention sweep, which had been skipped since the catch-up merge.
 
-| change | effect |
-|---|---|
-| Four route tables re-measured on sm_86 | **12–41% faster** at the widths that moved |
-| Upstream causal small-T adopted (12-file revert gone) | **13–25% faster** decode, int8 |
-| Two switch fallthroughs fixed | each was running a second kernel over the first |
-| DFlash2 unblocked on this fork | `--spec dflash2` previously died at startup |
-| KV plane typing derived from the profile | producer/consumer disagreement is now a compile error |
+**Every route table in the tree has now been measured on sm_86.** That was the largest outstanding
+body of work and it is finished. What remains is correctness, coverage needing hardware this box
+does not have, and measurement debt.
 
-**Eight review rounds** on PR #16, seven of eight findings genuine (one disputed with evidence and
-withdrawn). The recurring lesson, worth keeping: **fix the class, not the flagged line** — chasing
-the class is what found the `kv_cache_append` contract lines and the `AGENTS.md` wrong-target claim
-that nobody had flagged.
-
-Everything below is what is *not* done. Ordered by what blocks what.
+In flight: #21 (this file), #26 (503 during startup), #27 (q4 SwiGLU retune), #29 (housekeeping),
+#30 (DFlash2 sweep).
 
 ---
 
 ## 0. Next up, in this order
 
-1. **Dedupe `prompt_i8.cuh`'s local f16 dequant helpers** (section 7). ~15 minutes, and it closes
-   the exact gap that caused the small-T bug: the shared codec had no f16 variant for the INT8
-   codings, so upstream's kernel reached for the bf16 one. Removing the local copies removes the
-   trap.
-2. **Measure the `w8_pair` k=2048 table** (section 4). The best remaining pure-speed bet — 37
-   routes, the largest table in the tree, on the 35B DFlash path, never measured on sm_86.
-3. **Audit the gross-error limits** (section 5). Cheap insurance: any criterion under ~4e-3 against
-   a BF16 output will read as an accuracy regression the next time a route boundary moves.
+1. **The `T=112` graph-replay failure** (§1.1). The only open item that could be a correctness
+   defect in *released* code. Four hypotheses are already ruled out — read that entry first, it
+   will save a day.
+2. **The two test-criterion outliers** (§4). Small, the last loose ends from the §5 audit, and
+   neither needs hardware this box lacks.
+3. **The real-model maximum-configuration decision** (§1.2). A judgement call more than a task.
 
-Then, in no fixed order: the two items descoped from PR #16 under review (sections 4a and 5a), and
-the DFlash2 attention sweep (section 2), which is now narrowed to a single reproducible case.
+Everything else is blocked on hardware/artifacts (§2) or is measurement debt (§3).
 
-**Keep `investigate/small-t-upstream` until the next catch-up.** It is merged, but it is also the
-clean, self-contained record of how upstream's small-T was adopted and what had to be fixed to make
-it work here (`19c7617c` and its parents). The next merge from `neroued/master` will touch the same
-subsystem.
+**Keep `investigate/small-t-upstream` until the next catch-up.** It is merged, but it is the clean
+record of how upstream's small-T was adopted and what had to be fixed (`19c7617c` and its parents).
+The next merge from `neroued/master` will touch the same subsystem.
 
 ---
 
-## 1. Shipping — done
+## 1. Correctness and coverage
 
-- [x] ~~Push the branch, open the PR, land PR #15 first.~~ All done. PR #15 merged to `master`
-      first (four mechanical conflicts, resolved), then this branch merged `master`.
-- [x] ~~**PR #16**~~ — **approved and merged.** CodePulse: *"No action needed — ship it."* Eight
-      review rounds; the resolutions are recorded in the commit messages, which is where to look
-      if any of them needs revisiting.
-- [x] ~~Cut a release.~~ **v0.9.0-rtx3090**, Windows + Linux archives with SHA256SUMS.
-- [ ] PR #12 is a `DO NOT MERGE` draft recording the prefill/decode overlap negative result. Close
-      it or leave it as the record — it should not merge either way. **Still the only open PR
-      housekeeping item.**
+### 1.1 `attn_input_proj` grossly wrong at `W8 DFlash2 A16 T=112 graph phase=1`
 
-## 2. Correctness and coverage gaps
+- [ ] Not a tolerance miss — `actual=34` against `reference=-65.9`, `actual=4.09` against `67.15`,
+      on q, k *and* value. Seen in **2 of 6 full-suite runs** (`ctest -j2`), always that exact case
+      and always the graph-replay phase; passes 3/3 in isolation.
 
-- [x] ~~Port upstream's DFlash2 attention sweep.~~ **Done.** The segfault was in the fixture, not
-      the sweep: `BatchAttentionCase::table_rows` are indices *into* the cache table, not the batch
-      size, but the fixture sized the table by batch, so a batch of one addressing row 7 indexed a
-      one-element vector — `cache_table_row_count` now sizes it correctly. The sweep is registered
-      as `ninfer_softmax_attention_dflash2_test` (`--dflash2-only`) and runs BF16, INT8, FP8,
-      NVFP4, K8V4, and this fork's own rk8v4 (via the `CachePlan` overload, since the public
-      `KvCacheStorage` enum cannot select it).
-- [x] ~~`ninfer_qwen3_8_27b_dflash2_real_test` cannot run on a 24 GB card.~~ **It can — it just
-      defaults to a maximum configuration.** The test already takes argv
-      (`k graph optimized batch kv vision state_slots`) but `add_test` passes none, so it runs
-      k=15, **batch=8** (18,432-token KV) and 3 state slots, wanting 6.32 GB. Run it scaled and it
-      passes end to end: `ninfer_qwen3_8_27b_dflash2_real_test.exe 7 1 1 2 int8 0 1` →
-      `ok K=7 B=2 graph=1 optimized=1 accepted=20/20`.
-      **Now wired into ctest.** `ninfer_add_test` gained a `TEST_ARGS` option and the test is
-      registered with `TEST_ARGS 7 1 1 2 int8 0 1`, so it runs that configuration by default and
-      passes; the executable still accepts any other configuration when run by hand.
+      Two reasons this outranks everything else. **`T=112` sits in the `{97,128}` →
+      `R32C64K128` band retuned in PR #16**, which shipped in v0.9.0. And the criterion involved
+      was *loosened* by the §5 floor and still fails loudly, which rules out tolerance — the values
+      are ~10x off.
 
-### Running the real-model tests on this box (verified 2026-09-07, idle GPU)
+      **Four hypotheses ruled out. Do not repeat these** — 69 targeted iterations across five
+      isolation experiments, of which only the full-suite row reproduced:
+
+      | experiment | iterations | reproduced |
+      |---|---|---|
+      | full `ctest -j2` | 6 (across two builds) | **2** |
+      | `-R` subset of 11 related tests, `-j2` | 6 | 0 |
+      | full attn test vs one long-lived partner | 14 | 0 |
+      | `--dflash2-only` vs one long-lived partner | 40 | 0 |
+      | attn test alone | 3 | 0 |
+
+      - **Not tolerance.** One failure was on the §5 loosened-floor build, and the values are ~10x
+        off — two orders of magnitude past any plausible bound.
+      - **Not memory pressure**, the original assumption. On a 24,576 MiB card the idle baseline is
+        1,782 MiB and the partner tests peak at 2,135 MiB: **353 MiB of added load, leaving
+        21.9 GiB free at the peak.** Nothing is near a capacity limit.
+      - **Not single-partner compute contention**, across 54 iterations that provably covered the
+        case (`NINFER_OP_REPORT_STATS=1` confirms `--dflash2-only` runs all three of q/k/value at
+        `T=112 graph phase=1`).
+      - **Not modest process churn** — 11 tests under `-j2`, six times, stayed clean.
+
+      So the trigger is something only the *full* 125-test run supplies: cumulative allocator state
+      across many processes, a specific predecessor test, or duration. **The next step is not
+      another contention harness** — it is to catch a failing full-suite run with instrumentation
+      already attached (dump the failing tile's inputs, or loop the suite overnight capturing
+      `NINFER_OP_REPORT_STATS=1` for this Op only).
+
+      *Method note, because it wasted two attempts:* the first harnesses shelled out to
+      `ninfer_softmax_attention_nvfp4_test.exe` / `_k8v4_test.exe`, which **do not exist** — those
+      are ctest entries sharing one binary with `--nvfp4-only` / `--k8v4-only`. `Start-Process`
+      failed silently, no load ever ran, and the "clean" results were meaningless. Resolve binaries
+      with `Resolve-Path`, assert the partner is alive, and take argument lists from
+      `build-ninja/tests/CTestTestfile.cmake`.
+
+### 1.2 Real-model tests pin maximum configurations, not this box's capability
+
+- [ ] Measured via the CLI, which is the honest way to size them:
+
+      | model | configuration | result |
+      |---|---|---|
+      | 27B | 131,072 ctx, int8 | **works** — 4.44 GiB reservation, 449 MiB spare |
+      | 27B | 32,768 ctx, int8, `--vision` | **works** — 2.01 GiB reservation, 2.54 GiB spare |
+      | 35B-A3B | 32,768 ctx, int8 | **works** — 513.7 MiB reservation, 726 MiB spare |
+
+      There is room for meaningful end-to-end coverage; the tests simply pin
+      262,144-context/vision/batch-8 layouts. `NINFER_REAL_TEST_MAX_CONTEXT` lowers the ceiling the
+      35B's `exercise_maximum_configuration` asks for (unset, the pinned 256K layout runs as
+      before).
+
+      **The 35B's remaining blocker is its *base* engine, not the maximum one:** 20.8 GiB of
+      weights plus a 472 MB runtime reservation against ~21.4 GiB free leaves it **~93 MB short**
+      when the desktop holds ~2.4 GB. Closing a couple of GPU clients is enough. Decide whether the
+      base config should also honour the env var, or skip with a clear message when the reservation
+      genuinely will not fit.
+
+- [ ] **Six real-model tests skip** for want of artifacts/env vars: `27b_prefix_real`,
+      `27b_score_real`, `27b_load_plan`, `35b_a3b_real`, `35b_a3b_dflash_real`,
+      `35b_a3b_dflash_load_plan`. Some fail environmentally on this host rather than from a defect
+      — see `ninfer-3090-35b-real-tests-environmental` in memory.
+
+#### Running the real-model tests here (verified 2026-09-07, idle GPU)
 
 ```
 NINFER_QWEN3_8_27B_WEIGHTS=C:\Ninefer-3090\models\qwen3_8_27b.ninfer
@@ -93,346 +120,199 @@ NINFER_REAL_TEST_MAX_CONTEXT=8192      # only needed for the 35B
 | `35b_a3b_real` | **passes** with `NINFER_REAL_TEST_MAX_CONTEXT=8192` |
 | the other four | skip — need a Qwen3.6 27B artifact, or a DFlash-carrying 35B artifact |
 
-**Free VRAM is the whole story, and it is not marginal — it is decisive.** With the desktop
-busy (~4.4 GiB free) `27b_prefix_real` skips; idle (~21.9 GiB free) it passes. For the 35B the
-runtime reservation the maximum-configuration exercise asks for scales with the ceiling:
-262,144 → 4.15 GB, 32,768 → 1.48 GB, 16,384 → 1.29 GB, 8,192 → fits. Available runtime capacity
-on an idle box is ~1.02 GiB once the 20.8 GiB of weights are resident.
-
-The default stays 262,144 deliberately: on a machine that can hold it, that is the configuration
-worth pinning. The env var is for boxes that cannot, and the test now *skips* rather than fails
-when it genuinely will not fit.
-
-- [ ] **The real-model tests fail on their *maximum* configurations, not on this box's capability.**
-      Measured 2026-09-07 via the CLI, which is the honest way to size them:
-      | model | configuration | result |
-      |---|---|---|
-      | 27B | 131,072 ctx, int8 | **works** — 4.44 GiB reservation, 449 MiB spare |
-      | 27B | 32,768 ctx, int8, `--vision` | **works** — 2.01 GiB reservation, 2.54 GiB spare |
-      | 35B-A3B | 32,768 ctx, int8 | **works** — 513.7 MiB reservation, 726 MiB spare |
-
-      So there is plenty of room for meaningful end-to-end coverage; the tests simply pin
-      262,144-context/vision/batch-8 layouts. `NINFER_REAL_TEST_MAX_CONTEXT` now lowers the ceiling
-      the 35B test's `exercise_maximum_configuration` asks for (unset, the pinned 256K layout is
-      exercised exactly as before).
-      **The 35B's remaining blocker is its *base* engine, not the maximum one:** 20.8 GiB of weights
-      plus a 472 MB runtime reservation against ~21.4 GiB free leaves it **~93 MB short**, because
-      the desktop is holding ~2.4 GB (Chrome, Steam, Ferdium, Docker…). Closing a couple of GPU
-      clients is enough to run it. Worth deciding whether the base config should also honour
-      `NINFER_REAL_TEST_MAX_CONTEXT`, or whether the test should skip with a clear message when the
-      reservation genuinely will not fit rather than failing.
-- [ ] **Six other real-model tests skip** for want of artifacts/env vars: `27b_prefix_real`,
-      `27b_score_real`, `27b_load_plan`, `35b_a3b_real`, `35b_a3b_dflash_real`,
-      `35b_a3b_dflash_load_plan`. See `ninfer-3090-35b-real-tests-environmental` in memory — some
-      of these are known to fail environmentally on this host rather than because of a defect.
-
-## 3. Combinations asked for but never exercised
-
-- [ ] **`--vision-residency overlay` + DFlash2.** Planned in the test matrix, never actually run.
-      The overlay path borrows device memory per image from the evictable text-weight tail, and
-      DFlash2 binds its own weight bundle, so the interaction with the eviction ladder is exactly
-      the sort of thing that will not show up until someone tries it.
-- [ ] **DFlash2 + multi-GPU expert offload.** This host has one 3090; the offload path degenerates
-      to the single-rank identity mapping, so nothing meaningful was tested. Needs the two-card
-      box (vast) or a second local GPU. **More interesting now that PR #15 has landed on `master`**
-      — the offload path is no longer hypothetical, and this branch has merged it.
-- [ ] **`--spec dflash` (v1) on 35B-A3B.** Refused by the 27B artifact ("selected masked draft
-      backend is not supported by this target") because v1 is a 35B backend — correct behaviour,
-      but it means v1 itself is untested this cycle. Needs the 35B DFlash artifact.
-
-## 4. Performance work left on the table
-
-**Every route table the catch-up merge changed has now been measured on sm_86 and retuned.**
-There were exactly three (`git diff master...HEAD` over the route arrays): W8 attention-input
-DFlash2, W8 SwiGLU DFlash2, and W8 linear-pair k=5120. All three were wrong here, by 12-41%.
-The other seven tables the merge left alone. The general lesson is in
-`ninfer-3090-route-tables-can-be-dead-code`: **after a catch-up, diff the route arrays first and
-re-measure every one that moved** — a table is tuning for the GPU it was tuned on, and nothing
-about it fails on a different one.
-
-- [ ] **Three schedules are now routed at no width**: `DFlash2MmaR16C64K128` (W8 attention input,
-      never won anywhere), `DFlash2MmaR32C64K128` (W8 SwiGLU, ties `R64C64K128` at 33..44), and
-      `MmaResidualR64C32` (Q5 linear-add). All are deliberately kept — deleting an upstream
-      schedule costs merge effort for no measured gain — but a schedule nothing selects is what let
-      both switch fallthroughs hide. Consider a test that *lists* unrouted schedules per Op, so the
-      set is visible and deliberate rather than accidental.
-- [ ] **`w8_pair` k=2048 table (37 routes) is unmeasured on sm_86.** The merge did not touch it, so
-      it is not a new regression, but it is the largest route table in the tree and sits on the 35B
-      DFlash path. `bench/ops/w8_pair_schedule_bench.cu` is the starting point but this is **more
-      than a second `sweep_for_k(2048, ...)` call**, which is what a first look suggested:
-      - `w8_pair_execute_schedule` calls `require_dflash_row_views` whenever `k == 2048`, so the two
-        weights cannot be standalone 1024-row matrices as they are for k=5120. They must be row
-        views into a 6144-row parent taken at rows 4096 and 5120. `PairFixture` in
-        `tests/ops/linear_pair/linear_pair_test_common.cpp` already builds exactly that and is the
-        thing to copy.
-      - The schedule list needs the split-K and concat families, and those are the ones that assume
-        the k=2048 geometry. A kernel run outside the shape it was written for faults rather than
-        throwing, and the sweep driver can only catch throws — add them a few at a time.
-- [ ] **q4 SwiGLU `Materialized` boundaries are unmeasured on sm_86**: routes `{49,128}`,
-      `{257,384}`, `{513,640}`. `bench/ops/q4_linear_swiglu_schedule_bench.cu` deliberately excludes
-      Materialized because it needs a workspace and has a different launch signature. Extending the
-      bench to cover it would close the last unmeasured boundaries in that table.
-- [ ] **Two q4_q5 schedules never win at any measured width**: `grouped_r32_c64_s4` (also reachable
-      as `PairR32C64S4`) and `pair_r32_c64_s3`. They still occupy enum entries and switch cases.
-      Either find the shape where they win, or delete them — dead schedules are what let the
-      fallthrough bug hide.
-- [x] ~~Audit other Ops for the dead-table pattern.~~ Done: all ten `*_resolve_plan` files were
-      checked and only `attn_input_proj/q4_q5` had a table nothing read. Both GDN resolvers, both
-      W8 attention/SwiGLU resolvers and `w8_pair` iterate theirs. The two switch fallthroughs found
-      along the way are fixed and `-Werror=implicit-fallthrough` now guards non-MSVC builds
-      (MSVC has no equivalent warning, so CI carries the guard for this host).
-- [x] ~~**The causal small-T subsystem is reverted**~~ **Done — upstream's small-T is adopted and
-      the revert is gone.** Root cause of the INT8 corruption: upstream's `small_t_i8.cuh` stages V
-      for an **f16** PV MMA (`dst` is `__half*`, read by `ldmatrix`, consumed by `mma_f16`) but
-      filled it with `kv_cache_int8_dequant_i8x8_from` / `_int4_dequant_i4x8_from`, both of which
-      pack with `pack_bf16x2`. Both types are sixteen bits, so it compiled, ran, and reinterpreted
-      every value. Both affected storages (int8-g64, rk8v4) go through exactly those two helpers,
-      which is why the symptom was "the INT8 family" and nothing else. Fixed by adding
-      `kv_cache_int8_dequant_f16x8_from` / `kv_cache_int4_dequant_f16x8_from` next to their bf16
-      counterparts — the shared codec had never had f16 variants for the INT8 codings, which is
-      exactly why the wrong helper looked right (`prompt_i8.cuh` had worked around it with local
-      copies; **deduping those against the shared codec is the one follow-up left**).
-
-      The revert commit had guessed "a softmax denominator over the wrong split count". That was
-      wrong, and `keys=1` disproves it: one split, one key, no denominator arithmetic, still 7.9x.
-
-      **Measured payoff on sm_86** (int8, cached decode, cold, B=1, d256-h24-kv4, median us):
-
-      | context | W=1 | W=2 | W=4 | W=6 |
-      |---|---|---|---|---|
-      | 512  | 23.6 -> 18.4 | 25.6 -> 21.5 | 29.7 -> 24.6 | 36.9 -> 27.6 |
-      | 2048 | 31.7 -> 24.6 | 35.8 -> 27.6 | 43.0 -> 33.8 | 68.6 -> 52.2 |
-      | 8192 | 68.6 -> 52.2 | 77.8 -> 59.4 | 95.2 -> 82.9 | 112.6 -> 84.0 |
-
-      13-25% faster at every shape measured, on the decode path, for the default KV dtype.
-
-      **The "second blocker" was self-inflicted and is worth remembering.** Restoring upstream's
-      *test* file along with the kernels dropped two fork-only fixes (the DFlash2-sweep skip from
-      `b91ee27c`, and the rk8v4 fixture fix). The result crashed with a different symptom almost
-      every run — "vector too long", "bad allocation", "invalid naive Softmax Attention geometry",
-      a raw access violation — which reads exactly like memory corruption in the new kernels and is
-      not. Two things cut through it: `compute-sanitizer` reported **0 device errors** twice, and
-      `cdbX64.exe` (from the Store WinDbg package, in `%LOCALAPPDATA%\Microsoft\WindowsApps`) showed
-      the fault was a C++ exception, not a memory fault. **When porting a subsystem, take the
-      kernels and keep this fork's tests.**
-
-
-## 5. Test-criterion calibration — done
-
-- [x] ~~Audit `gross_relative_to_max_reference` across the other Op tests.~~ **Done, and the
-      prediction held across the whole tree.** Measured every Op test with
-      `NINFER_OP_REPORT_STATS=1` and expressed both the bound and the observed error in BF16
-      rounding steps (2^-8 of the tensor maximum):
-
-      | gross limit | worst observed error | worst / limit | criteria |
-      |---|---|---|---|
-      | 0.51-1.61 steps | 0.66-1.53 | **0.54-0.99** | 24 |
-      | 2.00 steps | 0.09-1.51 | **0.05-0.71** | 16 |
-
-      The bound and the error being measured were the same quantity: these kernels are accurate to
-      about one rounding step, as good as the dtype permits, so a bound of that magnitude measures
-      BF16 rather than the kernel. Two attention criteria were set *below* their own observed error
-      and passed only because `gross_absolute` carried them.
-
-      The fix was not a new number. `kBf16UnitRoundoff = 1/256` already existed and
-      `2.0 * kBf16UnitRoundoff` was already the bound in `linear/`, `test_attn_input_proj.cpp`,
-      `test_gdn_input_proj.cpp`, `test_gdn_input_proj_conv_snapshot.cpp` and `test_linear_topk.cu`.
-      Half the tree followed the convention; the other half picked numbers by hand.
-      `kBf16GrossRelativeFloor` names it once with the derivation. `relative_l2` untouched
-      everywhere — it is what constrains kernel accuracy.
-
-      **Two criteria deliberately left out**, because the BF16 floor argument does not reach
-      either. Both still want doing, so they stay open here rather than being pointed at a section
-      this branch does not carry:
-
-      - [ ] **`sparse_moe` sits at 0.92 of its limit** with `gross_relative_to_max_reference = 0.0`,
-            so its bound is pure `gross_absolute` and the floor cannot apply. It also carries the
-            largest observed BF16 error in the tree — **3.64 rounding steps**, against 0.09–1.53
-            everywhere else. Both facts want explaining before the bound is touched: either that
-            kernel is genuinely less accurate than every other BF16 Op, or its criterion measures
-            something different.
-      - [ ] **`gated_delta_net`'s state criterion sits at 0.87** and compares an **FP32** output, so
-            dtype rounding is not its floor; the error arrives from BF16 inputs propagating. Needs
-            its own derivation rather than the BF16 one.
-
-      **The earlier 4.5e-3 step for linear_pair is superseded.** It derived the ULP argument
-      correctly but stopped *inside* a single rounding step, and that criterion's worst case is
-      exactly 1.00 of one — so it cleared the two observed outliers without removing the cause.
-      A one-off adjustment where the rule was needed.
-
-      One thing the sweep itself got wrong first time, worth remembering: grepping for
-      `gross_relative_to_max_reference` only matches designated initializers and silently misses
-      every criterion written positionally, `{2.9e-3, 4.0e-3, 4.5e-3}`. That undercounted the set
-      by a third. Enumerate `ReductionCriterion` instead.
-
-## 4a. Documents that still speak for the wrong GPU
-
-- [ ] **Audit `docs/performance.md` provenance.** `AGENTS.md` claimed the implementation targets
-      `sm_120a` on an RTX 5090 — corrected, since this fork is `sm_86`/RTX 3090 and the same file's
-      own build section already said so. Chasing that turned up a bigger question this branch has
-      not answered: `docs/performance.md` presents campaigns measured **on an RTX 5090 with CUDA
-      13.1** (lines ~63, ~80, ~131, ~190). Some of that is certainly upstream's, and the PR
-      description claims this fork "keeps this fork's sm_86 measurements" — those two statements
-      cannot both be fully true.
-
-      Deliberately **not** rewritten under review: sorting which tables are ours and which are
-      inherited needs the provenance of each campaign, not a search-and-replace, and getting it
-      wrong would replace one misleading claim with another. The bounded fix — label each campaign
-      with the hardware it ran on, the way `qwen3.8-27b-dflash2.md` now separates 上游证据 from
-      本 fork 证据 — is the shape to aim for.
-
-      `README.md` is already correct here: its "## Upstream" section contrasts upstream's
-      RTX 5090/`sm_120a` target with this fork's SM86 layer, so it needs no change.
-
-## 5a. Speculative greedy finiteness guard — done
-
-- [x] ~~Thread a per-row finiteness signal into `speculative_accept_sparse_warp_greedy_kernel`.~~
-      **Done, and it was both smaller and larger than this entry assumed.**
-
-      *Smaller:* no signature change across the launcher boundary was needed.
-      `speculative_accept_sparse_drafts_launch` already receives the verify logits and already
-      computes `physical_rows`; the raw-greedy branch simply ignored them. Only the kernel
-      signatures lacked the parameters.
-
-      *Larger:* this entry claimed "every other commit path now refuses to license a token chosen
-      from a non-finite column". That was wrong. **Four** greedy routes were passing a hardcoded
-      `true`, not one:
-        - sparse raw-greedy (the route this entry described);
-        - dense multiblock `speculative_sampling_group_finalize_kernel<false>`, no penalties;
-        - dense penalized greedy, in the same kernel's general path;
-        - sparse penalized greedy, in `speculative_sparse_warp_accept`'s greedy branch.
-
-      All four now test the raw verify logit of the token they are about to license, which is the
-      signal the single-block dense kernel has always used. Penalties change the score that selects
-      the terminal but not the logit behind it, and a diverged pass makes the whole column NaN
-      before any penalty applies.
-
-      Regression cases in `tests/ops/test_speculative_round.cpp` cover every route with poisoned
-      and clean rows mixed in one batch. Verified adversarially: reverting the guard produces 60
-      failures. The last two routes were found by CodePulse review on PR #18.
-
-      *Also found while adding coverage for the dense multiblock routes:* `sampling_adjusted_logit`
-      applied presence/frequency penalty subtraction to non-finite raw logits unconditionally.
-      CUDA's NaN canonicalization on that subtraction produces a different bit pattern than an
-      untouched NaN, which the total-order sort key (`score_id_order_key`) ranks as strictly higher
-      -- so a poisoned verify column's already-drafted (penalized) token could spuriously win the
-      greedy top-1 selection and get accepted, moving the terminal to a later, clean column and
-      evading the finiteness guard entirely. `sampling_adjusted_logit` now returns a non-finite raw
-      value unperturbed, so every non-finite entry in a poisoned column stays bit-identical and the
-      guard sees whichever one the id tie-break selects.
-
-## 5c. Greedy acceptance validates the whole committed span — done
-
-- [x] ~~Every greedy route tested `sampling_selected_logit_is_finite` only at the divergence
-      column, never at a column accepted as a match.~~ **Fixed.** If a diverged forward pass gave a
-      column an all-NaN row whose argmax happened to equal that column's draft, the round accepted
-      it as a match, folded it into `licensed_tokens` with no finiteness check, and then committed
-      on whichever later, clean column became the terminal.
-
-      Raised by CodePulse on PR #18 against 5a's new sparse code, and confirmed to be the
-      pre-existing shape of `speculative_accept_greedy_drafts_kernel` on `master` — 5a made the
-      other routes match that pattern rather than introducing it. Initially descoped as "touches
-      code PR #18 never modified"; that was the wrong call, because the fix is cheap.
-
-      All five greedy sites now validate the committed span `[0, accepted_count]`:
-      the two sparse warp routes with a single `__ballot_sync` (one lane per column, and
-      `a <= extent <= k <= 15` always fits a warp), the single-block greedy+penalties path by
-      accumulating into a shared flag inside the column loop it already runs, and both dense
-      multiblock routes through the shared `speculative_commit_span_is_finite` helper.
-
-      Verified adversarially: reverting only the sparse warp path to terminal-only produces **40
-      failures, all 40 in the new poisoned-matched-column cases**, with every terminal-column case
-      still passing.
-## 5b. Reproducibility
-
-- [ ] **fp8, k8v4 and nvfp4 causal attention are not run-to-run deterministic.** Running
-      `ninfer_softmax_attention_test` twice from the *same binary* produces ~36 differing
-      `OP_ERROR_STATS` lines, always in those three storage families (plus a couple of bf16
-      geometry lines); int8-g64 and rk8v4 are byte-identical across runs. All of it stays well
-      inside tolerance, so nothing fails — but it means **those cases cannot be used for
-      exact-match regression checks**, and it cost a real detour: after a change that touched only
-      the INT8 prompt loader, 34 stat lines moved and looked like collateral damage until a
-      same-binary control run showed the same 36 lines moving on their own.
-      Worth understanding rather than assuming: a split reduction whose order varies, or an atomic
-      accumulation, would both explain it. Until then, diff *only the storage family you changed*
-      when using these stats to prove a change is neutral.
-
-## 6. Measurement debt
-
-- [ ] **DFlash2 corpus numbers on sm_86.** Only single-prompt smoke numbers are recorded (text
-      20.0% / 2.38 tok-per-round, vision 85.7% / 7.00). `docs/performance.md` deliberately does not
-      reproduce upstream's tables because they are sm_120.
-- [ ] **Speculative decoding is not bit-identical to greedy**, and it is not clear that it should
-      be. DFlash2 and MTP produce byte-identical output *to each other* and both diverge from the
-      width-1 greedy path about a hundred tokens into the text fixture. Verification evaluates k+1
-      columns in one pass where plain decode evaluates one, so reductions run in a different order
-      and a near-tie argmax flips. MTP reproduces it exactly, so it predates this merge — but
-      nobody has decided whether that is acceptable or worth pinning down.
-
-## 7. Hygiene
-
-- [x] ~~`plane_types.h` wiring is partial.~~ Extended to every plane-cast site that should have it,
-      and the earlier "~76 sites across 12 files" estimate was wrong: most `__half*`/`__nv_bfloat16*`
-      appearances under `softmax_attention/` are shared-memory arena partitioning or BF16 activation
-      inputs, not cache planes. The actual set is **ten** sites in eight files — the producer
-      (`kv_cache/append/{launch,k8v4_launch,nvfp4_launch}.cu`, `context_kv_materialize`) and the
-      consumer (`causal_cache/{prompt,small_t}_{fp8,k8v4,nvfp4}.cu`) halves of each storage — and
-      both halves now derive from `d256_kv_cache_profile`, so a producer/consumer disagreement is a
-      compile error. `assert_kv_scale_planes` / `assert_kv_planes` were added to cover the scale
-      planes, which needed it more than the code planes: across the six storages the value scale is
-      FP16, a raw E4M3 byte, or FP16-again, and `Fp8KeyNvfp4Value` mixes two within one cache.
-      **One deliberate exception**, commented at the site: the INT8 family in `causal_cache/prompt.cu`
-      and `small_t.cu` keeps `std::int8_t*` for both codings because a single kernel serves int8-g64
-      and rk8v4 and the packed-int4 path re-casts internally where it unpacks. Substituting
-      `KvValueCodeT<...>` there would change behaviour, not tidy it.
-- [ ] **Dedupe `prompt_i8.cuh`'s local f16 dequant helpers.** It defines its own
-      `causal_prompt_i8_dequant_f16x8` / `causal_prompt_i4_dequant_f16x8` because the shared codec
-      had no f16 variants for the INT8 codings. It does now
-      (`kv_cache_int8_dequant_f16x8_from` / `kv_cache_int4_dequant_f16x8_from`), so the locals are
-      redundant. That missing pair is exactly what made upstream's small-T reach for the bf16
-      helper and silently reinterpret every value, so collapsing them removes the trap rather than
-      just tidying.
-- [x] ~~Clean up the extra worktrees.~~ **Done.** `baseline-master` was already gone; `wt-readme`
-      removed after checking clean status and confirming `feat/dual-gpu-graph-mode` is fully merged
-      into master with nothing unpushed. The branch is kept, so the history survives.
-- [x] ~~Untracked clutter in the repo root.~~ **Decided, per file:** `config.bat`/`config_exit.txt`
-      deleted (a failed VS 2026/MSVC 14.50 configure attempt, superseded by `scripts/build.ps1`
-      documenting exactly why CUDA 12.8 rejects that compiler); `scripts/download-ornith-1.5-35b-a3b.bat`
-      deleted (byte-identical to the tracked `download-qwen36-35b-a3b.bat` but named for a model it
-      does not download, and never shipped); `repro/` gitignored rather than deleted (two captured
-      Responses-API payloads carrying third-party prompt text, not this repo's data to bin).
-      `build_merge.bat` *is* committed and carries the toolchain pinning this host needs. PR #12
-      closed as the record of the abandoned dual-GPU overlap experiment.
+**Free VRAM is decisive, not marginal.** Desktop busy (~4.4 GiB free): `27b_prefix_real` skips.
+Idle (~21.9 GiB free): it passes. The 35B's runtime reservation scales with the ceiling —
+262,144 → 4.15 GB, 32,768 → 1.48 GB, 16,384 → 1.29 GB, 8,192 → fits — against ~1.02 GiB available
+once the 20.8 GiB of weights are resident.
 
 ---
 
-## Build note, because it cost hours
+## 2. Genuinely blocked, and what by
 
-Never run two builds against `build-ninja` at once. Concurrent ninja instances produce
-"Permission denied" on object files, `cmake --build` reporting success with the executable never
-relinked, and phantom hangs. **Always compare the test binary's mtime against the sources before
-believing a test result.** And a build that looks hung is almost always just slow: `nvcc` idles at
-~0.1s CPU while its `cicc` child does the work, and `small_t_fp8.cu` legitimately burns 170+
-seconds in `cicc`. Check `cicc`, not `nvcc`. Full details in the
-`ninfer-3090-windows-build-recipe` memory.
+This section previously read "blocked on hardware or artifacts" and lumped three items together.
+That was wrong on one of them and imprecise on another — **only one needs hardware this box does
+not have.** Check before assuming an entry here is unreachable.
 
-Two more that cost real time on 2026-09-07:
+### Needs a second GPU — one item
 
-- **Never truncate a build pipeline.** `cmake --build ... | Select-Object -First N` (or `| head`)
-  returns while `ninja` keeps running detached, and the next build collides with it —
-  `ninja: error: opening deps log: Permission denied`, i.e. self-inflicted concurrent-ninja
-  corruption. Redirect the whole build to a file and grep the file afterwards. Before assuming the
-  build directory is free: `Get-Process ninja,cmake,cicc`.
-- **Buffered stdout lies about where a crash happened.** The last flushed line is *not* the last
-  line executed; a truncated trailing line named the wrong function twice during the small-T
-  investigation. Add explicit `<< std::flush` markers around candidate regions instead. Note also
-  that `cdb` does not capture the debuggee's **stderr** — put diagnostics on stdout.
+- [ ] **DFlash2 + multi-GPU expert offload.** `nvidia-smi` reports exactly one device here, so the
+      offload path degenerates to the single-rank identity mapping and there is nothing to
+      exercise. Needs the two-card box or a second local GPU. More interesting now that PR #15 has
+      landed and the offload path is no longer hypothetical.
+
+### Needs an artifact we do not have — not a hardware limit
+
+- [ ] **`--spec dflash` (v1) on 35B-A3B.** Refused by the 27B artifact ("selected masked draft
+      backend is not supported by this target") because v1 is a 35B backend — correct behaviour.
+      The local `qwen3_6_35b_a3b.ninfer` (20.84 GB, revision `c8b8c1c0`) carries **no DFlash
+      bundle**: `ninfer_qwen3_6_35b_a3b_dflash_load_plan_test` skips with "this artifact carries no
+      DFlash bundle". So this needs a DFlash-carrying 35B artifact, not a bigger card. Worth
+      checking whether `neroued/Qwen3.6-35B-A3B-NInfer` publishes one at another revision before
+      treating it as out of reach.
+The six skipping real-model tests in §1.2 are mostly this same shape — four of them want a
+Qwen3.6 27B artifact, a different model family from the `qwen3_8_27b` held locally. Tracked there
+rather than duplicated here.
+
+---
+
+## 3. Measurement debt
+
+- [ ] **DFlash2 corpus numbers on sm_86.** Only single-prompt smoke numbers exist (text 20.0% /
+      2.38 tok-per-round, vision 85.7% / 7.00). `docs/performance.md` deliberately does not
+      reproduce upstream's tables because they are sm_120 — see the provenance banner there.
+- [ ] **Speculative decoding is not bit-identical to greedy**, and it is not clear it should be.
+      DFlash2 and MTP produce byte-identical output *to each other* and both diverge from the
+      width-1 greedy path about a hundred tokens into the text fixture. Verification evaluates k+1
+      columns in one pass where plain decode evaluates one, so reductions run in a different order
+      and a near-tie argmax flips. MTP reproduces it exactly, so it predates the merge — but nobody
+      has decided whether that is acceptable or worth pinning down.
+- [ ] **q4 SwiGLU `{513,640}` is still on `Materialized`, unmeasured either way.** The one band
+      where Materialized and the c128 tile could not be separated: Materialized won T=576 in three
+      of four runs, but c128 there ranged 4147–4959 µs (**19.6% spread**) and the margins outside
+      the single outlying run were ±2%. Changing it would be fitting noise. Re-measure if the noise
+      floor on this Op improves — it is markedly noisier than the other route tables, which is
+      itself worth understanding.
+
+---
+
+## 4. Test-criterion calibration
+
+The §5 audit floored every BF16 gross bound at two rounding steps (#20). Two criteria were
+deliberately left out because the BF16 floor argument does not reach them, and both still want
+doing:
+
+- [ ] **`sparse_moe` sits at 0.92 of its limit** with `gross_relative_to_max_reference = 0.0`, so
+      its bound is pure `gross_absolute` and the floor cannot apply. It also carries the **largest
+      observed BF16 error in the tree — 3.64 rounding steps**, against 0.09–1.53 everywhere else.
+      Both facts want explaining before the bound is touched: either that kernel is genuinely less
+      accurate than every other BF16 Op, or its criterion measures something different.
+- [ ] **`gated_delta_net`'s state criterion sits at 0.87** and compares an **FP32** output, so dtype
+      rounding is not its floor; the error arrives from BF16 inputs propagating. Needs its own
+      derivation rather than the BF16 one.
+
+---
+
+## 5. Reproducibility
+
+- [ ] **fp8, k8v4 and nvfp4 causal attention are not run-to-run deterministic.** Running
+      `ninfer_softmax_attention_test` twice from the *same binary* produces ~36 differing
+      `OP_ERROR_STATS` lines, always in those three storage families (plus a couple of bf16 geometry
+      lines); int8-g64 and rk8v4 are byte-identical across runs. All of it stays well inside
+      tolerance, so nothing fails — but those cases **cannot be used for exact-match regression
+      checks**, and it cost a real detour: after a change touching only the INT8 prompt loader, 34
+      stat lines moved and looked like collateral damage until a same-binary control run showed the
+      same 36 lines moving on their own. A split reduction whose order varies, or an atomic
+      accumulation, would both explain it. Until then, diff *only the storage family you changed*.
+
+---
+
+## 6. Operational
+
+- [ ] **The pinned host-KV default is 8 GiB regardless of host RAM.** #25 made the failure
+      *diagnosable* — the CUDA "out of memory" text now names the size, says it is system RAM not
+      VRAM, and names `--host-kv-mib` and `--no-prefix-reuse`. It did not change the sizing, which
+      is a policy question needing its own measurement: what "available" means differs by OS, and
+      shrinking it silently would regress prefix reuse for people who have the memory.
+- [ ] **Binaries embed their build directory.** `/home/ash/ninfer-rel/src/...` appears 200 times in
+      the Linux binaries and `C:\ninfer-fork\ninfer-3090\...` about 466 times in the Windows ones,
+      via `__FILE__` and nvcc source paths. Pre-existing (v0.8.1 embedded `/mnt/c/ninfer-fork/...`
+      405 times) and not a secret — the file names are already public and no Windows binary
+      contains a `C:\Users\...` path. `-ffile-prefix-map=` plus `--compiler-options` for nvcc would
+      rewrite them to relative paths, which also makes assertion messages more readable. Cosmetic;
+      do it with a release build, not on its own.
+
+---
+
+## 7. Closed this cycle, and what it taught
+
+Kept because the reasoning is what stops the same investigation being repeated.
+
+| # | item | the useful part |
+|---|---|---|
+| #17 | release scripts could not cut a release | `--package` configured `NINFER_BUILD_BENCHMARKS=OFF` while every packager requires `bench/ninfer_bench`, so it failed *after* the whole tree had built |
+| #18 | greedy finiteness guard | **five** routes, not the one recorded; and span-wide, not terminal-only — a matched column whose logits are all NaN matched by accident, and a terminal-only guard licensed it |
+| #19 | `docs/performance.md` provenance | all ten "tested revisions" are upstream commits; every hardware line says RTX 5090 except the vision section, so "every figure here is measured on sm_86" was false |
+| #20 | BF16 gross-error floor | the bound and the error were the same quantity — kernels are accurate to ~1 rounding step, so a bound of that size measures BF16, not the kernel. `2.0 * kBf16UnitRoundoff` was already the house convention in five files |
+| #22 | `w8_pair` k=2048, **up to 52.8%** | under `NINFER_SM8X_COMPAT` all twelve `DualSplitKMedium` schedules are **one kernel**, so eight routes could never win. A live table whose *distinctions* are dead |
+| #23 | unrouted schedules visible | pins the set **by name**, not by count — a change stranding one schedule while un-stranding another keeps the count identical |
+| #24 | shipped launchers | one shipped `HOST=0.0.0.0` (unauthenticated, LAN-wide), one hardcoded an absolute path from this machine, one could never find its own server binary in the release layout |
+| #25 | pinned-host diagnostics | `cudaMallocHost` failing says "out of memory" and points entirely at the GPU; it is **system RAM** |
+| #26 | 503 during startup | `bind()` before the Engine is deliberate (fast port-clash failure) but left a 10 s window accepting TCP with nothing answering — a `tcpSocket` probe called that ready |
+| #27 | q4 SwiGLU Materialized, **up to 23%** | upstream alternated Materialized/c128 three times across one contiguous range; the winner does not flip back and forth, and it did not |
+| #28 | q4_q5 "never wins" | the old claim covered T≤208 only; extended to 4096 it holds, and `pair_c64` is a *slower twin* of `mixed_r32_c64_s3`, never ahead |
+| #29 | repo housekeeping | worktrees removed, dead files deleted, `repro/` ignored rather than binned, PR #12 closed as the record |
+| #30 | DFlash2 attention sweep | the fixture sized the cache table by the **batch**, but `table_rows` are indices *into* the table; B=1 addressing row 7 indexed a one-element vector, unchecked |
+| — | §7 `prompt_i8` dedupe | already landed with the small-T adoption; the entry was simply stale |
+| — | `--vision-residency overlay` + DFlash2 | **was never blocked** — it runs on this one 3090 and always could have. See below |
+
+### `--vision-residency overlay` + DFlash2 — verified working, 2026-09-08
+
+Listed for weeks as needing hardware. It does not. On this single 3090, with
+`qwen3_8_27b_dflash2.ninfer`, `--vision --vision-residency overlay --spec dflash2 --draft-tokens 7`:
+
+- starts cleanly — 18.0 GiB of weights, runtime 1.03 GiB, **2.30 GiB still free**, ready in 9.0 s;
+- answers four *different* images in sequence (2.4–2.7 s each), describing each correctly and
+  reading its embedded label with the index incrementing 00 → 01 → 02 → 03;
+- the server is still healthy afterwards and the log carries no `ERROR`, `FATAL` or eviction line.
+
+The worry in the old entry — overlay borrows device memory per image from the evictable
+text-weight tail while DFlash2 holds its own weight bundle, so the eviction ladder is untested —
+is exactly what the four-image sequence exercises, because the borrow-and-release has to happen
+more than once. It holds.
+
+**The lesson is about the list, not the feature**: "never run" had drifted into "cannot be run".
+Try it before writing it off; this took one command.
+
+Two recurring lessons worth carrying forward:
+
+**Fix the class, not the flagged line.** #18 was reported as one route and was five. #24 was
+reported as one launcher and was four problems across six. Chasing the class is also what found the
+`kv_cache_append` contract lines and the `AGENTS.md` wrong-target claim that nobody had flagged.
+
+**A route table can be live and still wrong.** `q4_q5` had a tuned table nobody read beside a
+hardcoded chain. `w8_pair` k=2048 had a table that *was* read, but whose distinctions did not exist
+on this hardware. So `grep resolve_plan` is necessary and not sufficient — also grep the launchers
+for `NINFER_SM8X_COMPAT`, and confirm in the sweep, where identical schedules print *identical*
+times.
+
+---
+
+## Build notes, because they cost hours
+
+**Never run two builds against `build-ninja` at once.** Concurrent ninja produces "Permission
+denied" on object files, `cmake --build` reporting success with the executable never relinked, and
+phantom hangs. **Always compare the test binary's mtime against the sources before believing a test
+result.** A build that looks hung is usually just slow: `nvcc` idles at ~0.1 s CPU while its `cicc`
+child works, and `small_t_fp8.cu` legitimately burns 170+ s in `cicc`. Check `cicc`, not `nvcc`.
+
+**A running test binary breaks the next link**, with the same `LNK1104: cannot open file` signature
+as concurrent ninja but a different cause. This bit three times in one session, twice from a
+background `ctest` still holding a binary while the next build started — including once from a
+background job that session had started itself and then rebased underneath. Two habits:
+
+- Before building: `Get-Process ninja,cmake,cicc,ninfer_*` — the `ninfer_*` half is the one people
+  forget.
+- **Never leave a background build or ctest running while switching branches or rebasing.** Two
+  tests "failed" that way and hung as processes; they passed in isolation and the suite was clean.
+
+**Check the build's exit code separately from the test's.** The stale-binary trap is silent: the
+build fails, the test runs the *previous* binary, and reports a pass. Every "verified" claim in this
+file was checked that way after being caught out by it.
+
+**Never truncate a build pipeline.** `cmake --build ... | Select-Object -First N` returns while
+`ninja` keeps running detached, and the next build collides with it. Redirect the whole build to a
+file and grep the file.
+
+**Buffered stdout lies about where a crash happened.** The last flushed line is not the last line
+executed. Add explicit `<< std::flush` markers around candidate regions. `cdb` does not capture the
+debuggee's **stderr** — put diagnostics on stdout.
 
 ## Debugging note
 
-A scriptable console debugger is installed: `%LOCALAPPDATA%\Microsoft\WindowsApps\cdbX64.exe`
-(from the Store WinDbg package — there is no plain `cdb.exe`, and the Windows Kits `Debuggers\x64`
-directory holds only DLLs). `compute-sanitizer` sees device memory only, so
-`ERROR SUMMARY: 0 errors` on a process that still dies is positive evidence of a **host-side**
-fault — switch to cdb at that point. See `windows-cdb-debugger-available` in memory for the
-invocations.
+A scriptable console debugger is installed: `%LOCALAPPDATA%\Microsoft\WindowsApps\cdbX64.exe` (from
+the Store WinDbg package — there is no plain `cdb.exe`, and the Windows Kits `Debuggers\x64`
+directory holds only DLLs). `compute-sanitizer` sees device memory only, so `ERROR SUMMARY: 0
+errors` on a process that still dies is positive evidence of a **host-side** fault — switch to cdb
+at that point. The DFlash2 sweep (#30) is the worked example: zero device errors, and the fault was
+a `std::vector` index out of range in the host reference. See `windows-cdb-debugger-available` in
+memory for the invocations.
