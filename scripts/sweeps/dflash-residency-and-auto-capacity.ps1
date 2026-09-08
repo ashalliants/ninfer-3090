@@ -52,7 +52,11 @@ foreach ($m in @(@{k='27b-dense'; p="$mdir\qwen3_8_27b.ninfer"},
         --kv-dtype $d --max-context 262144 --kv-capacity auto > $log 2>&1
     $code = $LASTEXITCODE
     $txt = Get-Content $log -Raw
-    $cap = if ($txt -match '(?m)^.*KV capacity.*$') { $Matches[0].Trim() }
+    # Require digits. The summary prints three lines containing "KV capacity" -- "KV capacity
+    # policy  auto", "KV capacity  262144" and "KV capacity headroom  1.00 GiB" -- and a match on
+    # the phrase alone takes the first, reporting the string "auto" as though it were the measured
+    # capacity. Only the numeric line has a bare integer after it.
+    $cap = if ($txt -match '(?m)^\s*summary\s+KV capacity\s+(\d+)\s*$') { $Matches[1] }
            else { "exit=$code no-kv-line" }
     "$($m.k),$d,$cap"
   }

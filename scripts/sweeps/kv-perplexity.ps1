@@ -16,6 +16,11 @@ $dtypes = @('fp8','nvfp4','k8v4')
 
 foreach ($d in $dtypes) {
     $log = "$out\$d.log"
+    # Clear any previous run's output first. ninfer-perplexity writes report.json under a
+    # timestamped subdirectory of --output, so a rerun that fails leaves the earlier report in
+    # place and the check below would pick it up and print it as a fresh result -- a stale number
+    # reported as a new measurement, which is the one failure mode a sweep must not have.
+    Remove-Item -Recurse -Force "$out\$d" -ErrorAction SilentlyContinue
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     & .\build-ninja\apps\ninfer-perplexity.exe `
         "$modelDir\qwen3_8_27b.ninfer" `
@@ -24,7 +29,9 @@ foreach ($d in $dtypes) {
         --output "$out\$d" --log-level warning > $log 2>&1
     $code = $LASTEXITCODE
     $report = Get-ChildItem -Recurse -Filter report.json "$out\$d" -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($report) {
+    # Exit code as well as the report's existence: a run that produced a report and then failed
+    # should be reported as a failure, not quietly read.
+    if ($code -eq 0 -and $report) {
         $j = Get-Content $report.FullName -Raw | ConvertFrom-Json
         "{0,-7} ppl={1}  tokens={2}  {3}s" -f $d, $j.overall.perplexity, $j.overall.scored_tokens, [math]::Round($sw.Elapsed.TotalSeconds,0)
     } else {
