@@ -192,9 +192,14 @@ int main() {
     //
     // The inventory as measured, and what is known about each group:
     //
-    //   w8_pair            11  decode r8/r16 and splitk c224/c256 have no band in either table;
+    //   w8_pair            19  decode r8/r16 and splitk c224/c256 have no band in either table;
     //                          the seven concat tile shapes are upstream ids this fork's measured
-    //                          boundaries never select.
+    //                          boundaries never select; and the eight DualSplitKMediumC80..C192
+    //                          ids were stranded by the k=2048 retune (c0c3000e), which collapsed
+    //                          {65,192} into one ConcatMmaR32C64 band because all twelve medium
+    //                          schedules are the same kernel under NINFER_SM8X_COMPAT. Those eight
+    //                          are exactly the routes that retune deleted, which is this test
+    //                          doing its job -- the count moved 18 -> 26 and had to be looked at.
     //   w8_attn_input       2  DFlash2MmaR16C64K128 won at no width in the sm_86 sweep. SimtR8C4
     //                          is reachable in principle but no shape's table picks it.
     //   w8_linear_swiglu    1  DFlash2MmaR32C64K128 ties R64C64K128 at 33..44 and wins nowhere.
@@ -204,7 +209,7 @@ int main() {
     //
     // All of them are kept on purpose: deleting an upstream schedule costs merge effort at every
     // future catch-up for no measured gain here. The point is that the set is written down.
-    constexpr std::size_t kExpectedUnrouted = 18;
+    constexpr std::size_t kExpectedUnrouted = 26;
     if (total != kExpectedUnrouted) {
         std::cerr << "route coverage changed: " << total << " unrouted schedules, expected "
                   << kExpectedUnrouted
