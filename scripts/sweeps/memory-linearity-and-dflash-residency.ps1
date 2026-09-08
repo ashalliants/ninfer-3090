@@ -14,30 +14,14 @@ $models = @(
   @{ key='27b-dense'; path="$modelDir\qwen3_8_27b.ninfer" },
   @{ key='35b-moe';   path="$modelDir\qwen3_6_35b_a3b.ninfer" }
 )
-$dtypes = @('bf16','int8','fp8','rk8v4','k8v4','nvfp4')
 
-# ---------------------------------------------------------------------------------------------
-# 1. Automatic-sizing context per dtype. README publishes this for int8 and rk8v4 only; the engine
-#    resolves it against a headroom boundary rather than a fixed byte budget, so it cannot be
-#    derived from bytes-per-token and has to be read off a real load. No --max-ctx = auto.
-# ---------------------------------------------------------------------------------------------
-"== auto capacity =="
-"model,kv,auto_max_context,kv_payload_bytes"
-foreach ($m in $models) {
-  foreach ($d in $dtypes) {
-    $csv = "$out\auto_$($m.key)_$d.csv"
-    & .\build-ninja\bench\ninfer_bench.exe --weights $m.path --kv-dtype $d `
-        -n 1 -r 1 --warmup 0 -o csv --output-file $csv > "$out\auto_$($m.key)_$d.log" 2>&1
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $csv)) {
-      "$($m.key),$d,FAILED,"
-      Get-Content "$out\auto_$($m.key)_$d.log" -Tail 2 | ForEach-Object { "    $_" }
-      continue
-    }
-    $r = Import-Csv $csv | Select-Object -First 1
-    "$($m.key),$d,$($r.max_context),$($r.kv_payload_bytes)"
-  }
-}
-
+# This script used to open with an "automatic-sizing context per dtype" probe that ran
+# ninfer_bench with no -p and -n 1 and read max_context back out of the CSV. It does not measure
+# that. With no prompt lengths and a one-token generation, auto-sizing follows the *workload*, and
+# the answer comes back as 3 -- a number that lands in the CSV looking entirely legitimate. It has
+# been removed rather than fixed, because ninfer_bench cannot answer the question at all: use the
+# serving path, which dflash-residency-and-auto-capacity.ps1 does.
+#
 # ---------------------------------------------------------------------------------------------
 # 2. Does carrying DFlash cost anything when DFlash is not selected? docs/rtx-3090-windows.md
 #    recommends the older, 0.38 GiB smaller pin on the grounds that it is what qualified the 24 GB

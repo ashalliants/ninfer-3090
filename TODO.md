@@ -278,12 +278,12 @@ recurs, and because the follow-on work below only exists now that they are gone.
 
 ## 2b. `docs/config-calculator.html` is advertised as authoritative and is not yet correct
 
-Added by #32, **which merged with two of its six confirmed defects still open.** README and
+Added by #32, **which merged with two of its six confirmed defects still open**, one of them only partly. README and
 `docs/cli.md` link to the page, so those two are live rather than theoretical. Read the checkboxes
 rather than assuming a merged PR means a finished page; the file itself agrees, carrying a
 `KNOWN GAP (see TODO.md)` comment where speculative memory should be modelled.
 
-Closed before it landed: KV page rounding, sub-4,096 decode (now labelled a lower bound held at the
+Closed before it landed: KV page rounding (with regression tests), sub-4,096 decode (now labelled a lower bound held at the
 shallowest measurement rather than claimed as interpolated), and per-row weight-artifact labelling.
 The doc contradictions were fixed separately in #33. The evidence for each is kept below so nobody
 has to re-derive it.
@@ -334,10 +334,18 @@ has to re-derive it.
       per weight profile, so `weightsBytes` is not transferable to, say, the NVFP4-weight variant.
       Either add the weight-profile dimension or label each row with its artifact.
 
-- [ ] **No regression coverage for any of the arithmetic.** Nothing references the page or its
-      functions. The memory model is small and pure — extracting it and pinning page rounding,
-      speculative reservations and the interpolation boundaries would catch all of the above
-      silently regressing.
+- [ ] **The regression tests exist but nothing runs them.** #32 landed
+      `docs/config-calculator.test.mjs`, and it is good: it extracts the page's `<script>` into a
+      `vm` sandbox against a DOM stub — keeping the one-file, no-build property rather than
+      restructuring the page into modules — and pins page rounding, the `decodeAtDepth` boundaries,
+      and a golden case asserting the 262,144-token INT8 figure still equals the engine's own
+      9,197,389,568-byte refusal. It passes (`node docs/config-calculator.test.mjs`).
+
+      What is missing is a runner. Nothing in CI, CTest or `scripts/` invokes it, so it will catch
+      a regression only if someone remembers to run it by hand. Wire it in. It needs `node`, which
+      no other test here does, so it probably belongs in the GitHub workflow rather than CTest.
+      It also does not cover the speculative path — which is the half still known to be wrong — so
+      extend it alongside that fix rather than after.
 
 - [x] **Active docs still contradict the six-format claim.** Fixed in #33, across four places. #32 fixed README's `Current limits`
       and `docs/perplexity.md`, but README's *opening* summary still says the FP8 E4M3 KV profile
