@@ -29,6 +29,13 @@ about three hours for twelve model/format combinations.
 | `memory-linearity-and-dflash-residency.ps1` | Is the non-KV sequence cost per-token or fixed? | 20 min |
 | `dflash-residency-and-auto-capacity.ps1` | Does carrying DFlash cost VRAM when unused? | 15 min |
 | `speculation-matrix.ps1` | What does each speculative backend cost and buy? | 1 h |
+| `decode-roofline.ps1` | What fraction of the card's 936.2 GB/s does decode reach? | instant |
+
+`decode-roofline.ps1` needs no GPU: it reads the CSVs `kv-decode-vs-depth.ps1` leaves behind and
+divides achieved bandwidth by peak. Run that sweep first. Note it only means anything for the
+**dense** model -- applied to the A3B MoE it returns 391% of peak, which is not a result but a
+demonstration that the formula does not hold there, since an MoE never reads its resident weights
+per token. See TODO section 2c.
 
 ## Things these got wrong, so you do not repeat them
 
