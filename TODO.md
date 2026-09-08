@@ -1,15 +1,25 @@
 # TODO
 
-State as of 2026-09-07, branch `sync/neroued-catchup-20260906`, open as **PR #16**, with
-`origin/master` (including PR #15, multi-GPU expert offload) merged in. Full suite is
-**123/123 passing**, tree builds clean on sm_86, DFlash2 works on the real 27B including with
-`--vision`.
+State as of 2026-09-08. **PR #16 is approved and merged to `master`**, and released as
+**v0.9.0-rtx3090** (Windows + Linux). Full suite **123/123**, plus three real-model tests passing
+on an idle GPU. The branch carried the upstream catch-up, PR #15's multi-GPU expert offload, four
+measured route retunes, two switch-fallthrough fixes, profile-derived KV plane typing, and the
+adoption of upstream's causal small-T.
 
-Since the PR was opened: all three route tables the merge changed have been re-measured on sm_86
-and retuned (12-41% faster at the widths that moved); a second switch fallthrough was found and
-fixed; every KV plane cast now derives from `d256_kv_cache_profile`; and **upstream's causal
-small-T is adopted, so the 12-file revert is gone** — it needed one real fix (bf16 codes fed to an
-f16 MMA) and is 13-25% faster here.
+What landed, with numbers:
+
+| change | effect |
+|---|---|
+| Four route tables re-measured on sm_86 | **12–41% faster** at the widths that moved |
+| Upstream causal small-T adopted (12-file revert gone) | **13–25% faster** decode, int8 |
+| Two switch fallthroughs fixed | each was running a second kernel over the first |
+| DFlash2 unblocked on this fork | `--spec dflash2` previously died at startup |
+| KV plane typing derived from the profile | producer/consumer disagreement is now a compile error |
+
+**Eight review rounds** on PR #16, seven of eight findings genuine (one disputed with evidence and
+withdrawn). The recurring lesson, worth keeping: **fix the class, not the flagged line** — chasing
+the class is what found the `kv_cache_append` contract lines and the `AGENTS.md` wrong-target claim
+that nobody had flagged.
 
 Everything below is what is *not* done. Ordered by what blocks what.
 
@@ -26,37 +36,27 @@ Everything below is what is *not* done. Ordered by what blocks what.
 3. **Audit the gross-error limits** (section 5). Cheap insurance: any criterion under ~4e-3 against
    a BF16 output will read as an accuracy regression the next time a route boundary moves.
 
-**PR #16 scope.** It is now substantially bigger than when it was opened: the catch-up itself, plus
-four measured route retunes, two switch-fallthrough fixes, the KV plane typing, the `master`/PR #15
-merge, and the causal small-T adoption. If that is too much to review in one pass, the small-T
-adoption is the clean thing to split out — it is self-contained (merge `19c7617c` and its parents on
-`investigate/small-t-upstream`) and carries its own measured justification.
+Then, in no fixed order: the two items descoped from PR #16 under review (sections 4a and 5a), and
+the DFlash2 attention sweep (section 2), which is now narrowed to a single reproducible case.
+
+**Keep `investigate/small-t-upstream` until the next catch-up.** It is merged, but it is also the
+clean, self-contained record of how upstream's small-T was adopted and what had to be fixed to make
+it work here (`19c7617c` and its parents). The next merge from `neroued/master` will touch the same
+subsystem.
 
 ---
 
-## 1. Blocking — the work isn't shared yet
+## 1. Shipping — done
 
-- [x] ~~Push the branch.~~ Pushed.
-- [x] ~~Open the PR.~~ **PR #16** — "Upstream catch-up: DFlash2, measured sm_86 route boundaries,
-      one KV plane declaration". Route retunes have landed on the branch since it was opened.
-- [x] ~~Decide whether PR #15 lands before or after this catch-up.~~ **PR #15 goes first — it is
-      safe.** Trial-merged with `git merge-tree --write-tree`: 25 files are touched by both branches
-      but only **four conflict**, and none of them is in this branch's route tables, KV plane
-      typing, or the causal small-T revert. All seven `causal_cache/*.cu` files auto-merge cleanly.
-      Once #15 is on `master`, this branch merges `master` and resolves:
-      - `apps/cli/options.cpp` (1 hunk, 7 lines) — usage string. Take the union:
-        `[--device N] [--devices N,M]` *and* `--spec mtp|dflash|dflash2`.
-      - `src/ops/attn_input_proj/fp8/fp8_attn_input_a8.cu` (1 hunk, 12 lines) — take **#15's**
-        version. It opts into >48 KB dynamic shared memory at runtime where ours only had a
-        `static_assert`. Confirm the sm_86 schedule stays under the ~99 KB opt-in ceiling.
-      - `src/targets/qwen3_6_27b/impl/load/bindings.cpp` (3 hunks, 36 lines) — take **#15's**: it
-        reorders `bind_weight`'s defaults to `(evict_rank, placement)` and threads `core_placement`.
-        All three hunks are the same change; apply it at every call site consistently.
-      - `tests/targets/qwen3_6_35b_a3b/test_dflash_load_plan.cpp` (1 hunk, 18 lines) — take **#15's**
-        richer failure message, but keep whichever label matches the enclosing block (the two sides
-        name different branches of the same test).
+- [x] ~~Push the branch, open the PR, land PR #15 first.~~ All done. PR #15 merged to `master`
+      first (four mechanical conflicts, resolved), then this branch merged `master`.
+- [x] ~~**PR #16**~~ — **approved and merged.** CodePulse: *"No action needed — ship it."* Eight
+      review rounds; the resolutions are recorded in the commit messages, which is where to look
+      if any of them needs revisiting.
+- [x] ~~Cut a release.~~ **v0.9.0-rtx3090**, Windows + Linux archives with SHA256SUMS.
 - [ ] PR #12 is a `DO NOT MERGE` draft recording the prefill/decode overlap negative result. Close
-      it or leave it as the record — it should not merge either way.
+      it or leave it as the record — it should not merge either way. **Still the only open PR
+      housekeeping item.**
 
 ## 2. Correctness and coverage gaps
 
