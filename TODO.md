@@ -436,8 +436,12 @@ Ordered by how much they could bite. The first is a possible correctness defect 
       What that rules out:
       - **Not tolerance.** One of the two failures was on the section 5 loosened-floor build, and
         the values are ~10x off — two orders of magnitude past any plausible bound.
-      - **Not memory pressure**, which was the original assumption. The partner tests peak at
-        ~2.1 GiB against a 1.78 GiB idle baseline, i.e. ~350 MiB of load with **22.8 GiB free**.
+      - **Not memory pressure**, which was the original assumption. On a 24,576 MiB card, the idle
+        baseline is 1,782 MiB and the partner tests peak at 2,135 MiB — **353 MiB of added load,
+        leaving 22,441 MiB (21.9 GiB) free at the peak.** Nothing here is close to a capacity
+        limit. (The earlier note said "22.8 GiB free", which matched neither the idle figure of
+        22,794 MiB nor the at-peak one; the raw MiB readings are kept above so it cannot drift
+        again.)
       - **Not single-partner compute contention**, across 54 iterations that provably covered the
         case (`NINFER_OP_REPORT_STATS=1` confirms `--dflash2-only` runs all three of q/k/value at
         `T=112 graph phase=1`).
