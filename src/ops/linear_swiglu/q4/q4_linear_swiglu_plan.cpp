@@ -31,7 +31,7 @@ struct RouteSpec {
 
 constexpr Q4LinearSwiGluProblem kShape{34816, 17408, 5120, 5120, 1};
 
-constexpr std::array<RouteSpec, 10> kRoutes{{
+constexpr std::array<RouteSpec, 7> kRoutes{{
     {{1, 1}, Q4LinearSwiGluScheduleId::GemvPair},
     // Measured on sm_86 with bench/ops/q4_linear_swiglu_schedule_bench.cu (cold, median of 11):
     // SmallTTiled and the 40-wide pair tile cross between 24 and 25, us --
@@ -45,10 +45,28 @@ constexpr std::array<RouteSpec, 10> kRoutes{{
     {{2, 24}, Q4LinearSwiGluScheduleId::SmallTTiled},
     {{25, 40}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C40},
     {{41, 48}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C48},
-    {{49, 128}, Q4LinearSwiGluScheduleId::Materialized},
-    {{129, 256}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
-    {{257, 384}, Q4LinearSwiGluScheduleId::Materialized},
-    {{385, 512}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
+    // Measured on sm_86 by bench/ops/q4_linear_swiglu_schedule_bench.cu, cold, median of 9-15,
+    // repeated three to four times per width because this Op is noisier than the others here.
+    //
+    // Upstream alternates Materialized and the c128 tile three times across 49..640. That shape is
+    // implausible on its face -- the winner does not genuinely change back and forth over a
+    // contiguous range -- and it does not survive measurement. Materialized lost at every width in
+    // {49,128} and {257,384}, in every run:
+    //
+    //   T          49     64     96    128    257    320    384
+    //   c128      812    823    848    809   2309   2310   2190
+    //   mat       856    855    890    864   3004   2724   2398
+    //   c128 by  5.1%   3.9%   4.7%   6.4%  23.1%  15.2%   8.7%
+    //
+    // So {49,128} and {257,384} join the c128 bands on either side, and 49..512 becomes one route
+    // instead of four.
+    //
+    // {513,640} is deliberately left on Materialized. It is the one band where the two are close,
+    // and the measurement cannot separate them: over four runs Materialized won 576 three times,
+    // but c128 at that width ranged 4147-4959 us (19.6% spread) and the margins outside the single
+    // outlying run were +-2%. Changing it would be fitting noise. Re-measure it if the noise floor
+    // on this Op ever improves.
+    {{49, 512}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
     {{513, 640}, Q4LinearSwiGluScheduleId::Materialized},
     {{641, kAnyCols}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
 }};
@@ -83,6 +101,11 @@ std::size_t materialized_workspace_bytes(std::int32_t rows, std::int32_t cols) {
 }
 
 } // namespace
+
+std::size_t q4_linear_swiglu_materialized_workspace_bytes(std::int32_t gate_up_rows,
+                                                          std::int32_t max_cols) {
+    return materialized_workspace_bytes(gate_up_rows, max_cols);
+}
 
 const char* q4_linear_swiglu_schedule_name(Q4LinearSwiGluScheduleId schedule) noexcept {
     switch (schedule) {
@@ -162,8 +185,14 @@ void q4_linear_swiglu_execute_plan(const Q4LinearSwiGluPlan& plan, const Tensor&
     if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
         throw std::invalid_argument("q4 linear_swiglu: plan does not match the exact problem");
     }
+    q4_linear_swiglu_execute_schedule(plan.schedule, x, w, out, ws, stream);
+}
 
-    switch (plan.schedule) {
+void q4_linear_swiglu_execute_schedule(Q4LinearSwiGluScheduleId schedule, const Tensor& x,
+                                       const Weight& w, Tensor& out, WorkspaceArena& ws,
+                                       cudaStream_t stream) {
+    const Q4LinearSwiGluProblem problem{w.n, out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
+    switch (schedule) {
     case Q4LinearSwiGluScheduleId::GemvPair:
         q4_linear_swiglu_gemv_pair_launch(x, w, out, stream);
         return;

@@ -8,12 +8,16 @@
 // q4_linear_swiglu_small_t_exact, a kernel upstream deleted, so it had nothing behind it -- but
 // neither did 32 on sm_86.
 //
-// Materialized is not included: it needs a workspace and a different launch signature, and it is
-// not adjacent to the boundary under test.
+// Materialized is included as of the sm_86 sweep of the {49,128}/{257,384}/{513,640} bands. It is
+// not a kernel -- it is linear() into a workspace followed by silu_mul() over the two halves -- so
+// it has no launch signature to put in a function-pointer table, which is why it was left out
+// before. Every schedule now goes through q4_linear_swiglu_execute_schedule instead, the real
+// dispatch minus its plan-matches-problem check, so the bench times the Op rather than a replica.
 
 #include "core/device.h"
 #include "ninfer_bench_common.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_kernels.h"
+#include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 #include "quantized_weight.cuh"
 
 #include <cuda_runtime.h>
@@ -33,11 +37,11 @@ using ninfer::QType;
 using ninfer::Tensor;
 using ninfer::Weight;
 
-using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+using Id = ninfer::ops::detail::Q4LinearSwiGluScheduleId;
 
 struct Schedule {
     const char* name;
-    Launch launch;
+    Id id;
     // Largest column count the kernel actually processes; 0 means unbounded. gemv_pair is a
     // decode kernel registered for {1,1}: hand it more columns and it silently does one column's
     // work in a constant 122.9 us, which makes it look like it wins everywhere.
@@ -45,14 +49,12 @@ struct Schedule {
 };
 
 const Schedule kSchedules[] = {
-    {"gemv_pair", &ninfer::ops::detail::q4_linear_swiglu_gemv_pair_launch, 1},
-    {"small_t_tiled", &ninfer::ops::detail::q4_linear_swiglu_small_t_tiled_launch, 32},
-    {"split_half_pair_c40",
-     &ninfer::ops::detail::q4_linear_swiglu_mma_split_half_pair_r32_c40_launch, 0},
-    {"split_half_pair_c48",
-     &ninfer::ops::detail::q4_linear_swiglu_mma_split_half_pair_r32_c48_launch, 0},
-    {"split_half_pair_c128",
-     &ninfer::ops::detail::q4_linear_swiglu_mma_split_half_pair_r32_c128_launch, 0},
+    {"gemv_pair", Id::GemvPair, 1},
+    {"small_t_tiled", Id::SmallTTiled, 32},
+    {"split_half_pair_c40", Id::MmaSplitHalfPairR32C40, 0},
+    {"split_half_pair_c48", Id::MmaSplitHalfPairR32C48, 0},
+    {"split_half_pair_c128", Id::MmaSplitHalfPairR32C128, 0},
+    {"materialized", Id::Materialized, 0},
 };
 constexpr int kScheduleCount = static_cast<int>(sizeof(kSchedules) / sizeof(kSchedules[0]));
 
@@ -98,6 +100,17 @@ int main(int argc, char** argv) {
     ninfer::DeviceBuffer flush(kFlushBytes);
     cudaStream_t stream = nullptr;
 
+    // Materialized stages the whole gate+up product, so its workspace scales with the widest
+    // column count swept. Size it once for the whole range rather than per point, and directly
+    // from max_tokens rather than through resolve_plan's route table: every schedule here runs at
+    // every in-domain token count regardless of which one the table would actually pick, and the
+    // table often does not route to Materialized anywhere in [1, max_tokens] -- which is the whole
+    // point of sweeping it outside its routed interval.
+    const std::size_t workspace_bytes =
+        ninfer::ops::detail::q4_linear_swiglu_materialized_workspace_bytes(kGateUpRows,
+                                                                           max_tokens);
+    ninfer::WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 1));
+
     cudaDeviceProp properties{};
     cudaGetDeviceProperties(&properties, 0);
     std::printf("# gpu=%s sm=%d%d  q4 swiglu schedules, cold, median of %d\n", properties.name,
@@ -119,7 +132,8 @@ int main(int argc, char** argv) {
                 continue;
             }
             const auto invoke = [&](cudaStream_t launch_stream) {
-                schedule.launch(x, packed.weight, out, launch_stream);
+                ninfer::ops::detail::q4_linear_swiglu_execute_schedule(
+                    schedule.id, x, packed.weight, out, workspace, launch_stream);
             };
             double us = 0.0;
             try {
