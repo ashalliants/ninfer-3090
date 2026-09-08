@@ -101,11 +101,14 @@ int main(int argc, char** argv) {
     cudaStream_t stream = nullptr;
 
     // Materialized stages the whole gate+up product, so its workspace scales with the widest
-    // column count swept. Size it once for the whole range rather than per point.
+    // column count swept. Size it once for the whole range rather than per point, and directly
+    // from max_tokens rather than through resolve_plan's route table: every schedule here runs at
+    // every in-domain token count regardless of which one the table would actually pick, and the
+    // table often does not route to Materialized anywhere in [1, max_tokens] -- which is the whole
+    // point of sweeping it outside its routed interval.
     const std::size_t workspace_bytes =
-        ninfer::ops::detail::q4_linear_swiglu_capacity_workspace_bytes(kGateUpRows, kOutputRows,
-                                                                       kHidden, kHidden, 1,
-                                                                       max_tokens);
+        ninfer::ops::detail::q4_linear_swiglu_materialized_workspace_bytes(kGateUpRows,
+                                                                           max_tokens);
     ninfer::WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 1));
 
     cudaDeviceProp properties{};

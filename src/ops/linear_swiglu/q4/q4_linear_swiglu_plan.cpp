@@ -102,6 +102,11 @@ std::size_t materialized_workspace_bytes(std::int32_t rows, std::int32_t cols) {
 
 } // namespace
 
+std::size_t q4_linear_swiglu_materialized_workspace_bytes(std::int32_t gate_up_rows,
+                                                          std::int32_t max_cols) {
+    return materialized_workspace_bytes(gate_up_rows, max_cols);
+}
+
 const char* q4_linear_swiglu_schedule_name(Q4LinearSwiGluScheduleId schedule) noexcept {
     switch (schedule) {
     case Q4LinearSwiGluScheduleId::GemvPair:

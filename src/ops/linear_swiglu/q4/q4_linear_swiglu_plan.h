@@ -41,6 +41,15 @@ std::size_t q4_linear_swiglu_capacity_workspace_bytes(std::int32_t gate_up_rows,
                                                       std::int32_t padded_k, std::int32_t min_cols,
                                                       std::int32_t max_cols);
 
+// Workspace for Materialized alone, sized directly from the column count rather than from which
+// columns resolve_plan's route table currently sends there. Materialized's workspace grows
+// monotonically with cols, so sizing for the widest column count in a sweep covers every narrower
+// one too. Exists for callers -- benchmarks in particular -- that run Materialized outside its
+// routed interval; q4_linear_swiglu_capacity_workspace_bytes reports zero for those callers and is
+// the wrong function to size against.
+std::size_t q4_linear_swiglu_materialized_workspace_bytes(std::int32_t gate_up_rows,
+                                                          std::int32_t max_cols);
+
 void q4_linear_swiglu_execute_plan(const Q4LinearSwiGluPlan& plan, const Tensor& x, const Weight& w,
                                    Tensor& out, WorkspaceArena& ws, cudaStream_t stream);
 
