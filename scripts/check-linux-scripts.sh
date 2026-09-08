@@ -8,6 +8,20 @@ trap 'rm -rf -- "$tmp"' EXIT
 for script in "$root"/*.sh; do
   bash -n "$script"
 done
+
+# CRLF in a shell script is not cosmetic. Inside a `case` block the stray CR becomes part of the
+# `in` token and Linux bash refuses the file outright -- which is exactly what happened to
+# run-qwen36-35b-a3b-c1-maxctx.sh and run-qwen38-c1-maxctx.sh, the two launchers the README
+# recommends as the Linux entry point. `bash -n` above catches that particular shape, but a CRLF
+# script without a `case` parses and then misbehaves at runtime instead, so check the bytes.
+#
+# -U forces binary matching. Without it, Git Bash's grep translates CR away and reports every file
+# clean on a Windows checkout, which is how this survived as long as it did.
+crlf="$(LC_ALL=C grep -lU $'\r' "$root"/*.sh "$root"/*/*.sh 2>/dev/null || true)"
+if [[ -n "$crlf" ]]; then
+  printf 'Shell scripts with CRLF line endings (must be LF; see .gitattributes):\n%s\n' "$crlf" >&2
+  exit 1
+fi
 # Deliberately Windows-only, so exempt from the counterpart rule. Named individually rather than
 # pattern-matched: every other package-release-* does have a .sh sibling, and the rule is worth
 # keeping strict for the launchers and downloaders, where a missing counterpart actually strands
