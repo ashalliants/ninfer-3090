@@ -574,11 +574,11 @@ bool HttpServer::listen() {
     if (public_model_id_.empty()) {
         throw std::logic_error("HTTP public model id is not resolved");
     }
-    if (options_.log_stats_interval_ms != 0) {
-        stats_stopping_ = false;
-        stats_thread_   = std::thread([this] { run_stats_reporter(); });
-    }
     try {
+        if (options_.log_stats_interval_ms != 0) {
+            stats_stopping_ = false;
+            stats_thread_   = std::thread([this] { run_stats_reporter(); });
+        }
         // When the startup listener is running, the accept loop is already live on its thread and
         // has been since bind(); calling listen_after_bind() again would try to accept on the same
         // socket from two threads. Wait for that loop instead.
@@ -588,6 +588,15 @@ bool HttpServer::listen() {
         return result;
     } catch (...) {
         stop_stats_reporter();
+        // Stop and join the startup listener before this exception unwinds past us. attach() has
+        // already run by the time listen() can be called, so that thread is live against
+        // service_; the caller (main.cpp) destroys the attached GenerationService, constructed
+        // after this HttpServer, before this object -- leaving that thread dereferencing a
+        // dangling pointer for however long stack unwinding takes if it is still running then.
+        if (startup_listener_.joinable()) {
+            server_.stop();
+            startup_listener_.join();
+        }
         throw;
     }
 }
