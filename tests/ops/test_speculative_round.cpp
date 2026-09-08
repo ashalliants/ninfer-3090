@@ -630,7 +630,15 @@ struct SparseAcceptSuite {
     // top-k rather than reading target_tokens, and a NaN does not sort predictably, so the poison
     // there is the whole column -- which is what a diverged forward pass actually produces. The
     // raw route reads target_tokens directly, so poisoning that one logit is exact.
-    int sparse_non_finite_terminal_case(bool raw_greedy, int poison, bool penalized = false) {
+    // `poison_matched` moves the NaN off the divergence column and onto a column the round
+    // *accepts*. Both sparse greedy routes read target_tokens directly, so the match still
+    // succeeds -- the ids say "the target picked what the draft proposed" while the logits behind
+    // that verdict are NaN, which is precisely the case a terminal-only guard waves through: it
+    // licenses the accepted draft and then commits on a finite terminal further along. Only
+    // meaningful for the non-penalized routes; the penalized ones select from the column's own
+    // ranking, so poisoning a column there changes what is selected and the divergence moves.
+    int sparse_non_finite_terminal_case(bool raw_greedy, int poison, bool penalized = false,
+                                        bool poison_matched = false) {
         std::vector<std::int32_t> targets(kSparseColumns * kSparseBatch),
             drafts(kSparseDrafts * kSparseBatch);
         std::vector<std::uint16_t> logits(static_cast<std::size_t>(kSparsePhysicalRows) *
@@ -681,15 +689,19 @@ struct SparseAcceptSuite {
                 drafts[row * kSparseDrafts + col] = ids[base + rank];
                 q[base + rank]                    = 1.0f;
             }
-            // Poison every other row. The NaN goes on the exact logit the kernel tests: the
-            // divergence column's target token.
-            const bool poisoned = (row & 1) == (poison & 1);
+            // Poison every other row. The NaN goes on the exact logit the kernel tests.
+            // poison_matched needs an accepted column to exist, so a row that diverges at 0 has
+            // none and is left clean -- expected_refusal tracks that rather than assuming.
+            const int matched_column = reject / 2;
+            const bool poisoned = ((row & 1) == (poison & 1)) && (!poison_matched || reject > 0);
             if (poisoned) {
+                const int column = poison_matched ? matched_column : reject;
                 if (penalized) {
                     for (int v = 0; v < kSparseTokenDomain; ++v)
-                        logits[sparse_logit_index(row, reject, v)] = f32_to_bf16(quiet_nan);
+                        logits[sparse_logit_index(row, column, v)] = f32_to_bf16(quiet_nan);
                 } else {
-                    logits[sparse_logit_index(row, reject, targets[row * kSparseColumns + reject])] =
+                    logits[sparse_logit_index(row, column,
+                                              targets[row * kSparseColumns + column])] =
                         f32_to_bf16(quiet_nan);
                 }
             }
@@ -716,9 +728,10 @@ struct SparseAcceptSuite {
             }
         }
         return execute_sparse_accept_case(
-            "sparse non-finite terminal K=" + std::to_string(kSparseDrafts) + " B=" +
-                std::to_string(kSparseBatch) + (raw_greedy ? " raw" : " general") +
-                (penalized ? " penalized" : "") + " p" + std::to_string(poison),
+            "sparse non-finite " + std::string(poison_matched ? "matched" : "terminal") +
+                " K=" + std::to_string(kSparseDrafts) + " B=" + std::to_string(kSparseBatch) +
+                (raw_greedy ? " raw" : " general") + (penalized ? " penalized" : "") + " p" +
+                std::to_string(poison),
             targets, logits, drafts, ids, q, extents, lengths, anchors, configs, history,
             {raw_greedy}, &expected);
     }
@@ -1495,6 +1508,11 @@ int main(int argc, char** argv) {
                 for (int poison = 0; poison < 2; ++poison) {
                     failures +=
                         SparseAcceptSuite(k, batch).sparse_non_finite_terminal_case(raw, poison);
+                    // The same fixture with the NaN on an *accepted* column instead of the
+                    // divergence column. A terminal-only guard passes this while licensing a
+                    // draft the target never actually endorsed.
+                    failures += SparseAcceptSuite(k, batch).sparse_non_finite_terminal_case(
+                        raw, poison, /*penalized=*/false, /*poison_matched=*/true);
                 }
             }
             // Penalized greedy takes the group-finalize routes instead, which select the terminal

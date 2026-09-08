@@ -298,27 +298,28 @@ about it fails on a different one.
       value unperturbed, so every non-finite entry in a poisoned column stays bit-identical and the
       guard sees whichever one the id tie-break selects.
 
-## 5c. Greedy acceptance only tests the divergence column, not accepted matches
+## 5c. Greedy acceptance validates the whole committed span — done
 
-- [ ] Every greedy route (`speculative_accept_greedy_drafts_kernel`'s no-penalty and penalized
-      paths, `speculative_sampling_group_finalize_kernel<false>`'s no-penalty and penalized paths,
-      and both sparse warp routes closed by 5a) walks `while (a < extent && row_targets[a] ==
-      row_drafts[a]) ++a;` and tests `sampling_selected_logit_is_finite` only at column `a`, the
-      divergence/terminal column. **A column before `a` is never checked.** If a diverged forward
-      pass produces an all-NaN row whose argmax (undefined under NaN comparisons -- see
-      `sampling_better`) happens to equal that column's draft token, the round accepts it as a
-      match and folds it into `licensed_tokens` with no finiteness check at all; the guard only
-      ever sees whichever later, possibly-clean column becomes the terminal.
-      **Raised by CodePulse on PR #18, against 5a's new sparse-greedy code** (`speculative_round.cuh:178`),
-      but confirmed to be the pre-existing shape of `speculative_accept_greedy_drafts_kernel`'s
-      no-penalty path already on `master` before PR #18 -- 5a made the other three routes match
-      this pattern, not introduce it. **Descoped from PR #18**: closing it means validating
-      finiteness of every accepted column in all four greedy routes (an extra
-      `sampling_selected_logit_is_finite` read per accepted column, not just the terminal), which
-      touches code PR #18 never modified and changes the acceptance protocol uniformly rather than
-      guarding one more call site. That is a distinct effort from "make the new routes match the
-      established pattern," which is what PR #18 shipped.
+- [x] ~~Every greedy route tested `sampling_selected_logit_is_finite` only at the divergence
+      column, never at a column accepted as a match.~~ **Fixed.** If a diverged forward pass gave a
+      column an all-NaN row whose argmax happened to equal that column's draft, the round accepted
+      it as a match, folded it into `licensed_tokens` with no finiteness check, and then committed
+      on whichever later, clean column became the terminal.
 
+      Raised by CodePulse on PR #18 against 5a's new sparse code, and confirmed to be the
+      pre-existing shape of `speculative_accept_greedy_drafts_kernel` on `master` — 5a made the
+      other routes match that pattern rather than introducing it. Initially descoped as "touches
+      code PR #18 never modified"; that was the wrong call, because the fix is cheap.
+
+      All five greedy sites now validate the committed span `[0, accepted_count]`:
+      the two sparse warp routes with a single `__ballot_sync` (one lane per column, and
+      `a <= extent <= k <= 15` always fits a warp), the single-block greedy+penalties path by
+      accumulating into a shared flag inside the column loop it already runs, and both dense
+      multiblock routes through the shared `speculative_commit_span_is_finite` helper.
+
+      Verified adversarially: reverting only the sparse warp path to terminal-only produces **40
+      failures, all 40 in the new poisoned-matched-column cases**, with every terminal-column case
+      still passing.
 ## 5b. Reproducibility
 
 - [ ] **fp8, k8v4 and nvfp4 causal attention are not run-to-run deterministic.** Running
