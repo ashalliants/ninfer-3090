@@ -27,17 +27,20 @@ Everything below is what is *not* done. Ordered by what blocks what.
 
 ## 0. Next up, in this order
 
-1. **Dedupe `prompt_i8.cuh`'s local f16 dequant helpers** (section 7). ~15 minutes, and it closes
-   the exact gap that caused the small-T bug: the shared codec had no f16 variant for the INT8
-   codings, so upstream's kernel reached for the bf16 one. Removing the local copies removes the
-   trap.
+1. **Chase the `T=112` graph-replay failure** (section 8). It is the only open item that could be a
+   correctness defect in *released* code, and the band it lands in was retuned by this fork.
 2. **Measure the `w8_pair` k=2048 table** (section 4). The best remaining pure-speed bet — 37
    routes, the largest table in the tree, on the 35B DFlash path, never measured on sm_86.
-3. **Audit the gross-error limits** (section 5). Cheap insurance: any criterion under ~4e-3 against
-   a BF16 output will read as an accuracy regression the next time a route boundary moves.
+3. **A test that lists unrouted schedules per Op** (section 4). Cheap, and a schedule nothing
+   selects is what let both switch fallthroughs hide.
 
-Then, in no fixed order: the two items descoped from PR #16 under review (sections 4a and 5a), and
-the DFlash2 attention sweep (section 2), which is now narrowed to a single reproducible case.
+Then, in no fixed order: the remaining section 4 boundary measurements, the section 8 startup
+findings, and the DFlash2 attention sweep (section 2), which is narrowed to a single case.
+
+**Cleared since the v0.9.0 release**, all with measurements recorded in their PRs: the section 5
+gross-error audit (#20), the section 5a finiteness guard (#18, which turned out to be four routes
+rather than one), the section 4a docs provenance (#19), the release-build gap (#17), and the
+section 7 `prompt_i8` dedupe (which had already landed — the entry was simply stale).
 
 **Keep `investigate/small-t-upstream` until the next catch-up.** It is merged, but it is also the
 clean, self-contained record of how upstream's small-T was adopted and what had to be fixed to make
@@ -385,13 +388,11 @@ about it fails on a different one.
       and `small_t.cu` keeps `std::int8_t*` for both codings because a single kernel serves int8-g64
       and rk8v4 and the packed-int4 path re-casts internally where it unpacks. Substituting
       `KvValueCodeT<...>` there would change behaviour, not tidy it.
-- [ ] **Dedupe `prompt_i8.cuh`'s local f16 dequant helpers.** It defines its own
-      `causal_prompt_i8_dequant_f16x8` / `causal_prompt_i4_dequant_f16x8` because the shared codec
-      had no f16 variants for the INT8 codings. It does now
-      (`kv_cache_int8_dequant_f16x8_from` / `kv_cache_int4_dequant_f16x8_from`), so the locals are
-      redundant. That missing pair is exactly what made upstream's small-T reach for the bf16
-      helper and silently reinterpret every value, so collapsing them removes the trap rather than
-      just tidying.
+- [x] ~~Dedupe `prompt_i8.cuh`'s local f16 dequant helpers.~~ **Already done** — it landed with the
+      small-T adoption itself and this entry was simply never ticked. `prompt_i8.cuh` now calls the
+      shared `kv_cache_int8_dequant_f16x8_from` / `kv_cache_int4_dequant_f16x8_from`, and the
+      comment at the top of that file records why the missing pair mattered: it is exactly what made
+      upstream's small-T reach for the bf16 helper and silently reinterpret every value.
 - [x] ~~Clean up the extra worktrees.~~ **Done.** `baseline-master` was already gone; `wt-readme`
       removed after checking clean status and confirming `feat/dual-gpu-graph-mode` is fully merged
       into master with nothing unpushed. The branch is kept, so the history survives.
@@ -405,6 +406,74 @@ about it fails on a different one.
       closed as the record of the abandoned dual-GPU overlap experiment.
 
 ---
+
+## 8. Found 2026-09-08, while clearing this list
+
+Ordered by how much they could bite. The first is a possible correctness defect in released code.
+
+- [ ] **`attn_input_proj` produces grossly wrong values at `W8 DFlash2 A16 T=112 graph phase=1`.**
+      Not a tolerance miss — `actual=34` against `reference=-65.9`, `actual=4.09` against `67.15`,
+      on q, k *and* value. Seen in **2 of 3 full-suite runs** (`ctest -j2`), always that exact case
+      and always the graph-replay phase; passes 3/3 in isolation.
+
+      Two reasons this matters more than a normal flake. **`T=112` sits in the `{97,128}` →
+      `R32C64K128` band retuned in PR #16**, which shipped in v0.9.0. And the criterion involved was
+      *loosened* by the section 5 floor and still fails loudly, which rules out tolerance as the
+      cause — the values are ~10x off.
+
+      **The contention hypothesis is untested, not disproven.** Two reproduction attempts looked
+      clean and were worthless: they shelled out to `ninfer_softmax_attention_nvfp4_test.exe` and
+      `ninfer_softmax_attention_k8v4_test.exe`, which do not exist — those are *ctest* entries that
+      share `ninfer_softmax_attention_test.exe` with `--nvfp4-only` / `--k8v4-only`. `Start-Process`
+      failed silently, no concurrent load ever ran, and `gpu_used=1782 MiB` in the log should have
+      given it away. Redo it with the real binary plus arguments, taken from
+      `build-ninja/tests/CTestTestfile.cmake`.
+
+- [ ] **`--spec mtp` cannot start with default host-KV sizing.** It reserves **8 GiB of pinned host
+      memory** and dies during startup:
+
+      ```
+      INFO  pinning host KV | 8.00 GiB
+      ERROR startup failed | pinning host KV | 87.1 ms
+      FATAL server failed during startup | cudaMallocHost failed: cudaErrorMemoryAllocation: out of memory
+      ```
+
+      Nothing about this is GPU-side, so no VRAM sizing predicts it, and the message names CUDA for
+      what is a *host* RAM shortfall. `--host-kv-mib 512` works around it and MTP then runs fine.
+      Decide whether the default should scale with available host RAM, or at least fail with a
+      message that says "host" and names the flag.
+
+- [ ] **`/v1/models` answers before startup has finished.** It returned 200 about 2 s in, while the
+      log shows 3.7 s to materialize weights and further time to pin host state and KV. A readiness
+      probe that passes early will have orchestrators routing traffic at a server that is still
+      loading — and it masked the MTP failure above until the process exit was checked directly.
+      Either gate the endpoint on startup completion or add a separate readiness endpoint.
+
+- [ ] **`sparse_moe`'s gross bound is pure `gross_absolute`.** Its
+      `gross_relative_to_max_reference` is `0.0`, so the section 5 BF16 floor does not reach it, and
+      it sits at **0.92** of its limit with the largest observed BF16 error in the tree —
+      **3.64 rounding steps**, against 0.09-1.53 everywhere else. Both facts want explaining before
+      the bound is touched: either the kernel is genuinely less accurate than every other BF16 Op,
+      or the criterion is measuring something different.
+
+- [ ] **`gated_delta_net`'s state criterion sits at 0.87.** Deliberately left out of the section 5
+      floor because it compares an **FP32** output, so dtype rounding is not its floor; the error
+      arrives from BF16 inputs propagating. Needs its own derivation rather than the BF16 one.
+
+- [ ] **Binaries embed their build directory.** `/home/ash/ninfer-rel/src/...` appears 200 times in
+      the Linux binaries and `C:\ninfer-fork\ninfer-3090\...` about 466 times in the Windows ones,
+      via `__FILE__` and nvcc source paths. Pre-existing (v0.8.1 embedded `/mnt/c/ninfer-fork/...`
+      405 times) and not a secret — the file names are already public in the repo, and no Windows
+      binary contains a `C:\Users\...` path. `-ffile-prefix-map=` on the host compiler plus
+      `--compiler-options` for nvcc would rewrite them to relative paths, which also makes assertion
+      messages more readable. Cosmetic; do it with a release build, not on its own.
+
+- [ ] **A running test binary breaks the next link.** `cmake --build` failed with
+      `LNK1104: cannot open file 'tests\ninfer_softmax_attention_test.exe'` because a test process
+      left over from a previous script still held it. The build note below covers *two builds*
+      colliding; this is a different cause with the same signature, and it produced the stale-binary
+      trap again — the build failed while the test still "passed", from the previous binary. Add
+      `Get-Process ninfer_*` to the pre-build check alongside `Get-Process ninja,cmake,cicc`.
 
 ## Build note, because it cost hours
 
