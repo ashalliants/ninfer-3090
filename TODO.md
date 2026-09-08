@@ -261,27 +261,65 @@ about it fails on a different one.
       `README.md` is already correct here: its "## Upstream" section contrasts upstream's
       RTX 5090/`sm_120a` target with this fork's SM86 layer, so it needs no change.
 
-## 5a. Sparse speculative raw-greedy has no finiteness guard
+## 5a. Speculative greedy finiteness guard — done
 
-- [ ] **Thread a per-row finiteness signal into `speculative_accept_sparse_warp_greedy_kernel`.**
-      Every other commit path now refuses to license a token chosen from a non-finite column:
-      the dense routes test `sampling_selected_logit_is_finite`/`sampling_value_is_finite`, and
-      `speculative_sparse_warp_accept` now tests the weight behind its chosen terminal. The
-      sparse **raw-greedy** route cannot: its kernel receives `target_tokens` (ints) and never
-      sees a float, so `speculative_sparse_warp_greedy` passes `true` with that stated at the
-      call site.
+- [x] ~~Thread a per-row finiteness signal into `speculative_accept_sparse_warp_greedy_kernel`.~~
+      **Done, and it was both smaller and larger than this entry assumed.**
 
-      Closing it means changing `speculative_accept_sparse_drafts_launch` and the kernel
-      signature to carry either the verify logits or a precomputed per-row finite flag, plus its
-      callers, plus regression cases in `tests/ops/test_speculative_round.cpp` for both sparse
-      routes. That is a signature change across the launcher boundary, so it was descoped from
-      the catch-up PR rather than designed under review pressure — the bounded half (the accept
-      path, which has numerics in scope) is fixed there.
+      *Smaller:* no signature change across the launcher boundary was needed.
+      `speculative_accept_sparse_drafts_launch` already receives the verify logits and already
+      computes `physical_rows`; the raw-greedy branch simply ignored them. Only the kernel
+      signatures lacked the parameters.
 
-      Worth knowing when prioritising: an all-NaN target column on this route licenses an
-      arbitrary token and advances the sequence length instead of returning
-      `kSamplerNonFiniteToken`. Raised by CodePulse on PR #16.
+      *Larger:* this entry claimed "every other commit path now refuses to license a token chosen
+      from a non-finite column". That was wrong. **Four** greedy routes were passing a hardcoded
+      `true`, not one:
+        - sparse raw-greedy (the route this entry described);
+        - dense multiblock `speculative_sampling_group_finalize_kernel<false>`, no penalties;
+        - dense penalized greedy, in the same kernel's general path;
+        - sparse penalized greedy, in `speculative_sparse_warp_accept`'s greedy branch.
 
+      All four now test the raw verify logit of the token they are about to license, which is the
+      signal the single-block dense kernel has always used. Penalties change the score that selects
+      the terminal but not the logit behind it, and a diverged pass makes the whole column NaN
+      before any penalty applies.
+
+      Regression cases in `tests/ops/test_speculative_round.cpp` cover every route with poisoned
+      and clean rows mixed in one batch. Verified adversarially: reverting the guard produces 60
+      failures. The last two routes were found by CodePulse review on PR #18.
+
+      *Also found while adding coverage for the dense multiblock routes:* `sampling_adjusted_logit`
+      applied presence/frequency penalty subtraction to non-finite raw logits unconditionally.
+      CUDA's NaN canonicalization on that subtraction produces a different bit pattern than an
+      untouched NaN, which the total-order sort key (`score_id_order_key`) ranks as strictly higher
+      -- so a poisoned verify column's already-drafted (penalized) token could spuriously win the
+      greedy top-1 selection and get accepted, moving the terminal to a later, clean column and
+      evading the finiteness guard entirely. `sampling_adjusted_logit` now returns a non-finite raw
+      value unperturbed, so every non-finite entry in a poisoned column stays bit-identical and the
+      guard sees whichever one the id tie-break selects.
+
+## 5c. Greedy acceptance validates the whole committed span — done
+
+- [x] ~~Every greedy route tested `sampling_selected_logit_is_finite` only at the divergence
+      column, never at a column accepted as a match.~~ **Fixed.** If a diverged forward pass gave a
+      column an all-NaN row whose argmax happened to equal that column's draft, the round accepted
+      it as a match, folded it into `licensed_tokens` with no finiteness check, and then committed
+      on whichever later, clean column became the terminal.
+
+      Raised by CodePulse on PR #18 against 5a's new sparse code, and confirmed to be the
+      pre-existing shape of `speculative_accept_greedy_drafts_kernel` on `master` — 5a made the
+      other routes match that pattern rather than introducing it. Initially descoped as "touches
+      code PR #18 never modified"; that was the wrong call, because the fix is cheap.
+
+      All five greedy sites now validate the committed span `[0, accepted_count]`:
+      the two sparse warp routes with a single `__ballot_sync` (one lane per column, and
+      `a <= extent <= k <= 15` always fits a warp), the single-block greedy+penalties path by
+      accumulating into a shared flag inside the column loop it already runs, and both dense
+      multiblock routes through the shared `speculative_commit_span_is_finite` helper.
+
+      Verified adversarially: reverting only the sparse warp path to terminal-only produces **40
+      failures, all 40 in the new poisoned-matched-column cases**, with every terminal-column case
+      still passing.
 ## 5b. Reproducibility
 
 - [ ] **fp8, k8v4 and nvfp4 causal attention are not run-to-run deterministic.** Running
