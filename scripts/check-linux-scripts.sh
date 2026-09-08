@@ -36,28 +36,46 @@ if [[ -n "$crlf" ]]; then
   printf 'Linux bash rejects these outright inside a `case` block.\n' >&2
   exit 1
 fi
-# Deliberately Windows-only, so exempt from the counterpart rule. Named individually rather than
-# pattern-matched: every other package-release-* does have a .sh sibling, and the rule is worth
-# keeping strict for the launchers and downloaders, where a missing counterpart actually strands
-# Linux users. Without this exemption the rule below exits on its first violation and nothing
-# after it runs -- which is the state this check has been in, so none of the downloader coverage
-# further down was executing at all.
-windows_only=(
-  'package-release-rtx4090-early1.ps1'
-)
+# Every Windows script needs a Bash sibling. There used to be an exemption list here holding
+# package-release-rtx4090-early1.ps1; the counterpart was written instead, so the list is gone
+# rather than empty. An exemption list is where the next Windows-only script quietly goes.
+#
+# Accumulate rather than exiting on the first miss. This loop used to `exit 1` immediately, and
+# because it was failing on a cosmetic counterpart rule, none of the downloader coverage below it
+# ran at all -- which is how the curl fixture further down went stale unnoticed. A guard that
+# stops at its first complaint disables everything after it.
+missing=''
 for windows_script in "$root"/*.bat "$root"/*.ps1; do
-  base="$(basename -- "$windows_script")"
-  exempt=0
-  for allowed in "${windows_only[@]}"; do
-    [[ "$base" == "$allowed" ]] && exempt=1
-  done
-  (( exempt )) && continue
   counterpart="${windows_script%.*}.sh"
-  if [[ ! -x "$counterpart" ]]; then
-    printf 'Missing Bash counterpart: %s\n' "$counterpart" >&2
-    exit 1
-  fi
+  [[ -f "$counterpart" ]] || missing+="  $(basename -- "$counterpart")"$'
+'
 done
+if [[ -n "$missing" ]]; then
+  printf 'Missing Bash counterpart for a Windows script:
+%s' "$missing" >&2
+  exit 1
+fi
+
+# The executable bit, read from the index rather than the filesystem. On a Windows checkout every
+# file looks executable to bash, and under WSL /mnt/c reports 777 for everything, so `-x` on the
+# working tree cannot see a mode-644 script here at all -- while a real Linux checkout gets a file
+# that will not run. scripts/package-release-v090.sh, the current release's Linux packager, sat at
+# 644 for exactly that reason. `git ls-files -s` reports what is committed, which is the thing
+# that actually reaches a Linux user.
+not_executable=''
+while IFS= read -r entry; do
+  mode="${entry%% *}"
+  path="${entry#*$'	'}"
+  [[ "$mode" == '100755' ]] || not_executable+="  $path (mode $mode)"$'
+'
+done < <(git -C "$repo_root" ls-files -s '*.sh' '*.bash' 2>/dev/null)
+if [[ -n "$not_executable" ]]; then
+  printf 'Shell scripts committed without the executable bit:
+%s' "$not_executable" >&2
+  printf 'Fix with: git update-index --chmod=+x <path>
+' >&2
+  exit 1
+fi
 
 cat > "$tmp/ninfer-serve" <<'SERVER'
 #!/usr/bin/env bash
@@ -105,8 +123,7 @@ CURL
 chmod +x "$tmp/bin/curl"
 PATH="$tmp/bin:$PATH" NINFER_MODEL_DIR="$tmp/models" "$root/download-qwen38-27b.sh" >/dev/null
 qwen36_35b_expected_size="$(sed -n 's/^expected_size=\([0-9]\+\)$/\1/p' "$root/download-qwen36-35b-a3b.sh")"
-PATH="$tmp/bin:$PATH" NINFER_MODEL_DIR="$tmp/models" NINFER_SKIP_SHA256=1 \
-  NINFER_TEST_FAKE_SIZE="$qwen36_35b_expected_size" "$root/download-qwen36-35b-a3b.sh" >/dev/null
+PATH="$tmp/bin:$PATH" NINFER_MODEL_DIR="$tmp/models" NINFER_SKIP_SHA256=1   NINFER_TEST_FAKE_SIZE="$qwen36_35b_expected_size" "$root/download-qwen36-35b-a3b.sh" >/dev/null
 [[ -f "$tmp/models/qwen3_8_27b.ninfer" ]]
 [[ -f "$tmp/models/qwen3_6_35b_a3b.ninfer" ]]
 
