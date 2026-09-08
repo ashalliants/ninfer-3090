@@ -27,7 +27,7 @@ constexpr ops::AttentionHeadGeometry kGeometry{kDim, kHeads, kHeads};
 constexpr ReductionCriterion kPackedAttentionBf16Criterion{
     .relative_l2                     = 2.5e-3,
     .gross_absolute                  = 1e-3,
-    .gross_relative_to_max_reference = 2.8e-3,
+    .gross_relative_to_max_reference = kBf16GrossRelativeFloor,
 };
 
 std::size_t index_of(int token, int head, int d) {

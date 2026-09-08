@@ -35,13 +35,13 @@ constexpr double kTheta           = 1.0e7;
 constexpr ReductionCriterion kKeyCriterion{
     3.0e-3,
     1.0e-2,
-    6.0e-3,
+    kBf16GrossRelativeFloor,
 };
 
 constexpr ReductionCriterion kValueCriterion{
     2.9e-3,
     4.0e-3,
-    3.8e-3,
+    kBf16GrossRelativeFloor,
 };
 
 std::size_t cache_elements() {

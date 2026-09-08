@@ -24,7 +24,7 @@ constexpr int kStateDim = 128;
 
 constexpr ReductionCriterion gated_delta_net_output_bf16_criterion() {
     return {/*relative_l2=*/4.1e-3, /*gross_absolute=*/5.0e-6,
-            /*gross_relative_to_max_reference=*/5.5e-3};
+            /*gross_relative_to_max_reference=*/kBf16GrossRelativeFloor};
 }
 
 constexpr ReductionCriterion gated_delta_net_state_fp32_criterion() {

@@ -33,7 +33,7 @@ namespace {
 constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute) {
     switch (activation_compute) {
     case ActivationCompute::A16:
-        return {3.3e-3, 5.0e-3, 6.3e-3};
+        return {3.3e-3, 5.0e-3, kBf16GrossRelativeFloor};
     case ActivationCompute::A8:
         // Both independently A8-quantized projections feed the nonlinear product, so this profile
         // allows twice Linear's relative-L2 quantization allowance plus a bounded gross tail.

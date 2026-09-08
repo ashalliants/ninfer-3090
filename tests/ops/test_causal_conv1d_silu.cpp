@@ -24,7 +24,7 @@ namespace {
 constexpr ReductionCriterion kCausalConvA16Criterion{
     /*relative_l2*/ 1.85e-3,
     /*gross_absolute*/ 1.0e-3,
-    /*gross_relative_to_max_reference*/ 3.7e-3,
+    /*gross_relative_to_max_reference*/ kBf16GrossRelativeFloor,
 };
 
 constexpr std::uint8_t kOutputPoison = 0xff;

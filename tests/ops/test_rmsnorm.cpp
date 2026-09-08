@@ -16,10 +16,13 @@ using namespace ninfer::test::norm;
 namespace {
 
 // BF16 RNE alone can incur almost 2^-8 relative error; the gross bound must
-// contain that storage error as well as FP32 reduction/rsqrt error.
+// contain that storage error as well as FP32 reduction/rsqrt error. It used to
+// be 3.95e-3 -- 1.01 of that storage step, so it contained the first term and
+// almost none of the second, and 168 of 734 cases sat above 0.9 of it. It now
+// takes the shared floor; see kBf16GrossRelativeFloor in op_check.h.
 constexpr ReductionCriterion rmsnorm_bf16_criterion() {
     return {/*relative_l2*/ 1.85e-3, /*gross_absolute*/ 1.0e-5,
-            /*gross_relative_to_max_reference*/ 3.95e-3};
+            /*gross_relative_to_max_reference*/ kBf16GrossRelativeFloor};
 }
 
 std::vector<double> rmsnorm_oracle(const std::vector<float>& input,

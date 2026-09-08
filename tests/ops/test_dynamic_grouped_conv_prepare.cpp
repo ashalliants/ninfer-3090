@@ -32,10 +32,10 @@ constexpr float kEps                    = 1.0e-6F;
 
 constexpr ReductionCriterion kFinishDeltaCriterion{/*relative_l2=*/3.2e-3,
                                                    /*gross_absolute=*/4.0e-3,
-                                                   /*gross_relative=*/4.5e-3};
+                                                   /*gross_relative=*/kBf16GrossRelativeFloor};
 constexpr ReductionCriterion kPreparedCriterion{/*relative_l2=*/3.6e-3,
                                                 /*gross_absolute=*/5.0e-3,
-                                                /*gross_relative=*/6.0e-3};
+                                                /*gross_relative=*/kBf16GrossRelativeFloor};
 
 std::uint32_t mix32(std::uint32_t value) {
     value ^= value >> 16;

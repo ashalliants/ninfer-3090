@@ -75,6 +75,42 @@ struct ReductionCriterion {
     double gross_relative_to_max_reference;
 };
 
+// Floor for `gross_relative_to_max_reference` when the compared output is stored as BF16.
+//
+// BF16 keeps eight significand bits, so for a value in [2^e, 2^(e+1)) the representable spacing is
+// 2^(e-7) and round-to-nearest costs up to half of that. Relative to the value that is at most
+// 2^-8 = 3.906e-3, reached at the bottom of a binade. `gross_relative_to_max_reference` bounds the
+// single worst element against the largest reference value in the tensor, so a limit below 2^-8
+// requires that element to round at least as well as the FP32 oracle -- which is a property of the
+// input, not of the kernel.
+//
+// Measured across every Op test carrying such a criterion (NINFER_OP_REPORT_STATS=1, worst case per
+// criterion, expressed in the 2^-8 step above):
+//
+//     limit          worst observed error      worst / limit
+//     0.51-1.46 ULP        0.66-1.46 ULP          0.77-0.99
+//
+// The bound and the error being measured are the same quantity, which is why every one of them sat
+// within a fifth of failing. Two of the attention criteria were already *below* their own observed
+// error and passed only because `gross_absolute` carried them, so their relative term was doing no
+// work at all.
+//
+// Two steps leaves room for the kernel accumulating in a different order than the oracle while
+// still bounding a genuinely wrong element far more tightly than any real defect: the sm_86 small-T
+// INT8 regression ran 3-11x the reference, i.e. hundreds of times this bound. It also keeps the
+// storage profiles ordered by lossiness -- bf16/int8/rk8v4 at 2.00 steps, fp8 at 2.30, nvfp4/k8v4
+// at 2.82 -- rather than tightest-on-the-hardest.
+//
+// This value is not new. Several tests already spell it `2.0 * kBf16UnitRoundoff` or `2.0 / 256.0`
+// (tests/ops/linear/linear_test_common.cpp, linear/test_bf16_a16.cpp, test_attn_input_proj.cpp,
+// test_gdn_input_proj.cpp, test_gdn_input_proj_conv_snapshot.cpp, test_linear_topk.cu), where
+// kBf16UnitRoundoff is that same 2^-8 step. Naming it once makes a house convention that half the
+// tree already followed apply to the other half, instead of each Op picking a number by hand.
+//
+// This is only the gross bound, whose job is catching one badly wrong element. `relative_l2` is the
+// criterion that constrains kernel accuracy and is deliberately untouched by this floor.
+inline constexpr double kBf16GrossRelativeFloor = 2.0 / 256.0; // 2^-7, two BF16 rounding steps
+
 struct ReductionStats {
     double relative_l2                = 0.0;
     double root_mean_squared_error    = 0.0;

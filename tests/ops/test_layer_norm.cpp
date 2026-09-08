@@ -19,7 +19,7 @@ constexpr float kEps                = 1.0e-6F;
 
 constexpr ReductionCriterion layer_norm_bf16_criterion() {
     return {/*relative_l2*/ 1.9e-3, /*gross_absolute*/ 2.0e-4,
-            /*gross_relative_to_max_reference*/ 2.7e-3};
+            /*gross_relative_to_max_reference*/ kBf16GrossRelativeFloor};
 }
 
 std::vector<double> layer_norm_oracle(const std::vector<float>& x, const std::vector<float>& weight,

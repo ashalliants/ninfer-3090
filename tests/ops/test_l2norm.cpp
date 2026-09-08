@@ -18,7 +18,7 @@ constexpr float kEps = 1.0e-6F;
 
 constexpr ReductionCriterion l2norm_bf16_criterion() {
     return {/*relative_l2*/ 1.9e-3, /*gross_absolute*/ 2.0e-7,
-            /*gross_relative_to_max_reference*/ 3.2e-3};
+            /*gross_relative_to_max_reference*/ kBf16GrossRelativeFloor};
 }
 
 struct Shape {

@@ -67,35 +67,41 @@ KvCacheStorage cache_plan_storage(const CachePlan& plan) {
 
 // A1 and A3 use one fixed criterion for each registered storage profile; token count, geometry,
 // execution envelope, and private launch route do not select or relax it.
+// These three profiles all end in a BF16 output store, so their gross bound sits at
+// kBf16GrossRelativeFloor -- see op_check.h for the derivation. The bounds they used to carry
+// (2.7e-3, 2.2e-3, 2.7e-3) were 0.56 to 0.69 of a single BF16 rounding step, and two of them were
+// below the error actually observed here: they admitted their own cases only because
+// `gross_absolute` carried them, so the relative term was doing no work.
+//
+// `relative_l2` is unchanged and stays the accuracy gate. It is what separates the three profiles,
+// and the separation is real. Measured over the 46 rk8v4 cases against the 35 INT8 cases:
+//
+//     profile     max relative_l2
+//     bf16            2.604e-3
+//     int8-g64        2.990e-3
+//     rk8v4           3.040e-3
+//
+// rk8v4 stages values through the same FP16 path as the INT8 coding (one represented FP16
+// code-scale product per dimension, one FP16 P/V MMA, one BF16 output store) and its keys are the
+// same rotated INT8 G64 plane, so those shared stages dominate and it lands just above INT8 rather
+// than an order of magnitude above it. Re-derive with NINFER_DUMP_ATTN_STATS=1, which prints
+// per-case stats.
 constexpr ReductionCriterion kAttentionBf16Criterion{
     /*relative_l2*/ 2.8e-3,
     /*gross_absolute*/ 1.0e-3,
-    /*gross_relative_to_max_reference*/ 2.7e-3,
+    /*gross_relative_to_max_reference*/ kBf16GrossRelativeFloor,
 };
 
 constexpr ReductionCriterion kAttentionInt8Criterion{
     /*relative_l2*/ 3.15e-3,
     /*gross_absolute*/ 1.1e-3,
-    /*gross_relative_to_max_reference*/ 2.2e-3,
+    /*gross_relative_to_max_reference*/ kBf16GrossRelativeFloor,
 };
-// The rk8v4 route stages values through the same FP16 path as the INT8 coding (one represented
-// FP16 code-scale product per dimension, one FP16 P/V MMA, one BF16 output store), and its keys
-// are the same rotated INT8 G64 plane. Those shared stages dominate the error, so rk8v4 lands
-// close to INT8 rather than an order of magnitude above it -- but not close enough to share the
-// bound. Measured over the 46 rk8v4 cases here against the 35 INT8 cases:
-//
-//     profile     max relative_l2     max (gross error / gross limit)
-//     bf16            2.604e-3                    0.932
-//     int8-g64        2.990e-3                    0.926
-//     rk8v4           3.040e-3                    1.010   <- exceeds the INT8 gross bound
-//
-// The extra margin below is set so rk8v4 keeps the same headroom the other two profiles already
-// have (worst case ~0.91 of its own limit), rather than being given a loose bound that would stop
-// catching regressions. Re-derive with NINFER_DUMP_ATTN_STATS=1, which prints per-case stats.
+
 constexpr ReductionCriterion kAttentionRk8v4Criterion{
     /*relative_l2*/ 3.25e-3,
     /*gross_absolute*/ 1.1e-3,
-    /*gross_relative_to_max_reference*/ 2.7e-3,
+    /*gross_relative_to_max_reference*/ kBf16GrossRelativeFloor,
 };
 
 constexpr ReductionCriterion kAttentionFp8Criterion{

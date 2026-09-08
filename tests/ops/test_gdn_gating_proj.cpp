@@ -33,7 +33,7 @@ constexpr ReductionCriterion kGdnProjectionFp32{/*relative_l2=*/1.4e-6,
                                                 /*gross_relative_to_max_reference=*/2.5e-6};
 constexpr ReductionCriterion kGdnNormOutputBf16{/*relative_l2=*/1.75e-3,
                                                 /*gross_absolute=*/1.0e-4,
-                                                /*gross_relative_to_max_reference=*/4.0e-3};
+                                                /*gross_relative_to_max_reference=*/kBf16GrossRelativeFloor};
 // FP32 public controls permit 16-bit private operands/materialization. The gross cap includes
 // propagated BF16 staging error; relative L2 remains the accuracy gate for the full formula.
 constexpr ReductionCriterion kGdnNormControlFp32{/*relative_l2=*/8.0e-4,
