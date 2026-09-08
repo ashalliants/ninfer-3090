@@ -30,10 +30,10 @@ Everything below is what is *not* done. Ordered by what blocks what.
 1. **Chase the `T=112` graph-replay failure** (section 8). Still the only open item that could be a
    correctness defect in *released* code, and the band it lands in was retuned by this fork.
    Four hypotheses are already ruled out — read that entry before starting.
-2. **The two shipped-launcher findings in section 8**: `--spec mtp` cannot start with default
-   host-KV sizing (8 GiB of pinned host memory, and the error names CUDA for a host shortfall), and
-   `/v1/models` answers before startup finishes. Both are small and both affect people running the
-   release.
+2. **The startup findings in section 8.** The pinned-host-memory diagnostics are done (#25 — the
+   CUDA "out of memory" text now names the size, says it is system RAM, and names the flag). What
+   is left is the readiness gap: the socket accepts ~10 s before anything answers on it, which
+   makes a TCP health check report ready far too early.
 3. **The remaining section 4 boundary measurements**: q4 SwiGLU `Materialized`, and the two q4_q5
    schedules that win at no measured width.
 
@@ -495,11 +495,39 @@ Ordered by how much they could bite. The first is a possible correctness defect 
       Decide whether the default should scale with available host RAM, or at least fail with a
       message that says "host" and names the flag.
 
-- [ ] **`/v1/models` answers before startup has finished.** It returned 200 about 2 s in, while the
-      log shows 3.7 s to materialize weights and further time to pin host state and KV. A readiness
-      probe that passes early will have orchestrators routing traffic at a server that is still
-      loading — and it masked the MTP failure above until the process exit was checked directly.
-      Either gate the endpoint on startup completion or add a separate readiness endpoint.
+- [ ] **The listening socket accepts ~10 s before anything answers on it.**
+
+      **This entry previously said "`/v1/models` answers before startup has finished". That was
+      wrong** — it came from an arithmetic bug in the smoke script's own elapsed-time print, not
+      from the server. Measured properly (poll TCP connect and HTTP GET separately from process
+      start, 100 ms apart, against the 27B):
+
+      | | |
+      |---|---|
+      | first TCP connect accepted | **0.27 s** |
+      | first HTTP 200 from `/v1/models` | **9.5 s** |
+      | what happens in between | the request **times out** — not connection-refused |
+
+      Server log for the same run: weights ready +4.9 s, host state pinned +6.8 s, CUDA graphs
+      +10.3 s, `listening on ...` +10.6 s. So the HTTP layer is correct — it answers only once
+      warmup is done. The problem is the other end: `apps/serve/main.cpp` calls `server.bind()` at
+      line 58, *before* constructing the engine at line 63, and `server.listen()` only at line 90.
+
+      Binding early is deliberate and worth keeping: it fails fast on a port clash instead of after
+      ten seconds of weight loading. The cost is a ten-second window where the port is open and the
+      kernel accepts connections into the backlog while nothing services them, so:
+      - a **TCP-based readiness probe** (Kubernetes `tcpSocket`, most load-balancer health checks)
+        reports the server ready ~10 s early and routes traffic into a socket that will not answer;
+      - an **HTTP probe** burns its full timeout on every attempt instead of failing fast.
+
+      The fix that keeps both properties is to serve during startup rather than not serve: bring the
+      HTTP layer up right after `bind()` with a handler that returns `503` plus a
+      `Retry-After`, and swap in the real service once warmup completes. That is a real change to
+      the startup sequence (a listener thread running before the engine exists, then a handoff), so
+      it wants its own change rather than being folded into a diagnostics fix.
+
+      Until then the honest guidance is: **health-check with an HTTP GET, not a TCP connect**, and
+      allow ~15 s of startup on the 27B.
 
 - [ ] **`sparse_moe`'s gross bound is pure `gross_absolute`.** Its
       `gross_relative_to_max_reference` is `0.0`, so the section 5 BF16 floor does not reach it, and
