@@ -422,7 +422,8 @@ Ordered by how much they could bite. The first is a possible correctness defect 
       cause — the values are ~10x off.
 
       **Investigated 2026-09-08. Four hypotheses ruled out; it needs the full suite.** Do not repeat
-      these — 80+ targeted iterations, all clean:
+      these — 69 targeted iterations across five isolation experiments. Only the full-suite row
+      reproduced it (2 of 6); every isolated variant, 63 iterations in all, stayed clean:
 
       | experiment | iterations | reproduced |
       |---|---|---|
