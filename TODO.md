@@ -250,9 +250,19 @@ about it fails on a different one.
       `kBf16GrossRelativeFloor` names it once with the derivation. `relative_l2` untouched
       everywhere — it is what constrains kernel accuracy.
 
-      Two criteria deliberately left out, both now in section 8: `sparse_moe` (bound is pure
-      `gross_absolute`, so the floor does not reach it) and `gated_delta_net`'s FP32 state
-      criterion (dtype rounding is not its floor).
+      **Two criteria deliberately left out**, because the BF16 floor argument does not reach
+      either. Both still want doing, so they stay open here rather than being pointed at a section
+      this branch does not carry:
+
+      - [ ] **`sparse_moe` sits at 0.92 of its limit** with `gross_relative_to_max_reference = 0.0`,
+            so its bound is pure `gross_absolute` and the floor cannot apply. It also carries the
+            largest observed BF16 error in the tree — **3.64 rounding steps**, against 0.09–1.53
+            everywhere else. Both facts want explaining before the bound is touched: either that
+            kernel is genuinely less accurate than every other BF16 Op, or its criterion measures
+            something different.
+      - [ ] **`gated_delta_net`'s state criterion sits at 0.87** and compares an **FP32** output, so
+            dtype rounding is not its floor; the error arrives from BF16 inputs propagating. Needs
+            its own derivation rather than the BF16 one.
 
       **The earlier 4.5e-3 step for linear_pair is superseded.** It derived the ULP argument
       correctly but stopped *inside* a single rounding step, and that criterion's worst case is
