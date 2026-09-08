@@ -47,7 +47,7 @@ NINFER_REAL_TEST_MAX_CONTEXT=8192      # only needed for the 35B
 **Free VRAM decides whether these pass or skip**, not correctness — see §1.2. Close GPU clients
 first and check `nvidia-smi`.
 
-### Open pull requests
+### Recently landed, and what is still owed on it
 
 - **#32 — `docs/config-calculator.html` — merged, but not finished.** Three of the six confirmed
   defects were fixed before it landed and **two were not**; the file itself says so, carrying a
@@ -56,8 +56,6 @@ first and check `nvidia-smi`.
   speculative configuration by roughly 170 MiB.** Closing that is the top non-correctness item in
   §0, and the multiplier it needs is already measured in §2b. Until then, treat its speculative
   rows as optimistic.
-- **#34 — shell-script line endings.** Small and self-contained. Two launchers did not parse on
-  Linux at all; see the note below. Merge this one first, it touches nothing else.
 - A worktree at `.claude/worktrees/eager-baking-cascade` exists and has been used by a second agent
   working the same branches. **Check `git worktree list` before assuming a branch is free**, and
   `git fetch` before pushing: concurrent work on `fix/artifact-download-revisions` was duplicated
@@ -99,14 +97,17 @@ question, and which one produced a wrong answer and why.
 1. **The `T=112` graph-replay failure** (§1.1). The only open item that could be a correctness
    defect in *released* code. Four hypotheses are already ruled out — read that entry first, it
    will save a day.
-2. **The calculator's speculative-memory gap** (§2b). Now shipped on master and linked from
+2. **DFlash2 currently costs 20% on the 27B** (§2c). A shipped v0.9.0 feature that is a net loss
+   on text, and the cheapest possible first test -- sweep `--draft-tokens` below 7 -- has never
+   been run.
+3. **The calculator's speculative-memory gap** (§2b). Now shipped on master and linked from
    README, so it is live: every speculative configuration it reports is roughly 170 MiB optimistic.
    The multiplier that fixes it is already measured — implementing, not investigating.
-3. **Re-run the six real-model tests** (§1.2, §2). Their artifact blockers are gone as of #31 and
+4. **Re-run the six real-model tests** (§1.2, §2). Their artifact blockers are gone as of #31 and
    nobody has looked since; at least one is expected to fail rather than skip.
-4. **The two test-criterion outliers** (§4). Small, the last loose ends from the §5 audit, and
+5. **The two test-criterion outliers** (§4). Small, the last loose ends from the §5 audit, and
    neither needs hardware this box lacks.
-5. **The real-model maximum-configuration decision** (§1.2). A judgement call more than a task.
+6. **The real-model maximum-configuration decision** (§1.2). A judgement call more than a task.
 
 Only one open item now needs hardware this box lacks (§2). The rest is measurement debt (§3),
 calibration (§4) or policy calls (§6).
@@ -352,6 +353,114 @@ has to re-derive it.
       "is not" admitted on SM86, and `docs/cli.md` and `docs/serving.md` were not touched. All six
       formats are measured and working; the Blackwell restriction applies to FP8/NVFP4 *weights and
       activations*, not KV storage. Fix them together so the claim is consistent everywhere.
+
+---
+
+## 2c. Performance left on the table
+
+Nothing here was in this file before 2026-09-08, which is itself the point: the KV sweeps were run
+to document formats, and these fell out of the data on the way. Ordered by size of the prize.
+
+- [ ] **DFlash2 makes the 27B *slower*, and no document says so.** Measured on one artifact
+      (`qwen3_8_27b_dflash2.ninfer`), 8,192-token context, INT8 KV, tg128, three repetitions:
+
+      | config | tok/s | vs no speculation |
+      |---|---:|---:|
+      | none | 35.44 ± 1.42 | — |
+      | `--spec dflash2 --draft-tokens 7` | 27.57 ± 0.06 | **−22.2%** |
+      | ...` --lm-head-draft` | 28.33 ± 0.02 | **−20.1%** |
+      | `--spec mtp --draft-tokens 3` | 41.28 ± 0.10 | +16.5% |
+      | ...` --lm-head-draft` | 43.99 ± 0.10 | +24.1% |
+
+      The deviations rule out noise. `docs/performance.md` already records the *acceptance* —
+      20.0% on text, 2.38 tok/round — but never states the throughput consequence, so a reader
+      reasonably assumes a headline v0.9.0 feature is a win. On text it is a 20% penalty, and it is
+      36% behind MTP3 with the draft head on the same file.
+
+      The arithmetic explains it and points at the fix. Seven drafts at 20% acceptance yields ~2.38
+      tokens per round, but each round verifies eight columns instead of one. **Nobody has tried
+      any other draft count** — the sweep used 7 throughout, because `docs/cli.md` calls seven "the
+      checkpoint recommendation". Sweeping `--draft-tokens 1..7` is cheap and is the first thing to
+      do; there may simply be a crossover below 7 where DFlash2 turns positive on text.
+
+      Note the same document records **vision** DFlash2 at 85.7% acceptance and 7.00 tok/round,
+      which is close to ideal. So the backend is not broken — text drafting specifically is. If no
+      draft count makes text positive, say so in the docs and scope the feature to vision rather
+      than leaving it as an apparently-free option.
+
+- [ ] **The three KV formats with the worst decode falloff are exactly the three that are not
+      run-to-run deterministic.** Falloff from a 4,096- to a 32,768-token cache, no speculation:
+
+      | format | 27B | 35B | deterministic (§5) |
+      |---|---:|---:|---|
+      | `int8` | −6.3% | −10.9% | yes |
+      | `rk8v4` | −6.2% | −9.5% | yes |
+      | `bf16` | −11.5% | −14.9% | mostly |
+      | `fp8` | −14.6% | −21.0% | **no** |
+      | `nvfp4` | −15.7% | −21.1% | **no** |
+      | `k8v4` | −17.9% | −25.2% | **no** |
+
+      `rk8v4` is the control that kills the obvious explanation: it packs 4-bit values exactly as
+      `k8v4` does, and it has the flattest curve of all six. So this is not the cost of unpacking.
+      **If `nvfp4` decoded on `rk8v4`'s curve it would be the outright best format** — 45% smaller
+      than INT8 with no speed penalty — rather than the compromise it currently is.
+
+      Read the code rather than inferring from the table, and two things came back. One is a
+      likely cause; the other kills the tidy theory that produced this entry.
+
+      **Cause, and a one-line experiment.** fp8, k8v4 and nvfp4 are the only formats calling
+      `causal_small_t_quantized_active_splits` (`small_t.cuh:122-130`), which at decode past 8,198
+      keys asks for `SmallTMaximumSplits` (85). But the *host* capacity function
+      (`small_t.cu:49-53`) grants that bump to `Fp8E4M3Row256` **only**, and the device then clamps
+      to whatever the host allocated (`small_t.cuh:129`). At a 32,768-token decode the default tier
+      is `div_up(32768, 480) = 69`, so:
+
+      | format | device policy asks | host grants | actually runs |
+      |---|---:|---:|---:|
+      | `fp8` | 85 | 85 | 85 |
+      | `nvfp4` | 85 | 69 | **69** |
+      | `k8v4` | 85 | 69 | **69** |
+
+      nvfp4 and k8v4 run 19% fewer splits than the code intends, at exactly the depths where they
+      measure worst, and nothing reports the discrepancy. Extending the condition at
+      `small_t.cu:50` to `Nvfp4Group16` and `Fp8KeyNvfp4Value` and re-running
+      `scripts/sweeps/kv-decode-vs-depth.ps1` is a cheap test of how much of the falloff that is.
+      Note it cannot be the whole story: fp8 *does* get 85 splits and still falls off 21% on the
+      35B, so it is paying something else — plausibly `KeyBlock` pinned to 32 rather than the int8
+      path's 64, forced by sm_86's shared-memory budget because the fp8 kernel keeps dequantized
+      BF16 copies of K *and* V (`small_t_fp8.cu:26-29`).
+
+      **What this entry originally claimed, wrongly.** It read the §5 non-determinism and this
+      falloff as one root cause — "a split reduction whose order varies, or an atomic
+      accumulation". There are **no atomics anywhere** in `src/ops/softmax_attention/`, and both
+      reducers accumulate over an identical ordered `for (split = 0; split < active_splits; ++split)`
+      loop, which is deterministic given the same split count. So the correlation across six
+      formats is real and still wants explaining, but the mechanism proposed for it is not the one.
+      Treat §5 as open on its own terms.
+
+      One thing found on the way that is worth its own look: the fp8 partial kernel returns early
+      for `split >= active_split_count` **without writing neutral values**
+      (`small_t_fp8.cuh:148`), so untouched splits keep whatever the workspace arena last held.
+      That is safe only while the partial kernel and the reducer compute the same
+      `active_split_count`. They do today — both clamp to the same launch capacity — but it is an
+      invariant held by coincidence of two separate call sites rather than by construction, and the
+      host/device asymmetry above shows those sites already disagree about intent.
+
+- [ ] **The sm_86 fallback constants were chosen to fit, not measured.** `NINFER_SM8X_COMPAT`
+      guards eleven sites, and most encode a real hardware limit rather than a missing feature —
+      sm_86's 49,152-byte static shared-memory cap forces `KWarps` from 8 to 4 in
+      `w8_config.h:59`, halves the K tile in `w8_linear_swiglu_gemm_mma.cu:120`, drops
+      `kLastExactCols` from 48 to 32 in `w8_linear_add_gemm_splitk.cu:19`, and so on. The comments
+      are honest that these are what fits. None of them record a measurement showing the chosen
+      value is the *best* one that fits, and the alternatives were never swept on this hardware.
+      Lower confidence than the two above, but it is untouched ground across every W8 Op.
+
+- [ ] **`w8_pair` medium discards its schedule entirely on sm_86.**
+      `w8_pair_gemm_splitk.cu:133` is `(void)schedule` under `NINFER_SM8X_COMPAT`, so every
+      schedule runs the same chunked loop. PR #22 already removed the twelve now-identical route
+      entries this made redundant, confirmed by identical 24.576 µs timings, so the *table* is
+      honest. What is unknown is whether a genuinely sm_86-specific tiling would beat the generic
+      chunking — nobody has written one to find out.
 
 ---
 
