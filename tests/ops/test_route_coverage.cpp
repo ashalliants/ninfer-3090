@@ -9,8 +9,10 @@
 //
 // So this test does not fail on unrouted schedules. Keeping an upstream schedule that wins nowhere
 // here is a deliberate and correct choice -- deleting it costs merge effort for no measured gain.
-// What is not acceptable is not knowing. This prints the set, and fails only if it *changes*, so
-// the set stays deliberate rather than accumulating by accident.
+// What is not acceptable is not knowing. This prints the set and pins it two ways: the aggregate
+// count below, and each Op's exact schedule names against `survey`'s `expected_unrouted` argument.
+// The count alone would pass unchanged if a route edit stranded one schedule while un-stranding
+// another -- the per-Op name set is what catches that the identity, not just the size, moved.
 //
 // It also catches the k=2048 case from a different angle: an Op can route to twelve distinct
 // schedule ids that are one kernel on this hardware. That does not show up here -- all twelve are
@@ -25,7 +27,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <exception>
 #include <functional>
 #include <iostream>
 #include <limits>
@@ -68,32 +69,48 @@ struct OpReport {
     std::string op;
     std::size_t declared = 0;
     std::vector<std::string> unrouted;
+    std::vector<std::string> expected_unrouted;
+    bool identity_ok = true;
 };
 
 // One Op, all of its shapes. Surveying per shape would be misleading: the w8_pair k=5120 table
 // selects three schedules, so 42 of its 45 ids look "unrouted" there while most are live at
 // k=2048. What matters is whether an id is reachable from *any* registered shape of the Op.
+//
+// `expected_unrouted` is the exact baseline for this Op, compared as a set so reordering the enum
+// does not itself fail the test. Update it, in the same commit as the route table that moved,
+// naming which schedules changed state -- that is the identity check `kExpectedUnrouted` alone
+// cannot make: a route edit that strands one schedule while un-stranding another leaves the total
+// unchanged, and only comparing the sets themselves catches that the membership moved.
 template <typename Id, typename NameFn, typename ResolveFn>
 OpReport survey(const std::string& op, NameFn name, std::string_view unknown,
                 const std::vector<std::string>& shape_names,
-                const std::vector<ResolveFn>& resolvers) {
+                const std::vector<ResolveFn>& resolvers,
+                std::vector<std::string> expected_unrouted) {
     const std::vector<Id> declared = declared_schedules<Id>(name, unknown);
     std::set<int> routed;
     for (const auto& resolve : resolvers) {
+        // Every route table this survey uses is compile-time verified contiguous and closed from
+        // column 1 through the unbounded tail (each Op's own `catalog_is_closed`/
+        // `routes_are_closed` static_assert), and every shape here is one `*_admits` already
+        // accepts. So no probed width can fail to resolve -- a throw here is not "this shape
+        // doesn't admit this width", it is one of those guarantees breaking, which must fail the
+        // test loudly rather than get folded into "unrouted" by a catch that assumed a gap that
+        // cannot exist.
         for (const std::int32_t cols : probe_widths()) {
-            try {
-                routed.insert(static_cast<int>(resolve(cols)));
-            } catch (const std::exception&) {
-                // A width this shape does not admit. Not every table is defined over every column
-                // count, and a throw says so rather than hiding a schedule.
-            }
+            routed.insert(static_cast<int>(resolve(cols)));
         }
     }
 
-    OpReport report{op, declared.size(), {}};
+    OpReport report{op, declared.size(), {}, std::move(expected_unrouted), true};
     for (const Id id : declared) {
         if (routed.count(static_cast<int>(id)) == 0) { report.unrouted.emplace_back(name(id)); }
     }
+    std::vector<std::string> actual_sorted = report.unrouted;
+    std::vector<std::string> expected_sorted = report.expected_unrouted;
+    std::sort(actual_sorted.begin(), actual_sorted.end());
+    std::sort(expected_sorted.begin(), expected_sorted.end());
+    report.identity_ok = actual_sorted == expected_sorted;
     (void)shape_names;
     return report;
 }
@@ -113,7 +130,17 @@ int main() {
          }),
          PairFn([](std::int32_t cols) {
              return detail::w8_pair_resolve_plan({1024, 2048, 2048, cols}).schedule;
-         })}));
+         })},
+        {"w8_pair.dual_decode.k2048.r8", "w8_pair.dual_decode.k2048.r16",
+         "w8_pair.splitk4.mma.r16.c80", "w8_pair.splitk4.mma.r16.c88",
+         "w8_pair.splitk4.mma.r16.c96", "w8_pair.splitk4.mma.r16.c104",
+         "w8_pair.splitk4.mma.r16.c112", "w8_pair.splitk2.mma.r16.c128",
+         "w8_pair.splitk2.mma.r16.c160", "w8_pair.splitk2.mma.r16.c192",
+         "w8_pair.splitk2.mma.r16.c224", "w8_pair.splitk2.mma.r16.c256",
+         "w8_pair.concat_mma.r32.c80", "w8_pair.concat_mma.r32.c112",
+         "w8_pair.concat_mma.r48.c64", "w8_pair.concat_mma.r64.c64",
+         "w8_pair.concat_mma.r64.c80", "w8_pair.concat_mma.r96.c80",
+         "w8_pair.concat_mma.r96.c112"}));
 
     using AttnFn = std::function<detail::W8AttnInputScheduleId(std::int32_t)>;
     reports.push_back(
@@ -137,7 +164,9 @@ int main() {
                             return detail::w8_attn_input_resolve_plan(
                                        {5120, 4096, 1024, 6144, 5120, cols})
                                 .schedule;
-                        })}));
+                        })},
+                       {"attn_input_proj.w8.simt.r8.c4",
+                        "attn_input_proj.w8.dflash2.mma.r16.c64.k128"}));
 
     using SwigluFn = std::function<detail::W8LinearSwiGluScheduleId(std::int32_t)>;
     reports.push_back(
@@ -153,7 +182,8 @@ int main() {
                               return detail::w8_linear_swiglu_resolve_plan(
                                          {34816, 17408, 5120, 5120, cols})
                                   .schedule;
-                          })}));
+                          })},
+                         {"linear_swiglu.w8.dflash2.mma.r32.c64.k128"}));
 
     using AddFn = std::function<detail::Q5LinearAddScheduleId(std::int32_t)>;
     reports.push_back(
@@ -165,7 +195,8 @@ int main() {
              }),
              AddFn([](std::int32_t cols) {
                  return detail::q5_linear_add_resolve_plan({5120, 17408, 17408, cols}).schedule;
-             })}));
+             })},
+            {"linear_add.q5.mma.r64.c32.cta_collective_residual"}));
 
     using Q4Q5Fn = std::function<detail::Q4Q5AttnInputScheduleId(std::int32_t)>;
     reports.push_back(
@@ -176,14 +207,33 @@ int main() {
                            return detail::q4_q5_attn_input_resolve_plan({5120, 6144, 1024, 5120,
                                                                          cols})
                                .schedule;
-                       })}));
+                       })},
+                       {"attn_input_proj.q4_q5.grouped_homogeneous_pair.mma.r32.c64.s4",
+                        "attn_input_proj.q4_q5.pair.r32.c64.s3",
+                        "attn_input_proj.q4_q5.pair.r32.c64.s4"}));
 
     std::size_t total = 0;
+    bool identity_changed = false;
     for (const OpReport& report : reports) {
         std::cout << report.op << ": " << report.unrouted.size() << " of " << report.declared
                   << " unrouted\n";
         for (const std::string& name : report.unrouted) { std::cout << "    " << name << '\n'; }
+        if (!report.identity_ok) {
+            identity_changed = true;
+            std::cerr << report.op << ": unrouted schedule set changed.\n  expected:";
+            for (const std::string& name : report.expected_unrouted) { std::cerr << ' ' << name; }
+            std::cerr << "\n  actual:  ";
+            for (const std::string& name : report.unrouted) { std::cerr << ' ' << name; }
+            std::cerr << '\n';
+        }
         total += report.unrouted.size();
+    }
+    if (identity_changed) {
+        std::cerr << "route coverage identity changed -- see the per-Op diff above. Update the "
+                     "expected_unrouted list in this file for the Op that moved, in the same "
+                     "commit as the route table that moved, and say which schedules changed "
+                     "state; the aggregate count can stay the same while the membership moves.\n";
+        return 1;
     }
 
     // The pin. Change it deliberately, in the same commit as the route table that moved, and say
