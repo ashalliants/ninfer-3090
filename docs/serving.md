@@ -111,6 +111,28 @@ to 64 further workers for connections that are merely open; the extra workers re
 Without that headroom a client-side connection pool of otherwise idle sockets occupies every worker
 and the server accepts real requests strictly one at a time.
 
+### Startup readiness
+
+The server binds its port and starts accepting connections before the Engine has loaded weights
+and finished warmup, so a port clash is reported in milliseconds rather than after loading. Every
+route -- including `/health`, `OPTIONS`, and requests that would otherwise be unauthenticated --
+answers `503` with `Retry-After: 2` until warmup completes, in the target's own error shape:
+
+```json
+{"error":{"message":"The model is still loading. Retry shortly.","type":"service_unavailable","code":"model_loading"}}
+```
+
+`POST /v1/messages` and `/v1/messages/count_tokens` receive the Anthropic envelope instead, with a
+`request_id` field and a `request-id` header, matching every other error response on those
+endpoints:
+
+```json
+{"type":"error","error":{"type":"api_error","message":"The model is still loading. Retry shortly."},"request_id":"req_..."}
+```
+
+A readiness probe should poll `GET /health` (or any endpoint) and expect `503` until the model is
+ready rather than treating an accepted TCP connection as a signal of readiness.
+
 ## OpenAI Chat Completions
 
 ```bash

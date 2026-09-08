@@ -359,6 +359,25 @@ void HttpServer::register_routes() {
 
     server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
         ensure_openai_request_id(req, res);
+        if (!ready_.load(std::memory_order_acquire)) {
+            // Runs for every route, including /health and OPTIONS, so a caller cannot tell "not
+            // ready" apart from "unauthenticated" -- and skips the API-key check below, since a
+            // loading-status response carries nothing worth protecting.
+            ApiError error;
+            error.status  = 503;
+            error.type    = "service_unavailable";
+            error.code    = "model_loading";
+            error.message = "The model is still loading. Retry shortly.";
+            // Weight load plus warmup measured ~10s on the 27B and longer on the 35B. Two seconds
+            // is a polite poll interval rather than a promise about when readiness arrives.
+            res.set_header("Retry-After", "2");
+            if (req.path.rfind("/v1/messages", 0) == 0) {
+                write_anthropic_error(res, error, new_anthropic_request_id());
+            } else {
+                write_openai_error(res, error);
+            }
+            return httplib::Server::HandlerResponse::Handled;
+        }
         if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
             return httplib::Server::HandlerResponse::Unhandled;
         }
@@ -506,6 +525,35 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
 
 bool HttpServer::bind() { return server_.bind_to_port(options_.host, options_.port); }
 
+void HttpServer::start_serving_during_startup() {
+    if (startup_listener_.joinable()) {
+        throw std::logic_error("HTTP startup listener is already running");
+    }
+
+    // The readiness gate lives in register_routes()'s single pre-routing handler, ahead of the
+    // API-key check -- not here, so starting this listener never replaces (and thereby drops) the
+    // auth/request-ID middleware for the remainder of the process's life.
+    startup_listener_ = std::thread([this] {
+        // listen_after_bind() blocks here for the whole life of the server, spanning the switch
+        // from 503 to serving. stop() is what ends it. It can also throw before ever reaching
+        // that loop -- the task queue's thread pool spawns its worker threads here, and
+        // std::thread's constructor throws std::system_error under resource exhaustion. An
+        // exception escaping a thread function is std::terminate, so it is caught and folded into
+        // the same false result a synchronous listen() failure already produces.
+        bool result = false;
+        try {
+            result = server_.listen_after_bind();
+        } catch (const std::exception&) {
+        }
+        startup_listener_result_.store(result, std::memory_order_release);
+    });
+}
+
+bool HttpServer::await_startup_listener() {
+    if (startup_listener_.joinable()) { startup_listener_.join(); }
+    return startup_listener_result_.load(std::memory_order_acquire);
+}
+
 void HttpServer::attach(GenerationService& service) {
     if (service_ != nullptr) {
         throw std::logic_error("HTTP generation service is already attached");
@@ -516,6 +564,9 @@ void HttpServer::attach(GenerationService& service) {
     request_jsonl_.write_server_start(options_, service.engine_options(),
                                       service.sampling_defaults(), public_model_id_, load,
                                       service.memory_summary());
+    // Release: everything above must be visible to a handler that observes ready_ as true. This is
+    // the only write, and handlers acquire it in the pre-routing guard before touching service_.
+    ready_.store(true, std::memory_order_release);
 }
 
 bool HttpServer::listen() {
@@ -523,20 +574,41 @@ bool HttpServer::listen() {
     if (public_model_id_.empty()) {
         throw std::logic_error("HTTP public model id is not resolved");
     }
-    if (options_.log_stats_interval_ms != 0) {
-        stats_stopping_ = false;
-        stats_thread_   = std::thread([this] { run_stats_reporter(); });
-    }
     try {
-        const bool result = server_.listen_after_bind();
+        if (options_.log_stats_interval_ms != 0) {
+            stats_stopping_ = false;
+            stats_thread_   = std::thread([this] { run_stats_reporter(); });
+        }
+        // When the startup listener is running, the accept loop is already live on its thread and
+        // has been since bind(); calling listen_after_bind() again would try to accept on the same
+        // socket from two threads. Wait for that loop instead.
+        const bool result =
+            startup_listener_.joinable() ? await_startup_listener() : server_.listen_after_bind();
         stop_stats_reporter();
         return result;
     } catch (...) {
         stop_stats_reporter();
+        // Stop and join the startup listener before this exception unwinds past us. attach() has
+        // already run by the time listen() can be called, so that thread is live against
+        // service_; the caller (main.cpp) destroys the attached GenerationService, constructed
+        // after this HttpServer, before this object -- leaving that thread dereferencing a
+        // dangling pointer for however long stack unwinding takes if it is still running then.
+        if (startup_listener_.joinable()) {
+            server_.stop();
+            startup_listener_.join();
+        }
         throw;
     }
 }
 
 void HttpServer::stop() { server_.stop(); }
+
+HttpServer::~HttpServer() {
+    if (startup_listener_.joinable()) {
+        server_.stop();
+        startup_listener_.join();
+    }
+    stop_stats_reporter();
+}
 
 } // namespace ninfer::serve

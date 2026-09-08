@@ -37,6 +37,14 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 class HttpServer {
 public:
     HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger);
+    // Stops and joins the startup listener if it is still running. Without this, a failure between
+    // start_serving_during_startup() and listen() -- the Engine throwing while loading weights, the
+    // most likely failure there is -- would destroy a joinable std::thread and call std::terminate,
+    // turning a clean diagnosable error into an abort.
+    ~HttpServer();
+
+    HttpServer(const HttpServer&)            = delete;
+    HttpServer& operator=(const HttpServer&) = delete;
 
     // Reserves the configured address before model loading. The service is attached only after its
     // Engine is ready, then listen() enters the blocking accept loop on the already-bound socket.
@@ -44,6 +52,25 @@ public:
     void attach(GenerationService& service);
     bool listen();
     void stop();
+
+    // Serve 503 while the Engine is still loading.
+    //
+    // bind() deliberately runs before the Engine is constructed, so a port clash fails in
+    // milliseconds instead of after ten seconds of weight loading. The cost used to be a window --
+    // measured at 0.27s to 9.5s on the 27B -- where the kernel accepted connections into the
+    // backlog and nothing ever answered them: a TCP readiness probe called that "ready", and an
+    // HTTP probe burned its whole timeout instead of failing fast.
+    //
+    // Calling this immediately after bind() starts the accept loop on a background thread with
+    // every route answering 503 plus Retry-After. attach() then publishes the service and the same
+    // loop begins serving normally, with no second bind and no handoff of the listening socket.
+    void start_serving_during_startup();
+    [[nodiscard]] bool serving_during_startup() const noexcept {
+        return startup_listener_.joinable();
+    }
+    // Blocks until the background accept loop returns, which happens when stop() is called.
+    // Mirrors listen()'s return: true when the loop exited cleanly.
+    bool await_startup_listener();
 
     [[nodiscard]] const std::string& public_model_id() const noexcept { return public_model_id_; }
 
@@ -97,7 +124,13 @@ private:
     void run_stats_reporter();
     void stop_stats_reporter();
 
+    // Written once by attach() on the main thread and read by request handlers on httplib's worker
+    // threads, so the publication has to be ordered. Handlers only ever test readiness through
+    // ready_; service_ itself is not read until ready_ has been observed true.
     GenerationService* service_ = nullptr;
+    std::atomic<bool> ready_{false};
+    std::thread startup_listener_;
+    std::atomic<bool> startup_listener_result_{false};
     ServeOptions options_;
     std::string public_model_id_;
     OpenAIResponsesStore openai_responses_store_;

@@ -60,6 +60,11 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        // Answer 503 from here on rather than leaving the accepted connection silent. The socket
+        // has been listenable since bind() either way; the difference is whether a caller arriving
+        // during the ten seconds of weight loading gets a documented "still loading" or a hang.
+        server.start_serving_during_startup();
+
         ninfer::serve::GenerationService service(options, startup_log.observer());
         startup_log.engine_ready(service.load_summary());
         operational_log.engine_capacity(service);
