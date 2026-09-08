@@ -43,6 +43,22 @@ std::size_t q4_linear_swiglu_capacity_workspace_bytes(std::int32_t gate_up_rows,
 
 void q4_linear_swiglu_execute_plan(const Q4LinearSwiGluPlan& plan, const Tensor& x, const Weight& w,
                                    Tensor& out, WorkspaceArena& ws, cudaStream_t stream);
+
+// Runs a schedule without first checking that it is the one resolve_plan would pick;
+// q4_linear_swiglu_execute_plan is exactly this plus that check.
+//
+// It exists so a bench can time every candidate schedule at the same column count, which is the
+// only way to tell whether a route boundary sits in the right place. Materialized in particular
+// cannot be timed any other way: it is not a kernel but a composite -- linear() into a workspace,
+// then silu_mul() over the two halves -- so a bench that called the pieces itself would be timing a
+// replica of the dispatch rather than the dispatch. Mirrors w8_pair_execute_schedule, which exists
+// for the same reason.
+//
+// Nothing on the inference path should call this: the check execute_plan adds is what keeps a plan
+// from being executed against a problem it was not resolved for.
+void q4_linear_swiglu_execute_schedule(Q4LinearSwiGluScheduleId schedule, const Tensor& x,
+                                       const Weight& w, Tensor& out, WorkspaceArena& ws,
+                                       cudaStream_t stream);
 void q4_linear_swiglu_dispatch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
                                cudaStream_t stream);
 
