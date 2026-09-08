@@ -125,6 +125,24 @@ Idle (~21.9 GiB free): it passes. The 35B's runtime reservation scales with the 
 262,144 → 4.15 GB, 32,768 → 1.48 GB, 16,384 → 1.29 GB, 8,192 → fits — against ~1.02 GiB available
 once the 20.8 GiB of weights are resident.
 
+### 1.3 `docs/config-calculator.html` undercounts startup memory for speculative configurations
+
+- [ ] Its "Startup memory" total only adds the extra resident weights measured for each
+      speculation option; it reuses the no-speculation CUDA graph allowance
+      (`DATA.graphBytes`, 12 MiB) for every mode and adds no extra KV pages for either backend.
+      The real engine (`src/targets/qwen3_6/impl/runtime/layouts_impl.h`) sizes the graph
+      allowance per speculative backend and draft window — up to ~86 MiB/lane for MTP, ~96
+      MiB/lane for DFlash under `NINFER_SM8X_COMPAT`, against the calculator's flat 12 MiB — and
+      `persistent_layout`'s `mtp_extra_pages` reserves additional paged-KV pages for MTP's
+      buffered draft tokens that the calculator never adds either. Closing this properly needs
+      either a full port of `mtp_graph_profiles`/`dflash_graph_profiles`/
+      `graph_topology_allowance` into the page's JS (nontrivial, capacity- and
+      draft-window-dependent piecewise logic) or fresh `ninfer_bench` measurements of the actual
+      per-mode graph allowance and extra KV pages — both out of scope for a docs PR. Descoped with
+      a prominent in-page caveat (the "What this does not model" section and the speculation
+      hint) rather than patched inline; the no-speculation case is unaffected and is the one this
+      page's own engine cross-check validates.
+
 ---
 
 ## 2. Genuinely blocked, and what by
