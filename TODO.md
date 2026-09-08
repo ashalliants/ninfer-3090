@@ -97,17 +97,20 @@ question, and which one produced a wrong answer and why.
 1. **The `T=112` graph-replay failure** (§1.1). The only open item that could be a correctness
    defect in *released* code. Four hypotheses are already ruled out — read that entry first, it
    will save a day.
-2. **DFlash2 currently costs 20% on the 27B** (§2c). A shipped v0.9.0 feature that is a net loss
+2. **Decode runs at 66% of the card's memory bandwidth** (§2c). The largest single number in this
+   file, it applies to every configuration rather than one feature, and no performance work here
+   has ever been measured against an absolute ceiling. Profile one decode step first.
+3. **DFlash2 currently costs 20% on the 27B** (§2c). A shipped v0.9.0 feature that is a net loss
    on text, and the cheapest possible first test -- sweep `--draft-tokens` below 7 -- has never
    been run.
-3. **The calculator's speculative-memory gap** (§2b). Now shipped on master and linked from
+4. **The calculator's speculative-memory gap** (§2b). Now shipped on master and linked from
    README, so it is live: every speculative configuration it reports is roughly 170 MiB optimistic.
    The multiplier that fixes it is already measured — implementing, not investigating.
-4. **Re-run the six real-model tests** (§1.2, §2). Their artifact blockers are gone as of #31 and
+5. **Re-run the six real-model tests** (§1.2, §2). Their artifact blockers are gone as of #31 and
    nobody has looked since; at least one is expected to fail rather than skip.
-5. **The two test-criterion outliers** (§4). Small, the last loose ends from the §5 audit, and
+6. **The two test-criterion outliers** (§4). Small, the last loose ends from the §5 audit, and
    neither needs hardware this box lacks.
-6. **The real-model maximum-configuration decision** (§1.2). A judgement call more than a task.
+7. **The real-model maximum-configuration decision** (§1.2). A judgement call more than a task.
 
 Only one open item now needs hardware this box lacks (§2). The rest is measurement debt (§3),
 calibration (§4) or policy calls (§6).
@@ -360,6 +363,68 @@ has to re-derive it.
 
 Nothing here was in this file before 2026-09-08, which is itself the point: the KV sweeps were run
 to document formats, and these fell out of the data on the way. Ordered by size of the prize.
+
+**Read the first entry before any of the others.** The rest of this section is specific kernels and
+features. The first one says the whole decode path has room in it, and no work here has ever been
+framed against a roofline — every performance change in this repository so far has been *relative*
+("this schedule beats that one"), never *absolute* ("this is N% of what the card can do"). That is
+the gap most likely to be hiding real speed.
+
+- [ ] **Dense decode runs at 65-66% of the card's memory bandwidth, and nobody has ever checked.**
+      Decode is memory-bound: each token streams the resident weights once plus the KV it attends
+      over. Against the 3090's 936.2 GB/s, from this cycle's own measurements (single lane, **no
+      speculation**, so tokens and weight-read rounds are the same thing):
+
+      | model | KV | depth | tok/s | achieved | % of peak |
+      |---|---|---:|---:|---:|---:|
+      | 27B dense | `int8` | 4,096 | 36.15 | 623 GB/s | **66.5%** |
+      | 27B dense | `int8` | 16,384 | 35.11 | 620 GB/s | **66.2%** |
+      | 27B dense | `int8` | 32,768 | 33.86 | 616 GB/s | **65.8%** |
+      | 27B dense | `rk8v4` | 32,768 | 33.54 | 602 GB/s | **64.3%** |
+
+      Flat across depth and across KV format, which says it is a property of the decode path rather
+      than of anything the KV work touched. A well-tuned memory-bound decode generally reaches
+      75-85% of peak. Closing even half that gap is roughly **36 → 41 tok/s on the 27B**, which is
+      larger than everything else in this section combined and applies to every configuration
+      rather than one feature.
+
+      This is a headline number, not a diagnosis: it says the room exists, not where it is. Next
+      step is a profile of one decode step (`--profile-measured` exists on `ninfer_bench`) to find
+      where the stall is — occupancy, L2 behaviour, or a launch gap between the per-layer kernels.
+
+- [ ] **Nobody knows where the MoE sits at all, because the accounting does not exist.** Applying
+      the same arithmetic to the 35B returns *391% of peak*, which is not a result, it is a proof
+      that the formula does not apply: an A3B MoE activates a fraction of its 21.04 GB per token,
+      so it never reads resident weights the way the dense model does. The bytes actually touched
+      per token — shared attention weights plus whichever experts route — have never been counted,
+      so there is no denominator, and therefore no way to say whether the 35B's 174 tok/s is close
+      to its ceiling or half of it. **Do that accounting before optimising anything on the MoE
+      path**; it is arithmetic over the artifact's layer inventory, not a measurement.
+
+- [ ] **Eight lanes buy 3.2x, not 8x, and the reason is unestablished.** README's own cohort table
+      has C1 decode at 78.71 tok/s against C8 at 250.26. Batched decode amortises the weight read
+      across the whole cohort — the same bytes serve every lane in a round — so a weight-bound
+      decode should scale much closer to linearly until compute takes over. Somewhere between one
+      lane and eight, something other than weight bandwidth becomes the limit, and no document says
+      what. Worth knowing: C8 is the profile the 27B release recommends for multi-user serving.
+
+      Careful with those particular numbers, though: they are end-to-end with MTP3 enabled, so
+      tokens per round is roughly `1 + 3 x acceptance` rather than 1, and dividing them into a
+      bandwidth figure gives nonsense (144% of peak at C1, doing it naively). The comparison needs
+      re-measuring without speculation before it can be reasoned about — `ninfer_bench` can do that
+      directly and the cohort table cannot.
+
+- [ ] **Prefill has no roofline either.** Measured this cycle at 1,254 tok/s on the 27B and 5,715
+      on the 35B at a 4,096-token prompt, falling to 1,087 and 4,302 by 32,768 — a 13% and 25%
+      decay that nothing explains or has looked at. Prefill is compute-bound rather than
+      bandwidth-bound, so the denominator is FLOPs and the accounting differs from decode; it has
+      not been done. Note the route tables *are* all measured (that work is finished), but measured
+      against each other, not against the hardware's ceiling.
+
+- [ ] **Vision has essentially one performance number in the entire repository.** One acceptance
+      figure for DFlash2 on the committed image fixture, and nothing about encode throughput,
+      how it scales with resolution, or what the overlay residency costs in time rather than in
+      bytes. It is an advertised feature of both models and it is unmeasured.
 
 - [ ] **DFlash2 makes the 27B *slower*, and no document says so.** Measured on one artifact
       (`qwen3_8_27b_dflash2.ninfer`), 8,192-token context, INT8 KV, tg128, three repetitions:
