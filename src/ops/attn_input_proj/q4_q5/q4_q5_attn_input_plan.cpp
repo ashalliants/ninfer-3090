@@ -40,8 +40,25 @@ struct RouteSpec {
 //   208           -   1340.4   1137.7    924.5     973.8     748.5
 //
 // parent_split_fixed is only defined for cols <= 12 (q4_q5_attn_input_small_t.cu) but already
-// loses to the 32-wide grouped tile at 9. grouped_r32_c64_s4 and pair_r32_c64_s3 never win at any
-// width measured; they stay in the enum because the schedule-name and execute switches list them.
+// loses to the 32-wide grouped tile at 9.
+//
+// grouped_r32_c64_s4 and pair_r32_c64_s3 win at no width, and that is now measured rather than
+// assumed. The table above covers 8..208; extending the sweep to 4096 settles the rest, us:
+//
+//     T           256    512   1024   2048   4096
+//     mixed_c128  854   1605   2900   6000  11296     <- wins at every width
+//     grouped_c64 1159  2149   4239   8449  16918     1.4-1.5x the winner
+//     pair_c64    1027  1908   3750   7400  14952     always just behind mixed_r32_c64_s3
+//
+// pair_r32_c64_s3 is the interesting one: it tracks mixed_r32_c64_s3 to within a couple of percent
+// at every width and is never ahead of it, so it is not a different trade-off, it is a slower
+// twin. PairR32C64S4 is not a third kernel at all -- it dispatches to the same launch as
+// grouped_r32_c64_s4 (see the execute switch), so those two share a measurement.
+//
+// All three stay in the enum. Deleting an upstream schedule costs merge effort at every future
+// catch-up for no measured gain here, and the reason to worry about dead schedules -- they are
+// where the two switch fallthroughs hid -- is now covered by tests/ops/test_route_coverage.cpp,
+// which enumerates the unrouted set and fails if its membership changes.
 constexpr std::array<RouteSpec, 6> kRoutes{{
     {{1, 8}, Q4Q5AttnInputScheduleId::ParentSplitFixed},
     {{9, 32}, Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR32C32S4},
