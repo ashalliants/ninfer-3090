@@ -50,20 +50,29 @@ constexpr std::array<W8PairRouteSpec, 3> kK5120Routes{{
     {449, kAnyCols, W8PairScheduleId::DualMmaR32C128},
 }};
 
-constexpr std::array<W8PairRouteSpec, 37> kK2048Routes{{
+constexpr std::array<W8PairRouteSpec, 29> kK2048Routes{{
     {1, 1, W8PairScheduleId::DualDecodeR4},
     {2, 32, W8PairScheduleId::DualSplitKMmaExactT},
     {33, 48, W8PairScheduleId::DualSplitKMediumC48},
     {49, 64, W8PairScheduleId::DualSplitKMediumC64},
-    {65, 80, W8PairScheduleId::DualSplitKMediumC80},
-    {81, 88, W8PairScheduleId::DualSplitKMediumC88},
-    {89, 96, W8PairScheduleId::DualSplitKMediumC96},
-    {97, 104, W8PairScheduleId::DualSplitKMediumC104},
-    {105, 112, W8PairScheduleId::DualSplitKMediumC112},
-    {113, 128, W8PairScheduleId::DualSplitKMediumC128},
-    {129, 160, W8PairScheduleId::DualSplitKMediumC160},
-    {161, 192, W8PairScheduleId::DualSplitKMediumC192},
-    {193, 384, W8PairScheduleId::ConcatMmaR32C64},
+    // Upstream splits 65..192 across eight DualSplitKMedium routes (C80, C88, C96, C104, C112,
+    // C128, C160, C192). On sm_86 those eight are the *same kernel*: under NINFER_SM8X_COMPAT
+    // w8_pair_splitk_medium_launch discards its schedule argument and loops
+    // w8_pair_splitk_exact_t over <=32-column chunks, so the medium family cannot tile wider than
+    // 32 here and its cost grows linearly with T while the concat kernels do not.
+    //
+    // Measured on this card (cold, median of 9, us), routed cost against ConcatMmaR32C64:
+    //
+    //     T      64     80     96    112    128    160    192
+    //     medium 36.9   44.0   47.1   58.4   61.4   75.8   91.1
+    //     concat 38.9   39.9   39.9   41.0   37.9   45.1   43.0
+    //     gain      -   9.3%  15.2%  29.8%  38.3%  40.5%  52.8%
+    //
+    // The crossover is sharp and sits at 65: medium still wins at 64 (36.9 vs 38.9) and loses from
+    // 66 on. ConcatMmaR32C64 already owned {193,384} and is within a step of the best schedule at
+    // every width in between, so the eight routes and the one below collapse into a single band
+    // rather than being retuned individually.
+    {65, 384, W8PairScheduleId::ConcatMmaR32C64},
     {385, 480, W8PairScheduleId::ConcatMmaR32C96},
     {481, 640, W8PairScheduleId::ConcatMmaR32C128},
     {641, 641, W8PairScheduleId::ExactConcatMmaR32C128},
