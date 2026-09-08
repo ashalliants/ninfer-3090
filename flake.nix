@@ -126,7 +126,11 @@
             return 0
           }
 
-          if [ -f "$model" ] && verify "$model"; then
+          # Only short-circuit when there is metadata to verify against: an unpinned entry
+          # (expected_size empty) has nothing for verify() to check, so it would return success
+          # for any existing regular file -- including an empty or corrupt one left over from an
+          # interrupted run -- and this path explicitly does not resume those (see above).
+          if [ -n "$expected_size" ] && [ -f "$model" ] && verify "$model"; then
             echo "Model already present: $model"
             exit 0
           fi
@@ -168,9 +172,12 @@
         description = "Qwen3.6-27B NInfer model";
       };
 
-      # Qwen3.6-35B-A3B, pinned to match scripts/download-qwen36-35b-a3b.sh. 560f227e is the
-      # measured 24 GB profile *and* carries the DFlash bundle; the older c8b8c1c0 pin predates
-      # DFlash, so an artifact fetched with it cannot run --spec dflash.
+      # Qwen3.6-35B-A3B, pinned to match scripts/download-qwen36-35b-a3b.sh. 560f227e carries the
+      # DFlash bundle; the older c8b8c1c0 pin predates DFlash, so an artifact fetched with it
+      # cannot run --spec dflash. Its extra 0.38 GiB on disk costs nothing in VRAM unless
+      # --spec dflash is actually selected (byte-identical 21,038,469,632-byte resident weights
+      # otherwise), so the published RTX 3090 concurrency measurements -- taken against
+      # c8b8c1c0 -- still apply. See README.md and docs/rtx-3090-windows.md.
       download-qwen36-35b = mkDownload {
         name = "download-qwen36-35b";
         filename = "qwen3_6_35b_a3b.ninfer";
