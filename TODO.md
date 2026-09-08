@@ -261,26 +261,32 @@ about it fails on a different one.
       `README.md` is already correct here: its "## Upstream" section contrasts upstream's
       RTX 5090/`sm_120a` target with this fork's SM86 layer, so it needs no change.
 
-## 5a. Sparse speculative raw-greedy has no finiteness guard
+## 5a. Speculative greedy finiteness guard — done
 
-- [ ] **Thread a per-row finiteness signal into `speculative_accept_sparse_warp_greedy_kernel`.**
-      Every other commit path now refuses to license a token chosen from a non-finite column:
-      the dense routes test `sampling_selected_logit_is_finite`/`sampling_value_is_finite`, and
-      `speculative_sparse_warp_accept` now tests the weight behind its chosen terminal. The
-      sparse **raw-greedy** route cannot: its kernel receives `target_tokens` (ints) and never
-      sees a float, so `speculative_sparse_warp_greedy` passes `true` with that stated at the
-      call site.
+- [x] ~~Thread a per-row finiteness signal into `speculative_accept_sparse_warp_greedy_kernel`.~~
+      **Done, and it was both smaller and larger than this entry assumed.**
 
-      Closing it means changing `speculative_accept_sparse_drafts_launch` and the kernel
-      signature to carry either the verify logits or a precomputed per-row finite flag, plus its
-      callers, plus regression cases in `tests/ops/test_speculative_round.cpp` for both sparse
-      routes. That is a signature change across the launcher boundary, so it was descoped from
-      the catch-up PR rather than designed under review pressure — the bounded half (the accept
-      path, which has numerics in scope) is fixed there.
+      *Smaller:* no signature change across the launcher boundary was needed.
+      `speculative_accept_sparse_drafts_launch` already receives the verify logits and already
+      computes `physical_rows`; the raw-greedy branch simply ignored them. Only the kernel
+      signatures lacked the parameters.
 
-      Worth knowing when prioritising: an all-NaN target column on this route licenses an
-      arbitrary token and advances the sequence length instead of returning
-      `kSamplerNonFiniteToken`. Raised by CodePulse on PR #16.
+      *Larger:* this entry claimed "every other commit path now refuses to license a token chosen
+      from a non-finite column". That was wrong. **Four** greedy routes were passing a hardcoded
+      `true`, not one:
+        - sparse raw-greedy (the route this entry described);
+        - dense multiblock `speculative_sampling_group_finalize_kernel<false>`, no penalties;
+        - dense penalized greedy, in the same kernel's general path;
+        - sparse penalized greedy, in `speculative_sparse_warp_accept`'s greedy branch.
+
+      All four now test the raw verify logit of the token they are about to license, which is the
+      signal the single-block dense kernel has always used. Penalties change the score that selects
+      the terminal but not the logit behind it, and a diverged pass makes the whole column NaN
+      before any penalty applies.
+
+      Regression cases in `tests/ops/test_speculative_round.cpp` cover every route with poisoned
+      and clean rows mixed in one batch. Verified adversarially: reverting the guard produces 60
+      failures. The last two routes were found by CodePulse review on PR #18.
 
 ## 5b. Reproducibility
 

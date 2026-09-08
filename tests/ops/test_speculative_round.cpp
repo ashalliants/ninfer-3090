@@ -624,7 +624,13 @@ struct SparseAcceptSuite {
     // the refusal is per row rather than a blanket one -- the unpoisoned rows must still commit
     // normally in the same launch. Runs on both greedy sparse routes: raw (the dedicated warp
     // kernel) and the multiblock group-finalize kernel's SparseProposal branch.
-    int sparse_non_finite_terminal_case(bool raw_greedy, int poison) {
+    // `penalized` selects the greedy routes that presence/frequency penalties force down the
+    // group-finalize path: dense speculative_store_accept_result and sparse
+    // speculative_sparse_warp_accept's greedy branch. Those pick the terminal from the penalized
+    // top-k rather than reading target_tokens, and a NaN does not sort predictably, so the poison
+    // there is the whole column -- which is what a diverged forward pass actually produces. The
+    // raw route reads target_tokens directly, so poisoning that one logit is exact.
+    int sparse_non_finite_terminal_case(bool raw_greedy, int poison, bool penalized = false) {
         std::vector<std::int32_t> targets(kSparseColumns * kSparseBatch),
             drafts(kSparseDrafts * kSparseBatch);
         std::vector<std::uint16_t> logits(static_cast<std::size_t>(kSparsePhysicalRows) *
@@ -636,6 +642,14 @@ struct SparseAcceptSuite {
         // temperature 0 everywhere: this is the greedy contract, and the raw route requires it.
         std::vector<ops::SamplingConfig> configs(kSparseBatch);
         std::vector<int> history(kSparseTokenDomain * kSparseBatch, 3);
+        if (penalized) {
+            // Uniform history, so the penalty shifts every candidate equally and the argmax of a
+            // clean column is still its target. What changes is the route, not the answer.
+            for (auto& cfg : configs) {
+                cfg.presence_penalty  = 1.0f;
+                cfg.frequency_penalty = 0.5f;
+            }
+        }
 
         SparseExpected expected{
             .licensed_tokens = std::vector<std::int32_t>(kSparseColumns * kSparseBatch, 0),
@@ -671,8 +685,13 @@ struct SparseAcceptSuite {
             // divergence column's target token.
             const bool poisoned = (row & 1) == (poison & 1);
             if (poisoned) {
-                logits[sparse_logit_index(row, reject, targets[row * kSparseColumns + reject])] =
-                    f32_to_bf16(quiet_nan);
+                if (penalized) {
+                    for (int v = 0; v < kSparseTokenDomain; ++v)
+                        logits[sparse_logit_index(row, reject, v)] = f32_to_bf16(quiet_nan);
+                } else {
+                    logits[sparse_logit_index(row, reject, targets[row * kSparseColumns + reject])] =
+                        f32_to_bf16(quiet_nan);
+                }
             }
 
             const std::size_t row_base = static_cast<std::size_t>(row) * kSparseColumns;
@@ -698,8 +717,8 @@ struct SparseAcceptSuite {
         }
         return execute_sparse_accept_case(
             "sparse non-finite terminal K=" + std::to_string(kSparseDrafts) + " B=" +
-                std::to_string(kSparseBatch) + (raw_greedy ? " raw" : " general") + " p" +
-                std::to_string(poison),
+                std::to_string(kSparseBatch) + (raw_greedy ? " raw" : " general") +
+                (penalized ? " penalized" : "") + " p" + std::to_string(poison),
             targets, logits, drafts, ids, q, extents, lengths, anchors, configs, history,
             {raw_greedy}, &expected);
     }
@@ -1372,6 +1391,13 @@ int main(int argc, char** argv) {
                     failures +=
                         SparseAcceptSuite(k, batch).sparse_non_finite_terminal_case(raw, poison);
                 }
+            }
+            // Penalized greedy takes the group-finalize routes instead, which select the terminal
+            // from the penalized top-k. raw_greedy is false by construction: the envelope means
+            // "all rows greedy *without* penalties".
+            for (int poison = 0; poison < 2; ++poison) {
+                failures += SparseAcceptSuite(k, batch).sparse_non_finite_terminal_case(
+                    /*raw_greedy=*/false, poison, /*penalized=*/true);
             }
         }
     }

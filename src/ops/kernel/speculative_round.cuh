@@ -189,9 +189,10 @@ __global__ __launch_bounds__(256) void speculative_accept_sparse_warp_greedy_ker
 }
 
 __device__ __forceinline__ void speculative_sparse_warp_accept(
-    SamplingWorkspace workspace, const int* drafts, const int* candidate_ids,
-    const float* proposal_q, const SamplingConfig& cfg, int k, int row, int extent, bool greedy,
-    int* lengths, int* anchors, int* licensed_tokens, int* licensed_counts, int* accepted) {
+    SamplingWorkspace workspace, const __nv_bfloat16* logits, const int* drafts,
+    const int* candidate_ids, const float* proposal_q, const SamplingConfig& cfg, int k, int row,
+    int extent, bool greedy, int* lengths, int* anchors, int* licensed_tokens, int* licensed_counts,
+    int* accepted, int physical_rows) {
     const int lane       = threadIdx.x & 31;
     const int old_length = lengths[row];
     bool reject          = false;
@@ -225,10 +226,18 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
     // this offset is caller-owned scratch that this round never wrote. Reading it would make the
     // guard depend on stale memory and could reject a perfectly good terminal -- worse than the
     // gap it closes. Per-row greedy inside a mixed batch is a supported route, not a corner.
+    //
+    // The greedy branch instead tests the raw verify logit of the token it is about to license,
+    // which is the same source every other greedy route uses. This route is reached with penalties
+    // applied to the selecting score; the underlying logit is unaffected by that and is still what
+    // says whether the forward pass diverged.
     bool terminal_is_finite;
     if (greedy) {
-        terminal           = workspace.dist_idx[sampling_dist_offset(a, 0)];
-        terminal_is_finite = true;
+        terminal = workspace.dist_idx[sampling_dist_offset(a, 0)];
+        const __nv_bfloat16* row_logits =
+            logits + static_cast<std::int64_t>(row) * (k + 1) * physical_rows;
+        terminal_is_finite = sampling_selected_logit_is_finite(
+            row_logits, static_cast<std::int64_t>(a) * physical_rows, terminal);
     } else {
         const int n  = workspace.dist_support[a];
         int token    = 0;
@@ -655,9 +664,10 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
             }
             __syncthreads();
             if (last_column && tid < 32)
-                speculative_sparse_warp_accept(workspace, drafts, candidate_ids, proposal_q, cfg, k,
-                                               row, extent, true, lengths, anchors, licensed_tokens,
-                                               licensed_counts, accepted);
+                speculative_sparse_warp_accept(workspace, logits, drafts, candidate_ids, proposal_q,
+                                               cfg, k, row, extent, true, lengths, anchors,
+                                               licensed_tokens, licensed_counts, accepted,
+                                               physical_rows);
             if (last_column && tid == 0) *workspace.speculative_finalize_count = 0;
             return;
         }
@@ -675,9 +685,9 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
         }
         __syncthreads();
         if (last_column && tid < 32)
-            speculative_sparse_warp_accept(workspace, drafts, candidate_ids, proposal_q, cfg, k,
-                                           row, extent, false, lengths, anchors, licensed_tokens,
-                                           licensed_counts, accepted);
+            speculative_sparse_warp_accept(workspace, logits, drafts, candidate_ids, proposal_q, cfg,
+                                           k, row, extent, false, lengths, anchors, licensed_tokens,
+                                           licensed_counts, accepted, physical_rows);
         if (last_column && tid == 0) *workspace.speculative_finalize_count = 0;
         return;
     } else {
@@ -700,16 +710,24 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                         tstar = selected;
                         break;
                     }
-                    // Greedy branch writes only dist_idx, so no probability is available to test;
-                    // see the note on the target-token greedy path above.
+                    // This is the penalized greedy route: presence/frequency penalties changed the
+                    // score that selected tstar, but the raw verify logit is still what says
+                    // whether the forward pass diverged, and a NaN row is NaN before any penalty is
+                    // applied. The greedy branch writes only dist_idx, so there is no probability
+                    // to test -- but the logits themselves are in scope, which is what the
+                    // no-penalty route above tests too.
                     // Dense only: this statement lives in the else of `if constexpr (SparseProposal)`, so it
                     // is instantiated with SparseProposal == false and token counts are updated.
                     // Spelled `true` rather than `!SparseProposal` because the double negative
                     // reads as if it could disable the counts here, which it cannot.
                     static_assert(!SparseProposal, "dense finalize path only");
+                    const __nv_bfloat16* row_logits =
+                        logits + static_cast<std::int64_t>(row) * cols * physical_rows;
+                    const std::int64_t tstar_base = static_cast<std::int64_t>(a) * physical_rows;
                     speculative_store_accept_result<true>(
                         row_drafts, k, row, a, tstar, lengths, anchors, row_tokens, licensed_counts,
-                        accepted, &cfg, true);
+                        accepted, &cfg,
+                        sampling_selected_logit_is_finite(row_logits, tstar_base, tstar));
                     *workspace.speculative_finalize_count = 0;
                 }
             }
