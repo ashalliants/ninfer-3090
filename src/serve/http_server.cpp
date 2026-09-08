@@ -359,6 +359,25 @@ void HttpServer::register_routes() {
 
     server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
         ensure_openai_request_id(req, res);
+        if (!ready_.load(std::memory_order_acquire)) {
+            // Runs for every route, including /health and OPTIONS, so a caller cannot tell "not
+            // ready" apart from "unauthenticated" -- and skips the API-key check below, since a
+            // loading-status response carries nothing worth protecting.
+            ApiError error;
+            error.status  = 503;
+            error.type    = "service_unavailable";
+            error.code    = "model_loading";
+            error.message = "The model is still loading. Retry shortly.";
+            // Weight load plus warmup measured ~10s on the 27B and longer on the 35B. Two seconds
+            // is a polite poll interval rather than a promise about when readiness arrives.
+            res.set_header("Retry-After", "2");
+            if (req.path.rfind("/v1/messages", 0) == 0) {
+                write_anthropic_error(res, error, new_anthropic_request_id());
+            } else {
+                write_openai_error(res, error);
+            }
+            return httplib::Server::HandlerResponse::Handled;
+        }
         if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
             return httplib::Server::HandlerResponse::Unhandled;
         }
@@ -511,24 +530,9 @@ void HttpServer::start_serving_during_startup() {
         throw std::logic_error("HTTP startup listener is already running");
     }
 
-    // One guard for every route, rather than thirteen. A pre-routing handler runs before dispatch,
-    // so a route added later is covered without anyone remembering to add a check to it.
-    server_.set_pre_routing_handler(
-        [this](const httplib::Request&, httplib::Response& res) -> httplib::Server::HandlerResponse {
-            if (ready_.load(std::memory_order_acquire)) {
-                return httplib::Server::HandlerResponse::Unhandled;
-            }
-            res.status = 503;
-            // Weight load plus warmup measured ~10s on the 27B and longer on the 35B. Two seconds
-            // is a polite poll interval rather than a promise about when readiness arrives.
-            res.set_header("Retry-After", "2");
-            res.set_content(
-                R"({"error":{"message":"The model is still loading. Retry shortly.",)"
-                R"("type":"service_unavailable","code":"model_loading"}})",
-                "application/json");
-            return httplib::Server::HandlerResponse::Handled;
-        });
-
+    // The readiness gate lives in register_routes()'s single pre-routing handler, ahead of the
+    // API-key check -- not here, so starting this listener never replaces (and thereby drops) the
+    // auth/request-ID middleware for the remainder of the process's life.
     startup_listener_ = std::thread([this] {
         // listen_after_bind() blocks here for the whole life of the server, spanning the switch
         // from 503 to serving. stop() is what ends it.
