@@ -741,9 +741,11 @@ roofline finally acquired a denominator; read them before the rest.
       k+1 free tokens. Both claims are now corrected in place, and
       `scripts/sweeps/dflash2-draft-tokens-realtext.ps1` is the sweep that does not use it.
 
-- [ ] **The three KV formats with the worst decode falloff were exactly the three that were not
-      run-to-run deterministic — and that turned out to be a coincidence.** #49 fixed the
-      non-determinism completely and the falloff did not move. Re-measured after it, and after the
+- [ ] **The three KV formats with the worst decode falloff are exactly the three that stage
+      dequantized tiles in shared memory — and the falloff is 3.21x the per-key cost.** Located
+      2026-09-09; the mechanism is below. #49 fixed the non-determinism that first drew attention to
+      the same three formats, and the falloff did not move — but they are siblings rather than a
+      coincidence, because the missing barrier sat around exactly that shared staging. Re-measured after it, and after the
       split-tier change in #52:
 
       | model | int8 | rk8v4 | fp8 | k8v4 | nvfp4 |
@@ -789,10 +791,67 @@ roofline finally acquired a denominator; read them before the rest.
       as well gained 0.4%/0.5%/1.2%. More splits at depth is worse for every quantized format, the
       host's default tier was the better number, and the special case is now gone from both sides.
       The falloff is unchanged by it and still wants an explanation.
-      Note it cannot be the whole story: fp8 *does* get 85 splits and still falls off 21% on the
-      35B, so it is paying something else — plausibly `KeyBlock` pinned to 32 rather than the int8
-      path's 64, forced by sm_86's shared-memory budget because the fp8 kernel keeps dequantized
-      BF16 copies of K *and* V (`small_t_fp8.cu:26-29`).
+
+      **Located and quantified 2026-09-09, and the sub-hypothesis above is wrong.** nsys with
+      node-level graph tracing on the 27B, `-pg P,128` at P = 4,096 and 32,768, filtered to the
+      decode attention kernels (`small_t`, 4,225 launches in both runs so per-launch figures are
+      directly comparable) and away from the prefill `prompt` kernels that otherwise dominate a
+      `-pg` capture:
+
+      | format | 4,096 keys | 32,768 keys | growth for 8x the depth |
+      |---|---:|---:|---:|
+      | `int8` | 62.65 µs/launch | 115.24 µs/launch | **1.84x** |
+      | `fp8` | 87.06 µs/launch | 255.96 µs/launch | **2.94x** |
+
+      So the falloff is in the decode attention kernel, it is not subtle, and it separates into two
+      distinct components:
+
+      - a **fixed** part — fp8 already costs 1.39x int8 at 4,096 keys, +24.4 µs per launch before
+        depth enters;
+      - a **per-key** part — marginal cost per additional key is **1.83 ns for int8 against 5.89 ns
+        for fp8, a 3.21x ratio**. This is the falloff. It is per-key work, which is what
+        dequantizing every key block into shared memory looks like, and it is why the gap widens
+        with depth (1.39x at 4K keys, 2.22x at 32K).
+
+      Both formats scale far better than the 8x a serial-in-keys kernel would give, because
+      split-K absorbs depth — so this is not a parallelism failure, it is a cost-per-key one.
+
+      **`KeyBlock` is not the difference.** This entry guessed fp8 was "paying something else —
+      plausibly `KeyBlock` pinned to 32 rather than the int8 path's 64". Read the dispatch:
+      `small_t.cu`'s final `else` branch, which is the one decode takes (`TokenTile <= 3`), launches
+      `<8, 2, 32, false>` — **`KeyBlock = 32` for int8 too**. The 64-wide case appears only under
+      `TokenTile >= 6`, which is a prefill width. There is no 32-against-64 asymmetry at decode to
+      explain anything.
+
+      **What does separate the six formats is `DynamicArena`.** int8, rk8v4 and bf16 all decode with
+      `DynamicArena = false` and zero dynamic shared memory. fp8, k8v4 and nvfp4 all decode with
+      `DynamicArena = true`, staging dequantized tiles in a shared arena:
+
+      | format | dynamic shared per block | blocks/SM that allows | 27B falloff | 35B falloff |
+      |---|---:|---:|---:|---:|
+      | `int8` / `rk8v4` / `bf16` | **0** | unbounded by shared | −10.4 / −7.9 / — | −9.4 / −7.2 / — |
+      | `nvfp4` | 24 KiB (`3 x 32 x 256`) | 4 | −18.0% | −21.4% |
+      | `k8v4` | 44 KiB (`11 x 32 x 256 / 2`) | 2 | −15.6% | −26.0% |
+      | `fp8` | 48 KiB (`6 x 32 x 256`) | 2 | −12.5% | −21.3% |
+
+      That is the **same three-way split as §5's non-determinism**, and it means the correlation this
+      entry opened by calling "a coincidence" is not one. Both symptoms come from the same
+      architectural choice — dequantize-into-shared — because #49's missing barrier sat between
+      `cp_wait<0>()` and `dequant_k_tile()`, i.e. around exactly that staging. The non-determinism
+      was not causally upstream of the falloff (fixing it moved nothing), but the two are siblings
+      rather than coincidence, which is a more useful thing to know.
+
+      **Occupancy alone does not order them, so it is necessary and not sufficient.** nvfp4 uses
+      half fp8's dynamic bytes and gets twice the blocks per SM, yet has the *worst* 27B falloff of
+      the six. So block count is not the whole mechanism; the per-key dequantization work is the
+      part that matches, and that wants confirming with `ncu` on the three quantized kernels — now
+      possible, see the closed tooling entry in §3 and `scripts/sweeps/admin-profile.ps1`.
+
+      What this is worth: **if `nvfp4` decoded on `rk8v4`'s curve it would be the outright best
+      format** — 45% smaller than INT8 with no speed penalty — rather than the compromise it is.
+      The target is the 3.21x per-key ratio, and `rk8v4` proves it is achievable, because it packs
+      4-bit values exactly as `k8v4` does and yet has the flattest curve of all six without a
+      shared arena at all.
 
       **What this entry originally claimed, wrongly — now settled.** It read the §5
       non-determinism and this falloff as one root cause — "a split reduction whose order varies, or an atomic
