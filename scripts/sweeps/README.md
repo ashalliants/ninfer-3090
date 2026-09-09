@@ -32,12 +32,22 @@ about three hours for twelve model/format combinations.
 | `decode-roofline.ps1` | What fraction of the card's 936.2 GB/s does decode reach? | instant |
 | `decode-step-profile.ps1` | Where does a decode step's time go -- occupancy, launch gaps, or bandwidth? | a few min |
 | `power-and-clocks.ps1` | Does the 315 W cap bound these numbers? | a few min |
+| `admin-profile.ps1` | Everything needing an elevated shell: `ncu` counters, and what 350 W buys | a few min |
 
 `decode-roofline.ps1` needs no GPU: it reads the CSVs `kv-decode-vs-depth.ps1` leaves behind and
 divides achieved bandwidth by peak. Run that sweep first. Note it only means anything for the
 **dense** model -- applied to the A3B MoE it returns 391% of peak, which is not a result but a
 demonstration that the formula does not hold there, since an MoE never reads its resident weights
 per token. See TODO section 2c.
+
+**`admin-profile.ps1` must be run from an administrator shell** and refuses to start otherwise.
+It is the only script here that does. `ncu` fails with `ERR_NVGPUCTRPERM` as a normal user because
+GPU performance counters are administrator-only by default on Windows, and `nvidia-smi -pl`/`-lgc`
+are refused outright. Running elevated satisfies the counter permission without the persistent
+`RmProfilingAdminOnly=0` registry change and without a reboot, which is why the script exists
+rather than an instruction to reconfigure the driver. It changes the power limit and clock lock and
+restores both in a `finally` block, including on Ctrl+C; pass `-SkipPower` to leave the power limit
+alone entirely.
 
 `power-and-clocks.ps1` needs neither a model sweep nor `nsys`, only `nvidia-smi`: it samples power,
 clocks and throttle reasons through one decode and one prefill. The answer as of 2026-09-09 is that

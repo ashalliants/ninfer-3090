@@ -50,13 +50,45 @@ struct RouteSpec {
 // decode cohort spends 13.8 ms of a 56.3 ms round in this exact kernel at width 8. See TODO
 // sections 2c and 3.
 //
+// Below 32 the tile is chosen by measurement, not by which one exists. Every decode extent lives
+// here -- a verification round is k+1 wide (6 at the four draft tokens docs/cli.md recommends) and
+// a C8 serving cohort is 8 -- and until 2026-09-09 all of 7..32 took the 32-wide tile, so eight
+// live columns issued four times the MMA work they needed.
+//
+// Measured with bench/ops/q4_q5_gdn_input_schedule_bench.cu, cold, medians of 31 with --spread
+// (us, median and min..p95). Every boundary below has its winner's p95 under the runner-up's min,
+// so none of it is inside the noise:
+//
+//   T    independent          c8               c16              c32
+//   6    188.4 187..189   240.6 235..247    247.8 245..255   290.8 289..293
+//   7    330.8 327..336   238.6 231..250    242.7 238..252   267.3 264..272
+//   8    319.5 315..323   236.5 231..248    243.7 237..253   267.3 263..273
+//   9    486.4 481..493   504.8 492..526    243.7 240..525   267.3 265..274
+//   16          --        506.9 497..523    242.7 237..253   267.3 264..273
+//   17          --        750.6 738..1158   495.6 484..513   269.3 266..274
+//   32          --        999.4 980..1037   491.5 479..508   264.2 262..268
+//
+// So c8 wins 7..8 by 10.7-11.5%, c16 wins 9..16 by 8.8-9.2%, and each collapses one column past
+// its own width because a second pass costs a whole extra weight read. The staircase is exactly
+// the tile widths.
+//
+// Do not read that 11% as evidence the padding was the main cost. It is not: dropping BN from 32
+// to 8 removes 75% of the padded MMA work and buys 11%, because this Op streams ~55 MB of weights
+// (4096x5120 q4 plus 12288x5120 q5) whose 64.4 us at 854.2 GB/s no tile choice changes. c8 at
+// 236.5 us is 27% of that floor. The padded work was a minor term all along, and the remaining 3.7x
+// is the thing worth chasing -- see TODO section 2c.
+//
+// A tile narrower than the live extent repeats the whole weight pass per column slice, so
+// above 16 columns the 32-wide tile covers a decode round in one pass instead of two.
 // Above the direct route the cost of a grouped MMA tile is set by its padded column width,
 // not by the live token count, so the tile is chosen to be the narrowest one that still
 // covers the extent in a single pass. Decode extents (C8 with MTP3 is 32) get the 32-wide
 // tile; the 128-wide tile remains the prefill-chunk anchor.
-constexpr std::array<RouteSpec, 4> kRoutes{{
+constexpr std::array<RouteSpec, 6> kRoutes{{
     {{1, 6}, Q4Q5GdnInputScheduleId::IndependentDirectFixed},
-    {{7, 32}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C32},
+    {{7, 8}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C8},
+    {{9, 16}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C16},
+    {{17, 32}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C32},
     {{33, 64}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C64},
     {{65, kAnyCols}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128},
 }};
@@ -84,6 +116,10 @@ const char* q4_q5_gdn_input_schedule_name(Q4Q5GdnInputScheduleId schedule) noexc
     switch (schedule) {
     case Q4Q5GdnInputScheduleId::IndependentDirectFixed:
         return "gdn_input_proj.q4_q5.independent_direct_fixed";
+    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C8:
+        return "gdn_input_proj.q4_q5.grouped_mixed.mma.r64.c8";
+    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C16:
+        return "gdn_input_proj.q4_q5.grouped_mixed.mma.r64.c16";
     case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C32:
         return "gdn_input_proj.q4_q5.grouped_mixed.mma.r64.c32";
     case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C64:
@@ -140,24 +176,30 @@ Q4Q5GdnInputConvPlan q4_q5_gdn_input_conv_resolve_plan(const Q4Q5GdnInputProblem
     }
 }
 
-void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
-                                  const Weight& qk_weight, const Weight& value_z_weight,
-                                  Tensor& qkv, Tensor& z, cudaStream_t stream) {
+void q4_q5_gdn_input_execute_schedule(Q4Q5GdnInputScheduleId schedule, const Tensor& x,
+                                      const Weight& qk_weight, const Weight& value_z_weight,
+                                      Tensor& qkv, Tensor& z, cudaStream_t stream) {
     const Q4Q5GdnInputProblem problem{x.ne[0],   qk_weight.n, value_z_weight.n,
                                       qkv.ne[0], z.ne[0],     qk_weight.padded_shape[1],
                                       x.ne[1]};
-    const Q4Q5GdnInputPlan resolved = q4_q5_gdn_input_resolve_plan(problem);
-    if (resolved.schedule != plan.schedule) {
-        throw std::invalid_argument("Q4/Q5 GDN input: plan does not match exact problem");
+    if (!q4_q5_gdn_input_admits(problem)) {
+        throw std::invalid_argument(
+            "Q4/Q5 GDN input: exact problem or column count is not admitted");
     }
 
-    switch (plan.schedule) {
+    switch (schedule) {
     case Q4Q5GdnInputScheduleId::IndependentDirectFixed: {
         Tensor qk    = qkv.slice(0, 0, problem.qk_rows);
         Tensor value = qkv.slice(0, problem.qk_rows, problem.z_rows);
         q4_q5_gdn_input_independent_launch(x, qk_weight, value_z_weight, qk, value, z, stream);
         return;
     }
+    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C8:
+        q4_q5_gdn_input_grouped_mma_c8_launch(x, qk_weight, value_z_weight, qkv, z, stream);
+        return;
+    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C16:
+        q4_q5_gdn_input_grouped_mma_c16_launch(x, qk_weight, value_z_weight, qkv, z, stream);
+        return;
     case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C32:
         q4_q5_gdn_input_grouped_mma_c32_launch(x, qk_weight, value_z_weight, qkv, z, stream);
         return;
@@ -169,6 +211,19 @@ void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
         return;
     }
     throw std::logic_error("Q4/Q5 GDN input: unknown schedule");
+}
+
+void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
+                                  const Weight& qk_weight, const Weight& value_z_weight,
+                                  Tensor& qkv, Tensor& z, cudaStream_t stream) {
+    const Q4Q5GdnInputProblem problem{x.ne[0],   qk_weight.n, value_z_weight.n,
+                                      qkv.ne[0], z.ne[0],     qk_weight.padded_shape[1],
+                                      x.ne[1]};
+    const Q4Q5GdnInputPlan resolved = q4_q5_gdn_input_resolve_plan(problem);
+    if (resolved.schedule != plan.schedule) {
+        throw std::invalid_argument("Q4/Q5 GDN input: plan does not match exact problem");
+    }
+    q4_q5_gdn_input_execute_schedule(plan.schedule, x, qk_weight, value_z_weight, qkv, z, stream);
 }
 
 void q4_q5_gdn_input_dispatch(const Tensor& x, const Weight& qk_weight,

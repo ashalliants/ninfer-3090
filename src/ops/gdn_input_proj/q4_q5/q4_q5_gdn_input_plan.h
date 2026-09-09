@@ -11,6 +11,8 @@ namespace ninfer::ops::detail {
 
 enum class Q4Q5GdnInputScheduleId {
     IndependentDirectFixed,
+    GroupedMixedMmaR64C8,
+    GroupedMixedMmaR64C16,
     GroupedMixedMmaR64C32,
     GroupedMixedMmaR64C64,
     GroupedMixedMmaR64C128,
@@ -47,6 +49,21 @@ Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem
 Q4Q5GdnInputConvPlan q4_q5_gdn_input_conv_resolve_plan(const Q4Q5GdnInputProblem& problem,
                                                        std::int32_t batch_size);
 
+// Runs a schedule without first checking that it is the one resolve_plan would pick;
+// q4_q5_gdn_input_execute_plan is exactly this plus that check.
+//
+// It exists so a bench can time every candidate schedule at the same column count, which is the
+// only way to tell whether a route boundary sits in the right place. This Op needed it most and
+// had it last: its {{1, 6}} / {{7, 32}} boundary is where DFlash2 loses 15% between five and six
+// draft tokens, and where a C8 decode cohort starts paying a 32-wide tile for eight live columns,
+// and until now neither could be checked against the alternative. Mirrors
+// q4_linear_swiglu_execute_schedule and w8_pair_execute_schedule.
+//
+// Nothing on the inference path should call this: the check execute_plan adds is what keeps a plan
+// from being executed against a problem it was not resolved for.
+void q4_q5_gdn_input_execute_schedule(Q4Q5GdnInputScheduleId schedule, const Tensor& x,
+                                      const Weight& qk_weight, const Weight& value_z_weight,
+                                      Tensor& qkv, Tensor& z, cudaStream_t stream);
 void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
                                   const Weight& qk_weight, const Weight& value_z_weight,
                                   Tensor& qkv, Tensor& z, cudaStream_t stream);
