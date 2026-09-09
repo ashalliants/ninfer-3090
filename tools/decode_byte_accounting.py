@@ -114,6 +114,8 @@ def main() -> None:
                         help="cache depth in tokens; repeatable")
     parser.add_argument("--tok-s", type=float, action="append", default=[],
                         help="measured decode tok/s at the matching --depth; repeatable")
+    parser.add_argument("--json", action="store_true",
+                        help="emit the byte counts as JSON, for scripts that need the denominator")
     args = parser.parse_args()
 
     if len(args.tok_s) != len(args.depth):
@@ -121,6 +123,10 @@ def main() -> None:
 
     result = account(read_directory(args.artifact))
     per_token = float(result["per_token"])
+
+    if args.json:
+        print(json.dumps({k: v for k, v in result.items() if k != "unread"}))
+        return
 
     print(f"{args.artifact.name}: bytes read per decoded token, one lane, no speculation")
     print(f"  dense weights, every token          : {result['dense']:>15,} B")
