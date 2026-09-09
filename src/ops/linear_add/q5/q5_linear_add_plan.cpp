@@ -36,6 +36,20 @@ constexpr std::array<SupportSpec, 2> kSupports{{
     {5120, 17408, 17408},
 }};
 
+// The 2..10 band is measured too (2026-09-09, same bench, --tokens 1,2,4,6,8,10,12,16, medians of
+// 15): SIMT split2 wins it outright, and the boundary at 10/11 is where the two curves actually
+// cross. k=6144, T=8: split2 74.8 vs c16 101.4. T=10: 93.2 vs 101.4, still split2 but only just,
+// and split2's +8.7 us per row puts T=11 at ~102 -- level with c16, which is flat. Same story at
+// k=17408 (T=8: 200.7 vs 282.6). split2 is registered only to 10, so 11 upward is not a measured
+// flip; it is the domain edge landing exactly where the extrapolation says it should.
+//
+// Be clear about what that does and does not say, because a serving cohort of 8 lands here. It is
+// the right choice between the kernels that exist, not a good one. split2 grows ~8.7 us per row
+// (k=6144: 41.0/56.3/74.8/93.2 at T=4/6/8/10) so it barely amortises the weight read, while c16 is
+// flat from T=4 to T=16 but flat at 4x the 25.3 us this weight costs to stream once at 854 GB/s.
+// The T=1 GEMV reaches 41.0 us, 62% of that floor. A narrow-extent kernel with c16's flatness at
+// the GEMV's efficiency is worth most of the C1-to-C8 scaling loss; see TODO section 2c.
+//
 // A tile narrower than the live extent repeats the whole weight pass per column slice, so
 // above 16 columns the 32-wide tile covers a decode round in one pass instead of two.
 // Measured on sm_86 with bench/ops/q5_linear_add_schedule_bench.cu, cold, medians of 9-15.
