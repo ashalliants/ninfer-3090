@@ -86,10 +86,11 @@ statistics still drive the normal verdict. Passing tests remain quiet without it
 Invoke it unqualified so `PATH` resolves it:
 
 ```bash
-compute-sanitizer --tool initcheck --error-exitcode 9   build/tests/ninfer_softmax_attention_test
+compute-sanitizer --tool initcheck --error-exitcode 9 \
+  build/tests/ninfer_softmax_attention_test
 ```
 
-**Do not call the copy under `CUDA12.4\compute-sanitizer\` by absolute path.** Two copies are
+**Do not call the copy under `CUDA/v12.4/compute-sanitizer/` by absolute path.** Two copies are
 installed on a typical toolkit layout, and the 2024.1.0 one in v12.4 prints its banner and
 `ERROR SUMMARY: 0 errors`, exits 0, and **never executes the binary** — a clean report having
 checked nothing. `PATH` resolves `compute-sanitizer` to the v12.8 launcher, which is the working
