@@ -757,29 +757,84 @@ The two entries below are the largest identified speed opportunities in the repo
 out of #53's profile and #50's byte accounting, both have a measured gap against a measured
 ceiling, and neither has had any optimisation attempted.
 
-- [ ] **The MoE expert gather runs at 40-45% of the card's read bandwidth while contiguous weight
-      kernels on the same decode step reach 78-82%.** This is the single biggest number left in
-      this file. Measured (#53), bytes attributed from the artifact inventory:
+- [ ] **The MoE expert gather is latency-bound, not divergence-bound or bandwidth-bound.** Still
+      the biggest number left in this file, but it now has a cause. `ncu` counters collected
+      2026-09-09 via `scripts/sweeps/admin-profile.ps1` (elevated; the counters are
+      administrator-only on Windows and that was the whole blocker), 35B, int8 KV, decode, clocks
+      locked at 1,500 MHz, `--graph-profiling node`:
 
-      | kernel | bytes | time | achieved | % of achievable |
-      |---|---:|---:|---:|---:|
-      | `sparse_moe_d3_nine_warp` (routed gate_up, 8/256) | 8.91 MB | 23.4 µs | 381 GB/s | **44.6%** |
-      | `sparse_moe_d4_nine_warp` (routed down, 8/256) | 5.58 MB | 16.4 µs | 340 GB/s | **39.9%** |
-      | `w8_k2048_decode` (gdn qkv_z, contiguous) | 26.74 MB | 38.2 µs | 700 GB/s | 81.9% |
-      | `q6_rowsplit_gemm_simt` (output head, contiguous) | 397.31 MB | 595.6 µs | 667 GB/s | 78.1% |
+      | | `d3_nine_warp` (gate_up) | `d4_nine_warp` (down) |
+      |---|---|---|
+      | duration | 28.45 µs | 25.18 µs |
+      | memory throughput | 425.9 GB/s (**49.9%** of achievable) | 487.5 GB/s (**57.1%**) |
+      | DRAM throughput | 46.79% | 53.56% |
+      | compute (SM) throughput | 35.69% | 36.55% |
+      | **avg. active threads per warp** | **31.11 / 32** | **29.06 / 32** |
+      | L1/TEX hit rate | 31.67% | 87.58% |
+      | L2 hit rate | 5.89% | 15.96% |
+      | **schedulers with no eligible warp** | **44.57%** | **58.63%** |
+      | eligible warps per scheduler | 1.62 (of 8.28 active) | 1.13 (of 10.25 active) |
+      | achieved / theoretical occupancy | 60.16% / 93.75% | 78.91% / 93.75% |
+      | **block limit: registers** | **5** | **5** |
+      | block limit: shared memory | 12 | 7 |
+      | registers per thread | 36 | 40 |
+      | waves per SM | **1.25** | 5.00 |
 
-      The four `sparse_moe` stages are **38% of decode busy time** on the 35B, and that model sits
-      at ~51% of achievable overall against the dense 27B's ~66-70%. A further **15.5%** of its
-      decode window is GPU idle between kernels (corrected in #60 from the 12.6% first reported),
-      which its mean kernel duration of 12.3 µs against the 27B's 40.3 µs explains: the MoE
-      launches three times as many, three times shorter, so per-launch overhead lands three times
-      as hard. Eight scattered expert blocks
-      per layer per token is the shape; whether the cost is address divergence, L2 behaviour, or
-      too little work per CTA to cover the latency is unknown — `ncu` would say, and is installed
-      but has no `ncu.exe` at the expected path (see the tooling entry in §3).
+      This entry listed three candidate causes. The counters settle all three.
 
-      Closing even half the gap between the expert kernels and the contiguous ones is worth
-      roughly 15-20% on the recommended model. Nothing here has been tried.
+      **Address divergence — ruled out.** 31.11 and 29.06 active threads per warp out of 32. The
+      8-of-256 expert selection happens at *block* granularity, so lanes within a warp still walk
+      one expert's weights contiguously. There is no lane divergence to fix, and that was the
+      leading hypothesis.
+
+      **L2 behaviour — real, inherent, and not a bug.** 5.89% and 15.96% hit rates are close to
+      zero reuse, but an expert's weights are read once per token and there is nothing to hit. No
+      tuning recovers this; it is what top-8-of-256 costs.
+
+      **Too little work in flight — confirmed, and this is the answer.** Neither DRAM (46.79/53.56%)
+      nor SM (35.69/36.55%) is anywhere near saturated, which is the textbook signature. The
+      schedulers say it directly: **no warp is eligible to issue 44.6% of cycles on d3 and 58.6% on
+      d4**, with only 1.1-1.6 eligible warps per scheduler against 8-10 resident. Warps are there
+      and stalled, not absent.
+
+      **The binding constraint is registers, and the arithmetic is small.** Both kernels report
+      `Block Limit Registers = 5` against a shared-memory limit of 12 and 7 — so registers, not
+      shared memory, is what caps blocks per SM. At 288 threads per block:
+
+      | registers/thread | registers/block | blocks/SM |
+      |---|---|---|
+      | 40 (d4 today) | 11,520 | 5 |
+      | 36 (d3 today) | 10,368 | 6 |
+      | 32 | 9,216 | 7 |
+      | 28 | 8,064 | 8 |
+
+      Getting d3 to 32 and d4 to 32 would take both from 5 blocks to 7 — **+40% more warps resident
+      to hide the same latency**, without touching the algorithm. That is a `__launch_bounds__` and
+      register-pressure exercise, which is the cheapest thing on this list and should be tried
+      first.
+
+      **d3 has a second, independent problem: 1.25 waves per SM.** 512 blocks against 82 SMs at 5
+      blocks each is 410 block slots, so the grid fills the machine once and the *tail wave is a
+      quarter full*. d4 runs 2,048 blocks (5.00 waves) and is correspondingly healthier on every
+      occupancy metric. Splitting d3's work into more, smaller blocks would remove the tail; this is
+      separate from the register question and both apply.
+
+      **One more thing the counters exposed: over-fetch.** ncu measured 12.12 MB of DRAM traffic on
+      d3 and 12.27 MB on d4, where #50's artifact inventory attributes **8.91 MB** and **5.58 MB**
+      of useful weight bytes — 1.36x and **2.20x**. Some of that is sector granularity on a gather
+      that lands on 8 scattered blocks, and it means the effective bandwidth figures above flatter
+      the kernels: d4 moves 2.2x the bytes it needs. Worth confirming with
+      `dram__bytes_read.sum` directly before optimising against it, since the byte attribution and
+      the ncu run are different measurements.
+
+      Closing even half the gap to the contiguous kernels is still worth roughly 15-20% on the
+      recommended model. The order to try things is now: registers, then d3's wave tail, then the
+      over-fetch.
+
+      Not yet collected: the contiguous-kernel reference from the same elevated run.
+      `admin-profile.ps1` passed `-k 'regex:a|b'` and PowerShell parsed the `|` as a pipe, so that
+      half produced only an error. Fixed in the script; re-run it to get the local baseline these
+      percentages are compared against.
 
 - [ ] **Prefill's MLP GEMMs run at ~30% of the card's INT8 tensor-core rate**, and the obvious
       excuse for that has been measured and ruled out.
@@ -957,51 +1012,51 @@ ceiling, and neither has had any optimisation attempted.
       different winners, which is documented at the top of `schedule_sweep.cuh`. The point is that
       a narrow cold-flush margin is a reason to profile, not a decision.
 
-- [ ] **The 315 W power cap binds continuously, but it does not touch memory clock — so most of
-      this file is unaffected.** Measured 2026-09-09 with `scripts/sweeps/power-and-clocks.ps1`,
-      which samples `nvidia-smi` at 2 Hz through a 27B `tg1024` decode and a `pp8192` prefill,
-      int8 KV. Three runs, medians and full ranges over busy samples (utilization > 50%):
+- [x] **The 315 W power cap costs nothing measurable. Closed 2026-09-09.** Measured both ways with
+      `scripts/sweeps/power-and-clocks.ps1`, and then at 350 W from an elevated shell:
 
-      | | decode (162-168 samples) | prefill (52-53 samples) |
+      | | 315 W (cap) | 350 W (default) |
       |---|---|---|
-      | board power | 314 W median | 314 W median |
-      | `sw_power_cap` active | **161-168 of 162-168** | **51-52 of 52-53** |
-      | SM clock | **1,500-1,515 MHz** median | **1,635-1,650 MHz** median |
-      | memory clock | **9,501 MHz in every sample** | **9,501 MHz in every sample** |
-      | temperature | 63-74 °C median, 75 max | 68-76 °C median, 77 max |
-      | thermal throttle | **0 samples, all runs** | **0 samples, all runs** |
+      | decode `tg1024` | 37.16-37.55 tok/s | **37.15 tok/s** |
+      | prefill `pp8192` | 1,204-1,255 tok/s | **1,228.5 tok/s** |
+      | decode SM clock | 1,500-1,515 MHz median | 1,545 MHz median |
+      | prefill SM clock | 1,635-1,650 MHz median | 1,680 MHz median |
+      | memory clock | 9,501 MHz, every sample | 9,501 MHz, every sample |
+      | board power | 314 W median | 342-349 W median |
+      | `sw_power_cap` active | 161-168 of 162-168 | **161 of 163** |
+      | thermal throttle | 0 samples | 0 samples |
 
-      The cap is genuinely and permanently binding — power pins within 1 W of the limit whenever
-      the card is busy — and it is the *only* thing throttling. No thermal slowdown appears in any
-      sample of any run, at any temperature reached.
+      **+35 W (+11% of budget) buys +3% SM clock and 0% throughput, in both phases.** Decode is
+      identical to within 0.4%; prefill is inside its own run-to-run spread. So the cap can stay
+      where it is, and every number in this file stands without an asterisk.
 
-      What it costs is a narrower question than this entry assumed. **Memory never leaves 9,501 MHz
-      in either phase, in any run**, which is the full 19 Gbps spec, so every bandwidth number in
-      this file — the 854.2 GB/s achievable figure, the decode roofline, the whole of §2c's decode
-      analysis — is measured at unthrottled memory and the cap does not bound it. SM clock is what
-      pays: decode sits about 11% below the 3090's 1,695 MHz rated boost, prefill about 3%. Decode
-      is bandwidth-bound so 11% of SM clock buys little there, and prefill — the phase where SM
-      clock would matter — is the phase where the cap costs least.
+      Why it costs nothing is the useful part. The memory clock **never leaves 9,501 MHz** — the
+      full 19 Gbps spec — at either power limit, in any sample of any run. Decode is
+      bandwidth-bound, so SM clock is not what it is waiting for; prefill is the phase where SM
+      clock could matter and it is the phase the cap squeezes least (1,635 vs 1,680 MHz, 2.8%).
+      Nothing was ever thermally throttled either, at any temperature reached, up to 80 °C.
 
-      The compute ratios are self-cancelling: prefill's "~30% of INT8 MMA peak" (§2c) divides a
-      capped measurement by a ceiling probe run under the same cap, so lifting the limit moves
-      numerator and denominator together.
+      Note the cap is still *binding* at 350 W — `sw_power_cap` is active in 161 of 163 busy
+      samples there too — so this is not "the cap stopped mattering", it is "this workload does not
+      convert board power into throughput". Lifting to the 400 W maximum would not change that
+      conclusion for decode, which cannot go faster than its memory clock allows.
 
-      **Careful with the maxima.** Individual samples reach 1,740-1,935 MHz on both phases. Those
-      are the first sample or two of a run, before the cap clamps a cold card, and quoting one as a
-      steady clock is wrong — the first version of this script reported `Measure-Object -Average`
-      under a column labelled "median" and that is exactly the mistake it invites. This entry
-      previously claimed the SM clock "swings 1,665-1,755 MHz"; both ends of that are wrong for
-      steady state in either phase.
+      The compute ratios were self-cancelling as predicted: prefill's "~30% of INT8 MMA peak"
+      divides a capped measurement by a ceiling probe run under the same cap.
 
-      **Still open, and still needs an elevated shell.** `nvidia-smi -pl 350` is refused with
-      "Insufficient Permissions" from this session, re-confirmed 2026-09-09, so the residual
-      question stands: what would the missing 35 W buy on prefill? With SM clock already at 97% of
-      rated boost there, the honest prior is "very little" — but that is a prediction. Re-run the
-      script after `-pl 350` to settle it. The second half of this entry is the more valuable one:
-      `nvidia-smi -lgc` to lock clocks would collapse the 3-5% between-process spread that made the
-      27B hard to read this cycle, and that spread is now known to be the largest source of noise
-      in every end-to-end comparison here (see §3's cold-flush entry).
+      Also corrects the figures this entry originally carried. It claimed the SM clock "swings
+      1,665-1,755 MHz"; steady state is 1,500-1,515 on decode and 1,635-1,650 on prefill at 315 W.
+      Individual samples do reach 1,905-1,935 MHz, but only in the first sample or two before the
+      cap clamps a cold card — the first draft of the sampling script reported
+      `Measure-Object -Average` under a column labelled "median", which is exactly how a boost
+      spike gets quoted as a steady clock, so it now takes a real median and says why.
+
+      **Still worth doing, and not blocked on anything: `nvidia-smi -lgc` for measurement runs.**
+      The 3-5% between-process spread is now the largest source of noise in every end-to-end
+      comparison here. It forced the DFlash2 tile A/B to interleave the two binaries within each
+      repetition rather than run one build then the other, and it made an earlier comparison need a
+      control column to be readable at all. That is a measurement-hygiene fix, not a performance
+      one, and it is independent of the power limit.
 
 - [ ] **`compute-sanitizer` cannot launch this repository's test binaries.** It reports "Target
       application doesn't exist or is not a valid executable" for `ninfer_*_test.exe` — absolute
