@@ -82,9 +82,15 @@ try {
 
   # A contiguous kernel from the same step, as the reference the percentages above are against.
   # Without it the MoE numbers have no local baseline and have to be compared across runs.
+  #
+  # One kernel pattern, not an alternation. The first version passed -k 'regex:a|b' and PowerShell
+  # parsed the | as a pipeline separator before ncu ever saw it, so the invocation became
+  # "ncu ... regex:a" piped into a command named b. It died with "'b' is not recognized as an
+  # internal or external command" and wrote an empty report -- which reads like an ncu problem and
+  # is not one. Single pattern, via --kernel-name.
   "== 2/3 ncu: contiguous reference kernels (27B, int8, decode) -> $out\contiguous_ref.txt"
   & $Ncu --target-processes all --graph-profiling node `
-      -k 'regex:q5_rowsplit_gemv|q4_linear_swiglu_gemv_pair' --launch-skip 64 --launch-count 8 `
+      --kernel-name 'regex:q5_rowsplit_gemv' --launch-skip 64 --launch-count 8 `
       --section SpeedOfLight --section MemoryWorkloadAnalysis `
       --section MemoryWorkloadAnalysis_Tables --section Occupancy --section LaunchStats `
       $bench --weights $dense --kv-dtype int8 --max-ctx 8192 -n 64 -r 1 --warmup 1 `
