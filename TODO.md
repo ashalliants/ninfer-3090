@@ -1049,6 +1049,35 @@ ceiling, and neither has had any optimisation attempted.
       are the target. The MLP pair is 68% of prefill FLOPs, which makes this the largest
       compute-side opportunity in the file.
 
+      **Two more explanations ruled out 2026-09-09, both analytically, which narrows this to the MMA
+      pipeline itself.** Working from the chunk-640 profile — `q4a8_swiglu` takes 1,212.20 ms over
+      512 calls, so 2.368 ms per call at the 27B's `34,816 x 5,120` MLP shape with 640 columns:
+
+      | | |
+      |---|---:|
+      | work | 228.2 GOP |
+      | weights read | 94.7 MB (4-bit codes plus one FP16 scale per 64) |
+      | activations | 47.8 MB |
+      | achieved | **96.4 TOPS = 31%** of the 314.8 TOPS ceiling |
+      | compute floor at the ceiling | 0.725 ms |
+      | memory floor at 854.2 GB/s | 0.167 ms |
+
+      **Not memory.** The kernel is compute-bound over its own memory floor by **4.3x** at this
+      shape, so no amount of bandwidth work touches it. Worth stating because "30% of peak" invites
+      the assumption that something is starving.
+
+      **Not dequantization.** Unpacking every one of the 178M 4-bit codes costs 0.020 ms at 2 int
+      ops per code, 0.040 ms at 4, and 0.080 ms at 8 — **1%, 2% and 3% of the 2.368 ms call**,
+      against the 3090's 17.8 T int-op/s CUDA-core rate. Even a pessimistic unpack cannot account
+      for a 69% shortfall. This was the natural next hypothesis after the tile-shape one and it is
+      also wrong.
+
+      So the gap is inside the MMA pipeline: issue rate, shared-memory feeding, or occupancy, and
+      those three need counters to separate. `scripts/sweeps/admin-profile.ps1` now collects them
+      (section 3 of that script, `ComputeWorkloadAnalysis` and `InstructionStats` alongside the
+      usual occupancy and scheduler sections) — it needs one elevated run, since GPU performance
+      counters are administrator-only on Windows.
+
       Two small things fall out. The default chunk of 1,024 is 1.0% off the plateau, so 2,048 is
       free throughput *if* the extra workspace is affordable — worth checking against the memory
       model in `docs/config-calculator.html` before changing a default. And 256 costs 6.9%, which
