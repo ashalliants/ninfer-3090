@@ -1,14 +1,23 @@
 # TODO
 
-State as of 2026-09-08, after a clearing pass that closed fourteen items and a KV-format
-measurement pass that produced §2b.
+State as of 2026-09-09, after a correctness pass that closed nine items and found three defects
+nobody had filed.
 
-Released: **v0.9.0-rtx3090** (Windows + Linux). Full suite **125/125** on this box, now including
-upstream's DFlash2 attention sweep, which had been skipped since the catch-up merge.
+Released: **v0.9.0-rtx3090** (Windows + Linux). Full suite **126/126** on this box.
 
-**Every route table in the tree has now been measured on sm_86.** That was the largest outstanding
-body of work and it is finished. What remains is correctness, coverage needing hardware this box
-does not have, and measurement debt.
+**The headline is that three of the six KV formats were quietly wrong.** fp8, nvfp4 and k8v4
+attention was missing a block barrier between `cp_wait<0>()` and a whole-tile shared-memory read,
+and it corrupted every prefill output column except the last — by up to 26 in logprob. Greedy
+decode reads only the last column, so generation stayed byte-identical and nothing noticed. Every
+published perplexity figure for those three formats was measured through it. See §5.
+
+**The decode roofline now has a denominator**, and it is not the one this file used for a cycle.
+The card sustains 854 GB/s on reads, not its advertised 936; and a token reads far less than
+`weights_capacity_bytes`. On that accounting the dense 27B sits at ~66-70% of achievable and the
+**35B MoE at ~51%, flat across depth** — the larger prize, on the recommended model. See §2c.
+
+Every route table in the tree has been measured on sm_86; that work is finished. What remains is
+profiling, measurement debt, and coverage needing hardware this box does not have.
 
 ---
 
@@ -41,11 +50,17 @@ NINFER_QWEN3_8_27B_WEIGHTS=C:\Ninefer-3090\models\qwen3_8_27b.ninfer
 NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS=C:\Ninefer-3090\models\qwen3_8_27b_dflash2.ninfer
 NINFER_QWEN3_6_35B_A3B_WEIGHTS=C:\Ninefer-3090\models\qwen3_6_35b_a3b.ninfer
 NINFER_QWEN3_6_27B_WEIGHTS=C:\Ninefer-3090\models\qwen3_6_27b.ninfer
+NINFER_QWEN3_6_27B_NVFP4_WEIGHTS=C:\Ninefer-3090\models\qwen3_6_27b_nvfp4.ninfer
 NINFER_REAL_TEST_MAX_CONTEXT=8192      # only needed for the 35B
 ```
 
-**Free VRAM decides whether these pass or skip**, not correctness — see §1.2. Close GPU clients
-first and check `nvidia-smi`.
+`NINFER_QWEN3_6_27B_NVFP4_WEIGHTS` was missing from this block for a cycle, and it is the only
+thing that was keeping `27b_load_plan` skipping — the artifact has been on the disk all along.
+
+**Free VRAM used to decide whether these pass or skip.** It no longer does: the reason was the
+pinned host-KV allocation being charged against the card (§6, #45), and with that clamped the six
+real-model tests pass on an idle box and under `ctest -j2`. Still worth closing GPU clients before
+a *measurement* run, where free VRAM changes the automatic sizing.
 
 ### Recently landed, and what is still owed on it
 
@@ -53,13 +68,28 @@ first and check `nvidia-smi`.
   defects were fixed before it landed and **two were not**; the file itself says so, carrying a
   `KNOWN GAP (see TODO.md)` comment where speculative memory should be modelled. See §2b. So the
   page is live on master, README and `docs/cli.md` link to it, and **it still undercounts any
-  speculative configuration by roughly 170 MiB.** Closing that is the top non-correctness item in
-  §0, and the multiplier it needs is already measured in §2b. Until then, treat its speculative
-  rows as optimistic.
-- A worktree at `.claude/worktrees/eager-baking-cascade` exists and has been used by a second agent
-  working the same branches. **Check `git worktree list` before assuming a branch is free**, and
-  `git fetch` before pushing: concurrent work on `fix/artifact-download-revisions` was duplicated
-  once this cycle because of exactly that.
+  speculative configuration by roughly 170 MiB.** Until then, treat its speculative rows as
+  optimistic.
+- **A second agent works in this checkout.** On 2026-09-09 a *locked* worktree at
+  `.claude/worktrees/moonlit-scribbling-sundae` was on `sync/neroued-catchup-20260908` with build
+  logs minutes old. **Run `git worktree list` before assuming a branch is free**, `git fetch`
+  before pushing, and do not delete a worktree you did not create even when it is holding 46 GB.
+- **Do not merge a stack of dependent PRs in one pass.** Seven were opened stacked, each based on
+  the one below; merging them bottom-up with `--delete-branch` deleted each base out from under
+  the PR above it, and GitHub *closed* three rather than retargeting them. Only the first reached
+  master. The recovery is to retarget each branch at `master` and merge one at a time, which works
+  because a branch that is a prefix of the chain diffs to exactly its own commit once its
+  predecessors have landed.
+
+### Disk, because it stopped a build dead
+
+`C:` filled to **zero bytes free** mid-session and a build failed with
+`fatal error C1085: Cannot write compiler generated file ... No space left on device`. Three
+things were holding it: the other agent's worktree (46 GB), `build-linux` (60 GB), and
+`scripts/models/qwen3_8_27b.ninfer` — a **19 GB byte-identical duplicate** of
+`qwen3_8_27b_dflash2.ninfer`, verified by SHA-256, sitting under the downloaders' default output
+path and *misnamed*, so anything trusting that path would silently load the DFlash2 artifact.
+The duplicate is deleted. Two WSL crash dumps in `%TEMP%\wsl-crashes` were another 12 GB.
 
 ### Windows tooling hides Linux breakage, and did
 
@@ -94,132 +124,111 @@ question, and which one produced a wrong answer and why.
 
 ## 0. Next up, in this order
 
-1. **The `T=112` graph-replay failure** (§1.1). The only open item that could be a correctness
-   defect in *released* code. Four hypotheses are already ruled out — read that entry first, it
-   will save a day.
-2. **Decode runs at 66% of the card's memory bandwidth** (§2c). The largest single number in this
-   file, it applies to every configuration rather than one feature, and no performance work here
-   has ever been measured against an absolute ceiling. Profile one decode step first.
-3. **DFlash2 currently costs 20% on the 27B** (§2c). A shipped v0.9.0 feature that is a net loss
-   on text, and the cheapest possible first test -- sweep `--draft-tokens` below 7 -- has never
-   been run.
-4. **The calculator's speculative-memory gap** (§2b). Now shipped on master and linked from
-   README, so it is live: every speculative configuration it reports is roughly 170 MiB optimistic.
-   The multiplier that fixes it is already measured — implementing, not investigating.
-5. **Re-run the six real-model tests** (§1.2, §2). Their artifact blockers are gone as of #31 and
-   nobody has looked since; at least one is expected to fail rather than skip.
-6. **The two test-criterion outliers** (§4). Small, the last loose ends from the §5 audit, and
-   neither needs hardware this box lacks.
-7. **The real-model maximum-configuration decision** (§1.2). A judgement call more than a task.
+1. **Profile one decode step** (§2c). The MoE runs at ~51% of the card's *achievable* read
+   bandwidth and is flat across depth; the dense path at ~66-70%. Both denominators now exist and
+   neither path has ever been profiled. `scripts/sweeps/decode-step-profile.ps1` captures exactly
+   one measured repetition under nsys and reports GPU-busy against window-wall first, because a
+   launch gap is not recoverable by kernel tuning and rules itself in or out in one run.
+2. **Re-measure perplexity for fp8, k8v4 and nvfp4** (§5). Those three numbers were scored
+   through the attention race #49 fixed. They are not "single runs that probably averaged out";
+   they are measurements of a broken kernel, and the format ranking built on them means nothing
+   until they are redone. Include int8 as a control.
+3. **The KV decode falloff still wants an explanation** (§2c). #49 removed the tidy theory
+   without moving the numbers: fp8/k8v4/nvfp4 still fall off two to three times as fast as
+   int8/rk8v4.
+4. **DFlash2 costs 20% on the 27B and no draft count below 7 has ever been tried** (§2c).
+   `scripts/sweeps/dflash2-draft-tokens.ps1` sweeps 1..12 with and without the draft head.
+5. **The calculator's speculative-memory gap** (§2b). Live on master and linked from README, so
+   every speculative configuration it reports is roughly 170 MiB optimistic.
+   `scripts/sweeps/speculative-memory-terms.ps1` reads every term the page needs in about ten
+   minutes; this is implementing, not investigating.
+6. **The two test-criterion outliers** (§4). Small, and neither needs hardware this box lacks.
 
-Only one open item now needs hardware this box lacks (§2). The rest is measurement debt (§3),
-calibration (§4) or policy calls (§6).
+Only one open item now needs hardware this box does not have (§2). The rest is measurement debt
+(§3), calibration (§4) or policy calls (§6).
 
 **Keep `investigate/small-t-upstream` until the next catch-up.** It is merged, but it is the clean
-record of how upstream's small-T was adopted and what had to be fixed (`19c7617c` and its parents).
-The next merge from `neroued/master` will touch the same subsystem.
+record of how upstream's small-T was adopted and what had to be fixed (`19c7617c` and its
+parents). The next merge from `neroued/master` will touch the same subsystem.
 
 ---
 
 ## 1. Correctness and coverage
 
-### 1.1 `attn_input_proj` grossly wrong at `W8 DFlash2 A16 T=112 graph phase=1`
+### 1.1 `attn_input_proj` grossly wrong at `W8 DFlash2 A16 T=112 graph phase=1` — closed
 
-- [ ] Not a tolerance miss — `actual=34` against `reference=-65.9`, `actual=4.09` against `67.15`,
-      on q, k *and* value. Seen in **2 of 6 full-suite runs** (`ctest -j2`), always that exact case
-      and always the graph-replay phase; passes 3/3 in isolation.
+- [x] **A race in the test harness, not in any kernel.** Closed by #44, 2026-09-09.
 
-      Two reasons this outranks everything else. **`T=112` sits in the `{97,128}` →
-      `R32C64K128` band retuned in PR #16**, which shipped in v0.9.0. And the criterion involved
-      was *loosened* by the §5 floor and still fails loudly, which rules out tolerance — the values
-      are ~10x off.
+      `DeviceBuffer::copy_from_host` uses `cudaMemcpy`, and for a host-to-device copy out of
+      *pageable* memory CUDA documents that the call returns once the source has been staged
+      for DMA, "but the DMA to final destination may not have completed". That trailing DMA
+      completes on the legacy stream, and every stream `DeviceContext` owns is created with
+      `cudaStreamNonBlocking`, which is exempt from the legacy stream's implicit ordering. So
+      "stage the inputs, then launch on the engine stream" is a race, and it is the sequence
+      every Op test's setup uses.
 
-      **Four hypotheses ruled out. Do not repeat these** — 69 targeted iterations across five
-      isolation experiments, of which only the full-suite row reproduced:
+      A faithful replica of exactly what the failing case runs — a 1,146,880-byte pageable
+      H2D, three `cudaMemsetAsync` on a non-blocking stream, then a captured graph launched on
+      it — read stale bytes in **146 of 200 iterations**, up to 17.8% of the buffer, on an
+      otherwise idle GPU. With `cudaStreamSynchronize(nullptr)` after the copy: 0 of 200.
+      Copies at or below ~256 KiB never raced; every size above it did.
 
-      | experiment | iterations | reproduced |
+      Every property of the reported failure follows: only the graph-replay phase, because it
+      is the only phase that re-uploads its activation; q, k *and* value at once, because they
+      share one input; never in isolation, because an idle box lands the DMA in time; and the
+      input verifying clean afterwards, because by then the DMA has long finished.
+
+      `tests/test_device_buffer_visibility.cu` is the reproducer kept as a regression test. It
+      reads stale data in roughly 90 of every 100 iterations against an unsynchronized
+      `DeviceBuffer`.
+
+      **The part worth keeping.** The window is narrow enough that instrumentation closes it.
+      Two probes were built and both were useless for opposite reasons: a D2H read-back on the
+      same stream, ordered ahead of the kernel, made the race vanish entirely (the copy engine
+      serializes the in-flight H2D behind it), and an early draft of the regression test
+      cleared its counter with `DeviceBuffer::fill` between the copy and the stream work —
+      one synchronous runtime call in the gap, and 0 races out of 90 where there should have
+      been 84. When measuring a race, check that your instrument still shows it on a case you
+      know is broken.
+
+### 1.2 Real-model tests — all six now run and pass
+
+- [x] **Re-run on 2026-09-09, idle GPU, serially and under `ctest -j2`.** Full suite **126/126**.
+
+      | test | before | now |
       |---|---|---|
-      | full `ctest -j2` | 6 (across two builds) | **2** |
-      | `-R` subset of 11 related tests, `-j2` | 6 | 0 |
-      | full attn test vs one long-lived partner | 14 | 0 |
-      | `--dflash2-only` vs one long-lived partner | 40 | 0 |
-      | attn test alone | 3 | 0 |
+      | `27b_prefix_real` | failed (host-KV pin) | **passes** |
+      | `27b_score_real` | failed (`a repeated score window inherited prior State/KV`) | **passes** |
+      | `27b_dflash2_real` | failed (host-KV pin) | **passes** |
+      | `27b_load_plan` | skipped | **passes** with `NINFER_QWEN3_6_27B_NVFP4_WEIGHTS` set |
+      | `35b_a3b_real` | failed (host-KV pin) | **passes** |
+      | `35b_a3b_dflash_real` | failed (host-KV pin) | **passes** |
 
-      - **Not tolerance.** One failure was on the §5 loosened-floor build, and the values are ~10x
-        off — two orders of magnitude past any plausible bound.
-      - **Not memory pressure**, the original assumption. On a 24,576 MiB card the idle baseline is
-        1,782 MiB and the partner tests peak at 2,135 MiB: **353 MiB of added load, leaving
-        21.9 GiB free at the peak.** Nothing is near a capacity limit.
-      - **Not single-partner compute contention**, across 54 iterations that provably covered the
-        case (`NINFER_OP_REPORT_STATS=1` confirms `--dflash2-only` runs all three of q/k/value at
-        `T=112 graph phase=1`).
-      - **Not modest process churn** — 11 tests under `-j2`, six times, stayed clean.
+      Three separate defects were behind those, and none of them was the model:
 
-      So the trigger is something only the *full* 125-test run supplies: cumulative allocator state
-      across many processes, a specific predecessor test, or duration. **The next step is not
-      another contention harness** — it is to catch a failing full-suite run with instrumentation
-      already attached (dump the failing tile's inputs, or loop the suite overnight capturing
-      `NINFER_OP_REPORT_STATS=1` for this Op only).
+      1. **The pinned host KV cache could not be reserved beside any shipped model** (#45, and
+         see §6). On Windows a pinned host allocation is charged against VRAM, so the 8 GiB
+         default failed with the card full and tens of GiB of system RAM free.
+      2. **`score_real` was a real correctness defect** — fp8/nvfp4/k8v4 attention corrupting
+         every prefill output column but the last (#49, and see §5).
+      3. **`load_plan` crashed silently** rather than reporting, because it had no top-level
+         catch (#46), and the environment variable naming its second artifact was missing from
+         the handoff block above.
 
-      *Method note, because it wasted two attempts:* the first harnesses shelled out to
-      `ninfer_softmax_attention_nvfp4_test.exe` / `_k8v4_test.exe`, which **do not exist** — those
-      are ctest entries sharing one binary with `--nvfp4-only` / `--k8v4-only`. `Start-Process`
-      failed silently, no load ever ran, and the "clean" results were meaningless. Resolve binaries
-      with `Resolve-Path`, assert the partner is alive, and take argument lists from
-      `build-ninja/tests/CTestTestfile.cmake`.
+      `NINFER_QWEN3_6_27B_NVFP4_WEIGHTS` is the one environment variable the handoff block at
+      the top of this file was missing; the artifact has been on disk all along.
 
-### 1.2 Real-model tests pin maximum configurations, not this box's capability
+      **`27b_load_plan` now pins a hardware bound rather than skipping.** Its NVFP4 case plans
+      a 1,024-token prefill chunk, and on sm_86 that cannot exist: NVFP4 weights need A4
+      execution, which is sm_100a/sm_120a only, so the policy degrades to `A16Only`, and NVFP4
+      A16 `linear_swiglu` is registered through T=16 and no further. The test asserts the
+      refusal and its message, so a wider registration would fail it rather than pass silently.
 
-- [ ] Measured via the CLI, which is the honest way to size them:
-
-      | model | configuration | result |
-      |---|---|---|
-      | 27B | 131,072 ctx, int8 | **works** — 4.44 GiB reservation, 449 MiB spare |
-      | 27B | 32,768 ctx, int8, `--vision` | **works** — 2.01 GiB reservation, 2.54 GiB spare |
-      | 35B-A3B | 32,768 ctx, int8 | **works** — 513.7 MiB reservation, 726 MiB spare |
-
-      There is room for meaningful end-to-end coverage; the tests simply pin
-      262,144-context/vision/batch-8 layouts. `NINFER_REAL_TEST_MAX_CONTEXT` lowers the ceiling the
-      35B's `exercise_maximum_configuration` asks for (unset, the pinned 256K layout runs as
-      before).
-
-      **The 35B's remaining blocker is its *base* engine, not the maximum one:** 20.8 GiB of
-      weights plus a 472 MB runtime reservation against ~21.4 GiB free leaves it **~93 MB short**
-      when the desktop holds ~2.4 GB. Closing a couple of GPU clients is enough. Decide whether the
-      base config should also honour the env var, or skip with a clear message when the reservation
-      genuinely will not fit.
-
-- [ ] **Six real-model tests skip** for want of artifacts/env vars: `27b_prefix_real`,
-      `27b_score_real`, `27b_load_plan`, `35b_a3b_real`, `35b_a3b_dflash_real`,
-      `35b_a3b_dflash_load_plan`. Some fail environmentally on this host rather than from a defect
-      — see `ninfer-3090-35b-real-tests-environmental` in memory.
-
-      **The artifact half of this is now gone** (2026-09-08): the Qwen3.6 27B artifact and a
-      DFlash-carrying 35B are both local and pinned, per §2. Nobody has re-run the six since. Do
-      that before treating any of them as blocked, and expect at least one real failure rather than
-      a skip — `27b_score_real` was last seen reporting *a repeated score window inherited prior
-      State/KV*, which is a defect the missing artifact was masking.
-
-#### Running the real-model tests here (verified 2026-09-07, idle GPU)
-
-```
-NINFER_QWEN3_8_27B_WEIGHTS=C:\Ninefer-3090\models\qwen3_8_27b.ninfer
-NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS=C:\Ninefer-3090\models\qwen3_8_27b_dflash2.ninfer
-NINFER_QWEN3_6_35B_A3B_WEIGHTS=C:\Ninefer-3090\models\qwen3_6_35b_a3b.ninfer
-NINFER_REAL_TEST_MAX_CONTEXT=8192      # only needed for the 35B
-```
-
-| test | with an idle GPU |
-|---|---|
-| `27b_prefix_real` | **passes** (10.4 s) |
-| `27b_dflash2_real` | **passes** (23.6 s) — wired via `TEST_ARGS` |
-| `35b_a3b_real` | **passes** with `NINFER_REAL_TEST_MAX_CONTEXT=8192` |
-| the other four | skip — need a Qwen3.6 27B artifact, or a DFlash-carrying 35B artifact |
-
-**Free VRAM is decisive, not marginal.** Desktop busy (~4.4 GiB free): `27b_prefix_real` skips.
-Idle (~21.9 GiB free): it passes. The 35B's runtime reservation scales with the ceiling —
-262,144 → 4.15 GB, 32,768 → 1.48 GB, 16,384 → 1.29 GB, 8,192 → fits — against ~1.02 GiB available
-once the 20.8 GiB of weights are resident.
+- [x] **The maximum-configuration judgement call, resolved.** The tests pin layouts sized for a
+      card this box does not have, and `NINFER_REAL_TEST_MAX_CONTEXT` already lowers the ceiling
+      the 35B's `exercise_maximum_configuration` asks for. With the host-KV fix in place the
+      *base* engine now fits without closing anything, so the remaining question — whether the
+      base config should also honour the env var — is moot: it starts. Left as it is.
 
 ### 1.3 `docs/config-calculator.html` undercounts startup memory for speculative configurations
 
@@ -271,12 +280,14 @@ recurs, and because the follow-on work below only exists now that they are gone.
 - [x] **The Qwen3.6 27B artifact** — downloaded and pinned at `faaa0c14` (#31), so the four tests
       in §1.2 that wanted it are no longer artifact-blocked.
 
-### Unblocked, and now owed work
+### Unblocked, and now owed work — closed
 
-- [ ] **Re-run the six real-model tests now that both artifacts exist** (§1.2). Their skip reasons
-      are gone; what actually passes on this box is unknown. `27b_score_real` in particular was
-      last seen failing with *a repeated score window inherited prior State/KV* — a genuine defect
-      the missing artifact was hiding, not an environmental skip.
+- [x] **Re-run the six real-model tests now that both artifacts exist** (§1.2). Done 2026-09-09.
+      All six run and pass. `27b_score_real` was indeed hiding a genuine defect rather than an
+      environmental skip, and it was worse than the message suggested: not State/KV inheritance
+      but a data race corrupting every prefill output column but the last, in three of the six KV
+      formats (#49, §5). The other four were failing on the pinned host-KV allocation (#45, §6),
+      and `27b_load_plan` needed one environment variable that the handoff block had never listed.
 
 ---
 
@@ -361,45 +372,92 @@ has to re-derive it.
 
 ## 2c. Performance left on the table
 
-Nothing here was in this file before 2026-09-08, which is itself the point: the KV sweeps were run
-to document formats, and these fell out of the data on the way. Ordered by size of the prize.
+Ordered by size of the prize. The first three entries were rewritten on 2026-09-09, when the
+roofline finally acquired a denominator; read them before the rest.
 
-**Read the first entry before any of the others.** The rest of this section is specific kernels and
-features. The first one says the whole decode path has room in it, and no work here has ever been
-framed against a roofline — every performance change in this repository so far has been *relative*
-("this schedule beats that one"), never *absolute* ("this is N% of what the card can do"). That is
-the gap most likely to be hiding real speed.
+- [x] **Dense decode runs at 65-66% of the card's memory bandwidth.** Closed by #50 and #51 — the
+      observation was right that headroom exists, and wrong in both of its terms.
 
-- [ ] **Dense decode runs at 65-66% of the card's memory bandwidth, and nobody has ever checked.**
-      Decode is memory-bound: each token streams the resident weights once plus the KV it attends
-      over. Against the 3090's 936.2 GB/s, from this cycle's own measurements (single lane, **no
-      speculation**, so tokens and weight-read rounds are the same thing):
+      *936.2 GB/s is not a ceiling anything reaches.* It is the advertised 384-bit GDDR6X at
+      19.5 Gbps. `tools/hbm_bandwidth_probe.cu` was already in the tree and had never been
+      pointed at this card. 4 GiB working set (683x L2), best of five: read 854.2 GB/s (91.3% of
+      advertised), memset-write 863.3, kernel write 824.1, D2D copy 813.2. Decode streams
+      weights and KV *in*, so 854.2 GB/s is its ceiling.
 
-      | model | KV | depth | tok/s | achieved | % of peak |
+      *Resident is not read.* `weights_capacity_bytes` counts the vision tower, MTP and DFlash
+      when unselected, the draft head with speculation off, and all but one row of the token
+      embedding — 2.47 GB of the 27B that never moves per token.
+      `tools/decode_byte_accounting.py` counts what a token actually touches, from the
+      artifact's own object directory: **15.743 GB** on the 27B.
+
+      | model | kv | depth | tok/s | achieved | % achievable |
       |---|---|---:|---:|---:|---:|
-      | 27B dense | `int8` | 4,096 | 36.15 | 623 GB/s | **66.5%** |
-      | 27B dense | `int8` | 16,384 | 35.11 | 620 GB/s | **66.2%** |
-      | 27B dense | `int8` | 32,768 | 33.86 | 616 GB/s | **65.8%** |
-      | 27B dense | `rk8v4` | 32,768 | 33.54 | 602 GB/s | **64.3%** |
+      | 27B dense | int8 | 4,096 | 37.44 | 595 GB/s | 69.6% |
+      | 27B dense | int8 | 32,768 | 33.56 | 565 GB/s | 66.2% |
 
-      Flat across depth and across KV format, which says it is a property of the decode path rather
-      than of anything the KV work touched. A well-tuned memory-bound decode generally reaches
-      75-85% of peak. Closing even half that gap is roughly **36 → 41 tok/s on the 27B**, which is
-      larger than everything else in this section combined and applies to every configuration
-      rather than one feature.
+      So the dense path sits around two-thirds of what the card can deliver, not 66% of an
+      unreachable number. Real headroom, roughly thirteen points, and still unprofiled.
 
-      This is a headline number, not a diagnosis: it says the room exists, not where it is. Next
-      step is a profile of one decode step (`--profile-measured` exists on `ninfer_bench`) to find
-      where the stall is — occupancy, L2 behaviour, or a launch gap between the per-layer kernels.
+- [x] **Nobody knows where the MoE sits at all, because the accounting does not exist.** Closed by
+      #50. It exists now, and it changes which entry in this section matters most.
 
-- [ ] **Nobody knows where the MoE sits at all, because the accounting does not exist.** Applying
-      the same arithmetic to the 35B returns *391% of peak*, which is not a result, it is a proof
-      that the formula does not apply: an A3B MoE activates a fraction of its 21.04 GB per token,
-      so it never reads resident weights the way the dense model does. The bytes actually touched
-      per token — shared attention weights plus whichever experts route — have never been counted,
-      so there is no denominator, and therefore no way to say whether the 35B's 174 tok/s is close
-      to its ceiling or half of it. **Do that accounting before optimising anything on the MoE
-      path**; it is arithmetic over the artifact's layer inventory, not a measurement.
+      An A3B MoE reads 1.943 GB of dense text weight per token plus 8 of 256 experts per layer —
+      0.580 GB out of 18.556 GB of experts resident — for **2.522 GB per token**. Against the
+      854.2 GB/s read ceiling:
+
+      | model | kv | depth | tok/s | achieved | % achievable |
+      |---|---|---:|---:|---:|---:|
+      | 35B-A3B | int8 | 4,096 | 169.55 | 435 GB/s | 50.9% |
+      | 35B-A3B | int8 | 16,384 | 163.39 | 440 GB/s | 51.6% |
+      | 35B-A3B | int8 | 32,768 | 153.62 | 441 GB/s | 51.6% |
+
+      **Flat to within a point across an eightfold change in cache depth**, which is a far
+      cleaner signal than the dense model's gentle decay: whatever limits the MoE is not the
+      cache and not the depth.
+
+      This reverses the ordering this section opened with. The dense path has about thirteen
+      points of headroom; **the MoE has about thirty**, on the model the release recommends. A
+      gather of 8 scattered expert blocks per layer is the obvious suspect and is where the
+      profile should start. `scripts/sweeps/decode-step-profile.ps1` (#51) is the tooling.
+
+- [x] **Profile one decode step.** Done 2026-09-09 (#53), and it says the shortfall is inside the
+      kernels rather than between them — on both models, but for different reasons.
+
+      | workload | launches | GPU busy | wall | idle |
+      |---|---:|---:|---:|---:|
+      | 27B dense decode | 83,623 | 3,368 ms | 3,528 ms | 4.5% |
+      | 35B-A3B decode | 57,770 | 708 ms | 811 ms | 12.6% |
+      | 27B dense prefill | 87,110 | 6,524 ms | 6,684 ms | 2.4% |
+      | 35B-A3B prefill | 60,715 | 1,397 ms | 1,504 ms | 7.1% |
+
+      Dividing the read set into *busy* time alone: 27B 598 GB/s (70.0% of achievable), 35B
+      456 GB/s (53.4%). So closing every launch gap buys 4.5% on the dense path and 12.6% on the
+      MoE, and the rest is kernel efficiency.
+
+      **On the MoE the shortfall has an address.** Bytes attributed from the artifact inventory,
+      instance counts fixing the mapping (129 rounds, 40 text layers, 8 of 256 experts):
+
+      | kernel | bytes | time | achieved | % achievable |
+      |---|---:|---:|---:|---:|
+      | `sparse_moe_d3` (routed gate_up) | 8.91 MB | 23.4 µs | 381 GB/s | **44.6%** |
+      | `sparse_moe_d4` (routed down) | 5.58 MB | 16.4 µs | 340 GB/s | **39.9%** |
+      | `w8_k2048_decode` (gdn qkv_z) | 26.74 MB | 38.2 µs | 700 GB/s | 81.9% |
+      | `q6_rowsplit_gemm_simt` (output head) | 397.31 MB | 595.6 µs | 667 GB/s | 78.1% |
+
+      The expert kernels reach 40-45% of what the card can read while *contiguous* weight kernels
+      on the same step in the same model reach 78-82%. The four `sparse_moe` stages are 38% of
+      decode busy time. That is the gather of eight scattered expert blocks per layer, measured
+      rather than suspected, and it is the single largest identified opportunity in this file.
+
+      The 27B is a different shape: 86% of its busy time is four GEMV kernels that *are* the weight
+      streaming, so its remaining thirty points are inside those.
+
+      *Two instrument bugs on the way, both of which produced confident nonsense.* `-pg 4096,128`
+      captures prefill and decode together and prefill dominates — the 27B's top kernel came back
+      as 256 launches of `q4a8_swiglu`, which is 4 prefill chunks x 64 layers. Then decode reported
+      **99.3% GPU idle** from 807 launches over 128 steps of a 64-layer model, about six kernels
+      per step, because nsys records a CUDA graph replay as one opaque entity unless given
+      `--cuda-graph-trace=node`. Both reasons are written into the script.
 
 - [ ] **Eight lanes buy 3.2x, not 8x, and the reason is unestablished.** README's own cohort table
       has C1 decode at 78.71 tok/s against C8 at 250.26. Batched decode amortises the weight read
@@ -453,8 +511,17 @@ the gap most likely to be hiding real speed.
       draft count makes text positive, say so in the docs and scope the feature to vision rather
       than leaving it as an apparently-free option.
 
-- [ ] **The three KV formats with the worst decode falloff are exactly the three that are not
-      run-to-run deterministic.** Falloff from a 4,096- to a 32,768-token cache, no speculation:
+- [ ] **The three KV formats with the worst decode falloff were exactly the three that were not
+      run-to-run deterministic — and that turned out to be a coincidence.** #49 fixed the
+      non-determinism completely and the falloff did not move. Re-measured after it, and after the
+      split-tier change in #52:
+
+      | model | int8 | rk8v4 | fp8 | k8v4 | nvfp4 |
+      |---|---:|---:|---:|---:|---:|
+      | 27B dense | −10.4% | −7.9% | −12.5% | −15.6% | −18.0% |
+      | 35B-A3B | −9.4% | −7.2% | −21.3% | −26.0% | −21.4% |
+
+      The original table, kept because the ratios are what matter and they are unchanged:
 
       | format | 27B | 35B | deterministic (§5) |
       |---|---:|---:|---|
@@ -486,17 +553,19 @@ the gap most likely to be hiding real speed.
       | `nvfp4` | 85 | 69 | **69** |
       | `k8v4` | 85 | 69 | **69** |
 
-      nvfp4 and k8v4 run 19% fewer splits than the code intends, at exactly the depths where they
-      measure worst, and nothing reports the discrepancy. Extending the condition at
-      `small_t.cu:50` to `Nvfp4Group16` and `Fp8KeyNvfp4Value` and re-running
-      `scripts/sweeps/kv-decode-vs-depth.ps1` is a cheap test of how much of the falloff that is.
+      **That experiment was run (#52) and it refutes the hypothesis.** Extending the grant to
+      `Nvfp4Group16` and `Fp8KeyNvfp4Value` made them *slower* on the 35B -- -3.1%/-2.5%/-2.3% at
+      4,096/16,384/32,768 against an fp8 control that moved 0.3% -- and removing the bump from fp8
+      as well gained 0.4%/0.5%/1.2%. More splits at depth is worse for every quantized format, the
+      host's default tier was the better number, and the special case is now gone from both sides.
+      The falloff is unchanged by it and still wants an explanation.
       Note it cannot be the whole story: fp8 *does* get 85 splits and still falls off 21% on the
       35B, so it is paying something else — plausibly `KeyBlock` pinned to 32 rather than the int8
       path's 64, forced by sm_86's shared-memory budget because the fp8 kernel keeps dequantized
       BF16 copies of K *and* V (`small_t_fp8.cu:26-29`).
 
-      **What this entry originally claimed, wrongly.** It read the §5 non-determinism and this
-      falloff as one root cause — "a split reduction whose order varies, or an atomic
+      **What this entry originally claimed, wrongly — now settled.** It read the §5
+      non-determinism and this falloff as one root cause — "a split reduction whose order varies, or an atomic
       accumulation". There are **no atomics anywhere** in `src/ops/softmax_attention/`, and both
       reducers accumulate over an identical ordered `for (split = 0; split < active_splits; ++split)`
       loop, which is deterministic given the same split count. So the correlation across six
@@ -568,75 +637,126 @@ doing:
 
 ## 5. Reproducibility
 
-- [ ] **The speculative decode sweep measures acceptance, not depth, and cannot be read like the
-      non-speculative one.** `scripts/sweeps/kv-decode-with-speculation.ps1` produced 35B INT8 at
-      212.19 tok/s on a 4,096-token cache and **316.83 tok/s on a 32,768-token one** — faster
-      deeper, which is not physical. Acceptance went 58.3% → 100% between those two points, and on
-      the fixed `bench_corpus.ids` a draft can simply be right every time on a repetitive stretch.
-      Several rows sit at exactly 100%. So those tok/s figures describe what the corpus does to the
-      draft, not what depth does to attention, and none of them are in README or the calculator for
-      that reason. Speculative throughput needs a corpus with realistic diversity, or many more
-      repetitions, before it means anything. The memory columns from the same run **are** sound —
-      they are read at load and do not depend on the corpus.
+- [x] **fp8, k8v4 and nvfp4 causal attention are not run-to-run deterministic.** Closed by #49,
+      2026-09-09, and it was not a tolerance curiosity — it was a data race corrupting output.
 
-- [ ] **The published perplexity figures for fp8, k8v4 and nvfp4 are single runs of a
-      non-deterministic path.** README's six-format table and the calculator both carry
-      `fp8 4.347181` and `k8v4 4.347596`, a gap of 0.0096%, and those two formats are named in the
-      entry directly below as not run-to-run deterministic. 261,167 scored tokens should average
-      most of that away, but nobody has checked, so **the fp8-versus-k8v4 ordering may not be
-      real** — and it is currently the stated reason for preferring one over the other. One repeat
-      run of each settles it; if the spread is comparable to the gap, say so beside the numbers
-      rather than ranking them. `bf16`, `int8` and `rk8v4` are unaffected: the same entry records
-      those as byte-identical across runs.
+      Five quantized kernels called `dequant_k_tile()` immediately after `cp_wait<0>()` with no
+      `__syncthreads()` between them. `cp_wait<0>()` retires only the *calling thread's*
+      cp.async group, while `dequant_k_tile()` has every thread walk the whole tile, so each
+      thread reads bytes another thread issued. The prologue in the same files pairs the two
+      correctly and the lambda's own comment states the requirement; only the steady-state loop
+      omitted it, and it omitted it in exactly the three storage families named here. bf16 and
+      int8 pair them everywhere and were always byte-identical.
+
+      What it cost, on the 27B through `EnginePurpose::CausalScoring`: `score_tokens` called
+      twice on the same window disagreed on **all 1024** logprobs — median 0.2, mean 3.2, worst
+      ~26. A token at -0.0013 in one run was -22.61 in the next: p about 1 becoming p about
+      1e-10. Total logprob over a 200-token window ranged from -352 to -588 across five calls in
+      one process, and again across processes. int8 and bf16 returned the identical checksum
+      every time.
+
+      **Why it hid for so long.** Greedy decode reads only the last column's hidden state.
+      Prefill's other columns — the ones scoring and perplexity consume — are discarded there,
+      so generation looked perfect and stayed byte-identical while the same kernels were
+      producing garbage for every other position.
+
+      After the fix, `ninfer_softmax_attention_test` run three times from one binary is
+      byte-identical (15 differing `OP_ERROR_STATS` lines before), and `27b_score_real` reports
+      `max_overlap_error=0` for fp8, nvfp4, k8v4 and int8 alike.
+
+      *Ruled out on the way, so it is not re-investigated:* the `split >= active_split_count`
+      early return in the small_t partial kernels skips `write_neutral()`, which §2c flags as
+      safe only by coincidence. Writing the merge identity there changed nothing — 15 differing
+      lines before and after. It is a latent hazard, not this defect.
+
+- [ ] **The published perplexity figures for fp8, k8v4 and nvfp4 are not just single runs, they
+      were measured through the race above.** README's six-format table and the calculator both
+      carry `fp8 4.347181` and `k8v4 4.347596`, a gap of 0.0096%, and perplexity is scored
+      through exactly the prefill path #49 fixed — every output column but the last was
+      corrupted. So these are not "probably fine, averaged over 261,167 tokens": they are
+      measurements of a broken kernel, and the fp8-versus-k8v4 ordering they are used to justify
+      means nothing. **Re-measure all three, twice each, and only then decide whether the
+      ordering is real.** `bf16`, `int8` and `rk8v4` are unaffected — different kernels,
+      byte-identical across runs, and their numbers stand.
 
 - [ ] **fp8 and k8v4 are dominated on all three axes and nothing says so structurally.** Each is
       beaten by `rk8v4` on size, decode-at-depth and perplexity simultaneously (README's table).
-      That is a documentation statement today; decide whether it should be more — de-emphasised in
-      `--help`, or left fully available on the grounds that upstream parity is worth more than
-      steering. Not a defect either way, but the measurement is in and the decision is not.
+      Hold this until the re-measurement above lands: two of the three axes were measured on the
+      racy path, so the domination claim itself is now unproven. If it survives re-measurement,
+      decide whether to de-emphasise them in `--help` or leave them fully available on the
+      grounds that upstream parity is worth more than steering.
 
-- [ ] **fp8, k8v4 and nvfp4 causal attention are not run-to-run deterministic.** Running
-      `ninfer_softmax_attention_test` twice from the *same binary* produces ~36 differing
-      `OP_ERROR_STATS` lines, always in those three storage families (plus a couple of bf16 geometry
-      lines); int8-g64 and rk8v4 are byte-identical across runs. All of it stays well inside
-      tolerance, so nothing fails — but those cases **cannot be used for exact-match regression
-      checks**, and it cost a real detour: after a change touching only the INT8 prompt loader, 34
-      stat lines moved and looked like collateral damage until a same-binary control run showed the
-      same 36 lines moving on their own. A split reduction whose order varies, or an atomic
-      accumulation, would both explain it. Until then, diff *only the storage family you changed*.
-
----
+- [ ] **The speculative decode sweep measures acceptance, not depth, and cannot be read like the
+      non-speculative one.** `scripts/sweeps/kv-decode-with-speculation.ps1` produced 35B INT8 at
+      212.19 tok/s on a 4,096-token cache and **316.83 tok/s on a 32,768-token one** — faster
+      deeper, which is not physical. Acceptance went 58.3% to 100% between those two points, and
+      on the fixed `bench_corpus.ids` a draft can simply be right every time on a repetitive
+      stretch. Several rows sit at exactly 100%. So those tok/s figures describe what the corpus
+      does to the draft, not what depth does to attention, and none of them are in README or the
+      calculator for that reason. Speculative throughput needs a corpus with realistic diversity,
+      or many more repetitions, before it means anything. The memory columns from the same run
+      **are** sound — they are read at load and do not depend on the corpus.
 
 ## 6. Operational
 
-- [ ] **The pinned host-KV default is 8 GiB regardless of host RAM.** #25 made the failure
-      *diagnosable* — the CUDA "out of memory" text now names the size, says it is system RAM not
-      VRAM, and names `--host-kv-mib` and `--no-prefix-reuse`. It did not change the sizing, which
-      is a policy question needing its own measurement: what "available" means differs by OS, and
-      shrinking it silently would regress prefix reuse for people who have the memory.
-- [ ] **The unpinned downloaders cannot verify anything they fetch.** #31 gave the pinned
-      downloaders revision-scoped staging plus size and SHA-256 verification. `download-qwen38-27b`
-      (both the script and the flake entry) and `flake.nix`'s `download-qwen36-35b-v2` deliberately
-      track upstream `main`, so they have no expected size or hash to check against: a truncated or
-      corrupt 17 GB download is accepted silently and, because `main` can move between runs, they
-      cannot safely resume either. Pinning `qwen3_8_27b` would close it at the cost of freezing
-      people to a revision that goes stale — a policy call, not a bug. Whatever is decided, the
-      asymmetry should be stated where people choose a downloader.
+- [x] **The pinned host-KV default is 8 GiB regardless of host RAM.** Closed by #45, 2026-09-09,
+      and the framing was wrong: host RAM was never the constraint.
 
-- [ ] **`package-release-rtx4090-early1.ps1` has no Linux counterpart.** `check-linux-scripts.sh`
-      requires every `.bat`/`.ps1` to have one, and #31 exempted this file by name so the check
-      could run at all. Either write the counterpart or leave the exemption, but it is a list that
-      will rot silently if release packaging grows another Windows-only script.
+      On Windows/WDDM a pinned host allocation is mapped into the GPU's address space and
+      charged against the card. Measured on this 24,576 MiB 3090, allocating N MiB on the device
+      and then finding the largest pin that succeeds:
+
+      | device resident | VRAM free | largest pin |
+      |---:|---:|---:|
+      | 15,360 MiB | 7,972 MiB | 8,192 MiB |
+      | 17,408 MiB | 5,924 MiB | 6,656 MiB |
+      | 19,456 MiB | 3,876 MiB | 3,840 MiB |
+      | 21,504 MiB | 1,828 MiB | 2,816 MiB |
+      | 22,528 MiB |   804 MiB | 1,536 MiB |
+
+      Resident-device plus pinned-host lands within a few hundred MiB of the card's capacity
+      every time. The failure is `cudaErrorAlreadyMapped`, not out-of-memory, and #25's
+      diagnostic read it as "this is system RAM, not VRAM" — exactly backwards, which is what
+      sent the investigation the wrong way for an hour.
+
+      **Backing off does not work, and this is the part to remember.** One failed
+      `cudaMallocHost` poisons every later one in the process. With 2,852 MiB free, 1,024 MiB
+      succeeded twice; then a deliberate 8,192 MiB failure made 1,024, 256 and even **64 MiB**
+      fail with the same error, and `cudaGetLastError` did not clear it. A halving retry loop was
+      written and abandoned on that evidence. The size is now clamped before the first attempt,
+      to free VRAM less 1 GiB and then halved, Windows only.
+
+      **Still owed:** the shipped `run-*-maxctx` launchers pass `--host-kv-mib 8192` explicitly
+      and fill the card with KV, so on Windows they now silently get a fraction of what they ask
+      for. Per the table they could never have had 8 GiB. The flag should say something
+      achievable, or go.
+
+- [x] **The unpinned downloaders cannot verify anything they fetch.** Closed by #48, 2026-09-09.
+      `download-qwen38-27b.{sh,bat}` had in fact already pinned `18dfc887` in their URL — they
+      simply verified nothing and resumed onto the final path. They now stage under a
+      revision-scoped name and check size and SHA-256, matching `download-qwen36-27b`.
+      `flake.nix` had been tracking `main` for the same model, so `nix run` and the shell script
+      could fetch different artifacts; it is pinned to match. The local artifact every published
+      27B number was measured against hashes to the pinned revision, so the pin also records
+      which bytes those numbers describe. One downloader stays unverifiable by design —
+      `download-qwen36-35b-v2` tracks upstream `main`, which is the whole point of it — and
+      README now says so where people choose.
+
+- [x] **`package-release-rtx4090-early1.ps1` has no Linux counterpart.** Closed by #47. The
+      counterpart is written and the `windows_only` exemption list is deleted rather than left
+      empty. The same PR made that loop accumulate its misses instead of exiting at the first,
+      and added an executable-bit check read from the git index rather than the filesystem —
+      which immediately found four scripts committed at 644, including
+      `scripts/package-release-v090.sh`, the current release's own Linux packager.
 
 - [ ] **Binaries embed their build directory.** `/home/ash/ninfer-rel/src/...` appears 200 times in
       the Linux binaries and `C:\ninfer-fork\ninfer-3090\...` about 466 times in the Windows ones,
       via `__FILE__` and nvcc source paths. Pre-existing (v0.8.1 embedded `/mnt/c/ninfer-fork/...`
       405 times) and not a secret — the file names are already public and no Windows binary
       contains a `C:\Users\...` path. `-ffile-prefix-map=` plus `--compiler-options` for nvcc would
-      rewrite them to relative paths, which also makes assertion messages more readable. Cosmetic;
+      rewrite them to relative paths, which also makes assertion messages more readable. MSVC has
+      no documented equivalent; `/d1trimfile:` is the usual answer and is undocumented. Cosmetic;
       do it with a release build, not on its own.
-
----
 
 ## 7. Closed this cycle, and what it taught
 
@@ -658,6 +778,16 @@ Kept because the reasoning is what stops the same investigation being repeated.
 | #29 | repo housekeeping | worktrees removed, dead files deleted, `repro/` ignored rather than binned, PR #12 closed as the record |
 | #30 | DFlash2 attention sweep | the fixture sized the cache table by the **batch**, but `table_rows` are indices *into* the table; B=1 addressing row 7 indexed a one-element vector, unchecked |
 | — | §7 `prompt_i8` dedupe | already landed with the small-T adoption; the entry was simply stale |
+| #37 | master did not compile | a lambda introduced in #30's review commit could not see `order`; nothing had rebuilt that TU, so every "125/125" since was measured against a binary the tree could no longer produce |
+| #44 | the `T=112` graph-replay failure | not a kernel. `cudaMemcpy` out of pageable memory returns before the DMA lands, and the DMA rides the legacy stream that `cudaStreamNonBlocking` is exempt from |
+| #45 | the pinned host-KV default | on WDDM a pinned host allocation is charged against **VRAM**; #25's diagnostic asserted the opposite. And a failed `cudaMallocHost` poisons every later one, so back-off is impossible |
+| #46 | four real-model tests died as `0xc0000409` | no top-level catch, so `what()` never printed. `e06d7363` in a debugger is a C++ throw, not corruption |
+| #47 | the Linux guard did not guard | an exemption list, a loop that exited at its first complaint, and an `-x` check that cannot see a mode-644 file on Windows or WSL — which had let the current release's own Linux packager sit at 644 |
+| #48 | the 27B downloaders | already pinned, verified nothing; `flake.nix` disagreed with the shell scripts about which revision to fetch |
+| #49 | fp8/nvfp4/k8v4 non-determinism | a missing `__syncthreads()` between `cp_wait<0>()` and a whole-tile shared-memory read. Corrupted every prefill output column but the last, which is why generation looked perfect |
+| #52 | `SmallTMaximumSplits` | section 2c proposed extending the bump to nvfp4 and k8v4; measured, it made them 2.3-3.1% slower, and removing it from fp8 too gained 0.4-1.2%. The host was right and the device policy was wrong |
+| #53 | where the MoE's bandwidth goes | the expert gather runs at 40-45% of achievable while contiguous weight kernels on the same step reach 78-82% |
+| #50, #51 | the decode roofline | both terms were wrong: the ceiling is measured at 854 GB/s not 936, and the numerator is the read set not the resident set. Gave the MoE its first denominator |
 | — | `--vision-residency overlay` + DFlash2 | **was never blocked** — it runs on this one 3090 and always could have. See below |
 
 ### `--vision-residency overlay` + DFlash2 — verified working, 2026-09-08
@@ -678,7 +808,31 @@ more than once. It holds.
 **The lesson is about the list, not the feature**: "never run" had drifted into "cannot be run".
 Try it before writing it off; this took one command.
 
-Two recurring lessons worth carrying forward:
+**A correlation is not a mechanism, and this file said so twice before it mattered.** §2c noted
+that the three formats with the worst decode falloff were exactly the three that were not
+run-to-run deterministic, and wisely added "treat §5 as open on its own terms". #49 fixed the
+non-determinism completely and the falloff did not move at all. Two real defects sharing a
+population is not one defect.
+
+**Check that your instrument still fires on a case you know is broken.** Two probes were built
+for the `T=112` race and both were useless in opposite directions. A D2H read-back on the same
+stream, ordered ahead of the kernel, made the race vanish entirely — the copy engine serialises
+the in-flight H2D behind it. An early draft of the regression test cleared its counter with
+`DeviceBuffer::fill` between the copy and the stream work, and that one synchronous runtime call
+in the gap took 84 races out of 90 down to zero. Both looked like clean results.
+
+**The bug you can see is the one that does not matter.** fp8 attention was corrupting every
+prefill output column except the last, by up to 26 in logprob, for as long as anyone has been
+measuring perplexity with it — and greedy generation stayed byte-identical throughout, because
+greedy reads only the last column. `27b_score_real` was the only thing in the tree that looked,
+and it had been skipping for want of an artifact that was sitting on the disk.
+
+**"Resident" and "read" are different numbers and only one of them is a denominator.** Dividing
+throughput into `weights_capacity_bytes` overstated the dense path by six points and returned
+418% of peak on the MoE. The MoE figure had been in this file for a cycle, correctly labelled as
+a non-result, and the fix was arithmetic over the artifact rather than any measurement.
+
+Two from earlier cycles, still true:
 
 **Fix the class, not the flagged line.** #18 was reported as one route and was five. #24 was
 reported as one launcher and was four problems across six. Chasing the class is also what found the
