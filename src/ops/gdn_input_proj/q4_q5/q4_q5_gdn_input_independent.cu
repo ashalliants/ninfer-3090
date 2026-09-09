@@ -77,6 +77,16 @@ void launch_q4(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t 
     throw std::invalid_argument("Q4/Q5 GDN independent launch requires T in [1,15]");
 }
 
+// Where the Q5 half hands over from the split4 route to simt_r8_c8.
+//
+// 8, measured. split4 beats the grouped c8 tile that used to be routed at these widths by 5.9% at
+// width 7 and 13.2% at width 8, with the two spreads disjoint at both, and collapses at 9 on a
+// register cliff. The route table now sends {1,8} to IndependentDirectFixed and the c8 band is
+// gone. Numbers and method are in q4_q5_gdn_input_plan.cpp; the reason 9 collapses is on
+// launch_q5_split4_exact below. simt_r8_c8 keeps widths 9..15, which the route table does not
+// reach but the schedule bench does.
+constexpr std::int32_t kQ5Split4LastCols = 8;
+
 void launch_q5_gemv(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
                     cudaStream_t stream) {
     constexpr int kRowsPerBlock = 16;
@@ -108,6 +118,25 @@ void launch_q5_split4(const Tensor& x, const Weight& weight, Tensor& value, Tens
     CUDA_CHECK(cudaGetLastError());
 }
 
+// Instantiated to 16, not 6, and the extra ten are the point.
+//
+// This kernel is the highest-parallelism thing in the Op by an order of magnitude: one block per
+// output row with four warps splitting K and reducing through s_part, so 12,288 blocks and 49,152
+// warps -- 12.5 machine-fulls, against the grouped MMA tile's 0.26. TODO section 2c establishes
+// that the narrow-extent kernels here are parallelism-starved rather than bandwidth-bound, and this
+// is the one route that is not.
+//
+// It used to throw above T=6, which is why `launch_q5` fell back to the 3.12-machine-full
+// `simt_r8_c8` at exactly width 7 -- and that is where the schedule bench's `independent` column
+// jumps 188.4 -> 330.8 us for one extra column, with nothing else changing at that boundary (the q4
+// half moved to R8C8 back at T=4). When this cycle measured "extend the direct route to {{1, 15}}"
+// and recorded -3.6% at width 7, it was measuring `simt_r8_c8`; split4 was never tested above 6.
+//
+// Widening it is instantiation, not new code: the kernel is already generic in its column count
+// (`acc[kTt]`, `s_part[4][kTt]`, and a `tt` loop over `x + tt * kStride`). Watch the register
+// budget rather than the shared arena -- it carries `__launch_bounds__(128, 10)`, so 51 registers
+// per thread, and `acc[kTt]` costs one register per column; past roughly T=10 expect spills, which
+// will look like a loss for a reason that is not the geometry.
 void launch_q5_split4_exact(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
                             cudaStream_t stream) {
     switch (x.ne[1]) {
@@ -126,8 +155,14 @@ void launch_q5_split4_exact(const Tensor& x, const Weight& weight, Tensor& value
     case 6:
         launch_q5_split4<6>(x, weight, value, z, stream);
         return;
+    case 7:
+        launch_q5_split4<7>(x, weight, value, z, stream);
+        return;
+    case 8:
+        launch_q5_split4<8>(x, weight, value, z, stream);
+        return;
     default:
-        throw std::invalid_argument("GDN Q5 split4 requires T in [2,6]");
+        throw std::invalid_argument("GDN Q5 split4 requires T in [2,8]");
     }
 }
 
@@ -157,7 +192,7 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
         launch_q5_gemv(x, weight, value, z, stream);
         return;
     }
-    if (x.ne[1] <= 6) {
+    if (x.ne[1] <= kQ5Split4LastCols) {
         launch_q5_split4_exact(x, weight, value, z, stream);
         return;
     }
