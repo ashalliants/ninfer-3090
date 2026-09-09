@@ -25,6 +25,10 @@ if ($resolvedProductParent -ne $resolvedDist -or (Split-Path -Leaf $ProductRoot)
 }
 if (Test-Path -LiteralPath $ProductRoot) { Remove-Item -LiteralPath $ProductRoot -Recurse -Force }
 if (Test-Path -LiteralPath $ArchivePath) { Remove-Item -LiteralPath $ArchivePath -Force }
+# The checksum goes too, and before anything can fail. It is written last, so leaving a previous
+# run's copy in place means a mid-run failure can leave `dist` holding a new archive beside a
+# checksum for the old one -- and publishing that pair is worse than publishing neither.
+if (Test-Path -LiteralPath $ChecksumPath) { Remove-Item -LiteralPath $ChecksumPath -Force }
 New-Item -ItemType Directory -Path $ProductRoot | Out-Null
 
 foreach ($product in $Products) {

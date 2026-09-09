@@ -196,7 +196,8 @@ runs:
 | 10 | 42.4 | +12.4% |
 | 12 | 40.6 | +7.6% |
 
-Seven costs 18.5% against four. There is a distinct cliff between five and six — 57.2 to 48.4 —
+Seven costs 18.4% against four, which is the same fact as four being 22.6% faster than seven — only
+the denominator differs. There is a distinct cliff between five and six — 57.2 to 48.4 —
 which looks like a block-geometry boundary rather than an acceptance effect, since acceptance is
 still rising there. `--lm-head-draft` is within noise of unset for DFlash2 at every count and can
 be left off.

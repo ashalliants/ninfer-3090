@@ -2,7 +2,7 @@
 
 **181 commits, 159 files** since v0.9.0. No new capabilities: this release is one week of
 measuring what v0.9.0 shipped, and it moves numbers on the paths people actually run. The largest
-single win is a **flag change** — DFlash2's recommended draft count was wrong by 18.5% — and the
+single win is a **flag change** — DFlash2's recommended draft count was wrong by 22.6% — and the
 largest kernel win is a route table that was **52.8%** off on this hardware at one width.
 
 Everything below was measured on this fork's own hardware (RTX 3090, `sm_86`, CUDA 12.8). Where a
@@ -37,8 +37,10 @@ INT8 KV, greedy, 256 generated tokens, mean of three runs, spread ≤0.2 tok/s e
 | 10 | 42.4 | +12.4% |
 | 12 | 40.6 | +7.6% |
 
-**DFlash2 is a win at every count from 1 to 12.** Four is 18.5% faster than the seven `docs/cli.md`
-used to recommend, and `docs/cli.md` now says four and carries this table. MTP3 with the draft head
+**DFlash2 is a win at every count from 1 to 12.** Four is 22.6% faster than the seven
+`docs/cli.md` used to recommend -- `59.1 / 48.2 - 1`, the throughput speedup this repository's
+methodology defines. Stated the other way round, seven gives up 18.4% against four; both describe
+the same pair and the denominator is what differs, and `docs/cli.md` now says four and carries this table. MTP3 with the draft head
 reaches 62.4 tok/s on the same measurement, so the gap to MTP is 5% at DFlash2's best count rather
 than the 36% previously recorded. `--lm-head-draft` is within noise of unset for DFlash2 at every
 count.
@@ -251,7 +253,8 @@ Unchanged from v0.9.0 and stated here so they are not rediscovered:
 Drop-in. No artifact re-conversion, no configuration changes, no CLI changes to existing flags.
 
 **One thing worth changing by hand:** if you run `--spec dflash2 --draft-tokens 7`, use
-`--draft-tokens 4` instead. That is 18.5% on the same hardware and artifact.
+`--draft-tokens 4` instead. That is 22.6% more decode throughput on the same hardware and
+artifact.
 
 ---
 

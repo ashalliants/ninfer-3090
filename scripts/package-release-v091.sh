@@ -15,6 +15,10 @@ mkdir -p -- "$dist_root"
 case "$product_root" in "$dist_root/$product_name") ;; *) exit 1 ;; esac
 rm -rf -- "$product_root"
 rm -f -- "$archive_path"
+# The checksum goes too, and before anything can fail. It is written last, so leaving a previous
+# run's copy in place means a mid-run failure can leave `dist` holding a new archive beside a
+# checksum for the old one -- and publishing that pair is worse than publishing neither.
+rm -f -- "$checksum_path"
 mkdir -- "$product_root"
 
 for product in 'apps/ninfer:ninfer' 'apps/ninfer-serve:ninfer-serve' 'bench/ninfer_bench:ninfer_bench'; do

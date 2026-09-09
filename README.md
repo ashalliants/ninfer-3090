@@ -28,7 +28,7 @@ see [`docs/config-calculator.html`](docs/config-calculator.html).
 The goal is the make the utmost rippin Qwen inference stack for the 3000 series. Gladly taking PR's, all help much appreciated. 
 
 Release notes for this branch: [v0.9.1](RELEASE_NOTES_0.9.1.md) — DFlash2 wants four draft tokens
-rather than seven (+18.5%), two more route tables re-measured for `sm_86` (up to 52.8%), and three
+rather than seven (+22.6%), two more route tables re-measured for `sm_86` (up to 52.8%), and three
 races fixed in paths that produced wrong output rather than an error. Previous:
 [v0.9.0](RELEASE_NOTES_0.9.0.md).
 
