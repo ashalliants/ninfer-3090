@@ -46,11 +46,26 @@ std::int32_t causal_small_t_split_upper_bound(std::int32_t window) {
 template <typename Geometry>
 std::int32_t causal_small_t_split_count(std::int32_t window, std::int32_t tokens,
                                         KvCacheStorage storage) {
-    if constexpr (Geometry::SmallTSplitScale == 1) {
-        if (storage == KvCacheStorage::Fp8E4M3Row256 && tokens == 1 && window > 8198) {
-            return Geometry::SmallTMaximumSplits;
-        }
-    }
+    // There used to be a SmallTMaximumSplits bump here for Fp8E4M3Row256 at tokens==1 and
+    // window>8198, and the device asked for that bump for *every* quantized storage while only
+    // fp8 was granted it. TODO.md section 2c read the asymmetry as the host shortchanging nvfp4
+    // and k8v4 -- 69 splits where their kernels asked for 85 -- and proposed extending the grant.
+    //
+    // Measured on this 3090, and it is the other way round: more splits at depth is worse.
+    // Extending the grant to nvfp4 and k8v4 cost them 2.3-3.1% on the 35B at every depth, against
+    // an fp8 control that moved 0.3%. Removing it from fp8 as well gained 0.4/0.5/1.2% at
+    // 4,096/16,384/32,768 over two samples per variant, with within-variant spread well under the
+    // difference at the two deeper points.
+    //
+    // So the bump is gone from both sides -- here, and from
+    // causal_small_t_quantized_active_splits -- and every quantized storage now takes the same
+    // default tier. That also retires the invariant section 2c flagged as held by coincidence:
+    // the partial kernel and the reducer no longer depend on two call sites happening to agree
+    // about a special case, because there is no special case.
+    //
+    // The 27B was not conclusive either way (its fp8 control moved +-3% between identical runs,
+    // which is worth knowing before trusting any single-sample result on that model).
+
     // A 64-key default split just above a 32-key boundary makes the partial kernel execute a
     // nearly empty second tile. T=5 uses one 32-key tile per split; the short T>=6 profile keeps
     // all newly appended rows in one tail split while retaining a useful B=8 grid.
