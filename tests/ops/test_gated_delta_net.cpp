@@ -27,9 +27,33 @@ constexpr ReductionCriterion gated_delta_net_output_bf16_criterion() {
             /*gross_relative_to_max_reference=*/kBf16GrossRelativeFloor};
 }
 
+// The state output is FP32, so #20's BF16 floor was left off it on the grounds that dtype rounding
+// of the *output* cannot be its floor. That is true and beside the point: measured, the error's
+// source is BF16 anyway, and the floor does reach it.
+//
+// NINFER_OP_REPORT_STATS=1 over the whole matrix splits cleanly in two:
+//
+//     path                                  max_abs    max_reference   steps
+//     decode / small-T / batch update      1.2e-8 .. 3.5e-8   ~0.09     0.00
+//     exact chunk / chunk-tail / two-chunk 4.6e-4 .. 8.1e-4   ~0.23     0.53-0.88
+//
+// The non-chunked paths are exact to eight decimal places -- there is no accumulation to speak of.
+// Everything above 1e-4 comes from the chunked recurrence, where the carried state crosses a BF16
+// intermediate at each chunk boundary. Slightly under one BF16 rounding step of the state's own
+// magnitude is exactly what one such round-trip costs, so this *is* the BF16 argument, arriving
+// through the carried state rather than through the output dtype.
+//
+// That makes the previous 3.9e-3 the same mistake #20 was written to fix. It is about 1.0 rounding
+// step, and the observed worst case is 0.88 of one -- 12% headroom, and the bound and the error
+// are the same quantity. Use `kBf16GrossRelativeFloor` (two steps) like every other criterion the
+// audit touched, which puts the worst observed case at 0.44 of its limit.
+//
+// `relative_l2` is untouched at 2.7e-3 against a measured 2.582e-3. It sits at 0.96, which is
+// tight, but it is the criterion that constrains kernel accuracy and #20's convention leaves it
+// alone deliberately -- loosening it would stop the chunked recurrence being checked at all.
 constexpr ReductionCriterion gated_delta_net_state_fp32_criterion() {
     return {/*relative_l2=*/2.7e-3, /*gross_absolute=*/1.0e-5,
-            /*gross_relative_to_max_reference=*/3.9e-3};
+            /*gross_relative_to_max_reference=*/kBf16GrossRelativeFloor};
 }
 
 struct Case {

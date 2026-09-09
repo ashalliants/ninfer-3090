@@ -38,14 +38,38 @@ constexpr std::int32_t kRoutedGateRows = kExperts * kExpertGateRows;
 constexpr std::int32_t kRoutedDownRows = kExperts * kHidden;
 constexpr std::int32_t kSharedGateRows = 2 * kIntermediate;
 
-// All registered variants consume represented BF16 activations and expose one BF16 destination.
-// The bound belongs to that A16 compute profile, not to a codec, T, private route, or schedule.
-// The limits retain modest headroom over the measured maxima from the complete case matrix:
-// rel-L2 1.117e-2 and pointwise 3.687e-3.
+// This criterion belongs to the complete A16 SparseMoe compute profile, not to a codec, T, private
+// route, or schedule. `relative_l2` is the kernel-accuracy constraint and keeps modest headroom
+// over the measured maximum across the whole case matrix (1.118e-2 against 1.2e-2); #20's floor
+// argument deliberately does not touch it.
+//
+// The gross bound needed a relative term, and finding out why answered the question TODO.md §4
+// asked. Measured with NINFER_OP_REPORT_STATS=1 over the full matrix, the gross error is not
+// uniformly large -- it steps at a route boundary:
+//
+//     codec     T          max_abs   max_reference   BF16 rounding steps
+//     q4+q5     1..46     4.85e-4        0.1778             0.70
+//     q4+q5     47..4097  2.36e-3        0.1778             3.40
+//     q4+q6     1..46     4.88e-4        0.1766             0.71
+//     q4+q6     47..768   2.51e-3        0.1766             3.64
+//     w8+w8     1..19     9.18e-4        0.2718             0.87
+//     w8+w8     20..768   3.69e-3        0.2718             3.47
+//
+// So the "largest observed BF16 error in the tree, 3.64 steps against 0.09-1.53 everywhere else"
+// is one *route*, above a T boundary, and below that boundary this Op sits at 0.70-0.87 like
+// everything else. The large-T route accumulates over more terms in a different order; a 5x
+// spread between two routes of one Op is a property of the algorithm, not evidence of a defect.
+//
+// The bound was `gross_absolute` alone at 4.0e-3, which the worst case reached 0.92 of. An
+// absolute bound does not scale with the data: the same relative accuracy on a case whose
+// max_reference is 0.5 rather than 0.27 would produce ~6.8e-3 and fail spuriously. Six rounding
+// steps of max_reference covers the measured 3.64 with real headroom while still bounding a
+// genuinely wrong element hundreds of times more tightly -- the sm_86 small-T INT8 regression ran
+// 3-11x its reference. `gross_absolute` stays to carry the near-zero case.
 constexpr ReductionCriterion kSparseMoeA16Tolerance{
     /*relative_l2*/ 1.2e-2,
     /*gross_absolute*/ 4.0e-3,
-    /*gross_relative_to_max_reference*/ 0.0,
+    /*gross_relative_to_max_reference*/ 6.0 / 256.0,
 };
 
 constexpr std::size_t kOutputGuardBytes = 256;
