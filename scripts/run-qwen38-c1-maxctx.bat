@@ -79,6 +79,22 @@ echo Cache: 8 shared / 8 private / 32 host states  ^|  automatic prefix grid on
 echo API: http://%HOST%:%PORT%/v1
 echo.
 
+rem WHAT --host-kv-mib 8192 ACTUALLY GETS ON WINDOWS, which is not 8 GiB. WDDM maps a pinned host
+rem allocation into the GPU's address space and charges it against the card, so the runtime clamps
+rem the request to (free VRAM - 1 GiB) / 2 before the first cudaMallocHost -- it cannot ask and back
+rem off, because one failure poisons every later attempt in the process. At this profile's measured
+rem residency that resolves to:
+rem
+rem   launcher                        free after startup   pinned host KV
+rem   -------------------------------------------------------------------
+rem   run-qwen38-c1-maxctx (this)           1.59 GiB           302 MiB
+rem   run-qwen36-35b-a3b-c1-maxctx        184-344 MiB        0 -- none at all
+rem
+rem The flag is kept rather than corrected because it is right on the .sh launchers, where Linux
+rem pins the full 8 GiB of host RAM, and because it is harmless here: the clamp takes what is
+rem actually free after the KV cache is allocated, so it costs no context, and prefix reuse falls
+rem back to device pages when the pin is zero. Do not read "8192" as a description of this machine.
+
 "%SERVER%" "%MODEL%" ^
   --host %HOST% --port %PORT% ^
   --max-concurrency %CONCURRENCY% ^
