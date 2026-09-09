@@ -567,8 +567,10 @@ const DATA = {
            "measure, and slower at depth. Useful for comparison, rarely the right choice.",
     int8:  "The quality default: +0.0009% perplexity is effectively free, and it holds its decode " +
            "rate at depth better than anything except rk8v4.",
-    fp8:   "No reason to choose it. rk8v4 is smaller, faster at depth and better quality, so fp8 " +
-           "is dominated on all three axes.",
+    fp8:   "No longer dominated on all three axes: it now has *better* perplexity than rk8v4, by " +
+           "0.039%. That edge costs 26% more KV memory per token and 8.5% of decode speed at 32K " +
+           "depth -- a genuine trade, and a bad one for almost everyone, but a trade rather than " +
+           "a strict loss.",
     rk8v4: "The best all-round choice. 23% smaller than int8, the flattest decode curve of any " +
            "format measured, and +0.08% perplexity.",
     k8v4:  "Within 1.5% of rk8v4's size but the worst decode falloff measured (-25% by 32k) and " +
@@ -754,10 +756,27 @@ function render() {
      to fit in that page is its last one, c=64p, costing 64p*pt total (kv and per-token overhead
      both scale with c there). The largest fully-fitting page is p = floor(room / (64*pt)); the
      max context is that page's own boundary, which is therefore exact and always achievable --
-     never a page-partial value the engine would round up past what was checked. */
+     never a page-partial value the engine would round up past what was checked.
+
+     `fixed` was measured at the *displayed* ctx, but graphBytes() is a step function of context
+     (DFlash2 asks for more at deeper contexts -- see graphBytes' comment), so a solved maxCtx that
+     crosses a step the displayed ctx didn't reach would be solved against the wrong (smaller)
+     graph allowance and come back too large. Re-solve against fixedBytes at the candidate maxCtx
+     instead, and repeat until it stops moving; graphBytes only steps up with depth and a bigger
+     graph allowance only ever shrinks maxCtx, so this converges in at most as many iterations as
+     there are steps in graphBytes' table (in practice 1-2), and the loop is still capped so a
+     surprising future step table cannot hang the page. */
   if (haveKv) {
-    const room = usable - fixed;
-    const maxCtx = Math.max(0, PAGE_TOKENS * Math.floor(room / (PAGE_TOKENS * pt)));
+    let solveFixed = fixed;
+    let maxCtx = 0;
+    for (let i = 0; i < 8; i++) {
+      const room = usable - solveFixed;
+      const candidate = Math.max(0, PAGE_TOKENS * Math.floor(room / (PAGE_TOKENS * pt)));
+      const candidateFixed = fixedBytes(model, specKey, candidate);
+      if (candidate === maxCtx && candidateFixed === solveFixed) { maxCtx = candidate; break; }
+      maxCtx = candidate;
+      solveFixed = candidateFixed;
+    }
     const capped = Math.min(maxCtx, model.nativeMaxContext);
     $("out-maxctx").firstChild.nodeValue = fmtInt(capped);
     $("out-maxctx-sub").textContent = maxCtx > model.nativeMaxContext
@@ -809,10 +828,9 @@ function render() {
     ? "Measured draft acceptance " + (spec.accept * 100).toFixed(1) + "% on this model. "
     : "Weights " + spec.weightsGiB.toFixed(2) + " GiB at an 8k context. ") +
     (specKey !== "none"
-      ? "Startup memory above only counts the extra resident weights; the CUDA graph allowance " +
-        "and any extra KV pages this backend needs are not modeled and can be larger than the " +
-        "no-speculation figure used here (up to ~50 MiB more per lane for some DFlash graph " +
-        "classes) -- see TODO.md."
+      ? "Startup memory above already includes this mode's own extra resident weights, CUDA " +
+        "graph allowance and any extra KV pages -- each measured against the engine's own " +
+        "reported terms rather than borrowed from the no-speculation figure. See TODO.md §1.3."
       : "");
   $("ctx-hint").textContent = haveKv
     ? fmtGiB(kvBytes + ovhBytes) + " of sequence memory at " + fmtInt(ctx) + " tokens."

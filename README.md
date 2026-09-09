@@ -341,7 +341,7 @@ Three of these six are worth using:
 - **`nvfp4`** buys the most context by a wide margin — 45% smaller than INT8. On the 35B with MTP3
   and the draft head, on a machine running a desktop, it is the only format that still reaches the
   full 262,144 native context: `rk8v4` gets to about 231,000 and INT8 to about 179,000 there.
-  Headless, `rk8v4` clears 262,144 as well. It costs about 16% of decode speed at 32K and +0.22%
+  Headless, `rk8v4` clears 262,144 as well. It costs about 15% of decode speed at 32K and +0.22%
   perplexity.
 
 `fp8` and `k8v4` are still hard to recommend, but the reason has changed and it is worth stating
