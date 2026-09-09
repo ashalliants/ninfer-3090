@@ -34,6 +34,7 @@ about three hours for twelve model/format combinations.
 | `power-and-clocks.ps1` | Does the 315 W cap bound these numbers? | a few min |
 | `admin-profile.ps1` | Everything needing an elevated shell: `ncu` counters, and what 350 W buys | a few min |
 | `vision-encode-throughput.ps1` | What does Vision cost in time, and what does overlay residency cost? | 20 min |
+| `moe-prefill-pipeline-depth.ps1` | Where does the routed prefill Spread/Packed crossing sit on this card? | 70 min |
 
 `decode-roofline.ps1` needs no GPU: it reads the CSVs `kv-decode-vs-depth.ps1` leaves behind and
 divides achieved bandwidth by peak. Run that sweep first. Note it only means anything for the
