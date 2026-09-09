@@ -5,7 +5,8 @@ Set-Location (Resolve-Path (Join-Path $PSScriptRoot '..\..'))
 
 # Both overridable so this is not welded to one machine. The output directory is created here
 # because it does not exist in a clean checkout -- profiles/ is gitignored.
-$modelDir = if ($env:NINFER_MODEL_DIR) { $env:NINFER_MODEL_DIR } else { [IO.Path]::GetFullPath("$PSScriptRoot\..\..\models") }
+. "$PSScriptRoot\model-dir.ps1"
+$modelDir = Get-NInferModelDir
 $out      = if ($env:NINFER_SWEEP_OUT) { $env:NINFER_SWEEP_OUT } else { 'profiles\sweeps' }
 New-Item -ItemType Directory -Force -Path $out | Out-Null
 

@@ -7,10 +7,15 @@ these is an hour of work, not because they are polished tooling.
 All of them expect a Release `build-ninja` and run from the repository root:
 
 ```powershell
-$env:NINFER_MODEL_DIR = 'D:\elsewhere\models'      # optional; default is this repo's models dir
+$env:NINFER_MODEL_DIR = 'D:\elsewhere\models'      # optional; see model-dir.ps1 for the default
 $env:NINFER_SWEEP_OUT = 'profiles\sweeps'          # default; gitignored
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\sweeps\kv-decode-vs-depth.ps1
 ```
+
+With `NINFER_MODEL_DIR` unset, `model-dir.ps1` picks the first directory that actually holds a
+`.ninfer`: the repository's own `models\` first, then `scripts\models\`, which is where
+`scripts\download-qwen*` put artifacts by default. Set the variable to use anything else -- an
+explicit value is taken verbatim, never probed, so a typo fails on the path you named.
 
 They print a CSV summary to stdout and leave per-run `ninfer_bench` CSVs and logs under
 `$NINFER_SWEEP_OUT`. **Read the CSVs, not the console summary** — the summary is a convenience and

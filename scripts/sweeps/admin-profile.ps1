@@ -27,7 +27,8 @@ param(
   [switch]$SkipPower
 )
 
-if (-not $ModelDir) { $ModelDir = [IO.Path]::GetFullPath("$PSScriptRoot\..\..\models") }
+. "$PSScriptRoot\model-dir.ps1"
+if (-not $ModelDir) { $ModelDir = Get-NInferModelDir }
 $ErrorActionPreference = 'Continue'
 Set-Location (Resolve-Path (Join-Path $PSScriptRoot '..\..'))
 
