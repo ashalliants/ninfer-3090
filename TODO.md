@@ -508,6 +508,10 @@ roofline finally acquired a denominator; read them before the rest.
       | 4 | 101.0 | 2.75x | 4.00 | 39.61 |
       | 8 | 132.9 | 3.62x | 8.00 | 60.18 |
 
+      Those C8 figures predate the narrow GDN tiles of §3, which lifted C8 to **140.8 tok/s, 3.83x**
+      without moving C1/2/4 (widths 1, 2 and 4 stay on the independent route). Everything below is
+      still measured against the 3.62x profile, and the gap it describes is unchanged in kind.
+
       Batching itself works: `batch` is exactly C at every point and `row_rounds = C x rounds`, so
       one round serves the whole cohort and the 15.9 GiB weight read is amortised across it as
       intended. The loss is entirely in what a round costs. Against the 20.0 ms weight-bandwidth
@@ -1047,11 +1051,24 @@ ceiling, and neither has had any optimisation attempted.
       remaining 3.7x is what is actually worth chasing — the same conclusion §2c's 8-lane entry
       reaches about `mma_r64_c16`, from a different Op.
 
-      Not yet measured: the C8 **serving** cohort, which is the other workload this kernel dominates
-      (13.8 ms of a 56.3 ms round at width 8). The DFlash2 numbers above are the CLI path. The
-      serving A/B wants `tools/bench/run_serve_concurrency.py --concurrency 8 --mode mtp0` against
-      both binaries, interleaved the same way; expect low single digits, since the kernel is ~25%
-      of the round and the tile win is ~11% of the kernel.
+      **The C8 serving cohort — the other workload this kernel dominates, and the recommended
+      multi-user profile — gains 5.7%.** Measured after the fact, same interleaving, 27B/mtp0/int8
+      at `--concurrency 8 --decode-tokens 512`:
+
+      | rep | base | c8 tile | |
+      |---|---|---|---|
+      | 1 | 133.8 | 140.8 | +5.2% |
+      | 2 | 131.6 | 139.1 | +5.7% |
+      | 3 | 131.0 | 142.8 | +9.0% |
+
+      Positive 3 of 3 and **the two arms do not overlap at all** — base tops out at 133.8, tiles
+      bottom out at 139.1. That is better than the "low single digits" this entry first predicted
+      from `~25% of the round x ~11% of the kernel`, so something else improved alongside it; the
+      prediction was a lower bound rather than an estimate.
+
+      §2c's eight-lane curve moves with it: C1/2/4 are untouched (widths 1, 2 and 4 all stay on the
+      independent route) so the curve is now **36.8 / 61.1 / 101.0 / 140.8 tok/s, or 3.83x at eight
+      lanes** against the 3.62x measured before these tiles existed.
 
 - [ ] **`w8_pair` medium discards its schedule entirely on sm_86.**
       `w8_pair_gemm_splitk.cu:133` is `(void)schedule` under `NINFER_SM8X_COMPAT`, so every
