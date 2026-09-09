@@ -30,12 +30,17 @@ about three hours for twelve model/format combinations.
 | `dflash-residency-and-auto-capacity.ps1` | Does carrying DFlash cost VRAM when unused? | 15 min |
 | `speculation-matrix.ps1` | What does each speculative backend cost and buy? | 1 h |
 | `decode-roofline.ps1` | What fraction of the card's 936.2 GB/s does decode reach? | instant |
+| `decode-step-profile.ps1` | Where does a decode step's time go -- occupancy, launch gaps, or bandwidth? | a few min |
 
 `decode-roofline.ps1` needs no GPU: it reads the CSVs `kv-decode-vs-depth.ps1` leaves behind and
 divides achieved bandwidth by peak. Run that sweep first. Note it only means anything for the
 **dense** model -- applied to the A3B MoE it returns 391% of peak, which is not a result but a
 demonstration that the formula does not hold there, since an MoE never reads its resident weights
 per token. See TODO section 2c.
+
+`decode-step-profile.ps1` needs `nsys` (Nsight Systems) rather than a plain GPU run: it captures one
+measured decode repetition per configuration and reports GPU-busy vs. idle time from the trace, plus
+the top kernels by total time. Set `NINFER_NSYS` if it is not at the default install path.
 
 ## Things these got wrong, so you do not repeat them
 
