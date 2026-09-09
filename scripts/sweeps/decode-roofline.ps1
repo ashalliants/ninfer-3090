@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Continue'
 Set-Location (Resolve-Path (Join-Path $PSScriptRoot '..\..'))
 $d        = if ($env:NINFER_SWEEP_OUT) { $env:NINFER_SWEEP_OUT } else { 'profiles\sweeps' }
-$modelDir = if ($env:NINFER_MODEL_DIR) { $env:NINFER_MODEL_DIR } else { 'C:\Ninefer-3090\models' }
+$modelDir = if ($env:NINFER_MODEL_DIR) { $env:NINFER_MODEL_DIR } else { [IO.Path]::GetFullPath("$PSScriptRoot\..\..\models") }
 $python   = if ($env:NINFER_PYTHON) { $env:NINFER_PYTHON } else { 'python' }
 
 # Reads the per-run CSVs that kv-decode-vs-depth.ps1 leaves in $NINFER_SWEEP_OUT -- run that first.

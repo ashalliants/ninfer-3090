@@ -53,7 +53,15 @@
 # ------------------------------------------------------------------------------------------------
 set -euo pipefail
 
-MODEL="${NINFER_MODEL:-${NINFER_MODEL_DIR:-/mnt/c/Ninefer-3090/models}/qwen3_8_27b.ninfer}"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+root="$(cd -- "$script_dir/.." && pwd)"
+# Two layouts reach this script: a checkout, where the artifacts sit in the repository's own
+# models/ directory beside build-linux/, and an unpacked release archive, where the launcher
+# sits next to ninfer-serve and models/. Try the checkout first, then the archive -- the same
+# order the server lookup below uses. NINFER_MODEL_DIR and NINFER_MODEL override both.
+model_dir="${NINFER_MODEL_DIR:-$root/models}"
+[[ -d "$model_dir" ]] || model_dir="$script_dir/models"
+MODEL="${NINFER_MODEL:-$model_dir/qwen3_8_27b.ninfer}"
 CONTEXT="${NINFER_CONTEXT:-212992}"
 CONCURRENCY="${NINFER_CONCURRENCY:-2}"
 KV_CAPACITY="${NINFER_KV_CAPACITY:-$CONTEXT}"
@@ -78,7 +86,6 @@ case "$VISION" in
   *) printf 'NINFER_VISION must be on or off, got %s\n' "$VISION" >&2; exit 2 ;;
 esac
 
-root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 server="${NINFER_SERVER:-$root/build-linux/apps/ninfer-serve}"
 [[ -x "$server" ]] || server="$root/ninfer-serve"
 

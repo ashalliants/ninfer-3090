@@ -33,7 +33,7 @@
 $ErrorActionPreference = 'Continue'
 Set-Location (Resolve-Path (Join-Path $PSScriptRoot '..\..'))
 
-$modelDir = if ($env:NINFER_MODEL_DIR) { $env:NINFER_MODEL_DIR } else { 'C:\Ninefer-3090\models' }
+$modelDir = if ($env:NINFER_MODEL_DIR) { $env:NINFER_MODEL_DIR } else { [IO.Path]::GetFullPath("$PSScriptRoot\..\..\models") }
 $out      = if ($env:NINFER_SWEEP_OUT) { $env:NINFER_SWEEP_OUT } else { 'profiles\sweeps' }
 $cli      = '.\build-ninja\apps\ninfer.exe'
 $model    = "$modelDir\qwen3_8_27b.ninfer"

@@ -43,9 +43,15 @@
 # ------------------------------------------------------------------------------------------------
 set -euo pipefail
 
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+root="$(cd -- "$script_dir/.." && pwd)"
+# A checkout keeps its artifacts in the repository's own models/ directory; an unpacked release
+# archive keeps them beside this launcher. Try the checkout first, then the archive.
+model_dir="${NINFER_MODEL_DIR:-$root/models}"
+[[ -d "$model_dir" ]] || model_dir="$script_dir/models"
 # Override with NINFER_MODEL=... to point at a copy on the Linux filesystem, which loads faster
 # than reading 20.6 GiB across the 9p mount.
-MODEL="${NINFER_MODEL:-/mnt/c/Ninefer-3090/models/qwen3_6_35b_a3b.ninfer}"
+MODEL="${NINFER_MODEL:-$model_dir/qwen3_6_35b_a3b.ninfer}"
 
 # The native maximum, two lanes, everything on. This is the production headless profile: rk8v4 at
 # 262,144 tokens with MTP3 + draft head and vision overlay all enabled. It needs about 2.67 GiB of
@@ -106,7 +112,6 @@ esac
 HOST="${NINFER_HOST:-127.0.0.1}"
 PORT="${NINFER_PORT:-8080}"
 
-root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 server="${NINFER_SERVER:-$root/build-linux/apps/ninfer-serve}"
 [[ -x "$server" ]] || server="$root/ninfer-serve"
 

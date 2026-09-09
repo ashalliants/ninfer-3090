@@ -7,7 +7,7 @@ these is an hour of work, not because they are polished tooling.
 All of them expect a Release `build-ninja` and run from the repository root:
 
 ```powershell
-$env:NINFER_MODEL_DIR = 'C:\Ninefer-3090\models'   # default; override for another box
+$env:NINFER_MODEL_DIR = 'D:\elsewhere\models'      # optional; default is this repo's models dir
 $env:NINFER_SWEEP_OUT = 'profiles\sweeps'          # default; gitignored
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\sweeps\kv-decode-vs-depth.ps1
 ```

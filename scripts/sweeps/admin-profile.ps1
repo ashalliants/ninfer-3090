@@ -20,10 +20,14 @@
 # point is to capture what an unelevated session cannot.
 [CmdletBinding()]
 param(
-  [string]$ModelDir = $(if ($env:NINFER_MODEL_DIR) { $env:NINFER_MODEL_DIR } else { 'C:\Ninefer-3090\models' }),
+  # Resolved below rather than here: $PSScriptRoot is empty while a param default is being bound,
+  # so a repo-relative default written in this block silently resolves against the drive root.
+  [string]$ModelDir = $env:NINFER_MODEL_DIR,
   [string]$Ncu      = $(if ($env:NINFER_NCU) { $env:NINFER_NCU } else { 'C:\Program Files\NVIDIA Corporation\Nsight Compute 2025.1.0\ncu.bat' }),
   [switch]$SkipPower
 )
+
+if (-not $ModelDir) { $ModelDir = [IO.Path]::GetFullPath("$PSScriptRoot\..\..\models") }
 $ErrorActionPreference = 'Continue'
 Set-Location (Resolve-Path (Join-Path $PSScriptRoot '..\..'))
 
