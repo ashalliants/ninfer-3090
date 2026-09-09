@@ -24,6 +24,7 @@
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
+#include "ninfer/ops/sparse_moe.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/sigmoid_mul.h"
@@ -985,13 +986,27 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Variant::gdn_output_projection(on.view({kCfg.value_dim, T}), *w.out_proj, x, ph, work_, s);
 }
 
-void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph) {
+ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
+    // Name the next layer's projection codes so this layer's MoE D4 epilogue can warm L2 for
+    // them. The last layer names nothing. A pure hint: the value never reaches arithmetic.
+    const int next = layer + 1;
+    if (next >= kCfg.n_layers) { return {}; }
+    if (ModelConfig::is_full(next)) {
+        return Variant::projection_prefetch_hints(
+            *full_.at(static_cast<std::size_t>(ModelConfig::full_idx(next))).projection);
+    }
+    return Variant::projection_prefetch_hints(
+        *gdn_.at(static_cast<std::size_t>(ModelConfig::gdn_idx(next))).projection);
+}
+
+void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph,
+                           const ops::SparseMoeHints& hints) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
     Tensor h       = workspace_recipe::post_mixer_hidden<TextConfig>(work_, T);
     ops::rmsnorm(x, *post_norm, kCfg.rms_eps, true, h, s);
 
-    Variant::post_mixer(h, *m.payload, x, ph, work_, s);
+    Variant::post_mixer(h, *m.payload, x, ph, hints, work_, s);
 }
 
 // Move bytes from one rank's device to another's, through pinned host.
@@ -1070,9 +1085,10 @@ inline void TextContext::cross_rank_copy(const void* source, std::size_t from_ra
 // and hand back a finished residual, which costs one crossing out and one back instead of two of
 // each.
 inline void TextContext::run_mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph,
-                                      std::size_t expert_rank) {
+                                      std::size_t expert_rank,
+                                      const ops::SparseMoeHints& hints) {
     if (expert_rank == 0) {
-        mlp_tail(post_norm, m, x, ph);
+        mlp_tail(post_norm, m, x, ph, hints);
         return;
     }
 
@@ -1095,7 +1111,10 @@ inline void TextContext::run_mlp_tail(const Tensor* post_norm, const MlpW& m, Te
         Tensor remote = work_.alloc(x.dtype, {x.ne[0], x.ne[1]});
         cross_rank_copy(x.data, 0, remote.data, expert_rank, x.bytes());
 
-        mlp_tail(post_norm, m, remote, ph);
+        // Never the caller's hints here: they name pointers into next layer's projection weights,
+        // computed without regard to which rank holds them. Warming L2 on this remote device for
+        // an address that may live on a different card would prefetch the wrong device's memory.
+        mlp_tail(post_norm, m, remote, ph, {});
 
         // Copy the finished residual back into the caller's rank-0 buffer, so everything
         // downstream -- the next layer's attention, the head, sampling -- finds it where it
@@ -1121,6 +1140,16 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
         // it and back.
         const std::size_t expert_rank =
             split_execution ? split.placement(static_cast<std::uint32_t>(layer)).rank : 0U;
+        // The prefetch hint names pointers into the *next* layer's projection weights. Warming L2
+        // for them only makes sense when this layer's tail and the next layer's expert block run
+        // on the same device -- otherwise the hint would target the wrong card's memory, so it is
+        // dropped exactly like the last-layer case in next_projection_hints.
+        const std::size_t next_expert_rank =
+            (split_execution && layer + 1 < kCfg.n_layers)
+                ? split.placement(static_cast<std::uint32_t>(layer + 1)).rank
+                : 0U;
+        const ops::SparseMoeHints mlp_hints =
+            expert_rank == next_expert_rank ? next_projection_hints(layer) : ops::SparseMoeHints{};
         if (ModelConfig::is_full(layer)) {
             const int fidx         = ModelConfig::full_idx(layer);
             const FullLayerW& full = full_.at(static_cast<std::size_t>(fidx));
@@ -1139,7 +1168,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 auto mlp_scope = work_.scope();
-                run_mlp_tail(full.post_attn_norm, full.mlp, x, ph, expert_rank);
+                run_mlp_tail(full.post_attn_norm, full.mlp, x, ph, expert_rank, mlp_hints);
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
         } else {
@@ -1160,7 +1189,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 auto mlp_scope = work_.scope();
-                run_mlp_tail(gdn.post_attn_norm, gdn.mlp, x, ph, expert_rank);
+                run_mlp_tail(gdn.post_attn_norm, gdn.mlp, x, ph, expert_rank, mlp_hints);
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
         }
