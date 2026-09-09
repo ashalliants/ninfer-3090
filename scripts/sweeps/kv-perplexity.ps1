@@ -12,7 +12,15 @@ New-Item -ItemType Directory -Force -Path $out | Out-Null
 
 # Same corpus, mode and window as the three already recorded in README.md, so the new rows are
 # directly comparable rather than a separate experiment: ninfer-ppl-1m-v1, --quick, 4096/2048.
-$dtypes = @('fp8','nvfp4','k8v4')
+# The three that were measured through the attention race #49 fixed. Override to add a control:
+# NINFER_SWEEP_DTYPES=int8,fp8,nvfp4,k8v4 checks that this harness still reproduces README's int8
+# figure, which is the only way to know a changed fp8 number means the kernel changed rather than
+# the corpus, window or build having drifted underneath it.
+$dtypes = if ($env:NINFER_SWEEP_DTYPES) {
+  $env:NINFER_SWEEP_DTYPES -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+} else {
+  @('fp8','nvfp4','k8v4')
+}
 
 foreach ($d in $dtypes) {
     $log = "$out\$d.log"
