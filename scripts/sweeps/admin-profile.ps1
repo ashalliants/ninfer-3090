@@ -66,7 +66,7 @@ try {
   nvidia-smi -lgc 1500 2>&1 | Out-String | Write-Host
   if ($LASTEXITCODE -eq 0) { $clocksLocked = $true }
 
-  "== 1/3 ncu: MoE expert gather (35B, int8, decode) -> $out\moe_gather.txt"
+  "== 1/4 ncu: MoE expert gather (35B, int8, decode) -> $out\moe_gather.txt"
   & $Ncu --target-processes all --graph-profiling node `
       -k 'regex:sparse_moe' --launch-skip 64 --launch-count 12 `
       --section SpeedOfLight --section MemoryWorkloadAnalysis `
@@ -88,7 +88,7 @@ try {
   # "ncu ... regex:a" piped into a command named b. It died with "'b' is not recognized as an
   # internal or external command" and wrote an empty report -- which reads like an ncu problem and
   # is not one. Single pattern, via --kernel-name.
-  "== 2/3 ncu: contiguous reference kernels (27B, int8, decode) -> $out\contiguous_ref.txt"
+  "== 2/4 ncu: contiguous reference kernels (27B, int8, decode) -> $out\contiguous_ref.txt"
   & $Ncu --target-processes all --graph-profiling node `
       --kernel-name 'regex:q5_rowsplit_gemv' --launch-skip 64 --launch-count 8 `
       --section SpeedOfLight --section MemoryWorkloadAnalysis `
@@ -97,7 +97,29 @@ try {
       > "$out\contiguous_ref.txt" 2>&1
   "  ncu exit $LASTEXITCODE"
 
-  # ---------------------------------------------------------------- 2. what the power cap costs
+  # ---------------------------------------------------------------- 3. prefill's MLP GEMMs
+  #
+  # TODO section 2c: q4a8_swiglu reaches 96-97 TOPS against a measured 314.8 TOPS INT8 ceiling, so
+  # 31%, where a well-tuned large GEMM on Ampere usually reaches 60-80%. Two explanations have
+  # already been ruled out without counters -- it is not a skinny-tile artifact (chunk 256..4,096
+  # moves prefill 1.0%) and it is not dequantization (unpacking every 4-bit code costs 1-3% of the
+  # call even at 8 int ops per code). It is also not memory: at this shape the kernel is
+  # compute-bound over its memory floor by 4.3x.
+  #
+  # So the gap is inside the MMA pipeline, and these sections are what distinguishes the remaining
+  # candidates: issue rate, shared-memory feeding, and occupancy. The MLP pair is 68% of prefill
+  # FLOPs, which makes it the largest compute-side opportunity in the file.
+  "== 3/4 ncu: prefill MLP GEMMs (27B, int8, prefill) -> $out\prefill_mlp.txt"
+  & $Ncu --target-processes all --graph-profiling node `
+      --kernel-name 'regex:q4a8_swiglu' --launch-skip 8 --launch-count 6 `
+      --section SpeedOfLight --section MemoryWorkloadAnalysis --section Occupancy `
+      --section LaunchStats --section SchedulerStats --section WarpStateStats `
+      --section ComputeWorkloadAnalysis --section InstructionStats `
+      $bench --weights $dense --kv-dtype int8 --max-ctx 8192 -p 4096 -r 1 --warmup 1 `
+      > "$out\prefill_mlp.txt" 2>&1
+  "  ncu exit $LASTEXITCODE"
+
+  # ---------------------------------------------------------------- 4. what the power cap costs
   #
   # TODO section 3: the 315 W cap binds in essentially every busy sample, but memory clock never
   # leaves 9,501 MHz, so the bandwidth figures are already unthrottled and the prediction is that
@@ -105,7 +127,7 @@ try {
   # first -- a locked clock would hide exactly the effect being looked for.
   if (-not $SkipPower) {
     if ($clocksLocked) { nvidia-smi -rgc 2>&1 | Out-Null; $clocksLocked = $false }
-    "== 3/3 power limit 350 W -> $out\power_350.txt"
+    "== 4/4 power limit 350 W -> $out\power_350.txt"
     nvidia-smi -pl 350 2>&1 | Out-String | Write-Host
     if ($LASTEXITCODE -eq 0) {
       $powerChanged = $true
