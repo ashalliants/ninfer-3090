@@ -20,7 +20,14 @@ $models = @(
   @{ key='27b-dense'; path="$modelDir\qwen3_8_27b.ninfer" },
   @{ key='35b-moe';   path="$modelDir\qwen3_6_35b_a3b.ninfer" }
 )
-$dtypes = @('bf16','int8','fp8','rk8v4','k8v4','nvfp4')
+# All six by default. NINFER_SWEEP_DTYPES narrows it -- three hours is a lot to spend when a
+# change touched three of the six kernels and the other three are only a control. Comma-separated,
+# e.g. NINFER_SWEEP_DTYPES=int8,fp8,k8v4,nvfp4.
+$dtypes = if ($env:NINFER_SWEEP_DTYPES) {
+  $env:NINFER_SWEEP_DTYPES -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+} else {
+  @('bf16','int8','fp8','rk8v4','k8v4','nvfp4')
+}
 
 "model,kv,depth,decode_tok_s,stddev,kv_payload_bytes"
 foreach ($m in $models) {
