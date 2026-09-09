@@ -324,6 +324,12 @@ Every item in the previous version of this list is now closed. What follows is w
 should do first, and the ordering is by expected value rather than by section. The full
 seventeen-item table with what each one needs is in "Handing this off to another machine" above.
 
+**Where the open work actually is: §2c (8 items) and §3 (8 items), plus one blocked item in §2.**
+Sections 1, 2b, 4, 5 and 6 are fully closed and say so in their headings — they are kept because
+the reasoning is what stops the same investigation being repeated, not because anything is owed
+there. The trailing unnumbered subsections after §7 are methodology notes with no items; the one on
+editing this file with a script is worth reading before you edit this file with a script.
+
 1. **Run `scripts/sweeps/admin-profile.ps1 -SkipPower` from an elevated shell.** Two `ncu` profiles
    are outstanding and both are cheap: the prefill MLP GEMMs (§2c — memory, tile shape and
    dequantization are all already ruled out, so only issue rate, shared-memory feeding and
@@ -366,7 +372,7 @@ parents). The next merge from `neroued/master` will touch the same subsystem.
 
 ---
 
-## 1. Correctness and coverage
+## 1. Correctness and coverage — closed
 
 ### 1.1 `attn_input_proj` grossly wrong at `W8 DFlash2 A16 T=112 graph phase=1` — closed
 
@@ -503,7 +509,7 @@ recurs, and because the follow-on work below only exists now that they are gone.
 
 ---
 
-## 2b. `docs/config-calculator.html` is advertised as authoritative and is not yet correct
+## 2b. `docs/config-calculator.html` is advertised as authoritative and is not yet correct — closed
 
 Added by #32, **which merged with two of its six confirmed defects still open**, one of them only partly. README and
 `docs/cli.md` link to the page, so those two are live rather than theoretical. Read the checkboxes
@@ -1789,7 +1795,7 @@ shape the entries described.
       loosening it would stop the chunked recurrence being checked at all.
 ---
 
-## 5. Reproducibility
+## 5. Reproducibility — closed
 
 - [x] **fp8, k8v4 and nvfp4 causal attention are not run-to-run deterministic.** Closed by #49,
       2026-09-09, and it was not a tolerance curiosity — it was a data race corrupting output.
@@ -1894,7 +1900,7 @@ shape the entries described.
 
 ---
 
-## 6. Operational
+## 6. Operational — closed
 
 - [x] **The pinned host-KV default is 8 GiB regardless of host RAM.** Closed by #45, 2026-09-09,
       and the framing was wrong: host RAM was never the constraint.
