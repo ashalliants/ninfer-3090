@@ -669,22 +669,48 @@ doing:
       safe only by coincidence. Writing the merge identity there changed nothing — 15 differing
       lines before and after. It is a latent hazard, not this defect.
 
-- [ ] **The published perplexity figures for fp8, k8v4 and nvfp4 are not just single runs, they
-      were measured through the race above.** README's six-format table and the calculator both
-      carry `fp8 4.347181` and `k8v4 4.347596`, a gap of 0.0096%, and perplexity is scored
-      through exactly the prefill path #49 fixed — every output column but the last was
-      corrupted. So these are not "probably fine, averaged over 261,167 tokens": they are
-      measurements of a broken kernel, and the fp8-versus-k8v4 ordering they are used to justify
-      means nothing. **Re-measure all three, twice each, and only then decide whether the
-      ordering is real.** `bf16`, `int8` and `rk8v4` are unaffected — different kernels,
-      byte-identical across runs, and their numbers stand.
+- [x] **The published perplexity figures for fp8, k8v4 and nvfp4 were measured through the race
+      above.** Re-measured 2026-09-09, twice each, with int8 and bf16 as controls whose code paths
+      #49 does not touch.
 
-- [ ] **fp8 and k8v4 are dominated on all three axes and nothing says so structurally.** Each is
-      beaten by `rk8v4` on size, decode-at-depth and perplexity simultaneously (README's table).
-      Hold this until the re-measurement above lands: two of the three axes were measured on the
-      racy path, so the domination claim itself is now unproven. If it survives re-measurement,
-      decide whether to de-emphasise them in `--help` or leave them fully available on the
-      grounds that upstream parity is worth more than steering.
+      | format | published | re-measured | delta |
+      |---|---:|---:|---:|
+      | `int8` (control) | 4.343263 | 4.342425 | −0.019% |
+      | `bf16` (control) | 4.343225 | 4.342517 | −0.016% |
+      | `rk8v4` (control) | 4.346811 | 4.346413 | −0.009% |
+      | `fp8` | 4.347181 | **4.344724** | **−0.057%** |
+      | `k8v4` | 4.347596 | 4.347258 | −0.008% |
+      | `nvfp4` | 4.358924 | **4.352201** | **−0.154%** |
+
+      **All four re-measured formats are now bit-identical between passes** — `fp8` returned
+      4.344723843631465 twice over 261,167 scored tokens. That is #49's determinism claim proven at
+      the level that matters, not just at the Op-test level.
+
+      The three formats #49 does not touch all drifted −0.009% to −0.019%, which is a harness or
+      build offset against whenever the published numbers were taken, and is the floor on any claim
+      from this comparison. `fp8` moved three times that and `nvfp4` eight to seventeen times it:
+      real. `k8v4` at −0.008% sits *inside* the control band, so it did not measurably improve
+      despite being one of the patched kernels.
+
+      README, `docs/config-calculator.html` and `docs/rtx-3090-windows.md` all carry the new
+      figures.
+
+- [x] **fp8 and k8v4 are dominated on all three axes and nothing says so structurally.** Settled
+      2026-09-09, and the premise was half wrong once the numbers were redone.
+
+      **`fp8` is no longer dominated on all three axes.** Its re-measured perplexity, 4.344724,
+      *beats* `rk8v4`'s 4.346413 — a reproducible 0.039%, and both come from the same run so the
+      control drift cancels. It is still larger (33,024 B/token against 26,112) and still slower at
+      depth (30.34 against 33.17 tok/s at 32K), so what it now offers is a genuine trade: 26% more
+      KV memory and 8.5% of decode speed for 0.039% better quality. A bad trade for almost anyone,
+      but a trade rather than a strict loss, and README says exactly that instead of "no niche".
+
+      **`k8v4` is dominated, and comfortably.** 1.5% smaller than `rk8v4`, for 13% less decode
+      speed at depth, the worst falloff of any format on the 35B (−25.9%), and slightly worse
+      perplexity. No configuration makes that 1.5% worth having.
+
+      Left fully available in `--help` either way: upstream parity is worth more than steering, and
+      the README table now states the trade precisely enough that nobody needs steering.
 
 - [ ] **The speculative decode sweep measures acceptance, not depth, and cannot be read like the
       non-speculative one.** `scripts/sweeps/kv-decode-with-speculation.ps1` produced 35B INT8 at
@@ -850,6 +876,40 @@ hardcoded chain. `w8_pair` k=2048 had a table that *was* read, but whose distinc
 on this hardware. So `grep resolve_plan` is necessary and not sufficient — also grep the launchers
 for `NINFER_SM8X_COMPAT`, and confirm in the sweep, where identical schedules print *identical*
 times.
+
+---
+
+## This card is power-capped, which sets the floor on every measurement here
+
+`nvidia-smi` reports the power limit as **315 W against a 350 W default** (400 W maximum), and
+reports throttle reason `0x4` — `SwPowerCap` — continuously through every sweep. The SM clock
+swings **1,665–1,755 MHz** as a result while the memory clock stays fixed at 9,501 MHz. It looks
+deliberate rather than accidental, so it has been left alone; changing it needs an elevated shell
+anyway.
+
+**This is why within-run stddev lies.** `ninfer_bench -r 3` reports ±0.02–0.5 tok/s, which looks
+like a tight measurement. The spread *between processes* on the 27B is 3–5%: int8 at a
+4,096-token depth measured 37.44 tok/s in one run and 35.45 in another, on identical code, an hour
+apart. The clock drifts with temperature across runs and no amount of repetition inside one
+process sees it.
+
+Three consequences worth internalising before quoting any number in this file:
+
+- **Every performance comparison needs a control** — a configuration whose code path the change
+  does not touch, measured in the same run. The `SmallTMaximumSplits` work (#52) is the worked
+  example: the 35B's fp8 control held to 0.3% and made a 2.5% effect readable, while the 27B's
+  control moved ±3% and made that model's numbers worthless. Without the control, six numbers
+  looked like a result and three of them were noise.
+- **Do not compare across sessions.** Interleave the variants you are comparing inside one sitting,
+  or accept a 5% floor.
+- **The 35B is the quieter instrument.** Its controls repeatedly held to ≤0.3% where the 27B's
+  moved 3–5%, so a small effect should be measured there first.
+
+Also worth someone's attention: 315 W is 90% of this card's default TDP. Decode is memory-bound and
+the memory clock is not throttling, so the cost may be small — but it has never been measured.
+`nvidia-smi -pl 350` and a re-run of `kv-decode-vs-depth.ps1` would answer it, and
+`nvidia-smi -lgc <clock>` would collapse the 3–5% spread for measurement runs. Both need
+elevation.
 
 ---
 

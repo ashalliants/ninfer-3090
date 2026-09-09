@@ -487,13 +487,17 @@ const DATA = {
       kv: { bf16: 65536, int8: 33792, fp8: 33024, rk8v4: 26112, k8v4: 25728, nvfp4: 18432 },
       /* decode tok/s, no speculation, at these cache depths */
       depths: [4096, 16384, 32768],
+      /* Mean of two independent runs each, September 2026. Two runs because this card is
+         power-capped at 315 W of a 350 W default and the SM clock drifts 1,665-1,755 MHz with
+         temperature: single 27B runs vary by up to 5%, far more than the within-run stddev
+         suggests. */
       speed: {
-        bf16:  [36.74, 34.72, 32.50],
-        int8:  [36.15, 35.11, 33.86],
-        fp8:   [35.28, 32.57, 30.13],
-        rk8v4: [35.77, 34.73, 33.54],
-        k8v4:  [34.86, 31.76, 28.61],
-        nvfp4: [35.14, 32.64, 29.62]
+        bf16:  [36.58, 34.34, 31.93],
+        int8:  [35.31, 34.34, 33.63],
+        fp8:   [35.05, 33.09, 30.34],
+        rk8v4: [35.65, 34.73, 33.17],
+        k8v4:  [34.22, 31.83, 28.90],
+        nvfp4: [35.37, 32.78, 29.86]
       },
       spec: {
         none:          { label: "None",                weightsGiB: 15.92, decode: 34.41, accept: null },
@@ -513,13 +517,15 @@ const DATA = {
       seqFixedBytes: 70579968,
       kv: { bf16: 20480, int8: 10560, fp8: 10320, rk8v4: 8160, k8v4: 8040, nvfp4: 5760 },
       depths: [4096, 16384, 32768],
+      /* Mean of two independent runs each, September 2026; see the note on the 27B rows. On this
+         model rk8v4 is the fastest format at every depth measured, ahead of int8. */
       speed: {
-        bf16:  [169.98, 159.17, 144.60],
-        int8:  [173.83, 167.18, 154.90],
-        fp8:   [166.06, 149.53, 131.19],
-        rk8v4: [172.08, 165.82, 155.76],
-        k8v4:  [163.28, 141.51, 122.07],
-        nvfp4: [167.49, 150.14, 132.12]
+        bf16:  [166.16, 156.00, 142.99],
+        int8:  [171.76, 165.02, 154.88],
+        fp8:   [166.01, 148.82, 132.00],
+        rk8v4: [175.15, 168.50, 158.47],
+        k8v4:  [165.66, 143.58, 122.78],
+        nvfp4: [169.04, 151.81, 131.75]
       },
       spec: {
         none:          { label: "None",                weightsGiB: 19.59, decode: 178.00, accept: null },
@@ -533,13 +539,18 @@ const DATA = {
 
   /* Perplexity is model-independent in the sense that it was measured once, on the 27B, over the
      same corpus and window for all six formats. */
+  /* Re-measured September 2026. The fp8, k8v4 and nvfp4 figures published before that were
+     scored through a data race in the quantized attention kernels that corrupted every prefill
+     output column but the last; all three now reproduce bit-identically run to run. nvfp4 moved
+     -0.154% and fp8 -0.057%, against a 0.019% drift on the three formats the fix did not touch.
+     One consequence for anyone reading the table: fp8 now has *better* perplexity than rk8v4. */
   perplexity: {
-    bf16:  4.343225,
-    int8:  4.343263,
-    fp8:   4.347181,
-    rk8v4: 4.346811,
-    k8v4:  4.347596,
-    nvfp4: 4.358924
+    bf16:  4.342517,
+    int8:  4.342425,
+    fp8:   4.344724,
+    rk8v4: 4.346413,
+    k8v4:  4.347258,
+    nvfp4: 4.352201
   },
   kvLabels: {
     bf16:  "bf16 — full precision reference",
