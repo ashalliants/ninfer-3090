@@ -15,6 +15,8 @@ for the selected tool.
 | Build the Qwen3.8-27B artifact | [`convert/qwen3_8_27b/`](convert/qwen3_8_27b/) |
 | Build the 35B-A3B artifact | [`convert/qwen3_6_35b_a3b/`](convert/qwen3_6_35b_a3b/) |
 | Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
+| Count the bytes one decoded token reads (roofline denominator) | [`decode_byte_accounting.py`](decode_byte_accounting.py) |
+| Measure the card's sustained memory bandwidth | [`hbm_bandwidth_probe.cu`](hbm_bandwidth_probe.cu) |
 | Run benchmark matrices | [`bench/`](bench/README.md) |
 | Measure external Serve TTFT | [`bench/ttft/`](bench/ttft/README.md) |
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
