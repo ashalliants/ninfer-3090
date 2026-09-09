@@ -841,18 +841,51 @@ ceiling, and neither has had any optimisation attempted.
       different winners, which is documented at the top of `schedule_sweep.cuh`. The point is that
       a narrow cold-flush margin is a reason to profile, not a decision.
 
-- [ ] **The 315 W power cap has never been measured, and it bounds every number in this file.**
-      `nvidia-smi` reports the limit at 315 W against a 350 W default (400 W maximum) and throttle
-      reason `SwPowerCap` continuously through every sweep; the SM clock swings 1,665-1,755 MHz
-      with temperature while memory holds at 9,501 MHz. It looks deliberate, so it has been left
-      alone — and changing it needs an elevated shell, which this session did not have.
+- [ ] **The 315 W power cap binds continuously, but it does not touch memory clock — so most of
+      this file is unaffected.** Measured 2026-09-09 with `scripts/sweeps/power-and-clocks.ps1`,
+      which samples `nvidia-smi` at 2 Hz through a 27B `tg1024` decode and a `pp8192` prefill,
+      int8 KV. Three runs, medians and full ranges over busy samples (utilization > 50%):
 
-      Two separate questions, both open. **What does the cap cost?** Decode is memory-bound and the
-      memory clock is not throttling, so it may be little — but `nvidia-smi -pl 350` and a re-run
-      of `kv-decode-vs-depth.ps1` would say, and 10% of TDP is worth knowing about on a project
-      whose goal is riding the bandwidth ceiling. **Should measurement runs lock clocks?**
-      `nvidia-smi -lgc <clock>` would collapse the 3-5% between-process spread that made the 27B
-      unreadable this cycle. Both need someone at an elevated prompt.
+      | | decode (162-168 samples) | prefill (52-53 samples) |
+      |---|---|---|
+      | board power | 314 W median | 314 W median |
+      | `sw_power_cap` active | **161-168 of 162-168** | **51-52 of 52-53** |
+      | SM clock | **1,500-1,515 MHz** median | **1,635-1,650 MHz** median |
+      | memory clock | **9,501 MHz in every sample** | **9,501 MHz in every sample** |
+      | temperature | 63-74 °C median, 75 max | 68-76 °C median, 77 max |
+      | thermal throttle | **0 samples, all runs** | **0 samples, all runs** |
+
+      The cap is genuinely and permanently binding — power pins within 1 W of the limit whenever
+      the card is busy — and it is the *only* thing throttling. No thermal slowdown appears in any
+      sample of any run, at any temperature reached.
+
+      What it costs is a narrower question than this entry assumed. **Memory never leaves 9,501 MHz
+      in either phase, in any run**, which is the full 19 Gbps spec, so every bandwidth number in
+      this file — the 854.2 GB/s achievable figure, the decode roofline, the whole of §2c's decode
+      analysis — is measured at unthrottled memory and the cap does not bound it. SM clock is what
+      pays: decode sits about 11% below the 3090's 1,695 MHz rated boost, prefill about 3%. Decode
+      is bandwidth-bound so 11% of SM clock buys little there, and prefill — the phase where SM
+      clock would matter — is the phase where the cap costs least.
+
+      The compute ratios are self-cancelling: prefill's "~30% of INT8 MMA peak" (§2c) divides a
+      capped measurement by a ceiling probe run under the same cap, so lifting the limit moves
+      numerator and denominator together.
+
+      **Careful with the maxima.** Individual samples reach 1,740-1,935 MHz on both phases. Those
+      are the first sample or two of a run, before the cap clamps a cold card, and quoting one as a
+      steady clock is wrong — the first version of this script reported `Measure-Object -Average`
+      under a column labelled "median" and that is exactly the mistake it invites. This entry
+      previously claimed the SM clock "swings 1,665-1,755 MHz"; both ends of that are wrong for
+      steady state in either phase.
+
+      **Still open, and still needs an elevated shell.** `nvidia-smi -pl 350` is refused with
+      "Insufficient Permissions" from this session, re-confirmed 2026-09-09, so the residual
+      question stands: what would the missing 35 W buy on prefill? With SM clock already at 97% of
+      rated boost there, the honest prior is "very little" — but that is a prediction. Re-run the
+      script after `-pl 350` to settle it. The second half of this entry is the more valuable one:
+      `nvidia-smi -lgc` to lock clocks would collapse the 3-5% between-process spread that made the
+      27B hard to read this cycle, and that spread is now known to be the largest source of noise
+      in every end-to-end comparison here (see §3's cold-flush entry).
 
 - [ ] **`compute-sanitizer` cannot launch this repository's test binaries.** It reports "Target
       application doesn't exist or is not a valid executable" for `ninfer_*_test.exe` — absolute
