@@ -84,6 +84,17 @@ SERVER
 chmod +x "$tmp/ninfer-serve"
 touch "$tmp/qwen3_8_27b.ninfer" "$tmp/qwen3_6_35b_a3b.ninfer"
 
+# Hermetic fixtures. A developer's shell may already export NINFER_MODEL, NINFER_HOST and friends
+# -- the machine this was written on exports both -- and inheriting them makes every assertion below
+# describe that box rather than the layout under test. The first draft of the archive case failed
+# exactly that way, against a NINFER_MODEL naming a directory that no longer exists. Clear every
+# NINFER_* and pass back only what a case sets deliberately.
+ninfer_clear=()
+while IFS= read -r name; do
+  ninfer_clear+=(-u "$name")
+done < <(env | sed -n 's/^\(NINFER_[A-Za-z0-9_]*\)=.*/\1/p')
+clear_env() { env ${ninfer_clear[@]+"${ninfer_clear[@]}"} "$@"; }
+
 launchers=(
   'run-qwen38-c1.sh:qwen3_8_27b.ninfer:--max-context:65536'
   'run-qwen38-c8.sh:qwen3_8_27b.ninfer:--max-concurrency:8'
@@ -93,11 +104,81 @@ launchers=(
 for entry in "${launchers[@]}"; do
   IFS=: read -r script model expected value <<< "$entry"
   args="$tmp/${script%.sh}.args"
-  NINFER_SERVER="$tmp/ninfer-serve" NINFER_TEST_ARGS="$args" \
+  clear_env NINFER_SERVER="$tmp/ninfer-serve" NINFER_TEST_ARGS="$args" \
     "$root/$script" "$tmp/$model" >/dev/null
   grep -Fx -- "$expected" "$args" >/dev/null
   grep -Fx -- "$value" "$args" >/dev/null
 done
+
+# The two -maxctx launchers ship *inside* the release archive as well as living here, and README
+# calls them the Linux entry point. They resolved both the server and the artifact from
+# `dirname(script)/..` -- the archive's parent once packaged -- so the documented quick start exited
+# before serving, with a "Missing ninfer-serve" naming a path outside the archive. Nothing tested
+# that, because every case above hands the launcher an explicit NINFER_SERVER and model path.
+#
+# So drive them the way a user does: unpack and run, flat layout, no environment overrides beyond
+# the stub hook. The launcher must find the binary beside itself and the artifact under its own
+# models/, not one directory up.
+archive="$tmp/archive"
+mkdir -- "$archive" "$archive/models"
+cp -- "$tmp/ninfer-serve" "$archive/ninfer-serve"
+for entry in 'run-qwen38-c1-maxctx.sh:qwen3_8_27b.ninfer' \
+             'run-qwen36-35b-a3b-c1-maxctx.sh:qwen3_6_35b_a3b.ninfer'; do
+  IFS=: read -r script model <<< "$entry"
+  : > "$archive/models/$model"
+  cp -- "$root/$script" "$archive/$script"
+  args="$tmp/${script%.sh}.archive.args"
+  ( cd -- "$archive" && clear_env NINFER_TEST_ARGS="$args" "./$script" >/dev/null )
+  if ! grep -Fx -- "$archive/models/$model" "$args" >/dev/null; then
+    printf '%s did not resolve its artifact inside the archive: %s\n' "$script" "$(head -1 -- "$args")" >&2
+    exit 1
+  fi
+done
+
+# The probe must select the candidate that holds the artifact, not the first models/ directory that
+# happens to exist. An archive unpacked below a directory with its own (empty) models/ would
+# otherwise stop at the parent and fail while its own artifact sat beside the launcher.
+decoy="$tmp/decoy"
+mkdir -p -- "$decoy/models" "$decoy/inner/models"
+cp -- "$tmp/ninfer-serve" "$decoy/inner/ninfer-serve"
+: > "$decoy/inner/models/qwen3_8_27b.ninfer"
+cp -- "$root/run-qwen38-c1-maxctx.sh" "$decoy/inner/run-qwen38-c1-maxctx.sh"
+args="$tmp/run-qwen38-c1-maxctx.decoy.args"
+( cd -- "$decoy/inner" && clear_env NINFER_TEST_ARGS="$args" ./run-qwen38-c1-maxctx.sh >/dev/null )
+if ! grep -Fx -- "$decoy/inner/models/qwen3_8_27b.ninfer" "$args" >/dev/null; then
+  printf 'run-qwen38-c1-maxctx.sh stopped at an empty parent models/: %s\n' "$(head -1 -- "$args")" >&2
+  exit 1
+fi
+
+# An explicit NINFER_MODEL_DIR must be honoured verbatim, never probed past. The two-candidate
+# fallback above is for when the caller said nothing; applying it to a directory the caller *named*
+# reports a missing artifact under a path they never mentioned, and hides their typo. Assert the
+# error names the directory that was actually asked for.
+err="$tmp/explicit-dir.err"
+if ( cd -- "$archive" && clear_env NINFER_MODEL_DIR="$tmp/nope" NINFER_TEST_ARGS="$tmp/unused.args" \
+       ./run-qwen38-c1-maxctx.sh >/dev/null 2>"$err" ); then
+  printf 'run-qwen38-c1-maxctx.sh accepted a nonexistent NINFER_MODEL_DIR\n' >&2
+  exit 1
+fi
+if ! grep -Fq -- "$tmp/nope/qwen3_8_27b.ninfer" "$err"; then
+  printf 'run-qwen38-c1-maxctx.sh ignored an explicit NINFER_MODEL_DIR: %s\n' "$(head -1 -- "$err")" >&2
+  exit 1
+fi
+
+# The other half of the two-candidate lookup: a checkout must still prefer its own build tree and
+# models/ directory. This is the case that regresses if someone "simplifies" the fallback away.
+checkout="$tmp/checkout"
+mkdir -p -- "$checkout/scripts" "$checkout/build-linux/apps" "$checkout/models"
+cp -- "$tmp/ninfer-serve" "$checkout/build-linux/apps/ninfer-serve"
+: > "$checkout/models/qwen3_8_27b.ninfer"
+cp -- "$root/run-qwen38-c1-maxctx.sh" "$checkout/scripts/run-qwen38-c1-maxctx.sh"
+args="$tmp/run-qwen38-c1-maxctx.checkout.args"
+( cd -- "$checkout" && clear_env NINFER_TEST_ARGS="$args" ./scripts/run-qwen38-c1-maxctx.sh >/dev/null )
+if ! grep -Fx -- "$checkout/models/qwen3_8_27b.ninfer" "$args" >/dev/null; then
+  printf 'run-qwen38-c1-maxctx.sh did not resolve the checkout artifact: %s\n' "$(head -1 -- "$args")" >&2
+  exit 1
+fi
+
 
 mkdir -- "$tmp/bin" "$tmp/models"
 # NINFER_TEST_FAKE_SIZE makes the fixture produce a file of exactly the pinned downloaders'

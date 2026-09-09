@@ -43,9 +43,29 @@
 # ------------------------------------------------------------------------------------------------
 set -euo pipefail
 
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+root="$(cd -- "$script_dir/.." && pwd)"
+# Two layouts reach this script: a checkout, where the artifacts sit in the repository's own
+# models/ directory beside build-linux/, and an unpacked release archive, where the launcher
+# sits next to ninfer-serve and models/. Probe for the checkout first, then the archive -- the
+# same order the server lookup below uses.
+#
+# An explicit NINFER_MODEL_DIR is taken verbatim and never probed. Falling back past a
+# directory the caller named turns their typo into a 'Missing model' error about a path they
+# never mentioned, which is worse than failing on the one they did.
+artifact='qwen3_6_35b_a3b.ninfer'
+if [[ -n "${NINFER_MODEL_DIR:-}" ]]; then
+  model_dir="$NINFER_MODEL_DIR"
+else
+  # Test for the artifact, not merely for a models/ directory. An archive unpacked below a
+  # directory that happens to have its own models/ would otherwise stop at the parent and
+  # never look beside the launcher, failing while its own artifact sits right there.
+  model_dir="$root/models"
+  [[ -f "$model_dir/$artifact" ]] || model_dir="$script_dir/models"
+fi
 # Override with NINFER_MODEL=... to point at a copy on the Linux filesystem, which loads faster
 # than reading 20.6 GiB across the 9p mount.
-MODEL="${NINFER_MODEL:-/mnt/c/Ninefer-3090/models/qwen3_6_35b_a3b.ninfer}"
+MODEL="${NINFER_MODEL:-$model_dir/$artifact}"
 
 # The native maximum, two lanes, everything on. This is the production headless profile: rk8v4 at
 # 262,144 tokens with MTP3 + draft head and vision overlay all enabled. It needs about 2.67 GiB of
@@ -106,9 +126,10 @@ esac
 HOST="${NINFER_HOST:-127.0.0.1}"
 PORT="${NINFER_PORT:-8080}"
 
-root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 server="${NINFER_SERVER:-$root/build-linux/apps/ninfer-serve}"
-[[ -x "$server" ]] || server="$root/ninfer-serve"
+# Same two layouts as the artifact lookup above: build tree in a checkout, then the archive
+# root, where this launcher sits beside the binary.
+[[ -x "$server" ]] || server="$script_dir/ninfer-serve"
 
 if [[ ! -x "$server" ]]; then
   printf 'Missing ninfer-serve (looked for %s)\n' "$server" >&2

@@ -34,7 +34,8 @@
 $ErrorActionPreference = 'Continue'
 Set-Location (Resolve-Path (Join-Path $PSScriptRoot '..\..'))
 
-$modelDir = if ($env:NINFER_MODEL_DIR) { $env:NINFER_MODEL_DIR } else { 'C:\Ninefer-3090\models' }
+. "$PSScriptRoot\model-dir.ps1"
+$modelDir = Get-NInferModelDir
 $out      = if ($env:NINFER_SWEEP_OUT) { $env:NINFER_SWEEP_OUT } else { 'profiles\sweeps' }
 $bench    = '.\build-ninja\bench\ninfer_bench.exe'
 $model    = "$modelDir\qwen3_6_35b_a3b.ninfer"
