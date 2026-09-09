@@ -20,6 +20,65 @@ __device__ __forceinline__ bool sparse_moe_ranked_better(const SparseMoeRankedVa
     return a.value > b.value || (a.value == b.value && a.id < b.id);
 }
 
+// Sorts one lane's eight candidates descending, branch-free.
+//
+// This replaced a `while`-loop insertion sort, and the reason is measured rather than stylistic:
+// `ncu` attributes **15.25% of d2's active warp cycles to `branch_resolving`** and reports 22.19 of
+// 32 threads active per warp, both of which are that loop -- its trip count depends on the data, so
+// lanes diverge and the warp pays for every path. (The other 37.68% is `wait`, dependent
+// fixed-latency instructions, which needs more warps and is a separate change.)
+//
+// Batcher's odd-even merge sort for eight elements: 19 compare-exchanges in six dependency levels,
+// with every index a compile-time constant, so the whole thing unrolls into predicated selects with
+// no branches and no data-dependent trip count. The network is also *shorter* in dependent depth
+// than the insertion sort's worst case (six levels against seven).
+//
+// Semantics are identical, and that is load-bearing. `sparse_moe_ranked_better` is a total order
+// over distinct expert ids, so a correct sorting network produces exactly the sequence the
+// insertion sort did -- same set, same order -- which is what the callers downstream rely on and
+// what `ninfer_sparse_moe_test` checks.
+__device__ __forceinline__ void
+sparse_moe_sort_eight_descending(SparseMoeRankedValue (&run)[kSparseMoeTopK]) {
+    static_assert(kSparseMoeTopK == 8, "this network is specifically the eight-element one");
+    // A compare-exchange that leaves the better of the pair in `i`. Written with selects rather
+    // than a swap under an `if` so nvcc emits predicated moves; a branch here is the whole point.
+    const auto compare_exchange = [&run](int i, int j) {
+        const SparseMoeRankedValue a = run[i];
+        const SparseMoeRankedValue b = run[j];
+        const bool ordered           = sparse_moe_ranked_better(a, b);
+        run[i]                       = ordered ? a : b;
+        run[j]                       = ordered ? b : a;
+    };
+#pragma unroll
+    for (int level = 0; level < 6; ++level) {
+        // Batcher odd-even merge sort, n=8. Levels are listed explicitly because the closed form
+        // is less legible than the network and this is generated once at compile time anyway.
+        switch (level) {
+        case 0:
+            compare_exchange(0, 1); compare_exchange(2, 3);
+            compare_exchange(4, 5); compare_exchange(6, 7);
+            break;
+        case 1:
+            compare_exchange(0, 2); compare_exchange(1, 3);
+            compare_exchange(4, 6); compare_exchange(5, 7);
+            break;
+        case 2:
+            compare_exchange(1, 2); compare_exchange(5, 6);
+            break;
+        case 3:
+            compare_exchange(0, 4); compare_exchange(1, 5);
+            compare_exchange(2, 6); compare_exchange(3, 7);
+            break;
+        case 4:
+            compare_exchange(2, 4); compare_exchange(3, 5);
+            break;
+        default:
+            compare_exchange(1, 2); compare_exchange(3, 4); compare_exchange(5, 6);
+            break;
+        }
+    }
+}
+
 // Merges the descending run of each lane with the run of its xor partner and keeps the better
 // half. The eight exchanges of a step do not depend on each other, so the warp reaches the
 // warp-wide top-8 in five merge steps instead of eight dependent reduction rounds. Ranking is a
@@ -67,16 +126,7 @@ __device__ __forceinline__ void sparse_moe_select_top8_warp(const float* scores,
         const int id = lane + item * 32;
         local[item]  = {scores[id], id};
     }
-#pragma unroll
-    for (int i = 1; i < kSparseMoeTopK; ++i) {
-        const SparseMoeRankedValue value = local[i];
-        int position                     = i;
-        while (position > 0 && sparse_moe_ranked_better(value, local[position - 1])) {
-            local[position] = local[position - 1];
-            --position;
-        }
-        local[position] = value;
-    }
+    sparse_moe_sort_eight_descending(local);
     sparse_moe_merge_ranked_runs(local);
 
     if (lane == 0) {

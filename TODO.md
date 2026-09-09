@@ -2,8 +2,8 @@
 
 State as of 2026-09-09. Four passes: a profiling pass that closed six items and refuted five of its
 own hypotheses, a measurement-hygiene pass that closed three more, a counter pass that put a *cause*
-under the four biggest performance entries, and a kernel pass that shipped one speedup and reverted
-another. **42 items closed, 15 open.**
+under the four biggest performance entries, and a kernel pass that shipped **two** speedups and
+reverted a third. **46 items closed, 13 open.**
 If you are picking this up on different hardware, read "Handing this off to another machine" below
 before anything else.
 
@@ -21,13 +21,14 @@ into three-warp path blocks, which raised theoretical occupancy to 100% and *dro
 67.7% to 52.6%. That closed the MoE entry as a dead end — all four of its candidate fixes are now
 measured negatives.
 
-**The largest unexplained cost in this file is a single-warp kernel.** `sparse_moe_d2_warp_kernel`
-picks the top 8 of 257 experts in `<<<1, 32>>>` — one warp, one SM of 82 — and `nsys` puts it at
-**8.45% of the 35B's decode kernel time**, third of the four MoE stages and 3.6x d1. The stall
-breakdown is collected: **`wait` 37.7% and `branch_resolving` 15.3% against `long_scoreboard` 4.1%**,
-so it is exposed instruction latency and divergence, *not* memory — which rules out the most
-plausible fix and leaves two concrete ones (a block-scoped selection with 8 warps, and a
-branch-free sort). Target 4-5 µs, or 5-6% of decode. See §2c.
+**The second speedup came from a single-warp kernel nobody had looked at.**
+`sparse_moe_d2_warp_kernel` picks the top 8 of 257 experts in `<<<1, 32>>>` — one warp, one SM of
+82 — and `nsys` put it at **8.45% of the 35B's decode kernel time**, third of the four MoE stages.
+Its stall breakdown (`wait` 37.7%, `branch_resolving` 15.3%, `long_scoreboard` only 4.1%) said
+divergence and exposed latency, not memory. Replacing the divergent insertion sort with a
+branch-free 19-compare network took it **13.43 → 8.32 µs, −38%**, worth **+3.15% end to end on the
+35B, 6 of 6 paired reps against a control that drifted 0.00%.** The `wait` half remains and wants a
+block-scoped selection. See §2c.
 
 **Read this next: almost nothing here is bandwidth-bound, and this file spent a cycle assuming
 otherwise.** `ncu` counters on five kernels, all on one instrument with clocks locked, say the same
@@ -1484,8 +1485,40 @@ mechanism, and it is not tile geometry.**
       source, not measured*: confirm it with `l1tex__data_pipe_lsu_wavefronts_mem_shared` against
       `l1tex__data_pipe_lsu_wavefronts_mem_global` before committing to the retile.
 
-- [ ] **`sparse_moe_d2_warp_kernel` costs 8.45% of the 35B's decode kernel time on one warp of one
-      SM. Verified with `nsys` 2026-09-09, and it is now the largest cheap win in this file.**
+- [ ] **`sparse_moe_d2_warp_kernel` cost 8.45% of the 35B's decode kernel time on one warp of one
+      SM. Half of that is now gone — the branch-free sort shipped, **+3.15% end to end** — and the
+      other half still wants warps.**
+
+      **Shipped 2026-09-09: a branch-free sorting network.** The stall breakdown below put 15.25% of
+      d2's active warp cycles in `branch_resolving`, all of it the `while`-loop insertion sort over
+      each lane's eight candidates — its trip count is data-dependent, so lanes diverge and the warp
+      pays every path (22.19 of 32 threads active). Replaced with Batcher's odd-even merge sort for
+      eight elements: 19 compare-exchanges in six dependency levels, every index a compile-time
+      constant, emitted as predicated selects. Semantics are identical because
+      `sparse_moe_ranked_better` is a total order over distinct expert ids, and the network was
+      verified exhaustively on the host — **all 40,320 permutations, plus 20,000 tie-heavy cases
+      under the (value, id) order.**
+
+      | | before | after | change |
+      |---|---:|---:|---:|
+      | `sparse_moe_d2_warp` | 13.43 µs/inst | **8.32 µs/inst** | **−38.0%** |
+      | total decode kernel time | 820.3 ms | **795.8 ms** | **−2.99%** |
+      | `d1` / `d3` / `d4` (untouched) | | | −2.0% / +0.5% / −0.7% |
+
+      End to end, `run_interleaved_ab.py`, clocks locked, six paired repetitions, **the dense 27B as
+      control because it has no `sparse_moe` path at all**: **+3.15% paired median, 6 of 6 pairs
+      positive, +3.29% normalised, control drift +0.00%.** That matches the −2.99% kernel-time
+      prediction, which is the check worth having — the two instruments agree.
+
+      It beat the estimate (~1% was predicted from `branch_resolving` alone) because the network is
+      also shorter in dependent depth than the insertion sort's worst case, six levels against
+      seven, so it took some of the `wait` term too. Note the control here is chosen better than the
+      D3 experiment's: a model with none of the changed code, rather than a downstream kernel in the
+      same fused pipeline, which moved 6% on L2 state alone.
+
+      **What is left: the `wait` term, and it still wants more warps.** 37.68% of active warp cycles
+      before the change; d2 is still `<<<1, 32>>>` at 8.32 µs. The block-scoped 8-warp selection
+      described below is unchanged as the remaining prize, now worth roughly half what it was.
 
       Found incidentally in the MoE counter capture, where `ncu` timed it at 15.52 µs and the
       arithmetic in this entry's first draft argued that had to be inflated. **It was inflated by
