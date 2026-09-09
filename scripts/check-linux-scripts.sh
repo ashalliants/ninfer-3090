@@ -173,4 +173,30 @@ for downloader in download-qwen38-27b download-qwen36-35b-a3b download-qwen36-27
   rm -f -- "$tmp/models/$model."*".part"
 done
 
+# The size check alone is not the checksum contract: a payload of the right size but wrong content
+# must be rejected too, and every case above either skips the hash (NINFER_SKIP_SHA256=1) or never
+# reaches it (wrong size fails first). Drive the fixture with the correct size and the hash check
+# left on. `truncate -s` produces a sparse all-zero file, whose sha256 has no realistic chance of
+# matching a real download's pinned hash, so this exercises the actual comparison in `verify()`
+# rather than assuming it works because nothing has called it with a size-correct payload before.
+for downloader in download-qwen38-27b download-qwen36-27b download-qwen36-35b-a3b; do
+  case "$downloader" in
+    download-qwen38-27b) model='qwen3_8_27b.ninfer' ;;
+    download-qwen36-27b) model='qwen3_6_27b.ninfer' ;;
+    download-qwen36-35b-a3b) model='qwen3_6_35b_a3b.ninfer' ;;
+  esac
+  size="$(expected_size_of "$downloader")"
+
+  if PATH="$tmp/bin:$PATH" NINFER_MODEL_DIR="$tmp/models" NINFER_TEST_FAKE_SIZE="$size" \
+       "$root/$downloader.sh" >/dev/null 2>&1; then
+    printf '%s accepted a size-correct payload with the wrong checksum\n' "$downloader" >&2
+    exit 1
+  fi
+  if [[ -e "$tmp/models/$model" ]]; then
+    printf '%s promoted a payload that failed checksum verification to %s\n' "$downloader" "$model" >&2
+    exit 1
+  fi
+  rm -f -- "$tmp/models/$model."*".part"
+done
+
 printf '%s\n' 'Linux script checks passed.'
