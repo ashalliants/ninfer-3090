@@ -639,10 +639,60 @@ roofline finally acquired a denominator; read them before the rest.
       prefill chunk. Sweeping `--prefill-chunk` against this ceiling is the obvious next step and
       has not been done.
 
-- [ ] **Vision has essentially one performance number in the entire repository.** One acceptance
-      figure for DFlash2 on the committed image fixture, and nothing about encode throughput,
-      how it scales with resolution, or what the overlay residency costs in time rather than in
-      bytes. It is an advertised feature of both models and it is unmeasured.
+- [x] **Vision now has numbers. Closed 2026-09-09**, and the headline is that the encoder is not
+      the expensive part. `scripts/sweeps/vision-encode-throughput.ps1`; 27B, int8 KV, one image per
+      request, two measured repetitions per point. `apps/ninfer` reports the Vision stage separately
+      from text prefill, so encode cost is read directly rather than subtracted out.
+
+      | side | image tokens | encode (resident) | tok/ms | encode (overlay) | overlay penalty | text prefill | prefill / encode |
+      |---:|---:|---:|---:|---:|---:|---:|---:|
+      | 224 | 85 | 15.1 ms | 5.65 | 36.5 ms | +143% | 206 ms | 13.7x |
+      | 448 | 217 | 27.2 ms | 7.98 | 50.3 ms | +85% | 316 ms | 11.6x |
+      | 672 | 462 | 56.0 ms | **8.26** | 85.0 ms | +52% | 568 ms | 10.2x |
+      | 896 | 805 | 112.0 ms | 7.19 | 128.0 ms | +14% | 964 ms | 8.6x |
+      | 1120 | 1246 | 181.5 ms | 6.87 | 228.0 ms | +26% | 1,100 ms | 6.1x |
+      | 1344 | 1785 | 300.0 ms | 5.95 | 342.0 ms | +14% | 1,700 ms | 5.7x |
+      | 1568 | 2422 | 475.0 ms | 5.10 | 513.0 ms | +8% | 2,100 ms | 4.4x |
+
+      **Prefilling the image tokens costs 4.4-13.7x what encoding them does.** That is the number
+      to know before optimising anything here: at 1024px a single image is ~173 ms of encode against
+      ~945 ms of text prefill, so the Vision tower is ~15% of time-to-first-token and the other 85%
+      is the ordinary prefill path already covered by §2c's prefill entries. Vision needs no special
+      optimisation attention until that changes.
+
+      **Encode throughput peaks at 672px and falls 38% by 1568px** — 8.26 down to 5.10 tok/ms.
+      Against the 672px peak, encode time is superlinear in tokens: 1.01x at 672, 1.21x at 1120,
+      1.40x at 1344, **1.64x at 1568**. That is the shape attention inside the tower predicts, and
+      it means very large images are charged twice — more tokens, each more expensive. Small images
+      are also inefficient (1.48x at 224px) but for the opposite reason: 85 tokens does not fill the
+      machine.
+
+      **Overlay residency costs a roughly fixed ~30 ms per request, not a proportional one, and
+      saves 250.7 MiB.** Runtime reservation is 848.0 MiB resident against 597.3 MiB overlay. The
+      penalty is +143% at 224px and **+8% at 1568px** because the tower crosses PCIe once per
+      request whatever the image size. So overlay is close to free on large images and expensive on
+      small ones — the opposite of the intuition that a bigger image costs more to overlay. The
+      release launchers default to overlay, which these numbers support for the image sizes anyone
+      actually sends.
+
+      **Encode is exactly linear in image count**, and the overlay penalty is paid once per request
+      rather than once per image. Overlay, 1024px fixtures:
+
+      | images | tokens | encode | tok/ms | vs 1 image |
+      |---:|---:|---:|---:|---:|
+      | 1 | 1,045 | 173.0 ms | 6.04 | 1.00x |
+      | 2 | 2,071 | 352.0 ms | 5.88 | **2.03x** |
+      | 4 | 4,123 | 691.5 ms | 5.96 | **4.00x** |
+
+      So batching images into one request is neither better nor worse per token than sending them
+      separately, except that it amortises the one-off overlay crossing. Nothing here needs a
+      per-image cache.
+
+      One measurement trap the script documents: **resolutions are not free-form.** The
+      preprocessor snaps to a multiple of the merged patch size, so nearby resolutions can produce
+      identical token counts and a naive sweep shows plateaus that look like measurement error. The
+      sides above are multiples of 112 for that reason, and the token count is printed beside every
+      row so a plateau is visible rather than mysterious.
 
 - [x] **DFlash2 makes the 27B *slower*, and no document says so.** Wrong, and closed 2026-09-09.
       On text DFlash2 is a **win at every draft count from 1 to 12**. The entry's own premise came

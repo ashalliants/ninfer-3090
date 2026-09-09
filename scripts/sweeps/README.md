@@ -33,12 +33,21 @@ about three hours for twelve model/format combinations.
 | `decode-step-profile.ps1` | Where does a decode step's time go -- occupancy, launch gaps, or bandwidth? | a few min |
 | `power-and-clocks.ps1` | Does the 315 W cap bound these numbers? | a few min |
 | `admin-profile.ps1` | Everything needing an elevated shell: `ncu` counters, and what 350 W buys | a few min |
+| `vision-encode-throughput.ps1` | What does Vision cost in time, and what does overlay residency cost? | 20 min |
 
 `decode-roofline.ps1` needs no GPU: it reads the CSVs `kv-decode-vs-depth.ps1` leaves behind and
 divides achieved bandwidth by peak. Run that sweep first. Note it only means anything for the
 **dense** model -- applied to the A3B MoE it returns 391% of peak, which is not a result but a
 demonstration that the formula does not hold there, since an MoE never reads its resident weights
 per token. See TODO section 2c.
+
+`vision-encode-throughput.ps1` needs a vision-capable artifact and nothing else. It resizes the
+committed `bench/fixtures/ttft/media` photograph rather than generating synthetic images, because a
+flat image compresses trivially and a random one defeats every cache, and neither is
+representative. The headline it produces: **prefilling an image's tokens costs 4.4-13.7x what
+encoding them does**, so the Vision tower is about 15% of time-to-first-token at 1024px and is not
+where to look for a win. Watch for plateaus in the token count -- the preprocessor snaps to a
+multiple of the merged patch size, so nearby resolutions can produce identical token counts.
 
 **`admin-profile.ps1` must be run from an administrator shell** and refuses to start otherwise.
 It is the only script here that does. `ncu` fails with `ERR_NVGPUCTRPERM` as a normal user because
