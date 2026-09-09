@@ -1341,6 +1341,39 @@ ceiling, and neither has had any optimisation attempted.
       sits underneath it and was reported as no change for that reason. Bisecting it would make
       future quality claims sharper by an order of magnitude.
 
+      **Three candidates eliminated 2026-09-09, and the current value is exactly reproducible.**
+      `int8` re-runs to **4.342425** at HEAD — identical to twelve significant figures, on 261,167
+      scored tokens, in 465 s. So the drift is a real, repeatable difference between two builds and
+      not measurement noise.
+
+      **Not the artifact.** `qwen3_8_27b.ninfer` has an mtime of 29 August 14:06, and the old
+      figures were published in `838c8b5d` on 29 August. The weights have not been reconverted
+      since before the old measurement, which was the tidiest available explanation for a small
+      systematic shift across every format at once.
+
+      **Not the scoring set.** The token count is 261,167 in both, so the harness is windowing and
+      selecting exactly the same tokens. Whatever changed, changed arithmetic rather than what is
+      being averaged.
+
+      **Not kernel or tile selection — and this one is worth keeping.** The natural theory was that
+      route-table changes (the upstream catch-up rewrote several bands) select a different MMA tile,
+      whose reduction runs in a different order, moving the score in the fifth decimal. Tested
+      directly: routed width 1024 in `q5_linear_add` from `MmaResidualR64C128` to `R64C64`, which
+      the harness exercises on every one of its four 1,024-wide prefill chunks, and re-ran. The
+      score rate moved 568.9 to 535.8 tok/s, so a genuinely different kernel ran — and perplexity
+      came back **bit-identical at 4.342425**. Two different MMA tiles over the same weights produce
+      the same score to twelve figures. **Tile geometry does not perturb perplexity at all**, so no
+      route change anywhere in this repository can be the cause of this drift, and route changes
+      need not be treated as a quality risk.
+
+      What is left is a genuine numerics change in some kernel between 29 August and 9 September.
+      The range is **392 commits**, which includes the whole upstream catch-up, so a bisect is
+      about nine steps at roughly 20-30 minutes each — one build plus one 8-minute
+      `ninfer-perplexity` run — call it four hours of exclusive GPU time. Worth scheduling as a
+      block rather than squeezing between other work. Note the three shifts are *not* uniform
+      (−0.0193%, −0.0163%, −0.0092% for `int8`, `bf16`, `rk8v4`), so whatever it is does not simply
+      offset every score by a constant.
+
 - [ ] **`27b_load_plan` skips its DFlash2 binding matrix** for want of the *old* Qwen3.8 artifacts
       (`NINFER_QWEN3_8_27B_OLD_WEIGHTS`, `NINFER_QWEN3_8_27B_NVFP4_OLD_WEIGHTS`) and the NVFP4
       DFlash2 artifact. Everything else in that test now runs and passes (#46). This is the last
