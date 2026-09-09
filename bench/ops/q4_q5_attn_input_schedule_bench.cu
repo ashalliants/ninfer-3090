@@ -61,8 +61,11 @@ constexpr std::size_t kFlushBytes = 128u << 20;
 
 int main(int argc, char** argv) {
     std::vector<std::int32_t> tokens;
-    int repeat = 9;
-    int warmup = 3;
+    int repeat  = 9;
+    int warmup  = 3;
+    // A route boundary is only decidable if the margin clears the two schedules' own spread, and
+    // ColdTiming carries min and p95 already. See TODO section 3 on cold-flush margins.
+    bool spread = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
         if (arg == "--tokens" && i + 1 < argc) {
@@ -79,6 +82,8 @@ int main(int argc, char** argv) {
             repeat = std::atoi(argv[++i]);
         } else if (arg == "--warmup" && i + 1 < argc) {
             warmup = std::atoi(argv[++i]);
+        } else if (arg == "--spread") {
+            spread = true;
         } else {
             std::fprintf(stderr, "usage: %s [--tokens T,...] [--repeat N] [--warmup N] [--spread]\n", argv[0]);
             return 2;
@@ -108,12 +113,14 @@ int main(int argc, char** argv) {
     ninfer::DeviceBuffer flush(kFlushBytes);
     cudaStream_t stream = nullptr;
 
+    const int width = spread ? 30 : 20;
     cudaDeviceProp properties{};
     cudaGetDeviceProperties(&properties, 0);
-    std::printf("# gpu=%s sm=%d%d  q4_q5 attention-input schedules, median of %d\n", properties.name,
-                properties.major, properties.minor, repeat);
+    std::printf("# gpu=%s sm=%d%d  q4_q5 attention-input schedules, %s of %d\n", properties.name,
+                properties.major, properties.minor, spread ? "median min..p95" : "median",
+                repeat);
     std::printf("%6s", "T");
-    for (const Schedule& schedule : kSchedules) { std::printf(" %20s", schedule.name); }
+    for (const Schedule& schedule : kSchedules) { std::printf(" %*s", width, schedule.name); }
     // public_op is the same measurement through attn_input_proj(); a gap between it and
     // the schedule the router picked is dispatch overhead, not kernel cost.
     std::printf(" %12s %-22s   %-20s\n", "public_op", "routed_to", "winner");
@@ -131,22 +138,29 @@ int main(int argc, char** argv) {
         for (int s = 0; s < kScheduleCount; ++s) {
             const Schedule& schedule = kSchedules[s];
             if (schedule.max_cols != 0 && token_count > schedule.max_cols) {
-                std::printf(" %20s", "out-of-domain");
+                std::printf(" %*s", width, "out-of-domain");
                 continue;
             }
             const auto invoke = [&](cudaStream_t launch_stream) {
                 schedule.launch(x, qk.weight, gv.weight, tq, tg, tk, tv, launch_stream);
             };
-            double us = 0.0;
+            ninfer::bench::ColdTiming timing{};
             try {
-                us = ninfer::bench::measure_cold_launch(invoke, flush, stream, warmup, repeat)
-                         .median_us;
+                timing = ninfer::bench::measure_cold_launch(invoke, flush, stream, warmup, repeat);
             } catch (const std::exception&) {
                 cudaGetLastError();
-                std::printf(" %20s", "n/a");
+                std::printf(" %*s", width, "n/a");
                 continue;
             }
-            std::printf(" %20.3f", us);
+            const double us = timing.median_us;
+            if (spread) {
+                char cell[64];
+                std::snprintf(cell, sizeof(cell), "%.1f %.1f..%.1f", us, timing.min_us,
+                              timing.p95_us);
+                std::printf(" %*s", width, cell);
+            } else {
+                std::printf(" %*.3f", width, us);
+            }
             if (best_us == 0.0 || us < best_us) {
                 best_us   = us;
                 best_name = schedule.name;
