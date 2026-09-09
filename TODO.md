@@ -562,6 +562,36 @@ roofline finally acquired a denominator; read them before the rest.
       C8 is the profile the 27B release recommends for multi-user serving, and all three dominant
       families sit at 1.9-2.5x their T=1 cost for 8x the rows.
 
+      **The narrow-extent MMA kernel was built and it is worse. Measured 2026-09-09.** Added an
+      `R64C8` to `q5_linear_add` — `BlockCols` 8 with `WarpCols` 8, so one warp column, 4 warps and
+      128 threads against C16's 8 and 256 — on exactly the reasoning above. It loses to `c16` at
+      every width tested (us, medians of 21-31, k=6144):
+
+      | T | 2 | 4 | 6 | 8 | 10 | 16 |
+      |---|---:|---:|---:|---:|---:|---:|
+      | `c8` | 131.1 | 116.7 | 115.7 | 108.5 | 133.1 | 126.0 |
+      | `c16` | 114.7 | 103.4 | 102.4 | 102.4 | 103.4 | 95.2 |
+      | `split2_exact` | 36.9 | 44.0 | 56.3 | 76.8 | 96.3 | — |
+
+      6-32% worse than `c16`, and still far behind `split2_exact` below 11. Same story at k=17408.
+      Reverted; the route table is unchanged and the schedule is not registered. The numbers are
+      recorded in `src/ops/linear_add/q5/q5_linear_add_plan.cpp` beside the table so it is not
+      retried.
+
+      **Why it fails here and works elsewhere is the transferable part.** The same change succeeds
+      on the GDN input projection — C8 and C16 beat C32 by 9-11% there, and that shipped. The
+      difference is what dominates each kernel. The GDN projection's cost is padded MMA work, so
+      cutting `BN` cuts real work. `q5_linear_add` is already weight-read-bound: `c16` sits at 24%
+      of the 25.3 µs its weight costs to stream once, so cutting `BN` removes no work and halves
+      the warps available to hide the read. **Narrowing a tile helps when padding is the cost and
+      hurts when bandwidth is** — and this Op is the second kind.
+
+      So the 4x between `c16` and the weight-streaming floor is real and still worth having, but it
+      is not a tile-width problem and the prize stated above is not reachable that way. What
+      `rk8v4` proves in §2c's KV entry applies here too: something reaches a much larger fraction of
+      the floor at narrow extents, so the ceiling is not the obstacle — but the mechanism is not
+      tile geometry.
+
       **Part of this is now attributed.** §3's DFlash2 cliff entry chased the same kernel from the
       other direction and landed on `rowsplit_grouped_mma_kernel`, which is 13.78 ms of the 56.29 ms
       C8 round here. It is the GDN input projection, and at C8 it runs the `{{7, 32}}` route from
