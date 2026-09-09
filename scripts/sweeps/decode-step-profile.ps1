@@ -51,7 +51,12 @@ $configs = @(
 foreach ($c in $configs) {
   if (-not (Test-Path $c.path)) { "$($c.key): MISSING $($c.path)"; continue }
   $stem = "$out\prof_$($c.key)"
-  Remove-Item "$stem.nsys-rep","$stem.sqlite" -ErrorAction SilentlyContinue
+  # Everything nsys can write for this stem, not just the two inputs to the next `nsys profile`
+  # call. Without clearing the exported CSVs too, a later `nsys stats` failure (nonzero exit, no
+  # new CSV written) leaves the previous run's files in place, `Test-Path $trace` finds them, and
+  # this iteration reports someone else's numbers as its own.
+  Remove-Item "$stem.nsys-rep","$stem.sqlite",`
+      "$stem`_cuda_gpu_trace.csv","$stem`_cuda_gpu_kern_sum.csv" -ErrorAction SilentlyContinue
 
   & $nsys profile --force-overwrite true --output $stem `
       --trace cuda --cuda-graph-trace node --capture-range cudaProfilerApi --capture-range-end stop `
@@ -67,6 +72,11 @@ foreach ($c in $configs) {
 
   & $nsys stats --report cuda_gpu_kern_sum,cuda_gpu_trace --format csv `
       --output "$stem" "$stem.nsys-rep" > "$stem.stats.log" 2>&1
+  if ($LASTEXITCODE -ne 0) {
+    "$($c.key): nsys stats FAILED (exit $LASTEXITCODE)"
+    Get-Content "$stem.stats.log" -Tail 5 | ForEach-Object { "    $_" }
+    continue
+  }
 
   $trace = "$stem`_cuda_gpu_trace.csv"
   $kern  = "$stem`_cuda_gpu_kern_sum.csv"
@@ -79,8 +89,32 @@ foreach ($c in $configs) {
   if (-not $rows) { "$($c.key): trace CSV had no kernel rows"; continue }
   $starts = $rows | ForEach-Object { [double]$_.'Start (ns)' }
   $ends   = $rows | ForEach-Object { [double]$_.'Start (ns)' + [double]$_.'Duration (ns)' }
-  $busy   = ($rows | Measure-Object -Property 'Duration (ns)' -Sum).Sum
   $wall   = ($ends | Measure-Object -Maximum).Maximum - ($starts | Measure-Object -Minimum).Minimum
+
+  # Union of kernel intervals, not a sum of durations: decode launches on multiple streams, and
+  # concurrent kernels overlap in time. Summing durations double-counts that overlap, which
+  # understates idle time (or drives it negative) exactly when concurrency is doing its job.
+  # Merge-sweep instead: sort by start, extend the current run while the next interval overlaps
+  # or touches it, and bank the run's width once a gap opens.
+  $intervals = for ($i = 0; $i -lt $rows.Count; $i++) {
+    [pscustomobject]@{ Start = $starts[$i]; End = $ends[$i] }
+  }
+  $busy = 0.0
+  $runStart = $null
+  $runEnd   = $null
+  foreach ($iv in ($intervals | Sort-Object Start)) {
+    if ($null -eq $runStart) {
+      $runStart = $iv.Start
+      $runEnd   = $iv.End
+    } elseif ($iv.Start -le $runEnd) {
+      if ($iv.End -gt $runEnd) { $runEnd = $iv.End }
+    } else {
+      $busy    += $runEnd - $runStart
+      $runStart = $iv.Start
+      $runEnd   = $iv.End
+    }
+  }
+  if ($null -ne $runStart) { $busy += $runEnd - $runStart }
 
   ""
   "== $($c.key), int8, one measured repetition =="
