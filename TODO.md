@@ -1132,19 +1132,47 @@ ceiling, and neither has had any optimisation attempted.
       control column to be readable at all. That is a measurement-hygiene fix, not a performance
       one, and it is independent of the power limit.
 
-- [ ] **`compute-sanitizer` cannot launch this repository's test binaries.** It reports "Target
-      application doesn't exist or is not a valid executable" for `ninfer_*_test.exe` — absolute
-      path, `.bat` wrapper and direct `.exe` all tried — while launching a small standalone CUDA
-      executable from the same shell without complaint. The test binaries are large (575 MB for
-      `ninfer_qwen3_6_27b_score_real_test.exe`) and statically link everything, which is the
-      obvious suspect but is unconfirmed.
+- [x] **`compute-sanitizer` and `ncu` both work. Closed 2026-09-09 — this entry was wrong about
+      both, and the way it was wrong is worth keeping.**
 
-      This cost real time: `initcheck` was the right tool for the fp8 corruption in #49 and could
-      not be pointed at it, so the diagnosis came from a `--cuda-graph-trace` timeline and a
-      hand-built reproducer instead. `ncu.exe` is also missing from the Nsight Compute 2025.1.0
-      install directory, so per-kernel occupancy and L2 counters — exactly what the MoE expert
-      gather in §2c needs next — are currently unavailable too. Worth half an hour to fix before
-      the next kernel investigation, not during one.
+      **`compute-sanitizer`: there are two copies installed and one of them lies.**
+
+      | copy | version | result on `ninfer_gdn_input_proj_test.exe` |
+      |---|---|---|
+      | `CUDA\v12.4\compute-sanitizer\` | 2024.1.0 | **exit 0, "ERROR SUMMARY: 0 errors", and the test never ran** |
+      | `CUDA\v12.8\compute-sanitizer\` | current | runs to completion, real test output, 0 errors |
+
+      The v12.4 copy produces two lines of output — the banner and a clean error summary — and exits
+      0 without executing a single line of the binary. **That is a false pass, which is worse than
+      the failure this entry described**: a sanitizer run that reports success having checked
+      nothing. The v12.8 copy runs everything. `compute-sanitizer` on `PATH` resolves to
+      `CUDA\v12.8\bin\compute-sanitizer.bat`, which is the good one, so an unqualified invocation is
+      fine — but an absolute path to the v12.4 directory is not, and that is presumably how this
+      went wrong.
+
+      Verified working on v12.8: `memcheck` and `initcheck` both run `ninfer_gdn_input_proj_test`
+      and `ninfer_linear_swiglu_fp8_test` to completion, 0 errors. **`initcheck` also runs clean on
+      `ninfer_softmax_attention_test`, which is the Op #49 fixed** — the exact investigation this
+      entry says had to be done by hand instead.
+
+      Size is not the problem either. The 598 MB
+      `ninfer_qwen3_6_27b_score_real_test.exe` this entry named launches fine; it skips because
+      `NINFER_QWEN3_6_27B_WEIGHTS` is unset, and compute-sanitizer then says *"Target application
+      terminated before first instrumented API call"* — which is a consequence of the test making
+      no CUDA calls, not a launch failure. That message is easy to read as one.
+
+      **`ncu`: present, and the blocker was a permission, not a missing file.** The entry says
+      "`ncu.exe` is also missing from the Nsight Compute 2025.1.0 install directory". True as
+      written and misleading: the launcher is `ncu.bat` at the top of that directory, with the
+      binary under `target\windows-desktop-win7-x64\`. It runs. What actually stopped it is
+      `ERR_NVGPUCTRPERM` — **GPU performance counters are administrator-only by default on
+      Windows** — which is a permission, fixable per-run by an elevated shell with nothing
+      persistent and no reboot. `scripts\sweeps\admin-profile.ps1` exists for that and produced
+      §2c's MoE counters on the first try.
+
+      The lesson for the next investigation: when a tool appears not to work, check whether a
+      second copy is shadowing it and whether the failure is a permission. Neither of the two
+      things this entry called broken was broken.
 
 - [ ] **The perplexity harness drifts 0.019% from the published figures and nobody knows why.**
       Re-measuring all six KV formats (#63) moved the three formats #49 does not touch by

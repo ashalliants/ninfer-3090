@@ -80,6 +80,35 @@ Every participating comparison emits one `OP_ERROR_STATS` record containing the 
 actual error, active limit, and error-to-limit ratio. The switch changes reporting only; the same
 statistics still drive the normal verdict. Passing tests remain quiet without it.
 
+## Running a test under compute-sanitizer
+
+`memcheck` and `initcheck` both work on these binaries, including the large statically linked ones.
+Invoke it unqualified so `PATH` resolves it:
+
+```bash
+compute-sanitizer --tool initcheck --error-exitcode 9 \
+  build/tests/ninfer_softmax_attention_test
+```
+
+**Do not call the copy under `CUDA/v12.4/compute-sanitizer/` by absolute path.** Two copies are
+installed on a typical toolkit layout, and the 2024.1.0 one in v12.4 prints its banner and
+`ERROR SUMMARY: 0 errors`, exits 0, and **never executes the binary** — a clean report having
+checked nothing. `PATH` resolves `compute-sanitizer` to the v12.8 launcher, which is the working
+one, so the unqualified form above is safe.
+
+Two messages that look like failures and are not:
+
+- *"Target application terminated before first instrumented API call"* — the test made no CUDA
+  calls, usually because it skipped for a missing `NINFER_*_WEIGHTS` environment variable. Set the
+  variable, or pick a test that does not need one.
+- A single `-k 'regex:a|b'`-style argument disappearing in PowerShell: `|` is parsed as a pipeline
+  before the tool sees it. One pattern per invocation.
+
+`ncu` needs one thing more: GPU performance counters are administrator-only by default on Windows
+and it fails with `ERR_NVGPUCTRPERM` otherwise. Run it from an elevated shell — that satisfies the
+permission per-run, with nothing persistent and no reboot.
+`scripts/sweeps/admin-profile.ps1` does this for the profiles the maintainer notes reference.
+
 The variable-width DFlash2 target-attention subset can be run with
 `./build/tests/ninfer_softmax_attention_test --dflash2-only`. It covers D256/Q24/KV4 across all five
 cache codecs, W=2..16, B=1..8, request-local prefixes, cache effects, and Graph metadata/input
