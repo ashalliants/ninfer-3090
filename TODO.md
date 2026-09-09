@@ -568,6 +568,20 @@ roofline finally acquired a denominator; read them before the rest.
       entries, and neither the wider direct route nor a routing change gets it — that was measured
       and refused, see §3.
 
+      **The 35B MoE is now measured on the same curve, and it scales worse: 3.22x at eight lanes.**
+      164.4 / 273.2 / 400.0 / 529.7 tok/s at C1/2/4/8, same harness and settings. That is the
+      opposite of what "the MoE is work-starved at one token, so a cohort should fill the machine"
+      predicts, and the reason is worth carrying here: **a dense model amortises its weight read
+      across the cohort, an MoE with per-token routing does not.** Each token brings its own top-8
+      of 256, so the expected distinct routed experts per round goes 8.0 / 15.8 / 30.5 / **57.4** —
+      7.18x the routed weight bytes for 8x the tokens. Only the shared expert and the dense layers
+      amortise at all. §3's MoE entry has the full working.
+
+      So the 3.6x here and the 3.22x there have different causes and want different fixes, which is
+      worth knowing before anyone treats "batched decode should be nearly free" as a general rule.
+      On the dense 27B it nearly should be, and the gap is the narrow-extent kernels below. On the
+      MoE it should not be, and no kernel work changes that.
+
       Two notes on how this entry used to read. The numbers it quoted (C1 78.71 vs C8 250.26 tok/s)
       came from README's cohort table, which is end-to-end **with MTP3 enabled** — tokens per round
       is roughly `1 + 3 x acceptance` rather than 1, so dividing them into a bandwidth figure gives
@@ -827,28 +841,69 @@ ceiling, and neither has had any optimisation attempted.
       written for the multi-token path and takes a `tokens` argument; single-token decode does not
       use it.
 
-      So the order to try things, revised:
+      So the order to try things, revised — and the first item is a refutation of the obvious fix.
 
-      1. **Give d3 a grid that tiles 82 SMs.** Its 512 blocks are `kIntermediate`, a power of two,
-         and 410 slots is not — any power-of-two block count tiles 82 badly. This is the largest
-         single effect on the list and it is a launch-geometry change, not a kernel rewrite.
-      2. **Split the shared path out of the block**, along the lines `path_tiled` already takes, so
-         the routed warps are not held by the W8 warp. `PathsPerBlock` there is constrained to
-         divide `kTopK + 1 = 9`, so 3 is the natural choice: 3-warp blocks give 16 blocks per SM and
-         100% theoretical occupancy, and the shared path stops gating eight finished warps.
-      3. **Over-fetch.** ncu measured 12.12 MB of DRAM traffic on d3 and 12.27 MB on d4 where #50's
+      1. **Launch geometry does not help, and no block shape does.** d3's 512 blocks over 82 SMs at
+         5 blocks each is 410 slots, which reads like a fixable tiling problem. It is not: total
+         work is 512 columns x 9 warp-paths = **4,608 warp-units against the card's 3,936 warp
+         slots**, so the kernel is only **1.17 machine-fulls of work** and every partitioning gives
+         two waves. Efficiency `N / (slots x ceil(N/slots))` comes out at 62.4% for 9-warp blocks,
+         58.5% for 3-warp, 58.5% for 1-warp. There is no scheduling trick that makes a 1.17-full
+         kernel efficient. **d3 is not badly written; it is too small for this card at one token.**
+
+      2. **Batching does not rescue it either — measured, and this refuted a prediction.** If the
+         gather were merely work-starved, a cohort should fill the machine and the MoE should scale
+         *better* with concurrency than a dense model. Measured 2026-09-09, mtp0, int8 KV, 512
+         decode tokens, both models through `run_serve_concurrency.py`:
+
+         | C | 35B MoE tok/s | vs C1 | 27B dense tok/s | vs C1 |
+         |---|---|---|---|---|
+         | 1 | 164.4 | 1.00x | 36.8 | 1.00x |
+         | 2 | 273.2 | 1.66x | 61.1 | 1.66x |
+         | 4 | 400.0 | 2.43x | 101.0 | 2.75x |
+         | 8 | 529.7 | **3.22x** | 132.9 | **3.62x** |
+
+         The MoE scales *worse*, and the reason is structural rather than a kernel defect. **A dense
+         model amortises its weight read across the cohort — the same bytes serve every lane — but
+         an MoE with per-token routing does not.** Each token brings its own top-8 of 256, so the
+         expected number of distinct routed experts a round must read grows almost linearly with
+         the cohort: 8.0 at C1, 15.8 at C2, 30.5 at C4, **57.4 at C8** — `7.18x` the routed weight
+         bytes for `8x` the tokens. Only the shared expert and the dense layers amortise. The
+         marginal cost per added row bears it out: 1.29 ms/row on a 6.08 ms base for the MoE (21%
+         of base) against 4.71 ms/row on 27.20 ms for the dense model (17%).
+
+         This is worth stating plainly because it is the opposite of the usual intuition about
+         batching, and it means **the 35B's ~51% of achievable is not a bug to be fixed by
+         batching or by tiling.** It is what top-8-of-256 routing costs on a card whose per-layer
+         MoE work is a single machine-full.
+
+      3. **Split the shared path out of the block.** This one still stands, and the source already
+         names it: the shared W8 path is heavier than a routed Q4 path, the block cannot retire
+         until all nine warps finish, and eight completed routed warps sit holding warp slots while
+         warp 8 drains — which is the 44.6% / 58.6% "no eligible warp" reading directly.
+         `sparse_moe_d3_path_tiled_kernel` in the same file exists for exactly this and says so:
+         *"Three path CTAs per token/output row expose enough blocks for the 170-SM target and keep
+         the heavier shared W8 path from holding eight completed routed warps resident."* It is
+         written for the multi-token path and takes a `tokens` argument; single-token decode does
+         not use it. This does not add work to the machine, so item 1 does not apply — it removes a
+         serialisation inside a block that is already resident.
+
+      4. **Over-fetch.** ncu measured 12.12 MB of DRAM traffic on d3 and 12.27 MB on d4 where #50's
          artifact inventory attributes **8.91 MB** and **5.58 MB** of useful weight bytes — 1.36x
-         and **2.20x**. Confirm with `dram__bytes_read.sum` before optimising against it, since the
-         attribution and the ncu run are separate measurements.
+         and **2.20x**. If real, d4 moves over twice the bytes it needs and that is worth more than
+         anything else here. Confirm with `dram__bytes_read.sum` before optimising against it,
+         since the attribution and the ncu run are separate measurements.
 
       Registers are *not* on that list, which is the correction: an earlier draft of this entry
       claimed `Block Limit Registers = 5` was the constraint and that 32 registers per thread would
       give 7 blocks per SM. At 288 threads it would give 7 by the register rule, but the warp rule
-      still caps it at 5, so the change would measure as exactly nothing. Read both limits before
-      believing either.
+      caps it at 5 regardless, so the change would measure as exactly nothing. Read both limits
+      before believing either.
 
-      Closing even half the gap to the contiguous kernels is still worth roughly 15-20% on the
-      recommended model, and nothing here has been attempted yet.
+      What is left after all that is items 3 and 4 — a block-level serialisation and a possible 2x
+      over-fetch — not the 15-20% "close half the gap to the contiguous kernels" this entry used to
+      promise. That framing compared an 8-of-256 gather against kernels that stream contiguous
+      weights, and items 1 and 2 are why that comparison was never going to close.
 
       Not yet collected: the contiguous-kernel reference from the same elevated run.
       `admin-profile.ps1` passed `-k 'regex:a|b'` and PowerShell parsed the `|` as a pipe, so that
