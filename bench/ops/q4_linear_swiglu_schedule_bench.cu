@@ -67,8 +67,12 @@ constexpr std::size_t kFlushBytes  = 256ULL << 20;
 
 int main(int argc, char** argv) {
     std::vector<std::int32_t> tokens;
-    int repeat = 9;
-    int warmup = 3;
+    int repeat  = 9;
+    int warmup  = 3;
+    // A route boundary is only decidable if the margin between two schedules clears their own
+    // spread. This Op is the noisiest of the route tables and the {513,640} band went unresolved
+    // because of it, so print min..p95 beside the median when asked.
+    bool spread = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
         if (arg == "--tokens" && i + 1 < argc) {
@@ -85,8 +89,10 @@ int main(int argc, char** argv) {
             repeat = std::atoi(argv[++i]);
         } else if (arg == "--warmup" && i + 1 < argc) {
             warmup = std::atoi(argv[++i]);
+        } else if (arg == "--spread") {
+            spread = true;
         } else {
-            std::fprintf(stderr, "usage: %s [--tokens T,...] [--repeat N] [--warmup N]\n", argv[0]);
+            std::fprintf(stderr, "usage: %s [--tokens T,...] [--repeat N] [--warmup N] [--spread]\n", argv[0]);
             return 2;
         }
     }
@@ -111,12 +117,14 @@ int main(int argc, char** argv) {
                                                                            max_tokens);
     ninfer::WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 1));
 
+    const int width = spread ? 30 : 22;
     cudaDeviceProp properties{};
     cudaGetDeviceProperties(&properties, 0);
-    std::printf("# gpu=%s sm=%d%d  q4 swiglu schedules, cold, median of %d\n", properties.name,
-                properties.major, properties.minor, repeat);
+    std::printf("# gpu=%s sm=%d%d  q4 swiglu schedules, cold, %s of %d\n", properties.name,
+                properties.major, properties.minor, spread ? "median min..p95" : "median",
+                repeat);
     std::printf("%6s", "T");
-    for (const Schedule& schedule : kSchedules) { std::printf(" %22s", schedule.name); }
+    for (const Schedule& schedule : kSchedules) { std::printf(" %*s", width, schedule.name); }
     std::printf("   %-22s\n", "winner");
 
     for (const std::int32_t token_count : tokens) {
@@ -128,23 +136,30 @@ int main(int argc, char** argv) {
         for (int s = 0; s < kScheduleCount; ++s) {
             const Schedule& schedule = kSchedules[s];
             if (schedule.max_cols != 0 && token_count > schedule.max_cols) {
-                std::printf(" %22s", "out-of-domain");
+                std::printf(" %*s", width, "out-of-domain");
                 continue;
             }
             const auto invoke = [&](cudaStream_t launch_stream) {
                 ninfer::ops::detail::q4_linear_swiglu_execute_schedule(
                     schedule.id, x, packed.weight, out, workspace, launch_stream);
             };
-            double us = 0.0;
+            ninfer::bench::ColdTiming timing{};
             try {
-                us = ninfer::bench::measure_cold_launch(invoke, flush, stream, warmup, repeat)
-                         .median_us;
+                timing = ninfer::bench::measure_cold_launch(invoke, flush, stream, warmup, repeat);
             } catch (const std::exception&) {
                 cudaGetLastError();
-                std::printf(" %22s", "n/a");
+                std::printf(" %*s", width, "n/a");
                 continue;
             }
-            std::printf(" %22.3f", us);
+            const double us = timing.median_us;
+            if (spread) {
+                char cell[64];
+                std::snprintf(cell, sizeof(cell), "%.1f %.1f..%.1f", us, timing.min_us,
+                              timing.p95_us);
+                std::printf(" %*s", width, cell);
+            } else {
+                std::printf(" %*.3f", width, us);
+            }
             if (best_us == 0.0 || us < best_us) {
                 best_us   = us;
                 best_name = schedule.name;

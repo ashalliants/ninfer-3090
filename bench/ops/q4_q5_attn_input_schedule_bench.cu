@@ -80,7 +80,7 @@ int main(int argc, char** argv) {
         } else if (arg == "--warmup" && i + 1 < argc) {
             warmup = std::atoi(argv[++i]);
         } else {
-            std::fprintf(stderr, "usage: %s [--tokens T,...] [--repeat N] [--warmup N]\n", argv[0]);
+            std::fprintf(stderr, "usage: %s [--tokens T,...] [--repeat N] [--warmup N] [--spread]\n", argv[0]);
             return 2;
         }
     }

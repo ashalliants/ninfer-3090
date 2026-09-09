@@ -143,7 +143,7 @@ int main(int argc, char** argv) {
     ninfer::bench::SweepOptions options;
     options.tokens = {1, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 96, 112, 128, 160, 192, 256, 384};
     if (!ninfer::bench::parse_sweep_args(argc, argv, options)) {
-        std::fprintf(stderr, "usage: %s [--tokens T,...] [--repeat N] [--warmup N]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s [--tokens T,...] [--repeat N] [--warmup N] [--spread]\n", argv[0]);
         return 2;
     }
     sweep_attn_input(options);

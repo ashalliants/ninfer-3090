@@ -819,6 +819,28 @@ ceiling, and neither has had any optimisation attempted.
 
 ## 3. Measurement debt
 
+- [ ] **Every route boundary in the repository was decided on cold-flush margins, which overstate
+      the win.** `bench/ops/schedule_sweep.cuh` and its siblings call `measure_cold_launch`, which
+      flushes 256 MiB through L2 before every repetition. That is the right default — these
+      projections stream tens of MB against 6 MB of L2 and production is usually cold — but it is
+      not the same as in situ, and the gap is not small. Measured on the q4 SwiGLU `{513,640}`
+      decision (§5): the bench put c128 7.5% ahead of Materialized at T=576, while an nsys profile
+      of the same schedules inside a real 600-token chunk put it 2.4% ahead, with **both** schedules
+      slower per call in situ than in the bench (c128 4193 vs 3625 µs, Materialized 4295 vs 3927).
+      The flush penalises Materialized's second weight pass more than a real prefill does.
+
+      The sign was right in that case, and no boundary is known to be wrong. But every route
+      comment in `src/ops/*/`*`_plan.cpp` quotes cold-flush microseconds, several of them at
+      margins under 5%, and those margins are not speedups. Worth doing: take the boundaries whose
+      measured margin is under ~5% — the `{2,10}`/`{11,16}` q5 crossover at T=10 (93.2 vs 101.4,
+      8%) and the q4 SwiGLU `{2,24}`/`{25,40}` crossover at T=25 (464.9 vs 436.2, 6%) are the
+      obvious two — and check each in situ with a profile rather than the bench. The method is in
+      §5's entry; it is one nsys run per boundary.
+
+      Do not "fix" the flush. Cold is the honest default for a first pass and warm numbers pick
+      different winners, which is documented at the top of `schedule_sweep.cuh`. The point is that
+      a narrow cold-flush margin is a reason to profile, not a decision.
+
 - [ ] **The 315 W power cap has never been measured, and it bounds every number in this file.**
       `nvidia-smi` reports the limit at 315 W against a 350 W default (400 W maximum) and throttle
       reason `SwPowerCap` continuously through every sweep; the SM clock swings 1,665-1,755 MHz
@@ -887,12 +909,46 @@ ceiling, and neither has had any optimisation attempted.
       columns in one pass where plain decode evaluates one, so reductions run in a different order
       and a near-tie argmax flips. MTP reproduces it exactly, so it predates the merge — but nobody
       has decided whether that is acceptable or worth pinning down.
-- [ ] **q4 SwiGLU `{513,640}` is still on `Materialized`, unmeasured either way.** The one band
-      where Materialized and the c128 tile could not be separated: Materialized won T=576 in three
-      of four runs, but c128 there ranged 4147–4959 µs (**19.6% spread**) and the margins outside
-      the single outlying run were ±2%. Changing it would be fitting noise. Re-measure if the noise
-      floor on this Op improves — it is markedly noisier than the other route tables, which is
-      itself worth understanding.
+- [x] **q4 SwiGLU `{513,640}` settled: it goes to c128, and the alternation is gone.** The band
+      stayed on `Materialized` because the measurement could not separate the two — over four runs
+      Materialized won T=576 three times, while c128 there ranged 4147–4959 µs (19.6% spread) and
+      the margins outside the outlying run were ±2%.
+
+      The blocker was the instrument, not the card. `ColdTiming` had carried `min_us` and `p95_us`
+      all along and the sweep harness threw both away, printing only the median, so the spread that
+      made the decision impossible was never visible in the table. Added `--spread` to
+      `bench/ops/schedule_sweep.cuh` and to the q4 SwiGLU bench (which has its own arg loop), then
+      re-measured at 31–51 repetitions on an idle card. c128 wins all three widths in four
+      independent runs — 1.3–2.5% at 513, 1.2–7.5% at 576, 7.3–11.2% at 640 — and its *fastest*
+      sample beats Materialized's fastest everywhere, by 7–9% at 640 with no overlap at all. Sign
+      consistent 12 times out of 12. `{49,512}`, `{513,640}` and `{641,∞}` collapse into one
+      `{49,∞}` c128 route and the table drops from seven entries to five.
+
+      **Two things worth more than the route change itself.**
+
+      *The bench overstates margins.* Confirmed in situ with nsys on a single 600-token chunk:
+      Materialized costs 269.73 ms in `q4_rowsplit_gemm_mma` plus 5.16 ms in
+      `silu_and_mul_dim0_split` across 64 layers = 274.89 ms, against 268.32 ms for the c128 pair
+      kernel. c128 still wins, but by **2.4%, not 7.5%** — and both are slower per call in situ
+      than in the bench (4193 vs 3625 µs for c128; 4295 vs 3927 for Materialized). The bench
+      flushes L2 before every repetition and a real prefill does not arrive with a cold cache, so
+      the flush penalises Materialized's second pass more than production does. **This applies to
+      every band in every one of these route tables**, all of which were decided on cold-flush
+      numbers alone. Nothing is known to be mis-routed because of it — the sign was right here —
+      but no margin in those comments should be quoted as a speedup.
+
+      *End-to-end it is invisible, and that is expected.* `pp600` measured 886.0–888.8 tok/s with
+      c128 against 888.5–892.1 on Materialized: inside the run-to-run spread, because 6.6 ms of a
+      ~660 ms prefill sits under the ±3% that unrelated kernels move between runs.
+
+      One trap on the way: `--prefill-chunk 640` looks like the obvious way to exercise this band
+      and does not touch it. `q4a8_swiglu` claims any width with `tokens >= 128 && tokens % 128 ==
+      0`, and `--prefill-chunk` is required to be a multiple of 128, so **every full prefill chunk
+      goes to the integer-activation kernel and never reaches this table at all.** The `{49,∞}`
+      route is reached only by decode widths and by a prompt's ragged tail chunk. That is why
+      `{513,640}` was simultaneously close and inconsequential for so long. The first end-to-end
+      comparison here was run at chunk 640 and measured nothing, twice, before the profile showed
+      `q4a8_swiglu_kernel` where `q4_linear_swiglu` was assumed to be.
 
 ---
 

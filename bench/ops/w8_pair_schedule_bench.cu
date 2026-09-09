@@ -202,7 +202,7 @@ int main(int argc, char** argv) {
                                           86, 96,  112, 128, 160, 192, 256, 384, 512, 768, 960, 961,
                                           1024};
     if (!ninfer::bench::parse_sweep_args(argc, argv, options)) {
-        std::fprintf(stderr, "usage: %s [--k2048] [--tokens T,...] [--repeat N] [--warmup N]\n",
+        std::fprintf(stderr, "usage: %s [--k2048] [--tokens T,...] [--repeat N] [--warmup N] [--spread]\n",
                      argv[0]);
         return 2;
     }
