@@ -1,23 +1,215 @@
 # TODO
 
-State as of 2026-09-09, after a correctness pass that closed nine items and found three defects
-nobody had filed.
+State as of 2026-09-09, at the end of a profiling pass that closed six more items and refuted five
+of its own hypotheses. **34 items closed, 17 open.** If you are picking this up on different
+hardware, read "Handing this off to another machine" below before anything else.
 
 Released: **v0.9.0-rtx3090** (Windows + Linux). Full suite **126/126** on this box.
 
-**The headline is that three of the six KV formats were quietly wrong.** fp8, nvfp4 and k8v4
-attention was missing a block barrier between `cp_wait<0>()` and a whole-tile shared-memory read,
-and it corrupted every prefill output column except the last — by up to 26 in logprob. Greedy
-decode reads only the last column, so generation stayed byte-identical and nothing noticed. Every
-published perplexity figure for those three formats was measured through it. See §5.
+**One speedup shipped this pass, and it was small and cheap.** The GDN input projection was routing
+everything from 7 to 32 columns through a 32-wide MMA tile; adding C8 and C16 tiles is worth
+**+5.7% on the C8 serving profile** (3 of 3 runs, arms not overlapping) and +5.3% on DFlash2 at four
+draft tokens. That is the only behaviour change; everything else this pass produced was measurement.
 
-**The decode roofline now has a denominator**, and it is not the one this file used for a cycle.
-The card sustains 854 GB/s on reads, not its advertised 936; and a token reads far less than
-`weights_capacity_bytes`. On that accounting the dense 27B sits at ~66-70% of achievable and the
-**35B MoE at ~51%, flat across depth** — the larger prize, on the recommended model. See §2c.
+**The five biggest opportunities are all now located rather than suspected**, and three of them
+turned out to be the opposite of what this file assumed:
 
-Every route table in the tree has been measured on sm_86; that work is finished. What remains is
-profiling, measurement debt, and coverage needing hardware this box does not have.
+- The **MoE expert gather** is latency-bound, not divergence-bound. 31.1 of 32 threads per warp are
+  active, so there is no divergence to fix; and neither tiling nor batching helps, because the
+  kernel is 1.17 machine-fulls of work and an MoE with per-token routing does not amortise its
+  routed weight read across a cohort — 8 tokens touch ~57 distinct experts, not 8. The 35B's ~51%
+  of achievable is what top-8-of-256 costs, not a bug.
+- The **KV decode falloff** is 3.21x the per-key cost in the decode attention kernel — 5.89 ns
+  against int8's 1.83 ns — and it belongs to the three formats that stage dequantized tiles in
+  shared memory. `KeyBlock` was not the difference.
+- **Prefill's MLP GEMMs** at 31% of INT8 peak are not limited by memory (compute-bound over their
+  own memory floor by 4.3x), tile shape, or dequantization (1-3% of the call). What is left needs
+  counters.
+- **Eight lanes** buy 3.83x, and the gap is a narrow-extent kernel that reaches 24% of its
+  weight-streaming floor. A narrower tile was built for it and lost.
+- The **315 W power cap costs nothing** — +35 W buys +3% SM clock and 0% throughput, because memory
+  clock never leaves 9,501 MHz at either limit.
+
+Two pieces of tooling were believed broken and were not: `compute-sanitizer` (two copies installed,
+and the older one reports `0 errors` without executing the binary) and `ncu` (a permission, not a
+missing file). Both now work; see §3.
+
+Every route table in the tree has been measured on sm_86 and every one of them has a schedule
+bench. What remains is four kernel problems, some measurement debt, and two items needing hardware
+or artifacts this box does not have.
+
+---
+
+## Handing this off to another machine
+
+Written 2026-09-09 for an agent picking this up on different hardware. The section after this one
+("Start here if you are new to this box") is about *this* box; read this one first, because it says
+which of that still applies.
+
+### What every number in this file is, and is not
+
+All of it is one machine: **RTX 3090, `sm_86`, 24,576 MiB, CUDA 12.8, MSVC 14.44.35207, Windows 11,
+board power capped at 315 W.** Three measured ceilings are used throughout and none of them is a
+datasheet figure:
+
+| ceiling | value | note |
+|---|---:|---|
+| achievable read bandwidth | **854.2 GB/s** | not the advertised 936.1; every roofline here divides by this |
+| INT8 MMA | **314.8 TOPS** | `tools/tensor_core_rate_probe.cu` |
+| BF16 MMA, f32 accumulate | **67.6 TFLOPS** | same probe |
+
+**Re-measure those three first on new hardware.** Every percentage in §2c is a ratio against them,
+and carrying them across cards would repeat exactly the mistake this fork found in upstream's
+inherited tables.
+
+**The 315 W cap does not need reproducing.** Measured both ways: at 350 W decode is 37.15 tok/s
+against 37.16-37.55 at 315 W, and prefill 1,228.5 against 1,204-1,255 — so +35 W buys +3% SM clock
+and 0% throughput. Memory clock never leaves 9,501 MHz at either limit, which is why. See §3.
+
+### What definitely does not transfer
+
+**Every route table in the tree was measured on `sm_86` and is expected to be wrong elsewhere.**
+That is not a caveat, it is the main finding of the last two cycles: upstream's tables were
+inherited from `sm_120` and were wrong here by up to 52.8%. The tables, each with its own schedule
+bench under `bench/ops/`:
+
+| route table | bench | boundaries |
+|---|---|---|
+| `src/ops/linear_swiglu/q4/q4_linear_swiglu_plan.cpp` | `q4_linear_swiglu_schedule_bench` | 1 / 2..24 / 25..40 / 41..48 / 49..∞ |
+| `src/ops/linear_add/q5/q5_linear_add_plan.cpp` | `q5_linear_add_schedule_bench` | 1 / 2..10 / 11..16 / 17..24 / 25.. / 104.. / 128..∞ |
+| `src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.cpp` | `q4_q5_attn_input_schedule_bench` | see file |
+| `src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.cpp` | `q4_q5_gdn_input_schedule_bench` | 1..6 / 7..8 / 9..16 / 17..32 / 33..64 / 65..∞ |
+| `src/ops/linear_pair/w8/…` (`w8_pair`) | `w8_pair_schedule_bench` | see file |
+| DFlash2 w8 | `w8_dflash2_schedule_bench` | see file |
+
+Every one of those benches takes `--tokens`, `--repeat`, `--warmup` and **`--spread`**. Use
+`--spread`: it prints `median min..p95` per cell, and a boundary is only decidable when the winner's
+p95 clears the runner-up's min. A boundary in §5 went unresolved for a cycle because the harness
+printed medians only.
+
+Two rules learned the hard way about those tables, both with worked numbers in the files:
+
+- **Narrowing a tile helps when padding is the cost and hurts when bandwidth is.** Adding C8/C16 to
+  the GDN input projection won 9-11% and shipped; the identical change to `q5_linear_add` lost 6-32%,
+  because that kernel is already at 24% of its weight-streaming floor and a narrower tile removes no
+  work while halving the warps hiding the read.
+- **Cold-flush margins overstate the win.** These benches flush 256 MiB through L2 per repetition,
+  which is the right default, but a margin measured that way is not a speedup — one 7.5% bench
+  margin was 2.4% in situ. §3 has the entry; confirm anything under ~5% with a profile.
+
+### What must be re-established before any of this is reproducible
+
+1. **Model artifacts.** Paths, sizes and which-is-which are in the next section. They are ~18-23 GB
+   each and are not in the repo. The real-model tests take them by environment variable; the
+   sweeps take `NINFER_MODEL_DIR`.
+2. **Build environment.** Windows needs the VS 2022 BuildTools `vcvars64.bat` shell; the recipe is
+   in the next section. `cmake --build --target A B` **silently builds only A** on this generator —
+   pass one `--target` per name or you will measure a stale binary. That mistake produced a
+   "verified" result against a binary four hours older than its source.
+3. **GPU performance counters, if you want `ncu`.** On Windows they are administrator-only and
+   `ncu` fails with `ERR_NVGPUCTRPERM`. Running from an elevated shell satisfies it per-run with
+   nothing persistent and no reboot; `scripts/sweeps/admin-profile.ps1` refuses to start unelevated
+   and collects everything that needs it in one pass. The persistent alternative is
+   `HKLM\SOFTWARE\NVIDIA Corporation\Global\NvTweak\RmProfilingAdminOnly = 0` plus a reboot.
+4. **Clock stability.** See below — this is the single biggest threat to reproducing any A/B here.
+
+### Measurement hygiene, which is where the time actually goes
+
+**This card drifts 3-5% between processes, and that is larger than most effects in this file.** Two
+comparisons this cycle came out with opposite-signed drift (+2.9% then −3.8%) on code paths that had
+not changed. Consequences, all of them load-bearing:
+
+- **Interleave A/B arms within each repetition**, not all of one then all of the other. Build both
+  binaries, alternate them inside the loop, and report the *paired* median. `scripts/` has no
+  committed harness for this; the pattern is three lines of shell and it is not optional.
+- **Keep a control** — a configuration whose code path did not change between the two arms — and
+  normalise against it. In the GDN tile A/B, draft counts 4 and 5 stay on an unchanged route and
+  calibrated the drift; without them the result was unreadable.
+- **`nvidia-smi -lgc <clock>`** would remove this entirely and needs an elevated shell. It is the
+  cheapest measurement improvement available and it is still not done — §3 carries it.
+- Two identical-looking runs differing by <3% have measured nothing.
+
+Three more that each cost hours here:
+
+- **`nsys` needs `--cuda-graph-trace node`.** Decode replays a captured CUDA graph and the default
+  records the replay as one opaque entity, which reported 99.3% GPU idle. The tell was 807 launches
+  over 128 steps of a 64-layer model.
+- **`ninfer_bench` has no concurrency option.** Multi-lane numbers come from
+  `tools/bench/run_serve_concurrency.py`. An earlier entry claimed otherwise and sent the work the
+  wrong way.
+- **Never measure speculation on `bench/fixtures/bench_corpus.ids`.** It is 65,536 tokens over 682
+  distinct ids with 98.4% of bigrams repeated, and DFlash2 reports *exactly 100% acceptance at every
+  draft count from 1 to 12* on it. Any acceptance or tokens-per-round figure from that path is a
+  statement about the fixture. Use the serving path on generated prose; `scripts/sweeps/dflash2-draft-tokens-realtext.ps1`
+  is the pattern.
+
+And one reassurance, because it saves a whole class of worry: **MMA tile choice does not perturb
+perplexity.** Routing width 1024 in `q5_linear_add` from `C128` to `C64` moved the score rate
+568.9 → 535.8 tok/s, so a different kernel demonstrably ran, and perplexity came back bit-identical
+to twelve figures. Route changes are not a quality risk.
+
+### Tooling traps specific to Windows, all hit this cycle
+
+- **`compute-sanitizer` has two installed copies and one lies.** The 2024.1.0 copy under
+  `CUDA/v12.4/` prints its banner and `ERROR SUMMARY: 0 errors`, exits 0, and **never executes the
+  binary** — a clean report having checked nothing. The v12.8 copy works, and is what
+  `compute-sanitizer` on `PATH` resolves to. Never call it by an absolute v12.4 path.
+- **`-k 'regex:a|b'` in PowerShell** is parsed as a pipeline before `ncu` sees it. One
+  `--kernel-name` pattern per invocation.
+- **`apps/ninfer` writes its logs UTF-16LE.** `grep` finds nothing in them; decode first.
+- **`Get-FileHash` is unavailable** under the `powershell` on this box, which silently breaks the
+  hashing step of `dflash2-draft-tokens-realtext.ps1` (non-fatal, one error per iteration).
+- **Copying a built `.exe` out of `build-ninja/apps/`** breaks DLL resolution: exit 127 with an
+  empty log, which reads exactly like a model failure. Keep A/B binaries in that directory under
+  different names.
+- **Heredocs through this agent harness mangle `\n` and `\v`** inside Python strings. A `\v` in a
+  path became a literal vertical tab in committed Markdown. Write files with a file-write tool
+  rather than a heredoc when the content contains backslash escapes.
+
+### Work in flight that does not transfer
+
+- **Two `ncu` profiles are outstanding on this box** and a new machine simply re-runs
+  `scripts/sweeps/admin-profile.ps1 -SkipPower` there: section 2 (the contiguous-kernel baseline the
+  MoE's 40-45% figures are compared against, which failed first time on the PowerShell `|` bug) and
+  section 3 (the prefill MLP GEMMs, where memory, tile shape and dequantization are all already
+  ruled out and only issue rate / shared-memory feeding / occupancy remain). §2c has both.
+- **The perplexity drift bisect is scoped and unstarted**: 392 commits, ~nine steps at 20-30 minutes
+  each, about four hours of exclusive GPU time. It is a repository question rather than a hardware
+  one, but the baseline figures it bisects against were measured here. §3 has the constraints,
+  including that three candidates are already eliminated.
+- **`ninfer_qwen3_6_27b_score_real_test`** and its siblings need `NINFER_*_WEIGHTS` set or they skip.
+  A skip is not a pass, and under `compute-sanitizer` a skip surfaces as
+  *"Target application terminated before first instrumented API call"*.
+
+### The seventeen open items, and the next concrete action for each
+
+Ordered by expected value, not by section.
+
+| item | § | next action | needs |
+|---|---|---|---|
+| MoE expert gather is latency-bound | 2c | split the shared W8 path out of the 9-warp block, as `sparse_moe_d3_path_tiled_kernel` already does for multi-token; then confirm the 2.2x over-fetch on d4 with `dram__bytes_read.sum` | kernel work; `ncu` for the confirm |
+| Prefill MLP GEMMs at ~30% of INT8 peak | 2c | run `admin-profile.ps1` section 3 and read issue rate vs shared-memory feeding vs occupancy | one elevated run |
+| Eight lanes buy 3.6x (3.83x since the GDN tiles) | 2c | the 4x between `mma_r64_c16` and its weight-streaming floor is the target; **not** by narrowing the tile, which was tried and lost | kernel work |
+| KV decode falloff, 3.21x per-key on fp8 | 2c | attack the per-key dequant-into-shared cost; `rk8v4` proves the floor is reachable without a shared arena | kernel work |
+| DFlash2 5→6 cliff | 2c/3 | remainder after the GDN tiles is the grouped kernel sitting at 27% of its own weight-streaming floor | same kernel as the KV item |
+| Routed prefill pipeline-depth threshold 7/4 | 2c | sweep the constant through the product on this card — the method the source comment endorses over the operator fixture | GPU time only |
+| `w8_pair` medium discards its schedule on sm_86 | 3 | write one genuinely sm_86-specific tiling and bench it against the generic chunked loop | kernel work |
+| sm_86 fallback constants chosen to fit | 2c | sweep the alternatives at the eleven `NINFER_SM8X_COMPAT` sites | GPU time only |
+| Cold-flush margins overstate wins | 3 | profile the narrow boundaries in situ; the method is in §5's q4 SwiGLU entry | GPU time only |
+| Perplexity drift 0.019% | 3 | the scoped four-hour bisect | exclusive GPU time |
+| Speculative decoding not bit-identical to greedy | 3 | decide whether it should be; the divergence is a reduction-order effect in k+1-column verification and MTP reproduces it, so it predates DFlash2 | judgement, not measurement |
+| DFlash2 corpus acceptance on real text | 3 | bake a diverse corpus with `make_bench_corpus.py --source-text`, or extend the real-text sweep to report acceptance | a local HF tokenizer, which this box lacks |
+| `27b_load_plan` DFlash2 binding matrix | 3 | needs the *old* Qwen3.8 artifacts and the NVFP4 DFlash2 artifact | artifacts nobody has |
+| DFlash2 + multi-GPU expert offload | 2 | genuinely blocked | a second GPU |
+| No committed interleaved-A/B harness | 3 | ~40 lines in `tools/bench/`; the pattern is written out in the item | nothing |
+| `Get-FileHash` missing breaks a sweep's hash column | 3 | swap for `certutil -hashfile` | nothing |
+| Host memory pressure invalidates 35B runs | 3 | give the other sweeps the 24 GiB guard `moe-prefill-pipeline-depth.ps1` has | nothing |
+
+Two of those seventeen are hard-blocked on things no amount of work here provides (a second GPU, and
+artifacts that no longer exist). One is a judgement call rather than a measurement. The remaining
+fourteen are all actionable — three of them need no GPU at all, and four are kernel work on two
+closely related problems: narrow-extent weight streaming in `q5_linear_add`/`gdn_input`, and
+dequant-into-shared in the quantized attention kernels.
 
 ---
 
@@ -128,28 +320,45 @@ question, and which one produced a wrong answer and why.
 
 ## 0. Next up, in this order
 
-1. **Profile one decode step** (§2c). The MoE runs at ~51% of the card's *achievable* read
-   bandwidth and is flat across depth; the dense path at ~66-70%. Both denominators now exist and
-   neither path has ever been profiled. `scripts/sweeps/decode-step-profile.ps1` captures exactly
-   one measured repetition under nsys and reports GPU-busy against window-wall first, because a
-   launch gap is not recoverable by kernel tuning and rules itself in or out in one run.
-2. **Re-measure perplexity for fp8, k8v4 and nvfp4** (§5). Those three numbers were scored
-   through the attention race #49 fixed. They are not "single runs that probably averaged out";
-   they are measurements of a broken kernel, and the format ranking built on them means nothing
-   until they are redone. Include int8 as a control.
-3. **The KV decode falloff still wants an explanation** (§2c). #49 removed the tidy theory
-   without moving the numbers: fp8/k8v4/nvfp4 still fall off two to three times as fast as
-   int8/rk8v4.
-4. **DFlash2 costs 20% on the 27B and no draft count below 7 has ever been tried** (§2c).
-   `scripts/sweeps/dflash2-draft-tokens.ps1` sweeps 1..12 with and without the draft head.
-5. **The calculator's speculative-memory gap** (§2b). Live on master and linked from README, so
-   every speculative configuration it reports is roughly 170 MiB optimistic.
-   `scripts/sweeps/speculative-memory-terms.ps1` reads every term the page needs in about ten
-   minutes; this is implementing, not investigating.
-6. **The two test-criterion outliers** (§4). Small, and neither needs hardware this box lacks.
+Every item in the previous version of this list is now closed. What follows is what a fresh agent
+should do first, and the ordering is by expected value rather than by section. The full
+seventeen-item table with what each one needs is in "Handing this off to another machine" above.
 
-Only one open item now needs hardware this box does not have (§2). The rest is measurement debt
-(§3), calibration (§4) or policy calls (§6).
+1. **Run `scripts/sweeps/admin-profile.ps1 -SkipPower` from an elevated shell.** Two `ncu` profiles
+   are outstanding and both are cheap: the prefill MLP GEMMs (§2c — memory, tile shape and
+   dequantization are all already ruled out, so only issue rate, shared-memory feeding and
+   occupancy remain, and those need counters) and the contiguous-kernel baseline the MoE gather's
+   40-45% figures are compared against. This is minutes of GPU time and it unblocks the largest
+   compute-side item in the file.
+2. **Lock clocks for measurement: `nvidia-smi -lgc 1500`** (§3, elevated). The card drifts 3-5%
+   between processes, which is larger than most effects here — it forced every A/B this cycle to
+   interleave its two binaries within each repetition and carry an unchanged control. This is the
+   cheapest improvement to every future measurement in this repository and it is one line.
+3. **Two related kernel problems, and they are the real prizes** (§2c). Both are narrow-extent
+   weight streaming and both have a measured target:
+   - `q5_linear_add`'s `mma_r64_c16` sits at **24%** of what its weight costs to stream once, flat
+     from T=4 to T=16. Closing that is most of the eight-lane gap. **Not** by narrowing the tile —
+     that was built and lost 6-32%.
+   - the quantized attention kernels pay **3.21x** int8's per-key cost (5.89 ns against 1.83 ns),
+     which is the whole KV decode falloff. `rk8v4` reaches the flattest curve of all six formats
+     with no shared arena at all, so the floor is demonstrably reachable.
+4. **Split the shared W8 path out of the MoE's 9-warp block** (§2c). The source already names this
+   — `sparse_moe_d3_path_tiled_kernel` exists for it and says so — and it is what the 44.6%/58.6%
+   "no eligible warp" reading measures. Do not chase launch geometry or batching first: both were
+   measured this cycle and neither helps, because the kernel is 1.17 machine-fulls of work and an
+   MoE does not amortise its routed weight read across a cohort.
+5. **Sweep the routed prefill pipeline-depth constant through the product** (§2c). `7/4` is
+   upstream's RTX 5090 number and an RTX 5090 has 16x this card's L2. Sweeping the constant is the
+   method the source comment endorses over the operator fixture, which disagrees with the server by
+   6x. GPU time only, no new code.
+6. **The perplexity drift bisect** (§3), when four hours of exclusive GPU time are available. Three
+   candidates are already eliminated and the current value is exactly reproducible, so the
+   remaining work is mechanical.
+
+Two of the seventeen open items are hard-blocked — one on a second GPU (§2), one on artifacts that
+no longer exist (§3) — and one is a judgement call about whether speculative decoding should be
+bit-identical to greedy rather than a measurement (§3). Everything else is actionable, and three of
+the newest items (§3: the A/B harness, a hash call, and a memory guard) need no GPU at all.
 
 **Keep `investigate/small-t-upstream` until the next catch-up.** It is merged, but it is the clean
 record of how upstream's small-T was adopted and what had to be fixed (`19c7617c` and its
@@ -1248,6 +1457,54 @@ ceiling, and neither has had any optimisation attempted.
 ---
 
 ## 3. Measurement debt
+
+- [ ] **There is no committed harness for an interleaved A/B, and every comparison in this file
+      needed one.** The card drifts 3-5% between processes, so measuring all of arm A then all of
+      arm B is not a comparison — two runs this cycle came out with opposite-signed drift (+2.9%
+      then −3.8%) on code paths that had not changed. The working pattern, hand-rolled three
+      separate times this cycle:
+
+      1. build both binaries and place them **inside `build-ninja/apps/`** under different names,
+         because an executable copied elsewhere fails DLL resolution with exit 127 and an empty
+         log, which reads exactly like a model failure;
+      2. alternate the two inside one repetition loop, not one arm then the other;
+      3. report the **paired** median — the median of per-repetition ratios — and how many pairs
+         were positive, not the ratio of the two medians;
+      4. keep a control configuration whose code path is identical in both arms, and normalise
+         against it. In the GDN tile A/B, draft counts 4 and 5 stay on an unchanged route and are
+         what made the result readable.
+
+      Worth ~40 lines in `tools/bench/` taking two executable paths and a command template. It
+      would also stop the next person rediscovering that the ratio of two medians and the median of
+      ratios disagree here by more than the effects being measured. `nvidia-smi -lgc` (§3) reduces
+      the need for this but does not remove it, and needs an elevated shell.
+
+- [ ] **`scripts/sweeps/dflash2-draft-tokens-realtext.ps1` calls `Get-FileHash`, which does not
+      exist under this box's `powershell`.** It errors once per iteration — 26 iterations, 26 error
+      blocks in the output — and the `content_sha256` column comes out empty. Non-fatal, and the
+      throughput numbers it prints are unaffected, but the hash column is the entire mechanism by
+      which that script lets a reader check whether two configurations produced identical text,
+      which its own header says is the point. Replace it with `certutil -hashfile <path> SHA256`, or
+      call `[System.Security.Cryptography.SHA256]::Create()` directly, either of which works here.
+
+- [ ] **Host memory pressure can silently invalidate any 35B measurement on this box, and did.**
+      `vmmemWSL` holds up to **27 GiB of the 64 GiB** of host RAM while WSL is running, and the 35B
+      artifact is 22.8 GB — so loading it contends directly with WSL's footprint, the machine pages,
+      and timings become noise. A first attempt at the pipeline-depth sweep was abandoned for
+      exactly this. `wsl --shutdown` reclaims it.
+
+      `scripts/sweeps/moe-prefill-pipeline-depth.ps1` now refuses to start below 24 GiB free, and
+      **every other sweep here should grow the same guard** — none of them currently checks, and a
+      paging run produces plausible-looking numbers rather than an error. Related: this box's C:
+      drive sits at 98% full (45 GB free) and hit *zero* bytes earlier in the cycle, which failed a
+      build with `C1085 ... No space left on device`. Two artifacts were byte-identical duplicates
+      (19 GB recovered) and WSL crash dumps held another 12 GB.
+
+      **Reading today's numbers in light of this:** the paired interleaved A/Bs are robust to it,
+      because both arms met the same conditions — the GDN tile results (+5.7% C8 serving, 3 of 3
+      non-overlapping; +5.3% DFlash2 k=6, 6 of 6 pairs) and the route-boundary bench sweeps are
+      safe. Single-shot end-to-end figures taken during the same window are the ones to treat as
+      provisional and re-run under the guard.
 
 - [ ] **Every route boundary in the repository was decided on cold-flush margins, which overstate
       the win.** `bench/ops/schedule_sweep.cuh` and its siblings call `measure_cold_launch`, which
