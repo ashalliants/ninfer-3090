@@ -87,7 +87,9 @@ case "$VISION" in
 esac
 
 server="${NINFER_SERVER:-$root/build-linux/apps/ninfer-serve}"
-[[ -x "$server" ]] || server="$root/ninfer-serve"
+# Same two layouts as the artifact lookup above: build tree in a checkout, then the archive
+# root, where this launcher sits beside the binary.
+[[ -x "$server" ]] || server="$script_dir/ninfer-serve"
 
 if [[ ! -x "$server" ]]; then
   printf 'Missing ninfer-serve (looked for %s)\n' "$server" >&2
