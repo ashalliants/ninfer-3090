@@ -47,6 +47,8 @@ ninfer_add_op_bench(ninfer_candidate_selector_bench SOURCES ops/candidate_select
 ninfer_add_op_bench(ninfer_gdn_input_proj_bench SOURCES ops/gdn_input_proj_bench.cu)
 ninfer_add_op_bench(ninfer_gdn_input_proj_conv_snapshot_bench
   SOURCES ops/gdn_input_proj_conv_snapshot_bench.cu)
+ninfer_add_op_bench(ninfer_q4_q5_gdn_input_schedule_bench
+  SOURCES ops/q4_q5_gdn_input_schedule_bench.cu)
 ninfer_add_op_bench(ninfer_attn_input_proj_bench SOURCES ops/attn_input_proj_bench.cu)
 ninfer_add_op_bench(ninfer_q4_q5_attn_input_schedule_bench
   SOURCES ops/q4_q5_attn_input_schedule_bench.cu)

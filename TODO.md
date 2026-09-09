@@ -865,10 +865,64 @@ ceiling, and neither has had any optimisation attempted.
       width 8** (0.300 ms per instance at width 8 against 0.311 at width 7 — near-identical, which
       is what padded-width-dominated cost looks like). Fixing it pays twice.
 
-      One tooling gap behind all of this: **there is no schedule bench for this Op.** Every other
-      route table here has one (`bench/ops/q4_q5_attn_input_schedule_bench.cu` is the closest
-      sibling) and `q4_q5_gdn_input` does not, which is why its boundary carried no measurement for
-      so long. Write it before tuning a new tile.
+      One tooling gap was behind all of this: this Op had no schedule bench, which is why its
+      boundary carried no measurement for so long. Written now, and it produced the two narrow
+      tiles in the entry below — which take back a third of this cliff (k=6 goes from 47.9 to 51.2
+      tok/s, +5.3% paired, 6/6 runs). The cliff is smaller but still there: the remaining gap is
+      that the grouped kernel runs at 27% of its own weight-streaming floor at any width, and no
+      tile choice changes that.
+
+- [x] **The GDN input projection now has a schedule bench, and it bought two narrower tiles.**
+      Closed 2026-09-09. This was the one route table here with no schedule bench, which is why its
+      boundary carried no measurement while being implicated in two separate slowdowns.
+
+      `bench/ops/q4_q5_gdn_input_schedule_bench.cu` plus a
+      `q4_q5_gdn_input_execute_schedule` seam (the pattern `q4_linear_swiglu` and `w8_pair` already
+      use: the real dispatch minus its plan-matches-problem check, so every schedule can be timed
+      at every width). First result: **every existing boundary in that table is correct** — 6/7,
+      32/33 and 64/65 all sit exactly where the curves cross.
+
+      Second result: the table was missing two tiles. `GemmCfg` takes the tile width as `BN`, so
+      `R64C8` and `R64C16` are instantiations, not new kernels. Measured, cold, medians of 31 with
+      `--spread`, each winner's p95 below the runner-up's min:
+
+      | T | independent | c8 | c16 | c32 |
+      |---|---|---|---|---|
+      | 6 | **188.4** | 240.6 | 247.8 | 290.8 |
+      | 7 | 330.8 | **238.6** | 242.7 | 267.3 |
+      | 8 | 319.5 | **236.5** | 243.7 | 267.3 |
+      | 9 | 486.4 | 504.8 | **243.7** | 267.3 |
+      | 16 | — | 506.9 | **242.7** | 267.3 |
+      | 17 | — | 750.6 | 495.6 | **269.3** |
+      | 32 | — | 999.4 | 491.5 | **264.2** |
+
+      So c8 wins 7..8 by 10.7-11.5% and c16 wins 9..16 by 8.8-9.2%, each collapsing one column past
+      its own width because a second pass costs a whole extra weight read. The table is now
+      `{1,6} independent / {7,8} c8 / {9,16} c16 / {17,32} c32 / {33,64} c64 / {65,∞} c128`, and
+      `tests/ops/test_gdn_input_proj.cpp` gained widths 8, 9 and 17 so every new boundary is
+      exercised on both sides.
+
+      End to end on DFlash2, interleaving the two binaries within each repetition so thermal drift
+      lands on both arms — which it had to, because the card moved 3-5% between processes and that
+      is larger than the effect:
+
+      | k | width | base | c8/c16 | paired median | positive |
+      |---|---|---|---|---|---|
+      | 6 | 7 | 47.9 | 51.2 | **+5.3%** | 6/6 pairs |
+      | 8 | 9 | 44.4 | 45.2 | **+3.2%** | 4/6 pairs |
+
+      **Do not read the 11% as evidence that padding was the main cost.** Dropping `BN` from 32 to
+      8 removes 75% of the padded MMA work and buys 11%, because this Op streams ~55 MB of weights
+      (4,096x5,120 q4 plus 12,288x5,120 q5) whose 64.4 µs at 854.2 GB/s no tile choice changes. c8
+      at 236.5 µs is **27% of that floor**. The padded work was a minor term all along, and the
+      remaining 3.7x is what is actually worth chasing — the same conclusion §2c's 8-lane entry
+      reaches about `mma_r64_c16`, from a different Op.
+
+      Not yet measured: the C8 **serving** cohort, which is the other workload this kernel dominates
+      (13.8 ms of a 56.3 ms round at width 8). The DFlash2 numbers above are the CLI path. The
+      serving A/B wants `tools/bench/run_serve_concurrency.py --concurrency 8 --mode mtp0` against
+      both binaries, interleaved the same way; expect low single digits, since the kernel is ~25%
+      of the round and the tile win is ~11% of the kernel.
 
 - [ ] **`w8_pair` medium discards its schedule entirely on sm_86.**
       `w8_pair_gemm_splitk.cu:133` is `(void)schedule` under `NINFER_SM8X_COMPAT`, so every
