@@ -21,11 +21,13 @@ into three-warp path blocks, which raised theoretical occupancy to 100% and *dro
 67.7% to 52.6%. That closed the MoE entry as a dead end — all four of its candidate fixes are now
 measured negatives.
 
-**The largest cheap win in this file is a single-warp kernel.** `sparse_moe_d2_warp_kernel` picks
-the top 8 of 257 experts in `<<<1, 32>>>` — one warp, one SM of 82 — and `nsys` puts it at **8.45%
-of the 35B's decode kernel time**, third of the four MoE stages. At ~20,000 cycles for ~400
-instructions it is fully exposed latency, not arithmetic, so the fix is warps to interleave rather
-than a better sort. See §2c.
+**The largest unexplained cost in this file is a single-warp kernel.** `sparse_moe_d2_warp_kernel`
+picks the top 8 of 257 experts in `<<<1, 32>>>` — one warp, one SM of 82 — and `nsys` puts it at
+**8.45% of the 35B's decode kernel time**, third of the four MoE stages and 3.6x d1. The stall
+breakdown is collected: **`wait` 37.7% and `branch_resolving` 15.3% against `long_scoreboard` 4.1%**,
+so it is exposed instruction latency and divergence, *not* memory — which rules out the most
+plausible fix and leaves two concrete ones (a block-scoped selection with 8 warps, and a
+branch-free sort). Target 4-5 µs, or 5-6% of decode. See §2c.
 
 **Read this next: almost nothing here is bandwidth-bound, and this file spent a cycle assuming
 otherwise.** `ncu` counters on five kernels, all on one instrument with clocks locked, say the same
@@ -1444,23 +1446,68 @@ mechanism, and it is not tile geometry.**
       busy time" across the stages and found no room for it; the four stages are 40.9% of *kernel*
       time here, and d1 is far cheaper than assumed, which is where the room was.
 
-      **Why one warp is this slow, which is the part that says how to fix it.** 13.43 µs at
-      1,500 MHz is ~20,000 cycles to pick the top 8 of 257 floats — about 1 KB of input. The
+      **Why it is this slow is NOT yet established, and the obvious answer does not add up.**
+      13.43 µs at 1,500 MHz is ~20,000 cycles to pick the top 8 of 257 floats from about 1 KB. The
       selection is not badly written: `sparse_moe_route.cuh` gives each lane 8 scores, insertion
-      sorts them locally, then does five xor-merge steps, each 8 independent shuffles followed by a
-      3-stage bitonic restore. That is on the order of 400 instructions, so ~50 cycles per
-      instruction. **That is fully exposed latency: with a single warp resident there is nothing to
-      interleave, so every shuffle and every dependent compare pays its full latency.** It is not an
-      arithmetic problem and a better sort will not fix it.
+      sorts them locally, then runs five xor-merge steps, each 8 independent shuffles followed by a
+      3-stage bitonic restore. Costing that out — shuffles pipeline, the bitonic stages are
+      dependent at ~20-30 cycles each, the insertion sort is a few hundred cycles even divergent —
+      lands somewhere near **1,000 cycles, under a microsecond.** The measurement is twenty times
+      that, so the instruction mix does not explain it and "a single warp has nothing to interleave"
+      is at best a partial answer.
 
-      **The fix is more warps in the block, not more blocks.** One block means one SM either way —
-      the win is latency hiding *inside* the block. A block-scoped selection with 8 warps (each
-      taking 32 of the 257 experts, one score per lane, producing a local top-8, then one
-      cross-warp merge through shared memory) shortens the dependent chain from five merge steps
-      over 8-element runs to two plus a merge, and gives the scheduler seven other warps to issue
-      from meanwhile. On the arithmetic above that should land nearer 4-5 µs, which is
-      **5-6% of the 35B's decode time** — larger than anything else left in this file and much
+      What the counters do say (from the MoE capture, so `ncu`'s inflated 15.52 µs duration but
+      trustworthy ratios): **no eligible warp on 78.56% of cycles**, avg. active threads per warp
+      **22.19 of 32**, L2 hit rate 81.67%, DRAM throughput 0.60%. So the one warp is stalled for
+      four cycles in five, and it diverges — but which stall dominates is exactly what has not been
+      measured.
+
+      **The stall breakdown was collected rather than guessed, and it settles which fix is right.**
+      `ncu --metrics smsp__warp_issue_stalled_*_per_warp_active.pct` on `sparse_moe_d2`, three
+      launches, clocks locked — the `per_warp_active` family works without PC sampling, which is
+      what the MoE capture's missing `smsp__pcsamp_sample_count` had blocked:
+
+      | stall reason | % of active warp cycles |
+      |---|---:|
+      | **`wait`** — dependent fixed-latency instructions | **37.68** |
+      | **`branch_resolving`** — the divergent insertion sort | **15.25** |
+      | `imc_miss` | 7.69 |
+      | `short_scoreboard` | 4.15 |
+      | **`long_scoreboard`** — global memory latency | **4.09** |
+      | `barrier`, `lg_throttle` | 0.00 |
+
+      **Memory latency is 4% and is therefore not the problem** — which kills the most plausible of
+      the three candidates. Staging `scores` through shared memory or fusing into d1's tail would
+      buy essentially nothing. `wait` plus `branch_resolving` are **52.9% between them**, and both
+      are what a single warp running a dependent, divergent chain looks like with nothing to
+      interleave.
+
+      So the fix is the one the counters point at, and it is two changes to the same routine:
+
+      1. **More warps in the block**, to cover the 37.68% `wait`. One block still means one SM — the
+         win is interleaving *inside* it. A block-scoped selection with 8 warps (each taking 32 of
+         the 256 experts, one score per lane, a local top-8, then one cross-warp merge through
+         shared memory) both shortens the dependent chain and gives the scheduler seven other warps
+         to issue from.
+      2. **A branch-free sorting network** for the per-lane sort, to remove the 15.25%
+         `branch_resolving`. The current code is a `while`-loop insertion sort over 8 elements,
+         which is where the 22.19-of-32 active threads comes from.
+
+      On the ~1,000-cycle instruction cost that arithmetic gives, 4-5 µs is the target, i.e.
+      **5-6% of the 35B's decode time** — larger than anything else left in this file and far
       cheaper than the split-K MMA kernel.
+
+      **Two cautions before writing it.** The ranking is a total order over distinct expert ids and
+      `sparse_moe_route.cuh` says so, so any correct selection must produce the same set *and the
+      same order*; `ninfer_sparse_moe_test` at T=1 is the check. And
+      `sparse_moe_select_top8_warp` is shared with the prefill and small-T paths
+      (`sparse_moe_prefill_kernels.cu:153`, `sparse_moe_small_t_kernels.cu:103`), which call it per
+      token from a wide launch and are *not* latency-starved — so add a block-scoped variant
+      alongside it rather than replacing it.
+
+      That the mechanism was measured rather than assumed matters here specifically: the D3 block
+      split on this same page was built on an equally plausible story, measured, and came out
+      *worse*. This time the losing candidate was eliminated before any kernel was written.
 
       Two cautions. The ranking is a total order over distinct expert ids and the file says so, so
       any correct selection must produce the same set *and the same order* — `ninfer_sparse_moe_test`
