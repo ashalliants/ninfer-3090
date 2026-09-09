@@ -558,6 +558,16 @@ roofline finally acquired a denominator; read them before the rest.
       C8 is the profile the 27B release recommends for multi-user serving, and all three dominant
       families sit at 1.9-2.5x their T=1 cost for 8x the rows.
 
+      **Part of this is now attributed.** §3's DFlash2 cliff entry chased the same kernel from the
+      other direction and landed on `rowsplit_grouped_mma_kernel`, which is 13.78 ms of the 56.29 ms
+      C8 round here. It is the GDN input projection, and at C8 it runs the `{{7, 32}}` route from
+      `src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.cpp` — a **32-wide** MMA tile whose cost is
+      set by padded width, so eight live columns pay for thirty-two. The per-instance cost confirms
+      it: 0.300 ms at width 8 against 0.311 ms at width 7, near-identical where a live-token-scaled
+      kernel would differ by an eighth. So a `GroupedMixedMmaR64C8`/`R64C16` is wanted by both
+      entries, and neither the wider direct route nor a routing change gets it — that was measured
+      and refused, see §3.
+
       Two notes on how this entry used to read. The numbers it quoted (C1 78.71 vs C8 250.26 tok/s)
       came from README's cohort table, which is end-to-end **with MTP3 enabled** — tokens per round
       is roughly `1 + 3 x acceptance` rather than 1, so dividing them into a bandwidth figure gives
@@ -802,11 +812,63 @@ ceiling, and neither has had any optimisation attempted.
       model in `docs/config-calculator.html` before changing a default. And 256 costs 6.9%, which
       is worth knowing for anyone tempted to shrink the chunk to save memory.
 
-- [ ] **DFlash2 has a cliff between five and six draft tokens**, 57.2 to 48.4 tok/s (#65), a 15%
-      drop where acceptance is still rising. Seven through twelve continue to degrade. It looks
-      like a block-geometry boundary — seven forms block length eight, per `docs/cli.md` — so five
-      may be sitting just under a tile edge that six crosses. Worth a look if the last few percent
-      matter; four is already the recommended count and is on the good side of it.
+- [ ] **DFlash2's cliff between five and six draft tokens is a GDN input-projection route
+      boundary, and the fix is a narrower MMA tile.** Found 2026-09-09. Not the block geometry this
+      entry guessed at.
+
+      The cliff reproduces exactly — 27B DFlash2 artifact, greedy, `--max-new 256` on a prose
+      prompt, four repetitions each within ±0.1 tok/s. Converting to round cost is what makes it
+      readable, since acceptance and rate move together:
+
+      | k | tok/s | tok/round | ms/round | step |
+      |---|---|---|---|---|
+      | 3 | 59.1 | 2.55 | 43.1 | — |
+      | 4 | 59.5 | 2.95 | 49.6 | +6.4 |
+      | 5 | 59.2 | 3.07 | 51.9 | +2.3 |
+      | 6 | 50.0 | 2.97 | 59.4 | **+7.5** |
+      | 7 | 48.2 | 2.93 | 60.8 | +1.4 |
+      | 8 | 47.1 | 3.45 | 73.2 | +12.5 |
+
+      **Accepted tokens per round is flat at ~3.0 from k=4 onward** (2.95, 3.07, 2.97, 2.93, 3.45),
+      so nothing past four draft tokens pays for itself — every column beyond it is cost. That is
+      the real justification for the recommendation of four, which `docs/cli.md` already gives.
+
+      The 5→6 step itself is a schedule switch, confirmed by nsys per-round diff (83 rounds at k=5,
+      86 at k=6, both deterministic): kernel time per round goes 58.22 → 66.21 ms, +7.99, matching
+      the +7.5 from the throughput arithmetic. `q4_rowsplit_gemm_simt` (5.17 ms) and
+      `q5_rowsplit_gemm_simt_split4` (6.43) vanish and `rowsplit_grouped_mma_kernel` (15.82)
+      appears, on ~51 instances per round — the 27B's GDN layer count, not its 17 attention layers.
+      That is `src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.cpp`:
+
+      ```
+      {{1, 6},  IndependentDirectFixed},
+      {{7, 32}, GroupedMixedMmaR64C32},
+      ```
+
+      Verification width is k+1, so k=5 is the last count inside the direct route and k=6 is the
+      first to cross into a **32-wide** MMA tile whose cost, as that file's own comment says, is set
+      by padded width rather than live tokens. Width 7 pays for 32 columns.
+
+      **The obvious fix does not work, and that is the useful part.** Both `launch_q4` and
+      `launch_q5` accept T up to 15 with a dedicated R8C8 route for 5..15, so extending the direct
+      band looks free. Measured `{{1, 15}}` / `{{16, 32}}` end to end and normalised against k=4/5
+      (unchanged in both tables, and they calibrate a ~3% between-process drift): **−3.6% at width
+      7, +1.3% at width 8, −23.8% at width 9, −13.2% at width 11.** The `{1,6}` boundary is right.
+      Width 8 is the one place the direct path is competitive, which is the R8C8 tile fitting
+      exactly; 9 needs two passes and collapses. Recorded in that file so it is not retried.
+
+      **What to build instead: a `GroupedMixedMmaR64C8` or `R64C16`.** The grouped tile wins at
+      width 7 *despite* padding 7 columns into 32 — so the MMA path beats the SIMT direct path by
+      more than 4.6x of wasted width, and the prize is keeping that efficiency without the dead
+      columns. Two independent measurements want the same kernel: this cliff, and §2c's 8-lane
+      entry, where a C8 decode cohort spends **13.8 ms of a 56.3 ms round in this exact kernel at
+      width 8** (0.300 ms per instance at width 8 against 0.311 at width 7 — near-identical, which
+      is what padded-width-dominated cost looks like). Fixing it pays twice.
+
+      One tooling gap behind all of this: **there is no schedule bench for this Op.** Every other
+      route table here has one (`bench/ops/q4_q5_attn_input_schedule_bench.cu` is the closest
+      sibling) and `q4_q5_gdn_input` does not, which is why its boundary carried no measurement for
+      so long. Write it before tuning a new tile.
 
 - [ ] **`w8_pair` medium discards its schedule entirely on sm_86.**
       `w8_pair_gemm_splitk.cu:133` is `(void)schedule` under `NINFER_SM8X_COMPAT`, so every

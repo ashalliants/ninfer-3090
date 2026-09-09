@@ -25,6 +25,31 @@ struct RouteSpec {
     Q4Q5GdnInputScheduleId schedule;
 };
 
+// The 1..6 / 7..32 boundary is measured, and it is not where the kernels' own limits suggest.
+// q4_q5_gdn_input_independent.cu accepts T up to 15 -- launch_q4 and launch_q5 both carry a
+// dedicated R8C8 route for 5..15 -- so widths 7..15 look like a free extension of the cheap
+// direct path. Tried it (2026-09-09, {{1, 15}} / {{16, 32}}) and it is a net regression. Measured
+// through DFlash2 draft counts on the 27B, which is the workload that walks these widths one at a
+// time; verification width is k+1, and k=4/5 stay inside 1..6 in both tables so they calibrate the
+// ~3% between-process drift between the two builds:
+//
+//   k      4      5      6      7      8     10
+//   width  5      6      7      8      9     11
+//   direct route to 15, normalised against k=4,5:
+//         0.0%  +0.0%  -3.6%  +1.3% -23.8% -13.2%
+//
+// So the grouped MMA tile wins from width 7 upward and wins overwhelmingly from 9. Width 8 is the
+// one place the direct path is competitive, by 1.3%, which is the R8C8 tile fitting exactly; 9
+// needs two passes through an 8-wide tile and collapses.
+//
+// The useful part is why. The grouped tile wins at width 7 *despite* padding 7 live columns into
+// 32 -- so the MMA path is not merely better per column, it is better by more than 4.6x of wasted
+// width. That says the opportunity here is a narrower grouped tile (R64C8 or R64C16), which would
+// keep the MMA efficiency and stop paying for 25 dead columns, not a wider direct route. Two
+// separate measurements want it: DFlash2 loses 15% crossing this boundary at k=5->6, and a C8
+// decode cohort spends 13.8 ms of a 56.3 ms round in this exact kernel at width 8. See TODO
+// sections 2c and 3.
+//
 // Above the direct route the cost of a grouped MMA tile is set by its padded column width,
 // not by the live token count, so the tile is chosen to be the narrowest one that still
 // covers the extent in a single pass. Decode extents (C8 with MTP3 is 32) get the 32-wide
