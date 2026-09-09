@@ -121,6 +121,19 @@ if [[ -n "${NINFER_TEST_FAKE_SIZE:-}" ]]; then
 fi
 CURL
 chmod +x "$tmp/bin/curl"
+# Stubs sha256sum for the checksum-rejection fixture below. verify() hashes whatever it is given,
+# and a real sha256sum reads every logical byte even of a sparse file -- tens of GB per downloader,
+# which is instant to allocate but not free to read, and turned this fixture into a multi-minute
+# hash of empty space. The stub returns a fixed value that cannot match any pinned expected_sha256
+# without reading the file at all, which is enough to exercise verify()'s mismatch-rejection branch
+# -- the property under test is the script's response to a failed comparison, not whether
+# sha256sum itself hashes correctly.
+cat > "$tmp/bin/sha256sum" <<'HASH'
+#!/usr/bin/env bash
+printf -v hash '%064d' 0
+printf '%s  %s\n' "$hash" "${*: -1}"
+HASH
+chmod +x "$tmp/bin/sha256sum"
 # Every downloader now pins a revision and verifies size and sha256 before promoting, so they are
 # all driven the same way: hand the fixture the script's own expected_size and skip the hash, which
 # proves the promotion path without needing a real 17 GB payload.
@@ -168,6 +181,32 @@ for downloader in download-qwen38-27b download-qwen36-35b-a3b download-qwen36-27
   fi
   if ! compgen -G "$tmp/models/$model."*".part" >/dev/null; then
     printf '%s did not stage its download under a revision-scoped name\n' "$downloader" >&2
+    exit 1
+  fi
+  rm -f -- "$tmp/models/$model."*".part"
+done
+
+# The size check alone is not the checksum contract: a payload of the right size but wrong content
+# must be rejected too, and every case above either skips the hash (NINFER_SKIP_SHA256=1) or never
+# reaches it (wrong size fails first). Drive the fixture with the correct size and the hash check
+# left on -- the stubbed sha256sum above always returns a value that cannot match a real pinned
+# hash, so this exercises verify()'s mismatch-rejection branch without hashing tens of GB of
+# logical (sparse) data to get there.
+for downloader in download-qwen38-27b download-qwen36-27b download-qwen36-35b-a3b; do
+  case "$downloader" in
+    download-qwen38-27b) model='qwen3_8_27b.ninfer' ;;
+    download-qwen36-27b) model='qwen3_6_27b.ninfer' ;;
+    download-qwen36-35b-a3b) model='qwen3_6_35b_a3b.ninfer' ;;
+  esac
+  size="$(expected_size_of "$downloader")"
+
+  if PATH="$tmp/bin:$PATH" NINFER_MODEL_DIR="$tmp/models" NINFER_TEST_FAKE_SIZE="$size" \
+       "$root/$downloader.sh" >/dev/null 2>&1; then
+    printf '%s accepted a size-correct payload with the wrong checksum\n' "$downloader" >&2
+    exit 1
+  fi
+  if [[ -e "$tmp/models/$model" ]]; then
+    printf '%s promoted a payload that failed checksum verification to %s\n' "$downloader" "$model" >&2
     exit 1
   fi
   rm -f -- "$tmp/models/$model."*".part"
