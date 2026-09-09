@@ -65,6 +65,28 @@ else()
   add_compile_options(
     $<$<COMPILE_LANGUAGE:C,CXX>:-Wimplicit-fallthrough>
     $<$<COMPILE_LANGUAGE:C,CXX>:-Werror=implicit-fallthrough>)
+
+  # Keep the builder's absolute paths out of the shipped binaries. `__FILE__` and nvcc's own source
+  # references otherwise embed wherever the tree happened to sit: the v0.9.0 Linux binaries carry
+  # `/home/ash/ninfer-rel/src/...` about 200 times, and v0.8.1 carried `/mnt/c/ninfer-fork/...` 405
+  # times. Not a secret -- the file names are public and no path contains a home directory -- but
+  # it makes every assertion message shorter and more readable, and it makes two builds of the same
+  # commit from different directories produce closer output.
+  #
+  # Verified on this box under real Linux g++: `/tmp/ftest/sub/a.cpp` becomes `./sub/a.cpp`, and
+  # the absolute prefix disappears from `strings` entirely.
+  #
+  # **There is no working MSVC equivalent, and this was measured rather than assumed.** MSVC takes
+  # `__FILE__` from the path as written on the command line, and CMake writes absolute paths;
+  # `/d1trimfile:`, the usual suggestion, is undocumented and had *no effect* on `__FILE__` when
+  # tested against 14.44.35207 with an absolute source path. So the Windows binaries keep their
+  # ~466 occurrences until something better turns up.
+  #
+  # -Xcompiler reaches the host half of a .cu translation unit. Device-side `__FILE__` comes from
+  # nvcc's own frontend and has no documented remapping flag, so it is not covered here.
+  add_compile_options(
+    $<$<COMPILE_LANGUAGE:C,CXX>:-ffile-prefix-map=${PROJECT_SOURCE_DIR}=.>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffile-prefix-map=${PROJECT_SOURCE_DIR}=.>)
 endif()
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
