@@ -50,6 +50,34 @@ constexpr std::array<SupportSpec, 2> kSupports{{
 // The T=1 GEMV reaches 41.0 us, 62% of that floor. A narrow-extent kernel with c16's flatness at
 // the GEMV's efficiency is worth most of the C1-to-C8 scaling loss; see TODO section 2c.
 //
+// **A narrower tile than C16 does not help here, and that is not obvious.** Tried an R64C8 --
+// BlockCols 8 with WarpCols 8, so one warp column, 4 warps and 128 threads against C16's 8 and
+// 256 -- on the reasoning that a serving cohort of 8 and a k+1 verification round both land at
+// extents this narrow and should not pay for 16 padded columns. Measured 2026-09-09, cold,
+// medians of 21-31 (us):
+//
+//   T                   2      4      6      8     10     12     16
+//   k=6144   c8      131.1  116.7  115.7  108.5  133.1  133.1  126.0
+//            c16     114.7  103.4  102.4  102.4  103.4  102.4   95.2
+//            split2   36.9   44.0   56.3   76.8   96.3     --     --
+//   k=17408  c8         --  315.4     --  301.1     --     --  352.3
+//            c16        --  289.8     --  291.8     --     --  285.7
+//            split2     --  120.8     --  192.5     --     --     --
+//
+// c8 loses to c16 at every width and both lose to split2 below 11, so the route table is unchanged
+// and the schedule is not registered.
+//
+// The reason is worth keeping, because the same change *works* on the GDN input projection (see
+// q4_q5_gdn_input_plan.cpp, where C8 and C16 beat C32 by 9-11%). There, cost is dominated by
+// padded MMA work, so cutting BN cuts the work. Here the kernel is already weight-read-bound --
+// c16 sits at 24% of the 25.3 us this weight costs to stream once -- so cutting BN removes no
+// work and halves the warps available to hide the read. Narrowing a tile helps when padding is the
+// cost and hurts when bandwidth is.
+//
+// So TODO section 2c's stated prize -- "a narrow-extent MMA kernel that keeps mma_r64_c16's
+// flatness at the GEMV's fraction of bandwidth" -- is not reachable by narrowing BN. The 4x
+// between c16 and the weight-streaming floor is still there and still worth having; it just is not
+// a tile-width problem.
 // A tile narrower than the live extent repeats the whole weight pass per column slice, so
 // above 16 columns the 32-wide tile covers a decode round in one pass instead of two.
 // Measured on sm_86 with bench/ops/q5_linear_add_schedule_bench.cu, cold, medians of 9-15.
