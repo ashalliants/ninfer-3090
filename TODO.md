@@ -21,7 +21,13 @@ into three-warp path blocks, which raised theoretical occupancy to 100% and *dro
 67.7% to 52.6%. That closed the MoE entry as a dead end — all four of its candidate fixes are now
 measured negatives.
 
-**Read this first: almost nothing here is bandwidth-bound, and this file spent a cycle assuming
+**The largest cheap win in this file is a single-warp kernel.** `sparse_moe_d2_warp_kernel` picks
+the top 8 of 257 experts in `<<<1, 32>>>` — one warp, one SM of 82 — and `nsys` puts it at **8.45%
+of the 35B's decode kernel time**, third of the four MoE stages. At ~20,000 cycles for ~400
+instructions it is fully exposed latency, not arithmetic, so the fix is warps to interleave rather
+than a better sort. See §2c.
+
+**Read this next: almost nothing here is bandwidth-bound, and this file spent a cycle assuming
 otherwise.** `ncu` counters on five kernels, all on one instrument with clocks locked, say the same
 thing — the kernels that matter reach 20-50% of DRAM while saturating something else or nothing at
 all:
@@ -1417,26 +1423,51 @@ mechanism, and it is not tile geometry.**
       source, not measured*: confirm it with `l1tex__data_pipe_lsu_wavefronts_mem_shared` against
       `l1tex__data_pipe_lsu_wavefronts_mem_global` before committing to the retile.
 
-- [ ] **`sparse_moe_d2_warp_kernel` is a single 32-thread block, and `ncu` times it at 15.52 µs —
-      55% of d3. Verify that with `nsys` before believing it.**
+- [ ] **`sparse_moe_d2_warp_kernel` costs 8.45% of the 35B's decode kernel time on one warp of one
+      SM. Verified with `nsys` 2026-09-09, and it is now the largest cheap win in this file.**
 
-      Found incidentally in the section-1 capture. The kernel launches `<<<1, 32>>>`: one warp, on
-      one SM of 82, 2.09% achieved occupancy, and it runs once per MoE layer. If 15.52 µs were the
-      production cost it would be the second-largest MoE stage and a pure serialisation — 40 text
-      layers x 129 rounds would put it near d3's total.
+      Found incidentally in the MoE counter capture, where `ncu` timed it at 15.52 µs and the
+      arithmetic in this entry's first draft argued that had to be inflated. **It was inflated by
+      15%, not by 3x.** `nsys`, node-level graph tracing, 35B / int8 / `-n 128`, clocks locked:
 
-      **It is probably not that large, and the arithmetic is why.** #53's nsys profile has the four
-      `sparse_moe` stages at 38% of decode busy time; d3 and d4 alone account for ~29% at their
-      measured per-launch costs, leaving ~9% for d1 and d2 together, where a 15.52 µs d2 would need
-      about 11% on its own. So `ncu`'s figure is inflated — plausibly its floor for a one-block
-      kernel under replay, since instrumentation and serialisation do not shrink with the grid.
+      | stage | total | % of kernel time | µs/instance | instances |
+      |---|---:|---:|---:|---:|
+      | `sparse_moe_d3_nine_warp` | 134.89 ms | 16.44% | 26.14 | 5,160 |
+      | `sparse_moe_d4_nine_warp` | 104.22 ms | 12.70% | 21.83 | 4,773 |
+      | **`sparse_moe_d2_warp`** | **69.30 ms** | **8.45%** | **13.43** | 5,160 |
+      | `sparse_moe_d1` | 19.32 ms | 2.36% | 3.74 | 5,160 |
+      | all four | 335.88 ms | **40.9%** | | |
 
-      Do not act on it either way without a real measurement: `nsys` with
-      `--cuda-graph-trace=node`, filtered to `sparse_moe_d2`, which `decode-step-profile.ps1`
-      already knows how to capture. Recorded because the *structure* is worth a look regardless —
-      the selection itself is a well-written warp merge (`sparse_moe_route.cuh`: eight scores per
-      lane, local insertion sort, five xor-merge steps), so if d2 does cost real time the fix is
-      latency-hiding or fusion into d1's tail, not a better sort.
+      5,160 instances is 129 rounds x 40 text layers, so the mapping is exact. **d2 is the third
+      largest MoE stage, ahead of d1 by 3.6x, and it launches `<<<1, 32>>>` — one warp, on one SM of
+      82, 2.09% achieved occupancy.** The earlier reasoning that got this wrong divided #53's "38% of
+      busy time" across the stages and found no room for it; the four stages are 40.9% of *kernel*
+      time here, and d1 is far cheaper than assumed, which is where the room was.
+
+      **Why one warp is this slow, which is the part that says how to fix it.** 13.43 µs at
+      1,500 MHz is ~20,000 cycles to pick the top 8 of 257 floats — about 1 KB of input. The
+      selection is not badly written: `sparse_moe_route.cuh` gives each lane 8 scores, insertion
+      sorts them locally, then does five xor-merge steps, each 8 independent shuffles followed by a
+      3-stage bitonic restore. That is on the order of 400 instructions, so ~50 cycles per
+      instruction. **That is fully exposed latency: with a single warp resident there is nothing to
+      interleave, so every shuffle and every dependent compare pays its full latency.** It is not an
+      arithmetic problem and a better sort will not fix it.
+
+      **The fix is more warps in the block, not more blocks.** One block means one SM either way —
+      the win is latency hiding *inside* the block. A block-scoped selection with 8 warps (each
+      taking 32 of the 257 experts, one score per lane, producing a local top-8, then one
+      cross-warp merge through shared memory) shortens the dependent chain from five merge steps
+      over 8-element runs to two plus a merge, and gives the scheduler seven other warps to issue
+      from meanwhile. On the arithmetic above that should land nearer 4-5 µs, which is
+      **5-6% of the 35B's decode time** — larger than anything else left in this file and much
+      cheaper than the split-K MMA kernel.
+
+      Two cautions. The ranking is a total order over distinct expert ids and the file says so, so
+      any correct selection must produce the same set *and the same order* — `ninfer_sparse_moe_test`
+      at T=1 is the check. And `sparse_moe_select_top8_warp` is shared with the prefill and small-T
+      paths (`sparse_moe_prefill_kernels.cu:153`, `sparse_moe_small_t_kernels.cu:103`), which call it
+      per token from a wider launch and are *not* latency-starved; a block-scoped variant should be
+      added alongside it rather than replacing it.
 
 ### Found by this cycle's profiling, and not previously on this list
 
