@@ -27,8 +27,9 @@ measured negatives.
 Its stall breakdown (`wait` 37.7%, `branch_resolving` 15.3%, `long_scoreboard` only 4.1%) said
 divergence and exposed latency, not memory. Replacing the divergent insertion sort with a
 branch-free 19-compare network took it **13.43 → 8.32 µs, −38%**, worth **+3.15% end to end on the
-35B, 6 of 6 paired reps against a control that drifted 0.00%.** The `wait` half remains and wants a
-block-scoped selection. See §2c.
+35B, 6 of 6 paired reps against a control that drifted 0.00%.** The `wait` half remains, and §2c now
+carries a costed design for it — worth ~2%, and *not* the naive 8-warp split, which would
+parallelise the cheaper half of the routine and measure as almost nothing. See §2c.
 
 **Read this next: almost nothing here is bandwidth-bound, and this file spent a cycle assuming
 otherwise.** `ncu` counters on five kernels, all on one instrument with clocks locked, say the same
@@ -1516,9 +1517,48 @@ mechanism, and it is not tile geometry.**
       D3 experiment's: a model with none of the changed code, rather than a downstream kernel in the
       same fused pipeline, which moved 6% on L2 state alone.
 
-      **What is left: the `wait` term, and it still wants more warps.** 37.68% of active warp cycles
-      before the change; d2 is still `<<<1, 32>>>` at 8.32 µs. The block-scoped 8-warp selection
-      described below is unchanged as the remaining prize, now worth roughly half what it was.
+      **What is left: the `wait` term — but "more warps" as this entry first described it would
+      miss most of it, and that is worth reading before building anything.** Counting the routine's
+      own ops per lane:
+
+      | | ops |
+      |---|---:|
+      | local sort (the Batcher network) | 19 compare-exchanges |
+      | merge: shuffles (5 xor steps x 8) | 40 |
+      | merge: bitonic restores (5 x 3 stages x 4) | 60 |
+      | **merge total vs sort** | **5.3x** |
+
+      **The merge is the dominant half, and an 8-warp split parallelises the sort — the smaller
+      half.** Splitting 256 experts over 8 warps at one score per lane removes the per-lane sort
+      from the critical path, but each warp still has to produce a sorted top-8 and *something* must
+      still merge eight of those, so the naive version keeps the expensive part serial and would
+      measure as very little. That is the D3 mistake in a different costume: a plausible mechanism
+      that does not touch the dominant term.
+
+      **The design that does work needs both halves**, and the second is the cheap one:
+
+      1. 8 warps, one score per lane, each warp reducing its 32 candidates to a sorted top-8 —
+         a bitonic sort of 32 across lanes, 15 branch-free shuffle compare-exchanges, all 8 warps
+         concurrent so the latency interleaves.
+      2. **Merge 8 runs in 3 xor steps, not 5.** `sparse_moe_merge_ranked_runs` hardcodes
+         `for (partner = 1; partner < 32; partner <<= 1)` because today it merges 32 runs. Eight
+         runs need `log2(8) = 3`. That alone is 100 ops down to 60, **−40% of the dominant term**,
+         and it is a template parameter on the existing verified routine rather than new logic.
+
+      Critical-path ops: **119 today (19 + 100) against ~60** (the 30 for step 1 being spread over
+      eight concurrent warps). So call it half the addressable work.
+
+      **And the addressable work is not all 8.32 µs.** The smallest real kernel in the same nsys
+      capture, `rmsnorm_cta_bf16`, is **2.23 µs/instance**, which is about the floor for a small
+      launch on this box. So ~6.1 µs is addressable, halving it saves ~3 µs, and 3 µs x 5,160
+      instances is ~15.5 ms of 795.8 — **roughly 2% end to end, not the 5-6% this entry claimed
+      before the branch-free sort landed.** Still worth having, and worth knowing it is 2% before
+      committing to a bitonic-32 that needs its own exhaustive verification.
+
+      One thing that makes step 1 cheaper than it looks: lanes 8..31 of the merging warp can hold
+      runs of `{-inf, INT_MAX}`, which are trivially descending and can never be selected, so the
+      *existing* 5-step routine works unmodified as a correctness fallback while the 3-step variant
+      is being validated against it.
 
       Found incidentally in the MoE counter capture, where `ncu` timed it at 15.52 µs and the
       arithmetic in this entry's first draft argued that had to be inflated. **It was inflated by
