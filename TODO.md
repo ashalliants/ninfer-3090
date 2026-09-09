@@ -310,6 +310,12 @@ NINFER_REAL_TEST_MAX_CONTEXT=8192      # only needed for the 35B
 `NINFER_QWEN3_6_27B_NVFP4_WEIGHTS` was missing from this block for a cycle, and it is the only
 thing that was keeping `27b_load_plan` skipping — the artifact has been on the disk all along.
 
+**Setting it costs a different test, so the suite is 125/126 with this block and 126/126 without
+it.** `ninfer_qwen3_6_27b_prefix_real_test` passes with the variable unset and dies with
+`FATAL: nvfp4 linear_swiglu A16 is registered only through T=16` with it set — verified both ways
+on 2026-09-09, exit 0 against exit 1, same binary. So "126/126" in this file means the old env
+block; quote the count with the block it was measured under. The defect is §1's new entry.
+
 **Free VRAM used to make these fail outright, not skip.** Skip (exit 77) here is reserved for a
 missing artifact env var; a VRAM shortfall instead threw during `Engine` construction and failed
 the test. The specific cause was the pinned host-KV allocation being charged against the card (§6,
@@ -434,6 +440,23 @@ parents). The next merge from `neroued/master` will touch the same subsystem.
 ---
 
 ## 1. Correctness and coverage — closed
+
+- [ ] **`27b_prefix_real` dies on the NVFP4 artifact: `nvfp4 linear_swiglu A16 is registered only
+      through T=16`.** Found 2026-09-09 while confirming an unrelated change against the full
+      suite, and it is a coverage gap rather than a regression — the test only reaches this path
+      when `NINFER_QWEN3_6_27B_NVFP4_WEIGHTS` is set, which the env block in this file omitted until
+      last cycle. Verified both ways on the same binary: unset, exit 0; set, exit 1 with that FATAL.
+
+      So one of the two things that variable does is unblock `27b_load_plan`, and the other is turn
+      a skip into a hard failure. Two candidate fixes and they are not equivalent: either the NVFP4
+      `linear_swiglu` A16 route is registered past T=16 (a real widening, and the T=16 bound will
+      have been chosen for a reason worth reading first), or the prefix test bounds its own width
+      for the NVFP4 profile the way the other real-model tests bound `--max-context`. Prefer the
+      first if the wider route is legitimate — a FATAL here means production would hit it too on any
+      NVFP4 prefill wider than 16 columns, which is every real prompt.
+
+      Not a regression from anything this cycle: the failing path is `nvfp4_linear_swiglu`, and
+      nothing this cycle touched it. The suite is otherwise 125/126.
 
 ### 1.1 `attn_input_proj` grossly wrong at `W8 DFlash2 A16 T=112 graph phase=1` — closed
 
