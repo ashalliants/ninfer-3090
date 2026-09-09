@@ -1610,18 +1610,38 @@ shape the entries described.
       occurrences. Device-side `__FILE__` from nvcc's own frontend is not covered either -- there
       is no documented flag for it.
 
-- [ ] **The shipped `-maxctx` launchers ask for a host-KV pin they cannot have.**
-      `run-qwen38-c1-maxctx` and `run-qwen36-35b-a3b-c1-maxctx`, both `.bat` and `.sh`, pass
-      `--host-kv-mib 8192` explicitly, and both deliberately fill the card with KV. Per the
-      measured table above, at that residency the largest pin that succeeds on Windows is a small
-      fraction of 8 GiB — they could never have had it, before or after #45. Since #45 the request
-      is clamped rather than fatal, so the launchers do work; they are asking for something
-      impossible and the flag reads as though it were doing something.
+- [x] **The shipped `-maxctx` launchers ask for a host-KV pin they cannot have. Closed 2026-09-09 —
+      by documenting it, because the behaviour is right and the flag is not.**
 
-      Decide what they should say. A realistic figure, or drop the flag and take the clamped
-      default, or `--no-prefix-reuse` if prefix reuse is not worth any VRAM at maximum context —
-      which is a real question at these residencies and has not been measured either. Whichever
-      way, the four launchers should agree with each other and with README's launcher table.
+      All four launchers pass `--host-kv-mib 8192` and they already agree with each other, so the
+      "make them agree" half of this entry was moot. What they do *not* do is agree across
+      platforms, and nothing said so. The clamp is `#if defined(_WIN32)` only:
+
+      | launcher | platform | free after startup | pinned host KV |
+      |---|---|---:|---:|
+      | `run-qwen38-c1-maxctx.sh` | Linux | — | **8,192 MiB**, honoured in full |
+      | `run-qwen36-35b-a3b-c1-maxctx.sh` | Linux | — | **8,192 MiB**, honoured in full |
+      | `run-qwen38-c1-maxctx.bat` | Windows | 1.59 GiB | **302 MiB** |
+      | `run-qwen36-35b-a3b-c1-maxctx.bat` | Windows | 184-344 MiB | **0 — none at all** |
+
+      `clamp_host_kv_reservation_bytes` takes `(free VRAM − 1 GiB) / 2`, so the 35B maxctx profile
+      falls entirely under the 1 GiB floor and the flag is a **complete no-op** there. On the 27B it
+      delivers 3.7% of what it asks for.
+
+      **The three options this entry offered were all based on a wrong premise, which is why none of
+      them was right.** It assumed the pin competes with context — "both deliberately fill the card
+      with KV". It does not. The clamp reads `cudaMemGetInfo` *after* the KV cache is allocated
+      (`program_impl.h:1030`), so the pin takes from the slack that is left over and **costs no
+      context at all**. A realistic figure would be wrong on the next machine, dropping the flag
+      changes nothing because the default is also 8192, and `--no-prefix-reuse` would trade away
+      something that is currently free.
+
+      So the behaviour needs no change and the flag needs no correction — it is right on Linux and
+      harmless on Windows. What was wrong is that a reader had no way to know any of that. Each of
+      the four launchers now carries the measured table above and states plainly, on the Windows
+      side, not to read "8192" as a description of the machine; and on the Linux side, that the same
+      flag really does pin 8 GiB of host RAM there and why the platforms differ from identical
+      arguments.
 
 ---
 

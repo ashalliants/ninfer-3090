@@ -100,6 +100,12 @@ printf 'Qwen3.8-27B  |  C%s  |  context %s  |  KV pool %s  |  %s  |  %s  |  %s\n
 printf 'Cache: 8 shared / 8 private / 32 host states  |  automatic prefix grid on\n'
 printf 'API: http://%s:%s/v1\n\n' "$HOST" "$PORT"
 
+# --host-kv-mib 8192 is honoured in full here: on Linux this really does pin 8 GiB of host RAM, and
+# it is host RAM, not device memory. The Windows launchers pass the same number and get far less --
+# WDDM charges a pinned host allocation against the card, so the runtime clamps to
+# (free VRAM - 1 GiB) / 2 and the 27B profile ends up with 302 MiB while the 35B gets none at all.
+# That is why the two platforms behave differently from identical flags; see the note in the .bat.
+
 exec "$server" "$MODEL" \
   --host "$HOST" --port "$PORT" \
   --max-concurrency "$CONCURRENCY" \
