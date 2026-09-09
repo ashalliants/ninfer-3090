@@ -24,7 +24,10 @@ for product in 'apps/ninfer:ninfer' 'apps/ninfer-serve:ninfer-serve' 'bench/ninf
   cp -- "$source_path" "$destination"
 done
 cp -- "$repo_root/VERSION" "$repo_root/LICENSE" "$repo_root/RELEASE_NOTES_0.9.1.md" "$product_root/"
-cp -- "$repo_root/docs/rtx-3090-linux.md" "$product_root/README.md"
+# The archive README must describe the archive. docs/rtx-3090-linux.md is a guide to *building* from
+# source and points at ./scripts/download-*.sh; the packager copies those to the archive root, so a
+# user following it from inside the archive got a missing-file error.
+cp -- "$repo_root/docs/release-archive-linux.md" "$product_root/README.md"
 # Explicit rather than globbed, so a new script is shipped only once someone has decided it belongs
 # in the archive. Keep the downloaders in step with scripts/download-*.sh: the Qwen3.6 27B artifact
 # is what ninfer_qwen3_6_27b_* needs, and it is a different model family from qwen3_8_27b.

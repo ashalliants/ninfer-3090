@@ -1,4 +1,9 @@
-# NInfer-3090 v0.6.1 for Windows
+# NInfer-3090 for Windows
+
+> Not the archive README. This is the checkout-side Windows guide, so the scripts it names live
+> under `scripts/`. The README shipped inside the release archive is
+> [`release-archive-windows.md`](release-archive-windows.md), and `VERSION` in the archive says
+> which release you have.
 
 This native Windows release supports Qwen3.8-27B, Qwen3.6-27B, and the compact, text-only
 Qwen3.6-35B-A3B v0.3.1 artifact. The runtime provides paged KV, concurrent request execution,

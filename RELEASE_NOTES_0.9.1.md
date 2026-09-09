@@ -209,6 +209,16 @@ first is what produced several of them.
   `NINFER_BUILD_ROOT` for the packager so `-BuildDir` and `-Package` agree.
 - **Linux binaries no longer embed the builder's absolute paths.**
 - The line-ending policy is enforced repository-wide rather than in `scripts/` only.
+- **The archive now ships a README that describes the archive.** Both packagers previously copied a
+  checkout-oriented document — the Windows one still titled v0.6.1, the Linux one a guide to
+  *building from source* — and both point at `scripts/download-*`, while the packagers copy those
+  scripts to the archive root. Anyone following the packaged README hit a missing-file error. There
+  are now two archive READMEs written for the flat layout, with absolute links, since the archive
+  ships no `docs/` directory.
+- **`SHA256SUMS.txt` in the Windows archive is LF.** `Set-Content` wrote CRLF, so `sha256sum -c`
+  looked for filenames ending in a carriage return and reported `FAILED open or read` for every
+  line. The Linux list is written by `sha256sum` itself and was always fine. Both files now verify
+  with the standard tool; `Get-FileHash` was never affected.
 
 ---
 
