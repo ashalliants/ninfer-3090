@@ -230,23 +230,22 @@ parents). The next merge from `neroued/master` will touch the same subsystem.
       *base* engine now fits without closing anything, so the remaining question — whether the
       base config should also honour the env var — is moot: it starts. Left as it is.
 
-### 1.3 `docs/config-calculator.html` undercounts startup memory for speculative configurations
+### 1.3 `docs/config-calculator.html` undercounts startup memory for speculative configurations — closed
 
-- [ ] Its "Startup memory" total only adds the extra resident weights measured for each
-      speculation option; it reuses the no-speculation CUDA graph allowance
-      (`DATA.graphBytes`, 12 MiB) for every mode and adds no extra KV pages for either backend.
-      The real engine (`src/targets/qwen3_6/impl/runtime/layouts_impl.h`) sizes the graph
-      allowance per speculative backend and draft window — up to ~86 MiB/lane for MTP, ~96
-      MiB/lane for DFlash under `NINFER_SM8X_COMPAT`, against the calculator's flat 12 MiB — and
-      `persistent_layout`'s `mtp_extra_pages` reserves additional paged-KV pages for MTP's
-      buffered draft tokens that the calculator never adds either. Closing this properly needs
-      either a full port of `mtp_graph_profiles`/`dflash_graph_profiles`/
-      `graph_topology_allowance` into the page's JS (nontrivial, capacity- and
-      draft-window-dependent piecewise logic) or fresh `ninfer_bench` measurements of the actual
-      per-mode graph allowance and extra KV pages — both out of scope for a docs PR. Descoped with
-      a prominent in-page caveat (the "What this does not model" section and the speculation
-      hint) rather than patched inline; the no-speculation case is unaffected and is the one this
-      page's own engine cross-check validates.
+- [x] Closed 2026-09-09 by the same work as §2b's first entry, which has the measured terms, the
+      engine cross-checks and the scale of what was missing. The short version: the page reused the
+      12 MiB no-speculation CUDA graph allowance for every mode and added no extra cache for any of
+      them, and the entry's own guess at the fix — "a full port of `mtp_graph_profiles` /
+      `dflash_graph_profiles` / `graph_topology_allowance` into the page's JS, nontrivial and
+      piecewise" — turned out not to be needed. Measuring the engine's reported terms at three
+      contexts per mode gave five constants per mode, one of which is a two-step function of
+      context, and those reproduce the engine to 0.044% on MTP3 and exactly on DFlash-3.
+
+      Worth keeping: the entry descoped this as "out of scope for a docs PR" and was right that
+      porting the layout logic would have been. It was wrong that the alternative needed "fresh
+      `ninfer_bench` measurements of the actual per-mode graph allowance" as though that were the
+      expensive path — the whole matrix is ten minutes of load-and-report, because the engine
+      already prints every term.
 
 ---
 
@@ -303,35 +302,43 @@ shallowest measurement rather than claimed as interpolated), and per-row weight-
 The doc contradictions were fixed separately in #33. The evidence for each is kept below so nobody
 has to re-derive it.
 
-- [ ] **Speculative modes undercount memory by roughly 170 MiB, plus a per-token term.** The page
-      models speculation as a weights delta only. Measured on the 27B at `--max-ctx 40960`, INT8,
-      `none` against `mtp3 + --lm-head-draft`:
+- [x] **Speculative modes undercount memory by roughly 170 MiB, plus a per-token term.** Closed
+      2026-09-09. Every term is now measured per mode by
+      `scripts/sweeps/speculative-memory-terms.ps1`, and the undercount was far larger than 170 MiB
+      at anything but the mildest mode and depth.
 
-      | component | none | mtp3+head | delta | modelled? |
-      |---|---:|---:|---:|---|
-      | weights | 17,093,490,688 | 17,901,798,400 | +771 MiB | yes |
-      | sequence | 1,550,561,536 | 1,646,461,184 | +91.5 MiB | **no** |
-      | CUDA graph allowance | 12,582,912 | 90,177,536 | +74 MiB | **no** |
-      | workspace | 159,981,568 | 159,981,568 | 0 | n/a |
+      | model | spec | graph | seq fixed | seq/token | kv ratio | kv extra/token |
+      |---|---|---:|---:|---:|---:|---:|
+      | 27B | none | 12 MiB | 158.7 MiB | 1/16 | 1 | 0 |
+      | 27B | mtp3 (+head) | 86 MiB | 167.6 MiB | 1/8 | 1.06299 | 0 |
+      | 27B | dflash2-7 (+head) | **288/384 MiB** | 266.2 MiB | 1/16 | 1 | 0 |
+      | 35B | none | 12 MiB | 67.3 MiB | 1/16 | 1 | 0 |
+      | 35B | mtp3 (+head) | 86 MiB | 72.6 MiB | 1/8 | 1.10078 | 0 |
+      | 35B | dflash-3 (+head) | 160 MiB | 184.2 MiB | 1/8 | 1 | **4,096 B** |
 
-      `graphBytes` is hardcoded at 12,582,912, which is only right with speculation off.
+      **The "one constant multiplier" in the old entry only ever fitted MTP.** MTP buffers extra
+      draft tokens *in the KV format*, so its cost is multiplicative and identical across formats
+      — +6.2988% per token on the 27B, +10.078% on the 35B, both confirmed against nvfp4 to within
+      page rounding. DFlash v1 instead reserves a fixed scratch region per token, measured at
+      **exactly 4,096 bytes** and format-independent: 32 MiB at 8,192 tokens, 64 MiB at 16,384,
+      128 MiB at 32,768. Read as a ratio that is +38.8% on `int8` and +71.1% on `nvfp4`, which is
+      what made it look format-dependent. DFlash2 costs nothing per token and pays entirely in a
+      graph allowance that is itself a step in context: 288 MiB to 8,192 tokens, 384 MiB beyond.
 
-      **The speculative KV term is per-token, and it is one constant.** Measured across all six
-      formats on the 27B, MTP3 + draft head raises KV bytes/token by the same **6.26%** every time:
+      **Cross-checked against the engine's own refusal arithmetic, which the old entry noted had
+      only ever been done for `--spec` unset:**
 
-      | format | none | mtp3+head | ratio |
+      | configuration | engine | page | error |
       |---|---:|---:|---:|
-      | `bf16` | 65,536 | 69,638.4 | 1.0626 |
-      | `int8` | 33,792 | 35,907.3 | 1.0626 |
-      | `fp8` | 33,024 | 35,091.2 | 1.0626 |
-      | `rk8v4` | 26,112 | 27,746.6 | 1.0626 |
-      | `k8v4` | 25,728 | 27,338.5 | 1.0626 |
-      | `nvfp4` | 18,432 | 19,585.8 | 1.0626 |
+      | 27B int8 262,144, mtp3+head | 9,838,038,272 | 9,842,380,571 | +0.044% |
+      | 35B int8 262,144, dflash-3 | 4,312,377,600 | 4,312,377,600 | **exact** |
 
-      So the fix is a per-token multiplier on the cache plus a per-mode constant for the graph
-      allowance and sequence delta, not a flat offset. Only MTP3 + draft head was swept; DFlash and
-      DFlash2 need the same treatment before their rows can be trusted. Raw CSVs come from
-      `scripts/sweeps/kv-decode-with-speculation.ps1`.
+      For scale, the model the page used before this: 611 MiB short on the first, and **1,289 MiB
+      short (−31%)** on the second. "Roughly 170 MiB" was measured on MTP3 at a 40,960 context —
+      the mildest combination of mode and depth in the matrix.
+
+      User-visible effect: the page reported 262,144 tokens as the largest fitting context for
+      *every* speculation mode on the 35B. DFlash-3 actually tops out at 240,192.
 
 - [x] **KV is allocated in 64-token pages; the page charges exact tokens.** Fixed on #32. `KV page groups
       4096 / 4096` at a 262,144 context is 64 tokens per group. A context just past a page boundary
@@ -349,18 +356,20 @@ has to re-derive it.
       per weight profile, so `weightsBytes` is not transferable to, say, the NVFP4-weight variant.
       Either add the weight-profile dimension or label each row with its artifact.
 
-- [ ] **The regression tests exist but nothing runs them.** #32 landed
-      `docs/config-calculator.test.mjs`, and it is good: it extracts the page's `<script>` into a
-      `vm` sandbox against a DOM stub — keeping the one-file, no-build property rather than
-      restructuring the page into modules — and pins page rounding, the `decodeAtDepth` boundaries,
-      and a golden case asserting the 262,144-token INT8 figure still equals the engine's own
-      9,197,389,568-byte refusal. It passes (`node docs/config-calculator.test.mjs`).
+- [x] **The regression tests exist but nothing runs them.** Closed. #47 put
+      `docs/config-calculator.test.mjs` in a GitHub workflow — it needs `node`, which no other test
+      here does, so CTest was the wrong home for it. It now also covers the speculative path, which
+      the old entry correctly said it did not: three golden cases against the engine's own refusal
+      figures (no speculation, MTP3+head, DFlash-3), a check that DFlash's extra KV is a fixed
+      4,096 bytes per token rather than a ratio, a check that DFlash2's graph allowance steps with
+      context, and an invariant that no speculative mode may cost less than no speculation in
+      either fixed or per-token memory — which is precisely the failure the old model had.
 
-      What is missing is a runner. Nothing in CI, CTest or `scripts/` invokes it, so it will catch
-      a regression only if someone remembers to run it by hand. Wire it in. It needs `node`, which
-      no other test here does, so it probably belongs in the GitHub workflow rather than CTest.
-      It also does not cover the speculative path — which is the half still known to be wrong — so
-      extend it alongside that fix rather than after.
+      `docs/config-calculator.render.test.mjs` is new and covers what none of that did: `render()`
+      itself, over all 360 model x speculation x KV x context combinations, plus an assertion that
+      the reported largest-fitting context actually responds to the speculation mode. Most of the
+      page's code lives in `render()`, and a wrong property name there shows up only as a blank
+      page in a browser.
 
 - [x] **Active docs still contradict the six-format claim.** Fixed in #33, across four places. #32 fixed README's `Current limits`
       and `docs/perplexity.md`, but README's *opening* summary still says the FP8 E4M3 KV profile
@@ -472,12 +481,49 @@ roofline finally acquired a denominator; read them before the rest.
       re-measuring without speculation before it can be reasoned about — `ninfer_bench` can do that
       directly and the cohort table cannot.
 
-- [ ] **Prefill has no roofline either.** Measured this cycle at 1,254 tok/s on the 27B and 5,715
-      on the 35B at a 4,096-token prompt, falling to 1,087 and 4,302 by 32,768 — a 13% and 25%
-      decay that nothing explains or has looked at. Prefill is compute-bound rather than
-      bandwidth-bound, so the denominator is FLOPs and the accounting differs from decode; it has
-      not been done. Note the route tables *are* all measured (that work is finished), but measured
-      against each other, not against the hardware's ceiling.
+- [x] **Prefill has no roofline either.** It has one now (2026-09-09), and the naive version of it
+      is a trap worth documenting.
+
+      Prefill is compute-bound: a 1,024-token chunk does 2 x 25.02e9 x 1024 = 51.2 TFLOP of GEMM
+      against 15.74 GB of weight reads, an arithmetic intensity above 3,000 FLOP/byte. So the
+      denominator is MMA throughput, and `tools/tensor_core_rate_probe.cu` — already in the tree,
+      never pointed at this card — measures what it actually is:
+
+      | MMA shape | measured |
+      |---|---:|
+      | BF16 m16n8k16, f32 accumulate | **67.6 TFLOPS** |
+      | FP16 m16n8k16, f16 accumulate | 148.6 TFLOPS |
+      | INT8 m16n8k32 | **314.8 TOPS** |
+      | INT8 m16n8k16 | 302.4 TOPS |
+      | INT4 m16n8k64 | 601.3 TOPS |
+
+      **There is no single denominator, and using one gives whatever answer you want.** The 27B's
+      prefill mixes paths: the MLP GEMMs quantize activations to INT8 (`q4a8_swiglu_kernel`,
+      `q5a8_add_kernel`, fed by `quantize_activations`) while the GDN projections stay BF16
+      (`rowsplit_grouped_mma_kernel`, `q5_rowsplit_gemm_mma_kernel`). Time splits 54/46 between
+      them. Taking `2 x params` over the whole model and dividing by one ceiling gives **96.0% of
+      peak if you assume BF16** and **20.6% if you assume INT8** — for the same measurement. The
+      first number is very nearly what this entry was going to claim.
+
+      Per kernel, against the ceiling each one actually uses (from #53's capture, 4,096-token
+      prefill, parameter counts from the artifact):
+
+      | kernel | GFLOP/token | path | achieved | % of that ceiling |
+      |---|---:|---|---:|---:|
+      | `q4a8_swiglu` (mlp gate_up) | 22.82 | int8 | 97.4 T/s | **30.9%** |
+      | `q5a8_add` (mlp down) | 11.41 | int8 | 89.4 T/s | **28.4%** |
+      | `rowsplit_grouped_mma` (gdn value_z, query_key) | 8.05 | bf16 | 34.7 T/s | 51.4% |
+      | `q5_rowsplit_gemm_mma` (gdn output) | 3.02 | bf16 | 36.8 T/s | 54.4% |
+
+      So prefill is *not* near its ceiling. The MLP GEMMs, which are 68% of the FLOPs, run at
+      about **30% of the card's INT8 tensor-core rate**, and the BF16 projections at about 52% of
+      the BF16 rate. A well-tuned large GEMM on Ampere usually reaches 60-80% of a pure-MMA
+      microbenchmark, so there is real room here — plausibly more than in decode.
+
+      One caveat kept deliberately: these chunks are 1,024 tokens, which is skinny for a GEMM whose
+      other dimensions are 34,816 x 5,120, and the percentage would look different at a larger
+      prefill chunk. Sweeping `--prefill-chunk` against this ceiling is the obvious next step and
+      has not been done.
 
 - [ ] **Vision has essentially one performance number in the entire repository.** One acceptance
       figure for DFlash2 on the committed image fixture, and nothing about encode throughput,
