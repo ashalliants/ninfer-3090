@@ -207,7 +207,13 @@ first is what produced several of them.
   default while every packager ships `bench/ninfer_bench`, so packaging failed *after* the whole tree
   had compiled. `--package`/`-Package` now implies the option, and `build.ps1` sets
   `NINFER_BUILD_ROOT` for the packager so `-BuildDir` and `-Package` agree.
-- **Linux binaries no longer embed the builder's absolute paths.**
+- **Linux binaries no longer embed the builder's absolute paths in host code.**
+  `-ffile-prefix-map` covers C, C++ and the host half of every CUDA translation unit, which is where
+  the v0.9.0 Linux binaries carried `/home/ash/ninfer-rel/src/...` about 200 times. Two exclusions,
+  both measured rather than assumed: **device-side `__FILE__` comes from nvcc's own frontend and has
+  no remapping flag**, so `.cu` paths remain — 395 of them in this release's `ninfer-serve`, all
+  device-side — and MSVC has no working equivalent (`/d1trimfile:` is undocumented and had no effect
+  on `__FILE__` at 14.44.35207), so the Windows binaries keep theirs.
 - The line-ending policy is enforced repository-wide rather than in `scripts/` only.
 - **The archive now ships a README that describes the archive.** Both packagers previously copied a
   checkout-oriented document — the Windows one still titled v0.6.1, the Linux one a guide to
