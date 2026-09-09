@@ -135,6 +135,21 @@ for entry in 'run-qwen38-c1-maxctx.sh:qwen3_8_27b.ninfer' \
   fi
 done
 
+# The probe must select the candidate that holds the artifact, not the first models/ directory that
+# happens to exist. An archive unpacked below a directory with its own (empty) models/ would
+# otherwise stop at the parent and fail while its own artifact sat beside the launcher.
+decoy="$tmp/decoy"
+mkdir -p -- "$decoy/models" "$decoy/inner/models"
+cp -- "$tmp/ninfer-serve" "$decoy/inner/ninfer-serve"
+: > "$decoy/inner/models/qwen3_8_27b.ninfer"
+cp -- "$root/run-qwen38-c1-maxctx.sh" "$decoy/inner/run-qwen38-c1-maxctx.sh"
+args="$tmp/run-qwen38-c1-maxctx.decoy.args"
+( cd -- "$decoy/inner" && clear_env NINFER_TEST_ARGS="$args" ./run-qwen38-c1-maxctx.sh >/dev/null )
+if ! grep -Fx -- "$decoy/inner/models/qwen3_8_27b.ninfer" "$args" >/dev/null; then
+  printf 'run-qwen38-c1-maxctx.sh stopped at an empty parent models/: %s\n' "$(head -1 -- "$args")" >&2
+  exit 1
+fi
+
 # An explicit NINFER_MODEL_DIR must be honoured verbatim, never probed past. The two-candidate
 # fallback above is for when the caller said nothing; applying it to a directory the caller *named*
 # reports a missing artifact under a path they never mentioned, and hides their typo. Assert the

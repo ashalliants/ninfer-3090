@@ -63,13 +63,17 @@ root="$(cd -- "$script_dir/.." && pwd)"
 # An explicit NINFER_MODEL_DIR is taken verbatim and never probed. Falling back past a
 # directory the caller named turns their typo into a 'Missing model' error about a path they
 # never mentioned, which is worse than failing on the one they did.
+artifact='qwen3_8_27b.ninfer'
 if [[ -n "${NINFER_MODEL_DIR:-}" ]]; then
   model_dir="$NINFER_MODEL_DIR"
 else
+  # Test for the artifact, not merely for a models/ directory. An archive unpacked below a
+  # directory that happens to have its own models/ would otherwise stop at the parent and
+  # never look beside the launcher, failing while its own artifact sits right there.
   model_dir="$root/models"
-  [[ -d "$model_dir" ]] || model_dir="$script_dir/models"
+  [[ -f "$model_dir/$artifact" ]] || model_dir="$script_dir/models"
 fi
-MODEL="${NINFER_MODEL:-$model_dir/qwen3_8_27b.ninfer}"
+MODEL="${NINFER_MODEL:-$model_dir/$artifact}"
 CONTEXT="${NINFER_CONTEXT:-212992}"
 CONCURRENCY="${NINFER_CONCURRENCY:-2}"
 KV_CAPACITY="${NINFER_KV_CAPACITY:-$CONTEXT}"
