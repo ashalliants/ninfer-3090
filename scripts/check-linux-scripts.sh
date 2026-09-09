@@ -135,6 +135,21 @@ for entry in 'run-qwen38-c1-maxctx.sh:qwen3_8_27b.ninfer' \
   fi
 done
 
+# An explicit NINFER_MODEL_DIR must be honoured verbatim, never probed past. The two-candidate
+# fallback above is for when the caller said nothing; applying it to a directory the caller *named*
+# reports a missing artifact under a path they never mentioned, and hides their typo. Assert the
+# error names the directory that was actually asked for.
+err="$tmp/explicit-dir.err"
+if ( cd -- "$archive" && clear_env NINFER_MODEL_DIR="$tmp/nope" NINFER_TEST_ARGS="$tmp/unused.args" \
+       ./run-qwen38-c1-maxctx.sh >/dev/null 2>"$err" ); then
+  printf 'run-qwen38-c1-maxctx.sh accepted a nonexistent NINFER_MODEL_DIR\n' >&2
+  exit 1
+fi
+if ! grep -Fq -- "$tmp/nope/qwen3_8_27b.ninfer" "$err"; then
+  printf 'run-qwen38-c1-maxctx.sh ignored an explicit NINFER_MODEL_DIR: %s\n' "$(head -1 -- "$err")" >&2
+  exit 1
+fi
+
 # The other half of the two-candidate lookup: a checkout must still prefer its own build tree and
 # models/ directory. This is the case that regresses if someone "simplifies" the fallback away.
 checkout="$tmp/checkout"

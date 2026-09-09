@@ -57,10 +57,18 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd -- "$script_dir/.." && pwd)"
 # Two layouts reach this script: a checkout, where the artifacts sit in the repository's own
 # models/ directory beside build-linux/, and an unpacked release archive, where the launcher
-# sits next to ninfer-serve and models/. Try the checkout first, then the archive -- the same
-# order the server lookup below uses. NINFER_MODEL_DIR and NINFER_MODEL override both.
-model_dir="${NINFER_MODEL_DIR:-$root/models}"
-[[ -d "$model_dir" ]] || model_dir="$script_dir/models"
+# sits next to ninfer-serve and models/. Probe for the checkout first, then the archive -- the
+# same order the server lookup below uses.
+#
+# An explicit NINFER_MODEL_DIR is taken verbatim and never probed. Falling back past a
+# directory the caller named turns their typo into a 'Missing model' error about a path they
+# never mentioned, which is worse than failing on the one they did.
+if [[ -n "${NINFER_MODEL_DIR:-}" ]]; then
+  model_dir="$NINFER_MODEL_DIR"
+else
+  model_dir="$root/models"
+  [[ -d "$model_dir" ]] || model_dir="$script_dir/models"
+fi
 MODEL="${NINFER_MODEL:-$model_dir/qwen3_8_27b.ninfer}"
 CONTEXT="${NINFER_CONTEXT:-212992}"
 CONCURRENCY="${NINFER_CONCURRENCY:-2}"

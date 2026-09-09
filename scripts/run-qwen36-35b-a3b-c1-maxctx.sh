@@ -45,10 +45,20 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd -- "$script_dir/.." && pwd)"
-# A checkout keeps its artifacts in the repository's own models/ directory; an unpacked release
-# archive keeps them beside this launcher. Try the checkout first, then the archive.
-model_dir="${NINFER_MODEL_DIR:-$root/models}"
-[[ -d "$model_dir" ]] || model_dir="$script_dir/models"
+# Two layouts reach this script: a checkout, where the artifacts sit in the repository's own
+# models/ directory beside build-linux/, and an unpacked release archive, where the launcher
+# sits next to ninfer-serve and models/. Probe for the checkout first, then the archive -- the
+# same order the server lookup below uses.
+#
+# An explicit NINFER_MODEL_DIR is taken verbatim and never probed. Falling back past a
+# directory the caller named turns their typo into a 'Missing model' error about a path they
+# never mentioned, which is worse than failing on the one they did.
+if [[ -n "${NINFER_MODEL_DIR:-}" ]]; then
+  model_dir="$NINFER_MODEL_DIR"
+else
+  model_dir="$root/models"
+  [[ -d "$model_dir" ]] || model_dir="$script_dir/models"
+fi
 # Override with NINFER_MODEL=... to point at a copy on the Linux filesystem, which loads faster
 # than reading 20.6 GiB across the 9p mount.
 MODEL="${NINFER_MODEL:-$model_dir/qwen3_6_35b_a3b.ninfer}"
