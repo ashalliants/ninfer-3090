@@ -9,6 +9,12 @@
 # window. Whatever is missing is the GPU idle between kernels, and no amount of kernel tuning
 # recovers it. Then it ranks kernels by total time so the next question has somewhere to go.
 #
+# **--cuda-graph-trace node is not optional here.** Decode replays a captured CUDA graph, and
+# nsys's default graph tracing records the replay as one opaque entity rather than its nodes. The
+# per-kernel trace then contains only the handful of kernels launched outside the graph, and the
+# arithmetic below reports 99.3% of the window as GPU idle -- which is an artifact of the
+# instrument, not a launch gap. Ask for node-level tracing and the graph's kernels appear.
+#
 # ninfer_bench's --profile-measured brackets exactly one measured repetition with
 # cudaProfilerStart/Stop, and nsys --capture-range=cudaProfilerApi records only that, so the
 # report is one clean decode run rather than model loading and warmup.
@@ -28,12 +34,18 @@ $nsys = if ($env:NINFER_NSYS) { $env:NINFER_NSYS } else {
   'C:\Program Files\NVIDIA Corporation\Nsight Systems 2024.6.2\target-windows-x64\nsys.exe' }
 if (-not (Test-Path $nsys)) { throw "nsys not found at $nsys; set NINFER_NSYS" }
 
-# Both models, because the two sit at very different fractions of the achievable ceiling and the
-# reason is expected to differ: the dense one streams 15.7 GB per token in long contiguous runs,
-# the MoE 2.5 GB of which 0.58 GB is a gather of 8 expert blocks out of 256 per layer.
+# Two workloads per model, because the first attempt at this conflated them and the answer is
+# different for each. `-pg 4096,128` prefills 4,096 tokens and then decodes 128, and the prefill
+# dominates the capture completely -- the 27B's top kernel came back as 256 launches of
+# q4a8_swiglu, which is 4 prefill chunks x 64 layers, and causal_attention_*prompt*_i8 sat in the
+# top eight. None of that is decode. `-n 128` decodes only, on a shallow cache, which is the
+# workload the roofline question is actually about: decode streams the resident weights whatever
+# the cache depth, so a shallow cache is fine for asking where the time goes.
 $configs = @(
-  @{ key='27b-dense'; path="$modelDir\qwen3_8_27b.ninfer";      depth=4096 }
-  @{ key='35b-moe';   path="$modelDir\qwen3_6_35b_a3b.ninfer";  depth=4096 }
+  @{ key='27b-dense-decode';  path="$modelDir\qwen3_8_27b.ninfer";     args=@('-n','128') }
+  @{ key='35b-moe-decode';    path="$modelDir\qwen3_6_35b_a3b.ninfer"; args=@('-n','128') }
+  @{ key='27b-dense-prefill'; path="$modelDir\qwen3_8_27b.ninfer";     args=@('-pg','4096,128') }
+  @{ key='35b-moe-prefill';   path="$modelDir\qwen3_6_35b_a3b.ninfer"; args=@('-pg','4096,128') }
 )
 
 foreach ($c in $configs) {
@@ -42,10 +54,10 @@ foreach ($c in $configs) {
   Remove-Item "$stem.nsys-rep","$stem.sqlite" -ErrorAction SilentlyContinue
 
   & $nsys profile --force-overwrite true --output $stem `
-      --trace cuda --capture-range cudaProfilerApi --capture-range-end stop `
+      --trace cuda --cuda-graph-trace node --capture-range cudaProfilerApi --capture-range-end stop `
       .\build-ninja\bench\ninfer_bench.exe `
       --weights $c.path --kv-dtype int8 --max-ctx 8192 `
-      -pg "$($c.depth),128" -r 1 --warmup 1 --profile-measured `
+      @($c.args) -r 1 --warmup 1 --profile-measured `
       > "$stem.log" 2>&1
   if (-not (Test-Path "$stem.nsys-rep")) {
     "$($c.key): profile FAILED"
@@ -71,7 +83,7 @@ foreach ($c in $configs) {
   $wall   = ($ends | Measure-Object -Maximum).Maximum - ($starts | Measure-Object -Minimum).Minimum
 
   ""
-  "== $($c.key) at depth $($c.depth), int8, one measured repetition =="
+  "== $($c.key), int8, one measured repetition =="
   "  kernel launches        : {0:N0}" -f $rows.Count
   "  GPU busy               : {0:N3} ms" -f ($busy / 1e6)
   "  window wall            : {0:N3} ms" -f ($wall / 1e6)
