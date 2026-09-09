@@ -21,6 +21,13 @@ into three-warp path blocks, which raised theoretical occupancy to 100% and *dro
 67.7% to 52.6%. That closed the MoE entry as a dead end — all four of its candidate fixes are now
 measured negatives.
 
+**A shipped artifact does not load on this card.** `models/qwen3_6_27b_nvfp4.ninfer` fails in
+runtime planning with `nvfp4 linear_swiglu A16 is registered only through T=16`, on a three-word
+prompt — sm_86 forces NVFP4 weights onto the A16 route, and the A16 route has no width above 16.
+The only test that reaches it skips unless an env var this file omitted until last cycle is set,
+which is why "126/126" and a completely unusable configuration coexisted. `docs/cli.md` uses an
+NVFP4 artifact as its worked example. See §1.
+
 **The second speedup came from a single-warp kernel nobody had looked at.**
 `sparse_moe_d2_warp_kernel` picks the top 8 of 257 experts in `<<<1, 32>>>` — one warp, one SM of
 82 — and `nsys` put it at **8.45% of the 35B's decode kernel time**, third of the four MoE stages.
@@ -443,22 +450,70 @@ parents). The next merge from `neroued/master` will touch the same subsystem.
 
 ## 1. Correctness and coverage — closed
 
-- [ ] **`27b_prefix_real` dies on the NVFP4 artifact: `nvfp4 linear_swiglu A16 is registered only
-      through T=16`.** Found 2026-09-09 while confirming an unrelated change against the full
-      suite, and it is a coverage gap rather than a regression — the test only reaches this path
-      when `NINFER_QWEN3_6_27B_NVFP4_WEIGHTS` is set, which the env block in this file omitted until
-      last cycle. Verified both ways on the same binary: unset, exit 0; set, exit 1 with that FATAL.
+- [ ] **The NVFP4 27B artifact cannot start at all on sm_86. It is a shipped, documented
+      configuration and it is completely broken on this card.** Found 2026-09-09 while confirming
+      an unrelated change against the full suite; not a regression — nothing this cycle touched
+      `nvfp4_linear_swiglu`.
 
-      So one of the two things that variable does is unblock `27b_load_plan`, and the other is turn
-      a skip into a hard failure. Two candidate fixes and they are not equivalent: either the NVFP4
-      `linear_swiglu` A16 route is registered past T=16 (a real widening, and the T=16 bound will
-      have been chosen for a reason worth reading first), or the prefix test bounds its own width
-      for the NVFP4 profile the way the other real-model tests bound `--max-context`. Prefer the
-      first if the wider route is legitimate — a FATAL here means production would hit it too on any
-      NVFP4 prefill wider than 16 columns, which is every real prompt.
+      ```
+      $ ninfer.exe models\qwen3_6_27b_nvfp4.ninfer --prompt "Hello there friend" --max-new 4
+      starting engine
+      error: startup failed | planning runtime | 1.25 ms
+      error: nvfp4 linear_swiglu A16 is registered only through T=16
+      ```
 
-      Not a regression from anything this cycle: the failing path is `nvfp4_linear_swiglu`, and
-      nothing this cycle touched it. The suite is otherwise 125/126.
+      **It throws during runtime planning, before a single token is processed**, so this is not "long
+      prompts fail" — the artifact cannot be loaded. Reproduced with a 3-word prompt.
+
+      **Why, and it is a two-line collision between two deliberate decisions.**
+      `src/targets/qwen3_6_27b/impl/variant.cpp:49` forces NVFP4 weights onto the A16 route on this
+      architecture, with a comment that is entirely reasonable:
+
+      > *sm_86 has no FP8 or NVFP4 tensor-core path. Both quantized weight formats are admitted only
+      > through their A16 routes, which dequantize the stored codes to BF16 before the MMA.*
+
+      And `src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp:35` registers that A16 route
+      only to T=16, throwing above it. `AllowA4` handles any width (fused to 128, then TMA or a
+      split post-pass) — but `AllowA4` is exactly what sm_86 cannot use. **So the policy sm_86 is
+      forced onto is the one that has no wide route, and planning a default 1,024-token prefill
+      chunk hits the throw immediately.** `nvfp4_gdn_snapshot_plan.cpp:40` carries the same T=16
+      bound, so fixing only the SwiGLU would move the failure rather than remove it.
+
+      **Why it went unnoticed, which is the part worth keeping.** The only test that reaches it is
+      `27b_prefix_real`, and that test skips unless `NINFER_QWEN3_6_27B_NVFP4_WEIGHTS` is set — a
+      variable this file's env block omitted until last cycle, when it was added *because* it
+      unblocked `27b_load_plan`. Verified both ways on one binary: unset, exit 0; set, exit 1. So
+      the suite reads 126/126 on the old block and 125/126 on the current one, and the artifact has
+      been unusable on this card the whole time. **A skip is not a pass**, and this is the second
+      time this cycle that a missing env var was hiding something rather than merely reducing
+      coverage.
+
+      **`docs/cli.md` documents this configuration as a primary example** — an NVFP4 weight
+      artifact is the model argument in four of its invocations, and line 208 states that
+      "both `groupwise-int` and `nvfp4` artifacts use the same Engine route, including CUDA Graph".
+      On sm_86 that is not true of any prompt.
+
+      Three ways out, and they are not equivalent:
+
+      1. **Register the NVFP4 A16 route past T=16** in both `nvfp4_linear_swiglu` and
+         `nvfp4_gdn_snapshot`. This is the fix if A16 NVFP4 is meant to work here, and the T=16
+         bound needs reading first — it may exist because the small-T fused kernel is the only one
+         written, in which case this is real kernel work rather than a route-table edit.
+      2. **Reject the artifact at load time with a clear message** if A16 NVFP4 is not intended to
+         be supported on sm_86. Failing in `planning runtime` with a route-registration message is
+         the worst of both worlds; an explicit "NVFP4 weights require sm_89 or newer" at load is
+         honest and costs nothing.
+      3. Either way, **`docs/cli.md` must stop using an NVFP4 artifact as its worked example on a
+         page whose own banner is about this fork's sm_86 target**, and the model table in this file
+         should say the artifact does not load here.
+
+      Do not "fix" this by unsetting the env var. That restores 126/126 and re-hides a broken
+      shipped configuration, which is how it survived this long.
+
+      *Not yet checked, and deliberately not claimed:* whether the Qwen3.8 NVFP4 artifact
+      `docs/cli.md` actually names is affected. Only `qwen3_6_27b` defines `kNvfp4TextPolicy`, that
+      artifact is not on this disk, and there is no `qwen3_8_27b` target directory — so which target
+      serves it, and whether that target forces A16Only, is unverified.
 
 ### 1.1 `attn_input_proj` grossly wrong at `W8 DFlash2 A16 T=112 graph phase=1` — closed
 
