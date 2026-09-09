@@ -31,12 +31,20 @@ about three hours for twelve model/format combinations.
 | `speculation-matrix.ps1` | What does each speculative backend cost and buy? | 1 h |
 | `decode-roofline.ps1` | What fraction of the card's 936.2 GB/s does decode reach? | instant |
 | `decode-step-profile.ps1` | Where does a decode step's time go -- occupancy, launch gaps, or bandwidth? | a few min |
+| `power-and-clocks.ps1` | Does the 315 W cap bound these numbers? | a few min |
 
 `decode-roofline.ps1` needs no GPU: it reads the CSVs `kv-decode-vs-depth.ps1` leaves behind and
 divides achieved bandwidth by peak. Run that sweep first. Note it only means anything for the
 **dense** model -- applied to the A3B MoE it returns 391% of peak, which is not a result but a
 demonstration that the formula does not hold there, since an MoE never reads its resident weights
 per token. See TODO section 2c.
+
+`power-and-clocks.ps1` needs neither a model sweep nor `nsys`, only `nvidia-smi`: it samples power,
+clocks and throttle reasons through one decode and one prefill. The answer as of 2026-09-09 is that
+the cap binds in essentially every busy sample but the **memory clock never leaves 9,501 MHz**, so
+the bandwidth figures these sweeps produce are not capped. Read the two phases separately -- decode
+and prefill sit ~135 MHz apart on SM clock for the same power -- and ignore the maxima, which are
+ramp-up spikes on a cold card.
 
 `decode-step-profile.ps1` needs `nsys` (Nsight Systems) rather than a plain GPU run: it captures one
 measured decode repetition per configuration and reports GPU-busy vs. idle time from the trace, plus
