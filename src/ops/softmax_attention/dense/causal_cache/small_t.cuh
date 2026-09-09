@@ -119,13 +119,17 @@ __device__ __forceinline__ int causal_small_t_active_splits(int window, int laun
     return splits < launch_capacity ? splits : launch_capacity;
 }
 
+// Quantized storages take the plain default tier. This used to ask for SmallTMaximumSplits at
+// tokens==1 and window>8198 while the host granted that capacity to fp8 only, so nvfp4 and k8v4
+// silently ran fewer splits than this function returned and the two sides disagreed about intent.
+// Measurement said the host's default was the better number for all of them (see
+// causal_small_t_split_count in small_t.cu), so the request is gone rather than the grant
+// extended, and this now agrees with the host by construction.
 template <typename Geometry>
 __device__ __forceinline__ int
 causal_small_t_quantized_active_splits(int window, int launch_capacity, int tokens) {
-    int splits = causal_small_t_default_splits<Geometry>(window);
-    if constexpr (Geometry::SmallTSplitScale == 1) {
-        if (tokens == 1 && window > 8198) { splits = Geometry::SmallTMaximumSplits; }
-    }
+    (void)tokens;
+    const int splits = causal_small_t_default_splits<Geometry>(window);
     return splits < launch_capacity ? splits : launch_capacity;
 }
 
