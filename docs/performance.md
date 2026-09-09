@@ -25,12 +25,41 @@ and byte-identical output to the non-speculative vision run. These are single-pr
 numbers, not a campaign; the [Vision residency](performance/qwen3.8-27b.md#vision-residency-on-rtx-3090-groupwise-int-sm_86)
 and per-model pages remain the measured corpus results.
 
-**Speculative decoding is not bit-identical to non-speculative decoding here, and that is not
-new.** On the text prompt, DFlash2 and MTP produce the *same* output as each other and both
-differ from the width-1 greedy path a hundred tokens in (`数学上是未定义的` vs `不确定的`).
-Verification evaluates k+1 columns in one pass while plain decode evaluates one, so the
-reductions run in a different order and a near-tie argmax can flip. MTP shows it identically,
-so it is a property of the shared verification path rather than anything DFlash2 introduced.
+**Speculative decoding is not bit-identical to non-speculative decoding here, it is not required
+to be, and every configuration is nonetheless deterministic in itself.** Measured 2026-09-09 by
+hashing the generated text of 23 configurations x 3 repetitions
+(`scripts/sweeps/dflash2-draft-tokens-realtext.ps1`, `content_sha256`):
+
+- **every configuration reproduced its own output exactly**, 23 of 23, three runs each;
+- the width-1 greedy path produced a hash matched by no speculative configuration;
+- **DFlash2 and MTP do not match each other**, and DFlash2's output varies with the draft count —
+  eight distinct outputs across k = 1..12.
+
+Verification evaluates k+1 columns in one pass while plain decode evaluates one, so the reductions
+run in a different order and a near-tie argmax can flip; a different draft count is a different
+width and so a different order again. That is why bit-identity to greedy is not a target here: it
+would require computing the accepted column with the width-1 kernel on every round, which is the
+work speculation exists to avoid. It costs nothing in quality — swapping an MMA tile for a
+different reduction order leaves perplexity bit-identical to twelve significant figures — so what
+is guaranteed is per-configuration determinism, not cross-configuration equality.
+
+*An earlier version of this section claimed DFlash2 and MTP "produce the same output as each other".
+That was inferred from one prompt and is wrong; the hashes above are the measurement.*
+
+**Acceptance on realistic text, which the committed corpus cannot measure.** 27B DFlash2, INT8 KV,
+greedy, 256 generated tokens of the model's own prose, medians of three. `bench/fixtures/bench_corpus.ids`
+reports a flat 100% at every draft count because it is a curated bank tiled to length; these are the
+numbers to quote instead:
+
+| `--draft-tokens` | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 10 | 12 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| acceptance | 80.9% | 67.6% | 51.7% | 49.1% | 42.1% | 33.1% | 28.2% | 31.0% | 23.2% | 19.5% |
+| tok/round | 1.81 | 2.35 | 2.55 | 2.95 | 3.07 | 2.97 | 2.93 | 3.45 | 3.27 | 3.27 |
+| decode tok/s | 47.3 | 55.2 | **58.6** | 58.3 | 57.2 | 51.0 | 50.5 | 47.5 | 39.7 | 39.3 |
+
+Acceptance falls monotonically as the window widens, and tokens-per-round plateaus near 3.0 from
+k=4 — which is the real reason to recommend four rather than more. MTP3 reaches 58.3 tok/s at 56.0%
+acceptance, and MTP3 with `--lm-head-draft` is the fastest configuration measured at 62.9 tok/s.
 
 **Route boundaries are measured here, not inherited.** Two maintainer benches time every
 schedule of an Op at the same column count, cold, so a boundary can be chosen from data rather

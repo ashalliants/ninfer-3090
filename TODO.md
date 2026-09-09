@@ -2270,7 +2270,33 @@ ceiling, and neither has had any optimisation attempted.
       check whether upstream still publishes those revisions before treating it as out of reach,
       which is the move that closed both §2 artifact entries last cycle.
 
-- [ ] **DFlash2 corpus numbers on sm_86 — re-scoped, because the obvious way to get them is void.**
+- [x] **DFlash2 acceptance on realistic text — measured 2026-09-09, and it is nothing like the
+      committed corpus's answer.** `scripts/sweeps/dflash2-draft-tokens-realtext.ps1` now parses the
+      acceptance metrics the CLI has always printed, so this needed no new instrument and no local
+      tokenizer. 27B DFlash2 artifact, INT8 KV, greedy, 256 generated tokens on the model's own
+      prose, medians of three:
+
+      | k | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 10 | 12 |
+      |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+      | acceptance % | **80.9** | 67.6 | 51.7 | 49.1 | 42.1 | 33.1 | 28.2 | 31.0 | 23.2 | **19.5** |
+      | tok/round | 1.81 | 2.35 | 2.55 | 2.95 | 3.07 | 2.97 | 2.93 | 3.45 | 3.27 | 3.27 |
+      | decode tok/s | 47.3 | 55.2 | **58.6** | 58.3 | 57.2 | 51.0 | 50.5 | 47.5 | 39.7 | 39.3 |
+
+      **Acceptance falls monotonically from 80.9% to 19.5% as the draft window widens**, which is
+      the shape a draft head on real prose should have and is the opposite of the committed corpus's
+      flat 100% at every count. So `bench_corpus.ids` was not merely optimistic, it was reporting
+      the fixture; these are the numbers to quote.
+
+      **Tokens-per-round plateaus around 3.0 from k=4**, which is the real justification for
+      recommending four: everything past it buys ~0.1 tokens per round for a wider verification
+      pass. Throughput peaks at k=3-4 (58.6 / 58.3), consistent with the recommendation in
+      `docs/cli.md`.
+
+      MTP3 reaches 58.3 tok/s at **56.0%** acceptance and 2.67 tok/round, and `mtp3 --lm-head-draft`
+      is the fastest configuration measured at **62.9 tok/s**. `--lm-head-draft` remains within noise
+      for DFlash2 at every count, as previously recorded.
+
+- [x] **DFlash2 corpus numbers on sm_86 — the throughput half, kept for the reasoning.**
       Only single-prompt smoke numbers exist (text 20.0% / 2.38 tok-per-round, vision 85.7% /
       7.00). `docs/performance.md` deliberately does not reproduce upstream's tables because they
       are sm_120 — see the provenance banner there.
@@ -2286,12 +2312,48 @@ ceiling, and neither has had any optimisation attempted.
       pg19 prose sitting right there, though it needs a local HF tokenizer that this box does not
       have — or extend the real-text sweep to report acceptance. Vision acceptance is unaffected by
       any of this: it is measured on the committed image fixture, not the token corpus.
-- [ ] **Speculative decoding is not bit-identical to greedy**, and it is not clear it should be.
-      DFlash2 and MTP produce byte-identical output *to each other* and both diverge from the
-      width-1 greedy path about a hundred tokens into the text fixture. Verification evaluates k+1
-      columns in one pass where plain decode evaluates one, so reductions run in a different order
-      and a near-tie argmax flips. MTP reproduces it exactly, so it predates the merge — but nobody
-      has decided whether that is acceptable or worth pinning down.
+- [x] **Speculative decoding is not bit-identical to greedy, it should not be required to be, and
+      the premise this entry rested on is false. Decided 2026-09-09, with evidence.**
+
+      The entry said "DFlash2 and MTP produce byte-identical output *to each other*". **They do
+      not.** Hashing every run's generated text across 23 configurations x 3 repetitions:
+
+      | | |
+      |---|---|
+      | every configuration self-deterministic | **yes — 23 of 23, one hash across three runs each** |
+      | `none` (width-1 greedy) | its own unique hash, matched by nothing |
+      | `mtp3` / `mtp3+head` | one hash, distinct from **every** DFlash2 configuration |
+      | DFlash2 across draft counts | **8 distinct hashes** over k = 1..12 |
+
+      So the divergence is real, but it is not one divergence: output depends on the backend *and*
+      on the draft count. "Bit-identical to greedy" was never a single target — there are eight
+      different DFlash2 outputs to choose between before the question even reaches MTP.
+
+      **The decision: no, and it is architecturally incompatible with the feature.** The speedup is
+      that verification evaluates k+1 columns in one pass. That pass's reduction order for the
+      accepted column is not the width-1 GEMV's, and the only way to make it so is to compute the
+      accepted column with the width-1 kernel on every round — which is exactly the work
+      speculation exists to avoid. Requiring bit-identity would mean pinning one reduction order
+      across every verification width, a far stronger constraint than "lossless".
+
+      **And this class of difference is already measured to be quality-neutral in this repository.**
+      §3's perplexity entry swapped `q5_linear_add` from `MmaResidualR64C128` to `R64C64` — a
+      genuinely different MMA tile and reduction order, confirmed by a 6% change in score rate —
+      and perplexity came back **bit-identical at 4.342425 to twelve significant figures**. So a
+      changed reduction order does not move quality; it flips an argmax only at a near-tie, where
+      the two candidates are by construction near-equally probable.
+
+      **What should be guaranteed instead, and now is:**
+
+      1. **self-determinism** — a configuration reproduces its own output run to run. Measured
+         above, 23 of 23. This is the property that actually matters for reproducing a bug report,
+         and until now nobody had checked it.
+      2. **quality parity** — unaffected by reduction order, per the perplexity result.
+      3. **documented divergence** — `docs/performance.md` says so, and now says it correctly.
+
+      A test asserting bit-identity to greedy would fail permanently by design, which is worse than
+      no test. A test asserting self-determinism and cross-run stability would be worth having, and
+      `dflash2-draft-tokens-realtext.ps1`'s `content_sha256` column is the mechanism for it.
 - [x] **q4 SwiGLU `{513,640}` settled: it goes to c128, and the alternation is gone.** The band
       stayed on `Materialized` because the measurement could not separate the two — over four runs
       Materialized won T=576 three times, while c128 there ranged 4147–4959 µs (19.6% spread) and
