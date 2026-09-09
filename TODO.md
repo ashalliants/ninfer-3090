@@ -255,7 +255,7 @@ Ordered by expected value, not by section.
 | Eight lanes buy 3.6x (3.83x since the GDN tiles) | 2c | cheap half shipped (+2.85% at width 8); what is left is a split-K **MMA** kernel, modelled on `w8_gdn_input_gemm_splitk.cu` | kernel work |
 | KV decode falloff, 3.21x per-key on fp8 | 2c | attack the per-key dequant-into-shared cost; `rk8v4` proves the floor is reachable without a shared arena | kernel work |
 | DFlash2 5→6 cliff | 2c/3 | remainder after the GDN tiles is the grouped kernel sitting at 27% of its own weight-streaming floor | same kernel as the KV item |
-| Routed prefill pipeline-depth threshold 7/4 | 2c | sweep the constant through the product on this card — the method the source comment endorses over the operator fixture | GPU time only |
+| Routed prefill pipeline-depth threshold 7/4 | 2c | **swept**: a 1.33x change in the constant moves prefill 0.06-0.26%, the same as the drift between two identical builds. Safe to leave | closed |
 | `w8_pair` medium discards its schedule on sm_86 | 3 | five of the ten tiles fit sm_86's shared cap; put them behind an `#if` and bench T=33..64 | GPU time, small edit |
 | sm_86 fallback constants chosen to fit | 2c | sweep the alternatives at the eleven `NINFER_SM8X_COMPAT` sites | GPU time only |
 | Cold-flush margins overstate wins | 3 | **answered**: 4-5x overstatement, and a 5.9% cold margin inverted in situ. Distrust anything under ~10% | closed |
@@ -780,8 +780,44 @@ roofline finally acquired a denominator; read them before the rest.
       per step, because nsys records a CUDA graph replay as one opaque entity unless given
       `--cuda-graph-trace=node`. Both reasons are written into the script.
 
-- [ ] **The routed prefill gate/up pipeline-depth threshold is upstream's RTX 5090 number,
-      unmeasured on this card.** `src/ops/sparse_moe/prefill/sparse_moe_prefill_kernels.cu:314-315`
+- [x] **The routed prefill pipeline-depth threshold is measured on this card and 7/4 is not a
+      risk. Closed 2026-09-09** — sweeping the constant through the product moves prefill by less
+      than the run's own drift, and the likely reason is that no threshold in [1.5, 2.0] can change
+      the decision at any prompt length anyone runs.
+
+      `scripts/sweeps/moe-prefill-pipeline-depth.ps1`, 35B, int8 KV, `-p 1024,2048,4096,8192 -r 3`,
+      clocks locked at 1,500 MHz, source patched and rebuilt per ratio, with 7/4 repeated last as
+      the drift control the script's own header demands:
+
+      | prompt | 1.50 | 1.5625 | 1.625 | **1.75** | 2.00 | 1.75 again | spread |
+      |---:|---:|---:|---:|---:|---:|---:|---:|
+      | 1,024 | 5,895.6 | 5,880.9 | 5,880.6 | 5,882.7 | 5,892.4 | 5,891.97 | **0.26%** |
+      | 2,048 | 5,845.2 | 5,854.2 | 5,846.6 | 5,847.7 | 5,849.2 | 5,853.23 | **0.15%** |
+      | 4,096 | 5,706.4 | 5,705.0 | 5,706.0 | 5,707.8 | 5,701.4 | 5,712.63 | **0.11%** |
+      | 8,192 | 5,424.9 | 5,425.4 | 5,427.3 | 5,423.7 | 5,425.0 | 5,426.66 | **0.06%** |
+
+      **The two 7/4 readings agree to 0.05-0.16%, and the between-ratio spread is 0.06-0.26%** — so
+      the effect of a 1.33x change in the constant is the same size as the drift between two
+      identical builds. There is nothing here to tune, and nothing to fear: the concern was that
+      upstream's RTX 5090 number could be wrong on a card with a sixteenth of the L2, and across
+      the whole range it does not matter.
+
+      **Why it cannot matter is worth more than the table, and it is a caveat on this measurement
+      too.** The decision is `jobs * Den < Num * touched` (line 327) where `jobs` is the work-item
+      count and `touched` the number of experts with work, so the constant is compared against
+      *jobs per touched expert*. With `kExpertBM = 64` and top-8-of-256, average tokens per expert
+      is `T * 8 / 256`, so jobs per expert is `ceil(T / 2048)`: **~1.0 at T=1,024 and 2,048, ~2.0 at
+      4,096, ~4.0 at 8,192.** Every threshold in [1.5, 2.0] therefore puts 1,024/2,048 on Spread and
+      4,096/8,192 on Packed — **the branch never flipped between arms**, which is the simplest
+      explanation for four identical columns.
+
+      So this is a null result on the *risk* and a null *measurement* on the crossing point. The
+      honest position: 7/4 is safe to leave, and anyone who wants the actual crossing must first
+      make the branch move. Routing variance means jobs-per-expert is not exactly integral, so a
+      real test needs the decision printed rather than inferred — instrument `route_job_count[0]`
+      and `[1]` and the chosen `GateUpRoute` per prompt length, and look for a shape where the ratio
+      lands strictly inside [1.5, 2.0]. On this geometry that is roughly `T` between 1,536 and
+      2,048, i.e. a narrow band of short prompts, which is also why it is not worth chasing. `src/ops/sparse_moe/prefill/sparse_moe_prefill_kernels.cu:314-315`
       (`kGateUpDeepJobsNum`/`Den`, currently 7/4) picks between a 2-stage ("Spread") and a 6-stage
       ("Packed") pipeline for the narrow routed gate/up kernel based on jobs-per-expert crossing
       this ratio. The comment above it is explicit that the crossing point was measured on
