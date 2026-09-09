@@ -438,14 +438,23 @@ roofline finally acquired a denominator; read them before the rest.
 
       | workload | launches | GPU busy | wall | idle |
       |---|---:|---:|---:|---:|
-      | 27B dense decode | 83,623 | 3,368 ms | 3,528 ms | 4.5% |
-      | 35B-A3B decode | 57,770 | 708 ms | 811 ms | 12.6% |
-      | 27B dense prefill | 87,110 | 6,524 ms | 6,684 ms | 2.4% |
-      | 35B-A3B prefill | 60,715 | 1,397 ms | 1,504 ms | 7.1% |
+      | 27B dense decode | 83,623 | 3,336 ms | 3,500 ms | 4.7% |
+      | 35B-A3B decode | 57,770 | 717 ms | 849 ms | **15.5%** |
+      | 27B dense prefill | 87,110 | 6,512 ms | 6,675 ms | 2.4% |
+      | 35B-A3B prefill | 60,715 | 1,362 ms | 1,481 ms | 8.1% |
 
-      Dividing the read set into *busy* time alone: 27B 598 GB/s (70.0% of achievable), 35B
-      456 GB/s (53.4%). So closing every launch gap buys 4.5% on the dense path and 12.6% on the
-      MoE, and the rest is kernel efficiency.
+      Dividing the read set into *busy* time alone: 27B 601 GB/s (70.7% of achievable), 35B
+      450 GB/s (52.7%). So closing every launch gap buys 4.7% on the dense path and **15.5%** on
+      the MoE, and the rest is kernel efficiency.
+
+      *These are the corrected figures.* #53 reported 4.5% and 12.6%, computed by summing each
+      kernel's duration rather than taking the union of their `[start, end)` intervals. Decode
+      launches across streams and concurrent kernels overlap, so summing double-counts the overlap
+      and understates idle — found by CodePulse review on #51 and fixed in #60. The dense path
+      barely moved (1.0% of overlap); the MoE's idle went 12.6% to 15.5%, which makes its launch
+      overhead a fifth of its total shortfall rather than a quarter of it. Any future change to
+      this script's arithmetic should be checked against synthetic overlapping intervals, which is
+      how #60 verified the merge-sweep.
 
       **On the MoE the shortfall has an address.** Bytes attributed from the artifact inventory,
       instance counts fixing the mapping (129 rounds, 40 text layers, 8 of 256 experts):
@@ -693,7 +702,11 @@ ceiling, and neither has had any optimisation attempted.
       | `q6_rowsplit_gemm_simt` (output head, contiguous) | 397.31 MB | 595.6 µs | 667 GB/s | 78.1% |
 
       The four `sparse_moe` stages are **38% of decode busy time** on the 35B, and that model sits
-      at ~51% of achievable overall against the dense 27B's ~66-70%. Eight scattered expert blocks
+      at ~51% of achievable overall against the dense 27B's ~66-70%. A further **15.5%** of its
+      decode window is GPU idle between kernels (corrected in #60 from the 12.6% first reported),
+      which its mean kernel duration of 12.3 µs against the 27B's 40.3 µs explains: the MoE
+      launches three times as many, three times shorter, so per-launch overhead lands three times
+      as hard. Eight scattered expert blocks
       per layer per token is the shape; whether the cost is address divergence, L2 behaviour, or
       too little work per CTA to cover the latency is unknown — `ncu` would say, and is installed
       but has no `ncu.exe` at the expected path (see the tooling entry in §3).
