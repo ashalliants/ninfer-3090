@@ -40,9 +40,15 @@ DEFAULT_TOKENS = 65536
 
 # Curated, in-distribution prose spanning several domains and languages. Order and content are part
 # of the corpus contract: changing them changes the committed ids. Repetition to reach --tokens does
-# not bias prefill/decode throughput (both are token-count/bandwidth bound, not content dependent),
-# so this bank fills long corpora by rotated tiling. For genuinely diverse very long content, pass
-# --source-text instead.
+# not bias prefill or *plain* decode throughput (both are token-count/bandwidth bound, not content
+# dependent), so this bank fills long corpora by rotated tiling.
+#
+# That reasoning does not extend to speculative decoding, and the committed corpus is unusable for
+# it: 65,536 tokens drawn from 682 distinct ids with 98.4% of bigrams repeated, which a draft head
+# predicts perfectly. Swept through ninfer_bench, DFlash2 reports 100% acceptance at every draft
+# count from 1 to 12, and decode rises monotonically because each round emits k+1 free tokens --
+# none of which says anything about text. Pass --source-text for genuinely diverse content, or
+# measure the serving path on generated prose (scripts/sweeps/dflash2-draft-tokens-realtext.ps1).
 PARAGRAPHS: tuple[str, ...] = (
     "周末旅行规划资料：目的地是一个适合亲子散步的湖边小城，市中心到湖区有直达公交，车程大约"
     "四十分钟。周六下午两点以后人流会增加，建议提前购买返程车票，并把儿童水杯、薄外套、充电宝"

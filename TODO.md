@@ -530,32 +530,52 @@ roofline finally acquired a denominator; read them before the rest.
       how it scales with resolution, or what the overlay residency costs in time rather than in
       bytes. It is an advertised feature of both models and it is unmeasured.
 
-- [ ] **DFlash2 makes the 27B *slower*, and no document says so.** Measured on one artifact
-      (`qwen3_8_27b_dflash2.ninfer`), 8,192-token context, INT8 KV, tg128, three repetitions:
+- [x] **DFlash2 makes the 27B *slower*, and no document says so.** Wrong, and closed 2026-09-09.
+      On text DFlash2 is a **win at every draft count from 1 to 12**. The entry's own premise came
+      from a benchmark fixture that cannot measure drafting at all.
 
-      | config | tok/s | vs no speculation |
-      |---|---:|---:|
-      | none | 35.44 ± 1.42 | — |
-      | `--spec dflash2 --draft-tokens 7` | 27.57 ± 0.06 | **−22.2%** |
-      | ...` --lm-head-draft` | 28.33 ± 0.02 | **−20.1%** |
-      | `--spec mtp --draft-tokens 3` | 41.28 ± 0.10 | +16.5% |
-      | ...` --lm-head-draft` | 43.99 ± 0.10 | +24.1% |
+      Measured through the serving path on the model's own generated prose — 27B DFlash2 artifact,
+      INT8 KV, greedy, 256 generated tokens, mean of three runs, spread ≤0.2 tok/s except one row:
 
-      The deviations rule out noise. `docs/performance.md` already records the *acceptance* —
-      20.0% on text, 2.38 tok/round — but never states the throughput consequence, so a reader
-      reasonably assumes a headline v0.9.0 feature is a win. On text it is a 20% penalty, and it is
-      36% behind MTP3 with the draft head on the same file.
+      | `--draft-tokens` | decode | vs none |
+      |---:|---:|---:|
+      | (none) | 37.7 | — |
+      | 1 | 49.7 | +31.7% |
+      | 2 | 56.4 | +49.5% |
+      | 3 | 58.4 | +54.9% |
+      | **4** | **59.1** | **+56.5%** |
+      | 5 | 57.2 | +51.5% |
+      | 6 | 48.4 | +28.3% |
+      | 7 | 48.2 | +27.7% |
+      | 8 | 47.6 | +26.2% |
+      | 10 | 42.4 | +12.4% |
+      | 12 | 40.6 | +7.6% |
 
-      The arithmetic explains it and points at the fix. Seven drafts at 20% acceptance yields ~2.38
-      tokens per round, but each round verifies eight columns instead of one. **Nobody has tried
-      any other draft count** — the sweep used 7 throughout, because `docs/cli.md` calls seven "the
-      checkpoint recommendation". Sweeping `--draft-tokens 1..7` is cheap and is the first thing to
-      do; there may simply be a crossover below 7 where DFlash2 turns positive on text.
+      Three things follow.
 
-      Note the same document records **vision** DFlash2 at 85.7% acceptance and 7.00 tok/round,
-      which is close to ideal. So the backend is not broken — text drafting specifically is. If no
-      draft count makes text positive, say so in the docs and scope the feature to vision rather
-      than leaving it as an apparently-free option.
+      **The shipped recommendation is the wrong draft count.** `docs/cli.md` said seven; four is
+      **18.5% faster**, and `docs/cli.md` now says four and carries this table. The entry guessed
+      there might be "a crossover below 7 where DFlash2 turns positive" — there is a crossover at
+      four, but DFlash2 was never negative to begin with.
+
+      **MTP is still ahead, by far less than seven implied.** MTP3 with the draft head reaches
+      62.4 tok/s on the same measurement, so the gap is 5% at DFlash2's best count rather than the
+      36% this entry recorded.
+
+      **`--lm-head-draft` does nothing for DFlash2.** Within noise of unset at every count.
+
+      There is a clean cliff between five and six, 57.2 to 48.4, that looks like a block-geometry
+      boundary rather than acceptance — worth a look if anyone wants the last few percent.
+
+      *Why the old number was wrong, which matters more than the number.* It was measured on
+      `bench/fixtures/bench_corpus.ids`, which holds 65,536 tokens drawn from **682 distinct ids**
+      with **98.4% of bigrams repeated**, because it is a curated bank tiled to length. Both the
+      corpus manifest and the generator's docstring asserted that "repetition fills length only and
+      does not bias throughput" — true for prefill and plain decode, and false for anything that
+      drafts. Swept through `ninfer_bench` this corpus reports **100% acceptance at every draft
+      count from 1 to 12**, with decode rising monotonically to 159 tok/s because each round emits
+      k+1 free tokens. Both claims are now corrected in place, and
+      `scripts/sweeps/dflash2-draft-tokens-realtext.ps1` is the sweep that does not use it.
 
 - [ ] **The three KV formats with the worst decode falloff were exactly the three that were not
       run-to-run deterministic — and that turned out to be a coincidence.** #49 fixed the
@@ -758,170 +778,31 @@ doing:
       Left fully available in `--help` either way: upstream parity is worth more than steering, and
       the README table now states the trade precisely enough that nobody needs steering.
 
-- [ ] **The speculative decode sweep measures acceptance, not depth, and cannot be read like the
-      non-speculative one.** `scripts/sweeps/kv-decode-with-speculation.ps1` produced 35B INT8 at
-      212.19 tok/s on a 4,096-token cache and **316.83 tok/s on a 32,768-token one** — faster
-      deeper, which is not physical. Acceptance went 58.3% to 100% between those two points, and
-      on the fixed `bench_corpus.ids` a draft can simply be right every time on a repetitive
-      stretch. Several rows sit at exactly 100%. So those tok/s figures describe what the corpus
-      does to the draft, not what depth does to attention, and none of them are in README or the
-      calculator for that reason. Speculative throughput needs a corpus with realistic diversity,
-      or many more repetitions, before it means anything. The memory columns from the same run
-      **are** sound — they are read at load and do not depend on the corpus.
+- [x] **The speculative decode sweep measures acceptance, not depth, and cannot be read like the
+      non-speculative one.** Cause found and named, 2026-09-09. The entry blamed the corpus for
+      being "repetitive on a stretch" and prescribed "a corpus with realistic diversity, or many
+      more repetitions". More repetitions would not have helped: the fixture is *structurally*
+      unable to measure acceptance.
 
-## 6. Operational
+      `bench/fixtures/bench_corpus.ids` is 65,536 tokens drawn from **682 distinct token ids**,
+      with **98.4% of its bigrams repeated**, because it is a curated bank rotated and tiled to
+      length. A draft head predicts that perfectly. Swept through `ninfer_bench`, DFlash2 reports
+      **exactly 100% acceptance at every draft count from 1 through 12**, and decode climbs
+      monotonically from 37.6 to 159.7 tok/s because each round emits k+1 tokens for free. Not
+      several rows at 100% — all of them.
 
-- [x] **The pinned host-KV default is 8 GiB regardless of host RAM.** Closed by #45, 2026-09-09,
-      and the framing was wrong: host RAM was never the constraint.
+      Worse, both the corpus manifest and `tools/bench/make_bench_corpus.py` asserted in writing
+      that "repetition fills length only and does not bias throughput". That is correct for
+      prefill and plain decode, which are token-count and bandwidth bound, and wrong for every
+      speculative measurement. Both are corrected in place, and they were the reason this was read
+      as a sampling problem rather than a fixture that cannot answer the question.
 
-      On Windows/WDDM a pinned host allocation is mapped into the GPU's address space and
-      charged against the card. Measured on this 24,576 MiB 3090, allocating N MiB on the device
-      and then finding the largest pin that succeeds:
-
-      | device resident | VRAM free | largest pin |
-      |---:|---:|---:|
-      | 15,360 MiB | 7,972 MiB | 8,192 MiB |
-      | 17,408 MiB | 5,924 MiB | 6,656 MiB |
-      | 19,456 MiB | 3,876 MiB | 3,840 MiB |
-      | 21,504 MiB | 1,828 MiB | 2,816 MiB |
-      | 22,528 MiB |   804 MiB | 1,536 MiB |
-
-      Resident-device plus pinned-host lands within a few hundred MiB of the card's capacity
-      every time. The failure is `cudaErrorAlreadyMapped`, not out-of-memory, and #25's
-      diagnostic read it as "this is system RAM, not VRAM" — exactly backwards, which is what
-      sent the investigation the wrong way for an hour.
-
-      **Backing off does not work, and this is the part to remember.** One failed
-      `cudaMallocHost` poisons every later one in the process. With 2,852 MiB free, 1,024 MiB
-      succeeded twice; then a deliberate 8,192 MiB failure made 1,024, 256 and even **64 MiB**
-      fail with the same error, and `cudaGetLastError` did not clear it. A halving retry loop was
-      written and abandoned on that evidence. The size is now clamped before the first attempt,
-      to free VRAM less 1 GiB and then halved, Windows only.
-
-      **Still owed:** the shipped `run-*-maxctx` launchers pass `--host-kv-mib 8192` explicitly
-      and fill the card with KV, so on Windows they now silently get a fraction of what they ask
-      for. Per the table they could never have had 8 GiB. The flag should say something
-      achievable, or go.
-
-- [x] **The unpinned downloaders cannot verify anything they fetch.** Closed by #48, 2026-09-09.
-      `download-qwen38-27b.{sh,bat}` had in fact already pinned `18dfc887` in their URL — they
-      simply verified nothing and resumed onto the final path. They now stage under a
-      revision-scoped name and check size and SHA-256, matching `download-qwen36-27b`.
-      `flake.nix` had been tracking `main` for the same model, so `nix run` and the shell script
-      could fetch different artifacts; it is pinned to match. The local artifact every published
-      27B number was measured against hashes to the pinned revision, so the pin also records
-      which bytes those numbers describe. One downloader stays unverifiable by design —
-      `download-qwen36-35b-v2` tracks upstream `main`, which is the whole point of it — and
-      README now says so where people choose.
-
-- [x] **`package-release-rtx4090-early1.ps1` has no Linux counterpart.** Closed by #47. The
-      counterpart is written and the `windows_only` exemption list is deleted rather than left
-      empty. The same PR made that loop accumulate its misses instead of exiting at the first,
-      and added an executable-bit check read from the git index rather than the filesystem —
-      which immediately found four scripts committed at 644, including
-      `scripts/package-release-v090.sh`, the current release's own Linux packager.
-
-- [x] **Binaries embed their build directory.** Half fixed, and the other half measured as not
-      fixable. Closed 2026-09-09.
-
-      `-ffile-prefix-map=${PROJECT_SOURCE_DIR}=.` is now set for C, C++ and (via `-Xcompiler`) the
-      host half of CUDA translation units on GCC/Clang, which covers the Linux binaries and their
-      ~200 occurrences of `/home/ash/ninfer-rel/src/...`. Verified under real Linux g++ on this
-      box: `/tmp/ftest/sub/a.cpp` becomes `./sub/a.cpp` and the absolute prefix leaves `strings`
-      entirely.
-
-      **MSVC has no working equivalent and that is measured, not assumed.** It takes `__FILE__`
-      from the path as written on the command line and CMake writes absolute ones; the usual
-      suggestion, the undocumented `/d1trimfile:`, had *no effect* on `__FILE__` when tested
-      against 14.44.35207 with an absolute source path. The Windows binaries keep their ~466
-      occurrences. Device-side `__FILE__` from nvcc's own frontend is not covered either -- there
-      is no documented flag for it.
-
-## 7. Closed this cycle, and what it taught
-
-Kept because the reasoning is what stops the same investigation being repeated.
-
-| # | item | the useful part |
-|---|---|---|
-| #17 | release scripts could not cut a release | `--package` configured `NINFER_BUILD_BENCHMARKS=OFF` while every packager requires `bench/ninfer_bench`, so it failed *after* the whole tree had built |
-| #18 | greedy finiteness guard | **five** routes, not the one recorded; and span-wide, not terminal-only — a matched column whose logits are all NaN matched by accident, and a terminal-only guard licensed it |
-| #19 | `docs/performance.md` provenance | all ten "tested revisions" are upstream commits; every hardware line says RTX 5090 except the vision section, so "every figure here is measured on sm_86" was false |
-| #20 | BF16 gross-error floor | the bound and the error were the same quantity — kernels are accurate to ~1 rounding step, so a bound of that size measures BF16, not the kernel. `2.0 * kBf16UnitRoundoff` was already the house convention in five files |
-| #22 | `w8_pair` k=2048, **up to 52.8%** | under `NINFER_SM8X_COMPAT` all twelve `DualSplitKMedium` schedules are **one kernel**, so eight routes could never win. A live table whose *distinctions* are dead |
-| #23 | unrouted schedules visible | pins the set **by name**, not by count — a change stranding one schedule while un-stranding another keeps the count identical |
-| #24 | shipped launchers | one shipped `HOST=0.0.0.0` (unauthenticated, LAN-wide), one hardcoded an absolute path from this machine, one could never find its own server binary in the release layout |
-| #25 | pinned-host diagnostics | `cudaMallocHost` failing says "out of memory" and points entirely at the GPU; it is **system RAM** |
-| #26 | 503 during startup | `bind()` before the Engine is deliberate (fast port-clash failure) but left a 10 s window accepting TCP with nothing answering — a `tcpSocket` probe called that ready |
-| #27 | q4 SwiGLU Materialized, **up to 23%** | upstream alternated Materialized/c128 three times across one contiguous range; the winner does not flip back and forth, and it did not |
-| #28 | q4_q5 "never wins" | the old claim covered T≤208 only; extended to 4096 it holds, and `pair_c64` is a *slower twin* of `mixed_r32_c64_s3`, never ahead |
-| #29 | repo housekeeping | worktrees removed, dead files deleted, `repro/` ignored rather than binned, PR #12 closed as the record |
-| #30 | DFlash2 attention sweep | the fixture sized the cache table by the **batch**, but `table_rows` are indices *into* the table; B=1 addressing row 7 indexed a one-element vector, unchecked |
-| — | §7 `prompt_i8` dedupe | already landed with the small-T adoption; the entry was simply stale |
-| #37 | master did not compile | a lambda introduced in #30's review commit could not see `order`; nothing had rebuilt that TU, so every "125/125" since was measured against a binary the tree could no longer produce |
-| #44 | the `T=112` graph-replay failure | not a kernel. `cudaMemcpy` out of pageable memory returns before the DMA lands, and the DMA rides the legacy stream that `cudaStreamNonBlocking` is exempt from |
-| #45 | the pinned host-KV default | on WDDM a pinned host allocation is charged against **VRAM**; #25's diagnostic asserted the opposite. And a failed `cudaMallocHost` poisons every later one, so back-off is impossible |
-| #46 | four real-model tests died as `0xc0000409` | no top-level catch, so `what()` never printed. `e06d7363` in a debugger is a C++ throw, not corruption |
-| #47 | the Linux guard did not guard | an exemption list, a loop that exited at its first complaint, and an `-x` check that cannot see a mode-644 file on Windows or WSL — which had let the current release's own Linux packager sit at 644 |
-| #48 | the 27B downloaders | already pinned, verified nothing; `flake.nix` disagreed with the shell scripts about which revision to fetch |
-| #49 | fp8/nvfp4/k8v4 non-determinism | a missing `__syncthreads()` between `cp_wait<0>()` and a whole-tile shared-memory read. Corrupted every prefill output column but the last, which is why generation looked perfect |
-| #52 | `SmallTMaximumSplits` | section 2c proposed extending the bump to nvfp4 and k8v4; measured, it made them 2.3-3.1% slower, and removing it from fp8 too gained 0.4-1.2%. The host was right and the device policy was wrong |
-| #53 | where the MoE's bandwidth goes | the expert gather runs at 40-45% of achievable while contiguous weight kernels on the same step reach 78-82% |
-| #50, #51 | the decode roofline | both terms were wrong: the ceiling is measured at 854 GB/s not 936, and the numerator is the read set not the resident set. Gave the MoE its first denominator |
-| — | `--vision-residency overlay` + DFlash2 | **was never blocked** — it runs on this one 3090 and always could have. See below |
-
-### `--vision-residency overlay` + DFlash2 — verified working, 2026-09-08
-
-Listed for weeks as needing hardware. It does not. On this single 3090, with
-`qwen3_8_27b_dflash2.ninfer`, `--vision --vision-residency overlay --spec dflash2 --draft-tokens 7`:
-
-- starts cleanly — 18.0 GiB of weights, runtime 1.03 GiB, **2.30 GiB still free**, ready in 9.0 s;
-- answers four *different* images in sequence (2.4–2.7 s each), describing each correctly and
-  reading its embedded label with the index incrementing 00 → 01 → 02 → 03;
-- the server is still healthy afterwards and the log carries no `ERROR`, `FATAL` or eviction line.
-
-The worry in the old entry — overlay borrows device memory per image from the evictable
-text-weight tail while DFlash2 holds its own weight bundle, so the eviction ladder is untested —
-is exactly what the four-image sequence exercises, because the borrow-and-release has to happen
-more than once. It holds.
-
-**The lesson is about the list, not the feature**: "never run" had drifted into "cannot be run".
-Try it before writing it off; this took one command.
-
-**A correlation is not a mechanism, and this file said so twice before it mattered.** §2c noted
-that the three formats with the worst decode falloff were exactly the three that were not
-run-to-run deterministic, and wisely added "treat §5 as open on its own terms". #49 fixed the
-non-determinism completely and the falloff did not move at all. Two real defects sharing a
-population is not one defect.
-
-**Check that your instrument still fires on a case you know is broken.** Two probes were built
-for the `T=112` race and both were useless in opposite directions. A D2H read-back on the same
-stream, ordered ahead of the kernel, made the race vanish entirely — the copy engine serialises
-the in-flight H2D behind it. An early draft of the regression test cleared its counter with
-`DeviceBuffer::fill` between the copy and the stream work, and that one synchronous runtime call
-in the gap took 84 races out of 90 down to zero. Both looked like clean results.
-
-**The bug you can see is the one that does not matter.** fp8 attention was corrupting every
-prefill output column except the last, by up to 26 in logprob, for as long as anyone has been
-measuring perplexity with it — and greedy generation stayed byte-identical throughout, because
-greedy reads only the last column. `27b_score_real` was the only thing in the tree that looked,
-and it had been skipping for want of an artifact that was sitting on the disk.
-
-**"Resident" and "read" are different numbers and only one of them is a denominator.** Dividing
-throughput into `weights_capacity_bytes` overstated the dense path by six points and returned
-418% of peak on the MoE. The MoE figure had been in this file for a cycle, correctly labelled as
-a non-result, and the fix was arithmetic over the artifact rather than any measurement.
-
-Two from earlier cycles, still true:
-
-**Fix the class, not the flagged line.** #18 was reported as one route and was five. #24 was
-reported as one launcher and was four problems across six. Chasing the class is also what found the
-`kv_cache_append` contract lines and the `AGENTS.md` wrong-target claim that nobody had flagged.
-
-**A route table can be live and still wrong.** `q4_q5` had a tuned table nobody read beside a
-hardcoded chain. `w8_pair` k=2048 had a table that *was* read, but whose distinctions did not exist
-on this hardware. So `grep resolve_plan` is necessary and not sufficient — also grep the launchers
-for `NINFER_SM8X_COMPAT`, and confirm in the sweep, where identical schedules print *identical*
-times.
+      The replacement is `scripts/sweeps/dflash2-draft-tokens-realtext.ps1`: the serving path on
+      the model's own generated prose, greedy so each configuration produces identical text and the
+      comparison is speed on the same output. That is what produced the DFlash2 result in §2c.
+      Anything speculative measured through `ninfer_bench` on the committed corpus should be
+      treated as void. The memory columns from such runs remain sound — they are read at load and
+      do not depend on content.
 
 ---
 
