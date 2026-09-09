@@ -26,7 +26,9 @@ runtime planning with `nvfp4 linear_swiglu A16 is registered only through T=16`,
 prompt — sm_86 forces NVFP4 weights onto the A16 route, and the A16 route has no width above 16.
 The only test that reaches it skips unless an env var this file omitted until last cycle is set,
 which is why "126/126" and a completely unusable configuration coexisted. `docs/cli.md` uses an
-NVFP4 artifact as its worked example. See §1.
+NVFP4 artifact as its worked example. **The obvious fix — project then `silu_mul`, as the W4A4
+baseline does — was built, makes the artifact load, and is ~0.8% off because it rounds the
+projection to BF16 before the SiLU; reverted.** See §1.
 
 **The second speedup came from a single-warp kernel nobody had looked at.**
 `sparse_moe_d2_warp_kernel` picks the top 8 of 257 experts in `<<<1, 32>>>` — one warp, one SM of
@@ -493,19 +495,72 @@ parents). The next merge from `neroued/master` will touch the same subsystem.
       "both `groupwise-int` and `nvfp4` artifacts use the same Engine route, including CUDA Graph".
       On sm_86 that is not true of any prompt.
 
-      Three ways out, and they are not equivalent:
+      **The cheap fix was built, measured and reverted — it is ~0.8% off and fails the Op
+      criterion.** Worth recording in full, because it is the fix anyone would reach for first and
+      it does not work.
 
-      1. **Register the NVFP4 A16 route past T=16** in both `nvfp4_linear_swiglu` and
-         `nvfp4_gdn_snapshot`. This is the fix if A16 NVFP4 is meant to work here, and the T=16
-         bound needs reading first — it may exist because the small-T fused kernel is the only one
-         written, in which case this is real kernel work rather than a route-table edit.
-      2. **Reject the artifact at load time with a clear message** if A16 NVFP4 is not intended to
-         be supported on sm_86. Failing in `planning runtime` with a route-registration message is
-         the worst of both worlds; an explicit "NVFP4 weights require sm_89 or newer" at load is
-         honest and costs nothing.
-      3. Either way, **`docs/cli.md` must stop using an NVFP4 artifact as its worked example on a
+      `linear` under `A16Only` already accepts any T (`nvfp4_dispatch.cpp` returns the A16 route
+      unconditionally), so the fused kernel's T=16 bound is a limit on *fusion*, not on the maths.
+      That suggests routing wide A16 exactly as `LinearW4A4Post` already routes wide W4A4: project
+      into a buffer with `linear`, then apply `silu_mul`. Implemented as `LinearA16Post` — about
+      thirty lines, no new kernel, sharing the existing baseline block with the policy threaded
+      through instead of a hardcoded `AllowA4`.
+
+      **It makes the artifact load.** The three-word prompt that previously died in runtime planning
+      ran to completion, and a 98-token prompt prefilled at 28.7 tok/s and decoded at 13.7.
+      `27b_prefix_real` went from exit 1 to exit 0. Two workspace details had to be fixed on the way
+      and both are worth knowing: the A16 linear reports a *zero-byte* requirement, and zero is not
+      representable — `alloc_bytes(0)` throws "arena allocation must be nonzero" and a
+      `WorkspaceArena` over an empty span throws "borrowed DeviceArena storage must be non-empty",
+      so the request has to be floored at one alignment unit the way
+      `variant.cpp`'s `kMinimumLeafWorkspaceBytes` does.
+
+      **And then it fails accuracy at every new width.** `ninfer_linear_swiglu_nvfp4_test` with the
+      A16 cases extended past 16 (`{1, 4, 8, 16, 17, 128, 256, 1024}`):
+
+      ```
+      LinearSwiGLU NVFP4_A16 T=17   eager: reduction criterion failed at index 11 actual=4.59375 reference=4.55671
+      LinearSwiGLU NVFP4_A16 T=128  eager: reduction criterion failed at index 11 actual=4.59375 reference=4.55671
+      LinearSwiGLU NVFP4_A16 T=256  eager: reduction criterion failed at index 11 actual=4.59375 reference=4.55671
+      LinearSwiGLU NVFP4_A16 T=1024 eager: reduction criterion failed at index 11 actual=4.59375 reference=4.55671
+      ```
+
+      T ≤ 16 passes; every width on the new route fails, at the same index, with the same value. That
+      is systematic, not noise, and the cause is structural: **the post route rounds the gate and up
+      projections to BF16 before the SiLU, where the fused kernel keeps them in registers at FP32.**
+      One BF16 rounding of an intermediate is ~0.4% of relative precision and the observed error is
+      0.81%, so this is the design's inherent accuracy, not a coding slip. **Reverted** — a route
+      that cannot pass its own Op criterion is not a fix, and widening the criterion to admit it
+      would be exactly the mistake §4 was written about.
+
+      So the ways out, now with one eliminated by measurement:
+
+      1. ~~Linear-then-`silu_mul` under A16~~ — **built and reverted, ~0.8% error, see above.**
+      2. **An FP32 intermediate.** The correct and fast version of (1): have the projection land in
+         FP32 and apply SiLU from FP32. Blocked on two things that are both real work —
+         `silu_mul` is BF16-only (`src/ops/wrapper/silu_mul.cpp:13` rejects anything else), and the
+         NVFP4 A16 `linear` would have to emit an FP32 output. A fused
+         `silu_mul_f32_to_bf16(gate_f32, up_f32, out_bf16)` plus an FP32 output path is the shape.
+      3. **Chunk the fused A16 kernel over 16-column slices**, the way
+         `w8_pair_splitk_medium_launch` does under `NINFER_SM8X_COMPAT`. Numerics identical to the
+         passing T ≤ 16 path by construction, no new kernel — but it re-reads the whole MLP weight
+         per chunk, so a 1,024-token chunk streams the ~89 MB gate_up 64 times. Correct and
+         unusably slow; mentioned only so nobody proposes it as the easy answer.
+      4. **Reject the artifact at load with a clear message** if A16 NVFP4 is not meant to be
+         supported here. Failing in `planning runtime` with a route-registration string is the worst
+         of both worlds; "NVFP4 weights require sm_89 or newer" at load is honest and costs nothing.
+         This is the right *interim* step regardless of which of (2) is eventually done.
+      5. Either way, **`docs/cli.md` must stop using an NVFP4 artifact as its worked example on a
          page whose own banner is about this fork's sm_86 target**, and the model table in this file
          should say the artifact does not load here.
+
+      **`nvfp4_gdn_snapshot_plan.cpp:40` carries the same T=16 bound and was never reached**, because
+      the SwiGLU throws first. Whichever of (2) or (4) is done must handle it too, or the failure
+      simply moves one Op along.
+
+      One measurement note: the extended A16 cases are the coverage that catches all of this, and
+      they are *not* in the tree — the committed test stops at 16, which is why a route that cannot
+      run on sm_86 at all had a passing Op test. Re-add `{17, 128, 256, 1024}` alongside any fix.
 
       Do not "fix" this by unsetting the env var. That restores 126/126 and re-hides a broken
       shipped configuration, which is how it survived this long.
