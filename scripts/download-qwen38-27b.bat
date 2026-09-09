@@ -48,6 +48,10 @@ if not "!VERIFY_OK!"=="1" (
 )
 
 move /y "%PART%" "%MODEL%" >nul
+if errorlevel 1 (
+  echo Failed to move "%PART%" to "%MODEL%". Delete "%PART%" and run this file again.
+  exit /b 1
+)
 echo Model ready: %MODEL%
 echo Point the tests at it with:  set NINFER_QWEN3_8_27B_WEIGHTS=%MODEL%
 exit /b 0
