@@ -87,6 +87,13 @@ int main(int argc, char** argv) {
         g_server.store(&server);
         std::signal(SIGINT, handle_signal);
         std::signal(SIGTERM, handle_signal);
+#ifdef SIGBREAK
+        // Windows has no way to deliver SIGTERM to another process: TerminateProcess kills it
+        // outright and the shutdown path -- which flushes the final partial throughput interval --
+        // never runs. GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT) is the one graceful stop a parent
+        // can request, and the CRT raises it as SIGBREAK.
+        std::signal(SIGBREAK, handle_signal);
+#endif
 
         serving = true;
         operational_log.server_ready(options.host, options.port, server.public_model_id(),
