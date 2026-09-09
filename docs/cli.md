@@ -176,8 +176,34 @@ For DFlash:
 ```
 
 For Qwen3.8-27B artifacts containing the DFlash2 companion weights, select
-`--spec dflash2 --draft-tokens 7`, optionally with `--lm-head-draft` and `--vision`.
-DFlash2 accepts every draft count from 1 through 15; seven is the checkpoint recommendation.
+`--spec dflash2 --draft-tokens 4`, optionally with `--lm-head-draft` and `--vision`.
+DFlash2 accepts every draft count from 1 through 15. Seven is the checkpoint recommendation and
+what `docs/performance.md` was measured with, but **four is faster on this hardware** — measured
+on the RTX 3090, 27B, INT8 KV, greedy, generating 256 tokens of ordinary prose, mean of three
+runs:
+
+| `--draft-tokens` | decode | vs no speculation |
+|---:|---:|---:|
+| (none) | 37.7 tok/s | — |
+| 1 | 49.7 | +31.7% |
+| 2 | 56.4 | +49.5% |
+| 3 | 58.4 | +54.9% |
+| **4** | **59.1** | **+56.5%** |
+| 5 | 57.2 | +51.5% |
+| 6 | 48.4 | +28.3% |
+| 7 | 48.2 | +27.7% |
+| 8 | 47.6 | +26.2% |
+| 10 | 42.4 | +12.4% |
+| 12 | 40.6 | +7.6% |
+
+Seven costs 18.5% against four. There is a distinct cliff between five and six — 57.2 to 48.4 —
+which looks like a block-geometry boundary rather than an acceptance effect, since acceptance is
+still rising there. `--lm-head-draft` is within noise of unset for DFlash2 at every count and can
+be left off.
+
+For reference on the same measurement, MTP3 with the draft head reaches 62.4 tok/s (+65.3%), so
+MTP remains the faster backend on text — but by 5% at DFlash2's best draft count, not the 36% that
+seven implies.
 Both `groupwise-int` and `nvfp4` artifacts use the same Engine route, including CUDA Graph,
 concurrent requests, sampling penalties, and prefix reuse. An artifact without the companion
 weights reports a missing DFlash2 capability when selected.
