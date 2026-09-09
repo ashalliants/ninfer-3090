@@ -309,33 +309,51 @@ the decode column is the one that surprises, because the smallest formats are no
 
 | KV profile | Bytes/token | KV at 2,048 tokens | Perplexity | vs `bf16` | Decode at 32K depth |
 |---|---:|---:|---:|---:|---:|
-| `bf16` | 65,536 | 128.00 MiB | 4.343225 | — | 32.50 tok/s |
-| `int8` | 33,792 | 66.00 MiB | 4.343263 | +0.0009% | **33.86 tok/s** |
-| `fp8` | 33,024 | 64.50 MiB | 4.347181 | +0.0911% | 30.13 tok/s |
-| `rk8v4` | 26,112 | 51.00 MiB | 4.346811 | +0.0826% | 33.54 tok/s |
-| `k8v4` | 25,728 | 50.25 MiB | 4.347596 | +0.1006% | 28.61 tok/s |
-| `nvfp4` | **18,432** | **36.00 MiB** | 4.358924 | +0.3615% | 29.62 tok/s |
+| `bf16` | 65,536 | 128.00 MiB | 4.342517 | — | 31.93 tok/s |
+| `int8` | 33,792 | 66.00 MiB | 4.342425 | −0.0021% | **33.63 tok/s** |
+| `fp8` | 33,024 | 64.50 MiB | 4.344724 | +0.0508% | 30.34 tok/s |
+| `rk8v4` | 26,112 | 51.00 MiB | 4.346413 | +0.0897% | 33.17 tok/s |
+| `k8v4` | 25,728 | 50.25 MiB | 4.347258 | +0.1092% | 28.90 tok/s |
+| `nvfp4` | **18,432** | **36.00 MiB** | 4.352201 | +0.2229% | 29.86 tok/s |
 
 Perplexity is `ninfer-perplexity` on the fixed `ninfer-ppl-1m-v1` corpus, `--quick`, context/stride
 4096/2048, 261,167 scored tokens — the same corpus and window for every row. Decode is 128 timed
-steps on top of a 32,768-token prefill, no speculation; attention re-reads the whole cache each
-step, so a format's cost only shows at depth.
+steps on top of a 32,768-token prefill, no speculation, and is the **mean of two independent runs**
+because this card is power-capped at 315 W of its 350 W default and the SM clock drifts 1,665–1,755
+MHz with temperature; single runs on the 27B vary by up to 5%. Attention re-reads the whole cache
+each step, so a format's cost only shows at depth.
+
+**These numbers were all re-measured in September 2026 and several moved.** Three of the six
+formats — `fp8`, `nvfp4` and `k8v4` — had their perplexity scored through a data race in the
+quantized attention kernels that corrupted every prefill output column except the last. Greedy
+generation was unaffected, which is why it went unnoticed. With that fixed, `nvfp4` improved by
+0.154% and `fp8` by 0.057%, against a 0.019% drift on the formats the fix did not touch, and all
+three now reproduce bit-identically run to run.
 
 Three of these six are worth using:
 
-- **`int8`** is the default for good reason. Its perplexity cost is +0.0009%, which is nothing, and
-  it has the second-flattest decode curve.
-- **`rk8v4`** is the best all-round choice: 23% smaller than INT8 for +0.08% perplexity, and the
-  flattest decode curve measured (−6.2% from 4K to 32K, against INT8's −6.3%).
+- **`int8`** is the default for good reason. Its perplexity is indistinguishable from `bf16` — the
+  two are within 0.0001 of each other, which is below this harness's own reproducibility — and it
+  has the flattest decode curve on the 27B (−4.8% from 4K to 32K).
+- **`rk8v4`** is the best all-round choice: 23% smaller than INT8 for +0.09% perplexity, the
+  flattest curve on the 35B (−9.5%), and on that model it is also the **fastest** format at every
+  depth measured, ahead of INT8 by about 2%.
 - **`nvfp4`** buys the most context by a wide margin — 45% smaller than INT8. On the 35B with MTP3
   and the draft head, on a machine running a desktop, it is the only format that still reaches the
   full 262,144 native context: `rk8v4` gets to about 231,000 and INT8 to about 179,000 there.
-  Headless, `rk8v4` clears 262,144 as well. It costs about 13% of decode speed at 32K and +0.36%
+  Headless, `rk8v4` clears 262,144 as well. It costs about 16% of decode speed at 32K and +0.22%
   perplexity.
 
-`fp8` and `k8v4` have no niche. `fp8` is larger, slower at depth *and* worse quality than `rk8v4`;
-`k8v4` is within 1.5% of `rk8v4`'s size but has the worst decode falloff of any format measured
-(−17.9% on the 27B, −25.2% on the 35B) and slightly worse perplexity.
+`fp8` and `k8v4` are still hard to recommend, but the reason has changed and it is worth stating
+precisely rather than as "no niche".
+
+- **`fp8` is no longer dominated on all three axes.** It now has *better* perplexity than `rk8v4`
+  — 4.344724 against 4.346413, a real and reproducible 0.039% — which was not true before the race
+  was fixed. What that edge costs is 26% more KV memory per token and 8.5% of decode speed at 32K
+  depth. A genuine trade, and a bad one for almost everyone, but a trade rather than a strict loss.
+- **`k8v4` is dominated.** It is 1.5% smaller than `rk8v4` and pays for it with 13% less decode
+  speed at depth, the worst falloff of any format on the 35B (−25.9%), and slightly worse
+  perplexity. There is no configuration in which that 1.5% is worth it.
 
 Per-format numbers for the 35B, plus a fit calculator that solves for context and memory, are in
 [`docs/config-calculator.html`](docs/config-calculator.html).

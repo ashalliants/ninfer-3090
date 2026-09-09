@@ -104,8 +104,9 @@ boundary from 171,648 to 226,560 tokens at 1 GiB headroom, for 5.51 GiB of KV ag
 5.40 GiB.
 
 Since the port onto the `kv_cache_append` Op, that context gain has a measured quality cost of
-**+0.082% perplexity** (`ninfer-perplexity`, `ninfer-ppl-1m-v1` quick, 261,167 scored tokens:
-4.343263 on INT8 against 4.346811 on rk8v4). Values are not rotated, so there is no
+**+0.092% perplexity** (`ninfer-perplexity`, `ninfer-ppl-1m-v1` quick, 261,167 scored tokens:
+4.342425 on INT8 against 4.346413 on rk8v4; both re-measured September 2026 and both
+bit-reproducible run to run). Values are not rotated, so there is no
 inverse-rotation pass over the attention output. Values do use a finer group than keys, 32 against
 64, which halved that penalty from +0.146% at no cost in context.
 
