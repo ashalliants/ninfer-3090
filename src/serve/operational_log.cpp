@@ -463,11 +463,15 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                   product::format_pretty_bytes(memory.available_after_startup_bytes));
 
     if (cache.enabled) {
+        // Report what was actually pinned, not what was requested: on Windows the host KV cache
+        // is clamped against free VRAM at startup (program_impl.h), and can land at zero while
+        // `cache.host_kv_capacity_bytes` still holds the pre-clamp --host-kv-mib target. The
+        // memory summary is captured after that clamp runs, so it carries the true figure.
         logger_->info(
             "context cache | {} active + {} cached device states | host {} states, {} KV | "
             "private {} | shared {} | anchors {}",
             engine.max_concurrency, *cache.device_state_slots, cache.host_state_slots,
-            product::format_pretty_bytes(cache.host_kv_capacity_bytes),
+            product::format_pretty_bytes(memory.host_kv_capacity_bytes),
             *cache.max_private_continuations, *cache.max_shared_prefixes,
             *cache.max_long_anchors_per_continuation);
     } else {

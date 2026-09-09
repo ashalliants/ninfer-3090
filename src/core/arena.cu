@@ -406,6 +406,17 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
         throw std::runtime_error(cuda_error_message(prefix.c_str(), err));
     }
 
+    // The pending error read above is now gone for good -- `cudaGetLastError()` clears it, and
+    // nothing else has seen it since. A successful pin does not mean it never mattered: it means
+    // an earlier, unrelated CUDA call failed and nobody checked. Report it rather than let it
+    // disappear silently.
+    if (pending != cudaSuccess) {
+        std::fprintf(stderr,
+                      "ninfer: pinning %zu bytes of host memory succeeded, but cleared an "
+                      "unretrieved earlier CUDA error: %s: %s\n",
+                      size_bytes, cudaGetErrorName(pending), cudaGetErrorString(pending));
+    }
+
     data_ = ptr;
     size_ = size_bytes;
 }

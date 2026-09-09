@@ -2,6 +2,7 @@
 #include "targets/qwen3_6/impl/runtime/program.h"
 #include "targets/qwen3_6/impl/runtime/rebuild_work.h"
 
+#include "core/host_kv_clamp.h"
 #include "core/nvtx.h"
 #include "core/startup.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
@@ -1016,24 +1017,20 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         // device pages alone rather than the server failing to start.
         std::size_t reserved_bytes = plan.context_cache.host_kv_capacity_bytes;
 #if defined(_WIN32)
+        // Two terms, both learned the hard way. The 1 GiB floor (inside
+        // clamp_host_kv_reservation_bytes) is memory the run still needs after this point and
+        // that no plan accounts for: module loads, graph instantiation and the local-memory
+        // backing a launch requires. Clamping only to "free minus a few hundred MiB" got startup
+        // past the pin and then failed at the first kernel launch with
+        // `cudaErrorMemoryAllocation` from `cudaGetLastError`, which is a far worse failure than
+        // not starting.
+        //
+        // Halving what remains is the conservative split when the requirement on the other side
+        // is not known precisely: the cache never takes more headroom than it leaves.
         std::size_t free_device = 0, total_device = 0;
         if (cudaMemGetInfo(&free_device, &total_device) == cudaSuccess) {
-            // Two terms, both learned the hard way. The 1 GiB floor is memory the run still needs
-            // after this point and that no plan accounts for: module loads, graph instantiation
-            // and the local-memory backing a launch requires. Clamping only to "free minus a few
-            // hundred MiB" got startup past the pin and then failed at the first kernel launch
-            // with `cudaErrorMemoryAllocation` from `cudaGetLastError`, which is a far worse
-            // failure than not starting.
-            //
-            // Halving what remains is the conservative split when the requirement on the other
-            // side is not known precisely: the cache never takes more headroom than it leaves.
-            constexpr std::size_t kPinnedHostReserveBytes = 1ULL << 30;
-            const std::size_t budget =
-                free_device > kPinnedHostReserveBytes ? (free_device - kPinnedHostReserveBytes) / 2
-                                                      : 0;
-            if (reserved_bytes > budget) {
-                reserved_bytes = budget - (budget % minimum_stride);
-            }
+            reserved_bytes =
+                clamp_host_kv_reservation_bytes(reserved_bytes, free_device, minimum_stride);
         }
 #endif
 
