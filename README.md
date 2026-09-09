@@ -602,7 +602,8 @@ The server supports:
 See [HTTP serving](docs/serving.md) and [CLI usage](docs/cli.md).
 
 Qwen3.8-27B artifacts carrying the DFlash2 companion weights support
-`--spec dflash2 --draft-tokens 7`, with draft counts 1..15 and either full or optimized
+`--spec dflash2 --draft-tokens 4` (see [CLI usage](docs/cli.md) for why four rather than seven),
+with draft counts 1..15 and either full or optimized
 proposal heads. **DFlash2 runs with `--vision`**, verified on a 3090 against the committed
 `image_chart` fixture: target verification carries its own continuation RoPE position, so a
 multimodal row keeps its per-sequence `rope_delta` through verification rather than being

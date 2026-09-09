@@ -19,8 +19,12 @@
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\sweeps\dflash2-draft-tokens-realtext.ps1
 #
-# About 25 minutes. Greedy, so each configuration generates the same text and the comparison is of
-# speed on identical output rather than of two different continuations.
+# About 25 minutes. Greedy at every configuration, which is necessary but not sufficient for the
+# comparison to be of speed on identical output: TODO.md records DFlash2 and MTP producing
+# byte-identical output *to each other*, and both diverging from the width-1 greedy path within the
+# first hundred tokens -- squarely inside this sweep's --max-new 256 window. So this does not
+# assume identical output; it hashes each run's generated text (content_sha256 below) and leaves the
+# comparison to whoever reads the CSV, rather than asserting a thing that has been measured false.
 $ErrorActionPreference = 'Continue'
 Set-Location (Resolve-Path (Join-Path $PSScriptRoot '..\..'))
 
@@ -46,18 +50,24 @@ foreach ($n in 1,2,3,4,5,6,7,8,10,12) {
 $configs += @{ label='mtp3';      args=@('--spec','mtp','--draft-tokens','3') }
 $configs += @{ label='mtp3+head'; args=@('--spec','mtp','--draft-tokens','3','--lm-head-draft') }
 
-"config,rep,decode_tok_s,generated_tokens"
+"config,rep,decode_tok_s,generated_tokens,content_sha256"
 foreach ($c in $configs) {
   for ($rep = 1; $rep -le 3; $rep++) {
-    $log = "$out\rt_$($c.label -replace '\+','p')_$rep.log"
+    $stem = "$out\rt_$($c.label -replace '\+','p')_$rep"
+    $log  = "$stem.err.log"
+    $text = "$stem.txt"
     $argv = @($weights,'--prompt',$prompt,'--max-new','256','--max-context','8192',
               '--kv-dtype','int8','--greedy','--no-thinking') + $c.args
-    & .\build-ninja\apps\ninfer.exe @argv > $log 2>&1
-    if ($LASTEXITCODE -ne 0) { "$($c.label),$rep,FAILED,"; Get-Content $log -Tail 2 | ForEach-Object { "    $_" }; continue }
-    $txt = Get-Content $log -Raw
-    $dec = if ($txt -match 'decode speed\s+([\d.]+) tok/s') { $Matches[1] } else { '' }
-    $gen = if ($txt -match 'generated tokens\s+(\d+)')      { $Matches[1] } else { '' }
-    "$($c.label),$rep,$dec,$gen"
+    # apps/cli/main.cpp writes generated text to stdout and every stage/summary line (including
+    # decode_tok_s and generated_tokens below) to stderr -- captured separately so $text is exactly
+    # the model's output and can be hashed, rather than the merged stream this used to read.
+    & .\build-ninja\apps\ninfer.exe @argv > $text 2> $log
+    if ($LASTEXITCODE -ne 0) { "$($c.label),$rep,FAILED,,"; Get-Content $log -Tail 2 | ForEach-Object { "    $_" }; continue }
+    $txt  = Get-Content $log -Raw
+    $dec  = if ($txt -match 'decode speed\s+([\d.]+) tok/s') { $Matches[1] } else { '' }
+    $gen  = if ($txt -match 'generated tokens\s+(\d+)')      { $Matches[1] } else { '' }
+    $hash = (Get-FileHash $text -Algorithm SHA256).Hash
+    "$($c.label),$rep,$dec,$gen,$hash"
   }
 }
 "== done =="
