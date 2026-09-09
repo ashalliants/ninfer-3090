@@ -25,8 +25,8 @@
 #
 # Two things about this box that can invalidate a run, both hit while writing this script:
 #   * vmmemWSL can hold 27 GiB of the 64 GiB of host RAM, and the 35B artifact is 22.8 GB. Under
-#     that pressure the machine pages and the numbers are noise. Check free RAM first; the script
-#     refuses below 24 GiB.
+#     that pressure the machine pages and the numbers are noise. Guarded by host-memory.ps1, which
+#     refuses below the artifact's size plus headroom -- 24.0 GiB for this 35B.
 #   * the card drifts 3-5% between processes, and each ratio here is a separate process. Five
 #     ratios spread over an hour is exactly the shape that drift corrupts, so the sweep repeats the
 #     7/4 baseline as its LAST point as well as measuring it in sequence -- if the two 7/4 readings
@@ -35,6 +35,7 @@ $ErrorActionPreference = 'Continue'
 Set-Location (Resolve-Path (Join-Path $PSScriptRoot '..\..'))
 
 . "$PSScriptRoot\model-dir.ps1"
+. "$PSScriptRoot\host-memory.ps1"
 $modelDir = Get-NInferModelDir
 $out      = if ($env:NINFER_SWEEP_OUT) { $env:NINFER_SWEEP_OUT } else { 'profiles\sweeps' }
 $bench    = '.\build-ninja\bench\ninfer_bench.exe'
@@ -43,13 +44,11 @@ $source   = 'src\ops\sparse_moe\prefill\sparse_moe_prefill_kernels.cu'
 New-Item -ItemType Directory -Force -Path $out | Out-Null
 foreach ($p in @($bench, $model, $source)) { if (-not (Test-Path $p)) { throw "missing: $p" } }
 
-$os = Get-CimInstance Win32_OperatingSystem
-$freeGiB = $os.FreePhysicalMemory / 1MB
-"# host RAM free: {0:N1} GiB" -f $freeGiB
-if ($freeGiB -lt 24) {
-  # -f binds tighter than +, so the format must be applied to the whole string, not the last piece.
-  throw ("only {0:N1} GiB of host RAM free; the 35B artifact is 22.8 GB and this run will page. Check vmmemWSL (wsl --shutdown reclaims it) and retry." -f $freeGiB)
-}
+# This was the only sweep here with a memory guard, and it is now the shared one -- every other
+# script in this directory grew the same check. host-memory.ps1 sizes the requirement from the
+# artifact instead of hardcoding 24 GiB, which comes out at exactly 24.0 GiB for this 35B and so
+# reproduces the threshold this script used to carry inline.
+Assert-NInferHostMemory -Artifacts @($model)
 
 $original = Get-Content $source -Raw
 # 7/4 appears twice: once in sequence, once repeated at the end as the drift control.

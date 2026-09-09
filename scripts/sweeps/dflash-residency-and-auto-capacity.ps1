@@ -6,9 +6,16 @@ Set-Location (Resolve-Path (Join-Path $PSScriptRoot '..\..'))
 # Both overridable so this is not welded to one machine. The output directory is created here
 # because it does not exist in a clean checkout -- profiles/ is gitignored.
 . "$PSScriptRoot\model-dir.ps1"
+. "$PSScriptRoot\host-memory.ps1"
 $modelDir = Get-NInferModelDir
 $out      = if ($env:NINFER_SWEEP_OUT) { $env:NINFER_SWEEP_OUT } else { 'profiles\sweeps' }
 New-Item -ItemType Directory -Force -Path $out | Out-Null
+# Host memory pressure produces plausible numbers rather than an error, so it is guarded
+# rather than trusted -- see host-memory.ps1 for what goes wrong and why.
+Assert-NInferHostMemory -Artifacts @(
+    "$modelDir\qwen3_8_27b.ninfer",
+    "$modelDir\qwen3_6_35b_a3b.ninfer",
+    "$modelDir\qwen3_6_35b_a3b_v1_no_dflash.ninfer")
 
 $mdir = $modelDir
 

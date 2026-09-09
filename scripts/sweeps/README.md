@@ -37,7 +37,7 @@ about three hours for twelve model/format combinations.
 | `decode-roofline.ps1` | What fraction of the card's 936.2 GB/s does decode reach? | instant |
 | `decode-step-profile.ps1` | Where does a decode step's time go -- occupancy, launch gaps, or bandwidth? | a few min |
 | `power-and-clocks.ps1` | Does the 315 W cap bound these numbers? | a few min |
-| `admin-profile.ps1` | Everything needing an elevated shell: `ncu` counters, and what 350 W buys | a few min |
+| `admin-profile.ps1` | Everything needing an elevated shell: `ncu` counters, and what 350 W buys | ~40 min |
 | `vision-encode-throughput.ps1` | What does Vision cost in time, and what does overlay residency cost? | 20 min |
 | `moe-prefill-pipeline-depth.ps1` | Where does the routed prefill Spread/Packed crossing sit on this card? | 70 min |
 
@@ -63,6 +63,39 @@ are refused outright. Running elevated satisfies the counter permission without 
 rather than an instruction to reconfigure the driver. It changes the power limit and clock lock and
 restores both in a `finally` block, including on Ctrl+C; pass `-SkipPower` to leave the power limit
 alone entirely.
+
+It runs six sections. Two of them profile the **schedule benches** rather than the product, and that
+is deliberate: those benches allocate their own weights and never open an artifact, so there is no
+model load per replay pass, every schedule of the Op runs in one process at one width, and the fast
+and slow tiles are therefore profiled under identical conditions in the same run. That is the
+comparison the narrow-extent weight-streaming question needs, and it costs seconds rather than the
+tens of minutes the product sections cost.
+
+**It defaults to `--replay-mode application`, and you should leave it there on this box.** `ncu`'s
+default kernel replay saves and restores the device memory a kernel could touch. With 21 GB of
+weights resident there is no room on the card, so it spills that backup to *host* RAM — around
+42 GB alongside the artifact's own footprint, which does not fit beside `vmmemWSL`. When it does not
+fit, the run dies with
+
+```
+==WARNING== Backing up device memory in system memory. Kernel replay might be slow.
+==ERROR== Unhandled C++ exception: bad allocation
+==ERROR== Failed to profile "sparse_moe_d1_kernel"
+```
+
+and an otherwise **empty report**, which reads like an `ncu` bug and is not one. Application replay
+re-runs the whole application once per pass and needs no backup at all. The cost is that each pass
+reloads the artifact — about 31 s for the 35B — so a seven-section capture is twenty-odd passes and
+takes half an hour. `-ReplayMode kernel` is there for a model small enough that the backup fits on
+the card, and for the schedule benches, which allocate almost nothing.
+
+Every script here now calls `Assert-NInferHostMemory` from `host-memory.ps1` before it starts. Host
+memory pressure does not fail a run, it makes it *page*, and a paging run prints plausible numbers
+rather than an error — which is how one pipeline-depth sweep was completed and thrown away.
+`vmmemWSL` alone can hold 27 GiB of this box's 64 GiB, and `wsl --shutdown` reclaims it. The
+requirement is sized from the artifact (19.8 GiB for the 27B, 24.0 for anything touching the 35B,
+28.0 for `admin-profile.ps1`, which holds more than a plain bench run does), so a 27B-only sweep is
+not refused at a level that would only trouble the 35B. `NINFER_SKIP_MEMORY_GUARD=1` overrides it.
 
 `power-and-clocks.ps1` needs neither a model sweep nor `nsys`, only `nvidia-smi`: it samples power,
 clocks and throttle reasons through one decode and one prefill. The answer as of 2026-09-09 is that
