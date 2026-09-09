@@ -497,18 +497,39 @@ roofline finally acquired a denominator; read them before the rest.
       (`decode-step-profile.ps1` and the `scripts/sweeps/*.ps1` sweeps are all decode-only). Do not
       guess a replacement constant without that measurement.
 
-- [ ] **Eight lanes buy 3.2x, not 8x, and the reason is unestablished.** README's own cohort table
-      has C1 decode at 78.71 tok/s against C8 at 250.26. Batched decode amortises the weight read
-      across the whole cohort — the same bytes serve every lane in a round — so a weight-bound
-      decode should scale much closer to linearly until compute takes over. Somewhere between one
-      lane and eight, something other than weight bandwidth becomes the limit, and no document says
-      what. Worth knowing: C8 is the profile the 27B release recommends for multi-user serving.
+- [ ] **Eight lanes buy 3.6x, not 8x, and the cost is 4.7 ms per added row.** Measured 2026-09-09
+      on the 27B, int8 KV, no speculation, `--decode-tokens 512 --max-context 8192`, via
+      `tools/bench/run_serve_concurrency.py --suite decode-saturation`:
 
-      Careful with those particular numbers, though: they are end-to-end with MTP3 enabled, so
-      tokens per round is roughly `1 + 3 x acceptance` rather than 1, and dividing them into a
-      bandwidth figure gives nonsense (144% of peak at C1, doing it naively). The comparison needs
-      re-measuring without speculation before it can be reasoned about — `ninfer_bench` can do that
-      directly and the cohort table cannot.
+      | C | tok/s | vs C1 | batch | ms/round |
+      |---|---|---|---|---|
+      | 1 | 36.8 | 1.00x | 1.00 | 27.20 |
+      | 2 | 61.1 | 1.66x | 2.00 | 32.73 |
+      | 4 | 101.0 | 2.75x | 4.00 | 39.61 |
+      | 8 | 132.9 | 3.62x | 8.00 | 60.18 |
+
+      Batching itself is working: `batch` is exactly C at every point and `row_rounds = C x rounds`,
+      so one round serves the whole cohort and the 15.9 GiB weight read is amortised across it
+      exactly as intended. The scaling loss is entirely in what a round costs. Against the 20.0 ms
+      weight-bandwidth floor (15.9 GiB at the measured 854.2 GB/s), a C1 round spends 7.2 ms on
+      everything that is not the weight read — and **each additional row adds 4.7 ms, which is 65%
+      of that entire non-weight budget.** Per-row work is barely being amortised at all. If it were
+      free the round would stay at 27.20 ms and C8 would reach 294 tok/s; it reaches 45% of that.
+
+      So the open question is much narrower than "why isn't it linear": what costs 4.7 ms per row
+      in a round that reads its weights once? The cohort is shallow here (~850 tokens, int8 KV), so
+      KV traffic is far too small to explain it, and host time stayed at 0.3-0.5%. Candidates in
+      order of suspicion: the int8 decode GEMMs going from M=1 to M=8 against a tiling chosen for
+      GEMV, and per-row attention work outside the amortised path. Both are answerable with
+      `NINFER_OP_REPORT_STATS=1` at C1 and C8 and a subtraction, which is the next step.
+
+      The numbers this entry used to quote (C1 78.71 vs C8 250.26 tok/s) came from README's cohort
+      table, which is end-to-end **with MTP3 enabled** — tokens per round is roughly
+      `1 + 3 x acceptance` rather than 1, so dividing them into a bandwidth figure gives nonsense
+      (144% of peak at C1, done naively). It also claimed `ninfer_bench` could re-measure this
+      directly. It cannot: `ninfer_bench` has no concurrency option at all. The serving harness
+      above is the only path, and reaching it needed the Windows shutdown fix in #70 — the campaign
+      aborted on a throughput/`request_done` reconciliation that was correct and unmeetable.
 
 - [x] **Prefill has no roofline either.** It has one now (2026-09-09), and the naive version of it
       is a trap worth documenting.
@@ -714,17 +735,36 @@ ceiling, and neither has had any optimisation attempted.
       Closing even half the gap between the expert kernels and the contiguous ones is worth
       roughly 15-20% on the recommended model. Nothing here has been tried.
 
-- [ ] **Prefill's MLP GEMMs run at ~30% of the card's INT8 tensor-core rate.** Measured (#53 plus
-      `tools/tensor_core_rate_probe.cu`): `q4a8_swiglu` reaches 97.4 T/s and `q5a8_add` 89.4 T/s
-      against a measured 314.8 TOPS INT8 ceiling, while the BF16 GDN projections reach 51-54% of
-      the measured 67.6 TFLOPS BF16 ceiling. A well-tuned large GEMM on Ampere usually reaches
-      60-80% of a pure-MMA microbenchmark.
+- [ ] **Prefill's MLP GEMMs run at ~30% of the card's INT8 tensor-core rate**, and the obvious
+      excuse for that has been measured and ruled out.
 
-      One caveat before anyone chases it: these are 1,024-token prefill chunks against GEMM
-      dimensions of 34,816 x 5,120, which is skinny. **Sweep `--prefill-chunk` against this ceiling
-      first** — the percentage may be mostly a tile-shape artifact, and that is a cheap thing to
-      find out before touching a kernel. The MLP GEMMs are 68% of prefill FLOPs, so if the gap is
-      real it is worth more than anything in decode.
+      Measured (#53 plus `tools/tensor_core_rate_probe.cu`): `q4a8_swiglu` reaches 97.4 T/s and
+      `q5a8_add` 89.4 T/s against a measured **314.8 TOPS** INT8 ceiling, while the BF16 GDN
+      projections reach 51-54% of the measured **67.6 TFLOPS** BF16 ceiling. A well-tuned large
+      GEMM on Ampere usually reaches 60-80% of a pure-MMA microbenchmark.
+
+      **It is not a skinny-tile artifact.** The worry was that 1,024-token chunks against GEMM
+      dimensions of 34,816 x 5,120 are too narrow to fill the MMA pipeline, so the percentage would
+      improve with a bigger chunk. Swept on the 27B, int8 KV, an 8,192-token prompt, three
+      repetitions each:
+
+      | `--prefill-chunk` | prefill tok/s | vs 1,024 |
+      |---:|---:|---:|
+      | 256 | 1,139.7 | −6.9% |
+      | 512 | 1,192.1 | −2.7% |
+      | 1,024 (default) | 1,224.5 | — |
+      | 2,048 | 1,234.9 | +0.8% |
+      | 4,096 | 1,237.0 | +1.0% |
+
+      Throughput **plateaus by 2,048**, and quadrupling the chunk from the default buys 1.0%.
+      Nothing there closes a gap from 30% to 60-80%, so the shortfall is in the kernels and they
+      are the target. The MLP pair is 68% of prefill FLOPs, which makes this the largest
+      compute-side opportunity in the file.
+
+      Two small things fall out. The default chunk of 1,024 is 1.0% off the plateau, so 2,048 is
+      free throughput *if* the extra workspace is affordable — worth checking against the memory
+      model in `docs/config-calculator.html` before changing a default. And 256 costs 6.9%, which
+      is worth knowing for anyone tempted to shrink the chunk to save memory.
 
 - [ ] **DFlash2 has a cliff between five and six draft tokens**, 57.2 to 48.4 tok/s (#65), a 15%
       drop where acceptance is still rising. Seven through twelve continue to degrade. It looks
