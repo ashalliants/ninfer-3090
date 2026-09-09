@@ -797,39 +797,58 @@ ceiling, and neither has had any optimisation attempted.
       d4**, with only 1.1-1.6 eligible warps per scheduler against 8-10 resident. Warps are there
       and stalled, not absent.
 
-      **The binding constraint is registers, and the arithmetic is small.** Both kernels report
-      `Block Limit Registers = 5` against a shared-memory limit of 12 and 7 — so registers, not
-      shared memory, is what caps blocks per SM. At 288 threads per block:
+      **The binding constraint is the 9-warp block, and it is structural.** `Block Limit Warps` is
+      **also 5** — the same as `Block Limit Registers` — so registers are tied with the warp limit,
+      not binding beyond it, and cutting them buys nothing on its own. sm_86 allows 48 warps per
+      SM; a 9-warp block gives `48 / 9 = 5` blocks and 45 resident warps, which is exactly the
+      93.75% theoretical the counters report.
 
-      | registers/thread | registers/block | blocks/SM |
-      |---|---|---|
-      | 40 (d4 today) | 11,520 | 5 |
-      | 36 (d3 today) | 10,368 | 6 |
-      | 32 | 9,216 | 7 |
-      | 28 | 8,064 | 8 |
+      Nine warps is not a tuning choice. In both kernels warps 0..7 each take one of the top-8
+      routed experts through `RoutedCodec`, and **warp 8 takes the shared expert** through
+      `W8Codec` — `kTopK + 1`. Eight warps would have nowhere to put the shared expert. So the
+      6.25% of theoretical occupancy lost to 45-of-48 warps is the price of top-8-plus-shared, and
+      it is the small part anyway.
 
-      Getting d3 to 32 and d4 to 32 would take both from 5 blocks to 7 — **+40% more warps resident
-      to hide the same latency**, without touching the algorithm. That is a `__launch_bounds__` and
-      register-pressure exercise, which is the cheapest thing on this list and should be tried
-      first.
+      **What actually costs d3 is the wave tail, and the arithmetic matches to within 2 points.**
+      512 blocks (one per `kIntermediate` column) over 82 SMs at 5 blocks each is 410 slots: one
+      full wave of 410, then a second wave only 102 blocks deep, i.e. **25% full**. Average
+      occupancy across the two waves is `(410 + 102) / (2 x 410) = 62.4%` against a measured
+      **60.16%**. d3's occupancy shortfall is that tail and essentially nothing else. d4 launches
+      2,048 blocks (5.00 waves), where a tail of the same absolute size is a fifth as costly, and it
+      duly reaches 78.91%.
 
-      **d3 has a second, independent problem: 1.25 waves per SM.** 512 blocks against 82 SMs at 5
-      blocks each is 410 block slots, so the grid fills the machine once and the *tail wave is a
-      quarter full*. d4 runs 2,048 blocks (5.00 waves) and is correspondingly healthier on every
-      occupancy metric. Splitting d3's work into more, smaller blocks would remove the tail; this is
-      separate from the register question and both apply.
+      **And there is a load imbalance inside the block that the source already names.** The shared
+      W8 path is heavier than a routed Q4 path, but the block cannot retire until all nine warps
+      finish, so eight completed routed warps sit holding registers and warp slots while warp 8
+      drains. That is the 44.6% / 58.6% "no eligible warp" directly, and it is not a guess:
+      `sparse_moe_d3_path_tiled_kernel` in the same file exists for this reason and says so —
+      *"Three path CTAs per token/output row expose enough blocks for the 170-SM target and keep the
+      heavier shared W8 path from holding eight completed routed warps resident."* That kernel is
+      written for the multi-token path and takes a `tokens` argument; single-token decode does not
+      use it.
 
-      **One more thing the counters exposed: over-fetch.** ncu measured 12.12 MB of DRAM traffic on
-      d3 and 12.27 MB on d4, where #50's artifact inventory attributes **8.91 MB** and **5.58 MB**
-      of useful weight bytes — 1.36x and **2.20x**. Some of that is sector granularity on a gather
-      that lands on 8 scattered blocks, and it means the effective bandwidth figures above flatter
-      the kernels: d4 moves 2.2x the bytes it needs. Worth confirming with
-      `dram__bytes_read.sum` directly before optimising against it, since the byte attribution and
-      the ncu run are different measurements.
+      So the order to try things, revised:
+
+      1. **Give d3 a grid that tiles 82 SMs.** Its 512 blocks are `kIntermediate`, a power of two,
+         and 410 slots is not — any power-of-two block count tiles 82 badly. This is the largest
+         single effect on the list and it is a launch-geometry change, not a kernel rewrite.
+      2. **Split the shared path out of the block**, along the lines `path_tiled` already takes, so
+         the routed warps are not held by the W8 warp. `PathsPerBlock` there is constrained to
+         divide `kTopK + 1 = 9`, so 3 is the natural choice: 3-warp blocks give 16 blocks per SM and
+         100% theoretical occupancy, and the shared path stops gating eight finished warps.
+      3. **Over-fetch.** ncu measured 12.12 MB of DRAM traffic on d3 and 12.27 MB on d4 where #50's
+         artifact inventory attributes **8.91 MB** and **5.58 MB** of useful weight bytes — 1.36x
+         and **2.20x**. Confirm with `dram__bytes_read.sum` before optimising against it, since the
+         attribution and the ncu run are separate measurements.
+
+      Registers are *not* on that list, which is the correction: an earlier draft of this entry
+      claimed `Block Limit Registers = 5` was the constraint and that 32 registers per thread would
+      give 7 blocks per SM. At 288 threads it would give 7 by the register rule, but the warp rule
+      still caps it at 5, so the change would measure as exactly nothing. Read both limits before
+      believing either.
 
       Closing even half the gap to the contiguous kernels is still worth roughly 15-20% on the
-      recommended model. The order to try things is now: registers, then d3's wave tail, then the
-      over-fetch.
+      recommended model, and nothing here has been attempted yet.
 
       Not yet collected: the contiguous-kernel reference from the same elevated run.
       `admin-profile.ps1` passed `-k 'regex:a|b'` and PowerShell parsed the `|` as a pipe, so that
