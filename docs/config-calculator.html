@@ -426,15 +426,23 @@
     expert offload are all out of scope here &mdash; see <code>docs/performance.md</code>.
   </p>
   <p>
-    <strong>Speculative-mode startup memory is an undercount, not just an approximation</strong>
-    (tracked in <code>TODO.md</code>). The "Startup memory" total above only adds the extra
-    resident weights measured for each speculation option; it reuses the no-speculation CUDA graph
-    allowance and adds no extra KV pages for either backend. The real engine sizes the graph
-    allowance per backend and draft window and can need tens of MiB more per lane for MTP or
-    DFlash than the flat figure used here, and MTP separately reserves extra paged-KV pages for
-    buffered draft tokens. The engine-cross-check above is for <code>--spec</code> unset; it does
-    not validate a speculative configuration. Leave headroom, or verify empirically, before relying
-    on a speculative "Fits" verdict close to the edge.
+    <strong>Speculative modes are now modelled per mode, and cross-checked against the engine.</strong>
+    Every term — resident weights, CUDA graph allowance, the fixed and per-token parts of the
+    non-KV sequence block, and the extra cache each backend reserves — is measured separately for
+    each speculation option by <code>scripts/sweeps/speculative-memory-terms.ps1</code>. Two
+    configurations are pinned against the engine's own refusal arithmetic: MTP3 with the draft head
+    on the 27B at a 262,144-token context agrees to 0.044%, and DFlash-3 on the 35B agrees
+    <em>exactly</em>. Before this, the page reused the 12 MiB no-speculation graph allowance and
+    added no extra cache for any mode, which understated that DFlash-3 case by 1,289 MiB.
+  </p>
+  <p>
+    The two backends behave differently and the page reflects that. MTP buffers extra draft tokens
+    in the KV format, so its cost is a multiplier — +6.30% per token on the 27B, +10.08% on the
+    35B — identical across storage formats. DFlash v1 instead reserves a fixed 4,096 bytes per
+    token regardless of format, which as a ratio would read as +38.8% on <code>int8</code> and
+    +71.1% on <code>nvfp4</code>. DFlash2 costs nothing per token and pays entirely in a graph
+    allowance that is itself context-dependent: 288 MiB up to 8,192 tokens and 384 MiB beyond,
+    against 12 MiB with speculation off.
   </p>
   <p>
     <strong>Weight profile.</strong> Every model here is measured against the one
@@ -464,10 +472,6 @@
 /* Every number below is measured; see the method notes in the page body. Bytes are bytes. */
 const DATA = {
   cardMiB: 24576,
-  graphBytes: 12582912,
-  /* Measured: the non-KV sequence block also carries 1/16 byte per token on both models. Tiny,
-     but it is what makes the fixed constants above reproduce every measurement exactly. */
-  seqPerToken: 0.0625,
 
   models: {
     "27b": {
@@ -482,7 +486,6 @@ const DATA = {
       /* Non-KV sequence state, = sequence capacity - KV payload. Measured at four context lengths:
          it is a fixed block plus 1/16 byte per token, not a per-token cost. Solved exactly from
          8k/16k/32k/64k, which reproduce all four measurements to the byte. */
-      seqFixedBytes: 166438656,
       /* KV payload bytes per token, = kv_payload_bytes / max_context. */
       kv: { bf16: 65536, int8: 33792, fp8: 33024, rk8v4: 26112, k8v4: 25728, nvfp4: 18432 },
       /* decode tok/s, no speculation, at these cache depths */
@@ -500,11 +503,11 @@ const DATA = {
         nvfp4: [35.37, 32.78, 29.86]
       },
       spec: {
-        none:          { label: "None",                weightsGiB: 15.92, decode: 34.41, accept: null },
-        mtp3:          { label: "MTP, 3 draft tokens", weightsGiB: 16.34, decode: 39.90, accept: null },
-        "mtp3+head":   { label: "MTP3 + draft head",   weightsGiB: 16.67, decode: 42.33, accept: 0.302 },
-        "dflash2-7":   { label: "DFlash2, 7 tokens",   weightsGiB: 17.99, decode: 27.57, accept: 0.108 },
-        "dflash2-7+head": { label: "DFlash2-7 + draft head", weightsGiB: 18.33, decode: 28.33, accept: null }
+        none:          { label: "None",                weightsGiB: 15.92, decode: 34.41, accept: null, graphBytes: 12582912, seqFixedBytes: 166438656, seqPerToken: 0.0625, kvRatio: 1, kvExtraPerToken: 0 },
+        mtp3:          { label: "MTP, 3 draft tokens", weightsGiB: 16.34, decode: 39.90, accept: null, graphBytes: 90177536, seqFixedBytes: 175693056, seqPerToken: 0.125, kvRatio: 1.062988281, kvExtraPerToken: 0 },
+        "mtp3+head":   { label: "MTP3 + draft head",   weightsGiB: 16.67, decode: 42.33, accept: 0.302, graphBytes: 90177536, seqFixedBytes: 175693056, seqPerToken: 0.125, kvRatio: 1.062988281, kvExtraPerToken: 0 },
+        "dflash2-7":   { label: "DFlash2, 7 tokens",   weightsGiB: 17.99, decode: 27.57, accept: 0.108, graphBytes: [[8192, 301989888], [Infinity, 402653184]], seqFixedBytes: 279090432, seqPerToken: 0.0625, kvRatio: 1, kvExtraPerToken: 0 },
+        "dflash2-7+head": { label: "DFlash2-7 + draft head", weightsGiB: 18.33, decode: 28.33, accept: null, graphBytes: [[8192, 301989888], [Infinity, 402653184]], seqFixedBytes: 279090432, seqPerToken: 0.0625, kvRatio: 1, kvExtraPerToken: 0 }
       }
     },
     "35b": {
@@ -514,7 +517,6 @@ const DATA = {
       weightsBytes: 21038469632,
       workspaceBytes: 109453312,
       nativeMaxContext: 262144,
-      seqFixedBytes: 70579968,
       kv: { bf16: 20480, int8: 10560, fp8: 10320, rk8v4: 8160, k8v4: 8040, nvfp4: 5760 },
       depths: [4096, 16384, 32768],
       /* Mean of two independent runs each, September 2026; see the note on the 27B rows. On this
@@ -528,11 +530,11 @@ const DATA = {
         nvfp4: [169.04, 151.81, 131.75]
       },
       spec: {
-        none:          { label: "None",                weightsGiB: 19.59, decode: 178.00, accept: null },
-        mtp3:          { label: "MTP, 3 draft tokens", weightsGiB: 20.43, decode: 214.37, accept: null },
-        "mtp3+head":   { label: "MTP3 + draft head",   weightsGiB: 20.56, decode: 256.03, accept: 0.594 },
-        "dflash-3":    { label: "DFlash, 3 tokens",    weightsGiB: 19.98, decode: 173.73, accept: null },
-        "dflash-3+head": { label: "DFlash-3 + draft head", weightsGiB: 20.11, decode: 196.65, accept: 0.379 }
+        none:          { label: "None",                weightsGiB: 19.59, decode: 178.00, accept: null, graphBytes: 12582912, seqFixedBytes: 70579968, seqPerToken: 0.0625, kvRatio: 1, kvExtraPerToken: 0 },
+        mtp3:          { label: "MTP, 3 draft tokens", weightsGiB: 20.43, decode: 214.37, accept: null, graphBytes: 90177536, seqFixedBytes: 76086528, seqPerToken: 0.125, kvRatio: 1.10078125, kvExtraPerToken: 0 },
+        "mtp3+head":   { label: "MTP3 + draft head",   weightsGiB: 20.56, decode: 256.03, accept: 0.594, graphBytes: 90177536, seqFixedBytes: 76086528, seqPerToken: 0.125, kvRatio: 1.10078125, kvExtraPerToken: 0 },
+        "dflash-3":    { label: "DFlash, 3 tokens",    weightsGiB: 19.98, decode: 173.73, accept: null, graphBytes: 167772160, seqFixedBytes: 193136896, seqPerToken: 0.125, kvRatio: 1, kvExtraPerToken: 4096 },
+        "dflash-3+head": { label: "DFlash-3 + draft head", weightsGiB: 20.11, decode: 196.65, accept: 0.379, graphBytes: 167772160, seqFixedBytes: 193136896, seqPerToken: 0.125, kvRatio: 1, kvExtraPerToken: 4096 }
       }
     }
   },
@@ -593,26 +595,48 @@ const fmtInt = (n) => Math.round(n).toLocaleString("en-US");
 function modelOf() { return DATA.models[$("model").value]; }
 
 /* Per-token resident cost: the cache itself plus the non-KV sequence state that scales with it. */
-function perToken(model, kv) {
+/* Per-token resident cost: the cache itself plus the non-KV sequence state that scales with it.
+   Both move with the speculation mode, and the two speculative backends move them differently --
+   which is why TODO.md section 2b's "one constant multiplier" only ever fit MTP.
+     MTP buffers extra draft tokens *in the KV format*, so its cost is multiplicative and identical
+   across formats: +6.2988% per token on the 27B, +10.078% on the 35B (both confirmed against a
+   second format, nvfp4, to within page rounding).
+     DFlash v1 instead reserves a fixed scratch region per token, measured at exactly 4,096 bytes
+   and independent of the format. Modelling that as a ratio is what made it look format-dependent:
+   4,096 bytes is +38.8% on int8's 10,560 but +71.1% on nvfp4's 5,760.
+     DFlash2 on the 27B costs nothing per token at all and pays entirely in its graph allowance. */
+function perToken(model, kv, specKey) {
   const k = model.kv[kv];
-  return k === null ? null : k + DATA.seqPerToken;
+  if (k === null) return null;
+  const spec = model.spec[specKey === undefined ? "none" : specKey];
+  return k * spec.kvRatio + spec.kvExtraPerToken + spec.seqPerToken;
 }
 
-function fixedBytes(model, specKey) {
-  const spec = model.spec[specKey];
-  const base = model.spec.none.weightsGiB;
-  /* Speculation heads are extra resident weights; the measured deltas are in GiB.
-     KNOWN GAP (see TODO.md): DATA.graphBytes is the no-speculation CUDA graph allowance for
-     every spec mode. The real engine sizes it per speculative backend and draft window
-     (layouts_impl.h: 12 MiB flat for None, up to ~86 MiB/lane for MTP, up to ~96 MiB/lane for
-     DFlash), and MTP also reserves extra paged-KV pages for buffered draft tokens
-     (persistent_layout's mtp_extra_pages) that this function does not add either. Both are
-     undercounts specific to specKey != "none"; the no-speculation case is unaffected and is the
-     one figure this page's engine cross-check (see the method notes) actually validates. */
-  const specExtra = (spec.weightsGiB - base) * GIB;
-  return model.weightsBytes + specExtra + model.workspaceBytes + DATA.graphBytes +
-         model.seqFixedBytes;
+
+/* The CUDA graph allowance is per speculative backend, and for DFlash2 it is per context as well.
+   Measured with scripts/sweeps/speculative-memory-terms.ps1 at 8,192/16,384/32,768: DFlash2 asks
+   288 MiB at 8,192 and 384 MiB at both deeper points, so it is modelled as a step. Only three
+   contexts were measured, so treat a value between them as the higher of the two. */
+function graphBytes(spec, ctx) {
+  const g = spec.graphBytes;
+  if (typeof g === "number") return g;
+  for (const [limit, bytes] of g) if (ctx <= limit) return bytes;
+  return g[g.length - 1][1];
 }
+
+/* Everything resident that does not scale with context, for one speculation mode.
+   Every term here is measured per mode rather than borrowed from the no-speculation case, which
+   is what this page got wrong until 2026-09-09: it reused the 12 MiB graph allowance for all of
+   them and added no extra KV, understating MTP3 on the 27B by 149 MiB and the DFlash2 graph
+   allowance alone by 372 MiB. */
+function fixedBytes(model, specKey, ctx) {
+  const spec = model.spec[specKey];
+  const specExtra = (spec.weightsGiB - model.spec.none.weightsGiB) * GIB;
+  return model.weightsBytes + specExtra + model.workspaceBytes +
+         graphBytes(spec, ctx === undefined ? model.nativeMaxContext : ctx) +
+         spec.seqFixedBytes;
+}
+
 
 function usableBytes() {
   return (DATA.cardMiB - Number($("reserve").value)) * MIB;
@@ -654,18 +678,20 @@ function render() {
   const specKey = $("spec").value;
   const ctx = Math.max(256, Number($("ctx").value) || 0);
 
-  const pt = perToken(model, kv);
-  const fixed = fixedBytes(model, specKey);
+  const pt = perToken(model, kv, specKey);
+  const fixed = fixedBytes(model, specKey, ctx);
   const usable = usableBytes();
 
   const haveKv = pt !== null;
   /* KV is reserved by the physical page the requested context rounds up to, not by the exact
      token count -- see the PAGE_TOKENS note above. */
-  const kvBytes = haveKv ? model.kv[kv] * pageRoundUp(ctx) : 0;
-  const ovhBytes = haveKv ? model.seqFixedBytes + DATA.seqPerToken * ctx : 0;
-  const specExtra = (model.spec[specKey].weightsGiB - model.spec.none.weightsGiB) * GIB;
+  const specMode = model.spec[specKey];
+  const kvBytes = haveKv
+    ? (model.kv[kv] * specMode.kvRatio + specMode.kvExtraPerToken) * pageRoundUp(ctx) : 0;
+  const ovhBytes = haveKv ? specMode.seqFixedBytes + specMode.seqPerToken * ctx : 0;
+  const specExtra = (specMode.weightsGiB - model.spec.none.weightsGiB) * GIB;
   const weightsBytes = model.weightsBytes + specExtra;
-  const wsBytes = model.workspaceBytes + DATA.graphBytes;
+  const wsBytes = model.workspaceBytes + graphBytes(specMode, ctx);
   const total = weightsBytes + kvBytes + ovhBytes + wsBytes;
 
   /* Bar is drawn against the full card so the OS reserve is visible as unclaimed space. */
@@ -773,8 +799,11 @@ function render() {
   $("out-ppl-sub").textContent = ppl.toFixed(6) + " vs bf16 " + base.toFixed(6) +
     ($("model").value === "27b" ? "" : " · measured on the 27B");
 
+  /* Per mode: MTP and DFlash both raise the fixed block and double the per-token term, so
+     showing the no-speculation numbers here would contradict the memory bar above. */
   $("overhead-note").textContent =
-    (model.seqFixedBytes / MIB).toFixed(1) + " MiB fixed + 1/16 B per token";
+    (specMode.seqFixedBytes / MIB).toFixed(1) + " MiB fixed + " +
+    (specMode.seqPerToken === 0.0625 ? "1/16" : "1/8") + " B per token";
   $("kv-hint").textContent = DATA.kvNotes[kv];
   $("spec-hint").textContent = (spec.accept !== null
     ? "Measured draft acceptance " + (spec.accept * 100).toFixed(1) + "% on this model. "
@@ -800,7 +829,8 @@ function buildKvTable() {
   /* Against the real card and the chosen OS reserve rather than an arbitrary fixed budget: on the
      35B a 6 GiB budget put every format at the 262,144 cap, so the column distinguished nothing.
      fixedBytes already accounts for the fixed sequence block, so what is left is the cache. */
-  const budget = usableBytes() - fixedBytes(model, $("spec").value);
+  const specKeyForTable = $("spec").value;
+  const budget = usableBytes() - fixedBytes(model, specKeyForTable, model.nativeMaxContext);
 
   const deepest = model.depths[model.depths.length - 1];
   const rows = KV_ORDER.map((kv) => {
@@ -811,7 +841,8 @@ function buildKvTable() {
     if (b === null) return { kv, b, ppl, deep, ctx: null, capped: false };
     // Page-aligned, same reasoning as render()'s "Largest context that fits": see the PAGE_TOKENS
     // note near the top of this script.
-    const raw = PAGE_TOKENS * Math.floor(budget / (PAGE_TOKENS * (b + DATA.seqPerToken)));
+    const ptTable = perToken(model, kv, specKeyForTable);
+    const raw = PAGE_TOKENS * Math.floor(budget / (PAGE_TOKENS * ptTable));
     /* Report what is actually reachable: past the model's own context limit the extra budget
        buys nothing, and showing the uncapped figure would promise context that cannot be had. */
     return { kv, b, ppl, deep, ctx: Math.min(raw, model.nativeMaxContext),
@@ -837,7 +868,7 @@ function buildKvTable() {
   $("kv-caption").textContent =
     "Largest context is what fits on the " + model.label +
     " at the currently selected OS reserve and speculation mode, after the fixed " +
-    (model.seqFixedBytes / MIB).toFixed(1) +
+    (model.spec[specKeyForTable].seqFixedBytes / MIB).toFixed(1) +
     " MiB of non-KV sequence state. Decode is at a " + fmtInt(deepest) +
     "-token cache depth, no speculation. Perplexity was measured on the Qwen3.8-27B.";
 }

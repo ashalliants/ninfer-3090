@@ -37,6 +37,9 @@ jobs:
       # sandbox, which is what keeps docs/config-calculator.html a single file.
       - name: Run docs/config-calculator.test.mjs
         run: node docs/config-calculator.test.mjs
+      # The arithmetic tests never call render(), which is where most of the page's code is.
+      - name: Run docs/config-calculator.render.test.mjs
+        run: node docs/config-calculator.render.test.mjs
 
   linux-scripts:
     name: Linux launcher and downloader guard
