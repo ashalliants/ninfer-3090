@@ -249,8 +249,13 @@ def build_manifest(
         "source": "source_text" if source_provenance else "builtin_curated_bank",
         "source_files": source_provenance,
         "note": (
-            "meaningful tokens; tiled (rotated) and truncated to exactly `tokens`. "
-            "Repetition fills length only and does not bias throughput."
+            "meaningful tokens; tiled (rotated) and truncated to exactly `tokens`. Repetition "
+            "fills length only and does not bias PREFILL OR PLAIN DECODE throughput, which are "
+            "token-count and bandwidth bound. It does NOT hold for anything that drafts: a "
+            "sufficiently repetitive corpus lets a draft head predict it near-perfectly, "
+            "inflating acceptance and decode rate with no relationship to real text. Use a "
+            "diverse --source-text for speculative measurements, or measure the serving path on "
+            "generated prose (scripts/sweeps/dflash2-draft-tokens-realtext.ps1)."
         ),
     }
 
