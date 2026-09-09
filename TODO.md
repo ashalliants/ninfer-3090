@@ -749,14 +749,21 @@ doing:
       which immediately found four scripts committed at 644, including
       `scripts/package-release-v090.sh`, the current release's own Linux packager.
 
-- [ ] **Binaries embed their build directory.** `/home/ash/ninfer-rel/src/...` appears 200 times in
-      the Linux binaries and `C:\ninfer-fork\ninfer-3090\...` about 466 times in the Windows ones,
-      via `__FILE__` and nvcc source paths. Pre-existing (v0.8.1 embedded `/mnt/c/ninfer-fork/...`
-      405 times) and not a secret — the file names are already public and no Windows binary
-      contains a `C:\Users\...` path. `-ffile-prefix-map=` plus `--compiler-options` for nvcc would
-      rewrite them to relative paths, which also makes assertion messages more readable. MSVC has
-      no documented equivalent; `/d1trimfile:` is the usual answer and is undocumented. Cosmetic;
-      do it with a release build, not on its own.
+- [x] **Binaries embed their build directory.** Half fixed, and the other half measured as not
+      fixable. Closed 2026-09-09.
+
+      `-ffile-prefix-map=${PROJECT_SOURCE_DIR}=.` is now set for C, C++ and (via `-Xcompiler`) the
+      host half of CUDA translation units on GCC/Clang, which covers the Linux binaries and their
+      ~200 occurrences of `/home/ash/ninfer-rel/src/...`. Verified under real Linux g++ on this
+      box: `/tmp/ftest/sub/a.cpp` becomes `./sub/a.cpp` and the absolute prefix leaves `strings`
+      entirely.
+
+      **MSVC has no working equivalent and that is measured, not assumed.** It takes `__FILE__`
+      from the path as written on the command line and CMake writes absolute ones; the usual
+      suggestion, the undocumented `/d1trimfile:`, had *no effect* on `__FILE__` when tested
+      against 14.44.35207 with an absolute source path. The Windows binaries keep their ~466
+      occurrences. Device-side `__FILE__` from nvcc's own frontend is not covered either -- there
+      is no documented flag for it.
 
 ## 7. Closed this cycle, and what it taught
 
