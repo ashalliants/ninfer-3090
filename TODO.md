@@ -963,7 +963,7 @@ roofline finally acquired a denominator; read them before the rest.
       Three things follow.
 
       **The shipped recommendation is the wrong draft count.** `docs/cli.md` said seven; four is
-      **18.5% faster**, and `docs/cli.md` now says four and carries this table. The entry guessed
+      **22.6% faster**, and `docs/cli.md` now says four and carries this table. The entry guessed
       there might be "a crossover below 7 where DFlash2 turns positive" — there is a crossover at
       four, but DFlash2 was never negative to begin with.
 
