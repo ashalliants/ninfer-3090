@@ -57,10 +57,14 @@ NINFER_REAL_TEST_MAX_CONTEXT=8192      # only needed for the 35B
 `NINFER_QWEN3_6_27B_NVFP4_WEIGHTS` was missing from this block for a cycle, and it is the only
 thing that was keeping `27b_load_plan` skipping — the artifact has been on the disk all along.
 
-**Free VRAM used to decide whether these pass or skip.** It no longer does: the reason was the
-pinned host-KV allocation being charged against the card (§6, #45), and with that clamped the six
-real-model tests pass on an idle box and under `ctest -j2`. Still worth closing GPU clients before
-a *measurement* run, where free VRAM changes the automatic sizing.
+**Free VRAM used to make these fail outright, not skip.** Skip (exit 77) here is reserved for a
+missing artifact env var; a VRAM shortfall instead threw during `Engine` construction and failed
+the test. The specific cause was the pinned host-KV allocation being charged against the card (§6,
+#45), and with that clamped the six real-model tests pass on an idle box and under `ctest -j2`.
+That closes the one source of VRAM-caused failure this fix addresses -- it does not mean free VRAM
+no longer affects these tests at all: the model-weights allocation itself can still fail under real
+memory pressure from another process. Still worth closing GPU clients before a *measurement* run,
+where free VRAM also changes the automatic sizing.
 
 ### Recently landed, and what is still owed on it
 
@@ -458,6 +462,22 @@ roofline finally acquired a denominator; read them before the rest.
       **99.3% GPU idle** from 807 launches over 128 steps of a 64-layer model, about six kernels
       per step, because nsys records a CUDA graph replay as one opaque entity unless given
       `--cuda-graph-trace=node`. Both reasons are written into the script.
+
+- [ ] **The routed prefill gate/up pipeline-depth threshold is upstream's RTX 5090 number,
+      unmeasured on this card.** `src/ops/sparse_moe/prefill/sparse_moe_prefill_kernels.cu:314-315`
+      (`kGateUpDeepJobsNum`/`Den`, currently 7/4) picks between a 2-stage ("Spread") and a 6-stage
+      ("Packed") pipeline for the narrow routed gate/up kernel based on jobs-per-expert crossing
+      this ratio. The comment above it is explicit that the crossing point was measured on
+      upstream's server, with a fixture that walks the ratio continuously and disagrees with the
+      operator microbenchmark by about 6x depending on L2 warmth. That crossing depends on L2 size,
+      and an RTX 5090 has 16x the L2 of this box's RTX 3090 (96 MB vs. 6 MB) — there is no reason to
+      expect 7/4 is where *this* card's Spread/Packed tradeoff actually flips. Wrong constant,
+      wrong pipeline depth selected, not wrong output: `kExpertStages`/`kGateUpNarrowStages` still
+      produce correct results either way, so this is a performance risk, not a correctness one.
+      Re-measuring needs the same round-robin fixture the comment describes, built and run on this
+      RTX 3090; no sweep script here currently drives sparse MoE prefill directly
+      (`decode-step-profile.ps1` and the `scripts/sweeps/*.ps1` sweeps are all decode-only). Do not
+      guess a replacement constant without that measurement.
 
 - [ ] **Eight lanes buy 3.2x, not 8x, and the reason is unestablished.** README's own cohort table
       has C1 decode at 78.71 tok/s against C8 at 250.26. Batched decode amortises the weight read
