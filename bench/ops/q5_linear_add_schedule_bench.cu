@@ -88,7 +88,7 @@ int main(int argc, char** argv) {
     ninfer::bench::SweepOptions options;
     options.tokens = {1, 8, 16, 24, 32, 40, 48, 56, 64, 96, 128, 160, 176, 192, 208, 256};
     if (!ninfer::bench::parse_sweep_args(argc, argv, options)) {
-        std::fprintf(stderr, "usage: %s [--tokens T,...] [--repeat N] [--warmup N]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s [--tokens T,...] [--repeat N] [--warmup N] [--spread]\n", argv[0]);
         return 2;
     }
     sweep_for_k(6144, options);

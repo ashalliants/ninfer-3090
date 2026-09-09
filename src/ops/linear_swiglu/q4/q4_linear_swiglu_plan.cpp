@@ -31,7 +31,7 @@ struct RouteSpec {
 
 constexpr Q4LinearSwiGluProblem kShape{34816, 17408, 5120, 5120, 1};
 
-constexpr std::array<RouteSpec, 7> kRoutes{{
+constexpr std::array<RouteSpec, 5> kRoutes{{
     {{1, 1}, Q4LinearSwiGluScheduleId::GemvPair},
     // Measured on sm_86 with bench/ops/q4_linear_swiglu_schedule_bench.cu (cold, median of 11):
     // SmallTTiled and the 40-wide pair tile cross between 24 and 25, us --
@@ -58,17 +58,47 @@ constexpr std::array<RouteSpec, 7> kRoutes{{
     //   mat       856    855    890    864   3004   2724   2398
     //   c128 by  5.1%   3.9%   4.7%   6.4%  23.1%  15.2%   8.7%
     //
-    // So {49,128} and {257,384} join the c128 bands on either side, and 49..512 becomes one route
-    // instead of four.
+    // So {49,128} and {257,384} join the c128 bands on either side.
     //
-    // {513,640} is deliberately left on Materialized. It is the one band where the two are close,
-    // and the measurement cannot separate them: over four runs Materialized won 576 three times,
-    // but c128 at that width ranged 4147-4959 us (19.6% spread) and the margins outside the single
-    // outlying run were +-2%. Changing it would be fitting noise. Re-measure it if the noise floor
-    // on this Op ever improves.
-    {{49, 512}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
-    {{513, 640}, Q4LinearSwiGluScheduleId::Materialized},
-    {{641, kAnyCols}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
+    // {513,640} used to stay on Materialized because the measurement could not separate them:
+    // over four runs Materialized won 576 three times, but c128 there ranged 4147-4959 us (19.6%
+    // spread) and the margins outside the single outlying run were +-2%. Re-measured 2026-09-09
+    // with --spread (which did not exist then, so the spread that blocked the decision was never
+    // visible) at 31-51 repetitions per point on an idle card. c128 won all three widths in four
+    // independent runs; us, range of the per-run medians:
+    //
+    //   T            513          576          640
+    //   c128     3788-3906    3876-3933    3611-3641
+    //   mat      3863-3956    3950-4216    3895-4077
+    //   c128 by  1.3-2.5%     1.2-7.5%     7.3-11.2%
+    //
+    // The min settles it: c128's fastest sample beats Materialized's fastest at every width in
+    // every run, by 7-9% at 640 with no overlap (3524-3581 against 3862-3867). Sign is consistent
+    // 12 times out of 12.
+    //
+    // **This bench overstates the margin, so do not quote it as a speedup.** Confirmed in situ by
+    // profiling a single 600-token chunk (nsys, node-level graph trace, 64 layers): Materialized
+    // costs 269.73 ms in q4_rowsplit_gemm_mma plus 5.16 ms in silu_and_mul_dim0_split = 274.89 ms,
+    // against 268.32 ms for the c128 pair kernel. c128 still wins, but by 2.4%, not 7.5% -- and
+    // both are slower per call in situ than in the bench (4193 vs 3625 us for c128, 4295 vs 3927
+    // for Materialized). The bench flushes L2 before every repetition; a real prefill does not
+    // arrive with a cold cache, and the flush penalises Materialized's second pass more than
+    // production does. The same caveat applies to every band in this table.
+    //
+    // End-to-end the win is invisible: pp600 measured 886.0-888.8 tok/s with c128 against
+    // 888.5-892.1 on Materialized, i.e. inside the run-to-run spread, because 6.6 ms of a ~660 ms
+    // prefill is under the +-3% that unrelated kernels move between runs. Keep the change for
+    // consistency and because it is right, not for a number.
+    //
+    // Reachability, so nobody over-values this band: q4a8_swiglu takes any width with
+    // `tokens >= 128 && tokens % 128 == 0`, and --prefill-chunk must be a multiple of 128, so
+    // every full prefill chunk goes to the integer-activation kernel and never reaches this table.
+    // The 49..end route is reached only by decode widths and by a prompt's ragged tail chunk. That
+    // is why {513,640} was both close and inconsequential for so long.
+    //
+    // With this the alternation is gone completely and 49..end is one route. That was the
+    // suspicious thing about upstream's table to begin with.
+    {{49, kAnyCols}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
 }};
 
 constexpr bool catalog_is_closed() noexcept {

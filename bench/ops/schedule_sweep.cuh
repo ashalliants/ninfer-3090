@@ -58,14 +58,19 @@ struct SweepOptions {
     int warmup                = 3;
     std::size_t flush_bytes   = 256ULL << 20;
     const char* title         = "schedules";
+    // Print "median min..p95" per cell instead of the median alone. A route decision is only
+    // meaningful if the margin between two schedules clears their own spread, and the median by
+    // itself cannot tell you that -- TODO section 5 has a band that stayed unresolved for exactly
+    // this reason, where the losing schedule's own samples ranged 19.6%.
+    bool spread               = false;
     // Optional: what the Op's own resolver picks at this width, and the public Op itself. Supply
     // both or neither.
     std::function<const char*(std::int32_t)> routed_name;
     std::function<void(std::int32_t, cudaStream_t)> public_op;
 };
 
-// Parses "--tokens A,B,C", "--repeat N", "--warmup N". Returns false on an unrecognised argument
-// so the caller can print its own usage.
+// Parses "--tokens A,B,C", "--repeat N", "--warmup N", "--spread". Returns false on an
+// unrecognised argument so the caller can print its own usage.
 inline bool parse_sweep_args(int argc, char** argv, SweepOptions& options) {
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -84,6 +89,8 @@ inline bool parse_sweep_args(int argc, char** argv, SweepOptions& options) {
             options.repeat = std::atoi(argv[++i]);
         } else if (arg == "--warmup" && i + 1 < argc) {
             options.warmup = std::atoi(argv[++i]);
+        } else if (arg == "--spread") {
+            options.spread = true;
         } else {
             return false;
         }
@@ -95,12 +102,14 @@ inline void run_sweep(const SweepOptions& options, const std::vector<SweepEntry>
     DeviceBuffer flush(options.flush_bytes);
     cudaStream_t stream = nullptr;
 
+    const int width = options.spread ? 30 : 22;
     cudaDeviceProp properties{};
     cudaGetDeviceProperties(&properties, 0);
-    std::printf("# gpu=%s sm=%d%d  %s, cold, median of %d\n", properties.name, properties.major,
-                properties.minor, options.title, options.repeat);
+    std::printf("# gpu=%s sm=%d%d  %s, cold, %s of %d\n", properties.name, properties.major,
+                properties.minor, options.title,
+                options.spread ? "median min..p95" : "median", options.repeat);
     std::printf("%6s", "T");
-    for (const SweepEntry& entry : schedules) { std::printf(" %22s", entry.name); }
+    for (const SweepEntry& entry : schedules) { std::printf(" %*s", width, entry.name); }
     if (options.public_op) { std::printf(" %12s %-34s", "public_op", "routed_to"); }
     std::printf("   %-22s\n", "winner");
 
@@ -110,22 +119,30 @@ inline void run_sweep(const SweepOptions& options, const std::vector<SweepEntry>
         std::printf("%6d", tokens);
         for (const SweepEntry& entry : schedules) {
             if (entry.max_cols != 0 && tokens > entry.max_cols) {
-                std::printf(" %22s", "out-of-domain");
+                std::printf(" %*s", width, "out-of-domain");
                 continue;
             }
             const auto launch = [&](cudaStream_t launch_stream) {
                 entry.invoke(tokens, launch_stream);
             };
-            double us = 0.0;
+            ColdTiming timing{};
             try {
-                us = measure_cold_launch(launch, flush, stream, options.warmup, options.repeat)
-                         .median_us;
+                timing = measure_cold_launch(launch, flush, stream, options.warmup,
+                                             options.repeat);
             } catch (const std::exception&) {
                 cudaGetLastError();
-                std::printf(" %22s", "n/a");
+                std::printf(" %*s", width, "n/a");
                 continue;
             }
-            std::printf(" %22.3f", us);
+            const double us = timing.median_us;
+            if (options.spread) {
+                char cell[64];
+                std::snprintf(cell, sizeof(cell), "%.1f %.1f..%.1f", us, timing.min_us,
+                              timing.p95_us);
+                std::printf(" %*s", width, cell);
+            } else {
+                std::printf(" %*.3f", width, us);
+            }
             if (best_us == 0.0 || us < best_us) {
                 best_us   = us;
                 best_name = entry.name;
