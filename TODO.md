@@ -356,7 +356,7 @@ Ordered by expected value, not by section.
 | `w8_pair` medium discards its schedule on sm_86 | 3 | **done**: C48 and C64 instantiated, 13-17% over the chunked loop on the routed `{33,64}` band | closed |
 | sm_86 fallback constants chosen to fit | 2c | sweep the alternatives at the eleven `NINFER_SM8X_COMPAT` sites | GPU time only |
 | Cold-flush margins overstate wins | 3 | **answered, and the tidy rule is wrong**: three boundaries checked in situ came out −0.78%, +2.85% and +13.59% against +5.9%, +13.2% and +8.0% cold. A narrow margin is a reason to check, not a predictor of direction | closed |
-| Perplexity drift 0.019% | 3 | **started**: it is *two* transitions (−0.0092% + −0.0101%), so two `--first-parent` bisects. A single bisect would name one commit and mislead the next person | exclusive GPU time |
+| Perplexity drift 0.019% | 3 | **closed**: `f3f6c724` turned int8 prefill activations on by default (−0.0092%) and `1c12516e` did the rest (−0.0101%). Eight measurements. Only the sub-mechanism inside `1c12516e` is open, and it is one build | closed |
 | Speculative decoding not bit-identical to greedy | 3 | decide whether it should be; the divergence is a reduction-order effect in k+1-column verification and MTP reproduces it, so it predates DFlash2 | judgement, not measurement |
 | DFlash2 corpus acceptance on real text | 3 | bake a diverse corpus with `make_bench_corpus.py --source-text`, or extend the real-text sweep to report acceptance | a local HF tokenizer, which this box lacks |
 | `27b_load_plan` DFlash2 binding matrix | 3 | **half of it can run now**: both groupwise artifacts are on this disk (the "old" one is `models/qwen3_8_27b.ninfer`, SHA-verified). The two NVFP4 ones were never published and would have to be converted locally | artifacts nobody has |
@@ -489,8 +489,8 @@ Every item in the previous version of this list is now closed. What follows is w
 should do first, and the ordering is by expected value rather than by section. The full
 seventeen-item table with what each one needs is in "Handing this off to another machine" above.
 
-**Where the open work actually is: §2c (13 items), §3 (2), §2 (1, blocked) and §1 (1).** §2c grew
-by five in the 2026-09-10 pass — the five screens in §2c-vii — while §3 shrank from eight to two.
+**Where the open work actually is: §2c (13 items), §3 (1), §2 (1, blocked) and §1 (1).** §2c grew
+by five in the 2026-09-10 pass — the five screens in §2c-vii — while §3 shrank from eight to one.
 Sections 1, 2b, 4, 5 and 6 are fully closed and say so in their headings — they are kept because
 the reasoning is what stops the same investigation being repeated, not because anything is owed
 there. The trailing unnumbered subsections after §7 are methodology notes with no items; the one on
@@ -530,13 +530,12 @@ editing this file with a script is worth reading before you edit this file with 
    upstream's RTX 5090 number and an RTX 5090 has 16x this card's L2. Sweeping the constant is the
    method the source comment endorses over the operator fixture, which disagrees with the server by
    6x. GPU time only, no new code.
-8. **The perplexity drift bisect** (§3), when four hours of exclusive GPU time are available. Three
-   candidates are eliminated and the value is exactly reproducible — but it is **not** mechanical,
-   which is what this list said before the bisect was started. There are two transitions in the
-   range, so a single bisect converges on one and reports a cause that cannot reproduce the whole
-   drift. Bisect `838c8b5d..66378f06` and `66378f06..HEAD` separately, both `--first-parent`.
+8. **Confirm `FixedD` is what moved perplexity inside `1c12516e`** (§3) — the one loose end left
+   by the drift bisect, which is otherwise **done**: the 0.019% is `f3f6c724` (int8 activations on
+   by default, −0.0092%) plus `1c12516e` (−0.0101%). One build with the `rmsnorm.cuh` `FixedD`
+   specializations forced off, then re-score. Everything else in that entry is closed.
 
-Two of the seventeen open items are hard-blocked — one on a second GPU (§2), one on NVFP4 artifacts
+Two of the sixteen open items are hard-blocked — one on a second GPU (§2), one on NVFP4 artifacts
 that were never published rather than deleted (§3, checked upstream 2026-09-10). Everything else is
 actionable, and **two of the five new screens need no GPU at all**: the register decomposition is
 one build with `-Xptxas -v`, and the parallelism arithmetic is pen and paper. Do the arithmetic
@@ -3114,7 +3113,55 @@ at all, and one of those two should be done before any of the others.
       second copy is shadowing it and whether the failure is a permission. Neither of the two
       things this entry called broken was broken.
 
-- [ ] **The perplexity harness drifts 0.019% from the published figures and nobody knows why.**
+- [x] **The perplexity harness's 0.019% drift is two commits, both now named.** `f3f6c724` turned
+      the int8-activation prefill route on by default (−0.0092%) and `1c12516e`, the upstream
+      catch-up, did the rest (−0.0101%). Eight measurements, 2026-09-10. The original entry follows,
+      because the eliminations in it are what made eight measurements enough.
+
+      **Transition 1 = `f3f6c724`, "register the integer-activation route as
+      `LinearPolicy::AllowA8Int`".** The mechanism is not a guess — the bracket lands on exactly the
+      commit whose diff removes the opt-in:
+
+      | commit | | perplexity |
+      |---|---|---:|
+      | `9d84659c` | before the cluster | 4.34326255065906 |
+      | `4f0be008` | A8 route present, still env-gated | 4.34326255065906 |
+      | **`f3f6c724`** | **env gate removed** | **4.34286437475351** |
+      | `c41b29dd` | follow-up fix | 4.34286437475351 |
+
+      `0b0b098d` had added the route behind `NINFER_W4A8_PREFILL=1`, off by default, and `4f0be008`
+      extended it — both measure the old value to twelve figures, which is the env gate being
+      provably inert. `f3f6c724` deletes `q4a8_swiglu_enabled()` and makes `Q4G64_F16S` and
+      `Q5G64_F16S` return `AllowA8Int` unconditionally under `NINFER_SM8X_COMPAT`. So the drift is
+      **int8 activations on the 27B MLP prefill GEMMs**, which the commit itself documents as "0.9%
+      relative L2 on that projection ... for about twice the prefill GEMM rate".
+
+      **And the sign is the point.** Perplexity went *down*, 4.343263 → 4.342864. Quantizing
+      activations to int8 did not improve the model; a 0.9% relative perturbation moves the fifth
+      decimal, and which way it moves is a coin flip. That is the honest reading of every number in
+      this range, and it is why the drift is a **floor on comparison, not a regression**: any change
+      that perturbs the prefill GEMMs at the 1%-relative level can move perplexity by ~0.01%
+      in either direction.
+
+      **Transition 2 = `1c12516e`, the upstream catch-up (#16)**, pinned by the table further down.
+      Its sub-mechanism is the one thing still open, and it is narrow: `rmsnorm.cuh`'s new `FixedD`
+      template parameter, which makes the reduction trip count a compile-time constant and lets the
+      compiler re-associate the sum-of-squares. Two other suspects are eliminated by proof, not by
+      elimination-of-the-rest — the int8 KV codec refactor is bit-identical by arithmetic, and route
+      boundaries cannot move perplexity at all. Confirming `FixedD` is one build with the
+      specializations forced off, and it is the only loose end.
+
+      **What this buys.** Perplexity comparisons in this repository now have a known floor and a
+      known cause. `k8v4`'s −0.008% from #49, reported as "no change" because it sat under the
+      drift, sits under a drift that is now explained — and the standing rule is that a quality
+      claim smaller than ~0.01% needs the same build on both sides, not just the same corpus.
+
+      ---
+
+      **Everything below is the original entry, kept because its eliminations are what made eight
+      measurements enough. Read it as history: the drift is no longer unexplained.**
+
+      **The perplexity harness drifts 0.019% from the published figures and nobody knew why.**
       Re-measuring all six KV formats (#63) moved the three formats #49 does not touch by
       -0.009% to -0.019%: `int8` 4.343263 to 4.342425, `bf16` 4.343225 to 4.342517, `rk8v4`
       4.346811 to 4.346413. Same corpus, same window, same 261,167 scored tokens, and those code
