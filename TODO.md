@@ -285,7 +285,7 @@ Ordered by expected value, not by section.
 | Routed prefill pipeline-depth threshold 7/4 | 2c | **swept**: a 1.33x change in the constant moves prefill 0.06-0.26%, the same as the drift between two identical builds. Safe to leave | closed |
 | `w8_pair` medium discards its schedule on sm_86 | 3 | **done**: C48 and C64 instantiated, 13-17% over the chunked loop on the routed `{33,64}` band | closed |
 | sm_86 fallback constants chosen to fit | 2c | sweep the alternatives at the eleven `NINFER_SM8X_COMPAT` sites | GPU time only |
-| Cold-flush margins overstate wins | 3 | **answered**: 4-5x overstatement, and a 5.9% cold margin inverted in situ. Distrust anything under ~10% | closed |
+| Cold-flush margins overstate wins | 3 | **answered, and the tidy rule is wrong**: three boundaries checked in situ came out −0.78%, +2.85% and +13.59% against +5.9%, +13.2% and +8.0% cold. A narrow margin is a reason to check, not a predictor of direction | closed |
 | Perplexity drift 0.019% | 3 | the scoped four-hour bisect | exclusive GPU time |
 | Speculative decoding not bit-identical to greedy | 3 | decide whether it should be; the divergence is a reduction-order effect in k+1-column verification and MTP reproduces it, so it predates DFlash2 | judgement, not measurement |
 | DFlash2 corpus acceptance on real text | 3 | bake a diverse corpus with `make_bench_corpus.py --source-text`, or extend the real-text sweep to report acceptance | a local HF tokenizer, which this box lacks |
@@ -2678,15 +2678,29 @@ ceiling, and neither has had any optimisation attempted.
       | GDN input width 7, split4 over c8 | **+5.9%** | **−0.78%** | 0 / 6 |
       | GDN input width 8, split4 over c8 | **+13.2%** | **+2.85%** | 6 / 6 |
 
-      So the cold bench overstates by roughly 4-5x here, and **at width 7 it overstates enough to
-      invert the sign.** That is a sharper version of what this entry suspected: the q4 SwiGLU case
-      it was built on found 7.5% cold against 2.4% in situ, a 3x overstatement with the sign intact;
-      this is a case where the sign does *not* survive, on a margin that would previously have been
-      called comfortable.
+      So on this Op the cold bench overstated by 4-5x, and **at width 7 it overstated enough to
+      invert the sign** — on a margin that would previously have been called comfortable.
 
-      **The practical rule that follows: a cold-flush margin under about 10% is not a decision.**
-      Under 5% it was already suspect; 5.9% inverting means the honest threshold is roughly double
-      what this entry guessed. Above ~13% the sign held and about a quarter of the margin survived.
+      **Then a third boundary was checked and it went the other way, which kills the tidy rule.**
+      `q5_linear_add`'s `{2,10}`/`{11,16}` crossover was chosen on an 8% cold margin at T=10
+      (split2 93.2 µs against c16 101.4). Re-measured in situ 2026-09-10 — DFlash2 at
+      `--draft-tokens 9`, whose k+1 verification width is exactly T=10, against draft count 4 as a
+      control, six paired repetitions, clocks locked. Moving the boundary so c16 takes T=10 is
+      **−13.59%, 0 of 6 pairs positive, control +0.00%.** The shipped boundary is right, and the
+      in-situ margin is **1.7x larger** than the cold one rather than smaller:
+
+      | boundary | cold | in situ | outcome |
+      |---|---:|---:|---|
+      | GDN input width 7, split4 over c8 | +5.9% | **−0.78%** | sign inverted |
+      | GDN input width 8, split4 over c8 | +13.2% | +2.85% | survived, 4.6x smaller |
+      | `q5_linear_add` T=10, split2 over c16 | +8.0% | **+13.59%** | survived, **1.7x larger** |
+
+      **So "cold overstates by 4-5x" was an overreach from one Op, and the honest rule is the one
+      this entry started with: a narrow cold-flush margin is a reason to check, not a predictor of
+      anything — including its direction.** The flush penalises whichever schedule makes more weight
+      passes, so which way it biases depends on the pair being compared, not on the margin's size. A
+      threshold on the margin alone cannot work; what the margin buys you is a priority order for
+      which boundaries to re-measure.
 
       The method is now cheap enough that there is no excuse for skipping it —
       `tools/bench/run_interleaved_ab.py` plus `nvidia-smi -lgc 1500` produced control drift of
@@ -2695,12 +2709,17 @@ ceiling, and neither has had any optimisation attempted.
       digits, and do not re-derive the "cold is the honest default" argument: cold is right for a
       first pass, it is just not a decision.
 
-- [x] **The two under-5% boundaries this entry named are the ones still owed a check.** The
-      `{2,10}`/`{11,16}` q5 crossover at T=10 (93.2 vs 101.4, 8%) and the q4 SwiGLU
-      `{2,24}`/`{25,40}` crossover at T=25 (464.9 vs 436.2, 6%) both sit under the ~10% threshold
-      established above, which now means they are *presumed unsafe* rather than merely unverified.
-      Neither is known to be mis-routed. Re-check both with the interleaved harness before quoting
-      either margin as a speedup.
+- [x] **One of the two narrow boundaries is checked and correct; the other is still owed.**
+      The `{2,10}`/`{11,16}` q5 crossover at T=10 was re-measured in situ and the shipped choice
+      wins by **13.59%** — see the table above. So it was never "presumed unsafe"; it is simply
+      right, and by a wider margin in production than the bench suggested.
+
+      Still owed: the q4 SwiGLU `{2,24}`/`{25,40}` crossover at T=25 (464.9 vs 436.2 cold, 6%). The
+      method is now routine — find a workload that lands on the width, move the boundary one step,
+      A/B the two builds with a control that stays inside both arms. The obstacle is the workload:
+      TODO's q4-SwiGLU entry records that **every full prefill chunk goes to the integer-activation
+      kernel and never reaches this table**, so T=25 is hit only by decode widths and a prompt's
+      ragged tail chunk, and finding a repeatable driver for exactly 25 columns is the work.
 
 - [x] **The mechanism, kept because it is the reasoning behind the threshold above.**
       `bench/ops/schedule_sweep.cuh` and its siblings call `measure_cold_launch`, which
