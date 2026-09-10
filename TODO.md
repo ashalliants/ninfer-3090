@@ -487,10 +487,10 @@ question, and which one produced a wrong answer and why.
 
 Every item in the previous version of this list is now closed. What follows is what a fresh agent
 should do first, and the ordering is by expected value rather than by section. The full
-sixteen-item table with what each one needs is in "Handing this off to another machine" above.
+seventeen-item table with what each one needs is in "Handing this off to another machine" above.
 
-**Where the open work actually is: §2c (12 items), §3 (2), §2 (1, blocked) and §1 (1).** §2c grew
-by four in the 2026-09-10 pass — the four screens in §2c-vii — while §3 shrank from eight to two.
+**Where the open work actually is: §2c (13 items), §3 (2), §2 (1, blocked) and §1 (1).** §2c grew
+by five in the 2026-09-10 pass — the five screens in §2c-vii — while §3 shrank from eight to two.
 Sections 1, 2b, 4, 5 and 6 are fully closed and say so in their headings — they are kept because
 the reasoning is what stops the same investigation being repeated, not because anything is owed
 there. The trailing unnumbered subsections after §7 are methodology notes with no items; the one on
@@ -536,10 +536,11 @@ editing this file with a script is worth reading before you edit this file with 
    range, so a single bisect converges on one and reports a cause that cannot reproduce the whole
    drift. Bisect `838c8b5d..66378f06` and `66378f06..HEAD` separately, both `--first-parent`.
 
-Two of the sixteen open items are hard-blocked — one on a second GPU (§2), one on NVFP4 artifacts
+Two of the seventeen open items are hard-blocked — one on a second GPU (§2), one on NVFP4 artifacts
 that were never published rather than deleted (§3, checked upstream 2026-09-10). Everything else is
-actionable, and **two of the four new screens need no GPU at all**: the register decomposition is
-one build with `-Xptxas -v`, and the narrow-extent parallelism arithmetic is pen and paper.
+actionable, and **two of the five new screens need no GPU at all**: the register decomposition is
+one build with `-Xptxas -v`, and the parallelism arithmetic is pen and paper. Do the arithmetic
+first — it predicts which of the other screens can pay off on which kernel.
 
 **Keep `investigate/small-t-upstream` until the next catch-up.** It is merged, but it is the clean
 record of how upstream's small-T was adopted and what had to be fixed (`19c7617c` and its
@@ -2722,14 +2723,14 @@ ceiling, and neither has had any optimisation attempted.
 
 ---
 
-### 2c-vii. Four screens nobody has run, and every kernel win this cycle came from one of them
+### 2c-vii. Five screens nobody has run, and every kernel win this cycle came from one of them
 
 Written 2026-09-10, at the end of a cycle that shipped six speedups. Every open item above names
 **one kernel**. But all six wins came from applying the *same* three signatures to a kernel that
 nobody had checked, and none of those signatures has ever been run across the kernel set as a
-sweep. So the list is a list of kernels somebody happened to look at, and these four entries are
-the screens that would tell you which kernels to look at next. All four are cheap; two need no GPU
-at all.
+sweep. So the list is a list of kernels somebody happened to look at, and these five entries are
+the screens that would tell you which kernels to look at next. All five are cheap; two need no GPU
+at all, and one of those two should be done before any of the others.
 
 - [ ] **Nobody has attributed the missing 26% of decode bandwidth to any kernel.** The dense decode
       is at **73.9% of the 854.2 GB/s this card can actually read**, and the analytic read-set is
@@ -2762,6 +2763,12 @@ at all.
       amplification x bytes, and treat anything above ~1.2 as a defect rather than a tuning
       opportunity** — re-reading a weight tile is not a trade-off, it is waste.
 
+      **Collect `lts__t_sector_hit_rate` in the same pass.** Amplification says a kernel re-reads;
+      L2 hit rate says whether the re-read is costing DRAM traffic or is absorbed. It also
+      independently informs the routed prefill pipeline-depth item: `7/4` is upstream's RTX 5090
+      constant and **an RTX 5090 has 16x this card's L2**, so a measured hit rate is the direct
+      evidence for what that constant should be here, rather than sweeping it blind.
+
 - [ ] **The signature that produced three of this cycle's six speedups has never been run as a
       screen.** It is: **L1/TEX throughput high while DRAM throughput is well below it.** That
       combination means the kernel is limited by how fast its *consume loop* retires bytes, not by
@@ -2788,6 +2795,32 @@ at all.
       and its mantissa LSB is 1.0, so OR-ing a nibble into the mantissa and subtracting the bias
       `0x6410` (1040.0) yields `nibble - 16*high_bit`, which is `sign_extend<5>` for free. Any
       kernel dequantizing 4- or 5-bit codes can use it.
+
+- [ ] **The parallelism arithmetic has been done for two kernels and it decided both of them, and
+      it has never been tabulated for the rest. It costs no GPU time at all.** The quantity is total
+      warp-work divided by what the card can hold resident — "machine-fulls". For a tiled GEMM it is
+      `(rows / WM) x (BN / WN)`; **note `BM` does not appear**, which is why narrowing `BN` *reduces*
+      parallelism and why the tile-narrowing experiment lost 6-32%. The denominator is 82 SMs times
+      `65,536 / (regs x 32)` warps per SM.
+
+      Two kernels have been through it and in both cases it was the answer:
+
+      | kernel | warp-work | machine-fulls | what it explained |
+      |---|---:|---:|---|
+      | `rowsplit_grouped_mma_kernel` | 1,024 warps | **0.26** | 24.5% achieved occupancy; why split-K is the fix |
+      | `sparse_moe_d3_path_tiled` | — | **1.17** | why launch geometry and batching both measured flat |
+
+      Nothing else has a number. That matters right now, because the entry above ends by *guessing*
+      that block count is what takes up the slack when `kStages = 3` removes a 27% memory-latency
+      stall and buys nothing — and this table would settle that guess with pen and paper. Do it for
+      every kernel in the decode step and for the prefill GEMMs, rank by machine-fulls, and treat
+      anything under ~1.0 as latency-bound-by-construction: **no amount of stall-metric chasing will
+      help a kernel that cannot fill the machine**, which is the trap that consumed three built-and-
+      discarded experiments this cycle.
+
+      It also predicts which of the four screens above will pay off on which kernel, so it is worth
+      doing *first* even though it produces no measurement: a kernel at 0.3 machine-fulls does not
+      need its consume loop widened, it needs more blocks.
 
 - [ ] **Nobody knows the register decomposition of any kernel except one, and occupancy work has to
       be bought from the part nobody has measured.** `-Xptxas -v` appears nowhere in this file. The
