@@ -332,10 +332,11 @@ to twelve figures. Route changes are not a quality risk.
   MoE's 40-45% figures are compared against, which failed first time on the PowerShell `|` bug) and
   section 3 (the prefill MLP GEMMs, where memory, tile shape and dequantization are all already
   ruled out and only issue rate / shared-memory feeding / occupancy remain). §2c has both.
-- **The perplexity drift bisect is scoped and unstarted**: 392 commits, ~nine steps at 20-30 minutes
-  each, about four hours of exclusive GPU time. It is a repository question rather than a hardware
-  one, but the baseline figures it bisects against were measured here. §3 has the constraints,
-  including that three candidates are already eliminated.
+- **The perplexity drift bisect is started, and it found two transitions rather than one**:
+  −0.0092% then −0.0101%, summing to the recorded −0.0193%. So it is two bisects, not one, and
+  both must run `--first-parent` because the commits inside the upstream catch-up merge declare
+  `CMAKE_CUDA_ARCHITECTURES=120a` and cannot be built on this card. That cuts the range from 477
+  commits to 96. §3 has the measured endpoints and the three eliminated candidates.
 - **`ninfer_qwen3_6_27b_score_real_test`** and its siblings need `NINFER_*_WEIGHTS` set or they skip.
   A skip is not a pass, and under `compute-sanitizer` a skip surfaces as
   *"Target application terminated before first instrumented API call"*.
@@ -355,10 +356,10 @@ Ordered by expected value, not by section.
 | `w8_pair` medium discards its schedule on sm_86 | 3 | **done**: C48 and C64 instantiated, 13-17% over the chunked loop on the routed `{33,64}` band | closed |
 | sm_86 fallback constants chosen to fit | 2c | sweep the alternatives at the eleven `NINFER_SM8X_COMPAT` sites | GPU time only |
 | Cold-flush margins overstate wins | 3 | **answered, and the tidy rule is wrong**: three boundaries checked in situ came out −0.78%, +2.85% and +13.59% against +5.9%, +13.2% and +8.0% cold. A narrow margin is a reason to check, not a predictor of direction | closed |
-| Perplexity drift 0.019% | 3 | the scoped four-hour bisect | exclusive GPU time |
+| Perplexity drift 0.019% | 3 | **started**: it is *two* transitions (−0.0092% + −0.0101%), so two `--first-parent` bisects. A single bisect would name one commit and mislead the next person | exclusive GPU time |
 | Speculative decoding not bit-identical to greedy | 3 | decide whether it should be; the divergence is a reduction-order effect in k+1-column verification and MTP reproduces it, so it predates DFlash2 | judgement, not measurement |
 | DFlash2 corpus acceptance on real text | 3 | bake a diverse corpus with `make_bench_corpus.py --source-text`, or extend the real-text sweep to report acceptance | a local HF tokenizer, which this box lacks |
-| `27b_load_plan` DFlash2 binding matrix | 3 | needs the *old* Qwen3.8 artifacts and the NVFP4 DFlash2 artifact | artifacts nobody has |
+| `27b_load_plan` DFlash2 binding matrix | 3 | **half of it can run now**: both groupwise artifacts are on this disk (the "old" one is `models/qwen3_8_27b.ninfer`, SHA-verified). The two NVFP4 ones were never published and would have to be converted locally | artifacts nobody has |
 | DFlash2 + multi-GPU expert offload | 2 | genuinely blocked | a second GPU |
 
 Two of those fourteen are hard-blocked on things no amount of work here provides (a second GPU, and
@@ -486,25 +487,33 @@ question, and which one produced a wrong answer and why.
 
 Every item in the previous version of this list is now closed. What follows is what a fresh agent
 should do first, and the ordering is by expected value rather than by section. The full
-seventeen-item table with what each one needs is in "Handing this off to another machine" above.
+sixteen-item table with what each one needs is in "Handing this off to another machine" above.
 
-**Where the open work actually is: §2c (8 items) and §3 (8 items), plus one blocked item in §2.**
+**Where the open work actually is: §2c (12 items), §3 (2), §2 (1, blocked) and §1 (1).** §2c grew
+by four in the 2026-09-10 pass — the four screens in §2c-vii — while §3 shrank from eight to two.
 Sections 1, 2b, 4, 5 and 6 are fully closed and say so in their headings — they are kept because
 the reasoning is what stops the same investigation being repeated, not because anything is owed
 there. The trailing unnumbered subsections after §7 are methodology notes with no items; the one on
 editing this file with a script is worth reading before you edit this file with a script.
 
-1. **Run `scripts/sweeps/admin-profile.ps1 -SkipPower` from an elevated shell.** Two `ncu` profiles
+1. **Screen the decode kernels for the L1/TEX-versus-DRAM gap** (§2c-vii). Three of this cycle's
+   six speedups came from that one signature, the fix is an already-merged code pattern, and the
+   rest of the kernel family has never been checked. One `ncu` pass, two metrics. This is first
+   because it is the only item on the list whose *fix* is already written.
+2. **Attribute the missing 26% of decode bandwidth to kernels** (§2c-vii), in the same `ncu` pass,
+   with the amplification screen alongside it. Everything below this line is a guess about where
+   the shortfall lives until that table exists — including the guesses in §2c.
+3. **Run `scripts/sweeps/admin-profile.ps1 -SkipPower` from an elevated shell.** Two `ncu` profiles
    are outstanding and both are cheap: the prefill MLP GEMMs (§2c — memory, tile shape and
    dequantization are all already ruled out, so only issue rate, shared-memory feeding and
    occupancy remain, and those need counters) and the contiguous-kernel baseline the MoE gather's
    40-45% figures are compared against. This is minutes of GPU time and it unblocks the largest
    compute-side item in the file.
-2. **Lock clocks for measurement: `nvidia-smi -lgc 1500`** (§3, elevated). The card drifts 3-5%
+4. **Lock clocks for measurement: `nvidia-smi -lgc 1500`** (§3, elevated). The card drifts 3-5%
    between processes, which is larger than most effects here — it forced every A/B this cycle to
    interleave its two binaries within each repetition and carry an unchanged control. This is the
    cheapest improvement to every future measurement in this repository and it is one line.
-3. **Two related kernel problems, and they are the real prizes** (§2c). Both are narrow-extent
+5. **Two related kernel problems, and they are the real prizes** (§2c). Both are narrow-extent
    weight streaming and both have a measured target:
    - `q5_linear_add`'s `mma_r64_c16` sits at **24%** of what its weight costs to stream once, flat
      from T=4 to T=16. Closing that is most of the eight-lane gap. **Not** by narrowing the tile —
@@ -512,23 +521,25 @@ editing this file with a script is worth reading before you edit this file with 
    - the quantized attention kernels pay **3.21x** int8's per-key cost (5.89 ns against 1.83 ns),
      which is the whole KV decode falloff. `rk8v4` reaches the flattest curve of all six formats
      with no shared arena at all, so the floor is demonstrably reachable.
-4. **Split the shared W8 path out of the MoE's 9-warp block** (§2c). The source already names this
+6. **Split the shared W8 path out of the MoE's 9-warp block** (§2c). The source already names this
    — `sparse_moe_d3_path_tiled_kernel` exists for it and says so — and it is what the 44.6%/58.6%
    "no eligible warp" reading measures. Do not chase launch geometry or batching first: both were
    measured this cycle and neither helps, because the kernel is 1.17 machine-fulls of work and an
    MoE does not amortise its routed weight read across a cohort.
-5. **Sweep the routed prefill pipeline-depth constant through the product** (§2c). `7/4` is
+7. **Sweep the routed prefill pipeline-depth constant through the product** (§2c). `7/4` is
    upstream's RTX 5090 number and an RTX 5090 has 16x this card's L2. Sweeping the constant is the
    method the source comment endorses over the operator fixture, which disagrees with the server by
    6x. GPU time only, no new code.
-6. **The perplexity drift bisect** (§3), when four hours of exclusive GPU time are available. Three
-   candidates are already eliminated and the current value is exactly reproducible, so the
-   remaining work is mechanical.
+8. **The perplexity drift bisect** (§3), when four hours of exclusive GPU time are available. Three
+   candidates are eliminated and the value is exactly reproducible — but it is **not** mechanical,
+   which is what this list said before the bisect was started. There are two transitions in the
+   range, so a single bisect converges on one and reports a cause that cannot reproduce the whole
+   drift. Bisect `838c8b5d..66378f06` and `66378f06..HEAD` separately, both `--first-parent`.
 
-Two of the seventeen open items are hard-blocked — one on a second GPU (§2), one on artifacts that
-no longer exist (§3) — and one is a judgement call about whether speculative decoding should be
-bit-identical to greedy rather than a measurement (§3). Everything else is actionable, and three of
-the newest items (§3: the A/B harness, a hash call, and a memory guard) need no GPU at all.
+Two of the sixteen open items are hard-blocked — one on a second GPU (§2), one on NVFP4 artifacts
+that were never published rather than deleted (§3, checked upstream 2026-09-10). Everything else is
+actionable, and **two of the four new screens need no GPU at all**: the register decomposition is
+one build with `-Xptxas -v`, and the narrow-extent parallelism arithmetic is pen and paper.
 
 **Keep `investigate/small-t-upstream` until the next catch-up.** It is merged, but it is the clean
 record of how upstream's small-T was adopted and what had to be fixed (`19c7617c` and its
@@ -536,7 +547,7 @@ parents). The next merge from `neroued/master` will touch the same subsystem.
 
 ---
 
-## 1. Correctness and coverage — closed
+## 1. Correctness and coverage — closed except the NVFP4 loadability decision
 
 - [ ] **The NVFP4 27B artifact cannot start at all on sm_86. It is a shipped, documented
       configuration and it is completely broken on this card.** Found 2026-09-09 while confirming
@@ -2711,6 +2722,99 @@ ceiling, and neither has had any optimisation attempted.
 
 ---
 
+### 2c-vii. Four screens nobody has run, and every kernel win this cycle came from one of them
+
+Written 2026-09-10, at the end of a cycle that shipped six speedups. Every open item above names
+**one kernel**. But all six wins came from applying the *same* three signatures to a kernel that
+nobody had checked, and none of those signatures has ever been run across the kernel set as a
+sweep. So the list is a list of kernels somebody happened to look at, and these four entries are
+the screens that would tell you which kernels to look at next. All four are cheap; two need no GPU
+at all.
+
+- [ ] **Nobody has attributed the missing 26% of decode bandwidth to any kernel.** The dense decode
+      is at **73.9% of the 854.2 GB/s this card can actually read**, and the analytic read-set is
+      **15.743 GB/token**. Both numbers are for the whole step. There is no per-kernel table, so
+      every remaining decision about what to optimise next is a guess about where the 26% lives —
+      including the guess in the entry above that block count takes up the slack in the q5 GEMV.
+
+      Build the table: `ncu --replay-mode application --metrics
+      dram__bytes_read.sum,gpu__time_duration.sum` over one clock-locked `-pg 4096,128` decode step,
+      then per kernel report measured bytes, duration, and implied GB/s against 854.2. Rank by
+      **bytes x (1 - achieved/854.2)** — the absolute time each kernel is leaving on the floor —
+      because ranking by percentage promotes tiny kernels and this is a bandwidth budget, not a
+      league table. `scripts/sweeps/admin-profile.ps1` already collects `dram__bytes_read.sum` for
+      the MoE section; this generalises that section to the whole step.
+
+      Use `--replay-mode application`. Kernel replay mirrors the 21 GB device working set into host
+      RAM and dies with `bad allocation` unless nothing else on the box is holding memory.
+
+- [ ] **Bytes-read amplification has been measured for exactly one kernel, and it was 4.9x.** The
+      metric is measured DRAM (or L1 sector) bytes divided by the kernel's *analytic* read-set. A
+      decode kernel that streams weights once should sit at 1.0. `d4` came out at
+      `l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum` = 2,560,000 sectors = **81.9 MB against
+      8.3 MB actually read from L2** — it re-reads its working set roughly five times through L1.
+      That was found by hand, on one kernel, chasing something else.
+
+      Nobody has run it as a screen. Any kernel above 1.0 is doing avoidable work, and on a machine
+      that is 26% short of its own read bandwidth an amplification factor is the most direct
+      possible pointer at where the shortfall is. Same ncu pass as the entry above plus the two
+      sector counters, so it is one profiling run for both. **Screen every decode kernel, rank by
+      amplification x bytes, and treat anything above ~1.2 as a defect rather than a tuning
+      opportunity** — re-reading a weight tile is not a trade-off, it is waste.
+
+- [ ] **The signature that produced three of this cycle's six speedups has never been run as a
+      screen.** It is: **L1/TEX throughput high while DRAM throughput is well below it.** That
+      combination means the kernel is limited by how fast its *consume loop* retires bytes, not by
+      how fast memory delivers them — the kernel is issuing far more load instructions than the
+      bytes require, usually because each lane consumes one or two weights per trip.
+
+      It was found three times and fixed three times with the same two code changes, both now
+      shipped and available to copy:
+
+      | kernel | before | after | fix |
+      |---|---|---|---|
+      | `q5_rowsplit_gemv` | L1/TEX 87%, DRAM 50% | L1/TEX 37% | widen the consume loop to 8 weights/lane |
+      | `q4_linear_swiglu_gemv` | same shape | — | same widening, gate+up as 4-byte words |
+      | `q5_rowsplit_gemv` (dequant) | Compute 73% | 68.5%, DRAM 66.7% | half2 bit-trick + per-group scale hoist |
+
+      Together those moved dense decode **37.44 → 40.11 tok/s**. The remaining quantized GEMV and
+      GEMV-shaped kernels have never been checked for the same signature, and the fix is a known,
+      reviewed, already-merged pattern rather than a design problem. **This is the highest
+      expected-value mechanical item on the list**: one ncu pass over the decode kernel set
+      collecting `l1tex__throughput.avg.pct_of_peak_sustained_active` and
+      `dram__throughput.avg.pct_of_peak_sustained_elapsed`, then rank by the *gap* between them.
+
+      The half2 bit-trick is in `src/ops/linear/q5/q5_rowsplit_gemv.cuh`: half `0x6400` is 1024.0
+      and its mantissa LSB is 1.0, so OR-ing a nibble into the mantissa and subtracting the bias
+      `0x6410` (1040.0) yields `nibble - 16*high_bit`, which is `sign_extend<5>` for free. Any
+      kernel dequantizing 4- or 5-bit codes can use it.
+
+- [ ] **Nobody knows the register decomposition of any kernel except one, and occupancy work has to
+      be bought from the part nobody has measured.** `-Xptxas -v` appears nowhere in this file. The
+      prefill MLP entry established the principle the hard way: `q4a8_swiglu`'s 124 registers are
+      **32 accumulators and 92 of overhead**, the overhead term is what actually caps occupancy at
+      one block per SM, and the fix therefore has to come out of staged fragments and prefetch depth
+      rather than out of the accumulator array. That decomposition exists for that one kernel
+      because I worked it out by hand after getting it wrong.
+
+      It is available for every kernel at once, for the cost of one build: add `-Xptxas -v` and read
+      registers, spill stores and spill loads per kernel out of the log. Then compute, per kernel,
+      `65,536 / (regs x 32)` warps per SM and compare against what the kernel needs. **Zero GPU
+      time.** Two things this would surface that nothing on the list currently can:
+
+      1. **Spills already happening.** Forcing occupancy with `__launch_bounds__(kThreads, 2)` on
+         the prefill MLP cost **69.5%** (1,148.63 → 350.48 tok/s) purely because the compiler spilled
+         to reach 64 registers. Any kernel already spilling is paying that silently, and the log
+         says so for free.
+      2. **Which occupancy shortfalls are register-bound at all.** Both quantized KV decode
+         attention kernels reach only **33% of their own theoretical occupancy** (21.98 of 66.66 for
+         int8, 16.51 of 50.00 for fp8 — the same ratio to two figures). If their register counts are
+         low, the shortfall is not register pressure and the arena/grid work named in that entry is
+         the right target; if they are high, that entry is aimed at the wrong thing. Nobody can tell
+         which today.
+
+---
+
 ## 3. Measurement debt
 
 - [x] **The interleaved A/B harness is committed. Closed 2026-09-09** as
@@ -3023,12 +3127,104 @@ ceiling, and neither has had any optimisation attempted.
       need not be treated as a quality risk.
 
       What is left is a genuine numerics change in some kernel between 29 August and 9 September.
-      The range is **392 commits**, which includes the whole upstream catch-up, so a bisect is
-      about nine steps at roughly 20-30 minutes each — one build plus one 8-minute
-      `ninfer-perplexity` run — call it four hours of exclusive GPU time. Worth scheduling as a
-      block rather than squeezing between other work. Note the three shifts are *not* uniform
-      (−0.0193%, −0.0163%, −0.0092% for `int8`, `bf16`, `rk8v4`), so whatever it is does not simply
-      offset every score by a constant.
+      Note the three shifts are *not* uniform (−0.0193%, −0.0163%, −0.0092% for `int8`, `bf16`,
+      `rk8v4`), so whatever it is does not simply offset every score by a constant.
+
+      **The bisect was started 2026-09-10 and it has already falsified this entry's central
+      assumption, which is that there is one change to find.** There are at least two. Measured
+      endpoints and the first interior point, all `int8`, all 261,167 scored tokens:
+
+      | commit | date | perplexity |
+      |---|---|---:|
+      | `838c8b5d` (old, `git bisect good`) | 2026-08-29 | 4.343262550659062 |
+      | `66378f06` | 2026-09-03 | **4.342864374753507** |
+      | `HEAD` (new, `git bisect bad`) | 2026-09-10 | 4.342425372232802 |
+
+      `66378f06` is a **third value**, not either endpoint, so the interval contains two distinct
+      transitions: `838c8b5d → 66378f06` is −0.0092% and `66378f06 → HEAD` is −0.0101%. They sum
+      to −0.0193%, which is exactly the total `int8` drift recorded above — so this is not a third
+      measurement wobbling around one step, it is two steps of almost equal size that happen to add
+      up to the published gap. **A plain `git bisect` cannot find two transitions**; it will converge
+      on whichever one it happens to bracket and report it as the cause, and the next person will
+      then be unable to reproduce the full 0.019% from that one commit. Each half has to be bisected
+      separately.
+
+      **And the bisect must be run `--first-parent`.** The naive walk descends into the upstream
+      catch-up branch, where the code predates the sm_86 port: at `00f02055` CMake refuses outright
+      with *"NInfer supports only CMAKE_CUDA_ARCHITECTURES=120a; got '86'"*. Those commits cannot be
+      built on this card at all, so they are not `skip`-able noise, they are a region the bisect must
+      not enter. `git bisect start --first-parent` cuts the range from 477 commits to **96** (79 of
+      them merges), every one of which is sm_86-capable, and it is also the right granularity: a
+      merge commit identifies the PR that moved the number, which is the answer anyone actually
+      wants.
+
+      **Build only the target you run.** `cmake --build build-ninja` builds the test binaries too,
+      and at `de5fc15a` `tests/ops/softmax_attention/causal_cache.cpp` fails to compile under MSVC
+      (`error C3493: 'order' cannot be implicitly captured`) for reasons that have nothing to do
+      with perplexity. Passing `--target ninfer-perplexity` avoids skipping a perfectly measurable
+      commit, and cuts each step's build time as well. `scripts/sweeps/ppl-bisect-step.ps1` does
+      this.
+
+      **A commit that does not touch `src/`, `include/` or `apps/` cannot move the number, so filter
+      before you measure.** Of the 25 first-parent commits in the later half, 16 are scripts, docs or
+      release commits and 6 more touch only `src/serve` (which `ninfer-perplexity` does not link),
+      `src/core/nvtx.h` or a chat template. That leaves 3 real candidates out of 25. The filter is
+      one line and it turned a 5-step bisect into a 2-step one:
+
+      ```
+      git log --first-parent --format='%h|%s' A..B | while IFS='|' read h s; do
+        printf '%s src=%s %s
+' "$h" "$(git diff --name-only $h^ $h -- 'src/*' 'include/*' 'apps/*' | wc -l)" "$s"
+      done
+      ```
+
+      **Transition 2 is `1c12516e`, "Upstream catch-up: DFlash2 unblocked, measured sm_86 route
+      boundaries, upstream small-T adopted (#16)" — pinned to one commit, −0.0101%.** Measured
+      2026-09-10, all `int8`, all 261,167 scored tokens:
+
+      | commit | date | perplexity | |
+      |---|---|---:|---|
+      | `64403ada` dual-GPU graph mode (#15) | 2026-09-07 | 4.34286437475351 | mid |
+      | `1c12516e` upstream catch-up (#16) | 2026-09-08 | **4.3424253722328** | **new** |
+      | `de5fc15a` (#34) | 2026-09-08 | 4.3424253722328 | new |
+
+      `1c12516e`'s first parent *is* `64403ada`, so there is nothing between them: the transition is
+      that merge. Note `64403ada` rewrote 47 source files including every dense causal-cache
+      attention kernel and moved the score **not at all** — more evidence for §3's finding that
+      kernel and tile refactors do not perturb perplexity.
+
+      **The mechanism inside `1c12516e` is not yet isolated, and two of the three obvious suspects
+      are already ruled out by reading.** 153 files under `src/ops/` changed. Of them:
+
+      - **`src/ops/kv_cache/int8_g64_codec.cuh` is not it**, despite being the int8 KV codec. The
+        change is a pure addition (42 lines, 0 deletions) of f16 loaders, and
+        `prompt_i8.cuh` switching to them is provably bit-identical: the old form multiplied an
+        int8 code by an f16 scale in `half2`, the new form in FP32 before a single rounding, and an
+        8-bit code times an 11-bit scale needs 19 bits, exact in FP32's 24. Both round exactly once
+        to the same value. Upstream also verified it empirically, byte-identical `OP_ERROR_STATS`.
+      - **The route-boundary half of the commit is not it either**, by §3's own tile-geometry
+        result above.
+      - **`src/ops/kernel/rmsnorm.cuh` is the leading candidate.** It gained a `FixedD` template
+        parameter that replaces the runtime `d` with a compile-time constant. No arithmetic was
+        edited — but a constant trip count is exactly what lets the compiler fully unroll and
+        **re-associate the sum-of-squares reduction**, which changes rounding. RMSNorm runs on every
+        layer of every token, and it is format-independent, which is the only kind of mechanism that
+        can explain `bf16` KV moving (−0.0163%) alongside `int8` and `rk8v4`. Confirm it by
+        building `1c12516e` with the `FixedD` specializations forced off and re-scoring.
+
+      **Transition 1 is somewhere at or before `04e22c3f` and has three candidates left.**
+      `04e22c3f` "Merge neroued/master: full upstream catch-up" (2026-09-04) already reads
+      4.34286437475351, the mid value, so the first step happened at or before it. Surviving
+      candidates after the source filter, oldest first: **`b4ca75a9`** (`feat/w4a8-prefill`, 338
+      source files — the W4A8 prefill path the harness runs on every window, and the a priori
+      favourite), **`d015eb7f`** (`feat/vision-on-demand-residency`, 59), and `04e22c3f` itself
+      (175). Two more measurements at most.
+
+      **A warning for whoever runs those two.** `scripts/sweeps/ppl-bisect-step.ps1` classifies
+      against a single threshold, which is correct for transition 2 (mid and old both count as
+      "good") and **wrong for transition 1**, where the two values to separate are 4.343263 and
+      4.342864 and the printed verdict line will say "OLD" for both. Read the printed perplexity,
+      not the verdict.
 
 - [ ] **`27b_load_plan`'s DFlash2 binding matrix needs four artifacts. Two are on this disk today
       — one of them misidentified all along — and the other two were never published.** Checked
