@@ -9,8 +9,17 @@ before anything else.
 
 Released: **v0.9.0-rtx3090** (Windows + Linux). Full suite **126/126** on this box.
 
-**Two speedups have shipped on this Op, both on the same boundary, and the second one came from
-noticing the first had measured the wrong kernel.** Adding C8 and C16 tiles to the GDN input
+**Four speedups shipped this cycle, and the two biggest came from one measurement: `Mem Pipes Busy`
+at 81% while DRAM sat at 50%.** Widening the Q5 and Q4 GEMV consume loops from one code byte per
+lane to a 4-byte word — eight weights instead of two, a 4x cut in memory-pipe instructions for
+identical arithmetic — is worth **+3.90%** and **+1.95%** on the 27B dense decode, about **+5.9%
+compounded**, each 6 of 6 paired repetitions. The q4 SwiGLU pair now runs at **85.3% of DRAM**,
+which is the ceiling this file exists to reach; the q5 GEMV became **compute-bound at 73%**, a
+different problem than any other entry here. A third, `sparse_moe_d2`'s branch-free sorting network,
+is **+3.15% on the 35B**. See §2c.
+
+**Two speedups have shipped on the GDN input projection, both on the same boundary, and the second
+one came from noticing the first had measured the wrong kernel.** Adding C8 and C16 tiles to the GDN input
 projection was worth **+5.7% on the C8 serving profile** and +5.3% on DFlash2 at four draft tokens.
 Then instantiating the existing split-K direct kernel past its `T <= 6` throw made *it* the winner at
 width 8 — **+2.85% end to end, 6 of 6 paired repetitions, against a control that drifted 0.09%.**
@@ -1619,18 +1628,54 @@ mechanism, and it is not tile geometry.**
       which is the largest single-model gain this file records. The 35B is unmoved by either, as
       expected: its decode is the `sparse_moe` expert kernels.
 
-- [ ] **What is left in the GEMV path, and it is no longer the memory pipe.** After both widenings
-      the `q5_rowsplit_gemv` instantiations sit at **54-59% of DRAM** with `Mem Pipes Busy` down at
-      34-37%. Nothing is saturated, so there is more to take — but the constraint has moved and
-      **guessing what it is now would repeat exactly the mistake the last two entries were written
-      to correct.** Re-profile first: one `ncu` run over the same three instantiations plus the q4
-      pair, reading `SpeedOfLight` and the warp-stall breakdown
-      (`smsp__warp_issue_stalled_*_per_warp_active.pct`, which works without PC sampling).
+- [x] **Re-profiled after both widenings, and the constraint moved — differently for each kernel.
+      One is now at the bandwidth ceiling; the other became compute-bound.** Measured 2026-09-10,
+      `ncu`, clocks locked, six launches each, medians:
 
-      Two candidates worth naming only so the profile can rule on them, not to act on: the staging
-      side is now a larger share of a smaller total, and at 34-37% pipe utilisation the kernels may
-      simply be latency-bound on the cp.async pipeline depth (`kStages`), which is a tuning knob
-      rather than a rewrite.
+      | | `q4_linear_swiglu_gemv_pair` | `q5_rowsplit_gemv` |
+      |---|---:|---:|
+      | **DRAM throughput** | **85.26%** | 55.83% |
+      | L1/TEX throughput | 42.10% | 36.84% |
+      | **Compute (SM) throughput** | 76.15% | **73.31%** |
+      | stall: `wait` | **17.84%** | 5.88% |
+      | stall: `long_scoreboard` | 6.53% | 10.37% |
+      | stall: `barrier` | 3.39% | 6.39% |
+
+      **The q4 SwiGLU pair is essentially done: 85.26% of DRAM.** That is the state this whole file
+      is aiming at — a weight-streaming kernel actually limited by the memory it has to read. There
+      is no meaningful headroom left in it, and anyone who "optimises" it further will be trading
+      against bandwidth.
+
+      **The q5 GEMV is now compute-bound, not memory-bound: SM throughput 73.31% against DRAM
+      55.83%.** Removing the memory-pipe bottleneck promoted the dequantization arithmetic to the
+      constraint — the per-weight `sign_extend`, int-to-float conversion and `fmaf` chain. That is a
+      different kind of problem from everything else in this file and wants a different fix: fewer
+      or cheaper operations per weight (a `__dp4a`-style integer dot product, or the s8 tensor cores
+      the groupwise-int prefill path already uses), not better memory scheduling.
+
+      Note the stall totals are now *low* on both — the largest single reason is 17.84% — where the
+      pre-widening kernel had 81-86% of a pipe busy. Neither kernel is latency-starved any more,
+      which retires the `kStages` pipeline-depth candidate this entry named before profiling: at
+      these utilisations there is nothing for a deeper pipeline to hide.
+
+- [ ] **The q5 GEMV's dequantization arithmetic is the last identified decode constraint, and it is
+      a compute problem.** From the profile above: SM throughput 73.31% with DRAM at 55.83%, so
+      the kernel now has bandwidth headroom and spends it on unpacking. Per weight it does a shift,
+      a mask, an OR with the high bit, a 5-bit sign-extend, an int-to-float convert, a multiply by
+      the group scale and an `fmaf`.
+
+      Two directions, both real work, neither yet costed:
+
+      1. **Integer dot product.** Accumulate in int32 with `__dp4a` over four weights at a time and
+         apply the group scale once per group rather than per weight. The scale is already
+         per-group, so this is arithmetically exact rather than an approximation — it moves the
+         multiply out of the inner loop.
+      2. **The s8 tensor cores**, which Ampere has and which `q4a8_swiglu` already uses on the
+         prefill path. A T=1 GEMV is a poor fit for an MMA shape, so this is the less likely of the
+         two, but it is the same hardware the prefill path reaches for.
+
+      Do not start either without costing the current arithmetic first — the mistake this file keeps
+      recording is acting on a plausible mechanism before measuring which term dominates.
 
       This is the missing explanation for "the dense path sits around two-thirds of what the card
       can deliver". `q5_rowsplit_gemv` on the 27B decode, from the same elevated run:
