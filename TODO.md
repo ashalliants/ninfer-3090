@@ -400,6 +400,7 @@ NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS=C:\Ninefer-3090\models\qwen3_8_27b_dflash2.ni
 NINFER_QWEN3_6_35B_A3B_WEIGHTS=C:\Ninefer-3090\models\qwen3_6_35b_a3b.ninfer
 NINFER_QWEN3_6_27B_WEIGHTS=C:\Ninefer-3090\models\qwen3_6_27b.ninfer
 NINFER_QWEN3_6_27B_NVFP4_WEIGHTS=C:\Ninefer-3090\models\qwen3_6_27b_nvfp4.ninfer
+NINFER_QWEN3_8_27B_OLD_WEIGHTS=C:\Ninefer-3090\models\qwen3_8_27b.ninfer
 NINFER_REAL_TEST_MAX_CONTEXT=8192      # only needed for the 35B
 ```
 
@@ -3021,12 +3022,52 @@ ceiling, and neither has had any optimisation attempted.
       (−0.0193%, −0.0163%, −0.0092% for `int8`, `bf16`, `rk8v4`), so whatever it is does not simply
       offset every score by a constant.
 
-- [ ] **`27b_load_plan` skips its DFlash2 binding matrix** for want of the *old* Qwen3.8 artifacts
-      (`NINFER_QWEN3_8_27B_OLD_WEIGHTS`, `NINFER_QWEN3_8_27B_NVFP4_OLD_WEIGHTS`) and the NVFP4
-      DFlash2 artifact. Everything else in that test now runs and passes (#46). This is the last
-      real coverage gap in the real-model suite and it is an artifact problem, not a defect —
-      check whether upstream still publishes those revisions before treating it as out of reach,
-      which is the move that closed both §2 artifact entries last cycle.
+- [ ] **`27b_load_plan`'s DFlash2 binding matrix needs four artifacts. Two are on this disk today
+      — one of them misidentified all along — and the other two were never published.** Checked
+      upstream 2026-09-10, which is what this entry told the next person to do.
+
+      `huggingface.co/neroued/Qwen3.8-27B-NInfer` has four commits and has only ever published one
+      `.ninfer` file:
+
+      | commit | date | |
+      |---|---|---|
+      | `dc370fb6295a` | 2026-09-06 | Update artifact with DFlash2 companion weights |
+      | `18dfc887423f` | 2026-08-19 | docs(eval): publish qwen3.8 groupwise-int results |
+      | `3526913004b1` | 2026-08-14 | Add Qwen3.8-27B NInfer artifact |
+      | `6925b5541b49` | 2026-08-06 | initial commit |
+
+      **`qwen3_8_27b_nvfp4.ninfer` returns 404 at the pinned revision and appears in no commit's
+      file list.** So the two NVFP4 artifacts are not "deleted", they were never published, and no
+      amount of revision archaeology will produce them.
+
+      **The two groupwise ones are both here.** `qwen3_8_27b.ninfer` at the pre-DFlash2 revision
+      `18dfc887` is 18,210,531,328 bytes with SHA-256
+      `eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e` — **byte-identical to
+      `models/qwen3_8_27b.ninfer` on this box**, hash verified, not inferred from the size. So the
+      artifact this entry has been calling missing has been sitting in `models/` the whole time
+      under its plain name, because `dc370fb6` later *replaced* the same filename upstream with the
+      DFlash2 build, which is our `qwen3_8_27b_dflash2.ninfer`. That is the second time this cycle
+      an artifact was "missing" only from the env block; see the note under "Environment for the
+      real-model tests".
+
+      | the matrix wants | status |
+      |---|---|
+      | `NINFER_QWEN3_8_27B_OLD_WEIGHTS` | **have it** — `models/qwen3_8_27b.ninfer`, SHA-verified as rev `18dfc887` |
+      | `NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS` | **have it** — `models/qwen3_8_27b_dflash2.ninfer` |
+      | `NINFER_QWEN3_8_27B_NVFP4_OLD_WEIGHTS` | **never published** |
+      | `NINFER_QWEN3_8_27B_NVFP4_DFLASH2_WEIGHTS` | **never published** |
+
+      So this is no longer "artifacts nobody has". It is **half a matrix that can run once the env
+      block names the old artifact**, and a second half that would have to be **converted locally**
+      — `tests/convert/qwen3_8_27b/test_nvfp4_inventory.py` says a Qwen3.8 NVFP4 recipe exists in
+      this repo, so that is a conversion job rather than a download, and it needs the source
+      weights and disk for two more ~18 GB artifacts.
+
+      **Worth weighing against §1 before doing it:** NVFP4 weights cannot be loaded on sm_86 at all,
+      so a locally converted Qwen3.8 NVFP4 artifact would exercise the binding matrix's *planning*
+      path and nothing else on this card.
+
+      *Fixing the env block is the free half and is done below.*
 
 - [x] **DFlash2 acceptance on realistic text — measured 2026-09-09, and it is nothing like the
       committed corpus's answer.** `scripts/sweeps/dflash2-draft-tokens-realtext.ps1` now parses the
