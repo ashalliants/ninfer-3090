@@ -15,8 +15,16 @@
 # 00f02055). Those commits are unbuildable on this card -- not flaky, unbuildable -- and
 # --first-parent both avoids them and cuts the range from 477 commits to 96.
 #
-# COPY THIS FILE OUT OF THE REPO BEFORE YOU START. `git bisect` checks out commits that predate it,
-# which deletes it mid-run. Run the copy, pass -Repo, and it will Set-Location there itself.
+# COPY THIS FILE OUT OF THE REPO BEFORE YOU START, WITH ITS TWO HELPERS. `git bisect` checks out
+# commits that predate them, which deletes them mid-run:
+#
+#   copy scripts\sweeps\ppl-bisect-step.ps1 scripts\sweeps\model-dir.ps1 ^
+#        scripts\sweeps\host-memory.ps1 C:\bisect
+#   powershell -NoProfile -File C:\bisect\ppl-bisect-step.ps1 -Repo C:\ninfer-fork\ninfer-3090
+#
+# Copying this file alone works only while the checked-out commit still has the helpers, and the
+# earlier half of the range does not -- host-memory.ps1 was added 2026-09-10. Pass -Repo and the
+# script Set-Locations there itself.
 #
 # Run from (or pointed at) a detached HEAD under `git bisect`, then classify:
 #
@@ -40,11 +48,37 @@ param(
 )
 $ErrorActionPreference = 'Continue'
 
-# Dot-source from $PSScriptRoot BEFORE Set-Location. Note this file is meant to be run from a copy
-# outside the repo (see the header): $PSScriptRoot then points at the copy's directory, so keep
-# model-dir.ps1 and host-memory.ps1 beside the copy and pass -Repo.
-. "$PSScriptRoot\model-dir.ps1"
-. "$PSScriptRoot\host-memory.ps1"
+# Resolve the two shared helpers BEFORE Set-Location, and from either place they can legitimately
+# live, because this file is meant to be run from a copy outside the repo (see the header):
+#
+#   * beside the copy -- $PSScriptRoot, which is the copy's own directory;
+#   * in the checkout -- $Repo\scripts\sweeps, which works only when the checked-out commit
+#     actually has them. It often will not: host-memory.ps1 was added 2026-09-10 and every commit
+#     the earlier half of this bisect visits predates it. That is why depending on the repo copy
+#     alone is wrong here, and why the copy's own directory is tried first.
+#
+# If neither has them, fail with the command to fix it. A bare `. "$PSScriptRoot\model-dir.ps1"`
+# on a lone copy dies with "The term ... is not recognized", which says nothing about what to do.
+$helperDirs = @($PSScriptRoot, (Join-Path $Repo 'scripts\sweeps'))
+foreach ($helper in @('model-dir.ps1', 'host-memory.ps1')) {
+  $found = $helperDirs | Where-Object { $_ } |
+           ForEach-Object { Join-Path $_ $helper } |
+           Where-Object { Test-Path -LiteralPath $_ } |
+           Select-Object -First 1
+  if (-not $found) {
+    Write-Error @"
+missing helper: $helper
+
+Looked in:
+$($helperDirs | Where-Object { $_ } | ForEach-Object { "  $_" } | Out-String)
+Copy the three files together, then run the copy:
+
+  copy scripts\sweeps\ppl-bisect-step.ps1 scripts\sweeps\model-dir.ps1 scripts\sweeps\host-memory.ps1 <somewhere outside the repo>
+"@
+    exit 1
+  }
+  . $found
+}
 
 Set-Location $Repo
 
