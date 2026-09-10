@@ -32,7 +32,13 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (policy == LinearPolicy::A16Only) {
         if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
         if (tokens <= 16) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
-        throw std::invalid_argument("nvfp4 linear_swiglu A16 is registered only through T=16");
+        // Deliberately verbose. This throw fires during *runtime planning*, before a token
+        // is processed, so on sm_86 it is the entire user-visible symptom of an artifact
+        // that cannot be loaded at all -- and "registered only through T=16" gives an
+        // operator nothing to act on. It took a full-suite run and a bisect of two
+        // deliberate decisions to work out why; the message now carries that.
+        throw std::invalid_argument(
+            "nvfp4 linear_swiglu: the A16 route is registered only through T=16, and on sm_86 A16 is the only policy available for NVFP4 weights (no NVFP4 tensor-core path), so this artifact cannot serve a prefill chunk wider than 16 columns on this architecture. See TODO.md section 1. Use a groupwise-int artifact here, or build for sm_89+ where AllowA4 handles any width.");
     }
     if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
     if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }

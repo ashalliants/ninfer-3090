@@ -562,10 +562,30 @@ parents). The next merge from `neroued/master` will touch the same subsystem.
          passing T ≤ 16 path by construction, no new kernel — but it re-reads the whole MLP weight
          per chunk, so a 1,024-token chunk streams the ~89 MB gate_up 64 times. Correct and
          unusably slow; mentioned only so nobody proposes it as the easy answer.
-      4. **Reject the artifact at load with a clear message** if A16 NVFP4 is not meant to be
-         supported here. Failing in `planning runtime` with a route-registration string is the worst
-         of both worlds; "NVFP4 weights require sm_89 or newer" at load is honest and costs nothing.
-         This is the right *interim* step regardless of which of (2) is eventually done.
+      4. ~~Reject the artifact at load with a clear message~~ — **the message half is done
+         (2026-09-10); the artifact still does not load.** Failing in `planning runtime` with
+         "registered only through T=16" gave an operator nothing to act on, and working out why took
+         a full-suite run plus a bisect of two deliberate decisions. Both throw sites now say what
+         is wrong, why it is architectural, and what to do instead:
+
+         ```
+         error: startup failed | planning runtime | 40.3 ms
+         error: nvfp4 linear_swiglu: the A16 route is registered only through T=16, and on sm_86
+         A16 is the only policy available for NVFP4 weights (no NVFP4 tensor-core path), so this
+         artifact cannot serve a prefill chunk wider than 16 columns on this architecture. See
+         TODO.md section 1. Use a groupwise-int artifact here, or build for sm_89+ where AllowA4
+         handles any width.
+         ```
+
+         `nvfp4_gdn_snapshot_plan.cpp` got the same treatment even though it is normally unreachable
+         (the SwiGLU throws first), because a reader who lands there has fixed the SwiGLU and needs
+         to know this is the next wall.
+
+         **This is deliberately not a load-time rejection, and the item stays open because of it.**
+         Whether sm_86 should refuse the artifact outright, or gain the FP32-intermediate route in
+         (2), is a product call about a documented configuration rather than a bug fix — it is not
+         mine to make. Making the existing failure legible removes nothing, since nothing worked
+         before.
       5. Either way, **`docs/cli.md` must stop using an NVFP4 artifact as its worked example on a
          page whose own banner is about this fork's sm_86 target**, and the model table in this file
          should say the artifact does not load here.
