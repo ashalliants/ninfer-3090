@@ -44,6 +44,7 @@ platforms.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shlex
 import statistics
@@ -78,6 +79,26 @@ class Config:
     samples: list[Sample] = field(default_factory=list)
 
 
+def split_command(command: str) -> list[str]:
+    r"""Split a command string into argv, without eating Windows path separators.
+
+    shlex's POSIX mode treats backslash as an escape character, so an absolute Windows path is
+    silently mutilated rather than rejected: C:\ninfer-fork\build-ninja\apps\x.exe comes back as
+    "C:ninfer-forkbuild-ninjaappsx.exe", which then fails as a missing file for a reason the
+    message does not mention. Non-POSIX mode keeps separators intact but leaves quotes attached to
+    the token, so strip one matched pair -- that is what the shell would have consumed.
+    """
+    if os.name != "nt":
+        return shlex.split(command, posix=True)
+    tokens = shlex.split(command, posix=False)
+    stripped: list[str] = []
+    for token in tokens:
+        if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
+            token = token[1:-1]
+        stripped.append(token)
+    return stripped
+
+
 def parse_config(spec: str, *, is_control: bool) -> Config:
     if ":" not in spec:
         raise argparse.ArgumentTypeError(f"expected 'label:command', got {spec!r}")
@@ -85,7 +106,7 @@ def parse_config(spec: str, *, is_control: bool) -> Config:
     label = label.strip()
     if not label:
         raise argparse.ArgumentTypeError(f"empty label in {spec!r}")
-    argv = shlex.split(command, posix=True)
+    argv = split_command(command)
     if not argv:
         raise argparse.ArgumentTypeError(f"empty command in {spec!r}")
     if not any("{exe}" in token for token in argv):

@@ -29,13 +29,37 @@
 [CmdletBinding()]
 param(
   [string]$Repo   = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path,
-  [string]$Model  = 'models\qwen3_8_27b.ninfer',
+  # Left empty on purpose: resolved below through Get-NInferModelDir, the same contract every other
+  # sweep here uses. A param() default cannot do it -- $PSScriptRoot is empty while a default is
+  # being bound, so a repo-relative path written here resolves against the drive root and silently
+  # yields C:\models. See the comment at the top of model-dir.ps1.
+  [string]$Model  = '',
   [string]$Out    = 'profiles\ppl_bisect',
   [string]$VcVars = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat',
   [string]$Cuda   = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin\nvcc.exe'
 )
 $ErrorActionPreference = 'Continue'
+
+# Dot-source from $PSScriptRoot BEFORE Set-Location. Note this file is meant to be run from a copy
+# outside the repo (see the header): $PSScriptRoot then points at the copy's directory, so keep
+# model-dir.ps1 and host-memory.ps1 beside the copy and pass -Repo.
+. "$PSScriptRoot\model-dir.ps1"
+. "$PSScriptRoot\host-memory.ps1"
+
 Set-Location $Repo
+
+if (-not $Model) { $Model = Join-Path (Get-NInferModelDir) 'qwen3_8_27b.ninfer' }
+if (-not (Test-Path -LiteralPath $Model)) { Write-Error "missing artifact: $Model"; exit 1 }
+
+# The output directory must exist before the redirection below, not after. `> "$Out.log"` is
+# evaluated by the shell, so on a fresh checkout with no profiles\ directory the run dies on the
+# redirect having already built -- twelve minutes for nothing.
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Out) | Out-Null
+
+# A step scores an 18.2 GB artifact, and a scoring run that pages does not give a wrong number, it
+# gives a plausible one -- see host-memory.ps1. Guard before the build, so a shortfall costs
+# seconds rather than a build plus eight minutes of scoring.
+Assert-NInferHostMemory -Artifacts @($Model)
 
 $sha = (git rev-parse --short HEAD).Trim()
 "== bisect step at $sha  ($(git log -1 --format='%ad %s' --date=short))"

@@ -3955,10 +3955,23 @@ once mentioned `-rgc`**, which is how a measurement convenience becomes a machin
   restores it.** `-lgc <n>` pairs with `-rgc`. `-pl <n>` pairs with `-pl 315` on this box — check
   `nvidia-smi --query-gpu=power.limit --format=csv` first and restore what you actually found, not
   what this file says.
-- **Verify afterwards, because a failed restore is silent.** The card is clean when
-  `nvidia-smi -q -d PERFORMANCE` reports **`Applications Clocks Setting : Not Active`** and
-  `power.limit` reads what it read before you started. Check both at the end of a measuring
-  session, not just after the command.
+- **Verify afterwards, because a failed restore is silent — and verify it the right way, because
+  `-lgc` is invisible to every `nvidia-smi` report field on this driver.** Checked 2026-09-10 with
+  a lock actually held: `nvidia-smi -q -d PERFORMANCE` still said
+  `Applications Clocks Setting : Not Active`, no other Clocks Event Reason flipped, and
+  `--query-gpu=clocks.applications.graphics` answered *"Requested functionality has been
+  deprecated"*. That field tracks `-ac`-style **applications** clocks, not a `-lgc` **lock**, so
+  reading it as an all-clear is how a stale lock goes unnoticed for days.
+
+  The only signature is behavioural: **an idle GPU with locked clocks sits at the locked floor
+  instead of dropping to idle.**
+
+      nvidia-smi --query-gpu=clocks.sm,clocks.max.sm --format=csv,noheader
+
+  A few seconds after the last kernel, a clean RTX 3090 reads about **210 MHz** against a 2100 MHz
+  maximum. If it sits pinned near the value you locked (1395–1500 MHz), the lock is still on — run
+  `nvidia-smi -rgc`. For the power limit, `--query-gpu=power.limit` *is* reliable: compare it to
+  what you recorded before you started.
 
 `scripts/sweeps/admin-profile.ps1` is the worked example: it locks, profiles, and restores in a
 `finally`, and it takes `-SkipPower` so a profiling run never has to touch the power limit at all.

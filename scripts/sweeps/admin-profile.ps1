@@ -71,16 +71,13 @@ New-Item -ItemType Directory -Force -Path $out | Out-Null
 $bench = '.\build-ninja\bench\ninfer_bench.exe'
 $moe   = "$ModelDir\qwen3_6_35b_a3b.ninfer"
 $dense = "$ModelDir\qwen3_8_27b.ninfer"
-foreach ($p in @($bench, $moe, $dense)) {
-  if (-not (Test-Path $p)) { Write-Error "missing: $p"; exit 1 }
-}
 if (-not (Test-Path $Ncu)) { Write-Error "ncu not found at $Ncu; set NINFER_NCU"; exit 1 }
 
-# An ncu run is heavier on host RAM than the plain bench the shared guard is calibrated for: even
-# under application replay the tool holds its own buffers alongside the artifact. Ask for 4 GiB
-# above the usual headroom rather than discovering the shortfall as a bad_alloc ten minutes in.
-Assert-NInferHostMemory -Artifacts @($moe, $dense) -RequiredGiB (((Get-Item $moe).Length / 1GB) + 6.8)
-
+# Parse -Sections BEFORE the preflight, because what this run needs depends on what it was asked
+# for. Sections 1 and 4 profile the 35B, 2 and 3 the 27B, 5 uses the standalone Op benches and no
+# artifact at all, and 6 only moves the power limit. Demanding both artifacts and 35B-sized RAM up
+# front made `-Sections 5` fail on a box that simply has no 35B -- which is this box, and which is
+# exactly the machine the narrow-extent entries in TODO section 2c want profiled.
 $selected = @($Sections -split '[,;\s]+' | Where-Object { $_ -ne '' } | ForEach-Object {
   $n = 0
   if (-not [int]::TryParse($_, [ref]$n) -or $n -lt 1 -or $n -gt 6) {
@@ -91,6 +88,29 @@ $selected = @($Sections -split '[,;\s]+' | Where-Object { $_ -ne '' } | ForEach-
 })
 $wanted = [System.Collections.Generic.HashSet[int]]::new([int[]]$selected)
 "sections: $($selected -join ', ')   replay mode: $ReplayMode"
+
+$needsMoe   = $wanted.Contains(1) -or $wanted.Contains(4)
+$needsDense = $wanted.Contains(2) -or $wanted.Contains(3)
+$needed     = @()
+if ($needsMoe -or $needsDense) { $needed += $bench }
+if ($needsMoe)                 { $needed += $moe }
+if ($needsDense)               { $needed += $dense }
+foreach ($p in $needed) {
+  if (-not (Test-Path $p)) { Write-Error "missing: $p (required by the selected sections)"; exit 1 }
+}
+
+# An ncu run is heavier on host RAM than the plain bench the shared guard is calibrated for: even
+# under application replay the tool holds its own buffers alongside the artifact. Ask for 4 GiB
+# above the usual headroom rather than discovering the shortfall as a bad_alloc ten minutes in.
+# Size it on the largest artifact this run will actually open, and skip the guard entirely when no
+# artifact is opened at all.
+$guarded = @($needed | Where-Object { $_ -ne $bench })
+if ($guarded.Count -gt 0) {
+  $largest = ($guarded | ForEach-Object { (Get-Item $_).Length } | Measure-Object -Maximum).Maximum
+  Assert-NInferHostMemory -Artifacts $guarded -RequiredGiB (($largest / 1GB) + 6.8)
+} else {
+  "host-memory guard: skipped, the selected sections open no artifact"
+}
 
 # Remember what to put back. power.limit is the enforced ceiling; default_limit is the factory one.
 $originalLimit = (nvidia-smi --query-gpu=power.limit --format=csv,noheader | Select-Object -First 1)
