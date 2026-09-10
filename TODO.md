@@ -2327,13 +2327,45 @@ ceiling, and neither has had any optimisation attempted.
       MoE entry fell into with `Block Limit Registers = 5`: read both limits before believing
       either.
 
-      **What makes the fix affordable is that DRAM sits at 20.56%.** The natural way to cut
-      registers is a smaller per-thread accumulator tile, which costs arithmetic intensity and so
-      re-reads more weight. On a kernel using a fifth of the card's bandwidth that is close to free
-      — there is 4x of DRAM headroom to spend. So the next step is a retile of `q4a8_swiglu` (and
-      `q5a8_add`, whose shape and 28.4% figure are the same story) aimed at 85 or fewer registers
-      per thread, benched through the schedule-bench pattern rather than end to end, since 68% of
-      prefill FLOPs run here and a 40% local win is worth roughly 20% of prefill.
+      **What makes a fix affordable is that DRAM sits at 20.56%** — a smaller per-thread
+      accumulator tile costs arithmetic intensity and re-reads more weight, and on a kernel using a
+      fifth of the card's bandwidth there is 4x of headroom to spend on that.
+
+      **But the cheap way of buying the occupancy is catastrophic, and that is now measured.**
+      `__launch_bounds__(kThreads, 2)` asks nvcc for two blocks per SM, which forces 64 or fewer
+      registers per thread; the compiler reaches that by spilling. Tried it 2026-09-10, with the
+      shared-memory carveout raised to `cudaSharedmemCarveoutMaxShared` so shared memory would not
+      re-impose the one-block limit:
+
+      | | prefill tok/s (`pp8192`, three reps, clocks locked) |
+      |---|---:|
+      | baseline, 1 block/SM at 124 registers | **1,148.63 ± 0.18** |
+      | forced 2 blocks/SM at <=64 registers | **350.48 ± 0.01** |
+
+      **A 69.5% regression — spilling costs 3.3x what doubling resident warps buys.** Correctness
+      was unaffected (`ninfer_linear_swiglu_q4a8_int_test` passes either way), so this is purely a
+      performance answer. Reverted.
+
+      So **`ncu`'s "Est. Speedup 40%" is not reachable by forcing the register budget down**, and
+      that is the useful part: the 40% is only available from a retile that lowers the *natural*
+      register requirement. The registers are accounted for — `acc[2][4][4]` is 32,
+      `af[2][2][4]` is 16, `bf[4][2][2]` is 16, the two `Stage`s are ~14, addressing is the rest —
+      so the accumulator shape is the only term big enough to matter.
+
+      **And that retile is coupled, which is why it is not a constant.** Resident warps per SM is
+      `65,536 / (regs x 32)`, so 24 warps needs <=85 registers and 32 needs <=64. Reaching either
+      means changing the warp tile, which fixes `kThreads`; `kThreads` and `kBN` together fix the
+      warp grid (`4 warp_m x 4 warp_n` today); and `kBN` is what this kernel *claims*, through
+      `q4a8_tokens_supported` returning `tokens >= kBN && tokens % kBN == 0`. Halving `kBN` to 64
+      would widen the claimed domain to any multiple of 64 and change routing for widths this
+      kernel does not serve today. Halving the accumulator alone lands near 100 registers, which is
+      still one block at 512 threads and therefore still 16 warps — the block granularity eats it.
+
+      A concrete shape that does work arithmetically: 768 threads (24 warps) at <=85 registers, but
+      24 warps is `4 x 6`, which makes `kBN` 96 and breaks the multiple-of-128 prefill-chunk
+      assumption. So the honest next step is split-K within the block — fewer accumulators per warp
+      with a shared-memory reduction — and that is a rewrite with its own correctness surface, not a
+      tuning pass. `q5a8_add`, whose shape and 28.4% figure are the same story, would follow it.
 
       One caveat kept: `Block Limit Warps = 3` and `Block Limit SM = 16` are both far from binding,
       so nothing here is about block count.
