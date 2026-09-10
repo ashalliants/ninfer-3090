@@ -15,10 +15,15 @@ lane to a 4-byte word — eight weights instead of two, a 4x cut in memory-pipe 
 identical arithmetic — is worth **+3.90%** and **+1.95%** on the 27B dense decode, about **+5.9%
 compounded**, each 6 of 6 paired repetitions. The q4 SwiGLU pair now runs at **85.3% of DRAM**,
 which is the ceiling this file exists to reach; the q5 GEMV became **compute-bound at 73%**, a
-different problem than any other entry here. A third, `sparse_moe_d2`'s branch-free sorting network,
-is **+3.15% on the 35B**. End to end at depth 4,096 the dense decode went **69.0% → 72.2% of the
-854.2 GB/s the card can actually read** — three points of the thirteen that entry identified. See
-§2c.
+different problem than any other entry here. A third widening of the same kind on the q5
+dequantization arithmetic — the half2 bit-trick plus a per-group scale hoist, both exact — is
+**+2.67%**, and `sparse_moe_d2`'s branch-free sorting network is **+3.15% on the 35B**.
+
+**End to end at depth 4,096 the dense decode went 37.44 → 40.11 tok/s: 69.0% → 73.9% of the
+854.2 GB/s the card can actually read.** That is +7.13% throughput and **+4.9 points of the
+ceiling**, from the thirteen points §2c identified. Fully closing the remaining 26.1 would be
+54.3 tok/s; nothing here suggests that is reachable, and the number exists to stop the next person
+quoting 936.2 GB/s. See §2c.
 
 **Two speedups have shipped on the GDN input projection, both on the same boundary, and the second
 one came from noticing the first had measured the wrong kernel.** Adding C8 and C16 tiles to the GDN input
@@ -839,11 +844,13 @@ roofline finally acquired a denominator; read them before the rest.
 
       | | tok/s | achieved | % achievable |
       |---|---:|---:|---:|
-      | before | 37.44 ± — | 589.4 GB/s | 69.0% |
-      | **after** | **39.19 ± 0.03** | **617.0 GB/s** | **72.2%** |
+      | start of cycle | 37.44 | 589.4 GB/s | 69.0% |
+      | after the two consume-loop widenings | 39.19 ± 0.03 | 617.0 GB/s | 72.2% |
+      | **after the dequant bit-trick** | **40.11 ± 0.07** | **631.5 GB/s** | **73.9%** |
 
-      **+4.67% throughput and +3.2 points of the ceiling on the dense decode**, from removing a
-      memory-pipe bottleneck that this file had spent a cycle mistaking for bandwidth. The ceiling
+      **+7.13% throughput and +4.9 points of the ceiling on the dense decode**, from removing a
+      memory-pipe bottleneck that this file had spent a cycle mistaking for bandwidth, and then the
+      arithmetic bottleneck that removing it exposed. The ceiling
       itself is 54.3 tok/s if the remaining 27.8 points were ever fully closed, which is the honest
       shape of what is left. Note this depth-4,096 figure (+4.67%) is slightly below the +5.9%
       compounded from the two paired A/Bs; those measured prose generation through the CLI and this
@@ -1676,24 +1683,44 @@ mechanism, and it is not tile geometry.**
       which retires the `kStages` pipeline-depth candidate this entry named before profiling: at
       these utilisations there is nothing for a deeper pipeline to hide.
 
-- [ ] **The q5 GEMV's dequantization arithmetic is the last identified decode constraint, and it is
-      a compute problem.** From the profile above: SM throughput 73.31% with DRAM at 55.83%, so
-      the kernel now has bandwidth headroom and spends it on unpacking. Per weight it does a shift,
-      a mask, an OR with the high bit, a 5-bit sign-extend, an int-to-float convert, a multiply by
-      the group scale and an `fmaf`.
+- [x] **The q5 GEMV's dequantization arithmetic was the last identified decode constraint. Fixed
+      2026-09-10 with the in-tree half2 bit-trick plus a per-group scale hoist: +2.67% on the 27B.**
 
-      Two directions, both real work, neither yet costed:
+      Both halves are exact, not approximations, which is what made this safe to ship:
 
-      1. **Integer dot product.** Accumulate in int32 with `__dp4a` over four weights at a time and
-         apply the group scale once per group rather than per weight. The scale is already
-         per-group, so this is arithmetically exact rather than an approximation — it moves the
-         multiply out of the inner loop.
-      2. **The s8 tensor cores**, which Ampere has and which `q4a8_swiglu` already uses on the
-         prefill path. A T=1 GEMV is a poor fit for an MMA shape, so this is the less likely of the
-         two, but it is the same hardware the prefill path reaches for.
+      - **The bit-trick** is `Q5SimtDecodeAtom::decode_eight`'s, already used by
+        `q5_rowsplit_gemm_simt_split4_kernel`. half `0x6400` is 1024.0, whose mantissa LSB at that
+        exponent is exactly 1.0, so OR-ing a nibble into the mantissa *adds* it; inverting the high
+        bit and subtracting 1040.0 yields `nibble - 16 * high_bit`, which is precisely what
+        `sign_extend<5>(nibble | high << 4)` computes. **Verified on the host for all 32 five-bit
+        codes.** It replaces a per-weight sign-extend and int-to-float convert with one `hsub2` and
+        one `__half22float2` per *pair*.
+      - **The scale hoist** turns `sum_j((q_j * scale) * x_j)` into `sum_j(q_j * x_j) * scale`,
+        removing seven of every eight multiplies. It rounds *less*, not more — the scale is applied
+        to one accumulated value instead of eight products — and the scale is already per-group, so
+        nothing is being approximated.
 
-      Do not start either without costing the current arithmetic first — the mistake this file keeps
-      recording is acting on a plausible mechanism before measuring which term dominates.
+      | model | paired median | positive | range |
+      |---|---:|---:|---|
+      | 27B dense | **+2.67%** | **6 / 6** | +2.28% to +2.80% |
+      | 35B MoE | −0.65% | 2 / 6 | −2.56% to +2.00% |
+
+      *One correction to what this entry originally proposed.* It named `__dp4a` as the first
+      direction. **That is wrong for this kernel**: `__dp4a` is int8 x int8, and this is an A16 path
+      where the activations are BF16 — using it would mean quantizing `x`, which is a different
+      policy (`AllowA8Int`) and a different numeric contract, not an optimisation of this one. The
+      technique that does apply was already in the tree for the same codec.
+
+- [ ] **What is left after five speedups, and it is genuinely a different question now.** The dense
+      decode is at **73.9% of the 854.2 GB/s the card can read**, up from 69.0%. The q4 SwiGLU pair
+      is at 85.3% of DRAM and effectively finished. The q5 GEMV has had both its memory-pipe and its
+      arithmetic bottleneck removed, so **whatever binds it now has not been measured** — and the
+      lesson this file keeps re-learning is not to guess. One `ncu` run over the same instantiations,
+      reading `SpeedOfLight` and the stall breakdown, before any further kernel work.
+
+      The remaining 26.1 points to the ceiling are worth 54.3 tok/s if ever fully closed, which is
+      the honest shape of what is left. Nothing in this file suggests that is reachable; the point
+      of the number is to stop the next person quoting 936.2 GB/s.
 
       This is the missing explanation for "the dense path sits around two-thirds of what the card
       can deliver". `q5_rowsplit_gemv` on the 27B decode, from the same elevated run:

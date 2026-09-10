@@ -117,13 +117,41 @@ __device__ __forceinline__ float q5_gemv_consume_tile(const __nv_bfloat162* __re
         const float2 f2 = bf16x2_bits_to_float2(xv.z);
         const float2 f3 = bf16x2_bits_to_float2(xv.w);
         const float xs[kWeightsPerLane]{f0.x, f0.y, f1.x, f1.y, f2.x, f2.y, f3.x, f3.y};
+
+        // Dequantize two weights at a time through the half2 bit-trick, and apply the group scale
+        // ONCE for the whole group rather than once per weight.
+        //
+        // Both halves are about the arithmetic, because after the widening above this kernel is no
+        // longer memory-bound: `ncu` puts it at SM throughput 73.31% against DRAM 55.83%, so the
+        // per-weight unpacking is what is left.
+        //
+        // The trick is `Q5SimtDecodeAtom::decode_eight`'s, already used by
+        // q5_rowsplit_gemm_simt_split4_kernel, and it is exact rather than approximate. half
+        // 0x6400 is 1024.0, whose mantissa LSB at that exponent is exactly 1.0, so OR-ing a nibble
+        // into the mantissa *adds* it; inverting the high bit and subtracting 1040.0 then yields
+        // `nibble - 16 * high_bit`, which is precisely what `sign_extend<5>(nibble | high << 4)`
+        // computes. Verified on the host for all 32 five-bit codes. It replaces a per-weight
+        // sign-extend and int-to-float convert with one `hsub2` and one `__half22float2` per pair.
+        //
+        // Hoisting the scale is exact too -- `sum_j(q_j * x_j) * scale` against
+        // `sum_j((q_j * scale) * x_j)` -- and removes seven of every eight multiplies. It rounds
+        // *less*, not more, since the scale is applied to one accumulated value instead of eight
+        // products.
+        //
+        // Weight ordering is unchanged: bit-pair `pair` carries weights `pair` and `pair + 4`,
+        // which under this file's convention are the same k as before.
+        const std::uint32_t high_inv = high ^ 0xffu;
+        const __half2 bias           = __half2half2(__ushort_as_half(0x6410)); // 1040.0
+        float group_acc              = 0.0f;
 #pragma unroll
-        for (int j = 0; j < kWeightsPerLane; ++j) {
-            // Weight k0+j is nibble (j & 1) of code byte (j >> 1), with bit 4 from high bit j.
-            const std::uint32_t nibble = (word >> (8 * (j >> 1) + 4 * (j & 1))) & 0x0fu;
-            const int q = sign_extend<5>(static_cast<int>(nibble | (((high >> j) & 1u) << 4)));
-            acc         = fmaf(static_cast<float>(q) * scale, xs[j], acc);
+        for (int pair = 0; pair < kWeightsPerLane / 2; ++pair) {
+            std::uint32_t bits = ((word >> (4 * pair)) & 0x000f000fu) | 0x64006400u;
+            bits |= (((high_inv >> pair) & 1u) << 4) | (((high_inv >> (pair + 4)) & 1u) << 20);
+            const float2 q = __half22float2(__hsub2(half2_from_bits(bits), bias));
+            group_acc      = fmaf(q.x, xs[pair], group_acc);
+            group_acc      = fmaf(q.y, xs[pair + 4], group_acc);
         }
+        acc = fmaf(group_acc, scale, acc);
     }
     return acc;
 }
