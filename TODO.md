@@ -3182,14 +3182,43 @@ at all, and one of those two should be done before any of the others.
       then be unable to reproduce the full 0.019% from that one commit. Each half has to be bisected
       separately.
 
-      **And the bisect must be run `--first-parent`.** The naive walk descends into the upstream
-      catch-up branch, where the code predates the sm_86 port: at `00f02055` CMake refuses outright
-      with *"NInfer supports only CMAKE_CUDA_ARCHITECTURES=120a; got '86'"*. Those commits cannot be
-      built on this card at all, so they are not `skip`-able noise, they are a region the bisect must
-      not enter. `git bisect start --first-parent` cuts the range from 477 commits to **96** (79 of
-      them merges), every one of which is sm_86-capable, and it is also the right granularity: a
-      merge commit identifies the PR that moved the number, which is the answer anyone actually
-      wants.
+      **`--first-parent` is right for the later half and WRONG for the earlier half, and an earlier
+      version of this entry said to use it for both.** For the later half it is right: the naive walk
+      descends into the upstream catch-up branch, where the code predates the sm_86 port and
+      `00f02055` refuses outright with *"NInfer supports only CMAKE_CUDA_ARCHITECTURES=120a; got
+      '86'"*. Those commits cannot be built on this card at all — not `skip`-able noise, a region the
+      bisect must not enter — and restricting to first-parent both avoids them and cuts 477 commits
+      to **96**, at the right granularity: a merge names the PR that moved the number.
+
+      **For the earlier half it walks off the path entirely, because `838c8b5d` is not on the
+      first-parent chain.** `838c8b5d` is a commit *inside* the `feat/w4a8-prefill` branch, and
+      master at that moment did not have the perplexity harness at all. Proof, in the order that
+      makes it obvious:
+
+          git merge-base --is-ancestor 838c8b5d 12ca6cbd    # false
+          git merge-base --is-ancestor 838c8b5d b4ca75a9^2  # true  -- the merged branch
+          git ls-tree -r --name-only 12ca6cbd | grep perplex # nothing at all
+
+      So `838c8b5d` enters `b4ca75a9` through its **second** parent. `git rev-list --first-parent
+      838c8b5d..b4ca75a9` therefore lists master-line commits that are not on any path from
+      `838c8b5d`, and the bisect walked straight onto one: at `12ca6cbd` the build dies with
+      **`ninja: error: unknown target 'ninfer-perplexity'`** because the harness does not exist
+      there. That is not a broken commit to `skip`; it is a commit the range should never have
+      contained.
+
+      **The rule, which is worth more than either bisect.** Before trusting any range, check that
+      the good commit is actually an ancestor along the chain you intend to walk, and check the thing
+      you are measuring exists at the candidate:
+
+          git merge-base --is-ancestor <good> <candidate>
+          git show <candidate>:apps/CMakeLists.txt | grep ninfer-perplexity
+
+      **And do not read commit order off `--date=short`, which prints the *author* date.**
+      `838c8b5d` is authored 2026-08-29 and committed 2026-09-01. Every apparent date inversion in
+      this range is that, and it is what made the first-parent list look plausible.
+
+      The real earlier-half range is `838c8b5d..b4ca75a9` following the actual DAG: **34 commits**,
+      all of them ours and all sm_86-capable.
 
       **Build only the target you run.** `cmake --build build-ninja` builds the test binaries too,
       and at `de5fc15a` `tests/ops/softmax_attention/causal_cache.cpp` fails to compile under MSVC
@@ -3201,8 +3230,9 @@ at all, and one of those two should be done before any of the others.
       **A commit that does not touch `src/`, `include/` or `apps/` cannot move the number, so filter
       before you measure.** Of the 25 first-parent commits in the later half, 16 are scripts, docs or
       release commits and 6 more touch only `src/serve` (which `ninfer-perplexity` does not link),
-      `src/core/nvtx.h` or a chat template. That leaves 3 real candidates out of 25. The filter is
-      one line and it turned a 5-step bisect into a 2-step one:
+      `src/core/nvtx.h` or a chat template. That leaves 3 real candidates out of 25. In the earlier
+      half it is starker: 34 commits, of which the entire W4A8 prototype series is `src=0`. The
+      filter is one line and it turned a 5-step bisect into a 2-step one:
 
       ```
       git log --first-parent --format='%h|%s' A..B | while IFS='|' read h s; do
@@ -3245,13 +3275,55 @@ at all, and one of those two should be done before any of the others.
         can explain `bf16` KV moving (−0.0163%) alongside `int8` and `rk8v4`. Confirm it by
         building `1c12516e` with the `FixedD` specializations forced off and re-scoring.
 
-      **Transition 1 is somewhere at or before `04e22c3f` and has three candidates left.**
-      `04e22c3f` "Merge neroued/master: full upstream catch-up" (2026-09-04) already reads
-      4.34286437475351, the mid value, so the first step happened at or before it. Surviving
-      candidates after the source filter, oldest first: **`b4ca75a9`** (`feat/w4a8-prefill`, 338
-      source files — the W4A8 prefill path the harness runs on every window, and the a priori
-      favourite), **`d015eb7f`** (`feat/vision-on-demand-residency`, 59), and `04e22c3f` itself
-      (175). Two more measurements at most.
+      **Transition 1 is at or before `b4ca75a9`, and it is one of two clusters.** Both `04e22c3f`
+      (2026-09-04, upstream catch-up) and `b4ca75a9` (`feat/w4a8-prefill`) already read
+      4.34286437475351, the mid value, and `838c8b5d` *is* a genuine ancestor of `b4ca75a9`, so the
+      bracket is sound even though the first-parent list was not. Walking the real 34-commit range
+      with the source filter leaves two candidate clusters and nothing else:
+
+      1. **The integer-activation prefill route for the 27B MLP** — `0b0b098d` (opt-in for
+         `gate_up`), `4f0be008` (extended to `mlp/down`), `f3f6c724` (registered as
+         `LinearPolicy::AllowA8Int`), `c41b29dd` (keyed on registered shapes). This quantizes
+         *activations* to int8 on the prefill MLP GEMMs, which is the harness's hot path on every
+         one of its 124 windows. The accuracy claim made for it was **"accuracy-neutral"** and
+         pinned against a relative error — which is exactly the claim that permits a −0.0092%
+         perplexity move without anyone noticing. This is the a priori favourite.
+      2. **`91e78ab1`, "keep the sm_86 W8 linear_add single-column tail on a K-correct kernel"** —
+         and this one is not a tuning change, it is a **fixed out-of-bounds read**. On sm_86 both W8
+         `linear_add` split-K launchers hand a leftover single column to a kernel that bakes
+         `kDecodeK = 6144`; on the `K = 4096` shape that tail *read 2,048 BF16 past the end of `x`
+         and indexed the weights with the wrong row stride*. Fixing it necessarily changes results,
+         and being sm_86-only it explains why our numbers moved when upstream's published ones did
+         not.
+
+      **The branch name is misleading, and the source filter is what shows it.** Every W4A8 GEMM
+      commit in that branch — `dbdf207e`, `90af65cd`, `9d84659c` and the rest — is `src=0`: they are
+      prototypes under `tools/`, and none of that code reached the engine. So "the W4A8 prefill
+      merge" did not put W4A8 in the prefill path. What it actually shipped into `src/` was the A8
+      *activation* route and the `linear_add` tail fix.
+
+      **`c41b29dd` measures 4.34286437475351, the mid value — which eliminates the out-of-bounds
+      fix.** `91e78ab1` is *newer* than `c41b29dd`, so the transition had already happened by then.
+      That is worth stating plainly because `91e78ab1` was the more alarming of the two candidates:
+      a kernel reading 2,048 BF16 past the end of its input is a real defect, it was really there,
+      and it is really fixed — but **it is not what moved perplexity**, and the 27B scoring path
+      evidently never hit the `K = 4096` single-column tail.
+
+      **So transition 1 is at or before `c41b29dd`, and the next test is `9d84659c`** — the commit
+      immediately preceding the A8 cluster. Everything between it and the cluster is `src=0`, so it
+      splits the remaining candidates cleanly:
+
+      | `9d84659c` reads | conclusion |
+      |---|---|
+      | old (4.343263) | the A8 activation route is the cause — one of `0b0b098d`, `4f0be008`, `f3f6c724`, `c41b29dd` |
+      | mid (4.342864) | the cause is earlier, and the only real candidate left is **`2ba10da2`, "perf(kv): give rk8v4 values a 32-value group"** (`src=12`) |
+
+      That second branch would be a surprise worth chasing: `2ba10da2` is an *rk8v4* change and we
+      are measuring *int8*, so it could only move this number by touching shared codec code. Note
+      the arithmetic coincidence that makes it plausible anyway — transition 1 is −0.0092% and
+      **rk8v4’s entire recorded drift is also −0.0092%**. If `2ba10da2` turns out to be the
+      commit, that is one change explaining both, and the non-uniformity this entry opens with stops
+      being mysterious.
 
       **A warning for whoever runs those two.** `scripts/sweeps/ppl-bisect-step.ps1` classifies
       against a single threshold, which is correct for transition 2 (mid and old both count as
