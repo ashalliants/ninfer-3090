@@ -283,7 +283,7 @@ Ordered by expected value, not by section.
 | KV decode falloff, 3.21x per-key on fp8 | 2c | attack the per-key dequant-into-shared cost; `rk8v4` proves the floor is reachable without a shared arena | kernel work |
 | DFlash2 5→6 cliff | 2c/3 | remainder after the GDN tiles is the grouped kernel sitting at 27% of its own weight-streaming floor | same kernel as the KV item |
 | Routed prefill pipeline-depth threshold 7/4 | 2c | **swept**: a 1.33x change in the constant moves prefill 0.06-0.26%, the same as the drift between two identical builds. Safe to leave | closed |
-| `w8_pair` medium discards its schedule on sm_86 | 3 | five of the ten tiles fit sm_86's shared cap; put them behind an `#if` and bench T=33..64 | GPU time, small edit |
+| `w8_pair` medium discards its schedule on sm_86 | 3 | **done**: C48 and C64 instantiated, 13-17% over the chunked loop on the routed `{33,64}` band | closed |
 | sm_86 fallback constants chosen to fit | 2c | sweep the alternatives at the eleven `NINFER_SM8X_COMPAT` sites | GPU time only |
 | Cold-flush margins overstate wins | 3 | **answered**: 4-5x overstatement, and a 5.9% cold margin inverted in situ. Distrust anything under ~10% | closed |
 | Perplexity drift 0.019% | 3 | the scoped four-hour bisect | exclusive GPU time |
@@ -2448,8 +2448,9 @@ ceiling, and neither has had any optimisation attempted.
       independent route) so the curve is now **36.8 / 61.1 / 101.0 / 140.8 tok/s, or 3.83x at eight
       lanes** against the 3.62x measured before these tiles existed.
 
-- [ ] **`w8_pair` medium discards its schedule entirely on sm_86 — and *why* is now known: half
-      the table will not compile there. Five of the ten tiles do fit.**
+- [x] **`w8_pair` medium no longer discards its schedule on sm_86, and the two tiles that are
+      actually routed here are 13-17% faster than the chunked loop they replaced. Closed
+      2026-09-10.**
       `w8_pair_gemm_splitk.cu:133` is `(void)schedule` under `NINFER_SM8X_COMPAT`, so every
       schedule runs the same chunked loop, slicing T into `kLastExactT = 32` columns and calling the
       exact-T launcher repeatedly. PR #22 already removed the twelve now-identical route entries
@@ -2479,17 +2480,36 @@ ceiling, and neither has had any optimisation attempted.
       existing instantiations that already fit**, behind an `#if` that lets the other five fall
       through to the chunked loop.
 
-      What is still unknown is whether they *win*. The chunked fallback pays a whole extra weight
-      pass per 32-column slice, so at T=48 it does two passes where C48 does one — which is the
-      shape of a real win — but it also keeps 8 warps against the exact-T kernel's schedule, and
-      §2c's parallelism finding is a caution here: `C48 <48,4,2,3>` is 8 warps per block against the
-      chunked path's own geometry, and the *warp count* is what has mattered everywhere else in this
-      file. Bench it with `bench/ops/w8_pair_schedule_bench.cu`, which already exists and already
-      has the `execute_schedule` seam, at T=33..64 where C48 and C64 are the candidates.
+      **They win, and the bench gives a clean in-run baseline for free.** Only C48 and C64 are ever
+      routed on this card — `w8_pair_plan.cpp` sends `{33,48}` to C48 and `{49,64}` to C64, and from
+      T=66 the concat kernels win outright — so those are the two instantiated. C80, C128 and C160
+      also fit but are never asked for, and the remaining four exceed the cap. Because `medium_c128`
+      and `medium_c192` are *not* instantiated, they still fall through to the chunked loop, which
+      means the same bench run measures the tiles and their replacement side by side under identical
+      conditions:
 
-      Note this is a W8 Op, so it is the MTP/draft-head profile rather than the main 27B or 35B
-      path, and T>=33 means a wide extent — check it is reached in a real serving profile before
-      spending long on it.
+      | T | real tile | chunked loop (`medium_c128`) | gain | routed to |
+      |---|---:|---:|---:|---|
+      | 33 | **26.624** (c48) | 30.720 | **13.3%** | c48 |
+      | 48 | **30.720** (c48) | 36.864 | **16.7%** | c48 |
+      | 64 | **34.816** (c64) | 40.960 | **17.1%** | c64 |
+
+      `bench/ops/w8_pair_schedule_bench.exe --k2048`, cold, medians of 9, clocks locked. The
+      `public_op` column tracks the winner at every width, so the route table was already pointing
+      at the right schedule — it just had no schedule to reach.
+
+      The chunked fallback's cost is what the gain measures: it slices T into 32-column chunks and
+      pays a whole extra weight pass per slice, so at T=48 it streams the weights twice where C48
+      streams them once. §2c's parallelism caution does not bite here — `C48 <48,4,2,3>` is 8 warps
+      per block, the same as the exact-T kernel the chunked loop calls — so this is one fewer weight
+      pass rather than a geometry trade.
+
+      **What this is not: a model-level speedup, and that is stated rather than glossed.** This is
+      the k=2048 W8 pair, which is the 35B's DFlash draft-head path, and the band is T=33..64 — a
+      wide speculative extent rather than anything a decode step or an ordinary prefill reaches. The
+      13-17% is an Op-level number above the ~10% cold-flush threshold established in §3, so it
+      should survive in situ, but **no end-to-end measurement was taken because no shipped profile
+      obviously drives this band.** Anyone who finds one has a ready 13-17%.
 
 ---
 
