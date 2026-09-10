@@ -1599,16 +1599,38 @@ mechanism, and it is not tile geometry.**
       True of the global staging, false of the kernel: DRAM was at 50% while the pipe was at 81%.
       Corrected in place.
 
-- [ ] **The remaining GEMV headroom, and the q4 SwiGLU pair.** After the widening the three
-      `q5_rowsplit_gemv` instantiations sit at **54-59% of DRAM** with the memory pipe down at
-      34-37%, so nothing is saturated and there is more to take. Two follow-ups, in order:
+- [x] **The q4 SwiGLU GEMV pair got the same widening: +1.95% on the 27B, shipped 2026-09-10.**
+      It was the worse of the two kernels — one byte of gate codes, one byte of up codes and two
+      2-byte scale broadcasts produced four weights, so **five** memory-pipe instructions per group.
+      Now five per *four* groups. Q4 has no high plane, so the mapping is simpler than the Q5 case:
+      code byte b holds the weights at 2b and 2b+1, so weight k0+j is nibble (j & 1) of byte
+      (j >> 1). Host-verified to cover all 1,024 weights of a tile exactly once, code index again
+      `step * 32 + lane` so the shared reads stay conflict-free.
 
-      1. **Apply the same widening to `q4_linear_swiglu_gemv_pair`**, which §2c's C1 round table has
-         at 7.59 ms of a 26.18 ms round and which has the same one-byte-per-lane consume shape.
-         This is the reason the 27B gained 3.9% rather than the ~7% the q5 kernels alone suggest.
-      2. Then re-profile: with the pipe at a third utilisation, whatever is next will be a
-         different constraint, and guessing it now would repeat the mistake this entry was written
-         to correct.
+      Measured against the q5 widening as its baseline, so the gain is attributable to this change
+      alone — same harness, clocks locked, six paired repetitions:
+
+      | model | paired median | positive | range |
+      |---|---:|---:|---|
+      | 27B dense | **+1.95%** | **6 / 6** | +1.81% to +2.33% |
+      | 35B MoE | +0.31% | 4 / 6 | −1.22% to +1.42% |
+
+      **So the two widenings together are worth about +5.9% compounded on the 27B dense decode**,
+      which is the largest single-model gain this file records. The 35B is unmoved by either, as
+      expected: its decode is the `sparse_moe` expert kernels.
+
+- [ ] **What is left in the GEMV path, and it is no longer the memory pipe.** After both widenings
+      the `q5_rowsplit_gemv` instantiations sit at **54-59% of DRAM** with `Mem Pipes Busy` down at
+      34-37%. Nothing is saturated, so there is more to take — but the constraint has moved and
+      **guessing what it is now would repeat exactly the mistake the last two entries were written
+      to correct.** Re-profile first: one `ncu` run over the same three instantiations plus the q4
+      pair, reading `SpeedOfLight` and the warp-stall breakdown
+      (`smsp__warp_issue_stalled_*_per_warp_active.pct`, which works without PC sampling).
+
+      Two candidates worth naming only so the profile can rule on them, not to act on: the staging
+      side is now a larger share of a smaller total, and at 34-37% pipe utilisation the kernels may
+      simply be latency-bound on the cp.async pipeline depth (`kStages`), which is a tuning knob
+      rather than a rewrite.
 
       This is the missing explanation for "the dense path sits around two-thirds of what the card
       can deliver". `q5_rowsplit_gemv` on the 27B decode, from the same elevated run:

@@ -172,26 +172,56 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
         const auto* up_codes    = reinterpret_cast<const std::uint8_t*>(code_tile[warp][buf][1]);
         const auto* gate_scales = reinterpret_cast<const std::uint16_t*>(scale_tile[warp][buf][0]);
         const auto* up_scales   = reinterpret_cast<const std::uint16_t*>(scale_tile[warp][buf][1]);
+        // Eight weights per lane per step, not two. Same change, same reason, and the same 4x as
+        // q5_rowsplit_gemv's consume loop -- see the long note there for the measurement that
+        // motivated it (DRAM at 50% while Mem Pipes Busy sat at 81%).
+        //
+        // This kernel was the worse of the two: one byte of gate codes, one byte of up codes and
+        // two 2-byte scale broadcasts produced four weights, so five memory-pipe instructions per
+        // group. Now each lane takes a 4-byte word from each of gate and up -- 8 weights each --
+        // so eight lanes cover a group's 32 code bytes and 32 lanes cover FOUR groups per step.
+        // Five instructions per four groups against twenty.
+        //
+        // Q4 has no high plane, so this is simpler than the Q5 case: code byte b holds the weights
+        // at 2b (low nibble) and 2b+1 (high), which makes weight k0+j nibble (j & 1) of byte
+        // (j >> 1). Verified on the host that the (sub, pos) split covers all 1,024 weights of a
+        // tile exactly once, and the code index comes out as step * 32 + lane, so the shared reads
+        // stay conflict-free.
+        const auto* gate_codes32 = reinterpret_cast<const std::uint32_t*>(gate_codes);
+        const auto* up_codes32   = reinterpret_cast<const std::uint32_t*>(up_codes);
+        constexpr int kWeightsPerLane = 8;
+        constexpr int kLanesPerGroup  = kGroupK / kWeightsPerLane; // 8
+        constexpr int kGroupsPerStep  = 32 / kLanesPerGroup;       // 4
+        constexpr int kWordsPerGroup  = kBytesPerGroup / 4;        // 8
+        const int sub                 = lane / kLanesPerGroup;
+        const int pos                 = lane % kLanesPerGroup;
 #pragma unroll
-        for (int tile_group = 0; tile_group < kGroupsPerWarpTile; ++tile_group) {
+        for (int step = 0; step < kGroupsPerWarpTile / kGroupsPerStep; ++step) {
+            const int tile_group = step * kGroupsPerStep + sub;
             const float gate_scale =
                 __half2float(__ushort_as_half(static_cast<std::uint16_t>(gate_scales[tile_group])));
             const float up_scale =
                 __half2float(__ushort_as_half(static_cast<std::uint16_t>(up_scales[tile_group])));
 
-            const int gate_packed =
-                static_cast<int>(gate_codes[tile_group * kBytesPerGroup + lane]);
-            const int gate_q0   = sign_extend<4>(gate_packed & 0x0f);
-            const int gate_q1   = sign_extend<4>(gate_packed >> 4);
-            const int up_packed = static_cast<int>(up_codes[tile_group * kBytesPerGroup + lane]);
-            const int up_q0     = sign_extend<4>(up_packed & 0x0f);
-            const int up_q1     = sign_extend<4>(up_packed >> 4);
-            const int k0        = (tile * kGroupsPerWarpTile + tile_group) * kGroupK + lane * 2;
-            const float2 xv     = __bfloat1622float2(x2[k0 >> 1]);
-            gate_acc            = fmaf(static_cast<float>(gate_q0) * gate_scale, xv.x, gate_acc);
-            gate_acc            = fmaf(static_cast<float>(gate_q1) * gate_scale, xv.y, gate_acc);
-            up_acc              = fmaf(static_cast<float>(up_q0) * up_scale, xv.x, up_acc);
-            up_acc              = fmaf(static_cast<float>(up_q1) * up_scale, xv.y, up_acc);
+            const std::uint32_t gate_word = gate_codes32[tile_group * kWordsPerGroup + pos];
+            const std::uint32_t up_word    = up_codes32[tile_group * kWordsPerGroup + pos];
+
+            const int k0 = (tile * kGroupsPerWarpTile + tile_group) * kGroupK +
+                           pos * kWeightsPerLane;
+            const uint4 xv  = load_vec<uint4>(reinterpret_cast<const uint4*>(x2 + (k0 >> 1)));
+            const float2 f0 = bf16x2_bits_to_float2(xv.x);
+            const float2 f1 = bf16x2_bits_to_float2(xv.y);
+            const float2 f2 = bf16x2_bits_to_float2(xv.z);
+            const float2 f3 = bf16x2_bits_to_float2(xv.w);
+            const float xs[kWeightsPerLane]{f0.x, f0.y, f1.x, f1.y, f2.x, f2.y, f3.x, f3.y};
+#pragma unroll
+            for (int j = 0; j < kWeightsPerLane; ++j) {
+                const int shift = 8 * (j >> 1) + 4 * (j & 1);
+                const int gate_q = sign_extend<4>(static_cast<int>((gate_word >> shift) & 0x0fu));
+                const int up_q   = sign_extend<4>(static_cast<int>((up_word >> shift) & 0x0fu));
+                gate_acc = fmaf(static_cast<float>(gate_q) * gate_scale, xs[j], gate_acc);
+                up_acc   = fmaf(static_cast<float>(up_q) * up_scale, xs[j], up_acc);
+            }
         }
         __syncwarp();
     }
