@@ -330,7 +330,7 @@ Ordered by expected value, not by section.
 | MoE expert gather is latency-bound | 2c | **nothing actionable left.** All four candidates measured: geometry no, batching no, block split *worse*, over-fetch real but 1.83x on a 47%-utilised pipe | closed as a negative |
 | Prefill MLP GEMMs at ~30% of INT8 peak | 2c | run `admin-profile.ps1` section 3 and read issue rate vs shared-memory feeding vs occupancy | one elevated run |
 | Eight lanes buy 3.6x (3.83x since the GDN tiles) | 2c | cheap half shipped (+2.85% at width 8); what is left is a split-K **MMA** kernel, modelled on `w8_gdn_input_gemm_splitk.cu` | kernel work |
-| KV decode falloff, 3.21x per-key on fp8 | 2c | attack the per-key dequant-into-shared cost; `rk8v4` proves the floor is reachable without a shared arena | kernel work |
+| KV decode falloff, 3.21x per-key on fp8 | 2c | **counters in**: nothing saturated in either format, and *both* reach only 33% of their theoretical occupancy. The arena is a 1.33x term against a 2.4x gap — measure the grid before touching it | kernel work |
 | DFlash2 5→6 cliff | 2c/3 | remainder after the GDN tiles is the grouped kernel sitting at 27% of its own weight-streaming floor | same kernel as the KV item |
 | Routed prefill pipeline-depth threshold 7/4 | 2c | **swept**: a 1.33x change in the constant moves prefill 0.06-0.26%, the same as the drift between two identical builds. Safe to leave | closed |
 | `w8_pair` medium discards its schedule on sm_86 | 3 | **done**: C48 and C64 instantiated, 13-17% over the chunked loop on the routed `{33,64}` band | closed |
@@ -1425,8 +1425,49 @@ roofline finally acquired a denominator; read them before the rest.
       **Occupancy alone does not order them, so it is necessary and not sufficient.** nvfp4 uses
       half fp8's dynamic bytes and gets twice the blocks per SM, yet has the *worst* 27B falloff of
       the six. So block count is not the whole mechanism; the per-key dequantization work is the
-      part that matches, and that wants confirming with `ncu` on the three quantized kernels — now
-      possible, see the closed tooling entry in §3 and `scripts/sweeps/admin-profile.ps1`.
+      part that matches.
+
+      **The `ncu` counters this entry asked for are collected (2026-09-10), and they add a fact the
+      entry does not have: both formats reach only a third of their own theoretical occupancy.**
+      27B, `-pg 8192,64`, clocks locked, kernel replay, six launches of the `small_t` decode
+      attention kernels, medians:
+
+      | | `int8` (`..._i8_tiled`) | `fp8` (`..._fp8_tiled`) |
+      |---|---:|---:|
+      | duration | 32.62 µs | **78.40 µs** |
+      | DRAM throughput | 26.16% | 13.43% |
+      | L1/TEX throughput | 25.61% | 14.34% |
+      | Compute (SM) throughput | 16.61% | 16.07% |
+      | **theoretical occupancy** | **66.66%** | **50.00%** |
+      | **achieved occupancy** | **21.98%** | **16.51%** |
+      | stall `long_scoreboard` | 33.02% | 30.98% |
+      | stall `wait` | 14.76% | **21.95%** |
+      | stall `barrier` | 16.76% | 8.56% |
+
+      Three readings, in order of how much they change the entry.
+
+      **Nothing is saturated in either format.** The highest utilisation anywhere in that table is
+      26%. So the falloff is not bandwidth, not L1, and not compute — it is latency, the same
+      diagnosis §2c reached for the MoE gather and the narrow-extent kernels, and it means the
+      framing of "3.21x the per-key cost" as a *cost* is misleading: the kernel is not doing 3.21x
+      the work, it is waiting 3.21x as long.
+
+      **The dynamic shared arena costs exactly what this entry predicted, and it is the smaller
+      half.** fp8's theoretical occupancy is 50.00% against int8's 66.66%, which is the 2-blocks-per-SM
+      against unbounded that the arena table above derives. But that is a **1.33x** ratio against a
+      **2.4x** duration ratio, so the arena explains well under half of the gap. Removing it — the
+      `rk8v4`-shaped fix this entry proposes — should therefore be expected to recover part of the
+      falloff, not all of it, and anyone who ships it should predict ~1.3x rather than 3.2x.
+
+      **And the new fact: achieved occupancy is 33% of theoretical in *both* formats** — 21.98 of
+      66.66, and 16.51 of 50.00, the same ratio to two figures. Whatever stops these kernels filling
+      the SMs they are allowed is **format-independent and larger than the arena**, and it is not in
+      this entry at all. `long_scoreboard` at 31-33% in both says the resident warps are waiting on
+      global memory; with DRAM at 13-26% there is plenty of bandwidth, so it is a latency/occupancy
+      shortfall of the kind §2c's parallelism arithmetic explained for the GDN kernel. **Measure the
+      grid and the waves per SM against `(keys / KeyBlock) x splits` before touching the arena** —
+      on the evidence here that is the bigger of the two, and it is shared by the format everyone
+      considers the good one.
 
       What this is worth: **if `nvfp4` decoded on `rk8v4`'s curve it would be the outright best
       format** — 45% smaller than INT8 with no speed penalty — rather than the compromise it is.
