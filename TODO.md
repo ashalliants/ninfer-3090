@@ -130,17 +130,43 @@ or artifacts this box does not have.
 
 ---
 
-## Split-K inside the CTA is the answer to two of the three biggest items, and here is the design
+## Split-K inside the CTA is the answer to the GDN kernel, and NOT to the prefill MLP
 
 Written 2026-09-10 after reading both kernels, because the same shape resolves the GDN parallelism
 problem *and* the prefill MLP register problem, and neither entry says so from the other's side.
 
-**The two problems are the same problem.** `rowsplit_grouped_mma_kernel` reaches 24.5% achieved
-occupancy because total warp-work is `(rows/WM) x (BN/WN)` = 1,024 warps, 0.26 machine-fulls;
-`q4a8_swiglu` reaches 33.3% because `acc[2][4][4]` costs 32 of its 124 registers and the block
-granularity means one block per SM. **Splitting K inside the CTA fixes both**: it multiplies warps
-per block by `KSplits` without touching the grid, and it divides each warp's accumulator count by
-`KSplits` because each warp now owns a K-slice rather than a whole dot product.
+**They are NOT the same problem, and an earlier version of this section said they were. Correcting
+it here because acting on it would waste hours.** `rowsplit_grouped_mma_kernel` reaches 24.5%
+achieved occupancy because total warp-work is `(rows/WM) x (BN/WN)` = 1,024 warps, 0.26
+machine-fulls — too few warps *in the grid*. `q4a8_swiglu` reaches 33.3% because 124 registers per
+thread hold the SM to one block — too many registers *per thread*. Split-K addresses the first and
+makes the second **worse**.
+
+**Why it makes the prefill MLP worse.** A K-split warp still owns its whole output tile, just less
+of K, so its accumulator count is unchanged; what changes is that there are more warps per block.
+Accumulators per *block* are fixed by the block tile (128 x 128 outputs = one float each) while the
+non-accumulator overhead scales with thread count, and at 124 registers with 32 accumulators that
+overhead is **92 registers per thread**:
+
+| threads | acc/thread | total/thread | registers/block | blocks/SM | warps/SM |
+|---:|---:|---:|---:|---:|---:|
+| 512 (today) | 32 | 124 | 63,488 | 1 | **16** |
+| 768 | 21 | 113 | 86,784 | **0 — does not fit** | — |
+| 1024 | 16 | 108 | 110,592 | **0** | — |
+
+So more warps per block is not available at any width: 768 threads already exceeds the register
+file. The earlier claim that "768 threads gives 24 warps at <=85 registers" was arithmetic done on
+the accumulators alone and ignored the overhead term, which dominates.
+
+**The prefill MLP's real lever is therefore the 92 registers that are not accumulators** — `af`
+is 16, `bf` is 16, the two `Stage`s ~14, addressing the rest. Reaching 2 blocks per SM at 512
+threads needs <=64 total, i.e. overhead down from 92 to 32, which means fewer staged fragments and
+shallower prefetch — a direct trade against the latency hiding those exist to provide. That is a
+real tuning problem with a measurable knob, and it is a different one from split-K.
+
+**Split-K remains the answer for the GDN kernel**, where the constraint is the opposite: only 1,024
+warps exist in the whole grid, and at 48 registers per thread there is register headroom to spend on
+more of them.
 
 **The template is `src/ops/gdn_input_proj/w8/w8_gdn_input_gemm_splitk.cu`**, in the tree, for the W8
 variant of the same Op, and its route table has sent widths 2..96 through it all along.
@@ -160,17 +186,10 @@ instead of 64 — `(12,288 / 16) x 8` = 6,144 warps, 1.56 machine-fulls against 
 - `Jobs == 2 || Jobs == 4` is static_asserted, so the reduction has to be written once and work for
   both.
 
-**Do it in this order, because the first step is cheap and de-risks the second:**
-
-1. **Prove the win on the prefill MLP first**, where there is only one job and one codec.
-   `q4a8_swiglu`'s `acc[2][4][4]` at `KSplits = 2` becomes `acc[2][2][4]` — 16 registers instead of
-   32 — which on the accounting in §2c lands near 100 registers. That is still one block at 512
-   threads, so **pair it with 768 threads (24 warps)**: 24 warps at <=85 registers is one block and
-   50% occupancy, against 33.3% today. The blocker named in that entry is that 24 warps is `4 x 6`
-   and makes `kBN` 96, breaking the multiple-of-128 chunk assumption — **K-split removes that
-   blocker**, because the extra warps come from the K dimension rather than from `warp_n`, so the
-   warp grid stays `4 x 4` and `kBN` stays 128.
-2. **Then the GDN kernel**, with the reduction pattern already validated.
+**So there is no cheap first step on the prefill MLP, and the GDN kernel is where split-K goes.**
+Build it there directly, against the W8 template, and accept that the reduction pattern is being
+validated on the harder of the two kernels rather than the easier one. The prefill MLP wants a
+separate effort aimed at its overhead registers.
 
 **And measure it against the right null.** Forcing occupancy on this kernel the cheap way —
 `__launch_bounds__(kThreads, 2)` — cost **69.5%** (1,148.63 to 350.48 tok/s) because the compiler
@@ -2452,11 +2471,20 @@ ceiling, and neither has had any optimisation attempted.
       kernel does not serve today. Halving the accumulator alone lands near 100 registers, which is
       still one block at 512 threads and therefore still 16 warps — the block granularity eats it.
 
-      A concrete shape that does work arithmetically: 768 threads (24 warps) at <=85 registers, but
-      24 warps is `4 x 6`, which makes `kBN` 96 and breaks the multiple-of-128 prefill-chunk
-      assumption. So the honest next step is split-K within the block — fewer accumulators per warp
-      with a shared-memory reduction — and that is a rewrite with its own correctness surface, not a
-      tuning pass. `q5a8_add`, whose shape and 28.4% figure are the same story, would follow it.
+      **And 768 threads does not work either, which took a second pass to see.** Accumulators per
+      *block* are fixed by the 128 x 128 tile while the 92 registers of non-accumulator overhead
+      scale with thread count, so 768 threads needs 86,784 registers per block and 1,024 needs
+      110,592 — both over the 65,536 file. More warps per block is unavailable at any width, and
+      split-K makes it worse rather than better for exactly this reason (a K-split warp still owns
+      its whole output tile). See the split-K section near the top, which says so and corrects an
+      earlier claim of the opposite.
+
+      **So the lever is the 92 overhead registers, not the accumulators and not more warps.**
+      Reaching 2 blocks per SM at 512 threads needs <=64 total, i.e. overhead 92 -> 32: `af` is 16,
+      `bf` is 16, the two `Stage`s ~14, addressing the rest. Cutting it means fewer staged fragments
+      and shallower prefetch, traded directly against the latency hiding they provide — a tuning
+      problem with a measurable knob rather than a rewrite. `q5a8_add`, whose shape and 28.4% figure
+      are the same story, would follow it.
 
       One caveat kept: `Block Limit Warps = 3` and `Block Limit SM = 16` are both far from binding,
       so nothing here is about block count.
