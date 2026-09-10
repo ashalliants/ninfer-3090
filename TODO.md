@@ -130,6 +130,56 @@ or artifacts this box does not have.
 
 ---
 
+## Split-K inside the CTA is the answer to two of the three biggest items, and here is the design
+
+Written 2026-09-10 after reading both kernels, because the same shape resolves the GDN parallelism
+problem *and* the prefill MLP register problem, and neither entry says so from the other's side.
+
+**The two problems are the same problem.** `rowsplit_grouped_mma_kernel` reaches 24.5% achieved
+occupancy because total warp-work is `(rows/WM) x (BN/WN)` = 1,024 warps, 0.26 machine-fulls;
+`q4a8_swiglu` reaches 33.3% because `acc[2][4][4]` costs 32 of its 124 registers and the block
+granularity means one block per SM. **Splitting K inside the CTA fixes both**: it multiplies warps
+per block by `KSplits` without touching the grid, and it divides each warp's accumulator count by
+`KSplits` because each warp now owns a K-slice rather than a whole dot product.
+
+**The template is `src/ops/gdn_input_proj/w8/w8_gdn_input_gemm_splitk.cu`**, in the tree, for the W8
+variant of the same Op, and its route table has sent widths 2..96 through it all along.
+`KSplits` warps cover disjoint K ranges, reduce through a shared arena, and the CTA takes 16 rows
+instead of 64 — `(12,288 / 16) x 8` = 6,144 warps, 1.56 machine-fulls against the Q4/Q5 tile's 0.26.
+
+**What makes the Q4/Q5 port harder than a copy, having read it:**
+
+- `rowsplit_grouped_mma_kernel` takes **2 or 4 `RowSplitGroupedMmaJob`s** and a
+  `RowSplitGroupedMmaCodec` that is `Mixed` for this Op — q4 for the qk rows, q5 for value_z — so
+  the K-slice bookkeeping has to be per-codec (`HB` is 1 for Q4 and 8 for Q5).
+- It carries **five shared arrays** (`As`, `Bs[S]`, `Cr[S]`, `Hr[S]`, `Sr[S]`) across an `S`-deep
+  pipeline; the reduction arena has to fit *beside* them under the 48 KB static cap, and that cap is
+  already what forces `BK = 64` (`static_assert(GPB == 1)`).
+- The epilogue writes straight to `job.out` with no accumulator buffer, so a K-split needs the
+  cross-warp reduction inserted before it rather than bolted after.
+- `Jobs == 2 || Jobs == 4` is static_asserted, so the reduction has to be written once and work for
+  both.
+
+**Do it in this order, because the first step is cheap and de-risks the second:**
+
+1. **Prove the win on the prefill MLP first**, where there is only one job and one codec.
+   `q4a8_swiglu`'s `acc[2][4][4]` at `KSplits = 2` becomes `acc[2][2][4]` — 16 registers instead of
+   32 — which on the accounting in §2c lands near 100 registers. That is still one block at 512
+   threads, so **pair it with 768 threads (24 warps)**: 24 warps at <=85 registers is one block and
+   50% occupancy, against 33.3% today. The blocker named in that entry is that 24 warps is `4 x 6`
+   and makes `kBN` 96, breaking the multiple-of-128 chunk assumption — **K-split removes that
+   blocker**, because the extra warps come from the K dimension rather than from `warp_n`, so the
+   warp grid stays `4 x 4` and `kBN` stays 128.
+2. **Then the GDN kernel**, with the reduction pattern already validated.
+
+**And measure it against the right null.** Forcing occupancy on this kernel the cheap way —
+`__launch_bounds__(kThreads, 2)` — cost **69.5%** (1,148.63 to 350.48 tok/s) because the compiler
+spilled to reach 64 registers. A K-split that lowers the *natural* register count is a different
+thing entirely, but it shares the failure mode: check the compiler's register count and spill
+traffic before believing any throughput number.
+
+---
+
 ## Handing this off to another machine
 
 Written 2026-09-09 for an agent picking this up on different hardware. The section after this one
