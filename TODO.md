@@ -2989,6 +2989,14 @@ ceiling, and neither has had any optimisation attempted.
       sits underneath it and was reported as no change for that reason. Bisecting it would make
       future quality claims sharper by an order of magnitude.
 
+      **The six speedups shipped 2026-09-09/10 do not move it, which is worth having on record.**
+      `int8` at the head of `perf/gdn-split4-width8` scores **4.342425372232802** on 261,167 tokens
+      — identical to the 4.342425 recorded below, to every figure quoted. That includes the q5 GEMV
+      dequant change, which **reorders float accumulation** by hoisting the group scale out of the
+      inner loop; the claim made for it was "it rounds less, not more", and this is that claim
+      measured rather than argued. So the whole batch is quality-neutral, and §3's "tile geometry
+      does not perturb perplexity" now extends to accumulation order within a group.
+
       **Three candidates eliminated 2026-09-09, and the current value is exactly reproducible.**
       `int8` re-runs to **4.342425** at HEAD — identical to twelve significant figures, on 261,167
       scored tokens, in 465 s. So the drift is a real, repeatable difference between two builds and
