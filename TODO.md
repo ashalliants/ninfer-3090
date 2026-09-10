@@ -49,7 +49,7 @@ all:
 |---|---:|---|---:|---:|---|
 | `rowsplit_grouped_mma` C8 (GDN, w8) | **27.7** | 54.3 L1/TEX | **24.5** of 50 | **0.55** | too few warps exist |
 | `q4a8_swiglu` (prefill MLP) | **20.6** | 61.1 L1/TEX | 33.3 of 33.3 | 0.78 | 124 registers/thread |
-| `q5_rowsplit_gemv` (dense decode) | 50.1 | **86.6 L1/TEX** | 57.6 | — | memory-pipe issue |
+| `q5_rowsplit_gemv` (dense decode) | 50.1 → 54.3 | 86.6 → **36.7** L1/TEX | 57.6 | — | **fixed: +3.90%** |
 | `sparse_moe_d3` | 43.2 | 34.7 L1/TEX | 61.1 of 93.8 | 1.36 | nothing — latency |
 | `sparse_moe_d4` | 47.1 | 42.4 L1/TEX | 81.4 of 93.8 | 1.16 | nothing — latency |
 
@@ -1542,8 +1542,73 @@ mechanism, and it is not tile geometry.**
       split-K's parallelism, which is precisely why the answer is split-K on the **MMA** path and
       not simply "use the SIMT route".
 
-- [ ] **Dense decode's GEMV kernels are limited by memory-pipe *instruction issue*, not bandwidth,
-      and the dequantization loop is where the instructions go.**
+- [x] **Dense decode's GEMV kernels were limited by memory-pipe *instruction issue*, not
+      bandwidth. Widening the consume loop shipped 2026-09-10: +3.90% on the 27B, L1/TEX 87% → 37%.**
+
+      The consume loop read **one** code byte per lane per group and so spent four memory-pipe
+      instructions to produce two weights — a 1-byte `tn`, a 1-byte `th`, a 2-byte broadcast `tsc`
+      and a 4-byte `x`. Sixteen groups per tile is 64 instructions on the consume side against
+      three on the staging side, so consume outweighed staging roughly 20 to 1, and that is what
+      `Mem Pipes Busy` was measuring.
+
+      Now each lane takes a **4-byte code word — 8 nibbles, 8 weights** — so eight lanes cover a
+      group's 32 code bytes and 32 lanes cover four groups per step. Per step: one 4-byte `tn`, one
+      1-byte `th`, one 2-byte `tsc`, one 16-byte `x`. **Four instructions per four groups against
+      sixteen: a 4x cut, for identical arithmetic.**
+
+      | kernel | duration | DRAM % | L1/TEX % | Mem Pipes Busy % |
+      |---|---:|---:|---:|---:|
+      | `<5120, 6144>` | 46.18 → **42.59** (−7.8%) | 50.10 → 54.34 | 86.60 → **36.71** | 81.04 → **33.64** |
+      | `<5120, 17408>` | 116.29 → **108.35** (−6.8%) | 55.80 → 59.77 | 89.85 → **35.77** | 85.59 → **33.81** |
+      | `<12288, 5120>` | 88.74 → **80.58** (−9.2%) | 51.75 → 58.88 | 90.76 → **39.94** | 83.09 → **36.71** |
+
+      **L1/TEX throughput collapses from 87-91% to 36-40% — the predicted 4x — and DRAM utilisation
+      goes *up*.** That is the whole point: the kernel stops being pipe-limited and gets closer to
+      actually streaming its weights. It is still not DRAM-bound at 54-59%, so there is more here.
+
+      End to end, `run_interleaved_ab.py`, clocks locked, six paired repetitions:
+
+      | model | paired median | positive | range |
+      |---|---:|---:|---|
+      | 27B dense | **+3.90%** | **6 / 6** | +3.21% to +4.31% |
+      | 35B MoE | −0.34% | 2 / 6 | −1.72% to +2.00% |
+
+      The 35B showing nothing is the expected control-by-shape: its decode is dominated by the
+      `sparse_moe` expert kernels, not by this GEMV. **There is no true `--control` for this one and
+      that is stated rather than hidden** — the change is inside `q5_rowsplit_gemv`, which every
+      text model reaches, so no configuration has an identical code path in both arms. The
+      substitute is the drift floor the two earlier A/Bs established on this box: with
+      `nvidia-smi -lgc 1500` their controls moved 0.00% and +0.09% over six pairs, against a 3.9%
+      effect that the kernel counters predicted independently.
+
+      **Why 3.9% end to end and 6.8-9.2% per kernel.** §2c's decode profile has 86% of the 27B's
+      *busy* time in four GEMV kernels, but only some of those four are `q5_rowsplit_gemv` — the
+      rest are `q4_linear_swiglu_gemv_pair` and friends, which have the same byte-granular shape
+      and were not touched. **So the same widening applied to the q4 SwiGLU GEMV pair is the
+      obvious follow-up**, and it should be worth something similar.
+
+      Correctness: every Op that reaches this GEMV passes — `linear_q5_a16`, `linear_add_q5_a16`,
+      `gdn_input_proj`, `attn_input_proj`, `linear_swiglu_q4_a16` — and the packing convention is
+      unchanged (code byte b holds the weights at 2b and 2b+1; high-plane byte h bit j carries bit
+      4 of the weight at 8h+j), verified on the host to cover all 1,024 weights of a tile exactly
+      once. The new code index works out to `step * 32 + lane`, so the shared reads stay
+      conflict-free.
+
+      *The file header claimed the opposite and was wrong.* It said "all weight reads are fully
+      coalesced 128-bit loads, so the kernel runs DRAM-bound instead of L1/LSU- or latency-bound".
+      True of the global staging, false of the kernel: DRAM was at 50% while the pipe was at 81%.
+      Corrected in place.
+
+- [ ] **The remaining GEMV headroom, and the q4 SwiGLU pair.** After the widening the three
+      `q5_rowsplit_gemv` instantiations sit at **54-59% of DRAM** with the memory pipe down at
+      34-37%, so nothing is saturated and there is more to take. Two follow-ups, in order:
+
+      1. **Apply the same widening to `q4_linear_swiglu_gemv_pair`**, which §2c's C1 round table has
+         at 7.59 ms of a 26.18 ms round and which has the same one-byte-per-lane consume shape.
+         This is the reason the 27B gained 3.9% rather than the ~7% the q5 kernels alone suggest.
+      2. Then re-profile: with the pipe at a third utilisation, whatever is next will be a
+         different constraint, and guessing it now would repeat the mistake this entry was written
+         to correct.
 
       This is the missing explanation for "the dense path sits around two-thirds of what the card
       can deliver". `q5_rowsplit_gemv` on the 27B decode, from the same elevated run:
