@@ -16,7 +16,9 @@ identical arithmetic — is worth **+3.90%** and **+1.95%** on the 27B dense dec
 compounded**, each 6 of 6 paired repetitions. The q4 SwiGLU pair now runs at **85.3% of DRAM**,
 which is the ceiling this file exists to reach; the q5 GEMV became **compute-bound at 73%**, a
 different problem than any other entry here. A third, `sparse_moe_d2`'s branch-free sorting network,
-is **+3.15% on the 35B**. See §2c.
+is **+3.15% on the 35B**. End to end at depth 4,096 the dense decode went **69.0% → 72.2% of the
+854.2 GB/s the card can actually read** — three points of the thirteen that entry identified. See
+§2c.
 
 **Two speedups have shipped on the GDN input projection, both on the same boundary, and the second
 one came from noticing the first had measured the wrong kernel.** Adding C8 and C16 tiles to the GDN input
@@ -829,7 +831,23 @@ roofline finally acquired a denominator; read them before the rest.
       | 27B dense | int8 | 32,768 | 33.56 | 565 GB/s | 66.2% |
 
       So the dense path sits around two-thirds of what the card can deliver, not 66% of an
-      unreachable number. Real headroom, roughly thirteen points, and still unprofiled.
+      unreachable number. Real headroom, roughly thirteen points.
+
+      **Three points of that headroom are now taken.** Re-measured 2026-09-10 after the two GEMV
+      consume-loop widenings, same workload (`-pg 4096,128`, int8 KV, three repetitions, clocks
+      locked at 1,500 MHz), using the same 15.743 GB/token accounting:
+
+      | | tok/s | achieved | % achievable |
+      |---|---:|---:|---:|
+      | before | 37.44 ± — | 589.4 GB/s | 69.0% |
+      | **after** | **39.19 ± 0.03** | **617.0 GB/s** | **72.2%** |
+
+      **+4.67% throughput and +3.2 points of the ceiling on the dense decode**, from removing a
+      memory-pipe bottleneck that this file had spent a cycle mistaking for bandwidth. The ceiling
+      itself is 54.3 tok/s if the remaining 27.8 points were ever fully closed, which is the honest
+      shape of what is left. Note this depth-4,096 figure (+4.67%) is slightly below the +5.9%
+      compounded from the two paired A/Bs; those measured prose generation through the CLI and this
+      measures `ninfer_bench` at depth. Both are real and the workloads differ.
 
 - [x] **Nobody knows where the MoE sits at all, because the accounting does not exist.** Closed by
       #50. It exists now, and it changes which entry in this section matters most.
