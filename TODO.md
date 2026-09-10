@@ -1479,14 +1479,40 @@ roofline finally acquired a denominator; read them before the rest.
       falloff, not all of it, and anyone who ships it should predict ~1.3x rather than 3.2x.
 
       **And the new fact: achieved occupancy is 33% of theoretical in *both* formats** — 21.98 of
-      66.66, and 16.51 of 50.00, the same ratio to two figures. Whatever stops these kernels filling
-      the SMs they are allowed is **format-independent and larger than the arena**, and it is not in
-      this entry at all. `long_scoreboard` at 31-33% in both says the resident warps are waiting on
-      global memory; with DRAM at 13-26% there is plenty of bandwidth, so it is a latency/occupancy
-      shortfall of the kind §2c's parallelism arithmetic explained for the GDN kernel. **Measure the
-      grid and the waves per SM against `(keys / KeyBlock) x splits` before touching the arena** —
-      on the evidence here that is the bigger of the two, and it is shared by the format everyone
-      considers the good one.
+      66.66, and 16.51 of 50.00, the same ratio to two figures. The grid explains it, and the grid
+      is identical in both:
+
+      | | `int8` | `fp8` |
+      |---|---:|---:|
+      | grid | **(4, 65) = 260 blocks** | **(4, 65) = 260 blocks** |
+      | block | 256 threads (8 warps) | 256 threads (8 warps) |
+      | **Block Limit Registers** | **4** | **4** |
+      | Block Limit Shared Mem | 8.50 | 7.50 |
+      | Block Limit Warps / SM | 6 / 16 | 6 / 16 |
+      | theoretical warps per SM | 32 | 24 |
+      | achieved warps per SM | 10.54 | 7.93 |
+
+      **260 blocks against a capacity of 4 x 82 = 328 is 0.79 machine-fulls.** The kernel cannot fill
+      the card even once, in either format, which is the same shape as §2c's GDN entry and the MoE
+      gather — and at 32-78 µs a kernel that never fills the machine spends much of its life in ramp
+      and drain, which is what drags achieved warps to a third of theoretical.
+
+      **Two things here do not match what this entry has been assuming, and both want reconciling
+      before any kernel work.** First, **`Block Limit Registers` is 4 in both formats while
+      `Block Limit Shared Mem` is 7.5-8.5** — so registers bind at or before shared memory, and the
+      dynamic arena is *not* the binding term for `int8` at all. The arena table above derives
+      2 blocks/SM for fp8 from 48 KiB of dynamic shared; ncu reports 7.5. Those disagree, and the
+      arena story rests on the derivation rather than on a counter. Second, fp8's theoretical warps
+      (24) is 3 blocks' worth where int8's (32) is 4, so *something* costs fp8 a block — but with
+      both showing `Block Limit Registers = 4` it is not obvious from these counters which term it
+      is.
+
+      So the ordering changes: **the grid is the bigger and better-evidenced problem, it is
+      format-independent, and it is shared by `int8` — the format everyone considers the good one.**
+      More key-splits would add blocks and cost nothing but a wider reduction. Settle the
+      register-versus-shared question with `--section Occupancy --section LaunchStats` on all six
+      formats before spending effort on removing the arena, which on this evidence buys the smaller
+      half of a gap it may not even be causing.
 
       What this is worth: **if `nvfp4` decoded on `rk8v4`'s curve it would be the outright best
       format** — 45% smaller than INT8 with no speed penalty — rather than the compromise it is.
