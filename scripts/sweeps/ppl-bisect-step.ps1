@@ -82,7 +82,11 @@ Copy the three files together, then run the copy:
 
 Set-Location $Repo
 
-if (-not $Model) { $Model = Join-Path (Get-NInferModelDir) 'qwen3_8_27b.ninfer' }
+# -Root, not a bare call: model-dir.ps1 derives its candidates from its own $PSScriptRoot, which
+# for the copied invocation in the header is C:\bisect rather than the checkout -- so the default
+# artifact would be looked for beside the copy and the step would fail on a repository that has
+# the file. Set-Location above does not help; $PSScriptRoot is not a working directory.
+if (-not $Model) { $Model = Join-Path (Get-NInferModelDir -Root $Repo) 'qwen3_8_27b.ninfer' }
 if (-not (Test-Path -LiteralPath $Model)) { Write-Error "missing artifact: $Model"; exit 1 }
 
 # The output directory must exist before the redirection below, not after. `> "$Out.log"` is

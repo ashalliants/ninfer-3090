@@ -17,6 +17,11 @@ With `NINFER_MODEL_DIR` unset, `model-dir.ps1` picks the first directory that ac
 `scripts\download-qwen*` put artifacts by default. Set the variable to use anything else -- an
 explicit value is taken verbatim, never probed, so a typo fails on the path you named.
 
+`Get-NInferModelDir` derives those candidates from `model-dir.ps1`'s own location, which is right
+for every script that runs from `scripts\sweeps\`. `ppl-bisect-step.ps1` is the exception -- it is
+meant to be copied out of the repository -- so it passes `-Root $Repo` to resolve against the
+checkout being bisected rather than beside the copy. Nothing else needs the parameter.
+
 They print a CSV summary to stdout and leave per-run `ninfer_bench` CSVs and logs under
 `$NINFER_SWEEP_OUT`. **Read the CSVs, not the console summary** — the summary is a convenience and
 has been wrong before (see the note at the bottom).

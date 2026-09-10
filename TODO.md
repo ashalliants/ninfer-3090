@@ -3443,9 +3443,10 @@ at all, and one of those two should be done before any of the others.
       | tok/round | 1.81 | 2.35 | 2.55 | 2.95 | 3.07 | 2.97 | 2.93 | 3.45 | 3.27 | 3.27 |
       | decode tok/s | 47.3 | 55.2 | **58.6** | 58.3 | 57.2 | 51.0 | 50.5 | 47.5 | 39.7 | 39.3 |
 
-      **Acceptance falls monotonically from 80.9% to 19.5% as the draft window widens**, which is
-      the shape a draft head on real prose should have and is the opposite of the committed corpus's
-      flat 100% at every count. So `bench_corpus.ids` was not merely optimistic, it was reporting
+      **Acceptance falls from 80.9% to 19.5% as the draft window widens**, monotonically except at
+      k=7 -> 8, where it rises 28.2% -> 31.0% before resuming the decline. That is the shape a draft
+      head on real prose should have and is the opposite of the committed corpus's flat 100% at
+      every count. So `bench_corpus.ids` was not merely optimistic, it was reporting
       the fixture; these are the numbers to quote.
 
       **Tokens-per-round plateaus around 3.0 from k=4**, which is the real justification for

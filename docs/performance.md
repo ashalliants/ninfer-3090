@@ -57,7 +57,8 @@ numbers to quote instead:
 | tok/round | 1.81 | 2.35 | 2.55 | 2.95 | 3.07 | 2.97 | 2.93 | 3.45 | 3.27 | 3.27 |
 | decode tok/s | 47.3 | 55.2 | **58.6** | 58.3 | 57.2 | 51.0 | 50.5 | 47.5 | 39.7 | 39.3 |
 
-Acceptance falls monotonically as the window widens, and tokens-per-round plateaus near 3.0 from
+Acceptance falls steadily as the window widens, from 80.9% at k=1 to 19.5% at k=12, with one
+uptick against the trend at k=7 -> 8 (28.2% -> 31.0%); tokens-per-round plateaus near 3.0 from
 k=4 — which is the real reason to recommend four rather than more. MTP3 reaches 58.3 tok/s at 56.0%
 acceptance, and MTP3 with `--lm-head-draft` is the fastest configuration measured at 62.9 tok/s.
 

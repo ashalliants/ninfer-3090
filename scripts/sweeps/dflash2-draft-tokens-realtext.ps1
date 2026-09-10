@@ -20,11 +20,13 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\sweeps\dflash2-draft-tokens-realtext.ps1
 #
 # About 25 minutes. Greedy at every configuration, which is necessary but not sufficient for the
-# comparison to be of speed on identical output: TODO.md records DFlash2 and MTP producing
-# byte-identical output *to each other*, and both diverging from the width-1 greedy path within the
-# first hundred tokens -- squarely inside this sweep's --max-new 256 window. So this does not
-# assume identical output; it hashes each run's generated text (content_sha256 below) and leaves the
-# comparison to whoever reads the CSV, rather than asserting a thing that has been measured false.
+# comparison to be of speed on identical output. The hashes this sweep records are what settled
+# that: DFlash2 and MTP do NOT match each other, DFlash2's own output varies with the draft count
+# (eight distinct outputs across k = 1..12), and every speculative configuration diverges from the
+# width-1 greedy path within the first hundred tokens -- squarely inside this sweep's --max-new 256
+# window. See docs/performance.md, which carries the same finding and the retraction of the earlier
+# "byte-identical to each other" claim. So this asserts nothing about identity; it hashes each run's
+# generated text (content_sha256 below) and leaves the comparison to whoever reads the CSV.
 #
 # It also reports acceptance. TODO.md section 3 wants DFlash2's acceptance and tokens-per-round on
 # realistic text and records that the committed corpus cannot supply them -- it is 65,536 tokens
