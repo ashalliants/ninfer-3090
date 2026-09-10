@@ -1711,16 +1711,41 @@ mechanism, and it is not tile geometry.**
       policy (`AllowA8Int`) and a different numeric contract, not an optimisation of this one. The
       technique that does apply was already in the tree for the same codec.
 
-- [ ] **What is left after five speedups, and it is genuinely a different question now.** The dense
-      decode is at **73.9% of the 854.2 GB/s the card can read**, up from 69.0%. The q4 SwiGLU pair
-      is at 85.3% of DRAM and effectively finished. The q5 GEMV has had both its memory-pipe and its
-      arithmetic bottleneck removed, so **whatever binds it now has not been measured** — and the
-      lesson this file keeps re-learning is not to guess. One `ncu` run over the same instantiations,
-      reading `SpeedOfLight` and the stall breakdown, before any further kernel work.
+- [ ] **What is left after five speedups: the q5 GEMV now stalls on memory *latency*, and the
+      obvious cure was tried and does nothing.** The dense decode is at **73.9% of the 854.2 GB/s
+      the card can read**, up from 69.0%. The q4 SwiGLU pair is at 85.3% of DRAM and effectively
+      finished. The q5 GEMV was re-profiled after the dequant fix:
+
+      | metric | after widening | after dequant fix |
+      |---|---:|---:|
+      | DRAM throughput | 55.83% | **66.67%** |
+      | L1/TEX throughput | 36.84% | 46.47% |
+      | Compute (SM) throughput | 73.31% | 68.54% |
+      | **stall: `long_scoreboard`** | 10.37% | **27.26%** |
+      | stall: `wait` | 5.88% | 8.13% |
+
+      Both earlier constraints are gone — DRAM is up eleven points, compute is down five — and what
+      surfaced is **global-memory latency**: `long_scoreboard` went 10.37% → 27.26%. With the
+      consume loop cheap, the kernel drains tiles faster than a two-stage `cp.async` pipeline
+      prefetches them.
+
+      **So `kStages = 3` was the obvious cure, and it is worth exactly nothing. Measured
+      2026-09-10: 40.12 tok/s against 40.11 at `kStages = 2`**, inside the ±0.04-0.07 run spread, on
+      the same clock-locked `-pg 4096,128`. Reverted, because three stages are not free — 42,496 B
+      of shared against 31,744 costs a block per SM, so it buys a regression in occupancy for no
+      throughput. Four stages do not fit under the 48 KB static cap while `kStageX` is on.
+
+      That is the third plausible mechanism this cycle to be built, measured and thrown away (the
+      MoE D3 block split and split4-at-width-7 were the others), and the pattern is worth naming:
+      **a stall percentage says where the warps are waiting, not that removing the wait will make
+      the kernel faster.** Something else — most likely the block count, since these are
+      narrow-extent kernels and §2c's parallelism entry applies here too — takes up the slack.
 
       The remaining 26.1 points to the ceiling are worth 54.3 tok/s if ever fully closed, which is
       the honest shape of what is left. Nothing in this file suggests that is reachable; the point
-      of the number is to stop the next person quoting 936.2 GB/s.
+      of the number is to stop the next person quoting 936.2 GB/s. Next probe, if anyone wants it:
+      the launch geometry, not the pipeline — `kRowsPerBlock` and the resulting waves per SM, read
+      against the `(rows/WM) x (BN/WN)` arithmetic that explained the GDN kernel.
 
       This is the missing explanation for "the dense path sits around two-thirds of what the card
       can deliver". `q5_rowsplit_gemv` on the 27B decode, from the same elevated run:
