@@ -509,10 +509,16 @@ editing this file with a script is worth reading before you edit this file with 
    occupancy remain, and those need counters) and the contiguous-kernel baseline the MoE gather's
    40-45% figures are compared against. This is minutes of GPU time and it unblocks the largest
    compute-side item in the file.
-4. **Lock clocks for measurement: `nvidia-smi -lgc 1500`** (§3, elevated). The card drifts 3-5%
-   between processes, which is larger than most effects here — it forced every A/B this cycle to
-   interleave its two binaries within each repetition and carry an unchanged control. This is the
-   cheapest improvement to every future measurement in this repository and it is one line.
+4. **Lock clocks for measurement — and always in a `try`/`finally` pair** (§3, elevated):
+
+       nvidia-smi -lgc 1500        # before
+       nvidia-smi -rgc             # in a finally / trap, ALWAYS
+
+   The card drifts 3-5% between processes, which is larger than most effects here — it forced
+   every A/B this cycle to interleave its two binaries within each repetition and carry an
+   unchanged control. It is the cheapest improvement to every measurement in this repository.
+   **See "Leave this card as you found it" below before you run it**: an unpaired `-lgc` is a
+   persistent change to someone else's hardware, and this file recommended one for weeks.
 5. **Two related kernel problems, and they are the real prizes** (§2c). Both are narrow-extent
    weight streaming and both have a measured target:
    - `q5_linear_add`'s `mma_r64_c16` sits at **24%** of what its weight costs to stream once, flat
@@ -3932,8 +3938,32 @@ Three consequences worth internalising before quoting any number in this file:
 Also worth someone's attention: 315 W is 90% of this card's default TDP. Decode is memory-bound and
 the memory clock is not throttling, so the cost may be small — but it has never been measured.
 `nvidia-smi -pl 350` and a re-run of `kv-decode-vs-depth.ps1` would answer it, and
-`nvidia-smi -lgc <clock>` would collapse the 3–5% spread for measurement runs. Both need
-elevation.
+`nvidia-smi -lgc <clock>` would collapse the 3–5% spread for measurement runs. Both need elevation.
+
+**Both are also persistent changes to the machine, so read the next section first.** The 315 W cap
+is this host's own setting, not a default and not ours to keep: if you raise it to measure, restore
+it to **315** in a `finally`, and never leave a session having changed it.
+
+### Leave this card as you found it
+
+Every `nvidia-smi` write is a change to hardware someone else is using, and it survives the process
+that made it. **This file recommended an unpaired `nvidia-smi -lgc 1500` in seven places and never
+once mentioned `-rgc`**, which is how a measurement convenience becomes a machine left clocked at
+1500 MHz. Two rules, and they are not negotiable:
+
+- **Pair every write with its restore, in a `finally` or `trap`, so an error or a Ctrl-C still
+  restores it.** `-lgc <n>` pairs with `-rgc`. `-pl <n>` pairs with `-pl 315` on this box — check
+  `nvidia-smi --query-gpu=power.limit --format=csv` first and restore what you actually found, not
+  what this file says.
+- **Verify afterwards, because a failed restore is silent.** The card is clean when
+  `nvidia-smi -q -d PERFORMANCE` reports **`Applications Clocks Setting : Not Active`** and
+  `power.limit` reads what it read before you started. Check both at the end of a measuring
+  session, not just after the command.
+
+`scripts/sweeps/admin-profile.ps1` is the worked example: it locks, profiles, and restores in a
+`finally`, and it takes `-SkipPower` so a profiling run never has to touch the power limit at all.
+Prefer `-SkipPower` — the power question above is interesting, but it is not worth a persistent
+change on someone's workstation to answer as a side effect of something else.
 
 ---
 
@@ -4014,6 +4044,14 @@ background job that session had started itself and then rebased underneath. Two 
 **Check the build's exit code separately from the test's.** The stale-binary trap is silent: the
 build fails, the test runs the *previous* binary, and reports a pass. Every "verified" claim in this
 file was checked that way after being caught out by it.
+
+**And delete the log before every build, because the trap has a second form that survives the
+first check.** If you write the exit code into a log — `cmake --build ... > build.log 2>&1` then
+`echo BUILD_EXIT=%ERRORLEVEL% >> build.log` — and the build is *killed* rather than failed, the
+line is never appended and the previous run's `BUILD_EXIT=0` is still sitting in the file. Checking
+the exit code then reads a success that belongs to a different build. This cost three separate
+false "verified" readings in one session before it was spotted. `rm -f build.log` first, every
+time, and treat a *missing* `BUILD_EXIT` line as a failure rather than as no news.
 
 **Never truncate a build pipeline.** `cmake --build ... | Select-Object -First N` returns while
 `ninja` keeps running detached, and the next build collides with it. Redirect the whole build to a
