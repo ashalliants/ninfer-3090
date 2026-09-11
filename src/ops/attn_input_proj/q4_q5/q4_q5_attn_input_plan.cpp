@@ -59,8 +59,18 @@ struct RouteSpec {
 // catch-up for no measured gain here, and the reason to worry about dead schedules -- they are
 // where the two switch fallthroughs hid -- is now covered by tests/ops/test_route_coverage.cpp,
 // which enumerates the unrouted set and fails if its membership changes.
+//
+// 2026-09-11, RTX 3090 under Linux: SmallTMma -- the Q4 and Q5 small-T MMA kernels over query_key
+// and gate_value -- replaces ParentSplitFixed across 1..8, the T=1 GEMVs included. Cold, median
+// of 31 (us):
+//
+//   T                  1      2      3      4      5      6      7      8
+//   parent_split   81.9   93.2   94.2   90.1  164.9  174.2  215.0  161.8
+//   small_t        69.6   69.6   68.6   68.6   66.6   66.7   68.6   69.6
+//
+// At T=4 that is 71% of the 48.8 us both weights cost to stream once, against 54%.
 constexpr std::array<RouteSpec, 6> kRoutes{{
-    {{1, 8}, Q4Q5AttnInputScheduleId::ParentSplitFixed},
+    {{1, 8}, Q4Q5AttnInputScheduleId::SmallTMma},
     {{9, 32}, Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR32C32S4},
     {{33, 64}, Q4Q5AttnInputScheduleId::MixedR32C64S3},
     {{65, 127}, Q4Q5AttnInputScheduleId::MixedR64C128S2},

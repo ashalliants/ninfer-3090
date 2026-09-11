@@ -84,9 +84,20 @@ struct RouteSpec {
 // not by the live token count, so the tile is chosen to be the narrowest one that still
 // covers the extent in a single pass. Decode extents (C8 with MTP3 is 32) get the 32-wide
 // tile; the 128-wide tile remains the prefill-chunk anchor.
-constexpr std::array<RouteSpec, 6> kRoutes{{
-    {{1, 6}, Q4Q5GdnInputScheduleId::IndependentDirectFixed},
-    {{7, 8}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C8},
+//
+// 2026-09-11, RTX 3090 under Linux: SmallTMma -- the Q4 and Q5 small-T MMA kernels
+// (q4_small_t_mma.cuh, q5_small_t_mma.cuh) over query/key and value/z -- is flat across T=1..8 and
+// beats everything below it, the T=1 GEMVs included. Cold, median of 31 (us):
+//
+//   T                  1      2      3      4      5      6      7      8
+//   independent    91.1  101.4  111.6  100.4  146.4  164.9  322.5  309.2
+//   grouped c8    234.5  234.5  232.4  231.4  231.4  232.4  232.4  231.4
+//   small_t        79.7   79.9   78.8   78.8   82.9   82.9   84.0   84.0
+//
+// At T=4 (an MTP3 verify) that is 74% of the 58.7 us both weights cost to stream once, against
+// 58%; at T=1 the independent route's value/z GEMV is 768 blocks of 16 rows for 246 slots.
+constexpr std::array<RouteSpec, 5> kRoutes{{
+    {{1, 8}, Q4Q5GdnInputScheduleId::SmallTMma},
     {{9, 16}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C16},
     {{17, 32}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C32},
     {{33, 64}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C64},
