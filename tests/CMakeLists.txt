@@ -409,6 +409,9 @@ ninfer_add_op_test(ninfer_linear_add_q5_small_t_test
 ninfer_add_op_test(ninfer_q4_requantize_test
   SOURCES ops/test_q4_requantize.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_gdn_state_fp16_test
+  SOURCES ops/test_gdn_state_fp16.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_fused_linear_test(
   ninfer_linear_add_bf16_a16_test
   ops/linear_add/test_bf16_a16.cpp
