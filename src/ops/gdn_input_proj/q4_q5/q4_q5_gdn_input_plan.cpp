@@ -126,6 +126,8 @@ const char* q4_q5_gdn_input_schedule_name(Q4Q5GdnInputScheduleId schedule) noexc
         return "gdn_input_proj.q4_q5.grouped_mixed.mma.r64.c64";
     case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128:
         return "gdn_input_proj.q4_q5.grouped_mixed.mma.r64.c128";
+    case Q4Q5GdnInputScheduleId::SmallTMma:
+        return "gdn_input_proj.q4_q5.small_t.mma";
     }
     return "gdn_input_proj.q4_q5.unknown";
 }
@@ -209,6 +211,12 @@ void q4_q5_gdn_input_execute_schedule(Q4Q5GdnInputScheduleId schedule, const Ten
     case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128:
         q4_q5_gdn_input_grouped_mma_launch(x, qk_weight, value_z_weight, qkv, z, stream);
         return;
+    case Q4Q5GdnInputScheduleId::SmallTMma: {
+        Tensor qk    = qkv.slice(0, 0, problem.qk_rows);
+        Tensor value = qkv.slice(0, problem.qk_rows, problem.z_rows);
+        q4_q5_gdn_input_small_t_launch(x, qk_weight, value_z_weight, qk, value, z, stream);
+        return;
+    }
     }
     throw std::logic_error("Q4/Q5 GDN input: unknown schedule");
 }

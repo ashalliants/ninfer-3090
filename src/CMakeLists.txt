@@ -169,6 +169,7 @@ add_library(ninfer_ops STATIC
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.cpp
   ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_gemm_mma.cu
   ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
+  ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_small_t.cu
   ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_conv_snapshot.cu
   ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.cpp
   ops/gdn_input_proj/gdn_projected_conv.cu
