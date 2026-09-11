@@ -69,8 +69,8 @@ int main(int argc, char** argv) {
         ninfer::test::GuardedDeviceBuffer s32(state_elems * 4), s16(state_elems * 2);
         s32.fill(0);
         s16.fill(0);
-        ninfer::test::GuardedDeviceBuffer o32(static_cast<std::size_t>(kDim) * kHv * width * 2);
-        ninfer::test::GuardedDeviceBuffer o16(o32.size());
+        const std::size_t out_bytes = static_cast<std::size_t>(kDim) * kHv * width * 2;
+        ninfer::test::GuardedDeviceBuffer o32(out_bytes), o16(out_bytes);
         ninfer::WorkspaceArena ws(std::max<std::size_t>(
             256, ninfer::ops::gated_delta_net_workspace_capacity_bytes(kQk, kHv, true, width,
                                                                         width)));
