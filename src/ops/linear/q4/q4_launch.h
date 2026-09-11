@@ -4,9 +4,18 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
+
 namespace ninfer::ops::detail {
 
 using Q4Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+
+// Row counts a leading prefix of the 27B's 131072-row draft head (text/draft_head, K = 5120) may
+// take. Its rows are ordered by token frequency, so a prefix is the N most frequent proposal
+// tokens; multiples of 8192 keep every row tile of every schedule whole.
+inline constexpr bool q4_draft_head_prefix_rows(std::int32_t n) noexcept {
+    return n >= 8192 && n < 131072 && (n % 8192) == 0;
+}
 
 void launch_q4_gemv_r4_w1_direct(const Tensor& x, const Weight& w, Tensor& out,
                                  cudaStream_t stream);

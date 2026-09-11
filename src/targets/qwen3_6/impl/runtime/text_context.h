@@ -338,6 +338,7 @@ private:
     const Weight* proposal_head_                = nullptr;
     const std::int32_t* proposal_head_ids_      = nullptr;
     int proposal_head_n_                        = 0;
+    Weight proposal_head_prefix_{};
     const ops::SamplingConfig* sampling_config_ = nullptr;
     MtpW mtp_;
     std::array<FullLayerW, TextConfig::full_attention_layers()> full_{};

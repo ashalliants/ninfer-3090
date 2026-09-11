@@ -3,6 +3,7 @@
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
 #include "core/nvtx.h"
+#include <cstdlib>
 #include "targets/qwen3_6/impl/runtime/visual_scatter.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include <ninfer/targets/qwen3_6/vision_control.h>
@@ -270,8 +271,15 @@ void TextContext::bind() {
     lm_head_    = &weights_.output_head;
     if (weights_.optimized_proposal) {
         const auto& proposal = *weights_.optimized_proposal;
-        set_proposal_head(&proposal.head, static_cast<const std::int32_t*>(proposal.token_ids.data),
-                          proposal.head.n);
+        // EXPERIMENT: NINFER_DRAFT_HEAD_ROWS selects a leading row prefix of the draft head.
+        int rows = proposal.head.n;
+        if (const char* env = std::getenv("NINFER_DRAFT_HEAD_ROWS")) { rows = std::atoi(env); }
+        proposal_head_prefix_                 = proposal.head;
+        proposal_head_prefix_.n               = rows;
+        proposal_head_prefix_.shape[0]        = rows;
+        proposal_head_prefix_.padded_shape[0] = rows;
+        set_proposal_head(&proposal_head_prefix_,
+                          static_cast<const std::int32_t*>(proposal.token_ids.data), rows);
     }
 
     if (mtp_enabled()) {
