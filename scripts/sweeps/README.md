@@ -75,6 +75,14 @@ ramp-up spikes on a cold card.
 measured decode repetition per configuration and reports GPU-busy vs. idle time from the trace, plus
 the top kernels by total time. Set `NINFER_NSYS` if it is not at the default install path.
 
+`decode-step-profile.sh` is its Linux port, and adds the question the `.ps1` does not ask: an MTP3
+round (`27b-decode-mtp3`) next to a plain decode step (`27b-decode`), on the same binary, card and
+cache depth. A round verifies four columns in one pass, so the kernels that differ between the two
+reports are the ones that carry the verify cost. Its first run (RTX 3090, 2026-09-11) put 55% of the
+round's extra 13.4 ms in one kernel: the Q4 SwiGLU small-T MMA at T=4, 228 us against the T=1 GEMV's
+113 us. The bench corpus inflates acceptance, which does not matter here -- a round's kernel work is
+fixed by the draft count, not by what is accepted.
+
 ## Things these got wrong, so you do not repeat them
 
 **Decode must be measured at depth.** A `tg128` run seeds one token, so the cache is ~128 deep and
