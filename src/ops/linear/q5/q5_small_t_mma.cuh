@@ -34,35 +34,62 @@ struct Q5SmallTSchedule {
     static constexpr int kRowsPerLoaderWarp = kRowsPerCta / kKWarps;
     static constexpr int kCodeRowBytes      = kGroupK / 2;
     static constexpr int kHighRowBytes      = kGroupK / 8;
-    static constexpr int kRowPad            = 16;
+    // A lane reads eight contiguous code bytes per row (LDS.64) and two high bytes (LDS.16); a
+    // half-warp of 64-bit loads spans four rows, so code rows are staggered by 32 B (8 banks) and
+    // high rows by 16 B, which puts every row a warp touches in its own banks.
+    static constexpr int kCodeRowPad = 32;
+    static constexpr int kHighRowPad = 16;
+    // Activation columns are 64 bf16 (128 B) per warp slab; 16 B of padding staggers adjacent
+    // columns by four banks for the quarter-warp 128-bit B loads.
+    static constexpr int kXColPad = 8;
 };
 
-__device__ __forceinline__ int q5_small_t_swizzle_64(int row, int col) {
-    return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
-}
-
-// One code byte plus its two high bits (bit 0 for the low nibble, bit 1 for the high one) -> the
-// bf16 pair of signed five-bit codes, unscaled.
-__device__ __forceinline__ unsigned q5_small_t_bf16_pair(unsigned packed, unsigned high) {
-    const int q0 = ((static_cast<int>((packed & 0x0fu) | ((high & 1u) << 4))) ^ 0x10) - 0x10;
-    const int q1 = ((static_cast<int>((packed >> 4) | ((high & 2u) << 3))) ^ 0x10) - 0x10;
-    const __nv_bfloat162 pair = __floats2bfloat162_rn(static_cast<float>(q0), static_cast<float>(q1));
-    return *reinterpret_cast<const unsigned*>(&pair);
+// Eight Q5 codes -> four bf16 pairs, exactly, without int-to-float conversion. `word` holds four
+// code bytes (weight 2j in byte j's low nibble, 2j + 1 in its high nibble) and `high` their eight
+// high bits (bit i for weight i). A code is the five-bit two's-complement value nib - 16 * h; with
+// the high bit inverted into bit 4 it becomes v = nib + 16 * (1 - h) in [0, 31], which placed in
+// the mantissa of bf16 128.0 reads 128 + v, and subtracting 144 leaves the code. out[j] holds
+// weights (2j, 2j + 1).
+__device__ __forceinline__ void q5_small_t_decode_eight(unsigned word, unsigned high,
+                                                        unsigned (&out)[4]) {
+    const unsigned kMagic = 0x43004300u; // bf16 128.0 in both halves
+    const unsigned kBias  = 0x43104310u; // bf16 144.0 in both halves
+    const unsigned lo     = word & 0x0f0f0f0fu;
+    const unsigned hi     = (word >> 4) & 0x0f0f0f0fu;
+    unsigned even         = __byte_perm(lo, hi, 0x5140); // weights 0..3, one per byte
+    unsigned odd          = __byte_perm(lo, hi, 0x7362); // weights 4..7
+    const unsigned inv    = ~high;
+    // (b & 0xf) * 0x00204081 lays bits 0..3 at 0, 8, 16, 24 with no carries between the copies.
+    even |= (((inv & 0xfu) * 0x00204081u) & 0x01010101u) << 4;
+    odd |= ((((inv >> 4) & 0xfu) * 0x00204081u) & 0x01010101u) << 4;
+    const unsigned biased[4] = {__byte_perm(even, kMagic, 0x7150), __byte_perm(even, kMagic, 0x7372),
+                                __byte_perm(odd, kMagic, 0x7150), __byte_perm(odd, kMagic, 0x7372)};
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const __nv_bfloat162 value = __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&biased[j]),
+                                             *reinterpret_cast<const __nv_bfloat162*>(&kBias));
+        out[j]                     = *reinterpret_cast<const unsigned*>(&value);
+    }
 }
 
 // Rows: output rows. K: reduction length, a multiple of 512. XCols: activation columns staged
-// (4 or 8); the MMA column tile is always 8, and the B-fragment rows of columns at or past
-// `columns` are pointed at a zeroed 16-byte row instead of being staged, so a four-column extent
-// carries half the activation tile. Stages: depth of the cp.async ring (1 or 2). Epilogue::store(
-// row, col0, v) receives, for the lane's rows row and row + 8, v.x = (row, col0), v.y = (row,
-// col0 + 1), v.z = (row + 8, col0), v.w = (row + 8, col0 + 1); columns at or past `columns` must
-// be ignored by the epilogue.
+// (4 or 8); the MMA column tile is always 8 and the B fragments of columns at or past `columns`
+// are zero. Stages: depth of the cp.async ring (1 or 2). Epilogue::store(row, col0, v) receives,
+// for the lane's rows row and row + 8, v.x = (row, col0), v.y = (row, col0 + 1), v.z = (row + 8,
+// col0), v.w = (row + 8, col0 + 1); columns at or past `columns` must be ignored by the epilogue.
 //
-// SplitK > 1 spreads each row tile's slabs over that many CTAs (blockIdx.y), because a 5120-row
-// matrix is only 320 row tiles -- under four CTAs per SM, too few to keep enough weight reads in
-// flight. Each CTA publishes its fp32 partial to `partials`; the last CTA of a tile to arrive
-// (counted in `counters`, which it resets for the next launch) sums the SplitK partials in split
-// order -- so the result does not depend on arrival order -- and runs the epilogue.
+// K order. The MMA's k slots may be any permutation of a group's 64 k, provided A and B agree.
+// Lane lid is given k 16*lid .. 16*lid + 15 of its warp's group: for step ks, slots (2*lid,
+// 2*lid + 1) carry k 16*lid + 4*ks + {0, 1} and slots (2*lid + 8, 2*lid + 9) carry
+// 16*lid + 4*ks + {2, 3}. The lane's A operand over the four steps is then eight contiguous code
+// bytes per row -- one 64-bit load, decoded by q5_small_t_decode_eight -- and its B operand
+// sixteen contiguous activations of one column -- two 128-bit loads, no ldmatrix -- where the
+// natural slot order needs a byte load, a decode and an ldmatrix per fragment.
+//
+// SplitK > 1 spreads each row tile's slabs over that many CTAs (blockIdx.y). Each CTA publishes
+// its fp32 partial to `partials`; the last CTA of a tile to arrive (counted in `counters`, which
+// it resets for the next launch) sums the SplitK partials in split order -- so the result does
+// not depend on arrival order -- and runs the epilogue.
 template <int Rows, int K, int XCols, int Stages, int SplitK, class Epilogue>
 __launch_bounds__(256, (Stages == 1 ? 6 : 4)) __global__
     void q5_small_t_mma_kernel(const __nv_bfloat16* __restrict__ x,
@@ -71,24 +98,25 @@ __launch_bounds__(256, (Stages == 1 ? 6 : 4)) __global__
                                const std::uint8_t* __restrict__ scales, Epilogue epilogue,
                                int columns, float4* __restrict__ partials,
                                unsigned* __restrict__ counters) {
-    using Schedule              = Q5SmallTSchedule;
-    constexpr int kTileK        = Schedule::kTileKPerWarp;
-    constexpr int kWarps        = Schedule::kKWarps;
-    constexpr int kRowsPerCta   = Schedule::kRowsPerCta;
-    constexpr int kGroupK       = Schedule::kGroupK;
-    constexpr int kSlabs        = K / kGroupK;
-    constexpr int kGroupsPerRow = K / 64;
+    using Schedule               = Q5SmallTSchedule;
+    constexpr int kTileK         = Schedule::kTileKPerWarp;
+    constexpr int kWarps         = Schedule::kKWarps;
+    constexpr int kRowsPerCta    = Schedule::kRowsPerCta;
+    constexpr int kGroupK        = Schedule::kGroupK;
+    constexpr int kSlabs         = K / kGroupK;
+    constexpr int kGroupsPerRow  = K / 64;
+    constexpr int kXColStride    = kTileK + Schedule::kXColPad;
+    constexpr int kSlabsPerSplit = (kSlabs + SplitK - 1) / SplitK;
     static_assert(XCols == 4 || XCols == 8);
     static_assert(Stages == 1 || Stages == 2);
     static_assert(SplitK >= 1);
-    constexpr int kSlabsPerSplit = (kSlabs + SplitK - 1) / SplitK;
     static_assert(K % kGroupK == 0, "K must be a whole number of 512-wide slabs");
     static_assert(Rows % kRowsPerCta == 0);
 
     struct Stage {
-        std::uint8_t codes[kRowsPerCta][Schedule::kCodeRowBytes + Schedule::kRowPad];
-        std::uint8_t high[kRowsPerCta][Schedule::kHighRowBytes + Schedule::kRowPad];
-        __nv_bfloat16 activations[kWarps][XCols * kTileK];
+        std::uint8_t codes[kRowsPerCta][Schedule::kCodeRowBytes + Schedule::kCodeRowPad];
+        std::uint8_t high[kRowsPerCta][Schedule::kHighRowBytes + Schedule::kHighRowPad];
+        __nv_bfloat16 activations[kWarps][XCols][kXColStride];
         std::uint16_t scales[kRowsPerCta][kWarps];
     };
     union SharedStorage {
@@ -97,22 +125,23 @@ __launch_bounds__(256, (Stages == 1 ? 6 : 4)) __global__
     };
 
     __shared__ __align__(16) SharedStorage shared;
-    __shared__ __align__(16) __nv_bfloat16 zero_row[8];
 
-    const int tid  = static_cast<int>(threadIdx.x);
-    const int warp = tid >> 5;
-    const int lane = tid & 31;
-    const int gid  = lane >> 2;
-    const int lid  = lane & 3;
-    const int row0 = static_cast<int>(blockIdx.x) * kRowsPerCta;
-    if (tid < 8) { zero_row[tid] = __float2bfloat16_rn(0.0f); }
+    const int tid        = static_cast<int>(threadIdx.x);
+    const int warp       = tid >> 5;
+    const int lane       = tid & 31;
+    const int gid        = lane >> 2;
+    const int lid        = lane & 3;
+    const int row0       = static_cast<int>(blockIdx.x) * kRowsPerCta;
+    const int tile       = static_cast<int>(blockIdx.x);
+    const int slab_begin = static_cast<int>(blockIdx.y) * kSlabsPerSplit;
+    const int slab_end   = min(kSlabs, slab_begin + kSlabsPerSplit);
 
     const auto stage_x = [&](int slab_k0, Stage& stage) {
         const int items = columns * (kTileK / 8);
         for (int item = lane; item < items; item += 32) {
             const int col = item / (kTileK / 8);
             const int k8  = item - col * (kTileK / 8);
-            cp_async<16>(&stage.activations[warp][col * kTileK + q5_small_t_swizzle_64(col, k8 * 8)],
+            cp_async<16>(&stage.activations[warp][col][k8 * 8],
                          &x[static_cast<std::int64_t>(col) * K + slab_k0 + warp * kTileK + k8 * 8]);
         }
     };
@@ -135,10 +164,6 @@ __launch_bounds__(256, (Stages == 1 ? 6 : 4)) __global__
         }
     };
 
-    const int tile       = static_cast<int>(blockIdx.x);
-    const int slab_begin = static_cast<int>(blockIdx.y) * kSlabsPerSplit;
-    const int slab_end   = min(kSlabs, slab_begin + kSlabsPerSplit);
-
     const auto issue_slab = [&](int slab) {
         if (slab < slab_end) {
             Stage& stage = shared.stages[slab % Stages];
@@ -148,12 +173,9 @@ __launch_bounds__(256, (Stages == 1 ? 6 : 4)) __global__
         cp_commit(); // empty commits keep cp_wait<Stages - 1> exact through the tail
     };
 
-    const int b_col     = lane & 7;
-    const int b_koff    = ((lane >> 3) & 1) << 3;
-    const bool b_live   = b_col < columns;
-    const int warp_byte = warp * (kTileK / 2);
-    const int high_byte = warp * (kTileK / 8);
-    const int shift     = lid * 2;
+    const bool b_live   = gid < columns;
+    const int code_byte = warp * (kTileK / 2) + 8 * lid;
+    const int high_byte = warp * (kTileK / 8) + 2 * lid;
     float acc[4]        = {};
 
 #pragma unroll
@@ -166,30 +188,32 @@ __launch_bounds__(256, (Stages == 1 ? 6 : 4)) __global__
         __syncthreads();
 
         const Stage& stage = shared.stages[slab % Stages];
+        const uint2 top    = load_vec<uint2>(&stage.codes[gid][code_byte]);
+        const uint2 bot    = load_vec<uint2>(&stage.codes[gid + 8][code_byte]);
+        const unsigned top_high =
+            *reinterpret_cast<const std::uint16_t*>(&stage.high[gid][high_byte]);
+        const unsigned bot_high =
+            *reinterpret_cast<const std::uint16_t*>(&stage.high[gid + 8][high_byte]);
+        unsigned a_top[8], a_bot[8];
+        q5_small_t_decode_eight(top.x, top_high & 0xffu, *reinterpret_cast<unsigned(*)[4]>(&a_top[0]));
+        q5_small_t_decode_eight(top.y, top_high >> 8, *reinterpret_cast<unsigned(*)[4]>(&a_top[4]));
+        q5_small_t_decode_eight(bot.x, bot_high & 0xffu, *reinterpret_cast<unsigned(*)[4]>(&a_bot[0]));
+        q5_small_t_decode_eight(bot.y, bot_high >> 8, *reinterpret_cast<unsigned(*)[4]>(&a_bot[4]));
+
+        uint4 b_lo = make_uint4(0u, 0u, 0u, 0u);
+        uint4 b_hi = make_uint4(0u, 0u, 0u, 0u);
+        if (b_live) {
+            b_lo = load_vec<uint4>(&stage.activations[warp][gid][16 * lid]);
+            b_hi = load_vec<uint4>(&stage.activations[warp][gid][16 * lid + 8]);
+        }
+        const unsigned b_words[8] = {b_lo.x, b_lo.y, b_lo.z, b_lo.w, b_hi.x, b_hi.y, b_hi.z, b_hi.w};
+
         float group_acc[4] = {};
 #pragma unroll
         for (int ks = 0; ks < 4; ++ks) {
-            // byte_col & 3 == lid, so this lane's two high bits sit at the same shift in every
-            // high byte it reads; the +4 byte's bits are in the next high byte.
-            const int byte_col   = warp_byte + ks * 8 + lid;
-            const int high_col   = high_byte + ks * 2;
-            const unsigned h_top = static_cast<unsigned>(stage.high[gid][high_col]) >> shift;
-            const unsigned h_bot = static_cast<unsigned>(stage.high[gid + 8][high_col]) >> shift;
-            const unsigned h_top2 = static_cast<unsigned>(stage.high[gid][high_col + 1]) >> shift;
-            const unsigned h_bot2 =
-                static_cast<unsigned>(stage.high[gid + 8][high_col + 1]) >> shift;
-            const unsigned af0 = q5_small_t_bf16_pair(stage.codes[gid][byte_col], h_top);
-            const unsigned af1 = q5_small_t_bf16_pair(stage.codes[gid + 8][byte_col], h_bot);
-            const unsigned af2 = q5_small_t_bf16_pair(stage.codes[gid][byte_col + 4], h_top2);
-            const unsigned af3 = q5_small_t_bf16_pair(stage.codes[gid + 8][byte_col + 4], h_bot2);
-            unsigned bf0, bf1;
-            ldmatrix_x2(bf0, bf1,
-                        smem_addr(b_live ? &stage.activations[warp][b_col * kTileK +
-                                                                    q5_small_t_swizzle_64(
-                                                                        b_col, ks * 16 + b_koff)]
-                                         : &zero_row[0]));
-            mma_bf16(group_acc[0], group_acc[1], group_acc[2], group_acc[3], af0, af1, af2, af3,
-                     bf0, bf1);
+            mma_bf16(group_acc[0], group_acc[1], group_acc[2], group_acc[3], a_top[2 * ks],
+                     a_bot[2 * ks], a_top[2 * ks + 1], a_bot[2 * ks + 1], b_words[2 * ks],
+                     b_words[2 * ks + 1]);
         }
 
         const float top_scale = __half2float(__ushort_as_half(stage.scales[gid][warp]));
