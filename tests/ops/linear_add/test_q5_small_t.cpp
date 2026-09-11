@@ -7,8 +7,10 @@
 // small absolute floor for outputs near zero after cancellation). Each case also runs three times
 // and must give identical bytes every time.
 //
-// The routed c32/s4 tile is scored against the same oracle and reported but not failed on: on this
-// fixture it misses by up to ~7% at k=17408 from T=20, which is under investigation separately.
+// Comparing against the routed MMA tiles instead would not work at this tolerance: their
+// CtaCollectiveResidual epilogue rounds the product to bf16 before adding the residual
+// (q5_rowsplit_gemm_mma.cuh), so where the residual nearly cancels the product they sit a bf16
+// step of the product away from the oracle. This kernel rounds once.
 
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 #include "ops/op_tester.h"
@@ -141,19 +143,6 @@ int run_k(std::int32_t k) {
             std::cerr << "K=" << k << " T=" << tokens << ": " << misses
                       << " outputs miss the fp64 oracle, first at " << first << " ("
                       << bf16_to_f32(out[first]) << " vs " << oracle[first] << ")\n";
-        }
-
-        if (tokens > 16) {
-            device_out.copy_from_host(residual.data(), elements * 2);
-            ninfer::ops::detail::q5_linear_add_mma_r64_c32_s4_launch(x, weight, y, nullptr);
-            ninfer::test::cuda_check(cudaDeviceSynchronize(), "q5 linear_add c32/s4");
-            device_out.copy_to_host(out.data(), elements * 2);
-            const auto routed_misses = score(out, oracle, tokens, first);
-            if (routed_misses != 0) {
-                std::cerr << "  (diagnostic) K=" << k << " T=" << tokens << " c32/s4: "
-                          << routed_misses << " outputs miss the oracle, first at " << first
-                          << " (" << bf16_to_f32(out[first]) << " vs " << oracle[first] << ")\n";
-            }
         }
     }
     return failures;

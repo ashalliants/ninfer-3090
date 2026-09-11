@@ -1,21 +1,18 @@
-// The Q4/Q5 attention input projection's small-T MMA schedule against ParentSplitFixed, the direct
-// GEMV/SIMT schedule it would replace at decode widths, on the registered 27B shape: query_key
-// [7168,5120] Q4 into q (rows < 6144) and k, gate_value [7168,5120] Q5 into gate and v. Outputs are
-// held to one bf16 rounding step, and every element must have been written.
+// The Q4/Q5 attention input projection's small-T MMA schedule against an fp64 oracle, at T=1..32 on
+// the registered 27B shape: query_key [7168,5120] Q4 into q (rows < 6144) and k, gate_value
+// [7168,5120] Q5 into gate and v. Every output element is checked, starting from a sentinel so an
+// unwritten one fails; tolerance is one bf16 rounding step (tests/ops/small_t_oracle.h).
 
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_kernels.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
+#include "ops/small_t_oracle.h"
 
 #include <cuda_runtime.h>
 
-#include <algorithm>
-#include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <exception>
 #include <iostream>
-#include <string>
 #include <vector>
 
 namespace {
@@ -23,6 +20,7 @@ namespace {
 using ninfer::DType;
 using ninfer::QType;
 using ninfer::Tensor;
+namespace oracle = ninfer::test::small_t_oracle;
 
 constexpr std::int32_t kHidden    = 5120;
 constexpr std::int32_t kParent    = 7168;
@@ -30,45 +28,19 @@ constexpr std::int32_t kQueryRows = 6144;
 constexpr std::int32_t kKvRows    = 1024;
 constexpr std::int32_t kMaxTokens = 32;
 
-std::uint16_t f32_to_bf16_rne(float f) {
-    std::uint32_t bits = 0;
-    std::memcpy(&bits, &f, sizeof(bits));
-    return static_cast<std::uint16_t>((bits + 0x7fffU + ((bits >> 16) & 1U)) >> 16);
-}
-
-float bf16_to_f32(std::uint16_t h) {
-    const std::uint32_t bits = static_cast<std::uint32_t>(h) << 16;
-    float f                  = 0.0F;
-    std::memcpy(&f, &bits, sizeof(f));
-    return f;
-}
-
-struct Pair {
-    ninfer::test::GuardedDeviceBuffer reference;
-    ninfer::test::GuardedDeviceBuffer candidate;
-    std::int32_t rows;
-};
-
-int compare(const char* what, int tokens, Pair& buffers) {
-    const std::size_t elements = static_cast<std::size_t>(buffers.rows) * tokens;
-    std::vector<std::uint16_t> a(elements), b(elements);
-    buffers.reference.copy_to_host(a.data(), elements * 2);
-    buffers.candidate.copy_to_host(b.data(), elements * 2);
-    std::size_t mismatches = 0, first = elements;
-    for (std::size_t i = 0; i < elements; ++i) {
-        const float x = bf16_to_f32(a[i]);
-        const float y = bf16_to_f32(b[i]);
-        const bool ok = std::isfinite(y) &&
-                        std::fabs(x - y) <= std::max(std::fabs(x), std::fabs(y)) / 128.0F + 1.0e-6F;
-        if (!ok) {
-            if (first == elements) first = i;
-            ++mismatches;
-        }
-    }
-    if (mismatches == 0) return 0;
-    std::cerr << what << " T=" << tokens << ": " << mismatches << " mismatches, first at " << first
-              << " (" << bf16_to_f32(a[first]) << " vs " << bf16_to_f32(b[first]) << ")\n";
+int report(const char* what, std::int32_t tokens, const oracle::Miss& miss) {
+    if (miss.count == 0) return 0;
+    std::cerr << what << " T=" << tokens << ": " << miss.count
+              << " outputs miss the fp64 oracle, first at row " << miss.row << " col " << miss.col
+              << " (" << miss.value << " vs " << miss.oracle << ")\n";
     return 1;
+}
+
+std::vector<std::uint16_t> read(ninfer::test::GuardedDeviceBuffer& buffer, std::int32_t rows,
+                                std::int32_t tokens) {
+    std::vector<std::uint16_t> host(static_cast<std::size_t>(rows) * tokens);
+    buffer.copy_to_host(host.data(), host.size() * 2);
+    return host;
 }
 
 } // namespace
@@ -93,59 +65,56 @@ int main() {
         std::vector<std::uint16_t> activation(static_cast<std::size_t>(kHidden) * kMaxTokens);
         std::uint64_t state = 0x13198a2e03707344ULL;
         for (auto& value : activation) {
-            state = qw::detail::mix64(state);
+            state               = qw::detail::mix64(state);
             const int numerator = static_cast<int>(state % 255U) - 127;
-            value               = f32_to_bf16_rne(static_cast<float>(numerator) * 1e-3F);
+            value = oracle::f32_to_bf16_rne(static_cast<float>(numerator) * 1e-3F);
         }
+        const std::vector<double> qk_oracle = oracle::project(
+            qw::decode_row_split_lowbit(host_qk.payload, kParent, kHidden, kHidden,
+                                        QType::Q4G64_F16S),
+            kParent, kHidden, activation, kMaxTokens);
+        const std::vector<double> gv_oracle = oracle::project(
+            qw::decode_row_split_lowbit(host_gv.payload, kParent, kHidden, kHidden,
+                                        QType::Q5G64_F16S),
+            kParent, kHidden, activation, kMaxTokens);
+
         ninfer::test::GuardedDeviceBuffer device_x(activation.size() * 2);
         device_x.copy_from_host(activation.data(), activation.size() * 2);
-
         const auto bytes = [](std::int32_t rows) {
             return static_cast<std::size_t>(rows) * kMaxTokens * 2;
         };
-        Pair q{ninfer::test::GuardedDeviceBuffer(bytes(kQueryRows)),
-               ninfer::test::GuardedDeviceBuffer(bytes(kQueryRows)), kQueryRows};
-        Pair gate{ninfer::test::GuardedDeviceBuffer(bytes(kQueryRows)),
-                  ninfer::test::GuardedDeviceBuffer(bytes(kQueryRows)), kQueryRows};
-        Pair k{ninfer::test::GuardedDeviceBuffer(bytes(kKvRows)),
-               ninfer::test::GuardedDeviceBuffer(bytes(kKvRows)), kKvRows};
-        Pair v{ninfer::test::GuardedDeviceBuffer(bytes(kKvRows)),
-               ninfer::test::GuardedDeviceBuffer(bytes(kKvRows)), kKvRows};
+        ninfer::test::GuardedDeviceBuffer q(bytes(kQueryRows)), gate(bytes(kQueryRows));
+        ninfer::test::GuardedDeviceBuffer k(bytes(kKvRows)), v(bytes(kKvRows));
 
         int failures = 0;
         for (const std::int32_t tokens :
              {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 15, 16, 17, 20, 24, 31, 32}) {
             Tensor x(device_x.data(), DType::BF16, {kHidden, tokens});
-            Tensor rq(q.reference.data(), DType::BF16, {kQueryRows, tokens});
-            Tensor rg(gate.reference.data(), DType::BF16, {kQueryRows, tokens});
-            Tensor rk(k.reference.data(), DType::BF16, {kKvRows, tokens});
-            Tensor rv(v.reference.data(), DType::BF16, {kKvRows, tokens});
-            Tensor cq(q.candidate.data(), DType::BF16, {kQueryRows, tokens});
-            Tensor cg(gate.candidate.data(), DType::BF16, {kQueryRows, tokens});
-            Tensor ck(k.candidate.data(), DType::BF16, {kKvRows, tokens});
-            Tensor cv(v.candidate.data(), DType::BF16, {kKvRows, tokens});
-            for (Pair* p : {&q, &gate, &k, &v}) {
-                p->reference.fill(0);
-                p->candidate.fill(0xff); // a sentinel, so an unwritten element fails
+            Tensor tq(q.data(), DType::BF16, {kQueryRows, tokens});
+            Tensor tg(gate.data(), DType::BF16, {kQueryRows, tokens});
+            Tensor tk(k.data(), DType::BF16, {kKvRows, tokens});
+            Tensor tv(v.data(), DType::BF16, {kKvRows, tokens});
+            for (auto* buffer : {&q, &gate, &k, &v}) {
+                buffer->fill(0xff); // a NaN sentinel, so an unwritten element fails
             }
-            // ParentSplitFixed runs to 12 columns; the routed r32/c32 tile covers the rest.
-            if (tokens <= 12) {
-                ninfer::ops::detail::q4_q5_attn_input_small_t_launch(x, qk_weight, gv_weight, rq,
-                                                                     rg, rk, rv, nullptr);
-            } else {
-                ninfer::ops::detail::q4_q5_attn_input_grouped_mma_r32_c32_s4_launch(
-                    x, qk_weight, gv_weight, rq, rg, rk, rv, nullptr);
-            }
-            ninfer::ops::detail::q4_q5_attn_input_small_t_mma_launch(x, qk_weight, gv_weight, cq,
-                                                                     cg, ck, cv, nullptr);
-            ninfer::test::cuda_check(cudaDeviceSynchronize(), "attention input schedules");
-            failures += compare("q", tokens, q);
-            failures += compare("gate", tokens, gate);
-            failures += compare("k", tokens, k);
-            failures += compare("v", tokens, v);
+            ninfer::ops::detail::q4_q5_attn_input_small_t_mma_launch(x, qk_weight, gv_weight, tq,
+                                                                     tg, tk, tv, nullptr);
+            ninfer::test::cuda_check(cudaDeviceSynchronize(), "attention input small-T MMA");
+            failures += report("q", tokens,
+                               oracle::score(read(q, kQueryRows, tokens), kQueryRows, kQueryRows,
+                                             tokens, qk_oracle, kParent, 0));
+            failures += report("k", tokens,
+                               oracle::score(read(k, kKvRows, tokens), kKvRows, kKvRows, tokens,
+                                             qk_oracle, kParent, kQueryRows));
+            failures += report("gate", tokens,
+                               oracle::score(read(gate, kQueryRows, tokens), kQueryRows,
+                                             kQueryRows, tokens, gv_oracle, kParent, 0));
+            failures += report("v", tokens,
+                               oracle::score(read(v, kKvRows, tokens), kKvRows, kKvRows, tokens,
+                                             gv_oracle, kParent, kQueryRows));
         }
         std::cout << (failures == 0 ? "OK" : "FAIL")
-                  << " attention input small-T MMA matches the reference schedules at T=1..32\n";
+                  << " attention input small-T MMA matches the fp64 oracle at T=1..32\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << "attention input small-T MMA test failed: " << error.what() << '\n';
