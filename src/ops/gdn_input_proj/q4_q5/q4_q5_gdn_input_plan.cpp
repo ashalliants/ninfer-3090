@@ -84,11 +84,28 @@ struct RouteSpec {
 // not by the live token count, so the tile is chosen to be the narrowest one that still
 // covers the extent in a single pass. Decode extents (C8 with MTP3 is 32) get the 32-wide
 // tile; the 128-wide tile remains the prefill-chunk anchor.
-constexpr std::array<RouteSpec, 6> kRoutes{{
-    {{1, 6}, Q4Q5GdnInputScheduleId::IndependentDirectFixed},
-    {{7, 8}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C8},
-    {{9, 16}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C16},
-    {{17, 32}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C32},
+//
+// 2026-09-11, RTX 3090 under Linux: SmallTMma -- the Q4 and Q5 small-T MMA kernels
+// (q4_small_t_mma.cuh, q5_small_t_mma.cuh) over query/key and value/z -- is flat across T=1..8 and
+// beats everything below it, the T=1 GEMVs included. Cold, median of 31 (us):
+//
+//   T                  1      2      3      4      5      6      7      8
+//   independent    91.1  101.4  111.6  100.4  146.4  164.9  322.5  309.2
+//   grouped c8    234.5  234.5  232.4  231.4  231.4  232.4  232.4  231.4
+//   small_t        79.7   79.9   78.8   78.8   82.9   82.9   84.0   84.0
+//
+// At T=4 (an MTP3 verify) that is 74% of the 58.7 us both weights cost to stream once, against
+// 58%; at T=1 the independent route's value/z GEMV is 768 blocks of 16 rows for 246 slots.
+//
+// Its 16- and 32-column tiles against the grouped MMA tiles (us):
+//
+//   T              9     12     16     20     24     32
+//   small_t    100.4  100.4  114.7  164.9  182.3  226.3
+//   grouped    238.6  235.7  239.6  261.1  263.2  256.0     (c16 to 16, c32 above)
+//
+// so it runs to its 32-column limit and the c8/c16/c32 tiles serve nothing below 33.
+constexpr std::array<RouteSpec, 3> kRoutes{{
+    {{1, 32}, Q4Q5GdnInputScheduleId::SmallTMma},
     {{33, 64}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C64},
     {{65, kAnyCols}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128},
 }};
@@ -126,6 +143,8 @@ const char* q4_q5_gdn_input_schedule_name(Q4Q5GdnInputScheduleId schedule) noexc
         return "gdn_input_proj.q4_q5.grouped_mixed.mma.r64.c64";
     case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128:
         return "gdn_input_proj.q4_q5.grouped_mixed.mma.r64.c128";
+    case Q4Q5GdnInputScheduleId::SmallTMma:
+        return "gdn_input_proj.q4_q5.small_t.mma";
     }
     return "gdn_input_proj.q4_q5.unknown";
 }
@@ -209,6 +228,12 @@ void q4_q5_gdn_input_execute_schedule(Q4Q5GdnInputScheduleId schedule, const Ten
     case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128:
         q4_q5_gdn_input_grouped_mma_launch(x, qk_weight, value_z_weight, qkv, z, stream);
         return;
+    case Q4Q5GdnInputScheduleId::SmallTMma: {
+        Tensor qk    = qkv.slice(0, 0, problem.qk_rows);
+        Tensor value = qkv.slice(0, problem.qk_rows, problem.z_rows);
+        q4_q5_gdn_input_small_t_launch(x, qk_weight, value_z_weight, qk, value, z, stream);
+        return;
+    }
     }
     throw std::logic_error("Q4/Q5 GDN input: unknown schedule");
 }

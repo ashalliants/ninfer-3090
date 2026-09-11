@@ -23,11 +23,10 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
     static_assert((Geometry::kOutputRows % Schedule::kRowsPerCta) == 0);
 
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
-    q4_small_t_mma_kernel<Geometry, TileTokens, ActiveTokens>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(out.data));
+    q4_small_t_mma_launch<Geometry, TileTokens, ActiveTokens>(
+        kBlocks, stream, static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(out.data));
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -9,6 +9,9 @@ namespace ninfer::ops::detail {
 void q4_q5_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight,
                                         const Weight& value_z_weight, Tensor& qk, Tensor& value,
                                         Tensor& z, cudaStream_t stream);
+void q4_q5_gdn_input_small_t_launch(const Tensor& x, const Weight& qk_weight,
+                                    const Weight& value_z_weight, Tensor& qk, Tensor& value,
+                                    Tensor& z, cudaStream_t stream);
 
 void q4_q5_gdn_input_grouped_mma_c8_launch(const Tensor& x, const Weight& qk_weight,
                                            const Weight& value_z_weight, Tensor& qkv, Tensor& z,

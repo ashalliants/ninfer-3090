@@ -146,6 +146,7 @@ add_library(ninfer_ops STATIC
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.cpp
   ops/attn_input_proj/q4_q5/q4_q5_attn_input_gemm_mma.cu
   ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu
+  ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t_mma.cu
   ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.cpp
   ops/attn_input_proj/w8/w8_attn_input_decode.cu
   ops/attn_input_proj/w8/w8_attn_input_gemm_mma.cu
@@ -169,6 +170,7 @@ add_library(ninfer_ops STATIC
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.cpp
   ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_gemm_mma.cu
   ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
+  ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_small_t.cu
   ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_conv_snapshot.cu
   ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.cpp
   ops/gdn_input_proj/gdn_projected_conv.cu
@@ -225,6 +227,7 @@ add_library(ninfer_ops STATIC
   ops/linear_add/q5/q5_linear_add_gemm_mma.cu
   ops/linear_add/q5/q5_linear_add_gemm_simt.cu
   ops/linear_add/q5/q5_linear_add_gemv.cu
+  ops/linear_add/q5/q5_linear_add_small_t.cu
   ops/linear_add/q5/q5_linear_add_plan.cpp
   ops/linear_add/w8/w8_linear_add_gemm_mma.cu
   ops/linear_add/w8/w8_linear_add_gemm_simt.cu

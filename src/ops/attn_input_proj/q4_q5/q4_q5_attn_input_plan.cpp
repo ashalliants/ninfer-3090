@@ -59,9 +59,34 @@ struct RouteSpec {
 // catch-up for no measured gain here, and the reason to worry about dead schedules -- they are
 // where the two switch fallthroughs hid -- is now covered by tests/ops/test_route_coverage.cpp,
 // which enumerates the unrouted set and fails if its membership changes.
-constexpr std::array<RouteSpec, 6> kRoutes{{
-    {{1, 8}, Q4Q5AttnInputScheduleId::ParentSplitFixed},
-    {{9, 32}, Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR32C32S4},
+//
+// 2026-09-11, RTX 3090 under Linux: SmallTMma -- the Q4 and Q5 small-T MMA kernels over query_key
+// and gate_value -- replaces ParentSplitFixed across 1..8, the T=1 GEMVs included. Cold, median
+// of 31 (us):
+//
+//   T                  1      2      3      4      5      6      7      8
+//   parent_split   81.9   93.2   94.2   90.1  164.9  174.2  215.0  161.8
+//   small_t        69.6   69.6   68.6   68.6   66.6   66.7   68.6   69.6
+//
+// At T=4 that is 71% of the 48.8 us both weights cost to stream once, against 54%.
+//
+// Its 16- and 32-column tiles against the r32/c32 tile (us):
+//
+//   T              9     12     16     20     24     28     31     32
+//   small_t     94.2   93.2  109.6  145.4  162.8  183.3  194.6  200.7
+//   r32/c32    209.9  194.6  195.6  199.7  199.7  200.7  201.7  190.5
+//
+// small_t won through 31; at exactly 32 columns the grouped tile was full and won by 5%. Once its
+// 16- and 32-column tiles shared each staged activation slab between two to four row tiles
+// (ops/common/small_t_layout.cuh), same bench, median min..p95 of 31 (us):
+//
+//   T              9           16           17           24           32
+//   small_t     87.0  84..88   90.1  85..92 132.1 131..133 133.1 131..134 135.2 134..136
+//   r32/c32    209.9 209..211 197.6 197..199 201.7 200..203 201.7 201..203 191.5 189..193
+//
+// so it takes all of 1..32 and the r32/c32 tile serves nothing.
+constexpr std::array<RouteSpec, 5> kRoutes{{
+    {{1, 32}, Q4Q5AttnInputScheduleId::SmallTMma},
     {{33, 64}, Q4Q5AttnInputScheduleId::MixedR32C64S3},
     {{65, 127}, Q4Q5AttnInputScheduleId::MixedR64C128S2},
     {{128, 192}, Q4Q5AttnInputScheduleId::MixedR32C64S3},
@@ -102,6 +127,8 @@ const char* q4_q5_attn_input_schedule_name(Q4Q5AttnInputScheduleId schedule) noe
         return "attn_input_proj.q4_q5.mixed.r64.c128.s2";
     case Q4Q5AttnInputScheduleId::PairR32C64S4:
         return "attn_input_proj.q4_q5.pair.r32.c64.s4";
+    case Q4Q5AttnInputScheduleId::SmallTMma:
+        return "attn_input_proj.q4_q5.small_t.mma";
     }
     return "attn_input_proj.q4_q5.unknown";
 }
@@ -163,6 +190,10 @@ void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& 
     case Q4Q5AttnInputScheduleId::PairR32C64S4:
         q4_q5_attn_input_grouped_mma_r32_c64_s4_launch(x, query_key_weight, gate_value_weight, q,
                                                        gate, k, v, stream);
+        return;
+    case Q4Q5AttnInputScheduleId::SmallTMma:
+        q4_q5_attn_input_small_t_mma_launch(x, query_key_weight, gate_value_weight, q, gate, k, v,
+                                            stream);
         return;
     }
     throw std::logic_error("Q4/Q5 attention input: unknown schedule");

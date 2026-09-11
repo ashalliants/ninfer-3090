@@ -17,6 +17,7 @@ enum class Q4Q5AttnInputScheduleId {
     PairR32C64S3,
     MixedR64C128S2,
     PairR32C64S4,
+    SmallTMma,
 };
 
 struct Q4Q5AttnInputProblem {
