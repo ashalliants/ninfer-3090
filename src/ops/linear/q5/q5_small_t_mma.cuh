@@ -72,9 +72,10 @@ __device__ __forceinline__ void q5_small_t_decode_eight(unsigned word, unsigned 
 
 // Rows: output rows. K: reduction length, a multiple of 512. XCols: activation columns staged
 // (4, 8, 16 or 32), covered by max(1, XCols / 8) eight-column MMA tiles; the B fragments of
-// columns at or past `columns` are zero. Stages: depth of the cp.async ring (1 or 2). Epilogue::store(row, col0, v) receives,
-// for the lane's rows row and row + 8, v.x = (row, col0), v.y = (row, col0 + 1), v.z = (row + 8,
-// col0), v.w = (row + 8, col0 + 1); columns at or past `columns` must be ignored by the epilogue.
+// columns at or past `columns` are zero. Stages: depth of the cp.async ring (1 or 2).
+// Epilogue::store(row, col0, v) receives, for the lane's rows row and row + 8, v.x = (row, col0),
+// v.y = (row, col0 + 1), v.z = (row + 8, col0), v.w = (row + 8, col0 + 1); columns at or past
+// `columns` must be ignored by the epilogue.
 //
 // K order. The MMA's k slots may be any permutation of a group's 64 k, provided A and B agree.
 // Lane lid is given k 16*lid .. 16*lid + 15 of its warp's group: for step ks, slots (2*lid,

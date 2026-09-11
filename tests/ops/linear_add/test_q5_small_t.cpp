@@ -1,8 +1,8 @@
-// The Q5 small-T MMA residual kernel against the kernels it would replace (the T=1 GEMV, split2 at
-// T=2..16 and the c32 MMA tile above that), at T=1..32 on both registered K, with a nonzero residual. The MMA folds groups in a
-// different order from the SIMT kernels, so agreement is held to one bf16 rounding step of the
-// result rather than bit equality. Each case runs three times and must give identical bytes every
-// time.
+// The Q5 small-T MMA residual kernel against the kernels it would replace -- the T=1 GEMV, split2
+// at T=2..16 and the c32 MMA tile above that -- at T=1..32 on both registered K, with a nonzero
+// residual. The MMA folds groups in a different order from those kernels, so agreement is held to
+// one bf16 rounding step of the result rather than bit equality. Each case runs three times and
+// must give identical bytes every time.
 
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 #include "ops/op_tester.h"
