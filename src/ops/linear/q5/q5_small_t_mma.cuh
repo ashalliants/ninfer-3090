@@ -85,19 +85,13 @@ __device__ __forceinline__ void q5_small_t_decode_eight(unsigned word, unsigned 
 // bytes per row -- one 64-bit load, decoded by q5_small_t_decode_eight -- and its B operand
 // sixteen contiguous activations of one column -- two 128-bit loads, no ldmatrix -- where the
 // natural slot order needs a byte load, a decode and an ldmatrix per fragment.
-//
-// SplitK > 1 spreads each row tile's slabs over that many CTAs (blockIdx.y). Each CTA publishes
-// its fp32 partial to `partials`; the last CTA of a tile to arrive (counted in `counters`, which
-// it resets for the next launch) sums the SplitK partials in split order -- so the result does
-// not depend on arrival order -- and runs the epilogue.
-template <int Rows, int K, int XCols, int Stages, int SplitK, class Epilogue>
+template <int Rows, int K, int XCols, int Stages, class Epilogue>
 __launch_bounds__(256, (Stages == 1 ? 6 : 4)) __global__
     void q5_small_t_mma_kernel(const __nv_bfloat16* __restrict__ x,
                                const std::uint8_t* __restrict__ codes,
                                const std::uint8_t* __restrict__ high_bits,
                                const std::uint8_t* __restrict__ scales, Epilogue epilogue,
-                               int columns, float4* __restrict__ partials,
-                               unsigned* __restrict__ counters) {
+                               int columns) {
     using Schedule               = Q5SmallTSchedule;
     constexpr int kTileK         = Schedule::kTileKPerWarp;
     constexpr int kWarps         = Schedule::kKWarps;
@@ -106,10 +100,8 @@ __launch_bounds__(256, (Stages == 1 ? 6 : 4)) __global__
     constexpr int kSlabs         = K / kGroupK;
     constexpr int kGroupsPerRow  = K / 64;
     constexpr int kXColStride    = kTileK + Schedule::kXColPad;
-    constexpr int kSlabsPerSplit = (kSlabs + SplitK - 1) / SplitK;
     static_assert(XCols == 4 || XCols == 8);
     static_assert(Stages == 1 || Stages == 2);
-    static_assert(SplitK >= 1);
     static_assert(K % kGroupK == 0, "K must be a whole number of 512-wide slabs");
     static_assert(Rows % kRowsPerCta == 0);
 
@@ -132,9 +124,6 @@ __launch_bounds__(256, (Stages == 1 ? 6 : 4)) __global__
     const int gid        = lane >> 2;
     const int lid        = lane & 3;
     const int row0       = static_cast<int>(blockIdx.x) * kRowsPerCta;
-    const int tile       = static_cast<int>(blockIdx.x);
-    const int slab_begin = static_cast<int>(blockIdx.y) * kSlabsPerSplit;
-    const int slab_end   = min(kSlabs, slab_begin + kSlabsPerSplit);
 
     const auto stage_x = [&](int slab_k0, Stage& stage) {
         const int items = columns * (kTileK / 8);
@@ -165,7 +154,7 @@ __launch_bounds__(256, (Stages == 1 ? 6 : 4)) __global__
     };
 
     const auto issue_slab = [&](int slab) {
-        if (slab < slab_end) {
+        if (slab < kSlabs) {
             Stage& stage = shared.stages[slab % Stages];
             stage_weight(slab * kGroupK, stage);
             stage_x(slab * kGroupK, stage);
@@ -179,10 +168,10 @@ __launch_bounds__(256, (Stages == 1 ? 6 : 4)) __global__
     float acc[4]        = {};
 
 #pragma unroll
-    for (int prefetch = 0; prefetch < Stages - 1; ++prefetch) { issue_slab(slab_begin + prefetch); }
+    for (int prefetch = 0; prefetch < Stages - 1; ++prefetch) { issue_slab(prefetch); }
 
 #pragma unroll 1
-    for (int slab = slab_begin; slab < slab_end; ++slab) {
+    for (int slab = 0; slab < kSlabs; ++slab) {
         issue_slab(slab + Stages - 1);
         cp_wait<Stages - 1>();
         __syncthreads();
@@ -246,9 +235,8 @@ __launch_bounds__(256, (Stages == 1 ? 6 : 4)) __global__
         }
     }
     __syncthreads();
-    float4 sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     if (warp == 0) {
-        sum = make_float4(acc[0], acc[1], acc[2], acc[3]);
+        float4 sum = make_float4(acc[0], acc[1], acc[2], acc[3]);
 #pragma unroll
         for (int split = 2; split < kWarps; split += 2) {
             const float4 value = load_vec<float4>(partial + (split * 32 + lane) * 4);
@@ -257,35 +245,7 @@ __launch_bounds__(256, (Stages == 1 ? 6 : 4)) __global__
             sum.z += value.z;
             sum.w += value.w;
         }
-    }
-    if constexpr (SplitK == 1) {
-        if (warp == 0) { epilogue.store(row0 + gid, 2 * lid, sum); }
-    } else {
-        __shared__ unsigned is_last;
-        if (warp == 0) {
-            partials[(tile * SplitK + static_cast<int>(blockIdx.y)) * 32 + lane] = sum;
-            __threadfence();
-        }
-        __syncthreads();
-        if (tid == 0) {
-            const unsigned arrived = atomicAdd(&counters[tile], 1u);
-            is_last                = arrived == SplitK - 1 ? 1u : 0u;
-            if (is_last != 0u) { counters[tile] = 0u; }
-        }
-        __syncthreads();
-        if (is_last != 0u && warp == 0) {
-            __threadfence();
-            float4 total = __ldcg(&partials[(tile * SplitK) * 32 + lane]);
-#pragma unroll
-            for (int split = 1; split < SplitK; ++split) {
-                const float4 value = __ldcg(&partials[(tile * SplitK + split) * 32 + lane]);
-                total.x += value.x;
-                total.y += value.y;
-                total.z += value.z;
-                total.w += value.w;
-            }
-            epilogue.store(row0 + gid, 2 * lid, total);
-        }
+        epilogue.store(row0 + gid, 2 * lid, sum);
     }
 }
 

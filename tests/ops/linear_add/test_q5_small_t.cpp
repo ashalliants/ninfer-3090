@@ -1,9 +1,8 @@
 // The Q5 small-T MMA residual kernels against the SIMT kernels they would replace (the T=1 GEMV and
 // split2 at T=2..8), on both registered K, with a nonzero residual. The MMA folds groups in a
 // different order from the SIMT kernels, so agreement is held to one bf16 rounding step of the
-// result rather than bit equality. Each split-K variant runs three times per case with the same
-// inputs and must give identical bytes every time: its tile counters reset themselves, and the
-// partial sum is taken in split order whatever order the CTAs arrive in.
+// result rather than bit equality. Each case runs three times and must give identical bytes every
+// time.
 
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 #include "ops/op_tester.h"
@@ -96,10 +95,7 @@ int run_k(std::int32_t k) {
             std::int32_t max_tokens;
         };
         const Variant variants[] = {
-            {"split3", &ninfer::ops::detail::q5_linear_add_small_t_mma_launch, 8},
-            {"nosplit", &ninfer::ops::detail::q5_linear_add_small_t_mma_nosplit_launch, 8},
-            {"split2", &ninfer::ops::detail::q5_linear_add_small_t_mma_split2_launch, 4},
-            {"split4", &ninfer::ops::detail::q5_linear_add_small_t_mma_split4_launch, 4},
+            {"small_t", &ninfer::ops::detail::q5_linear_add_small_t_mma_launch, 8},
         };
         for (const Variant& variant : variants) {
         if (tokens > variant.max_tokens) continue;
