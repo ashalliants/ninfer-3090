@@ -68,15 +68,34 @@ struct Q4SwiGluSmallTEpilogue {
 
 using SmallTLauncher = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
+// Past eight columns the activation slab, not the weights, dominates what a CTA pulls through L2:
+// at 32 columns and one sixteen-row tile per CTA that is ~713 MB per call against 89 MB of
+// weights. Wider tiles share each staged slab between two or four row tiles
+// (ops/common/small_t_layout.cuh). One kernel, cold L2, median of 21, us:
+//
+//   T    kwarps 8           kwarps 4           kwarps 2
+//   8    121.9              128.0 / 120.8 (s2) 186.4
+//   16   293.9 / 244.7 (s2) 138.2              194.6
+//   24   291.8              189.4 / 186.4 (s2) 209.9 / 193.4 (s2)
+//   32   429.1              269.3 / 231.6 (s2) 244.7 / 204.8 (s2)
+template <int TileCols>
+struct Q4SwiGluSmallTTile {
+    static constexpr int kKWarps = TileCols <= 8 ? 8 : (TileCols <= 24 ? 4 : 2);
+    static constexpr int kStages = TileCols <= 16 ? 1 : 2;
+};
+
 template <int ActiveCols>
 void launch_small_t_active(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     constexpr int TileCols =
         ActiveCols <= 8 ? 8 : (ActiveCols <= 16 ? 16 : (ActiveCols <= 24 ? 24 : 32));
-    constexpr int kBlocks = kIntermediate / Q4SwiGluSmallTRows::kOutputRowsPerTile;
+    using Tile            = Q4SwiGluSmallTTile<TileCols>;
+    using Layout          = SmallTLayout<Tile::kKWarps>;
+    constexpr int kBlocks = kIntermediate / (Q4SwiGluSmallTRows::kOutputRowsPerTile *
+                                             Layout::kRowTiles);
     const Q4SwiGluSmallTEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data), x.ne[1]};
     q4_small_t_mma_kernel<Q4SwiGluSmallTGeometry, TileCols, ActiveCols, Q4SwiGluSmallTEpilogue,
-                          Q4SwiGluSmallTRows, true>
-        <<<kBlocks, Q4DraftSmallTSchedule::kThreads, 0, stream>>>(
+                          Q4SwiGluSmallTRows, true, Tile::kKWarps, Tile::kStages>
+        <<<kBlocks, Layout::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
             epilogue, Q4SwiGluSmallTRows{}, x.ne[1]);

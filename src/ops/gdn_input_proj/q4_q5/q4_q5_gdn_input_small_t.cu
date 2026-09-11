@@ -29,7 +29,7 @@ struct GdnQkGeometry {
     static constexpr int kGroupsPerRow = kHidden / 64;
 };
 
-template <int XCols, int Stages>
+template <int XCols, int Stages, int KWarps = 8>
 void launch_value_z(const Tensor& x, const Weight& w, Tensor& value, Tensor& z,
                     cudaStream_t stream) {
     // value_z rows [0, 6144) are the GDN value projection and [6144, 12288) its z gate.
@@ -39,14 +39,15 @@ void launch_value_z(const Tensor& x, const Weight& w, Tensor& value, Tensor& z,
                                     leading_dimension(z),
                                     kValueRows,
                                     x.ne[1]};
-    q5_small_t_mma_kernel<kValueZRows, kHidden, XCols, Stages, SmallTSplitStore>
-        <<<kValueZRows / Q5SmallTSchedule<8>::kRowsPerCta, Q5SmallTSchedule<8>::kThreads, 0, stream>>>(
+    using Schedule = Q5SmallTSchedule<KWarps>;
+    q5_small_t_mma_kernel<kValueZRows, kHidden, XCols, Stages, SmallTSplitStore, KWarps>
+        <<<kValueZRows / Schedule::kRowsPerCta, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
             epilogue, x.ne[1]);
 }
 
-template <int TileCols>
+template <int TileCols, int KWarps = 8, int Stages = 1>
 void launch_qk(const Tensor& x, const Weight& w, Tensor& qk, cudaStream_t stream) {
     const SmallTSplitStore epilogue{static_cast<__nv_bfloat16*>(qk.data),
                                     static_cast<__nv_bfloat16*>(qk.data),
@@ -54,10 +55,10 @@ void launch_qk(const Tensor& x, const Weight& w, Tensor& qk, cudaStream_t stream
                                     leading_dimension(qk),
                                     kQkRows,
                                     x.ne[1]};
+    using Layout = SmallTLayout<KWarps>;
     q4_small_t_mma_kernel<GdnQkGeometry, TileCols, TileCols, SmallTSplitStore,
-                          Q4SmallTMmaIdentityRows, true>
-        <<<kQkRows / Q4DraftSmallTSchedule::kRowsPerCta, Q4DraftSmallTSchedule::kThreads, 0,
-           stream>>>(static_cast<const __nv_bfloat16*>(x.data),
+                          Q4SmallTMmaIdentityRows, true, KWarps, Stages>
+        <<<kQkRows / Layout::kRowsPerCta, Layout::kThreads, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
                      static_cast<const std::uint8_t*>(w.qdata),
                      static_cast<const std::uint8_t*>(w.scales),
                      static_cast<__nv_bfloat16*>(qk.data), epilogue, Q4SmallTMmaIdentityRows{},
@@ -76,23 +77,31 @@ void q4_q5_gdn_input_small_t_launch(const Tensor& x, const Weight& qk_weight,
         qk_weight.padded_shape[1] != kHidden || value_z_weight.padded_shape[1] != kHidden) {
         throw std::invalid_argument("Q4/Q5 GDN input small-T MMA: unsupported shape");
     }
+    // 16 and 32 columns share each staged activation slab between tiles (KWarps 4), which at 32
+    // columns cuts what a CTA pulls through L2 by half. One kernel, cold L2, median of 21, us:
+    //
+    //                      T   kwarps 8          kwarps 4
+    //   value_z [12288]   16   79.9              72.7 (s3)
+    //   value_z [12288]   32  156.7             117.8
+    //   query_key [4096]  16   47.1 / 42.0 (s2)  25.6 (s2)
+    //   query_key [4096]  32   75.8             38.9 (s2)
     const int columns = x.ne[1];
     if (columns <= 4) {
         launch_value_z<4, 2>(x, value_z_weight, value, z, stream);
     } else if (columns <= 8) {
         launch_value_z<8, 1>(x, value_z_weight, value, z, stream);
     } else if (columns <= 16) {
-        launch_value_z<16, 1>(x, value_z_weight, value, z, stream);
+        launch_value_z<16, 3, 4>(x, value_z_weight, value, z, stream);
     } else {
-        launch_value_z<32, 1>(x, value_z_weight, value, z, stream);
+        launch_value_z<32, 1, 4>(x, value_z_weight, value, z, stream);
     }
     CUDA_CHECK(cudaGetLastError());
     if (columns <= 8) {
         launch_qk<8>(x, qk_weight, qk, stream);
     } else if (columns <= 16) {
-        launch_qk<16>(x, qk_weight, qk, stream);
+        launch_qk<16, 4, 2>(x, qk_weight, qk, stream);
     } else {
-        launch_qk<32>(x, qk_weight, qk, stream);
+        launch_qk<32, 4, 2>(x, qk_weight, qk, stream);
     }
     CUDA_CHECK(cudaGetLastError());
 }

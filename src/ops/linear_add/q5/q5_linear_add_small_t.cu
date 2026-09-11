@@ -36,22 +36,34 @@ struct Q5SmallTResidualEpilogue {
     }
 };
 
-template <int K, int XCols, int Stages>
+template <int K, int XCols, int Stages, int KWarps = 8>
 void launch(const Tensor& x, const Weight& w, Tensor& residual_out, cudaStream_t stream) {
+    using Schedule = Q5SmallTSchedule<KWarps>;
     const Q5SmallTResidualEpilogue epilogue{static_cast<__nv_bfloat16*>(residual_out.data),
                                             x.ne[1]};
-    q5_small_t_mma_kernel<kRows, K, XCols, Stages, Q5SmallTResidualEpilogue>
-        <<<kRows / Q5SmallTSchedule<8>::kRowsPerCta, Q5SmallTSchedule<8>::kThreads, 0, stream>>>(
+    q5_small_t_mma_kernel<kRows, K, XCols, Stages, Q5SmallTResidualEpilogue, KWarps>
+        <<<kRows / Schedule::kRowsPerCta, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
             epilogue, x.ne[1]);
 }
 
-// A 5120-row matrix is 320 CTAs, under four per SM. Up to four columns stage a four-column
-// activation tile, which leaves room for a two-deep cp.async ring at four CTAs per SM; wider
-// extents stage 8, 16 or 32 columns with a single stage. Splitting K over three CTAs per row tile
-// (960 CTAs, two full waves, last-arriver reduction) was measured and bought 0-2.5%, not worth a
-// workspace and a counter protocol.
+// A 5120-row matrix is 320 sixteen-row tiles, under four per SM. Up to four columns stage a
+// four-column activation tile, which leaves room for a two-deep cp.async ring at four CTAs per SM;
+// 5..8 columns stage eight with a single stage. Splitting K over three CTAs per row tile (960 CTAs,
+// two full waves, last-arriver reduction) was measured and bought 0-2.5%, not worth a workspace
+// and a counter protocol.
+//
+// From 16 columns the activation slab, not the weights, dominates what a CTA pulls through L2, so
+// two tiles share one (KWarps 4). One kernel, cold L2, median of 21, us:
+//
+//   K      T   kwarps 8   kwarps 4          kwarps 2
+//   6144   16    44.0     44.0 / 37.9 (s2)   65.5 / 53.2 (s2)
+//   6144   32    92.2     57.3               78.8 / 62.5 (s2)
+//   17408  16   106.5    115.7 / 106.5 (s2) 181.2 / 153.6 (s2)
+//   17408  32   222.2    146.4              215.0 / 166.9 (s2)
+//
+// (A two-deep ring at 32 columns and four K warps needs 50.7 KB, past the static limit.)
 template <int K>
 void launch_columns(const Tensor& x, const Weight& w, Tensor& residual_out, cudaStream_t stream) {
     const int columns = x.ne[1];
@@ -60,9 +72,9 @@ void launch_columns(const Tensor& x, const Weight& w, Tensor& residual_out, cuda
     } else if (columns <= 8) {
         launch<K, 8, 1>(x, w, residual_out, stream);
     } else if (columns <= 16) {
-        launch<K, 16, 1>(x, w, residual_out, stream);
+        launch<K, 16, 2, 4>(x, w, residual_out, stream);
     } else {
-        launch<K, 32, 1>(x, w, residual_out, stream);
+        launch<K, 32, 1, 4>(x, w, residual_out, stream);
     }
 }
 

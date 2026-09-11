@@ -38,23 +38,24 @@ SmallTSplitStore split_store(Tensor& head, Tensor& tail, int columns) {
             columns};
 }
 
-template <int XCols, int Stages>
+template <int XCols, int Stages, int KWarps = 8>
 void launch_gate_value(const Tensor& x, const Weight& w, Tensor& gate, Tensor& v,
                        cudaStream_t stream) {
-    q5_small_t_mma_kernel<kParentRows, kHidden, XCols, Stages, SmallTSplitStore>
-        <<<kParentRows / Q5SmallTSchedule<8>::kRowsPerCta, Q5SmallTSchedule<8>::kThreads, 0, stream>>>(
+    using Schedule = Q5SmallTSchedule<KWarps>;
+    q5_small_t_mma_kernel<kParentRows, kHidden, XCols, Stages, SmallTSplitStore, KWarps>
+        <<<kParentRows / Schedule::kRowsPerCta, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
             split_store(gate, v, x.ne[1]), x.ne[1]);
 }
 
-template <int TileCols>
+template <int TileCols, int KWarps = 8, int Stages = 1>
 void launch_query_key(const Tensor& x, const Weight& w, Tensor& q, Tensor& k,
                       cudaStream_t stream) {
+    using Layout = SmallTLayout<KWarps>;
     q4_small_t_mma_kernel<AttnQueryKeyGeometry, TileCols, TileCols, SmallTSplitStore,
-                          Q4SmallTMmaIdentityRows, true>
-        <<<kParentRows / Q4DraftSmallTSchedule::kRowsPerCta, Q4DraftSmallTSchedule::kThreads, 0,
-           stream>>>(static_cast<const __nv_bfloat16*>(x.data),
+                          Q4SmallTMmaIdentityRows, true, KWarps, Stages>
+        <<<kParentRows / Layout::kRowsPerCta, Layout::kThreads, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
                      static_cast<const std::uint8_t*>(w.qdata),
                      static_cast<const std::uint8_t*>(w.scales),
                      static_cast<__nv_bfloat16*>(q.data), split_store(q, k, x.ne[1]),
@@ -74,6 +75,14 @@ void q4_q5_attn_input_small_t_mma_launch(const Tensor& x, const Weight& query_ke
         gate_value_weight.padded_shape[1] != kHidden) {
         throw std::invalid_argument("Q4/Q5 attention input small-T MMA: unsupported shape");
     }
+    // Wider extents share each staged activation slab between row tiles (KWarps < 8). One kernel,
+    // cold L2, median of 21, us:
+    //
+    //                         T   kwarps 8          kwarps 4          kwarps 2
+    //   gate_value [7168]    16   54.3 / 52.2 (s2)  62.5 / 53.2 (s3)  63.5 / 57.4 (s2)
+    //   gate_value [7168]    32  100.4              80.9              79.9 / 69.7 (s2)
+    //   query_key [7168]     16   77.0 / 62.5 (s2)  36.9              52.2 / 46.1 (s2)
+    //   query_key [7168]     32  104.4              70.7 / 63.5 (s2)  70.7 / 57.3 (s2)
     const int columns = x.ne[1];
     if (columns <= 4) {
         launch_gate_value<4, 2>(x, gate_value_weight, gate, v, stream);
@@ -82,15 +91,15 @@ void q4_q5_attn_input_small_t_mma_launch(const Tensor& x, const Weight& query_ke
     } else if (columns <= 16) {
         launch_gate_value<16, 1>(x, gate_value_weight, gate, v, stream);
     } else {
-        launch_gate_value<32, 1>(x, gate_value_weight, gate, v, stream);
+        launch_gate_value<32, 2, 2>(x, gate_value_weight, gate, v, stream);
     }
     CUDA_CHECK(cudaGetLastError());
     if (columns <= 8) {
         launch_query_key<8>(x, query_key_weight, q, k, stream);
     } else if (columns <= 16) {
-        launch_query_key<16>(x, query_key_weight, q, k, stream);
+        launch_query_key<16, 4>(x, query_key_weight, q, k, stream);
     } else {
-        launch_query_key<32>(x, query_key_weight, q, k, stream);
+        launch_query_key<32, 2, 2>(x, query_key_weight, q, k, stream);
     }
     CUDA_CHECK(cudaGetLastError());
 }
