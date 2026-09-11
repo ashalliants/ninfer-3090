@@ -1,7 +1,9 @@
-// The Q5 small-T MMA residual kernel against the SIMT kernels it would replace (the T=1 GEMV and
+// The Q5 small-T MMA residual kernels against the SIMT kernels they would replace (the T=1 GEMV and
 // split2 at T=2..8), on both registered K, with a nonzero residual. The MMA folds groups in a
 // different order from the SIMT kernels, so agreement is held to one bf16 rounding step of the
-// result rather than bit equality.
+// result rather than bit equality. Each split-K variant runs three times per case with the same
+// inputs and must give identical bytes every time: its tile counters reset themselves, and the
+// partial sum is taken in split order whatever order the CTAs arrive in.
 
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 #include "ops/op_tester.h"
@@ -15,6 +17,7 @@
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <string>
 #include <vector>
 
 namespace {
@@ -83,10 +86,37 @@ int run_k(std::int32_t k) {
         } else {
             ninfer::ops::detail::q5_linear_add_split2_exact_launch(x, weight, out_a, nullptr);
         }
-        ninfer::ops::detail::q5_linear_add_small_t_mma_launch(x, weight, out_b, nullptr);
-        ninfer::test::cuda_check(cudaDeviceSynchronize(), "q5 linear_add kernels");
+        ninfer::test::cuda_check(cudaDeviceSynchronize(), "q5 linear_add reference");
         reference_out.copy_to_host(reference.data(), elements * 2);
+
+        using Launch = void (*)(const Tensor&, const ninfer::Weight&, Tensor&, cudaStream_t);
+        struct Variant {
+            const char* name;
+            Launch launch;
+            std::int32_t max_tokens;
+        };
+        const Variant variants[] = {
+            {"split3", &ninfer::ops::detail::q5_linear_add_small_t_mma_launch, 8},
+            {"nosplit", &ninfer::ops::detail::q5_linear_add_small_t_mma_nosplit_launch, 8},
+            {"split2", &ninfer::ops::detail::q5_linear_add_small_t_mma_split2_launch, 4},
+            {"split4", &ninfer::ops::detail::q5_linear_add_small_t_mma_split4_launch, 4},
+        };
+        for (const Variant& variant : variants) {
+        if (tokens > variant.max_tokens) continue;
+        std::vector<std::uint16_t> first_run;
+        for (int repeat = 0; repeat < 3; ++repeat) {
+        candidate_out.copy_from_host(residual.data(), elements * 2);
+        variant.launch(x, weight, out_b, nullptr);
+        ninfer::test::cuda_check(cudaDeviceSynchronize(), variant.name);
         candidate_out.copy_to_host(candidate.data(), elements * 2);
+        if (repeat == 0) {
+            first_run.assign(candidate.begin(), candidate.begin() + static_cast<std::ptrdiff_t>(elements));
+        } else if (!std::equal(first_run.begin(), first_run.end(), candidate.begin())) {
+            ++failures;
+            std::cerr << "K=" << k << " T=" << tokens << " " << variant.name
+                      << ": repeat " << repeat << " differs from the first run\n";
+        }
+        }
 
         std::size_t mismatches = 0, changed = 0, first = elements;
         for (std::size_t i = 0; i < elements; ++i) {
@@ -103,7 +133,7 @@ int run_k(std::int32_t k) {
         }
         if (mismatches != 0 || changed == 0) {
             ++failures;
-            std::cerr << "K=" << k << " T=" << tokens << ": "
+            std::cerr << "K=" << k << " T=" << tokens << " " << variant.name << ": "
                       << (changed == 0 ? "reference left the residual unchanged"
                                        : std::to_string(mismatches) + " mismatches, first at " +
                                              std::to_string(first) + " (" +
@@ -111,6 +141,7 @@ int run_k(std::int32_t k) {
                                              " vs " + std::to_string(bf16_to_f32(candidate[first])) +
                                              ")")
                       << '\n';
+        }
         }
     }
     return failures;
@@ -122,7 +153,7 @@ int main() {
     try {
         const int failures = run_k(6144) + run_k(17408);
         std::cout << (failures == 0 ? "OK" : "FAIL")
-                  << " Q5 LinearAdd small-T MMA matches the SIMT kernels at T=1..8, K=6144/17408\n";
+                  << " Q5 LinearAdd small-T MMA variants match the SIMT kernels at T=1..8, K=6144/17408\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << "Q5 LinearAdd small-T MMA test failed: " << error.what() << '\n';

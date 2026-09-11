@@ -50,7 +50,10 @@ void sweep_for_k(std::int32_t hidden, const ninfer::bench::SweepOptions& base) {
         // their domain they do not fail, they just stop being meaningful.
         {"gemv_residual", make(&detail::q5_linear_add_gemv_residual_launch), 1},
         {"split2_exact", make(&detail::q5_linear_add_split2_exact_launch), 10},
-        {"small_t_mma", make(&detail::q5_linear_add_small_t_mma_launch), 8},
+        {"small_t_split3", make(&detail::q5_linear_add_small_t_mma_launch), 8},
+        {"small_t_nosplit", make(&detail::q5_linear_add_small_t_mma_nosplit_launch), 8},
+        {"small_t_split2", make(&detail::q5_linear_add_small_t_mma_split2_launch), 4},
+        {"small_t_split4", make(&detail::q5_linear_add_small_t_mma_split4_launch), 4},
         {"mma_r64_c16", make(&detail::q5_linear_add_mma_r64_c16_launch), 0},
         {"mma_r64_c24", make(&detail::q5_linear_add_mma_r64_c24_launch), 0},
         {"mma_r64_c32", make(&detail::q5_linear_add_mma_r64_c32_launch), 0},
