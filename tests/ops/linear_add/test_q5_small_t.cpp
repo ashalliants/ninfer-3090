@@ -1,5 +1,5 @@
 // The Q5 small-T MMA residual kernel against the kernels it would replace -- the T=1 GEMV, split2
-// at T=2..16 and the c32 MMA tile above that -- at T=1..32 on both registered K, with a nonzero
+// at T=2..16 and the routed c32/s4 MMA tile above that -- at T=1..32 on both registered K, with a nonzero
 // residual. The MMA folds groups in a different order from those kernels, so agreement is held to
 // one bf16 rounding step of the result rather than bit equality. Each case runs three times and
 // must give identical bytes every time.
@@ -87,7 +87,7 @@ int run_k(std::int32_t k) {
         } else if (tokens <= 16) {
             ninfer::ops::detail::q5_linear_add_split2_exact_launch(x, weight, out_a, nullptr);
         } else {
-            ninfer::ops::detail::q5_linear_add_mma_r64_c32_launch(x, weight, out_a, nullptr);
+            ninfer::ops::detail::q5_linear_add_mma_r64_c32_s4_launch(x, weight, out_a, nullptr);
         }
         ninfer::test::cuda_check(cudaDeviceSynchronize(), "q5 linear_add reference");
         reference_out.copy_to_host(reference.data(), elements * 2);
