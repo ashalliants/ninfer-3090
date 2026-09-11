@@ -44,7 +44,8 @@ bool same_linear_spec(const LinearAttentionStatePoolSpec& left,
     return left.layers == right.layers && left.conv_channels == right.conv_channels &&
            left.conv_width == right.conv_width && left.value_heads == right.value_heads &&
            left.value_head_dim == right.value_head_dim && left.key_head_dim == right.key_head_dim &&
-           left.slot_count == right.slot_count && left.conv_dtype == right.conv_dtype;
+           left.slot_count == right.slot_count && left.conv_dtype == right.conv_dtype &&
+           left.recurrent_dtype == right.recurrent_dtype;
 }
 
 bool same_dflash_spec(const std::optional<DFlashLocalStateSpec>& left,
@@ -100,7 +101,7 @@ StateImageHostLayout plan_host_state_image(const StateImageSpec& spec) {
     const Tensor conv_slot(nullptr, spec.linear.conv_dtype,
                            {spec.linear.conv_channels, spec.linear.conv_width});
     const Tensor recurrent_slot(
-        nullptr, DType::FP32,
+        nullptr, spec.linear.recurrent_dtype,
         {spec.linear.key_head_dim, spec.linear.value_head_dim, spec.linear.value_heads});
     const Tensor hidden_slot(nullptr, DType::BF16, {spec.hidden});
     host.linear_conv_layer_bytes = conv_slot.bytes();

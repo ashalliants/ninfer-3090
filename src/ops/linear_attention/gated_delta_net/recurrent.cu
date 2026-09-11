@@ -4,6 +4,7 @@
 #include "ops/linear_attention/gated_delta_net/recurrent.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <cstdint>
 #include <stdexcept>
@@ -18,25 +19,42 @@ static_assert(sizeof(GdnReplayFoldKernelRows) == 128);
 static_assert(alignof(GdnReplayFoldKernelRows) == 16);
 static_assert(std::is_trivially_copyable_v<GdnReplayFoldKernelRows>);
 
-template <bool NormalizeQK>
-void launch_recurrent_direct_fixed(const Tensor& q, const Tensor& k, const Tensor& v,
+template <bool NormalizeQK, class StateT>
+void launch_recurrent_direct_typed(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
                                    const Tensor& state_read, Tensor& state_write, Tensor& out,
                                    cudaStream_t stream) {
     const auto heads = head_map::of(q.ne[1], v.ne[1]);
     const dim3 grid(static_cast<unsigned>(v.ne[1]), 1, static_cast<unsigned>(kStateDim / kBlockDv));
     const dim3 block(kWarpSize, kNumWarps, 1);
-    recurrent_bf16_direct_kernel<NormalizeQK><<<grid, block, 0, stream>>>(
+    recurrent_bf16_direct_kernel<NormalizeQK, StateT><<<grid, block, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data), static_cast<const float*>(g.data),
-        static_cast<const float*>(beta.data), static_cast<const float*>(state_read.data),
-        static_cast<float*>(state_write.data), static_cast<__nv_bfloat16*>(out.data), q.ne[2],
+        static_cast<const float*>(beta.data), static_cast<const StateT*>(state_read.data),
+        static_cast<StateT*>(state_write.data), static_cast<__nv_bfloat16*>(out.data), q.ne[2],
         heads, scale);
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <bool NormalizeInputs>
-void launch_recurrent_batch_update_fixed(const Tensor& q, const Tensor& k, const Tensor& v,
+template <bool NormalizeQK>
+void launch_recurrent_direct_fixed(const Tensor& q, const Tensor& k, const Tensor& v,
+                                   const Tensor& g, const Tensor& beta, float scale,
+                                   const Tensor& state_read, Tensor& state_write, Tensor& out,
+                                   cudaStream_t stream) {
+    if (state_read.dtype != state_write.dtype) {
+        throw std::invalid_argument("GDN recurrent: state read/write dtypes differ");
+    }
+    if (state_read.dtype == DType::FP16) {
+        launch_recurrent_direct_typed<NormalizeQK, __half>(q, k, v, g, beta, scale, state_read,
+                                                            state_write, out, stream);
+    } else {
+        launch_recurrent_direct_typed<NormalizeQK, float>(q, k, v, g, beta, scale, state_read,
+                                                           state_write, out, stream);
+    }
+}
+
+template <bool NormalizeInputs, class StateT>
+void launch_recurrent_batch_update_typed(const Tensor& q, const Tensor& k, const Tensor& v,
                                          const Tensor& g, const Tensor& beta, float scale,
                                          Tensor& ssm_states, const Tensor& source_state_slots,
                                          const Tensor& destination_state_slots, Tensor& out,
@@ -47,14 +65,14 @@ void launch_recurrent_batch_update_fixed(const Tensor& q, const Tensor& k, const
     const dim3 block(kWarpSize, kNumWarps, 1);
     const std::int64_t state_slot_stride =
         static_cast<std::int64_t>(kStateDim) * kStateDim * ssm_states.ne[2];
-    const BatchUpdateAccess access{
+    const BatchUpdateAccess<StateT> access{
         static_cast<const __nv_bfloat16*>(q.data),
         static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data),
         static_cast<const float*>(g.data),
         static_cast<const float*>(beta.data),
-        static_cast<const float*>(ssm_states.data),
-        static_cast<float*>(ssm_states.data),
+        static_cast<const StateT*>(ssm_states.data),
+        static_cast<StateT*>(ssm_states.data),
         static_cast<const std::int32_t*>(source_state_slots.data),
         static_cast<const std::int32_t*>(destination_state_slots.data),
         static_cast<__nv_bfloat16*>(out.data),
@@ -62,12 +80,29 @@ void launch_recurrent_batch_update_fixed(const Tensor& q, const Tensor& k, const
         state_slot_stride,
         scale,
     };
-    recurrent_batch_update_kernel<NormalizeInputs><<<grid, block, 0, stream>>>(access);
+    recurrent_batch_update_kernel<NormalizeInputs, StateT><<<grid, block, 0, stream>>>(access);
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <bool Masked>
-void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tensor& v,
+template <bool NormalizeInputs>
+void launch_recurrent_batch_update_fixed(const Tensor& q, const Tensor& k, const Tensor& v,
+                                         const Tensor& g, const Tensor& beta, float scale,
+                                         Tensor& ssm_states, const Tensor& source_state_slots,
+                                         const Tensor& destination_state_slots, Tensor& out,
+                                         cudaStream_t stream) {
+    if (ssm_states.dtype == DType::FP16) {
+        launch_recurrent_batch_update_typed<NormalizeInputs, __half>(
+            q, k, v, g, beta, scale, ssm_states, source_state_slots, destination_state_slots, out,
+            stream);
+    } else {
+        launch_recurrent_batch_update_typed<NormalizeInputs, float>(
+            q, k, v, g, beta, scale, ssm_states, source_state_slots, destination_state_slots, out,
+            stream);
+    }
+}
+
+template <bool Masked, class StateT>
+void launch_recurrent_record_typed(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
                                    const Tensor& ssm_states, const Tensor& valid_columns,
                                    const Tensor& initial_state_slots, Tensor& key_record,
@@ -79,13 +114,13 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
     const dim3 block(kWarpSize, kNumWarps, 1);
     const std::int64_t state_slot_stride =
         static_cast<std::int64_t>(kStateDim) * kStateDim * ssm_states.ne[2];
-    const RecordAccess<Masked> access{
+    const RecordAccess<Masked, StateT> access{
         static_cast<const __nv_bfloat16*>(q.data),
         static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data),
         static_cast<const float*>(g.data),
         static_cast<const float*>(beta.data),
-        static_cast<const float*>(ssm_states.data),
+        static_cast<const StateT*>(ssm_states.data),
         Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
         static_cast<const std::int32_t*>(initial_state_slots.data),
         static_cast<__nv_bfloat16*>(key_record.data),
@@ -97,23 +132,43 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
         state_slot_stride,
         scale,
     };
-    recurrent_record_kernel<Masked><<<grid, block, 0, stream>>>(access);
+    recurrent_record_kernel<Masked, StateT><<<grid, block, 0, stream>>>(access);
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <class Geometry>
-void launch_replay_fold_fixed(const GdnReplayRecords& records,
+template <bool Masked>
+void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tensor& v,
+                                   const Tensor& g, const Tensor& beta, float scale,
+                                   const Tensor& ssm_states, const Tensor& valid_columns,
+                                   const Tensor& initial_state_slots, Tensor& key_record,
+                                   Tensor& value_record, Tensor& gate_record, Tensor& out,
+                                   cudaStream_t stream) {
+    if (ssm_states.dtype == DType::FP16) {
+        launch_recurrent_record_typed<Masked, __half>(q, k, v, g, beta, scale, ssm_states,
+                                                      valid_columns, initial_state_slots,
+                                                      key_record, value_record, gate_record, out,
+                                                      stream);
+    } else {
+        launch_recurrent_record_typed<Masked, float>(q, k, v, g, beta, scale, ssm_states,
+                                                     valid_columns, initial_state_slots,
+                                                     key_record, value_record, gate_record, out,
+                                                     stream);
+    }
+}
+
+template <class Geometry, class StateT>
+void launch_replay_fold_typed(const GdnReplayRecords& records,
                               LinearAttentionStateAllLayersView states,
                               const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
                               cudaStream_t stream) {
-    const FoldAccess<Geometry> access{
+    const FoldAccess<Geometry, StateT> access{
         static_cast<const __nv_bfloat16*>(records.key.data),
         static_cast<const __nv_bfloat16*>(records.value.data),
         reinterpret_cast<const uint2*>(records.gate.data),
         static_cast<const __nv_bfloat16*>(records.conv.data),
-        static_cast<float*>(states.recurrent_layer0.data),
+        static_cast<StateT*>(states.recurrent_layer0.data),
         static_cast<__nv_bfloat16*>(states.conv_layer0.data),
-        states.recurrent_layer_stride_bytes / static_cast<std::int64_t>(sizeof(float)),
+        states.recurrent_layer_stride_bytes / static_cast<std::int64_t>(sizeof(StateT)),
         states.conv_layer_stride_bytes / static_cast<std::int64_t>(sizeof(__nv_bfloat16)),
         records.spec.record_capacity,
         records.spec.width,
@@ -123,8 +178,20 @@ void launch_replay_fold_fixed(const GdnReplayRecords& records,
                     static_cast<unsigned>(active_rows),
                     static_cast<unsigned>(Geometry::kLayers * (kStateDim / kBlockDv)));
     const dim3 block(kWarpSize, kNumWarps, 1);
-    recurrent_fold_kernel<Geometry><<<grid, block, 0, stream>>>(access);
+    recurrent_fold_kernel<Geometry, StateT><<<grid, block, 0, stream>>>(access);
     CUDA_CHECK(cudaGetLastError());
+}
+
+template <class Geometry>
+void launch_replay_fold_fixed(const GdnReplayRecords& records,
+                              LinearAttentionStateAllLayersView states,
+                              const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
+                              cudaStream_t stream) {
+    if (states.recurrent_layer0.dtype == DType::FP16) {
+        launch_replay_fold_typed<Geometry, __half>(records, states, rows, active_rows, stream);
+    } else {
+        launch_replay_fold_typed<Geometry, float>(records, states, rows, active_rows, stream);
+    }
 }
 
 } // namespace

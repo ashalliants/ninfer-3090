@@ -126,6 +126,7 @@ add_library(ninfer_ops STATIC
   ops/linear_attention/gated_delta_net/gated_delta_net.cpp
   ops/linear_attention/gated_delta_net/replay.cpp
   ops/linear_attention/gated_delta_net/recurrent.cu
+  ops/linear_attention/gated_delta_net/state_convert.cu
   ops/linear_attention/gated_delta_net/chunked/launch.cu
   ops/linear_attention/gated_delta_net/chunked/prepare_wy_wu.cu
   ops/linear_attention/gated_delta_net/chunked/state_passing.cu

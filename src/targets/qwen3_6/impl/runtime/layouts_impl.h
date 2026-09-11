@@ -10,6 +10,7 @@
 #include "ninfer/ops/context_kv_materialize.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 #include "ninfer/ops/linear_topk.h"
+#include <cstdlib>
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/linear_add.h"
@@ -146,6 +147,12 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 .key_head_dim   = TextConfig::gdn_key_head_dim,
                 .slot_count     = state_image_slots,
                 .conv_dtype     = DType::BF16,
+                // EXPERIMENT (perf/quality-trades): NINFER_GDN_STATE_FP16=1 stores the
+                // recurrent state in FP16.
+                .recurrent_dtype = [] {
+                    const char* env = std::getenv("NINFER_GDN_STATE_FP16");
+                    return env != nullptr && env[0] == '1' ? DType::FP16 : DType::FP32;
+                }(),
             },
         .hidden = TextConfig::hidden,
     };

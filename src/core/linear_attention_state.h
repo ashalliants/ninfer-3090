@@ -20,6 +20,9 @@ struct LinearAttentionStatePoolSpec {
     std::int32_t key_head_dim   = 0;
     std::int32_t slot_count     = 1;
     DType conv_dtype            = DType::BF16;
+    // FP32, or FP16 to halve the recurrent state's footprint and per-step traffic. The recurrence
+    // always computes in FP32; FP16 only rounds what is stored between steps.
+    DType recurrent_dtype = DType::FP32;
 };
 
 struct LinearAttentionStatePoolLayout {
