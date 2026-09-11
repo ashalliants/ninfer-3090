@@ -38,11 +38,7 @@ struct Q5SmallTSchedule : SmallTLayout<KWarps, TilesPerWarp> {
     // Activation columns are 64 bf16 (128 B) per K warp; 16 B of padding staggers adjacent
     // columns by four banks for the quarter-warp 128-bit B loads.
     static constexpr int kXColPad = 8;
-#ifdef NINFER_Q5_SMALL_T_PREFETCH
-    static constexpr Cache kWeightCache = Cache::cg_l2_256;
-#else
     static constexpr Cache kWeightCache = Cache::cg;
-#endif
 };
 
 // Shared memory of q5_small_t_mma_kernel: a ring of Stages slabs, reused for the final K
