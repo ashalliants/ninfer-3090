@@ -26,8 +26,8 @@
 namespace ninfer::ops::detail {
 
 // Per-row staging of one K slab for the layout SmallTLayout<KWarps> (ops/common/small_t_layout.cuh).
-template <int KWarps>
-struct Q5SmallTSchedule : SmallTLayout<KWarps> {
+template <int KWarps, int TilesPerWarp = 1>
+struct Q5SmallTSchedule : SmallTLayout<KWarps, TilesPerWarp> {
     static constexpr int kCodeRowBytes = KWarps * 32;
     static constexpr int kHighRowBytes = KWarps * 8;
     // A lane reads eight contiguous code bytes per row (LDS.64) and two high bytes (LDS.16); a
@@ -44,9 +44,9 @@ struct Q5SmallTSchedule : SmallTLayout<KWarps> {
 // Shared memory of q5_small_t_mma_kernel: a ring of Stages slabs, reused for the final K
 // reduction. Dynamic, so a ring deeper than the 48 KB static limit allows is available; launch
 // through q5_small_t_mma_launch, which sizes and configures it.
-template <int KWarps, int XCols, int Stages>
+template <int KWarps, int XCols, int Stages, int TilesPerWarp = 1>
 struct Q5SmallTStorage {
-    using Schedule = Q5SmallTSchedule<KWarps>;
+    using Schedule = Q5SmallTSchedule<KWarps, TilesPerWarp>;
     struct Stage {
         std::uint8_t codes[Schedule::kRowsPerCta][Schedule::kCodeRowBytes + Schedule::kCodeRowPad];
         std::uint8_t high[Schedule::kRowsPerCta][Schedule::kHighRowBytes + Schedule::kHighRowPad];
@@ -55,7 +55,7 @@ struct Q5SmallTStorage {
     };
     union Shared {
         Stage stages[Stages];
-        float partial[Schedule::kWarps * (XCols < 8 ? 1 : XCols / 8) * 32 * 4];
+        float partial[Schedule::kWarps * TilesPerWarp * (XCols < 8 ? 1 : XCols / 8) * 32 * 4];
     };
     static constexpr int kBytes = sizeof(Shared);
 };
@@ -104,14 +104,16 @@ __device__ __forceinline__ void q5_small_t_decode_eight(unsigned word, unsigned 
 // bytes per row -- one 64-bit load, decoded by q5_small_t_decode_eight -- and its B operand
 // sixteen contiguous activations of one column -- two 128-bit loads, no ldmatrix -- where the
 // natural slot order needs a byte load, a decode and an ldmatrix per fragment.
-template <int Rows, int K, int XCols, int Stages, class Epilogue, int KWarps = 8>
+template <int Rows, int K, int XCols, int Stages, class Epilogue, int KWarps = 8,
+          int TilesPerWarp = 1>
 __launch_bounds__(256, (KWarps < 8 || XCols >= 32 ? 2 : (XCols >= 16 || Stages == 2 ? 4 : 6)))
     __global__ void q5_small_t_mma_kernel(const __nv_bfloat16* __restrict__ x,
                                           const std::uint8_t* __restrict__ codes,
                                           const std::uint8_t* __restrict__ high_bits,
                                           const std::uint8_t* __restrict__ scales,
                                           Epilogue epilogue, int columns) {
-    using Schedule              = Q5SmallTSchedule<KWarps>;
+    using Schedule              = Q5SmallTSchedule<KWarps, TilesPerWarp>;
+    constexpr int kTpw          = TilesPerWarp;
     constexpr int kTileK        = 64;
     constexpr int kKWarps       = Schedule::kKWarps;
     constexpr int kRowsPerCta   = Schedule::kRowsPerCta;
@@ -124,7 +126,7 @@ __launch_bounds__(256, (KWarps < 8 || XCols >= 32 ? 2 : (XCols >= 16 || Stages =
     static_assert(K % kGroupK == 0, "K must be a whole number of slabs");
     static_assert(Rows % kRowsPerCta == 0);
 
-    using Storage = Q5SmallTStorage<KWarps, XCols, Stages>;
+    using Storage = Q5SmallTStorage<KWarps, XCols, Stages, TilesPerWarp>;
     using Stage   = typename Storage::Stage;
     extern __shared__ __align__(16) unsigned char q5_small_t_shared[];
     auto& shared = *reinterpret_cast<typename Storage::Shared*>(q5_small_t_shared);
@@ -135,9 +137,8 @@ __launch_bounds__(256, (KWarps < 8 || XCols >= 32 ? 2 : (XCols >= 16 || Stages =
     const int gid      = lane >> 2;
     const int lid      = lane & 3;
     const int k_split  = warp % kKWarps;
-    const int row_tile = warp / kKWarps;
-    const int cta_row0 = static_cast<int>(blockIdx.x) * kRowsPerCta;
-    const int tile_row = row_tile * 16 + gid;
+    const int first_tile = warp / kKWarps * kTpw; // this warp's tiles: first_tile + [0, kTpw)
+    const int cta_row0   = static_cast<int>(blockIdx.x) * kRowsPerCta;
 
     const auto stage_x = [&](int slab_k0, Stage& stage) {
         constexpr int kChunksPerCol = kGroupK / 8;
@@ -183,9 +184,9 @@ __launch_bounds__(256, (KWarps < 8 || XCols >= 32 ? 2 : (XCols >= 16 || Stages =
         cp_commit(); // empty commits keep cp_wait<Stages - 1> exact through the tail
     };
 
-    const int code_byte = k_split * (kTileK / 2) + 8 * lid;
-    const int high_byte = k_split * (kTileK / 8) + 2 * lid;
-    float acc[kNt][4]   = {};
+    const int code_byte     = k_split * (kTileK / 2) + 8 * lid;
+    const int high_byte     = k_split * (kTileK / 8) + 2 * lid;
+    float acc[kTpw][kNt][4] = {};
 
 #pragma unroll
     for (int prefetch = 0; prefetch < Stages - 1; ++prefetch) { issue_slab(prefetch); }
@@ -197,22 +198,30 @@ __launch_bounds__(256, (KWarps < 8 || XCols >= 32 ? 2 : (XCols >= 16 || Stages =
         __syncthreads();
 
         const Stage& stage = shared.stages[slab % Stages];
-        const uint2 top    = load_vec<uint2>(&stage.codes[tile_row][code_byte]);
-        const uint2 bot    = load_vec<uint2>(&stage.codes[tile_row + 8][code_byte]);
-        const unsigned top_high =
-            *reinterpret_cast<const std::uint16_t*>(&stage.high[tile_row][high_byte]);
-        const unsigned bot_high =
-            *reinterpret_cast<const std::uint16_t*>(&stage.high[tile_row + 8][high_byte]);
+        uint2 top[kTpw], bot[kTpw];
+        unsigned top_high[kTpw], bot_high[kTpw];
+#pragma unroll
+        for (int t = 0; t < kTpw; ++t) {
+            const int tile_row = (first_tile + t) * 16 + gid;
+            top[t]             = load_vec<uint2>(&stage.codes[tile_row][code_byte]);
+            bot[t]             = load_vec<uint2>(&stage.codes[tile_row + 8][code_byte]);
+            top_high[t] = *reinterpret_cast<const std::uint16_t*>(&stage.high[tile_row][high_byte]);
+            bot_high[t] =
+                *reinterpret_cast<const std::uint16_t*>(&stage.high[tile_row + 8][high_byte]);
+        }
 
-        float group_acc[kNt][4] = {};
+        float group_acc[kTpw][kNt][4] = {};
 #pragma unroll
         for (int half = 0; half < 2; ++half) {
             // Four code bytes and one high byte per row cover steps ks = 2*half and 2*half + 1.
-            unsigned a_top[4], a_bot[4];
-            q5_small_t_decode_eight(half == 0 ? top.x : top.y, (top_high >> (8 * half)) & 0xffu,
-                                    a_top);
-            q5_small_t_decode_eight(half == 0 ? bot.x : bot.y, (bot_high >> (8 * half)) & 0xffu,
-                                    a_bot);
+            unsigned a_top[kTpw][4], a_bot[kTpw][4];
+#pragma unroll
+            for (int t = 0; t < kTpw; ++t) {
+                q5_small_t_decode_eight(half == 0 ? top[t].x : top[t].y,
+                                        (top_high[t] >> (8 * half)) & 0xffu, a_top[t]);
+                q5_small_t_decode_eight(half == 0 ? bot[t].x : bot[t].y,
+                                        (bot_high[t] >> (8 * half)) & 0xffu, a_bot[t]);
+            }
 #pragma unroll
             for (int nt = 0; nt < kNt; ++nt) {
                 const int col = nt * 8 + gid;
@@ -220,22 +229,30 @@ __launch_bounds__(256, (KWarps < 8 || XCols >= 32 ? 2 : (XCols >= 16 || Stages =
                 if (col < columns) {
                     b = load_vec<uint4>(&stage.activations[k_split][col][16 * lid + 8 * half]);
                 }
-                mma_bf16(group_acc[nt][0], group_acc[nt][1], group_acc[nt][2], group_acc[nt][3],
-                         a_top[0], a_bot[0], a_top[1], a_bot[1], b.x, b.y);
-                mma_bf16(group_acc[nt][0], group_acc[nt][1], group_acc[nt][2], group_acc[nt][3],
-                         a_top[2], a_bot[2], a_top[3], a_bot[3], b.z, b.w);
+#pragma unroll
+                for (int t = 0; t < kTpw; ++t) {
+                    float(&g)[4] = group_acc[t][nt];
+                    mma_bf16(g[0], g[1], g[2], g[3], a_top[t][0], a_bot[t][0], a_top[t][1],
+                             a_bot[t][1], b.x, b.y);
+                    mma_bf16(g[0], g[1], g[2], g[3], a_top[t][2], a_bot[t][2], a_top[t][3],
+                             a_bot[t][3], b.z, b.w);
+                }
             }
         }
 
-        const float top_scale = __half2float(__ushort_as_half(stage.scales[tile_row][k_split]));
-        const float bot_scale =
-            __half2float(__ushort_as_half(stage.scales[tile_row + 8][k_split]));
 #pragma unroll
-        for (int nt = 0; nt < kNt; ++nt) {
-            acc[nt][0] = fmaf(group_acc[nt][0], top_scale, acc[nt][0]);
-            acc[nt][1] = fmaf(group_acc[nt][1], top_scale, acc[nt][1]);
-            acc[nt][2] = fmaf(group_acc[nt][2], bot_scale, acc[nt][2]);
-            acc[nt][3] = fmaf(group_acc[nt][3], bot_scale, acc[nt][3]);
+        for (int t = 0; t < kTpw; ++t) {
+            const int tile_row    = (first_tile + t) * 16 + gid;
+            const float top_scale = __half2float(__ushort_as_half(stage.scales[tile_row][k_split]));
+            const float bot_scale =
+                __half2float(__ushort_as_half(stage.scales[tile_row + 8][k_split]));
+#pragma unroll
+            for (int nt = 0; nt < kNt; ++nt) {
+                acc[t][nt][0] = fmaf(group_acc[t][nt][0], top_scale, acc[t][nt][0]);
+                acc[t][nt][1] = fmaf(group_acc[t][nt][1], top_scale, acc[t][nt][1]);
+                acc[t][nt][2] = fmaf(group_acc[t][nt][2], bot_scale, acc[t][nt][2]);
+                acc[t][nt][3] = fmaf(group_acc[t][nt][3], bot_scale, acc[t][nt][3]);
+            }
         }
         // The next iteration's issue_slab writes the stage this one just read.
         __syncthreads();
@@ -245,58 +262,68 @@ __launch_bounds__(256, (KWarps < 8 || XCols >= 32 ? 2 : (XCols >= 16 || Stages =
     // Reduce each tile's K partials: odd K warps publish, even ones fold their neighbour, then K
     // warp 0 sums the even ones -- the same order as the Q4 kernel.
     __syncthreads();
-    auto* partial = shared.partial;
+    auto* partial   = shared.partial;
+    const auto slot = [&](int w, int t, int nt) {
+        return partial + (((w * kTpw + t) * kNt + nt) * 32 + lane) * 4;
+    };
     if ((k_split & 1) != 0) {
 #pragma unroll
-        for (int nt = 0; nt < kNt; ++nt) {
-            store_vec(partial + ((warp * kNt + nt) * 32 + lane) * 4,
-                      make_float4(acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3]));
+        for (int t = 0; t < kTpw; ++t) {
+#pragma unroll
+            for (int nt = 0; nt < kNt; ++nt) {
+                const float(&a)[4] = acc[t][nt];
+                store_vec(slot(warp, t, nt), make_float4(a[0], a[1], a[2], a[3]));
+            }
         }
     }
     __syncthreads();
     if ((k_split & 1) == 0) {
 #pragma unroll
-        for (int nt = 0; nt < kNt; ++nt) {
-            const float4 partner =
-                load_vec<float4>(partial + (((warp + 1) * kNt + nt) * 32 + lane) * 4);
-            acc[nt][0] += partner.x;
-            acc[nt][1] += partner.y;
-            acc[nt][2] += partner.z;
-            acc[nt][3] += partner.w;
-            if (k_split != 0) {
-                store_vec(partial + ((warp * kNt + nt) * 32 + lane) * 4,
-                          make_float4(acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3]));
+        for (int t = 0; t < kTpw; ++t) {
+#pragma unroll
+            for (int nt = 0; nt < kNt; ++nt) {
+                float(&a)[4]         = acc[t][nt];
+                const float4 partner = load_vec<float4>(slot(warp + 1, t, nt));
+                a[0] += partner.x;
+                a[1] += partner.y;
+                a[2] += partner.z;
+                a[3] += partner.w;
+                if (k_split != 0) { store_vec(slot(warp, t, nt), make_float4(a[0], a[1], a[2], a[3])); }
             }
         }
     }
     if constexpr (kKWarps > 2) { __syncthreads(); }
     if (k_split == 0) {
 #pragma unroll
-        for (int nt = 0; nt < kNt; ++nt) {
-            float4 sum = make_float4(acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3]);
+        for (int t = 0; t < kTpw; ++t) {
 #pragma unroll
-            for (int split = 2; split < kKWarps; split += 2) {
-                const float4 value =
-                    load_vec<float4>(partial + (((warp + split) * kNt + nt) * 32 + lane) * 4);
-                sum.x += value.x;
-                sum.y += value.y;
-                sum.z += value.z;
-                sum.w += value.w;
+            for (int nt = 0; nt < kNt; ++nt) {
+                float4 sum = make_float4(acc[t][nt][0], acc[t][nt][1], acc[t][nt][2], acc[t][nt][3]);
+#pragma unroll
+                for (int split = 2; split < kKWarps; split += 2) {
+                    const float4 value = load_vec<float4>(slot(warp + split, t, nt));
+                    sum.x += value.x;
+                    sum.y += value.y;
+                    sum.z += value.z;
+                    sum.w += value.w;
+                }
+                epilogue.store(cta_row0 + (first_tile + t) * 16 + gid, nt * 8 + 2 * lid, sum);
             }
-            epilogue.store(cta_row0 + tile_row, nt * 8 + 2 * lid, sum);
         }
     }
 }
 
 // Launches q5_small_t_mma_kernel with its dynamic shared memory, raising the kernel's limit the
 // first time (per device) a layout needs more than the 48 KB default.
-template <int Rows, int K, int XCols, int Stages, class Epilogue, int KWarps = 8>
+template <int Rows, int K, int XCols, int Stages, class Epilogue, int KWarps = 8,
+          int TilesPerWarp = 1>
 void q5_small_t_mma_launch(cudaStream_t stream, const __nv_bfloat16* x, const std::uint8_t* codes,
                            const std::uint8_t* high_bits, const std::uint8_t* scales,
                            Epilogue epilogue, int columns) {
-    using Schedule        = Q5SmallTSchedule<KWarps>;
-    constexpr int kBytes  = Q5SmallTStorage<KWarps, XCols, Stages>::kBytes;
-    constexpr auto kernel = q5_small_t_mma_kernel<Rows, K, XCols, Stages, Epilogue, KWarps>;
+    using Schedule        = Q5SmallTSchedule<KWarps, TilesPerWarp>;
+    constexpr int kBytes  = Q5SmallTStorage<KWarps, XCols, Stages, TilesPerWarp>::kBytes;
+    constexpr auto kernel =
+        q5_small_t_mma_kernel<Rows, K, XCols, Stages, Epilogue, KWarps, TilesPerWarp>;
     if constexpr (kBytes > 48 * 1024) {
         configure_cuda_device_once([&] {
             return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,

@@ -47,9 +47,9 @@ struct Q4DraftSmallTSchedule {
 // by 32 B (eight banks; a row is 32 * KWarps bytes, so the stride is 32 or 96 mod 128); unpadded,
 // rows 256 B apart all share a bank. Activation columns are 64 bf16 (128 B) per K warp and 16 B of
 // padding staggers neighbours by four banks for the quarter-warp 128-bit loads.
-template <int KWarps, int TileCols, int Stages>
+template <int KWarps, int TileCols, int Stages, int TilesPerWarp = 1>
 struct Q4SmallTStorage {
-    using Layout                     = SmallTLayout<KWarps>;
+    using Layout                     = SmallTLayout<KWarps, TilesPerWarp>;
     static constexpr int kCodeRowPad = 32;
     static constexpr int kXColStride = 64 + 8;
 
@@ -60,25 +60,26 @@ struct Q4SmallTStorage {
     };
     union Shared {
         Stage stages[Stages];
-        float partial[Layout::kWarps * (TileCols / 8) * 32 * 4];
+        float partial[Layout::kWarps * TilesPerWarp * (TileCols / 8) * 32 * 4];
     };
     static constexpr int kBytes = sizeof(Shared);
 };
 
-// KWarps / Stages: the warp layout (ops/common/small_t_layout.cuh) and the depth of the cp.async
-// ring. RowPolicy maps one sixteen-row MMA tile to weight rows and names how many output rows the
-// tile produces; a CTA covers 8 / KWarps consecutive tiles, so the grid is
-// output rows / (RowPolicy::kOutputRowsPerTile * 8 / KWarps).
+// KWarps / TilesPerWarp / Stages: the warp layout (ops/common/small_t_layout.cuh) and the depth
+// of the cp.async ring. RowPolicy maps one sixteen-row MMA tile to weight rows and names how many
+// output rows the tile produces; a CTA covers SmallTLayout::kRowTiles consecutive tiles, so the
+// grid is output rows / (RowPolicy::kOutputRowsPerTile * kRowTiles).
 template <class Geometry, int TileCols, int ActiveCols, class Epilogue = Q4SmallTMmaStoreEpilogue,
           class RowPolicy = Q4SmallTMmaIdentityRows, bool MaskedColumns = false, int KWarps = 8,
-          int Stages = 1>
+          int Stages = 1, int TilesPerWarp = 1>
 __launch_bounds__(256, (KWarps < 8 ? 2 : (TileCols <= 16 ? 6 : 4))) __global__
     void q4_small_t_mma_kernel(const __nv_bfloat16* __restrict__ x,
                                const std::uint8_t* __restrict__ codes,
                                const std::uint8_t* __restrict__ scales,
                                __nv_bfloat16* __restrict__ out, Epilogue epilogue = {},
                                RowPolicy row_policy = {}, int columns = ActiveCols) {
-    using Layout                = SmallTLayout<KWarps>;
+    using Layout                = SmallTLayout<KWarps, TilesPerWarp>;
+    constexpr int kTpw          = TilesPerWarp;
     constexpr int kHidden       = Geometry::kInputRows;
     constexpr int kTileK        = 64;
     constexpr int kKWarps       = Layout::kKWarps;
@@ -108,7 +109,7 @@ __launch_bounds__(256, (KWarps < 8 ? 2 : (TileCols <= 16 ? 6 : 4))) __global__
     //
     // Shared memory: Q4SmallTStorage, dynamic, so a ring deeper than the 48 KB static limit allows
     // is available; launch through q4_small_t_mma_launch, which sizes and configures it.
-    using Storage = Q4SmallTStorage<KWarps, TileCols, Stages>;
+    using Storage = Q4SmallTStorage<KWarps, TileCols, Stages, TilesPerWarp>;
     using Stage   = typename Storage::Stage;
     extern __shared__ __align__(16) unsigned char q4_small_t_shared[];
     auto& shared = *reinterpret_cast<typename Storage::Shared*>(q4_small_t_shared);
@@ -119,9 +120,8 @@ __launch_bounds__(256, (KWarps < 8 ? 2 : (TileCols <= 16 ? 6 : 4))) __global__
     const int gid          = lane >> 2;
     const int lid          = lane & 3;
     const int k_split      = warp % kKWarps;
-    const int row_tile     = warp / kKWarps;
+    const int first_tile   = warp / kKWarps * kTpw; // this warp's tiles: first_tile + [0, kTpw)
     const int tile0        = static_cast<int>(blockIdx.x) * kRowTiles;
-    const int row0         = (tile0 + row_tile) * RowPolicy::kOutputRowsPerTile;
     const int live_columns = MaskedColumns ? columns : ActiveCols;
 
     // Only live columns are staged; the B fragments of the others are zero.
@@ -136,13 +136,14 @@ __launch_bounds__(256, (KWarps < 8 ? 2 : (TileCols <= 16 ? 6 : 4))) __global__
         }
     };
 
-    // One 16-byte code chunk per thread: rows * (kGroupK / 32) = 256.
+    // kTpw 16-byte code chunks per thread: rows * (kGroupK / 32) = 256 * kTpw.
     const auto stage_weight = [&](int group_k0, Stage& stage) {
         constexpr int kChunksPerRow = kGroupK / 32;
-        static_assert(kRowsPerCta * kChunksPerRow == Layout::kThreads);
-        {
-            const int row        = tid / kChunksPerRow;
-            const int chunk      = tid % kChunksPerRow;
+        static_assert(kRowsPerCta * kChunksPerRow == Layout::kThreads * kTpw);
+#pragma unroll
+        for (int item = tid; item < kRowsPerCta * kChunksPerRow; item += Layout::kThreads) {
+            const int row        = item / kChunksPerRow;
+            const int chunk      = item % kChunksPerRow;
             const int weight_row = row_policy.weight_row(
                 (tile0 + row / 16) * RowPolicy::kOutputRowsPerTile, row % 16);
             cp_async<16, Q4DraftSmallTSchedule::kCodeCache>(
@@ -171,9 +172,8 @@ __launch_bounds__(256, (KWarps < 8 ? 2 : (TileCols <= 16 ? 6 : 4))) __global__
         cp_commit(); // empty commits keep cp_wait<Stages - 1> exact through the tail
     };
 
-    const int tile_row  = row_tile * 16 + gid;
-    const int code_byte = k_split * (kTileK / 2) + 8 * lid;
-    float acc[kNt][4]   = {};
+    const int code_byte     = k_split * (kTileK / 2) + 8 * lid;
+    float acc[kTpw][kNt][4] = {};
 
 #pragma unroll
     for (int prefetch = 0; prefetch < Stages - 1; ++prefetch) { issue_group(prefetch); }
@@ -184,17 +184,25 @@ __launch_bounds__(256, (KWarps < 8 ? 2 : (TileCols <= 16 ? 6 : 4))) __global__
         cp_wait<Stages - 1>();
         __syncthreads();
 
-        const Stage& stage      = shared.stages[group_index % Stages];
-        float group_acc[kNt][4] = {};
-        const uint2 top         = load_vec<uint2>(&stage.codes[tile_row][code_byte]);
-        const uint2 bot         = load_vec<uint2>(&stage.codes[tile_row + 8][code_byte]);
+        const Stage& stage            = shared.stages[group_index % Stages];
+        float group_acc[kTpw][kNt][4] = {};
+        uint2 top[kTpw], bot[kTpw];
+#pragma unroll
+        for (int t = 0; t < kTpw; ++t) {
+            const int tile_row = (first_tile + t) * 16 + gid;
+            top[t]             = load_vec<uint2>(&stage.codes[tile_row][code_byte]);
+            bot[t]             = load_vec<uint2>(&stage.codes[tile_row + 8][code_byte]);
+        }
 
 #pragma unroll
         for (int half = 0; half < 2; ++half) {
             // Four code bytes per row cover steps ks = 2*half and 2*half + 1.
-            unsigned a_top[4], a_bot[4];
-            Q4MmaDecodeAtom::decode_eight(half == 0 ? top.x : top.y, a_top);
-            Q4MmaDecodeAtom::decode_eight(half == 0 ? bot.x : bot.y, a_bot);
+            unsigned a_top[kTpw][4], a_bot[kTpw][4];
+#pragma unroll
+            for (int t = 0; t < kTpw; ++t) {
+                Q4MmaDecodeAtom::decode_eight(half == 0 ? top[t].x : top[t].y, a_top[t]);
+                Q4MmaDecodeAtom::decode_eight(half == 0 ? bot[t].x : bot[t].y, a_bot[t]);
+            }
 #pragma unroll
             for (int nt = 0; nt < kNt; ++nt) {
                 const int col = nt * 8 + gid;
@@ -202,22 +210,30 @@ __launch_bounds__(256, (KWarps < 8 ? 2 : (TileCols <= 16 ? 6 : 4))) __global__
                 if (col < live_columns) {
                     b = load_vec<uint4>(&stage.activations[k_split][col][16 * lid + 8 * half]);
                 }
-                mma_bf16(group_acc[nt][0], group_acc[nt][1], group_acc[nt][2], group_acc[nt][3],
-                         a_top[0], a_bot[0], a_top[1], a_bot[1], b.x, b.y);
-                mma_bf16(group_acc[nt][0], group_acc[nt][1], group_acc[nt][2], group_acc[nt][3],
-                         a_top[2], a_bot[2], a_top[3], a_bot[3], b.z, b.w);
+#pragma unroll
+                for (int t = 0; t < kTpw; ++t) {
+                    float(&g)[4] = group_acc[t][nt];
+                    mma_bf16(g[0], g[1], g[2], g[3], a_top[t][0], a_bot[t][0], a_top[t][1],
+                             a_bot[t][1], b.x, b.y);
+                    mma_bf16(g[0], g[1], g[2], g[3], a_top[t][2], a_bot[t][2], a_top[t][3],
+                             a_bot[t][3], b.z, b.w);
+                }
             }
         }
 
-        const float top_scale = __half2float(__ushort_as_half(stage.scales[tile_row][k_split]));
-        const float bot_scale =
-            __half2float(__ushort_as_half(stage.scales[tile_row + 8][k_split]));
 #pragma unroll
-        for (int nt = 0; nt < kNt; ++nt) {
-            acc[nt][0] = fmaf(group_acc[nt][0], top_scale, acc[nt][0]);
-            acc[nt][1] = fmaf(group_acc[nt][1], top_scale, acc[nt][1]);
-            acc[nt][2] = fmaf(group_acc[nt][2], bot_scale, acc[nt][2]);
-            acc[nt][3] = fmaf(group_acc[nt][3], bot_scale, acc[nt][3]);
+        for (int t = 0; t < kTpw; ++t) {
+            const int tile_row    = (first_tile + t) * 16 + gid;
+            const float top_scale = __half2float(__ushort_as_half(stage.scales[tile_row][k_split]));
+            const float bot_scale =
+                __half2float(__ushort_as_half(stage.scales[tile_row + 8][k_split]));
+#pragma unroll
+            for (int nt = 0; nt < kNt; ++nt) {
+                acc[t][nt][0] = fmaf(group_acc[t][nt][0], top_scale, acc[t][nt][0]);
+                acc[t][nt][1] = fmaf(group_acc[t][nt][1], top_scale, acc[t][nt][1]);
+                acc[t][nt][2] = fmaf(group_acc[t][nt][2], bot_scale, acc[t][nt][2]);
+                acc[t][nt][3] = fmaf(group_acc[t][nt][3], bot_scale, acc[t][nt][3]);
+            }
         }
         // The next iteration's issue_group writes the stage this one just read.
         __syncthreads();
@@ -227,28 +243,34 @@ __launch_bounds__(256, (KWarps < 8 ? 2 : (TileCols <= 16 ? 6 : 4))) __global__
     // Reduce each tile's K partials: odd K warps publish, even ones fold their neighbour, then K
     // warp 0 sums the even ones.
     __syncthreads();
-    auto* partial = shared.partial;
+    auto* partial   = shared.partial;
+    const auto slot = [&](int w, int t, int nt) {
+        return partial + (((w * kTpw + t) * kNt + nt) * 32 + lane) * 4;
+    };
     if ((k_split & 1) != 0) {
 #pragma unroll
-        for (int nt = 0; nt < kNt; ++nt) {
-            store_vec(partial + ((warp * kNt + nt) * 32 + lane) * 4,
-                      make_float4(acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3]));
+        for (int t = 0; t < kTpw; ++t) {
+#pragma unroll
+            for (int nt = 0; nt < kNt; ++nt) {
+                const float(&a)[4] = acc[t][nt];
+                store_vec(slot(warp, t, nt), make_float4(a[0], a[1], a[2], a[3]));
+            }
         }
     }
     __syncthreads();
 
     if ((k_split & 1) == 0) {
 #pragma unroll
-        for (int nt = 0; nt < kNt; ++nt) {
-            const float4 partner =
-                load_vec<float4>(partial + (((warp + 1) * kNt + nt) * 32 + lane) * 4);
-            acc[nt][0] += partner.x;
-            acc[nt][1] += partner.y;
-            acc[nt][2] += partner.z;
-            acc[nt][3] += partner.w;
-            if (k_split != 0) {
-                store_vec(partial + ((warp * kNt + nt) * 32 + lane) * 4,
-                          make_float4(acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3]));
+        for (int t = 0; t < kTpw; ++t) {
+#pragma unroll
+            for (int nt = 0; nt < kNt; ++nt) {
+                float(&a)[4]         = acc[t][nt];
+                const float4 partner = load_vec<float4>(slot(warp + 1, t, nt));
+                a[0] += partner.x;
+                a[1] += partner.y;
+                a[2] += partner.z;
+                a[3] += partner.w;
+                if (k_split != 0) { store_vec(slot(warp, t, nt), make_float4(a[0], a[1], a[2], a[3])); }
             }
         }
     }
@@ -256,33 +278,37 @@ __launch_bounds__(256, (KWarps < 8 ? 2 : (TileCols <= 16 ? 6 : 4))) __global__
 
     if (k_split == 0) {
 #pragma unroll
-        for (int nt = 0; nt < kNt; ++nt) {
-            float4 sum = make_float4(acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3]);
+        for (int t = 0; t < kTpw; ++t) {
+            const int row0 = (tile0 + first_tile + t) * RowPolicy::kOutputRowsPerTile;
 #pragma unroll
-            for (int split = 2; split < kKWarps; split += 2) {
-                const float4 value =
-                    load_vec<float4>(partial + (((warp + split) * kNt + nt) * 32 + lane) * 4);
-                sum.x += value.x;
-                sum.y += value.y;
-                sum.z += value.z;
-                sum.w += value.w;
-            }
-            const int col0 = nt * 8 + 2 * lid;
-            if constexpr (std::is_same_v<Epilogue, Q4SmallTMmaStoreEpilogue>) {
-                if (col0 < live_columns) {
-                    out[static_cast<std::int64_t>(col0) * Geometry::kOutputRows + row0 + gid] =
-                        __float2bfloat16_rn(sum.x);
-                    out[static_cast<std::int64_t>(col0) * Geometry::kOutputRows + row0 + gid + 8] =
-                        __float2bfloat16_rn(sum.z);
+            for (int nt = 0; nt < kNt; ++nt) {
+                float4 sum = make_float4(acc[t][nt][0], acc[t][nt][1], acc[t][nt][2], acc[t][nt][3]);
+#pragma unroll
+                for (int split = 2; split < kKWarps; split += 2) {
+                    const float4 value = load_vec<float4>(slot(warp + split, t, nt));
+                    sum.x += value.x;
+                    sum.y += value.y;
+                    sum.z += value.z;
+                    sum.w += value.w;
                 }
-                if (col0 + 1 < live_columns) {
-                    out[static_cast<std::int64_t>(col0 + 1) * Geometry::kOutputRows + row0 + gid] =
-                        __float2bfloat16_rn(sum.y);
-                    out[static_cast<std::int64_t>(col0 + 1) * Geometry::kOutputRows + row0 + gid +
-                        8] = __float2bfloat16_rn(sum.w);
+                const int col0 = nt * 8 + 2 * lid;
+                if constexpr (std::is_same_v<Epilogue, Q4SmallTMmaStoreEpilogue>) {
+                    constexpr int kRows = Geometry::kOutputRows;
+                    if (col0 < live_columns) {
+                        out[static_cast<std::int64_t>(col0) * kRows + row0 + gid] =
+                            __float2bfloat16_rn(sum.x);
+                        out[static_cast<std::int64_t>(col0) * kRows + row0 + gid + 8] =
+                            __float2bfloat16_rn(sum.z);
+                    }
+                    if (col0 + 1 < live_columns) {
+                        out[static_cast<std::int64_t>(col0 + 1) * kRows + row0 + gid] =
+                            __float2bfloat16_rn(sum.y);
+                        out[static_cast<std::int64_t>(col0 + 1) * kRows + row0 + gid + 8] =
+                            __float2bfloat16_rn(sum.w);
+                    }
+                } else {
+                    epilogue.template store<ActiveCols>(row0 + gid, col0, sum);
                 }
-            } else {
-                epilogue.template store<ActiveCols>(row0 + gid, col0, sum);
             }
         }
     }
@@ -292,14 +318,15 @@ __launch_bounds__(256, (KWarps < 8 ? 2 : (TileCols <= 16 ? 6 : 4))) __global__
 // kernel's limit the first time (per device) a layout needs more than the 48 KB default.
 template <class Geometry, int TileCols, int ActiveCols, class Epilogue = Q4SmallTMmaStoreEpilogue,
           class RowPolicy = Q4SmallTMmaIdentityRows, bool MaskedColumns = false, int KWarps = 8,
-          int Stages = 1>
+          int Stages = 1, int TilesPerWarp = 1>
 void q4_small_t_mma_launch(int blocks, cudaStream_t stream, const __nv_bfloat16* x,
                            const std::uint8_t* codes, const std::uint8_t* scales,
                            __nv_bfloat16* out, Epilogue epilogue = {}, RowPolicy row_policy = {},
                            int columns = ActiveCols) {
-    constexpr int kBytes = Q4SmallTStorage<KWarps, TileCols, Stages>::kBytes;
+    constexpr int kBytes  = Q4SmallTStorage<KWarps, TileCols, Stages, TilesPerWarp>::kBytes;
     constexpr auto kernel = q4_small_t_mma_kernel<Geometry, TileCols, ActiveCols, Epilogue,
-                                                  RowPolicy, MaskedColumns, KWarps, Stages>;
+                                                  RowPolicy, MaskedColumns, KWarps, Stages,
+                                                  TilesPerWarp>;
     if constexpr (kBytes > 48 * 1024) {
         configure_cuda_device_once([&] {
             return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
