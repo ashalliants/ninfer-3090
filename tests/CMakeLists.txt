@@ -397,6 +397,9 @@ ninfer_add_fused_linear_test(
   ninfer_linear_add_q5_a16_test
   ops/linear_add/test_q5_a16.cpp
   ops/linear_add/linear_add_test_common.cpp)
+ninfer_add_op_test(ninfer_linear_add_q5_small_t_test
+  SOURCES ops/linear_add/test_q5_small_t.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_fused_linear_test(
   ninfer_linear_add_bf16_a16_test
   ops/linear_add/test_bf16_a16.cpp

@@ -1,0 +1,131 @@
+// The Q5 small-T MMA residual kernel against the SIMT kernels it would replace (the T=1 GEMV and
+// split2 at T=2..8), on both registered K, with a nonzero residual. The MMA folds groups in a
+// different order from the SIMT kernels, so agreement is held to one bf16 rounding step of the
+// result rather than bit equality.
+
+#include "ops/linear_add/q5/q5_linear_add_kernels.h"
+#include "ops/op_tester.h"
+#include "ops/quantized_weight.h"
+
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <exception>
+#include <iostream>
+#include <vector>
+
+namespace {
+
+using ninfer::DType;
+using ninfer::QType;
+using ninfer::Tensor;
+
+constexpr std::int32_t kRows      = 5120;
+constexpr std::int32_t kMaxTokens = 8;
+
+std::uint16_t f32_to_bf16_rne(float f) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &f, sizeof(bits));
+    return static_cast<std::uint16_t>((bits + 0x7fffU + ((bits >> 16) & 1U)) >> 16);
+}
+
+float bf16_to_f32(std::uint16_t h) {
+    const std::uint32_t bits = static_cast<std::uint32_t>(h) << 16;
+    float f                  = 0.0F;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+std::vector<std::uint16_t> random_bf16(std::size_t n, std::uint64_t seed, float scale) {
+    std::vector<std::uint16_t> bits(n);
+    std::uint64_t state = seed;
+    for (auto& value : bits) {
+        state                 = ninfer::test::quantized_weight::detail::mix64(state);
+        const float numerator = static_cast<float>(static_cast<int>(state % 255U) - 127);
+        value                 = f32_to_bf16_rne(numerator * scale);
+    }
+    return bits;
+}
+
+int run_k(std::int32_t k) {
+    namespace qw = ninfer::test::quantized_weight;
+    qw::PatternedWeightOptions options;
+    options.row_split_codes = qw::RowSplitCodePattern::Hashed;
+    options.row_split_scale = qw::RowSplitScalePattern::Small;
+    qw::PackedWeight host_weight =
+        qw::make_patterned_weight(QType::Q5G64_F16S, kRows, k, 0x5157U + k, options);
+    ninfer::test::GuardedDeviceBuffer device_weight(host_weight.payload.size());
+    device_weight.copy_from_host(host_weight.payload.data(), host_weight.payload.size());
+    const ninfer::Weight weight = host_weight.device_weight(device_weight.data());
+
+    const auto activation = random_bf16(static_cast<std::size_t>(k) * kMaxTokens, 0x1234, 1.0e-3F);
+    const auto residual   = random_bf16(static_cast<std::size_t>(kRows) * kMaxTokens, 0x9876, 1.0e-2F);
+    ninfer::test::GuardedDeviceBuffer device_x(activation.size() * 2);
+    device_x.copy_from_host(activation.data(), activation.size() * 2);
+    ninfer::test::GuardedDeviceBuffer reference_out(residual.size() * 2);
+    ninfer::test::GuardedDeviceBuffer candidate_out(residual.size() * 2);
+
+    int failures = 0;
+    std::vector<std::uint16_t> reference(residual.size());
+    std::vector<std::uint16_t> candidate(residual.size());
+    for (std::int32_t tokens = 1; tokens <= kMaxTokens; ++tokens) {
+        const std::size_t elements = static_cast<std::size_t>(kRows) * tokens;
+        Tensor x(device_x.data(), DType::BF16, {k, tokens});
+        Tensor out_a(reference_out.data(), DType::BF16, {kRows, tokens});
+        Tensor out_b(candidate_out.data(), DType::BF16, {kRows, tokens});
+        reference_out.copy_from_host(residual.data(), elements * 2);
+        candidate_out.copy_from_host(residual.data(), elements * 2);
+        if (tokens == 1) {
+            ninfer::ops::detail::q5_linear_add_gemv_residual_launch(x, weight, out_a, nullptr);
+        } else {
+            ninfer::ops::detail::q5_linear_add_split2_exact_launch(x, weight, out_a, nullptr);
+        }
+        ninfer::ops::detail::q5_linear_add_small_t_mma_launch(x, weight, out_b, nullptr);
+        ninfer::test::cuda_check(cudaDeviceSynchronize(), "q5 linear_add kernels");
+        reference_out.copy_to_host(reference.data(), elements * 2);
+        candidate_out.copy_to_host(candidate.data(), elements * 2);
+
+        std::size_t mismatches = 0, changed = 0, first = elements;
+        for (std::size_t i = 0; i < elements; ++i) {
+            changed += reference[i] != residual[i];
+            const float a = bf16_to_f32(reference[i]);
+            const float b = bf16_to_f32(candidate[i]);
+            const bool ok =
+                std::isfinite(b) &&
+                std::fabs(a - b) <= std::max(std::fabs(a), std::fabs(b)) / 128.0F + 1.0e-6F;
+            if (!ok) {
+                if (first == elements) first = i;
+                ++mismatches;
+            }
+        }
+        if (mismatches != 0 || changed == 0) {
+            ++failures;
+            std::cerr << "K=" << k << " T=" << tokens << ": "
+                      << (changed == 0 ? "reference left the residual unchanged"
+                                       : std::to_string(mismatches) + " mismatches, first at " +
+                                             std::to_string(first) + " (" +
+                                             std::to_string(bf16_to_f32(reference[first])) +
+                                             " vs " + std::to_string(bf16_to_f32(candidate[first])) +
+                                             ")")
+                      << '\n';
+        }
+    }
+    return failures;
+}
+
+} // namespace
+
+int main() {
+    try {
+        const int failures = run_k(6144) + run_k(17408);
+        std::cout << (failures == 0 ? "OK" : "FAIL")
+                  << " Q5 LinearAdd small-T MMA matches the SIMT kernels at T=1..8, K=6144/17408\n";
+        return failures == 0 ? 0 : 1;
+    } catch (const std::exception& error) {
+        std::cerr << "Q5 LinearAdd small-T MMA test failed: " << error.what() << '\n';
+        return 1;
+    }
+}
