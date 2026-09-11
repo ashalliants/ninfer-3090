@@ -196,7 +196,7 @@ int main() {
              AddFn([](std::int32_t cols) {
                  return detail::q5_linear_add_resolve_plan({5120, 17408, 17408, cols}).schedule;
              })},
-            {"linear_add.q5.mma.r64.c32.cta_collective_residual"}));
+            {"linear_add.q5.gemv.residual", "linear_add.q5.mma.r64.c32.cta_collective_residual"}));
 
     using Q4Q5Fn = std::function<detail::Q4Q5AttnInputScheduleId(std::int32_t)>;
     reports.push_back(
@@ -253,13 +253,14 @@ int main() {
     //   w8_attn_input       2  DFlash2MmaR16C64K128 won at no width in the sm_86 sweep. SimtR8C4
     //                          is reachable in principle but no shape's table picks it.
     //   w8_linear_swiglu    1  DFlash2MmaR32C64K128 ties R64C64K128 at 33..44 and wins nowhere.
-    //   q5_linear_add       1  MmaResidualR64C32, likewise.
+    //   q5_linear_add       2  MmaResidualR64C32, likewise; and GemvResidual since 2026-09-11,
+    //                          when split2 took T=1 from it by 13-14% (q5_linear_add_plan.cpp).
     //   q4_q5_attn_input    3  grouped_r32_c64_s4, pair_r32_c64_s3, pair_r32_c64_s4 -- the family
     //                          whose dispatch held both switch bugs the catch-up merge shipped.
     //
     // All of them are kept on purpose: deleting an upstream schedule costs merge effort at every
     // future catch-up for no measured gain here. The point is that the set is written down.
-    constexpr std::size_t kExpectedUnrouted = 26;
+    constexpr std::size_t kExpectedUnrouted = 27;
     if (total != kExpectedUnrouted) {
         std::cerr << "route coverage changed: " << total << " unrouted schedules, expected "
                   << kExpectedUnrouted

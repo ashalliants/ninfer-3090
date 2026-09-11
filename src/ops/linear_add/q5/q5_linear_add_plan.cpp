@@ -90,9 +90,28 @@ constexpr std::array<SupportSpec, 2> kSupports{{
 // 128 is not an arbitrary point: --prefill-chunk is required to be a multiple of 128, so every
 // full prefill chunk lands exactly on it, and C128 also wins outright at 192/256/384. C64 keeps
 // the 104..127 band, which only a prompt's ragged tail chunk reaches.
-constexpr std::array<RouteSpec, 8> kK6144Routes{{
-    {{1, 1}, Q5LinearAddScheduleId::GemvResidual},
-    {{2, 10}, Q5LinearAddScheduleId::Split2ExactResidual},
+// The narrow band, re-measured 2026-09-11 on an RTX 3090 under Linux (892.8 GB/s achievable read)
+// with q5_linear_add_small_t.cu registered: SmallTMmaResidual is the Q5 counterpart of the Q4
+// small-T MMA (q5_small_t_mma.cuh) and is flat across T=1..8 where split2 grows ~5-12 us per row.
+// Cold, median of 31 (us), p95 of the winner below the loser's min except where noted:
+//
+//   T                  1      2      3      4      5      6      8      9     10
+//   k=6144  split2   33.8   33.8   35.8   38.9   43.0   48.1   63.5   72.7   77.8
+//           small_t  34.8   34.8   34.8   34.8   34.8   35.8   35.8     --     --
+//           gemv     38.9     --
+//   k=17408 split2   75.8   78.8   86.0   99.3  116.7  130.0  176.1  196.6  204.8
+//           small_t  81.9   82.9   83.0   82.9   85.0   85.0   88.1     --     --
+//           gemv     88.1     --
+//
+// So split2 takes T=1 from the GEMV as well (13-14%: the GEMV's one warp per row in 16-row blocks
+// is 320 blocks for 246 slots, 1.3 waves, where split2's 64-thread blocks are 3.9), split2 keeps
+// T=2 (k=6144's T=2 is inside the spread; k=17408's is not), and small_t takes 3..8. At T=4, an
+// MTP3 verify, that is 22% faster at k=6144 and 17% at k=17408. small_t stops at eight columns;
+// split2 keeps 9..10 ahead of c16.
+constexpr std::array<RouteSpec, 9> kK6144Routes{{
+    {{1, 2}, Q5LinearAddScheduleId::Split2ExactResidual},
+    {{3, 8}, Q5LinearAddScheduleId::SmallTMmaResidual},
+    {{9, 10}, Q5LinearAddScheduleId::Split2ExactResidual},
     {{11, 16}, Q5LinearAddScheduleId::MmaResidualR64C16},
     {{17, 24}, Q5LinearAddScheduleId::MmaResidualR64C24},
     {{25, 32}, Q5LinearAddScheduleId::MmaResidualR64C32S4},
@@ -105,9 +124,10 @@ constexpr std::array<RouteSpec, 8> kK6144Routes{{
 // C16-shaped extent (T=16: c16 270.3 vs c32 300.0). Above that the story matches k=6144, with the
 // S4/S3 crossover later: T=48 s4 437.2 vs c24 474.1; T=96 s3 629.8 vs s4 683.0; T=128 c128 665.6
 // vs s3 817.2; T=192 c128 798.7 vs s3 1359.9.
-constexpr std::array<RouteSpec, 8> kK17408Routes{{
-    {{1, 1}, Q5LinearAddScheduleId::GemvResidual},
-    {{2, 10}, Q5LinearAddScheduleId::Split2ExactResidual},
+constexpr std::array<RouteSpec, 9> kK17408Routes{{
+    {{1, 2}, Q5LinearAddScheduleId::Split2ExactResidual},
+    {{3, 8}, Q5LinearAddScheduleId::SmallTMmaResidual},
+    {{9, 10}, Q5LinearAddScheduleId::Split2ExactResidual},
     {{11, 16}, Q5LinearAddScheduleId::MmaResidualR64C16},
     {{17, 24}, Q5LinearAddScheduleId::MmaResidualR64C24},
     {{25, 64}, Q5LinearAddScheduleId::MmaResidualR64C32S4},
@@ -162,6 +182,8 @@ const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept
         return "linear_add.q5.mma.r64.c32.s4.cta_collective_residual";
     case Q5LinearAddScheduleId::MmaResidualR64C128:
         return "linear_add.q5.mma.r64.c128.cta_collective_residual";
+    case Q5LinearAddScheduleId::SmallTMmaResidual:
+        return "linear_add.q5.mma.small_t.residual";
     }
     return "linear_add.q5.unknown";
 }
@@ -232,6 +254,9 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
         return;
     case Q5LinearAddScheduleId::MmaResidualR64C128:
         q5_linear_add_mma_r64_c128_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::SmallTMmaResidual:
+        q5_linear_add_small_t_mma_launch(x, w, residual_out, stream);
         return;
     }
     throw std::logic_error("q5 linear_add: unknown schedule");
