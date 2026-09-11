@@ -347,9 +347,22 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
     detail::w8_gdn_input_dispatch(x, weight, qkv, z, stream);
 }
 
-detail::Q4Q5GdnInputConvPlan resolve_q4_q5_conv_plan(std::int32_t tokens, std::int32_t batch_size) {
-    return detail::q4_q5_gdn_input_conv_resolve_plan({5120, 4096, 12288, 10240, 6144, 5120, tokens},
-                                                     batch_size);
+// The Q4/Q5 conv forms always materialize the projection through gdn_input_proj() and run the conv
+// separately. A fused projection-epilogue conv (SIMT GEMV/GEMM, T=1..3 and 5..6) served batch 1
+// until 2026-09-11 and lost at every width it took: record form, RTX 3090, graph replay, cold L2,
+// median of 50 (gdn_input_proj_conv_snapshot_bench), us:
+//
+//   T               1      2      3      5      6
+//   fused        95.2  104.4  123.9  162.8  191.5
+//   materialized 80.9   80.9   81.9   85.0   86.0     (snapshot form at T=1)
+//
+// At T=5 that was 4.8 ms of a four-draft-token MTP round.
+void require_q4_q5_conv_admitted(std::int32_t tokens, std::int32_t batch_size) {
+    if (!detail::q4_q5_gdn_input_admits({5120, 4096, 12288, 10240, 6144, 5120, tokens}) ||
+        batch_size <= 0 || batch_size > 8) {
+        throw std::invalid_argument(
+            "Q4/Q5 GDN input conv: exact problem or column count is not admitted");
+    }
 }
 
 detail::W8GdnInputConvPlan resolve_w8_conv_plan(std::int32_t tokens, std::int32_t batch_size) {
@@ -794,8 +807,8 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     const std::int32_t channels = query_rows + key_rows + value_rows;
     if (batch_size > 1) {
         if (q4_q5) {
-            (void)resolve_q4_q5_conv_plan(min_width, batch_size);
-            (void)resolve_q4_q5_conv_plan(max_width, batch_size);
+            require_q4_q5_conv_admitted(min_width, batch_size);
+            require_q4_q5_conv_admitted(max_width, batch_size);
         } else {
             (void)resolve_w8_conv_plan(min_width, batch_size);
             (void)resolve_w8_conv_plan(max_width, batch_size);
@@ -805,12 +818,9 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
 
     std::int32_t largest_materialized_width = 0;
     if (q4_q5) {
-        // Only T=1 keeps the fused epilogue, so every wider width materializes.
-        (void)resolve_q4_q5_conv_plan(min_width, 1);
-        if (resolve_q4_q5_conv_plan(max_width, 1).schedule ==
-            detail::Q4Q5GdnInputConvScheduleId::Materialized) {
-            largest_materialized_width = max_width;
-        }
+        require_q4_q5_conv_admitted(min_width, 1);
+        require_q4_q5_conv_admitted(max_width, 1);
+        largest_materialized_width = max_width;
     } else {
         (void)resolve_w8_conv_plan(min_width, 1);
         (void)resolve_w8_conv_plan(max_width, 1);
@@ -863,8 +873,8 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     }
     require_record_capacity_domain(batch_size, min_width, max_width);
     if (q4_q5) {
-        (void)resolve_q4_q5_conv_plan(min_width, batch_size);
-        (void)resolve_q4_q5_conv_plan(max_width, batch_size);
+        require_q4_q5_conv_admitted(min_width, batch_size);
+        require_q4_q5_conv_admitted(max_width, batch_size);
     } else {
         (void)resolve_w8_conv_plan(min_width, batch_size);
         (void)resolve_w8_conv_plan(max_width, batch_size);
@@ -944,15 +954,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
         return;
     }
 
-    const detail::Q4Q5GdnInputConvPlan plan =
-        resolve_q4_q5_conv_plan(geometry.width, geometry.batch);
-    if (plan.schedule == detail::Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused) {
-        detail::q4_q5_gdn_input_conv_snapshot_launch(
-            x, qk_weight, value_z_weight, conv_weight, conv_states, valid_columns,
-            initial_state_slots, snapshot_base_slots, query, key, value, z, stream);
-        return;
-    }
-
+    require_q4_q5_conv_admitted(geometry.width, geometry.batch);
     auto scope                 = ws.scope();
     ProjectedWorkspace scratch = allocate_projected_workspace(ws, kChannels, geometry.width);
     gdn_input_proj(x, qk_weight, value_z_weight, scratch.projected, z, stream);
@@ -992,14 +994,7 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
     require_record_nonoverlap(x, conv_weight, conv_states, valid_columns, initial_state_slots,
                               conv_record, query, key, value, z, workspace);
 
-    const detail::Q4Q5GdnInputConvPlan plan =
-        resolve_q4_q5_conv_plan(geometry.width, geometry.batch);
-    if (plan.schedule == detail::Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused) {
-        detail::q4_q5_gdn_input_conv_record_launch(x, qk_weight, value_z_weight, conv_weight,
-                                                   conv_states, valid_columns, initial_state_slots,
-                                                   conv_record, query, key, value, z, stream);
-        return;
-    }
+    require_q4_q5_conv_admitted(geometry.width, geometry.batch);
     compose_record(x, conv_weight, conv_states, valid_columns, initial_state_slots, conv_record,
                    query, key, value, z, geometry, workspace, stream,
                    [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {

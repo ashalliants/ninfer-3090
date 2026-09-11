@@ -149,16 +149,6 @@ const char* q4_q5_gdn_input_schedule_name(Q4Q5GdnInputScheduleId schedule) noexc
     return "gdn_input_proj.q4_q5.unknown";
 }
 
-const char* q4_q5_gdn_input_conv_schedule_name(Q4Q5GdnInputConvScheduleId schedule) noexcept {
-    switch (schedule) {
-    case Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused:
-        return "gdn_input_proj_conv.q4_q5.projection_epilogue_fused";
-    case Q4Q5GdnInputConvScheduleId::Materialized:
-        return "gdn_input_proj_conv.q4_q5.materialized";
-    }
-    return "gdn_input_proj_conv.q4_q5.unknown";
-}
-
 bool q4_q5_gdn_input_admits(const Q4Q5GdnInputProblem& problem) noexcept {
     return supported_shape(problem) && problem.cols >= 1;
 }
@@ -174,21 +164,6 @@ Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem
         return {route.schedule};
     }
     throw std::logic_error("Q4/Q5 GDN input: admitted problem has no covering route");
-}
-
-Q4Q5GdnInputConvPlan q4_q5_gdn_input_conv_resolve_plan(const Q4Q5GdnInputProblem& problem,
-                                                       std::int32_t batch_size) {
-    if (!q4_q5_gdn_input_admits(problem) || batch_size <= 0 || batch_size > 8) {
-        throw std::invalid_argument(
-            "Q4/Q5 GDN input conv: exact problem or column count is not admitted");
-    }
-    if (batch_size > 1) { return {Q4Q5GdnInputConvScheduleId::Materialized}; }
-    // Record form, RTX 3090, graph replay, cold L2, median of 50 (gdn_input_proj_conv_snapshot_bench):
-    // the fused SIMT projection costs 104.4 / 123.9 / 162.8 / 191.5 us at T=2/3/5/6, while the
-    // small-T MMA projection plus the separate conv costs 81.9 / 86.0 / 87.0 us at T=4/7/8. Only
-    // the T=1 GEMV keeps the fused epilogue.
-    if (problem.cols == 1) { return {Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused}; }
-    return {Q4Q5GdnInputConvScheduleId::Materialized};
 }
 
 void q4_q5_gdn_input_execute_schedule(Q4Q5GdnInputScheduleId schedule, const Tensor& x,
