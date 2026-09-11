@@ -13,7 +13,6 @@
 // in a permuted k order (see the kernel); each warp folds its group's fp16 scale into an fp32
 // accumulator, and the eight K partials are reduced through shared memory at the end.
 
-#include "core/device.h"
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/small_t_layout.cuh"
@@ -47,8 +46,8 @@ struct Q5SmallTSchedule : SmallTLayout<KWarps, TilesPerWarp> {
 };
 
 // Shared memory of q5_small_t_mma_kernel: a ring of Stages slabs, reused for the final K
-// reduction. Dynamic, so a ring deeper than the 48 KB static limit allows is available; launch
-// through q5_small_t_mma_launch, which sizes and configures it.
+// reduction. Rings deeper than two lose more occupancy than they hide latency (measured to four
+// stages, past the 48 KB static limit), so it stays static.
 template <int KWarps, int XCols, int Stages, int TilesPerWarp = 1>
 struct Q5SmallTStorage {
     using Schedule = Q5SmallTSchedule<KWarps, TilesPerWarp>;
@@ -133,8 +132,7 @@ __launch_bounds__(256, (KWarps < 8 || XCols >= 32 ? 2 : (XCols >= 16 || Stages =
 
     using Storage = Q5SmallTStorage<KWarps, XCols, Stages, TilesPerWarp>;
     using Stage   = typename Storage::Stage;
-    extern __shared__ __align__(16) unsigned char q5_small_t_shared[];
-    auto& shared = *reinterpret_cast<typename Storage::Shared*>(q5_small_t_shared);
+    __shared__ __align__(16) typename Storage::Shared shared;
 
     const int tid      = static_cast<int>(threadIdx.x);
     const int warp     = tid >> 5;
@@ -318,8 +316,7 @@ __launch_bounds__(256, (KWarps < 8 || XCols >= 32 ? 2 : (XCols >= 16 || Stages =
     }
 }
 
-// Launches q5_small_t_mma_kernel with its dynamic shared memory, raising the kernel's limit the
-// first time (per device) a layout needs more than the 48 KB default.
+// Launches q5_small_t_mma_kernel over Rows / SmallTLayout::kRowsPerCta CTAs.
 template <int Rows, int K, int XCols, int Stages, class Epilogue, int KWarps = 8,
           int TilesPerWarp = 1>
 void q5_small_t_mma_launch(cudaStream_t stream, const __nv_bfloat16* x, const std::uint8_t* codes,
@@ -329,13 +326,8 @@ void q5_small_t_mma_launch(cudaStream_t stream, const __nv_bfloat16* x, const st
     constexpr int kBytes  = Q5SmallTStorage<KWarps, XCols, Stages, TilesPerWarp>::kBytes;
     constexpr auto kernel =
         q5_small_t_mma_kernel<Rows, K, XCols, Stages, Epilogue, KWarps, TilesPerWarp>;
-    if constexpr (kBytes > 48 * 1024) {
-        configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        kBytes);
-        });
-    }
-    kernel<<<Rows / Schedule::kRowsPerCta, Schedule::kThreads, kBytes, stream>>>(
+    static_assert(kBytes <= 48 * 1024, "small-T MMA stages must fit static shared memory");
+    kernel<<<Rows / Schedule::kRowsPerCta, Schedule::kThreads, 0, stream>>>(
         x, codes, high_bits, scales, epilogue, columns);
 }
 

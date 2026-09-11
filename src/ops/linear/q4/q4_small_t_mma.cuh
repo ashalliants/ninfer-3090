@@ -1,6 +1,5 @@
 #pragma once
 
-#include "core/device.h"
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/small_t_layout.cuh"
@@ -47,7 +46,7 @@ struct Q4DraftSmallTSchedule {
 };
 
 // Shared memory of q4_small_t_mma_kernel: a ring of Stages K groups, reused for the final K
-// reduction. Padding: a half-warp of 64-bit code loads spans four rows, so code rows are staggered
+// reduction; static, as rings deeper than two lose more occupancy than they hide. Padding: a half-warp of 64-bit code loads spans four rows, so code rows are staggered
 // by 32 B (eight banks; a row is 32 * KWarps bytes, so the stride is 32 or 96 mod 128); unpadded,
 // rows 256 B apart all share a bank. Activation columns are 64 bf16 (128 B) per K warp and 16 B of
 // padding staggers neighbours by four banks for the quarter-warp 128-bit loads.
@@ -110,13 +109,9 @@ __launch_bounds__(256, (KWarps < 8 ? 2 : (TileCols <= 16 ? 6 : 4))) __global__
     // and an ldmatrix per B fragment. On sm_86 that instruction stream, not DRAM, bounded this
     // kernel: once the shared-memory conflicts were gone it still spent ~27 cycles per MMA against
     // the ~21 its weight bytes allow at full bandwidth.
-    //
-    // Shared memory: Q4SmallTStorage, dynamic, so a ring deeper than the 48 KB static limit allows
-    // is available; launch through q4_small_t_mma_launch, which sizes and configures it.
     using Storage = Q4SmallTStorage<KWarps, TileCols, Stages, TilesPerWarp>;
     using Stage   = typename Storage::Stage;
-    extern __shared__ __align__(16) unsigned char q4_small_t_shared[];
-    auto& shared = *reinterpret_cast<typename Storage::Shared*>(q4_small_t_shared);
+    __shared__ __align__(16) typename Storage::Shared shared;
 
     const int tid          = static_cast<int>(threadIdx.x);
     const int warp         = tid >> 5;
@@ -144,8 +139,11 @@ __launch_bounds__(256, (KWarps < 8 ? 2 : (TileCols <= 16 ? 6 : 4))) __global__
     const auto stage_weight = [&](int group_k0, Stage& stage) {
         constexpr int kChunksPerRow = kGroupK / 32;
         static_assert(kRowsPerCta * kChunksPerRow == Layout::kThreads * kTpw);
+        // A constant trip count keeps this straight-line: a tid-strided loop here costs the
+        // narrow tiles, which run at 42 registers, five spills and ~15% at T=4.
 #pragma unroll
-        for (int item = tid; item < kRowsPerCta * kChunksPerRow; item += Layout::kThreads) {
+        for (int i = 0; i < kTpw; ++i) {
+            const int item       = tid + i * Layout::kThreads;
             const int row        = item / kChunksPerRow;
             const int chunk      = item % kChunksPerRow;
             const int weight_row = row_policy.weight_row(
@@ -318,8 +316,7 @@ __launch_bounds__(256, (KWarps < 8 ? 2 : (TileCols <= 16 ? 6 : 4))) __global__
     }
 }
 
-// Launches q4_small_t_mma_kernel over `blocks` CTAs with its dynamic shared memory, raising the
-// kernel's limit the first time (per device) a layout needs more than the 48 KB default.
+// Launches q4_small_t_mma_kernel over `blocks` CTAs.
 template <class Geometry, int TileCols, int ActiveCols, class Epilogue = Q4SmallTMmaStoreEpilogue,
           class RowPolicy = Q4SmallTMmaIdentityRows, bool MaskedColumns = false, int KWarps = 8,
           int Stages = 1, int TilesPerWarp = 1>
@@ -331,15 +328,9 @@ void q4_small_t_mma_launch(int blocks, cudaStream_t stream, const __nv_bfloat16*
     constexpr auto kernel = q4_small_t_mma_kernel<Geometry, TileCols, ActiveCols, Epilogue,
                                                   RowPolicy, MaskedColumns, KWarps, Stages,
                                                   TilesPerWarp>;
-    if constexpr (kBytes > 48 * 1024) {
-        configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        kBytes);
-        });
-    }
-    kernel<<<blocks, SmallTLayout<KWarps>::kThreads, kBytes, stream>>>(x, codes, scales, out,
-                                                                        epilogue, row_policy,
-                                                                        columns);
+    static_assert(kBytes <= 48 * 1024, "small-T MMA stages must fit static shared memory");
+    kernel<<<blocks, SmallTLayout<KWarps>::kThreads, 0, stream>>>(x, codes, scales, out, epilogue,
+                                                                   row_policy, columns);
 }
 
 } // namespace ninfer::ops::detail
