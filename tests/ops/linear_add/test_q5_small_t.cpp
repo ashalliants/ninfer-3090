@@ -73,6 +73,7 @@ int run_k(std::int32_t k) {
     ninfer::test::GuardedDeviceBuffer candidate_out(residual.size() * 2);
 
     int failures = 0;
+    std::vector<float> dequant;
     std::vector<std::uint16_t> reference(residual.size());
     std::vector<std::uint16_t> candidate(residual.size());
     for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 15, 16, 17, 20, 24, 31, 32}) {
@@ -135,13 +136,18 @@ int run_k(std::int32_t k) {
             if (mismatches != 0 || changed == 0) {
                 ++failures;
                 if (mismatches != 0) {
-                    // fp64 oracle for the first mismatch, from the fixture's dequantized weights.
+                    // fp64 oracle for the first mismatch. The patterned fixture carries no
+                    // dequantized matrix, so decode the packed payload once, on first use.
+                    if (dequant.empty()) {
+                        dequant = qw::decode_row_split_lowbit(host_weight.payload, kRows, k, k,
+                                                              QType::Q5G64_F16S);
+                    }
                     const std::size_t row = first % kRows;
                     const std::size_t col = first / kRows;
                     double oracle         = bf16_to_f32(residual[first]);
                     for (std::int32_t kk = 0; kk < k; ++kk) {
                         oracle += static_cast<double>(
-                                      host_weight.dequant[row * static_cast<std::size_t>(k) + kk]) *
+                                      dequant[row * static_cast<std::size_t>(k) + kk]) *
                                   bf16_to_f32(activation[col * static_cast<std::size_t>(k) + kk]);
                     }
                     std::cerr << "  fp64 oracle at row " << row << " col " << col << ": " << oracle
