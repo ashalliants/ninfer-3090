@@ -13,6 +13,7 @@
 // in a permuted k order (see the kernel); each warp folds its group's fp16 scale into an fp32
 // accumulator, and the eight K partials are reduced through shared memory at the end.
 
+#include "core/device.h"
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/small_t_layout.cuh"
@@ -38,6 +39,25 @@ struct Q5SmallTSchedule : SmallTLayout<KWarps> {
     // Activation columns are 64 bf16 (128 B) per K warp; 16 B of padding staggers adjacent
     // columns by four banks for the quarter-warp 128-bit B loads.
     static constexpr int kXColPad = 8;
+};
+
+// Shared memory of q5_small_t_mma_kernel: a ring of Stages slabs, reused for the final K
+// reduction. Dynamic, so a ring deeper than the 48 KB static limit allows is available; launch
+// through q5_small_t_mma_launch, which sizes and configures it.
+template <int KWarps, int XCols, int Stages>
+struct Q5SmallTStorage {
+    using Schedule = Q5SmallTSchedule<KWarps>;
+    struct Stage {
+        std::uint8_t codes[Schedule::kRowsPerCta][Schedule::kCodeRowBytes + Schedule::kCodeRowPad];
+        std::uint8_t high[Schedule::kRowsPerCta][Schedule::kHighRowBytes + Schedule::kHighRowPad];
+        __nv_bfloat16 activations[KWarps][XCols][64 + Schedule::kXColPad];
+        std::uint16_t scales[Schedule::kRowsPerCta][KWarps];
+    };
+    union Shared {
+        Stage stages[Stages];
+        float partial[Schedule::kWarps * (XCols < 8 ? 1 : XCols / 8) * 32 * 4];
+    };
+    static constexpr int kBytes = sizeof(Shared);
 };
 
 // Eight Q5 codes -> four bf16 pairs, exactly, without int-to-float conversion. `word` holds four
@@ -98,25 +118,16 @@ __launch_bounds__(256, (KWarps < 8 || XCols >= 32 ? 2 : (XCols >= 16 || Stages =
     constexpr int kGroupK       = Schedule::kGroupK;
     constexpr int kSlabs        = K / kGroupK;
     constexpr int kGroupsPerRow = K / 64;
-    constexpr int kXColStride   = kTileK + Schedule::kXColPad;
     constexpr int kNt           = XCols < 8 ? 1 : XCols / 8;
     static_assert(XCols == 4 || XCols == 8 || XCols == 16 || XCols == 32);
-    static_assert(Stages == 1 || Stages == 2 || Stages == 3);
+    static_assert(Stages >= 1 && Stages <= 4);
     static_assert(K % kGroupK == 0, "K must be a whole number of slabs");
     static_assert(Rows % kRowsPerCta == 0);
 
-    struct Stage {
-        std::uint8_t codes[kRowsPerCta][Schedule::kCodeRowBytes + Schedule::kCodeRowPad];
-        std::uint8_t high[kRowsPerCta][Schedule::kHighRowBytes + Schedule::kHighRowPad];
-        __nv_bfloat16 activations[kKWarps][XCols][kXColStride];
-        std::uint16_t scales[kRowsPerCta][kKWarps];
-    };
-    union SharedStorage {
-        Stage stages[Stages];
-        float partial[Schedule::kWarps * kNt * 32 * 4];
-    };
-
-    __shared__ __align__(16) SharedStorage shared;
+    using Storage = Q5SmallTStorage<KWarps, XCols, Stages>;
+    using Stage   = typename Storage::Stage;
+    extern __shared__ __align__(16) unsigned char q5_small_t_shared[];
+    auto& shared = *reinterpret_cast<typename Storage::Shared*>(q5_small_t_shared);
 
     const int tid      = static_cast<int>(threadIdx.x);
     const int warp     = tid >> 5;
@@ -275,6 +286,25 @@ __launch_bounds__(256, (KWarps < 8 || XCols >= 32 ? 2 : (XCols >= 16 || Stages =
             epilogue.store(cta_row0 + tile_row, nt * 8 + 2 * lid, sum);
         }
     }
+}
+
+// Launches q5_small_t_mma_kernel with its dynamic shared memory, raising the kernel's limit the
+// first time (per device) a layout needs more than the 48 KB default.
+template <int Rows, int K, int XCols, int Stages, class Epilogue, int KWarps = 8>
+void q5_small_t_mma_launch(cudaStream_t stream, const __nv_bfloat16* x, const std::uint8_t* codes,
+                           const std::uint8_t* high_bits, const std::uint8_t* scales,
+                           Epilogue epilogue, int columns) {
+    using Schedule        = Q5SmallTSchedule<KWarps>;
+    constexpr int kBytes  = Q5SmallTStorage<KWarps, XCols, Stages>::kBytes;
+    constexpr auto kernel = q5_small_t_mma_kernel<Rows, K, XCols, Stages, Epilogue, KWarps>;
+    if constexpr (kBytes > 48 * 1024) {
+        configure_cuda_device_once([&] {
+            return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        kBytes);
+        });
+    }
+    kernel<<<Rows / Schedule::kRowsPerCta, Schedule::kThreads, kBytes, stream>>>(
+        x, codes, high_bits, scales, epilogue, columns);
 }
 
 } // namespace ninfer::ops::detail

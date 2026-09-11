@@ -38,14 +38,12 @@ struct Q5SmallTResidualEpilogue {
 
 template <int K, int XCols, int Stages, int KWarps = 8>
 void launch(const Tensor& x, const Weight& w, Tensor& residual_out, cudaStream_t stream) {
-    using Schedule = Q5SmallTSchedule<KWarps>;
     const Q5SmallTResidualEpilogue epilogue{static_cast<__nv_bfloat16*>(residual_out.data),
                                             x.ne[1]};
-    q5_small_t_mma_kernel<kRows, K, XCols, Stages, Q5SmallTResidualEpilogue, KWarps>
-        <<<kRows / Schedule::kRowsPerCta, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-            static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
-            epilogue, x.ne[1]);
+    q5_small_t_mma_launch<kRows, K, XCols, Stages, Q5SmallTResidualEpilogue, KWarps>(
+        stream, static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.qhigh),
+        static_cast<const std::uint8_t*>(w.scales), epilogue, x.ne[1]);
 }
 
 // A 5120-row matrix is 320 sixteen-row tiles, under four per SM. Up to four columns stage a

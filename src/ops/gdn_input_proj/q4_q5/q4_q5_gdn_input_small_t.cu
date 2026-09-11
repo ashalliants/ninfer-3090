@@ -39,12 +39,10 @@ void launch_value_z(const Tensor& x, const Weight& w, Tensor& value, Tensor& z,
                                     leading_dimension(z),
                                     kValueRows,
                                     x.ne[1]};
-    using Schedule = Q5SmallTSchedule<KWarps>;
-    q5_small_t_mma_kernel<kValueZRows, kHidden, XCols, Stages, SmallTSplitStore, KWarps>
-        <<<kValueZRows / Schedule::kRowsPerCta, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-            static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
-            epilogue, x.ne[1]);
+    q5_small_t_mma_launch<kValueZRows, kHidden, XCols, Stages, SmallTSplitStore, KWarps>(
+        stream, static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.qhigh),
+        static_cast<const std::uint8_t*>(w.scales), epilogue, x.ne[1]);
 }
 
 template <int TileCols, int KWarps = 8, int Stages = 1>
@@ -55,14 +53,12 @@ void launch_qk(const Tensor& x, const Weight& w, Tensor& qk, cudaStream_t stream
                                     leading_dimension(qk),
                                     kQkRows,
                                     x.ne[1]};
-    using Layout = SmallTLayout<KWarps>;
-    q4_small_t_mma_kernel<GdnQkGeometry, TileCols, TileCols, SmallTSplitStore,
-                          Q4SmallTMmaIdentityRows, true, KWarps, Stages>
-        <<<kQkRows / Layout::kRowsPerCta, Layout::kThreads, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
-                     static_cast<const std::uint8_t*>(w.qdata),
-                     static_cast<const std::uint8_t*>(w.scales),
-                     static_cast<__nv_bfloat16*>(qk.data), epilogue, Q4SmallTMmaIdentityRows{},
-                     x.ne[1]);
+    q4_small_t_mma_launch<GdnQkGeometry, TileCols, TileCols, SmallTSplitStore,
+                          Q4SmallTMmaIdentityRows, true, KWarps, Stages>(
+        kQkRows / SmallTLayout<KWarps>::kRowsPerCta, stream,
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+        static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(qk.data),
+        epilogue, Q4SmallTMmaIdentityRows{}, x.ne[1]);
 }
 
 } // namespace

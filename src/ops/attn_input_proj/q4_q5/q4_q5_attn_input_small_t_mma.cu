@@ -41,25 +41,21 @@ SmallTSplitStore split_store(Tensor& head, Tensor& tail, int columns) {
 template <int XCols, int Stages, int KWarps = 8>
 void launch_gate_value(const Tensor& x, const Weight& w, Tensor& gate, Tensor& v,
                        cudaStream_t stream) {
-    using Schedule = Q5SmallTSchedule<KWarps>;
-    q5_small_t_mma_kernel<kParentRows, kHidden, XCols, Stages, SmallTSplitStore, KWarps>
-        <<<kParentRows / Schedule::kRowsPerCta, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-            static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
-            split_store(gate, v, x.ne[1]), x.ne[1]);
+    q5_small_t_mma_launch<kParentRows, kHidden, XCols, Stages, SmallTSplitStore, KWarps>(
+        stream, static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.qhigh),
+        static_cast<const std::uint8_t*>(w.scales), split_store(gate, v, x.ne[1]), x.ne[1]);
 }
 
 template <int TileCols, int KWarps = 8, int Stages = 1>
 void launch_query_key(const Tensor& x, const Weight& w, Tensor& q, Tensor& k,
                       cudaStream_t stream) {
-    using Layout = SmallTLayout<KWarps>;
-    q4_small_t_mma_kernel<AttnQueryKeyGeometry, TileCols, TileCols, SmallTSplitStore,
-                          Q4SmallTMmaIdentityRows, true, KWarps, Stages>
-        <<<kParentRows / Layout::kRowsPerCta, Layout::kThreads, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
-                     static_cast<const std::uint8_t*>(w.qdata),
-                     static_cast<const std::uint8_t*>(w.scales),
-                     static_cast<__nv_bfloat16*>(q.data), split_store(q, k, x.ne[1]),
-                     Q4SmallTMmaIdentityRows{}, x.ne[1]);
+    q4_small_t_mma_launch<AttnQueryKeyGeometry, TileCols, TileCols, SmallTSplitStore,
+                          Q4SmallTMmaIdentityRows, true, KWarps, Stages>(
+        kParentRows / SmallTLayout<KWarps>::kRowsPerCta, stream,
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+        static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(q.data),
+        split_store(q, k, x.ne[1]), Q4SmallTMmaIdentityRows{}, x.ne[1]);
 }
 
 } // namespace
