@@ -48,21 +48,11 @@ union Q4SmallTBf16PairBits {
     unsigned bits;
 };
 
-// Decodes the two signed nibbles of one code byte into a bf16 pair without int-to-float
-// conversion, which sm_86 issues at 16 per clock per SM. The nibble n ^ 8 is placed in the
-// mantissa of bf16 128.0 (0x4300: one unit per mantissa step up to 255), giving 128 + (n ^ 8), and
-// 136 is subtracted, leaving the integer (n ^ 8) - 8 exactly -- the same bf16 bits
-// __floats2bfloat162_rn(float(q0), float(q1)) produces. Neutral in a cold microbenchmark, where
-// clocks sit near 1.8 GHz; under a sustained decode the card runs at its power limit (~1.56 GHz at
-// 350 W), and the conversion's issue slots are paid in clock.
 __device__ __forceinline__ unsigned q4_small_t_bf16_pair(std::uint8_t packed) {
-    const unsigned flipped = static_cast<unsigned>(packed) ^ 0x88u;
-    Q4SmallTBf16PairBits biased;
-    biased.bits = 0x43004300u | (flipped & 0x0fu) | ((flipped & 0xf0u) << 12);
-    Q4SmallTBf16PairBits bias;
-    bias.bits = 0x43084308u; // bf16 136.0 in both halves
+    const int q0 = (static_cast<int>(packed & 0x0fu) ^ 0x08) - 0x08;
+    const int q1 = (static_cast<int>(packed >> 4) ^ 0x08) - 0x08;
     Q4SmallTBf16PairBits result;
-    result.pair = __hsub2(biased.pair, bias.pair);
+    result.pair = __floats2bfloat162_rn(static_cast<float>(q0), static_cast<float>(q1));
     return result.bits;
 }
 
