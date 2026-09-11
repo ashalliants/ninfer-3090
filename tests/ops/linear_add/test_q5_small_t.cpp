@@ -1,8 +1,14 @@
-// The Q5 small-T MMA residual kernel against the kernels it would replace -- the T=1 GEMV, split2
-// at T=2..16 and the routed c32/s4 MMA tile above that -- at T=1..32 on both registered K, with a nonzero
-// residual. The MMA folds groups in a different order from those kernels, so agreement is held to
-// one bf16 rounding step of the result rather than bit equality. Each case runs three times and
-// must give identical bytes every time.
+// The Q5 small-T MMA residual kernel against an fp64 oracle, at T=1..32 on both registered K, with a
+// nonzero residual and dense two-signed activations. The oracle is computed once for 32 columns
+// from the decoded weights; columns are independent, so each T checks a prefix of it.
+//
+// Tolerance: the kernel reads exact bf16 codes and activations, accumulates in fp32 and rounds the
+// residual sum to bf16 once, so it must land within one bf16 rounding step (2^-8 relative, plus a
+// small absolute floor for outputs near zero after cancellation). Each case also runs three times
+// and must give identical bytes every time.
+//
+// The routed c32/s4 tile is scored against the same oracle and reported but not failed on: on this
+// fixture it misses by up to ~7% at k=17408 from T=20, which is under investigation separately.
 
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 #include "ops/op_tester.h"
@@ -52,6 +58,25 @@ std::vector<std::uint16_t> random_bf16(std::size_t n, std::uint64_t seed, float 
     return bits;
 }
 
+bool within(double oracle, float value) {
+    return std::isfinite(value) &&
+           std::fabs(static_cast<double>(value) - oracle) <= std::fabs(oracle) / 256.0 + 1.0e-5;
+}
+
+// Count the elements of `out` (rows x tokens) that miss the oracle; `first` is the first miss.
+std::size_t score(const std::vector<std::uint16_t>& out, const std::vector<double>& oracle,
+                  std::int32_t tokens, std::size_t& first) {
+    std::size_t misses = 0;
+    first              = 0;
+    for (std::size_t i = 0; i < static_cast<std::size_t>(kRows) * tokens; ++i) {
+        if (!within(oracle[i], bf16_to_f32(out[i]))) {
+            if (misses == 0) first = i;
+            ++misses;
+        }
+    }
+    return misses;
+}
+
 int run_k(std::int32_t k) {
     namespace qw = ninfer::test::quantized_weight;
     qw::PatternedWeightOptions options;
@@ -67,100 +92,67 @@ int run_k(std::int32_t k) {
         random_bf16(static_cast<std::size_t>(k) * kMaxTokens, 0x1234, 1.0e-3F);
     const auto residual =
         random_bf16(static_cast<std::size_t>(kRows) * kMaxTokens, 0x9876, 1.0e-2F);
+
+    // The patterned fixture carries no dequantized matrix; decode the payload for the oracle.
+    const std::vector<float> dequant =
+        qw::decode_row_split_lowbit(host_weight.payload, kRows, k, k, QType::Q5G64_F16S);
+    std::vector<double> oracle(static_cast<std::size_t>(kRows) * kMaxTokens);
+    for (std::int32_t col = 0; col < kMaxTokens; ++col) {
+        const std::uint16_t* xcol = activation.data() + static_cast<std::size_t>(col) * k;
+        for (std::int32_t row = 0; row < kRows; ++row) {
+            const float* wrow = dequant.data() + static_cast<std::size_t>(row) * k;
+            double sum        = 0.0;
+            for (std::int32_t kk = 0; kk < k; ++kk) {
+                sum += static_cast<double>(wrow[kk]) * bf16_to_f32(xcol[kk]);
+            }
+            const std::size_t i = static_cast<std::size_t>(col) * kRows + row;
+            oracle[i]           = sum + bf16_to_f32(residual[i]);
+        }
+    }
+
     ninfer::test::GuardedDeviceBuffer device_x(activation.size() * 2);
     device_x.copy_from_host(activation.data(), activation.size() * 2);
-    ninfer::test::GuardedDeviceBuffer reference_out(residual.size() * 2);
-    ninfer::test::GuardedDeviceBuffer candidate_out(residual.size() * 2);
+    ninfer::test::GuardedDeviceBuffer device_out(residual.size() * 2);
 
     int failures = 0;
-    std::vector<float> dequant;
-    std::vector<std::uint16_t> reference(residual.size());
-    std::vector<std::uint16_t> candidate(residual.size());
+    std::vector<std::uint16_t> out(residual.size());
+    std::vector<std::uint16_t> first_run;
     for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 15, 16, 17, 20, 24, 31, 32}) {
         const std::size_t elements = static_cast<std::size_t>(kRows) * tokens;
         Tensor x(device_x.data(), DType::BF16, {k, tokens});
-        Tensor out_a(reference_out.data(), DType::BF16, {kRows, tokens});
-        Tensor out_b(candidate_out.data(), DType::BF16, {kRows, tokens});
-        reference_out.copy_from_host(residual.data(), elements * 2);
-        candidate_out.copy_from_host(residual.data(), elements * 2);
-        if (tokens == 1) {
-            ninfer::ops::detail::q5_linear_add_gemv_residual_launch(x, weight, out_a, nullptr);
-        } else if (tokens <= 16) {
-            ninfer::ops::detail::q5_linear_add_split2_exact_launch(x, weight, out_a, nullptr);
-        } else {
-            ninfer::ops::detail::q5_linear_add_mma_r64_c32_s4_launch(x, weight, out_a, nullptr);
-        }
-        ninfer::test::cuda_check(cudaDeviceSynchronize(), "q5 linear_add reference");
-        reference_out.copy_to_host(reference.data(), elements * 2);
-
-        using Launch = void (*)(const Tensor&, const ninfer::Weight&, Tensor&, cudaStream_t);
-        struct Variant {
-            const char* name;
-            Launch launch;
-            std::int32_t max_tokens;
-        };
-        const Variant variants[] = {
-            {"small_t", &ninfer::ops::detail::q5_linear_add_small_t_mma_launch, 32},
-        };
-        for (const Variant& variant : variants) {
-            if (tokens > variant.max_tokens) continue;
-            std::vector<std::uint16_t> first_run;
-            for (int repeat = 0; repeat < 3; ++repeat) {
-                candidate_out.copy_from_host(residual.data(), elements * 2);
-                variant.launch(x, weight, out_b, nullptr);
-                ninfer::test::cuda_check(cudaDeviceSynchronize(), variant.name);
-                candidate_out.copy_to_host(candidate.data(), elements * 2);
-                if (repeat == 0) {
-                    first_run.assign(candidate.begin(),
-                                     candidate.begin() + static_cast<std::ptrdiff_t>(elements));
-                } else if (!std::equal(first_run.begin(), first_run.end(), candidate.begin())) {
-                    ++failures;
-                    std::cerr << "K=" << k << " T=" << tokens << " " << variant.name
-                              << ": repeat " << repeat << " differs from the first run\n";
-                }
-            }
-
-            std::size_t mismatches = 0, changed = 0, first = elements;
-            for (std::size_t i = 0; i < elements; ++i) {
-                changed += reference[i] != residual[i];
-                const float a = bf16_to_f32(reference[i]);
-                const float b = bf16_to_f32(candidate[i]);
-                const bool ok = std::isfinite(b) &&
-                                std::fabs(a - b) <=
-                                    std::max(std::fabs(a), std::fabs(b)) / 128.0F + 1.0e-6F;
-                if (!ok) {
-                    if (first == elements) first = i;
-                    ++mismatches;
-                }
-            }
-            if (mismatches != 0 || changed == 0) {
+        Tensor y(device_out.data(), DType::BF16, {kRows, tokens});
+        for (int repeat = 0; repeat < 3; ++repeat) {
+            device_out.copy_from_host(residual.data(), elements * 2);
+            ninfer::ops::detail::q5_linear_add_small_t_mma_launch(x, weight, y, nullptr);
+            ninfer::test::cuda_check(cudaDeviceSynchronize(), "q5 linear_add small-T MMA");
+            device_out.copy_to_host(out.data(), elements * 2);
+            if (repeat == 0) {
+                first_run.assign(out.begin(), out.begin() + static_cast<std::ptrdiff_t>(elements));
+            } else if (!std::equal(first_run.begin(), first_run.end(), out.begin())) {
                 ++failures;
-                if (mismatches != 0) {
-                    // fp64 oracle for the first mismatch. The patterned fixture carries no
-                    // dequantized matrix, so decode the packed payload once, on first use.
-                    if (dequant.empty()) {
-                        dequant = qw::decode_row_split_lowbit(host_weight.payload, kRows, k, k,
-                                                              QType::Q5G64_F16S);
-                    }
-                    const std::size_t row = first % kRows;
-                    const std::size_t col = first / kRows;
-                    double oracle         = bf16_to_f32(residual[first]);
-                    for (std::int32_t kk = 0; kk < k; ++kk) {
-                        oracle += static_cast<double>(
-                                      dequant[row * static_cast<std::size_t>(k) + kk]) *
-                                  bf16_to_f32(activation[col * static_cast<std::size_t>(k) + kk]);
-                    }
-                    std::cerr << "  fp64 oracle at row " << row << " col " << col << ": " << oracle
-                              << '\n';
-                }
-                std::cerr << "K=" << k << " T=" << tokens << " " << variant.name << ": "
-                          << (changed == 0
-                                  ? std::string("reference left the residual unchanged")
-                                  : std::to_string(mismatches) + " mismatches, first at " +
-                                        std::to_string(first) + " (" +
-                                        std::to_string(bf16_to_f32(reference[first])) + " vs " +
-                                        std::to_string(bf16_to_f32(candidate[first])) + ")")
-                          << '\n';
+                std::cerr << "K=" << k << " T=" << tokens << ": repeat " << repeat
+                          << " differs from the first run\n";
+            }
+        }
+        std::size_t first = 0;
+        const auto misses = score(out, oracle, tokens, first);
+        if (misses != 0) {
+            ++failures;
+            std::cerr << "K=" << k << " T=" << tokens << ": " << misses
+                      << " outputs miss the fp64 oracle, first at " << first << " ("
+                      << bf16_to_f32(out[first]) << " vs " << oracle[first] << ")\n";
+        }
+
+        if (tokens > 16) {
+            device_out.copy_from_host(residual.data(), elements * 2);
+            ninfer::ops::detail::q5_linear_add_mma_r64_c32_s4_launch(x, weight, y, nullptr);
+            ninfer::test::cuda_check(cudaDeviceSynchronize(), "q5 linear_add c32/s4");
+            device_out.copy_to_host(out.data(), elements * 2);
+            const auto routed_misses = score(out, oracle, tokens, first);
+            if (routed_misses != 0) {
+                std::cerr << "  (diagnostic) K=" << k << " T=" << tokens << " c32/s4: "
+                          << routed_misses << " outputs miss the oracle, first at " << first
+                          << " (" << bf16_to_f32(out[first]) << " vs " << oracle[first] << ")\n";
             }
         }
     }
@@ -173,7 +165,7 @@ int main() {
     try {
         const int failures = run_k(6144) + run_k(17408);
         std::cout << (failures == 0 ? "OK" : "FAIL")
-                  << " Q5 LinearAdd small-T MMA matches the reference kernels at T=1..32, "
+                  << " Q5 LinearAdd small-T MMA matches the fp64 oracle at T=1..32, "
                      "K=6144/17408\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
