@@ -79,9 +79,20 @@ __launch_bounds__(256, 6) __global__
     static_assert((kHidden % kGroupK) == 0);
     static_assert(RowPolicy::kOutputRowsPerCta <= kRowsPerCta);
 
+    // Each staged code row is padded by 16 B. Unpadded, the rows sit kGroupK / 2 = 256 B apart, a
+    // multiple of the 128 B that 32 four-byte banks span, so the eight rows the gid lanes read for
+    // one A fragment all land in one bank and every code byte load is an 8-way conflict. That, not
+    // memory, was this kernel's ceiling on sm_86: Q4 SwiGLU [34816,5120] took ~200-223 us flat
+    // across T=2..8 whatever its occupancy (6, 3 or 2 CTAs/SM), pipeline depth or K tile -- about
+    // half its ~106 us weight-streaming floor. 16 B (the cp.async alignment) staggers the rows by
+    // four banks: 137 / 129 / 134 / 148 us at T=2/4/6/8 against 223 / 201 / 205 / 205 (RTX 3090,
+    // cold, median of 31), bit-identical output. Pipelining the loads (a 2- or 3-deep cp.async
+    // ring) and a 128-wide per-warp K tile were measured on top of this and lost.
+    static constexpr int kCodeRowPad = 16;
+
     union SharedStorage {
         struct {
-            std::uint8_t codes[kRowsPerCta][kGroupK / 2];
+            std::uint8_t codes[kRowsPerCta][kGroupK / 2 + kCodeRowPad];
             __nv_bfloat16 activations[kWarps][kTileCols * kTileK];
             std::uint16_t scales[kRowsPerCta][kWarps];
         } staging;
