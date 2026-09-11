@@ -94,7 +94,8 @@ int main() {
         std::uint64_t state = 0x13198a2e03707344ULL;
         for (auto& value : activation) {
             state = qw::detail::mix64(state);
-            value = f32_to_bf16_rne(static_cast<float>(static_cast<int>(state % 255U) - 127) * 1e-3F);
+            const int numerator = static_cast<int>(state % 255U) - 127;
+            value               = f32_to_bf16_rne(static_cast<float>(numerator) * 1e-3F);
         }
         ninfer::test::GuardedDeviceBuffer device_x(activation.size() * 2);
         device_x.copy_from_host(activation.data(), activation.size() * 2);

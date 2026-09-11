@@ -63,8 +63,10 @@ int run_k(std::int32_t k) {
     device_weight.copy_from_host(host_weight.payload.data(), host_weight.payload.size());
     const ninfer::Weight weight = host_weight.device_weight(device_weight.data());
 
-    const auto activation = random_bf16(static_cast<std::size_t>(k) * kMaxTokens, 0x1234, 1.0e-3F);
-    const auto residual   = random_bf16(static_cast<std::size_t>(kRows) * kMaxTokens, 0x9876, 1.0e-2F);
+    const auto activation =
+        random_bf16(static_cast<std::size_t>(k) * kMaxTokens, 0x1234, 1.0e-3F);
+    const auto residual =
+        random_bf16(static_cast<std::size_t>(kRows) * kMaxTokens, 0x9876, 1.0e-2F);
     ninfer::test::GuardedDeviceBuffer device_x(activation.size() * 2);
     device_x.copy_from_host(activation.data(), activation.size() * 2);
     ninfer::test::GuardedDeviceBuffer reference_out(residual.size() * 2);
@@ -98,46 +100,47 @@ int run_k(std::int32_t k) {
             {"small_t", &ninfer::ops::detail::q5_linear_add_small_t_mma_launch, 8},
         };
         for (const Variant& variant : variants) {
-        if (tokens > variant.max_tokens) continue;
-        std::vector<std::uint16_t> first_run;
-        for (int repeat = 0; repeat < 3; ++repeat) {
-        candidate_out.copy_from_host(residual.data(), elements * 2);
-        variant.launch(x, weight, out_b, nullptr);
-        ninfer::test::cuda_check(cudaDeviceSynchronize(), variant.name);
-        candidate_out.copy_to_host(candidate.data(), elements * 2);
-        if (repeat == 0) {
-            first_run.assign(candidate.begin(), candidate.begin() + static_cast<std::ptrdiff_t>(elements));
-        } else if (!std::equal(first_run.begin(), first_run.end(), candidate.begin())) {
-            ++failures;
-            std::cerr << "K=" << k << " T=" << tokens << " " << variant.name
-                      << ": repeat " << repeat << " differs from the first run\n";
-        }
-        }
-
-        std::size_t mismatches = 0, changed = 0, first = elements;
-        for (std::size_t i = 0; i < elements; ++i) {
-            changed += reference[i] != residual[i];
-            const float a = bf16_to_f32(reference[i]);
-            const float b = bf16_to_f32(candidate[i]);
-            const bool ok =
-                std::isfinite(b) &&
-                std::fabs(a - b) <= std::max(std::fabs(a), std::fabs(b)) / 128.0F + 1.0e-6F;
-            if (!ok) {
-                if (first == elements) first = i;
-                ++mismatches;
+            if (tokens > variant.max_tokens) continue;
+            std::vector<std::uint16_t> first_run;
+            for (int repeat = 0; repeat < 3; ++repeat) {
+                candidate_out.copy_from_host(residual.data(), elements * 2);
+                variant.launch(x, weight, out_b, nullptr);
+                ninfer::test::cuda_check(cudaDeviceSynchronize(), variant.name);
+                candidate_out.copy_to_host(candidate.data(), elements * 2);
+                if (repeat == 0) {
+                    first_run.assign(candidate.begin(),
+                                     candidate.begin() + static_cast<std::ptrdiff_t>(elements));
+                } else if (!std::equal(first_run.begin(), first_run.end(), candidate.begin())) {
+                    ++failures;
+                    std::cerr << "K=" << k << " T=" << tokens << " " << variant.name
+                              << ": repeat " << repeat << " differs from the first run\n";
+                }
             }
-        }
-        if (mismatches != 0 || changed == 0) {
-            ++failures;
-            std::cerr << "K=" << k << " T=" << tokens << " " << variant.name << ": "
-                      << (changed == 0 ? "reference left the residual unchanged"
-                                       : std::to_string(mismatches) + " mismatches, first at " +
-                                             std::to_string(first) + " (" +
-                                             std::to_string(bf16_to_f32(reference[first])) +
-                                             " vs " + std::to_string(bf16_to_f32(candidate[first])) +
-                                             ")")
-                      << '\n';
-        }
+
+            std::size_t mismatches = 0, changed = 0, first = elements;
+            for (std::size_t i = 0; i < elements; ++i) {
+                changed += reference[i] != residual[i];
+                const float a = bf16_to_f32(reference[i]);
+                const float b = bf16_to_f32(candidate[i]);
+                const bool ok = std::isfinite(b) &&
+                                std::fabs(a - b) <=
+                                    std::max(std::fabs(a), std::fabs(b)) / 128.0F + 1.0e-6F;
+                if (!ok) {
+                    if (first == elements) first = i;
+                    ++mismatches;
+                }
+            }
+            if (mismatches != 0 || changed == 0) {
+                ++failures;
+                std::cerr << "K=" << k << " T=" << tokens << " " << variant.name << ": "
+                          << (changed == 0
+                                  ? std::string("reference left the residual unchanged")
+                                  : std::to_string(mismatches) + " mismatches, first at " +
+                                        std::to_string(first) + " (" +
+                                        std::to_string(bf16_to_f32(reference[first])) + " vs " +
+                                        std::to_string(bf16_to_f32(candidate[first])) + ")")
+                          << '\n';
+            }
         }
     }
     return failures;
@@ -149,7 +152,8 @@ int main() {
     try {
         const int failures = run_k(6144) + run_k(17408);
         std::cout << (failures == 0 ? "OK" : "FAIL")
-                  << " Q5 LinearAdd small-T MMA variants match the SIMT kernels at T=1..8, K=6144/17408\n";
+                  << " Q5 LinearAdd small-T MMA matches the SIMT kernels at T=1..8, "
+                     "K=6144/17408\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << "Q5 LinearAdd small-T MMA test failed: " << error.what() << '\n';

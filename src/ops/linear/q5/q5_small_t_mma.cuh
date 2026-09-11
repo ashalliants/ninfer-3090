@@ -1,19 +1,16 @@
 #pragma once
 
-// Q5 row-split small-T MMA core: the Q4 small-T kernel (q4_small_t_mma.cuh) with the Q5 high-bit
-// plane staged beside the nibbles. For narrow decode extents -- an MTP verify is T = K+1 = 4 -- the
-// SIMT split2/split4 kernels grow with T because every column is its own FMA stream, while an MMA
-// over an eight-column tile costs the same from T=1 to T=8.
+// Q5 row-split small-T MMA core, the Q5 counterpart of q4_small_t_mma.cuh. For narrow decode
+// extents -- an MTP verify is T = K+1 = 4 -- the SIMT split2/split4 kernels grow with T because
+// every column is its own FMA stream, while an MMA over an eight-column tile costs the same from
+// T=1 to T=8.
 //
 // A CTA owns 16 weight rows (one m16 tile) and splits each 512-wide K slab over eight warps, one
-// quantization group per warp. Codes and high bits are staged with cp.async, decoded straight into
-// A fragments (codes -> bf16 exactly: a Q5 code is an integer in [-16, 15]), and multiplied against
-// the staged activation tile with bf16 mma.sync; each warp folds its group's fp16 scale into an
-// fp32 accumulator, and the eight K partials are reduced through shared memory at the end.
-//
-// Both staged planes are padded so the eight rows the gid lanes read land in distinct banks: the
-// nibble rows are 256 B apart unpadded (every row in one bank, see q4_small_t_mma.cuh) and the high
-// rows 64 B (rows two apart share a bank).
+// quantization group per warp. Nibbles, high bits and scales are staged with cp.async; each lane
+// decodes its eight contiguous code bytes per row straight into A fragments (exactly: a Q5 code is
+// an integer in [-16, 15]) and multiplies them against the staged activations with bf16 mma.sync
+// in a permuted k order (see the kernel); each warp folds its group's fp16 scale into an fp32
+// accumulator, and the eight K partials are reduced through shared memory at the end.
 
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
@@ -62,8 +59,9 @@ __device__ __forceinline__ void q5_small_t_decode_eight(unsigned word, unsigned 
     // (b & 0xf) * 0x00204081 lays bits 0..3 at 0, 8, 16, 24 with no carries between the copies.
     even |= (((inv & 0xfu) * 0x00204081u) & 0x01010101u) << 4;
     odd |= ((((inv >> 4) & 0xfu) * 0x00204081u) & 0x01010101u) << 4;
-    const unsigned biased[4] = {__byte_perm(even, kMagic, 0x7150), __byte_perm(even, kMagic, 0x7372),
-                                __byte_perm(odd, kMagic, 0x7150), __byte_perm(odd, kMagic, 0x7372)};
+    const unsigned biased[4] = {
+        __byte_perm(even, kMagic, 0x7150), __byte_perm(even, kMagic, 0x7372),
+        __byte_perm(odd, kMagic, 0x7150), __byte_perm(odd, kMagic, 0x7372)};
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         const __nv_bfloat162 value = __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&biased[j]),
@@ -148,7 +146,8 @@ __launch_bounds__(256, (Stages == 1 ? 6 : 4)) __global__
                 cp_async<16, Cache::cg>(&stage.high[row][chunk * 16],
                                         high_bits + r * (K / 8) + slab_k0 / 8 + chunk * 16);
             } else if (lane == Schedule::kCodeRowBytes / 16 + Schedule::kHighRowBytes / 16) {
-                cp_async<16>(&stage.scales[row][0], scales + (r * kGroupsPerRow + slab_k0 / 64) * 2);
+                cp_async<16>(&stage.scales[row][0],
+                             scales + (r * kGroupsPerRow + slab_k0 / 64) * 2);
             }
         }
     };
@@ -183,26 +182,22 @@ __launch_bounds__(256, (Stages == 1 ? 6 : 4)) __global__
             *reinterpret_cast<const std::uint16_t*>(&stage.high[gid][high_byte]);
         const unsigned bot_high =
             *reinterpret_cast<const std::uint16_t*>(&stage.high[gid + 8][high_byte]);
-        unsigned a_top[8], a_bot[8];
-        q5_small_t_decode_eight(top.x, top_high & 0xffu, *reinterpret_cast<unsigned(*)[4]>(&a_top[0]));
-        q5_small_t_decode_eight(top.y, top_high >> 8, *reinterpret_cast<unsigned(*)[4]>(&a_top[4]));
-        q5_small_t_decode_eight(bot.x, bot_high & 0xffu, *reinterpret_cast<unsigned(*)[4]>(&a_bot[0]));
-        q5_small_t_decode_eight(bot.y, bot_high >> 8, *reinterpret_cast<unsigned(*)[4]>(&a_bot[4]));
-
-        uint4 b_lo = make_uint4(0u, 0u, 0u, 0u);
-        uint4 b_hi = make_uint4(0u, 0u, 0u, 0u);
-        if (b_live) {
-            b_lo = load_vec<uint4>(&stage.activations[warp][gid][16 * lid]);
-            b_hi = load_vec<uint4>(&stage.activations[warp][gid][16 * lid + 8]);
-        }
-        const unsigned b_words[8] = {b_lo.x, b_lo.y, b_lo.z, b_lo.w, b_hi.x, b_hi.y, b_hi.z, b_hi.w};
 
         float group_acc[4] = {};
 #pragma unroll
-        for (int ks = 0; ks < 4; ++ks) {
-            mma_bf16(group_acc[0], group_acc[1], group_acc[2], group_acc[3], a_top[2 * ks],
-                     a_bot[2 * ks], a_top[2 * ks + 1], a_bot[2 * ks + 1], b_words[2 * ks],
-                     b_words[2 * ks + 1]);
+        for (int half = 0; half < 2; ++half) {
+            // Four code bytes and one high byte per row cover steps ks = 2*half and 2*half + 1.
+            unsigned a_top[4], a_bot[4];
+            q5_small_t_decode_eight(half == 0 ? top.x : top.y, (top_high >> (8 * half)) & 0xffu,
+                                    a_top);
+            q5_small_t_decode_eight(half == 0 ? bot.x : bot.y, (bot_high >> (8 * half)) & 0xffu,
+                                    a_bot);
+            uint4 b = make_uint4(0u, 0u, 0u, 0u);
+            if (b_live) { b = load_vec<uint4>(&stage.activations[warp][gid][16 * lid + 8 * half]); }
+            mma_bf16(group_acc[0], group_acc[1], group_acc[2], group_acc[3], a_top[0], a_bot[0],
+                     a_top[1], a_bot[1], b.x, b.y);
+            mma_bf16(group_acc[0], group_acc[1], group_acc[2], group_acc[3], a_top[2], a_bot[2],
+                     a_top[3], a_bot[3], b.z, b.w);
         }
 
         const float top_scale = __half2float(__ushort_as_half(stage.scales[gid][warp]));
@@ -231,7 +226,8 @@ __launch_bounds__(256, (Stages == 1 ? 6 : 4)) __global__
         acc[2] += partner.z;
         acc[3] += partner.w;
         if (warp != 0) {
-            store_vec(partial + (warp * 32 + lane) * 4, make_float4(acc[0], acc[1], acc[2], acc[3]));
+            store_vec(partial + (warp * 32 + lane) * 4,
+                      make_float4(acc[0], acc[1], acc[2], acc[3]));
         }
     }
     __syncthreads();
