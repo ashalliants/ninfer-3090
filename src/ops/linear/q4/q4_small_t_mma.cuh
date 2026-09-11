@@ -2,6 +2,7 @@
 
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
+#include "ops/linear/q4/q4_rowsplit_storage.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -39,26 +40,9 @@ struct Q4DraftSmallTSchedule {
     static constexpr int kRowsPerLoaderWarp = kRowsPerCta / kKWarps;
 };
 
-__device__ __forceinline__ int q4_small_t_swizzle_64(int row, int col) {
-    return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
-}
-
-union Q4SmallTBf16PairBits {
-    __nv_bfloat162 pair;
-    unsigned bits;
-};
-
-__device__ __forceinline__ unsigned q4_small_t_bf16_pair(std::uint8_t packed) {
-    const int q0 = (static_cast<int>(packed & 0x0fu) ^ 0x08) - 0x08;
-    const int q1 = (static_cast<int>(packed >> 4) ^ 0x08) - 0x08;
-    Q4SmallTBf16PairBits result;
-    result.pair = __floats2bfloat162_rn(static_cast<float>(q0), static_cast<float>(q1));
-    return result.bits;
-}
-
 template <class Geometry, int TileCols, int ActiveCols, class Epilogue = Q4SmallTMmaStoreEpilogue,
           class RowPolicy = Q4SmallTMmaIdentityRows, bool MaskedColumns = false>
-__launch_bounds__(256, 6) __global__
+__launch_bounds__(256, (TileCols <= 16 ? 6 : 4)) __global__
     void q4_small_t_mma_kernel(const __nv_bfloat16* __restrict__ x,
                                const std::uint8_t* __restrict__ codes,
                                const std::uint8_t* __restrict__ scales,
@@ -79,21 +63,28 @@ __launch_bounds__(256, 6) __global__
     static_assert((kHidden % kGroupK) == 0);
     static_assert(RowPolicy::kOutputRowsPerCta <= kRowsPerCta);
 
-    // Each staged code row is padded by 16 B. Unpadded, the rows sit kGroupK / 2 = 256 B apart, a
-    // multiple of the 128 B that 32 four-byte banks span, so the eight rows the gid lanes read for
-    // one A fragment all land in one bank and every code byte load is an 8-way conflict. That, not
-    // memory, was this kernel's ceiling on sm_86: Q4 SwiGLU [34816,5120] took ~200-223 us flat
-    // across T=2..8 whatever its occupancy (6, 3 or 2 CTAs/SM), pipeline depth or K tile -- about
-    // half its ~106 us weight-streaming floor. 16 B (the cp.async alignment) staggers the rows by
-    // four banks: 137 / 129 / 134 / 148 us at T=2/4/6/8 against 223 / 201 / 205 / 205 (RTX 3090,
-    // cold, median of 31), bit-identical output. Pipelining the loads (a 2- or 3-deep cp.async
-    // ring) and a 128-wide per-warp K tile were measured on top of this and lost.
-    static constexpr int kCodeRowPad = 16;
+    // K order. The MMA's k slots may be any permutation of a group's 64 k, provided A and B agree.
+    // Lane lid is given k 16*lid .. 16*lid + 15 of its warp's group: for step ks, slots (2*lid,
+    // 2*lid + 1) carry k 16*lid + 4*ks + {0, 1} and slots (2*lid + 8, 2*lid + 9) carry
+    // 16*lid + 4*ks + {2, 3}. The lane's A operand over a group is then eight contiguous code bytes
+    // per row -- one 64-bit load, decoded by Q4MmaDecodeAtom::decode_eight without int-to-float
+    // conversion -- and its B operand sixteen contiguous activations of one column, two 128-bit
+    // loads, where the natural slot order costs a byte load and a two-conversion decode per A pair
+    // and an ldmatrix per B fragment. On sm_86 that instruction stream, not DRAM, bounded this
+    // kernel: once the shared-memory conflicts were gone it still spent ~27 cycles per MMA against
+    // the ~21 its weight bytes allow at full bandwidth.
+    //
+    // Padding. A half-warp of 64-bit code loads spans four rows, so code rows are staggered by 32 B
+    // (eight banks); unpadded, rows 256 B apart all share a bank. Activation columns are 64 bf16
+    // (128 B) per warp group and 16 B of padding staggers neighbours by four banks for the
+    // quarter-warp 128-bit loads.
+    static constexpr int kCodeRowPad = 32;
+    static constexpr int kXColStride = kTileK + 8;
 
     union SharedStorage {
         struct {
             std::uint8_t codes[kRowsPerCta][kGroupK / 2 + kCodeRowPad];
-            __nv_bfloat16 activations[kWarps][kTileCols * kTileK];
+            __nv_bfloat16 activations[kWarps][kTileCols][kXColStride];
             std::uint16_t scales[kRowsPerCta][kWarps];
         } staging;
 
@@ -114,22 +105,15 @@ __launch_bounds__(256, 6) __global__
     const int row0         = static_cast<int>(blockIdx.x) * RowPolicy::kOutputRowsPerCta;
     const int live_columns = MaskedColumns ? columns : ActiveCols;
 
+    // Only live columns are staged; the B fragments of the others are zero.
     const auto stage_x = [&](int group_k0) {
-        constexpr int kItemsPerSplit = ActiveCols * (kTileK / 8);
-        for (int item = lane; item < kItemsPerSplit; item += 32) {
+        const int items = live_columns * (kTileK / 8);
+        for (int item = lane; item < items; item += 32) {
             const int col = item / (kTileK / 8);
             const int k8  = item - col * (kTileK / 8);
-            auto* dst     = &x_shared[warp][col * kTileK + q4_small_t_swizzle_64(col, k8 * 8)];
-            if constexpr (MaskedColumns) {
-                const int source = col < live_columns ? col : 0;
-                cp_async_zfill<16>(dst,
-                                   &x[static_cast<std::int64_t>(source) * kHidden + group_k0 +
-                                      warp * kTileK + k8 * 8],
-                                   col < live_columns ? 16 : 0);
-            } else {
-                cp_async<16>(dst, &x[static_cast<std::int64_t>(col) * kHidden + group_k0 +
-                                     warp * kTileK + k8 * 8]);
-            }
+            cp_async<16>(&x_shared[warp][col][k8 * 8],
+                         &x[static_cast<std::int64_t>(col) * kHidden + group_k0 + warp * kTileK +
+                            k8 * 8]);
         }
     };
 
@@ -154,9 +138,7 @@ __launch_bounds__(256, 6) __global__
         }
     };
 
-    const int b_rin     = lane & 7;
-    const int b_koff    = ((lane >> 3) & 1) << 3;
-    const int warp_koff = k_split * kTileK;
+    const int code_byte = k_split * (kTileK / 2) + 8 * lid;
     float acc[kNt][4]   = {};
 
     stage_weight(0);
@@ -165,27 +147,30 @@ __launch_bounds__(256, 6) __global__
     cp_wait<0>();
     __syncthreads();
 
-#pragma unroll
+#pragma unroll 1
     for (int group_index = 0; group_index < kGroups; ++group_index) {
         const int group_k0      = group_index * kGroupK;
         float group_acc[kNt][4] = {};
+        const uint2 top         = load_vec<uint2>(&code_shared[gid][code_byte]);
+        const uint2 bot         = load_vec<uint2>(&code_shared[gid + 8][code_byte]);
 
 #pragma unroll
-        for (int ks = 0; ks < 4; ++ks) {
-            const int byte_col = warp_koff / 2 + ks * 8 + lid;
-            const unsigned af0 = q4_small_t_bf16_pair(code_shared[gid][byte_col]);
-            const unsigned af1 = q4_small_t_bf16_pair(code_shared[gid + 8][byte_col]);
-            const unsigned af2 = q4_small_t_bf16_pair(code_shared[gid][byte_col + 4]);
-            const unsigned af3 = q4_small_t_bf16_pair(code_shared[gid + 8][byte_col + 4]);
+        for (int half = 0; half < 2; ++half) {
+            // Four code bytes per row cover steps ks = 2*half and 2*half + 1.
+            unsigned a_top[4], a_bot[4];
+            Q4MmaDecodeAtom::decode_eight(half == 0 ? top.x : top.y, a_top);
+            Q4MmaDecodeAtom::decode_eight(half == 0 ? bot.x : bot.y, a_bot);
 #pragma unroll
             for (int nt = 0; nt < kNt; ++nt) {
-                unsigned bf0, bf1;
-                const int br = nt * 8 + b_rin;
-                ldmatrix_x2(bf0, bf1,
-                            smem_addr(&x_shared[k_split][br * kTileK + q4_small_t_swizzle_64(
-                                                                           br, ks * 16 + b_koff)]));
+                const int col = nt * 8 + gid;
+                uint4 b       = make_uint4(0u, 0u, 0u, 0u);
+                if (col < live_columns) {
+                    b = load_vec<uint4>(&x_shared[k_split][col][16 * lid + 8 * half]);
+                }
                 mma_bf16(group_acc[nt][0], group_acc[nt][1], group_acc[nt][2], group_acc[nt][3],
-                         af0, af1, af2, af3, bf0, bf1);
+                         a_top[0], a_bot[0], a_top[1], a_bot[1], b.x, b.y);
+                mma_bf16(group_acc[nt][0], group_acc[nt][1], group_acc[nt][2], group_acc[nt][3],
+                         a_top[2], a_bot[2], a_top[3], a_bot[3], b.z, b.w);
             }
         }
 
