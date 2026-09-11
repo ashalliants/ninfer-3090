@@ -1,5 +1,5 @@
-// The Q5 small-T MMA residual kernel against an fp64 oracle, at T=1..32 on both registered K, with a
-// nonzero residual and dense two-signed activations. The oracle is computed once for 32 columns
+// The Q5 small-T MMA residual kernel against an fp64 oracle, at T=1..32 on both registered K, with
+// a nonzero residual and dense two-signed activations. The oracle is computed once for 32 columns
 // from the decoded weights; columns are independent, so each T checks a prefix of it.
 //
 // Tolerance: the kernel reads exact bf16 codes and activations, accumulates in fp32 and rounds the

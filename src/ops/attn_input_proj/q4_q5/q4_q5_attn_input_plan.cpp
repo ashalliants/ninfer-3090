@@ -69,9 +69,17 @@ struct RouteSpec {
 //   small_t        69.6   69.6   68.6   68.6   66.6   66.7   68.6   69.6
 //
 // At T=4 that is 71% of the 48.8 us both weights cost to stream once, against 54%.
+//
+// Its 16- and 32-column tiles against the r32/c32 tile (us):
+//
+//   T              9     12     16     20     24     28     31     32
+//   small_t     94.2   93.2  109.6  145.4  162.8  183.3  194.6  200.7
+//   r32/c32    209.9  194.6  195.6  199.7  199.7  200.7  201.7  190.5
+//
+// small_t wins through 31; at exactly 32 columns the grouped tile is full and wins by 5%.
 constexpr std::array<RouteSpec, 6> kRoutes{{
-    {{1, 8}, Q4Q5AttnInputScheduleId::SmallTMma},
-    {{9, 32}, Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR32C32S4},
+    {{1, 31}, Q4Q5AttnInputScheduleId::SmallTMma},
+    {{32, 32}, Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR32C32S4},
     {{33, 64}, Q4Q5AttnInputScheduleId::MixedR32C64S3},
     {{65, 127}, Q4Q5AttnInputScheduleId::MixedR64C128S2},
     {{128, 192}, Q4Q5AttnInputScheduleId::MixedR32C64S3},

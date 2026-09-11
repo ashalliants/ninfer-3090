@@ -106,15 +106,21 @@ constexpr std::array<SupportSpec, 2> kSupports{{
 // So split2 takes T=1 from the GEMV as well (13-14%: the GEMV's one warp per row in 16-row blocks
 // is 320 blocks for 246 slots, 1.3 waves, where split2's 64-thread blocks are 3.9), split2 keeps
 // T=2 (k=6144's T=2 is inside the spread; k=17408's is not), and small_t takes 3..8. At T=4, an
-// MTP3 verify, that is 22% faster at k=6144 and 17% at k=17408. small_t stops at eight columns;
-// split2 keeps 9..10 ahead of c16.
-constexpr std::array<RouteSpec, 9> kK6144Routes{{
+// MTP3 verify, that is 22% faster at k=6144 and 17% at k=17408.
+//
+// The same kernel's 16- and 32-column tiles, measured the same way (us):
+//
+//   T                  9     12     16     20     24     32
+//   k=6144  small_t  39.9   38.9   45.1   62.7   69.6   93.2
+//           best MMA 75.8*  100.4  94.2  109.6  103.4  103.4     (* split2)
+//   k=17408 small_t  94.2   99.3  123.9  165.9  185.3  238.6
+//           best MMA 192.5* 281.6 276.5  300.0  289.8  285.7
+//
+// so it takes everything from 3 to its 32-column limit, including the C4 (16) and C8 (32) MTP3
+// verify widths the c16/c24/c32 tiles used to serve at 2-3x the cost.
+constexpr std::array<RouteSpec, 5> kK6144Routes{{
     {{1, 2}, Q5LinearAddScheduleId::Split2ExactResidual},
-    {{3, 8}, Q5LinearAddScheduleId::SmallTMmaResidual},
-    {{9, 10}, Q5LinearAddScheduleId::Split2ExactResidual},
-    {{11, 16}, Q5LinearAddScheduleId::MmaResidualR64C16},
-    {{17, 24}, Q5LinearAddScheduleId::MmaResidualR64C24},
-    {{25, 32}, Q5LinearAddScheduleId::MmaResidualR64C32S4},
+    {{3, 32}, Q5LinearAddScheduleId::SmallTMmaResidual},
     {{33, 103}, Q5LinearAddScheduleId::MmaResidualR64C32S3},
     {{104, 127}, Q5LinearAddScheduleId::MmaResidualR64C64},
     {{128, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
@@ -124,13 +130,10 @@ constexpr std::array<RouteSpec, 9> kK6144Routes{{
 // C16-shaped extent (T=16: c16 270.3 vs c32 300.0). Above that the story matches k=6144, with the
 // S4/S3 crossover later: T=48 s4 437.2 vs c24 474.1; T=96 s3 629.8 vs s4 683.0; T=128 c128 665.6
 // vs s3 817.2; T=192 c128 798.7 vs s3 1359.9.
-constexpr std::array<RouteSpec, 9> kK17408Routes{{
+constexpr std::array<RouteSpec, 6> kK17408Routes{{
     {{1, 2}, Q5LinearAddScheduleId::Split2ExactResidual},
-    {{3, 8}, Q5LinearAddScheduleId::SmallTMmaResidual},
-    {{9, 10}, Q5LinearAddScheduleId::Split2ExactResidual},
-    {{11, 16}, Q5LinearAddScheduleId::MmaResidualR64C16},
-    {{17, 24}, Q5LinearAddScheduleId::MmaResidualR64C24},
-    {{25, 64}, Q5LinearAddScheduleId::MmaResidualR64C32S4},
+    {{3, 32}, Q5LinearAddScheduleId::SmallTMmaResidual},
+    {{33, 64}, Q5LinearAddScheduleId::MmaResidualR64C32S4},
     {{65, 103}, Q5LinearAddScheduleId::MmaResidualR64C32S3},
     {{104, 127}, Q5LinearAddScheduleId::MmaResidualR64C64},
     {{128, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},

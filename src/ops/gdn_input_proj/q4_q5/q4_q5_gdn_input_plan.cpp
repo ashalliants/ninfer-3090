@@ -96,10 +96,16 @@ struct RouteSpec {
 //
 // At T=4 (an MTP3 verify) that is 74% of the 58.7 us both weights cost to stream once, against
 // 58%; at T=1 the independent route's value/z GEMV is 768 blocks of 16 rows for 246 slots.
-constexpr std::array<RouteSpec, 5> kRoutes{{
-    {{1, 8}, Q4Q5GdnInputScheduleId::SmallTMma},
-    {{9, 16}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C16},
-    {{17, 32}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C32},
+//
+// Its 16- and 32-column tiles against the grouped MMA tiles (us):
+//
+//   T              9     12     16     20     24     32
+//   small_t    100.4  100.4  114.7  164.9  182.3  226.3
+//   grouped    238.6  235.7  239.6  261.1  263.2  256.0     (c16 to 16, c32 above)
+//
+// so it runs to its 32-column limit and the c8/c16/c32 tiles serve nothing below 33.
+constexpr std::array<RouteSpec, 3> kRoutes{{
+    {{1, 32}, Q4Q5GdnInputScheduleId::SmallTMma},
     {{33, 64}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C64},
     {{65, kAnyCols}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128},
 }};
