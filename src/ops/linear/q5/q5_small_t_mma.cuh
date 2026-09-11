@@ -39,6 +39,11 @@ struct Q5SmallTSchedule : SmallTLayout<KWarps, TilesPerWarp> {
     // Activation columns are 64 bf16 (128 B) per K warp; 16 B of padding staggers adjacent
     // columns by four banks for the quarter-warp 128-bit B loads.
     static constexpr int kXColPad = 8;
+#ifdef NINFER_Q5_SMALL_T_PREFETCH
+    static constexpr Cache kWeightCache = Cache::cg_l2_256;
+#else
+    static constexpr Cache kWeightCache = Cache::cg;
+#endif
 };
 
 // Shared memory of q5_small_t_mma_kernel: a ring of Stages slabs, reused for the final K
@@ -162,11 +167,11 @@ __launch_bounds__(256, (KWarps < 8 || XCols >= 32 ? 2 : (XCols >= 16 || Stages =
             const int j          = item - row * kItemsPerRow;
             const std::int64_t r = cta_row0 + row;
             if (j < kCodeChunks) {
-                cp_async<16, Cache::cg>(&stage.codes[row][j * 16],
+                cp_async<16, Schedule::kWeightCache>(&stage.codes[row][j * 16],
                                         codes + r * (K / 2) + slab_k0 / 2 + j * 16);
             } else if (j < kCodeChunks + kHighChunks) {
                 const int chunk = j - kCodeChunks;
-                cp_async<16, Cache::cg>(&stage.high[row][chunk * 16],
+                cp_async<16, Schedule::kWeightCache>(&stage.high[row][chunk * 16],
                                         high_bits + r * (K / 8) + slab_k0 / 8 + chunk * 16);
             } else {
                 cp_async<2 * kKWarps>(&stage.scales[row][0],

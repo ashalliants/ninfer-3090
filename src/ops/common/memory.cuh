@@ -5,7 +5,8 @@
 
 namespace ninfer::ops {
 
-enum class Cache { ca, cg };
+// cg_l2_256: cp.async.cg with a 256-byte L2 prefetch hint (sm_80+), for streams of short chunks.
+enum class Cache { ca, cg, cg_l2_256 };
 
 template <class V, class T>
 __device__ __forceinline__ V load_vec(const T* ptr) {
@@ -38,6 +39,11 @@ __device__ __forceinline__ void cp_async(void* smem_dst, const void* gmem_src) {
     if constexpr (Policy == Cache::cg) {
         static_assert(Bytes == 16, "cp.async.cg requires a 16-byte copy");
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                     :
+                     : "r"(smem_addr(smem_dst)), "l"(gmem_src));
+    } else if constexpr (Policy == Cache::cg_l2_256) {
+        static_assert(Bytes == 16, "cp.async.cg requires a 16-byte copy");
+        asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], 16;\n"
                      :
                      : "r"(smem_addr(smem_dst)), "l"(gmem_src));
     } else {

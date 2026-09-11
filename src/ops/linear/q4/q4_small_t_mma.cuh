@@ -34,7 +34,11 @@ struct Q4DraftHeadGeometry {
 struct Q4DraftSmallTSchedule {
     static constexpr int kKWarps            = 8;
     static constexpr int kMinBlocksPerSm    = 6;
+#ifdef NINFER_Q4_SMALL_T_PREFETCH
+    static constexpr auto kCodeCache        = Cache::cg_l2_256;
+#else
     static constexpr auto kCodeCache        = Cache::cg;
+#endif
     static constexpr int kThreads           = kKWarps * 32;
     static constexpr int kTileKPerWarp      = 64;
     static constexpr int kGroupK            = kKWarps * kTileKPerWarp;
