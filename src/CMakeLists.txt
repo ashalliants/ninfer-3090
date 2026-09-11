@@ -146,6 +146,7 @@ add_library(ninfer_ops STATIC
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.cpp
   ops/attn_input_proj/q4_q5/q4_q5_attn_input_gemm_mma.cu
   ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu
+  ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t_mma.cu
   ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.cpp
   ops/attn_input_proj/w8/w8_attn_input_decode.cu
   ops/attn_input_proj/w8/w8_attn_input_gemm_mma.cu

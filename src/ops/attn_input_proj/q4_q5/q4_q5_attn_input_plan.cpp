@@ -102,6 +102,8 @@ const char* q4_q5_attn_input_schedule_name(Q4Q5AttnInputScheduleId schedule) noe
         return "attn_input_proj.q4_q5.mixed.r64.c128.s2";
     case Q4Q5AttnInputScheduleId::PairR32C64S4:
         return "attn_input_proj.q4_q5.pair.r32.c64.s4";
+    case Q4Q5AttnInputScheduleId::SmallTMma:
+        return "attn_input_proj.q4_q5.small_t.mma";
     }
     return "attn_input_proj.q4_q5.unknown";
 }
@@ -163,6 +165,10 @@ void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& 
     case Q4Q5AttnInputScheduleId::PairR32C64S4:
         q4_q5_attn_input_grouped_mma_r32_c64_s4_launch(x, query_key_weight, gate_value_weight, q,
                                                        gate, k, v, stream);
+        return;
+    case Q4Q5AttnInputScheduleId::SmallTMma:
+        q4_q5_attn_input_small_t_mma_launch(x, query_key_weight, gate_value_weight, q, gate, k, v,
+                                            stream);
         return;
     }
     throw std::logic_error("Q4/Q5 attention input: unknown schedule");
