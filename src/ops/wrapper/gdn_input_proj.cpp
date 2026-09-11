@@ -805,12 +805,11 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
 
     std::int32_t largest_materialized_width = 0;
     if (q4_q5) {
+        // Only T=1 keeps the fused epilogue, so every wider width materializes.
         (void)resolve_q4_q5_conv_plan(min_width, 1);
-        (void)resolve_q4_q5_conv_plan(max_width, 1);
-        if (max_width >= 7) {
+        if (resolve_q4_q5_conv_plan(max_width, 1).schedule ==
+            detail::Q4Q5GdnInputConvScheduleId::Materialized) {
             largest_materialized_width = max_width;
-        } else if (min_width <= 4 && max_width >= 4) {
-            largest_materialized_width = 4;
         }
     } else {
         (void)resolve_w8_conv_plan(min_width, 1);

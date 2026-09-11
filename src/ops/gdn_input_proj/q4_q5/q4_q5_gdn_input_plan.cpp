@@ -183,16 +183,12 @@ Q4Q5GdnInputConvPlan q4_q5_gdn_input_conv_resolve_plan(const Q4Q5GdnInputProblem
             "Q4/Q5 GDN input conv: exact problem or column count is not admitted");
     }
     if (batch_size > 1) { return {Q4Q5GdnInputConvScheduleId::Materialized}; }
-    switch (problem.cols) {
-    case 1:
-    case 2:
-    case 3:
-    case 5:
-    case 6:
-        return {Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused};
-    default:
-        return {Q4Q5GdnInputConvScheduleId::Materialized};
-    }
+    // Record form, RTX 3090, graph replay, cold L2, median of 50 (gdn_input_proj_conv_snapshot_bench):
+    // the fused SIMT projection costs 104.4 / 123.9 / 162.8 / 191.5 us at T=2/3/5/6, while the
+    // small-T MMA projection plus the separate conv costs 81.9 / 86.0 / 87.0 us at T=4/7/8. Only
+    // the T=1 GEMV keeps the fused epilogue.
+    if (problem.cols == 1) { return {Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused}; }
+    return {Q4Q5GdnInputConvScheduleId::Materialized};
 }
 
 void q4_q5_gdn_input_execute_schedule(Q4Q5GdnInputScheduleId schedule, const Tensor& x,
