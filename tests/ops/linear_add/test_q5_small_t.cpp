@@ -134,6 +134,19 @@ int run_k(std::int32_t k) {
             }
             if (mismatches != 0 || changed == 0) {
                 ++failures;
+                if (mismatches != 0) {
+                    // fp64 oracle for the first mismatch, from the fixture's dequantized weights.
+                    const std::size_t row = first % kRows;
+                    const std::size_t col = first / kRows;
+                    double oracle         = bf16_to_f32(residual[first]);
+                    for (std::int32_t kk = 0; kk < k; ++kk) {
+                        oracle += static_cast<double>(
+                                      host_weight.dequant[row * static_cast<std::size_t>(k) + kk]) *
+                                  bf16_to_f32(activation[col * static_cast<std::size_t>(k) + kk]);
+                    }
+                    std::cerr << "  fp64 oracle at row " << row << " col " << col << ": " << oracle
+                              << '\n';
+                }
                 std::cerr << "K=" << k << " T=" << tokens << " " << variant.name << ": "
                           << (changed == 0
                                   ? std::string("reference left the residual unchanged")
