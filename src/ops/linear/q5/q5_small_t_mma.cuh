@@ -71,8 +71,8 @@ __device__ __forceinline__ void q5_small_t_decode_eight(unsigned word, unsigned 
 }
 
 // Rows: output rows. K: reduction length, a multiple of 512. XCols: activation columns staged
-// (4 or 8); the MMA column tile is always 8 and the B fragments of columns at or past `columns`
-// are zero. Stages: depth of the cp.async ring (1 or 2). Epilogue::store(row, col0, v) receives,
+// (4, 8, 16 or 32), covered by max(1, XCols / 8) eight-column MMA tiles; the B fragments of
+// columns at or past `columns` are zero. Stages: depth of the cp.async ring (1 or 2). Epilogue::store(row, col0, v) receives,
 // for the lane's rows row and row + 8, v.x = (row, col0), v.y = (row, col0 + 1), v.z = (row + 8,
 // col0), v.w = (row + 8, col0 + 1); columns at or past `columns` must be ignored by the epilogue.
 //
@@ -84,7 +84,7 @@ __device__ __forceinline__ void q5_small_t_decode_eight(unsigned word, unsigned 
 // sixteen contiguous activations of one column -- two 128-bit loads, no ldmatrix -- where the
 // natural slot order needs a byte load, a decode and an ldmatrix per fragment.
 template <int Rows, int K, int XCols, int Stages, class Epilogue>
-__launch_bounds__(256, (Stages == 1 ? 6 : 4)) __global__
+__launch_bounds__(256, (XCols >= 32 ? 2 : (XCols >= 16 || Stages == 2 ? 4 : 6))) __global__
     void q5_small_t_mma_kernel(const __nv_bfloat16* __restrict__ x,
                                const std::uint8_t* __restrict__ codes,
                                const std::uint8_t* __restrict__ high_bits,
@@ -98,7 +98,8 @@ __launch_bounds__(256, (Stages == 1 ? 6 : 4)) __global__
     constexpr int kSlabs         = K / kGroupK;
     constexpr int kGroupsPerRow  = K / 64;
     constexpr int kXColStride    = kTileK + Schedule::kXColPad;
-    static_assert(XCols == 4 || XCols == 8);
+    constexpr int kNt            = XCols < 8 ? 1 : XCols / 8;
+    static_assert(XCols == 4 || XCols == 8 || XCols == 16 || XCols == 32);
     static_assert(Stages == 1 || Stages == 2);
     static_assert(K % kGroupK == 0, "K must be a whole number of 512-wide slabs");
     static_assert(Rows % kRowsPerCta == 0);
@@ -111,7 +112,7 @@ __launch_bounds__(256, (Stages == 1 ? 6 : 4)) __global__
     };
     union SharedStorage {
         Stage stages[Stages];
-        float partial[kWarps * 32 * 4];
+        float partial[kWarps * kNt * 32 * 4];
     };
 
     __shared__ __align__(16) SharedStorage shared;
@@ -161,10 +162,9 @@ __launch_bounds__(256, (Stages == 1 ? 6 : 4)) __global__
         cp_commit(); // empty commits keep cp_wait<Stages - 1> exact through the tail
     };
 
-    const bool b_live   = gid < columns;
     const int code_byte = warp * (kTileK / 2) + 8 * lid;
     const int high_byte = warp * (kTileK / 8) + 2 * lid;
-    float acc[4]        = {};
+    float acc[kNt][4]   = {};
 
 #pragma unroll
     for (int prefetch = 0; prefetch < Stages - 1; ++prefetch) { issue_slab(prefetch); }
@@ -183,7 +183,7 @@ __launch_bounds__(256, (Stages == 1 ? 6 : 4)) __global__
         const unsigned bot_high =
             *reinterpret_cast<const std::uint16_t*>(&stage.high[gid + 8][high_byte]);
 
-        float group_acc[4] = {};
+        float group_acc[kNt][4] = {};
 #pragma unroll
         for (int half = 0; half < 2; ++half) {
             // Four code bytes and one high byte per row cover steps ks = 2*half and 2*half + 1.
@@ -192,20 +192,29 @@ __launch_bounds__(256, (Stages == 1 ? 6 : 4)) __global__
                                     a_top);
             q5_small_t_decode_eight(half == 0 ? bot.x : bot.y, (bot_high >> (8 * half)) & 0xffu,
                                     a_bot);
-            uint4 b = make_uint4(0u, 0u, 0u, 0u);
-            if (b_live) { b = load_vec<uint4>(&stage.activations[warp][gid][16 * lid + 8 * half]); }
-            mma_bf16(group_acc[0], group_acc[1], group_acc[2], group_acc[3], a_top[0], a_bot[0],
-                     a_top[1], a_bot[1], b.x, b.y);
-            mma_bf16(group_acc[0], group_acc[1], group_acc[2], group_acc[3], a_top[2], a_bot[2],
-                     a_top[3], a_bot[3], b.z, b.w);
+#pragma unroll
+            for (int nt = 0; nt < kNt; ++nt) {
+                const int col = nt * 8 + gid;
+                uint4 b       = make_uint4(0u, 0u, 0u, 0u);
+                if (col < columns) {
+                    b = load_vec<uint4>(&stage.activations[warp][col][16 * lid + 8 * half]);
+                }
+                mma_bf16(group_acc[nt][0], group_acc[nt][1], group_acc[nt][2], group_acc[nt][3],
+                         a_top[0], a_bot[0], a_top[1], a_bot[1], b.x, b.y);
+                mma_bf16(group_acc[nt][0], group_acc[nt][1], group_acc[nt][2], group_acc[nt][3],
+                         a_top[2], a_bot[2], a_top[3], a_bot[3], b.z, b.w);
+            }
         }
 
         const float top_scale = __half2float(__ushort_as_half(stage.scales[gid][warp]));
         const float bot_scale = __half2float(__ushort_as_half(stage.scales[gid + 8][warp]));
-        acc[0]                = fmaf(group_acc[0], top_scale, acc[0]);
-        acc[1]                = fmaf(group_acc[1], top_scale, acc[1]);
-        acc[2]                = fmaf(group_acc[2], bot_scale, acc[2]);
-        acc[3]                = fmaf(group_acc[3], bot_scale, acc[3]);
+#pragma unroll
+        for (int nt = 0; nt < kNt; ++nt) {
+            acc[nt][0] = fmaf(group_acc[nt][0], top_scale, acc[nt][0]);
+            acc[nt][1] = fmaf(group_acc[nt][1], top_scale, acc[nt][1]);
+            acc[nt][2] = fmaf(group_acc[nt][2], bot_scale, acc[nt][2]);
+            acc[nt][3] = fmaf(group_acc[nt][3], bot_scale, acc[nt][3]);
+        }
         // The next iteration's issue_slab writes the stage this one just read.
         __syncthreads();
     }
@@ -216,32 +225,44 @@ __launch_bounds__(256, (Stages == 1 ? 6 : 4)) __global__
     __syncthreads();
     auto* partial = shared.partial;
     if ((warp & 1) != 0) {
-        store_vec(partial + (warp * 32 + lane) * 4, make_float4(acc[0], acc[1], acc[2], acc[3]));
+#pragma unroll
+        for (int nt = 0; nt < kNt; ++nt) {
+            store_vec(partial + ((warp * kNt + nt) * 32 + lane) * 4,
+                      make_float4(acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3]));
+        }
     }
     __syncthreads();
     if ((warp & 1) == 0) {
-        const float4 partner = load_vec<float4>(partial + ((warp + 1) * 32 + lane) * 4);
-        acc[0] += partner.x;
-        acc[1] += partner.y;
-        acc[2] += partner.z;
-        acc[3] += partner.w;
-        if (warp != 0) {
-            store_vec(partial + (warp * 32 + lane) * 4,
-                      make_float4(acc[0], acc[1], acc[2], acc[3]));
+#pragma unroll
+        for (int nt = 0; nt < kNt; ++nt) {
+            const float4 partner =
+                load_vec<float4>(partial + (((warp + 1) * kNt + nt) * 32 + lane) * 4);
+            acc[nt][0] += partner.x;
+            acc[nt][1] += partner.y;
+            acc[nt][2] += partner.z;
+            acc[nt][3] += partner.w;
+            if (warp != 0) {
+                store_vec(partial + ((warp * kNt + nt) * 32 + lane) * 4,
+                          make_float4(acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3]));
+            }
         }
     }
     __syncthreads();
     if (warp == 0) {
-        float4 sum = make_float4(acc[0], acc[1], acc[2], acc[3]);
 #pragma unroll
-        for (int split = 2; split < kWarps; split += 2) {
-            const float4 value = load_vec<float4>(partial + (split * 32 + lane) * 4);
-            sum.x += value.x;
-            sum.y += value.y;
-            sum.z += value.z;
-            sum.w += value.w;
+        for (int nt = 0; nt < kNt; ++nt) {
+            float4 sum = make_float4(acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3]);
+#pragma unroll
+            for (int split = 2; split < kWarps; split += 2) {
+                const float4 value =
+                    load_vec<float4>(partial + ((split * kNt + nt) * 32 + lane) * 4);
+                sum.x += value.x;
+                sum.y += value.y;
+                sum.z += value.z;
+                sum.w += value.w;
+            }
+            epilogue.store(row0 + gid, nt * 8 + 2 * lid, sum);
         }
-        epilogue.store(row0 + gid, 2 * lid, sum);
     }
 }
 

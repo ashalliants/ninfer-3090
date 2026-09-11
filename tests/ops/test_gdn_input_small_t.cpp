@@ -31,7 +31,7 @@ constexpr std::int32_t kQkRows    = 4096;
 constexpr std::int32_t kValueZ    = 12288;
 constexpr std::int32_t kQkvRows   = 10240;
 constexpr std::int32_t kZRows     = 6144;
-constexpr std::int32_t kMaxTokens = 8;
+constexpr std::int32_t kMaxTokens = 32;
 
 std::uint16_t f32_to_bf16_rne(float f) {
     std::uint32_t bits = 0;
@@ -103,7 +103,8 @@ int main() {
         int failures = 0;
         std::vector<std::uint16_t> a(qkv_bytes / 2), b(qkv_bytes / 2);
         std::vector<std::uint16_t> az(z_bytes / 2), bz(z_bytes / 2);
-        for (std::int32_t tokens = 1; tokens <= kMaxTokens; ++tokens) {
+        for (const std::int32_t tokens :
+             {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 15, 16, 17, 20, 24, 31, 32}) {
             Tensor x(device_x.data(), DType::BF16, {kHidden, tokens});
             Tensor rq(ref_qkv.data(), DType::BF16, {kQkvRows, tokens});
             Tensor rz(ref_z.data(), DType::BF16, {kZRows, tokens});
@@ -114,9 +115,11 @@ int main() {
             // A sentinel no real output takes, so an element the candidate never wrote shows up.
             out_qkv.fill(0xff);
             out_z.fill(0xff);
+            // IndependentDirectFixed runs to 15 columns; the routed 32-wide tile covers the rest.
             ninfer::ops::detail::q4_q5_gdn_input_execute_schedule(
-                Q4Q5GdnInputScheduleId::IndependentDirectFixed, x, qk_weight, vz_weight, rq, rz,
-                nullptr);
+                tokens <= 15 ? Q4Q5GdnInputScheduleId::IndependentDirectFixed
+                             : Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C32,
+                x, qk_weight, vz_weight, rq, rz, nullptr);
             ninfer::ops::detail::q4_q5_gdn_input_execute_schedule(
                 Q4Q5GdnInputScheduleId::SmallTMma, x, qk_weight, vz_weight, oq, oz, nullptr);
             ninfer::test::cuda_check(cudaDeviceSynchronize(), "GDN input schedules");
@@ -130,7 +133,7 @@ int main() {
             failures += compare("z", tokens, az, bz, z_elements);
         }
         std::cout << (failures == 0 ? "OK" : "FAIL")
-                  << " GDN input small-T MMA matches IndependentDirectFixed at T=1..8\n";
+                  << " GDN input small-T MMA matches the reference schedules at T=1..32\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << "GDN input small-T MMA test failed: " << error.what() << '\n';

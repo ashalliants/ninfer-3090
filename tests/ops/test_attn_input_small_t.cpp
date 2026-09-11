@@ -28,7 +28,7 @@ constexpr std::int32_t kHidden    = 5120;
 constexpr std::int32_t kParent    = 7168;
 constexpr std::int32_t kQueryRows = 6144;
 constexpr std::int32_t kKvRows    = 1024;
-constexpr std::int32_t kMaxTokens = 8;
+constexpr std::int32_t kMaxTokens = 32;
 
 std::uint16_t f32_to_bf16_rne(float f) {
     std::uint32_t bits = 0;
@@ -113,7 +113,8 @@ int main() {
                ninfer::test::GuardedDeviceBuffer(bytes(kKvRows)), kKvRows};
 
         int failures = 0;
-        for (std::int32_t tokens = 1; tokens <= kMaxTokens; ++tokens) {
+        for (const std::int32_t tokens :
+             {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 15, 16, 17, 20, 24, 31, 32}) {
             Tensor x(device_x.data(), DType::BF16, {kHidden, tokens});
             Tensor rq(q.reference.data(), DType::BF16, {kQueryRows, tokens});
             Tensor rg(gate.reference.data(), DType::BF16, {kQueryRows, tokens});
@@ -127,8 +128,14 @@ int main() {
                 p->reference.fill(0);
                 p->candidate.fill(0xff); // a sentinel, so an unwritten element fails
             }
-            ninfer::ops::detail::q4_q5_attn_input_small_t_launch(x, qk_weight, gv_weight, rq, rg,
-                                                                 rk, rv, nullptr);
+            // ParentSplitFixed runs to 12 columns; the routed r32/c32 tile covers the rest.
+            if (tokens <= 12) {
+                ninfer::ops::detail::q4_q5_attn_input_small_t_launch(x, qk_weight, gv_weight, rq,
+                                                                     rg, rk, rv, nullptr);
+            } else {
+                ninfer::ops::detail::q4_q5_attn_input_grouped_mma_r32_c32_s4_launch(
+                    x, qk_weight, gv_weight, rq, rg, rk, rv, nullptr);
+            }
             ninfer::ops::detail::q4_q5_attn_input_small_t_mma_launch(x, qk_weight, gv_weight, cq,
                                                                      cg, ck, cv, nullptr);
             ninfer::test::cuda_check(cudaDeviceSynchronize(), "attention input schedules");
@@ -138,7 +145,7 @@ int main() {
             failures += compare("v", tokens, v);
         }
         std::cout << (failures == 0 ? "OK" : "FAIL")
-                  << " attention input small-T MMA matches ParentSplitFixed at T=1..8\n";
+                  << " attention input small-T MMA matches the reference schedules at T=1..32\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << "attention input small-T MMA test failed: " << error.what() << '\n';

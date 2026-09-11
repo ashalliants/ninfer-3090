@@ -46,6 +46,7 @@ void launch_value_z(const Tensor& x, const Weight& w, Tensor& value, Tensor& z,
             epilogue, x.ne[1]);
 }
 
+template <int TileCols>
 void launch_qk(const Tensor& x, const Weight& w, Tensor& qk, cudaStream_t stream) {
     const SmallTSplitStore epilogue{static_cast<__nv_bfloat16*>(qk.data),
                                     static_cast<__nv_bfloat16*>(qk.data),
@@ -53,7 +54,8 @@ void launch_qk(const Tensor& x, const Weight& w, Tensor& qk, cudaStream_t stream
                                     leading_dimension(qk),
                                     kQkRows,
                                     x.ne[1]};
-    q4_small_t_mma_kernel<GdnQkGeometry, 8, 8, SmallTSplitStore, Q4SmallTMmaIdentityRows, true>
+    q4_small_t_mma_kernel<GdnQkGeometry, TileCols, TileCols, SmallTSplitStore,
+                          Q4SmallTMmaIdentityRows, true>
         <<<kQkRows / Q4DraftSmallTSchedule::kRowsPerCta, Q4DraftSmallTSchedule::kThreads, 0,
            stream>>>(static_cast<const __nv_bfloat16*>(x.data),
                      static_cast<const std::uint8_t*>(w.qdata),
@@ -67,20 +69,31 @@ void launch_qk(const Tensor& x, const Weight& w, Tensor& qk, cudaStream_t stream
 void q4_q5_gdn_input_small_t_launch(const Tensor& x, const Weight& qk_weight,
                                     const Weight& value_z_weight, Tensor& qk, Tensor& value,
                                     Tensor& z, cudaStream_t stream) {
-    if (x.ne[1] < 1 || x.ne[1] > 8) {
-        throw std::invalid_argument("Q4/Q5 GDN input small-T MMA requires T in [1,8]");
+    if (x.ne[1] < 1 || x.ne[1] > 32) {
+        throw std::invalid_argument("Q4/Q5 GDN input small-T MMA requires T in [1,32]");
     }
     if (x.ne[0] != kHidden || qk_weight.n != kQkRows || value_z_weight.n != kValueZRows ||
         qk_weight.padded_shape[1] != kHidden || value_z_weight.padded_shape[1] != kHidden) {
         throw std::invalid_argument("Q4/Q5 GDN input small-T MMA: unsupported shape");
     }
-    if (x.ne[1] <= 4) {
+    const int columns = x.ne[1];
+    if (columns <= 4) {
         launch_value_z<4, 2>(x, value_z_weight, value, z, stream);
-    } else {
+    } else if (columns <= 8) {
         launch_value_z<8, 1>(x, value_z_weight, value, z, stream);
+    } else if (columns <= 16) {
+        launch_value_z<16, 1>(x, value_z_weight, value, z, stream);
+    } else {
+        launch_value_z<32, 1>(x, value_z_weight, value, z, stream);
     }
     CUDA_CHECK(cudaGetLastError());
-    launch_qk(x, qk_weight, qk, stream);
+    if (columns <= 8) {
+        launch_qk<8>(x, qk_weight, qk, stream);
+    } else if (columns <= 16) {
+        launch_qk<16>(x, qk_weight, qk, stream);
+    } else {
+        launch_qk<32>(x, qk_weight, qk, stream);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

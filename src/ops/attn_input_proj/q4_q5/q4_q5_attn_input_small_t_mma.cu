@@ -48,10 +48,11 @@ void launch_gate_value(const Tensor& x, const Weight& w, Tensor& gate, Tensor& v
             split_store(gate, v, x.ne[1]), x.ne[1]);
 }
 
+template <int TileCols>
 void launch_query_key(const Tensor& x, const Weight& w, Tensor& q, Tensor& k,
                       cudaStream_t stream) {
-    q4_small_t_mma_kernel<AttnQueryKeyGeometry, 8, 8, SmallTSplitStore, Q4SmallTMmaIdentityRows,
-                          true>
+    q4_small_t_mma_kernel<AttnQueryKeyGeometry, TileCols, TileCols, SmallTSplitStore,
+                          Q4SmallTMmaIdentityRows, true>
         <<<kParentRows / Q4DraftSmallTSchedule::kRowsPerCta, Q4DraftSmallTSchedule::kThreads, 0,
            stream>>>(static_cast<const __nv_bfloat16*>(x.data),
                      static_cast<const std::uint8_t*>(w.qdata),
@@ -65,21 +66,32 @@ void launch_query_key(const Tensor& x, const Weight& w, Tensor& q, Tensor& k,
 void q4_q5_attn_input_small_t_mma_launch(const Tensor& x, const Weight& query_key_weight,
                                          const Weight& gate_value_weight, Tensor& q, Tensor& gate,
                                          Tensor& k, Tensor& v, cudaStream_t stream) {
-    if (x.ne[1] < 1 || x.ne[1] > 8) {
-        throw std::invalid_argument("Q4/Q5 attention input small-T MMA requires T in [1,8]");
+    if (x.ne[1] < 1 || x.ne[1] > 32) {
+        throw std::invalid_argument("Q4/Q5 attention input small-T MMA requires T in [1,32]");
     }
     if (x.ne[0] != kHidden || query_key_weight.n != kParentRows ||
         gate_value_weight.n != kParentRows || query_key_weight.padded_shape[1] != kHidden ||
         gate_value_weight.padded_shape[1] != kHidden) {
         throw std::invalid_argument("Q4/Q5 attention input small-T MMA: unsupported shape");
     }
-    if (x.ne[1] <= 4) {
+    const int columns = x.ne[1];
+    if (columns <= 4) {
         launch_gate_value<4, 2>(x, gate_value_weight, gate, v, stream);
-    } else {
+    } else if (columns <= 8) {
         launch_gate_value<8, 1>(x, gate_value_weight, gate, v, stream);
+    } else if (columns <= 16) {
+        launch_gate_value<16, 1>(x, gate_value_weight, gate, v, stream);
+    } else {
+        launch_gate_value<32, 1>(x, gate_value_weight, gate, v, stream);
     }
     CUDA_CHECK(cudaGetLastError());
-    launch_query_key(x, query_key_weight, q, k, stream);
+    if (columns <= 8) {
+        launch_query_key<8>(x, query_key_weight, q, k, stream);
+    } else if (columns <= 16) {
+        launch_query_key<16>(x, query_key_weight, q, k, stream);
+    } else {
+        launch_query_key<32>(x, query_key_weight, q, k, stream);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -1,5 +1,5 @@
-// The Q5 small-T MMA residual kernels against the SIMT kernels they would replace (the T=1 GEMV and
-// split2 at T=2..8), on both registered K, with a nonzero residual. The MMA folds groups in a
+// The Q5 small-T MMA residual kernel against the kernels it would replace (the T=1 GEMV, split2 at
+// T=2..16 and the c32 MMA tile above that), at T=1..32 on both registered K, with a nonzero residual. The MMA folds groups in a
 // different order from the SIMT kernels, so agreement is held to one bf16 rounding step of the
 // result rather than bit equality. Each case runs three times and must give identical bytes every
 // time.
@@ -26,7 +26,7 @@ using ninfer::QType;
 using ninfer::Tensor;
 
 constexpr std::int32_t kRows      = 5120;
-constexpr std::int32_t kMaxTokens = 8;
+constexpr std::int32_t kMaxTokens = 32;
 
 std::uint16_t f32_to_bf16_rne(float f) {
     std::uint32_t bits = 0;
@@ -75,7 +75,7 @@ int run_k(std::int32_t k) {
     int failures = 0;
     std::vector<std::uint16_t> reference(residual.size());
     std::vector<std::uint16_t> candidate(residual.size());
-    for (std::int32_t tokens = 1; tokens <= kMaxTokens; ++tokens) {
+    for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 15, 16, 17, 20, 24, 31, 32}) {
         const std::size_t elements = static_cast<std::size_t>(kRows) * tokens;
         Tensor x(device_x.data(), DType::BF16, {k, tokens});
         Tensor out_a(reference_out.data(), DType::BF16, {kRows, tokens});
@@ -84,8 +84,10 @@ int run_k(std::int32_t k) {
         candidate_out.copy_from_host(residual.data(), elements * 2);
         if (tokens == 1) {
             ninfer::ops::detail::q5_linear_add_gemv_residual_launch(x, weight, out_a, nullptr);
-        } else {
+        } else if (tokens <= 16) {
             ninfer::ops::detail::q5_linear_add_split2_exact_launch(x, weight, out_a, nullptr);
+        } else {
+            ninfer::ops::detail::q5_linear_add_mma_r64_c32_launch(x, weight, out_a, nullptr);
         }
         ninfer::test::cuda_check(cudaDeviceSynchronize(), "q5 linear_add reference");
         reference_out.copy_to_host(reference.data(), elements * 2);
@@ -97,7 +99,7 @@ int run_k(std::int32_t k) {
             std::int32_t max_tokens;
         };
         const Variant variants[] = {
-            {"small_t", &ninfer::ops::detail::q5_linear_add_small_t_mma_launch, 8},
+            {"small_t", &ninfer::ops::detail::q5_linear_add_small_t_mma_launch, 32},
         };
         for (const Variant& variant : variants) {
             if (tokens > variant.max_tokens) continue;
@@ -152,7 +154,7 @@ int main() {
     try {
         const int failures = run_k(6144) + run_k(17408);
         std::cout << (failures == 0 ? "OK" : "FAIL")
-                  << " Q5 LinearAdd small-T MMA matches the SIMT kernels at T=1..8, "
+                  << " Q5 LinearAdd small-T MMA matches the reference kernels at T=1..32, "
                      "K=6144/17408\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

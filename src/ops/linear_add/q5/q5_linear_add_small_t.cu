@@ -48,16 +48,21 @@ void launch(const Tensor& x, const Weight& w, Tensor& residual_out, cudaStream_t
 }
 
 // A 5120-row matrix is 320 CTAs, under four per SM. Up to four columns stage a four-column
-// activation tile, which leaves room for a two-deep cp.async ring at four CTAs per SM; five to
-// eight columns stage all eight with a single stage. Splitting K over three CTAs per row tile
+// activation tile, which leaves room for a two-deep cp.async ring at four CTAs per SM; wider
+// extents stage 8, 16 or 32 columns with a single stage. Splitting K over three CTAs per row tile
 // (960 CTAs, two full waves, last-arriver reduction) was measured and bought 0-2.5%, not worth a
 // workspace and a counter protocol.
 template <int K>
 void launch_columns(const Tensor& x, const Weight& w, Tensor& residual_out, cudaStream_t stream) {
-    if (x.ne[1] <= 4) {
+    const int columns = x.ne[1];
+    if (columns <= 4) {
         launch<K, 4, 2>(x, w, residual_out, stream);
-    } else {
+    } else if (columns <= 8) {
         launch<K, 8, 1>(x, w, residual_out, stream);
+    } else if (columns <= 16) {
+        launch<K, 16, 1>(x, w, residual_out, stream);
+    } else {
+        launch<K, 32, 1>(x, w, residual_out, stream);
     }
 }
 
@@ -65,8 +70,8 @@ void launch_columns(const Tensor& x, const Weight& w, Tensor& residual_out, cuda
 
 void q5_linear_add_small_t_mma_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                       cudaStream_t stream) {
-    if (x.ne[1] < 1 || x.ne[1] > 8) {
-        throw std::invalid_argument("q5 linear_add small-T MMA: T must be in [1,8]");
+    if (x.ne[1] < 1 || x.ne[1] > 32) {
+        throw std::invalid_argument("q5 linear_add small-T MMA: T must be in [1,32]");
     }
     if (residual_out.ne[0] != kRows || w.n != kRows) {
         throw std::invalid_argument("q5 linear_add small-T MMA: rows must be 5120");

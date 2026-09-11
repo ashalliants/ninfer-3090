@@ -63,7 +63,7 @@ struct Schedule {
 
 const Schedule kSchedules[] = {
     {"independent_direct", Id::IndependentDirectFixed, 15},
-    {"small_t_mma", Id::SmallTMma, 8},
+    {"small_t_mma", Id::SmallTMma, 32},
     {"grouped_r64_c8", Id::GroupedMixedMmaR64C8, 0},
     {"grouped_r64_c16", Id::GroupedMixedMmaR64C16, 0},
     {"grouped_r64_c32", Id::GroupedMixedMmaR64C32, 0},
