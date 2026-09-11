@@ -41,6 +41,11 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             if (t == 1) { return launch_q4_gemv_r4_w1_direct; }
             if (t <= 8) { return launch_q4_draft_head_small_t; }
             return launch_q4_mma_r64_c128;
+        case 248320:
+            // The vocabulary head requantized from W8 (q4_requantize.h).
+            if (t == 1) { return launch_q4_gemv_r4_w1_direct; }
+            if (t <= 32) { return launch_q4_small_t_rows; }
+            return launch_q4_mma_r64_c128;
         default:
             break;
         }

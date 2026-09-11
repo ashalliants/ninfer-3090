@@ -1,5 +1,11 @@
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
 
+#include "core/device.h"
+#include "ops/linear/q4/q4_requantize.h"
+
+#include <cstdio>
+#include <cstdlib>
+
 #include "artifact/typed_binding.h"
 #include "core/evictable_weight_pool.h"
 
@@ -693,6 +699,16 @@ LoadedModelData::LoadedModelData(std::vector<BindingPlan> plans,
     final_norm =
         artifact::materialized_tensor(backing, plan.final_norm, NumericFormat::BF16, {5120});
     output_head = materialized_weight(backing, plan.output_head, 248320, 5120);
+    // EXPERIMENT (perf/quality-trades): NINFER_LM_HEAD_Q4=1 requantizes the W8 vocabulary head to
+    // Q4G64 in place. Not with overlay vision (an evicted head is restored as W8 bytes) or DFlash
+    // (its linear_topk reads the W8 head).
+    if (const char* env = std::getenv("NINFER_LM_HEAD_Q4");
+        env != nullptr && env[0] == '1' && output_head.qtype == QType::W8G32_F16S &&
+        !plan.features.overlay_vision() && !plan.features.masked_draft()) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+        ops::requantize_w8g32_to_q4g64_in_place(output_head, nullptr);
+        std::fprintf(stderr, "lm_head: requantized W8G32 -> Q4G64 in place (NINFER_LM_HEAD_Q4)\n");
+    }
     if (plan.features.optimized_proposal()) {
         auto& proposal     = runtime.optimized_proposal.emplace();
         proposal.head      = artifact::materialized_weight(backing, plan.draft_head,

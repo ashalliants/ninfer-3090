@@ -1,6 +1,7 @@
 #include "ops/linear/q4/q4_launch.h"
 
 #include "core/device.h"
+#include "ops/common/small_t_split_store.cuh"
 #include "ops/linear/q4/q4_small_t_mma.cuh"
 
 #include <array>
@@ -30,6 +31,27 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
     CUDA_CHECK(cudaGetLastError());
 }
 
+// Any K = 5120 matrix whose rows are a whole number of 128-row CTAs, rows carried by the store
+// rather than the geometry; the 16-32-column tiles share staged activation slabs as gate_up does
+// (q4_linear_swiglu_gemv.cu has that layout sweep).
+template <int TileTokens, int KWarps, int Stages, int TilesPerWarp>
+void launch_rows(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    const int rows = weight.n;
+    const SmallTSplitStore store{static_cast<__nv_bfloat16*>(out.data),
+                                 static_cast<__nv_bfloat16*>(out.data),
+                                 rows,
+                                 rows,
+                                 rows,
+                                 x.ne[1]};
+    q4_small_t_mma_launch<FullGeometry, TileTokens, TileTokens, SmallTSplitStore,
+                          Q4SmallTMmaIdentityRows, true, KWarps, Stages, TilesPerWarp>(
+        rows / SmallTLayout<KWarps, TilesPerWarp>::kRowsPerCta, stream,
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(out.data),
+        store, Q4SmallTMmaIdentityRows{}, x.ne[1]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 template <class Geometry, int First, std::size_t... Offsets>
 constexpr auto make_launchers(std::index_sequence<Offsets...>) {
     return std::array<Q4Launch, sizeof...(Offsets)>{
@@ -49,6 +71,24 @@ bool matches(const Tensor& x, const Weight& weight) {
 }
 
 } // namespace
+
+void launch_q4_small_t_rows(const Tensor& x, const Weight& weight, Tensor& out,
+                            cudaStream_t stream) {
+    const int t = x.ne[1];
+    if (weight.k != FullGeometry::kInputRows || weight.padded_shape[1] != weight.k ||
+        weight.n % 128 != 0 || t < 2 || t > 32) {
+        throw std::invalid_argument("Q4 Linear small-T rows: unsupported problem");
+    }
+    if (t <= 8) {
+        launch_rows<8, 8, 1, 1>(x, weight, out, stream);
+    } else if (t <= 16) {
+        launch_rows<16, 4, 1, 1>(x, weight, out, stream);
+    } else if (t <= 24) {
+        launch_rows<24, 4, 2, 2>(x, weight, out, stream);
+    } else {
+        launch_rows<32, 2, 2, 1>(x, weight, out, stream);
+    }
+}
 
 void launch_q4_draft_head_small_t(const Tensor& x, const Weight& weight, Tensor& out,
                                   cudaStream_t stream) {

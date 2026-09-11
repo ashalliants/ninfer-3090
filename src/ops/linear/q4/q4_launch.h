@@ -16,6 +16,7 @@ void launch_q4_simt_r8_c4(const Tensor& x, const Weight& w, Tensor& out, cudaStr
 void launch_q4_simt_r8_c8(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 void launch_q4_draft_head_small_t(const Tensor& x, const Weight& w, Tensor& out,
                                   cudaStream_t stream);
+void launch_q4_small_t_rows(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 void launch_q4_mma_r64_c32(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 void launch_q4_mma_r64_c48(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 void launch_q4_mma_r64_c56(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
