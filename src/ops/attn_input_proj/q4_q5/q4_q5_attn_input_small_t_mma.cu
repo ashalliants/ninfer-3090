@@ -42,7 +42,7 @@ template <int XCols, int Stages>
 void launch_gate_value(const Tensor& x, const Weight& w, Tensor& gate, Tensor& v,
                        cudaStream_t stream) {
     q5_small_t_mma_kernel<kParentRows, kHidden, XCols, Stages, SmallTSplitStore>
-        <<<kParentRows / Q5SmallTSchedule::kRowsPerCta, Q5SmallTSchedule::kThreads, 0, stream>>>(
+        <<<kParentRows / Q5SmallTSchedule<8>::kRowsPerCta, Q5SmallTSchedule<8>::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
             split_store(gate, v, x.ne[1]), x.ne[1]);

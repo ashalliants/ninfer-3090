@@ -42,7 +42,7 @@ struct Q4SwiGluSmallTGeometry {
 };
 
 struct Q4SwiGluSmallTRows {
-    static constexpr int kOutputRowsPerCta = 8;
+    static constexpr int kOutputRowsPerTile = 8;
 
     __device__ __forceinline__ int weight_row(int output_row0, int local_row) const {
         return output_row0 + (local_row & 7) + (local_row >= 8 ? kIntermediate : 0);
@@ -72,7 +72,7 @@ template <int ActiveCols>
 void launch_small_t_active(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     constexpr int TileCols =
         ActiveCols <= 8 ? 8 : (ActiveCols <= 16 ? 16 : (ActiveCols <= 24 ? 24 : 32));
-    constexpr int kBlocks = kIntermediate / Q4SwiGluSmallTRows::kOutputRowsPerCta;
+    constexpr int kBlocks = kIntermediate / Q4SwiGluSmallTRows::kOutputRowsPerTile;
     const Q4SwiGluSmallTEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data), x.ne[1]};
     q4_small_t_mma_kernel<Q4SwiGluSmallTGeometry, TileCols, ActiveCols, Q4SwiGluSmallTEpilogue,
                           Q4SwiGluSmallTRows, true>

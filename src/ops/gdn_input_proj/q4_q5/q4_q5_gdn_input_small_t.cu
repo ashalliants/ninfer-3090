@@ -40,7 +40,7 @@ void launch_value_z(const Tensor& x, const Weight& w, Tensor& value, Tensor& z,
                                     kValueRows,
                                     x.ne[1]};
     q5_small_t_mma_kernel<kValueZRows, kHidden, XCols, Stages, SmallTSplitStore>
-        <<<kValueZRows / Q5SmallTSchedule::kRowsPerCta, Q5SmallTSchedule::kThreads, 0, stream>>>(
+        <<<kValueZRows / Q5SmallTSchedule<8>::kRowsPerCta, Q5SmallTSchedule<8>::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
             epilogue, x.ne[1]);

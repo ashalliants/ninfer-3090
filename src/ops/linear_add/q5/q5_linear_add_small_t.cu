@@ -41,7 +41,7 @@ void launch(const Tensor& x, const Weight& w, Tensor& residual_out, cudaStream_t
     const Q5SmallTResidualEpilogue epilogue{static_cast<__nv_bfloat16*>(residual_out.data),
                                             x.ne[1]};
     q5_small_t_mma_kernel<kRows, K, XCols, Stages, Q5SmallTResidualEpilogue>
-        <<<kRows / Q5SmallTSchedule::kRowsPerCta, Q5SmallTSchedule::kThreads, 0, stream>>>(
+        <<<kRows / Q5SmallTSchedule<8>::kRowsPerCta, Q5SmallTSchedule<8>::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
             epilogue, x.ne[1]);
