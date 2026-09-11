@@ -50,45 +50,45 @@ __device__ __forceinline__ unsigned q5_small_t_bf16_pair(unsigned packed, unsign
     return *reinterpret_cast<const unsigned*>(&pair);
 }
 
-// Rows: output rows. K: reduction length, a multiple of 512. TileCols: MMA column tile (8..32);
-// columns past `columns` are zero-filled, not read. Epilogue::store(row, col0, v) receives, for the
-// lane's rows row and row + 8, v.x = (row, col0), v.y = (row, col0 + 1), v.z = (row + 8, col0),
-// v.w = (row + 8, col0 + 1); columns at or past `columns` must be ignored by the epilogue.
-template <int Rows, int K, int TileCols, class Epilogue>
-__launch_bounds__(256, 6) __global__
+// Rows: output rows. K: reduction length, a multiple of 512. XCols: activation columns staged
+// (4 or 8); the MMA column tile is always 8, and the B-fragment rows of columns at or past
+// `columns` are pointed at a zeroed 16-byte row instead of being staged, so a four-column extent
+// carries half the activation tile. Stages: depth of the cp.async ring (1 or 2). Epilogue::store(
+// row, col0, v) receives, for the lane's rows row and row + 8, v.x = (row, col0), v.y = (row,
+// col0 + 1), v.z = (row + 8, col0), v.w = (row + 8, col0 + 1); columns at or past `columns` must
+// be ignored by the epilogue.
+template <int Rows, int K, int XCols, int Stages, class Epilogue>
+__launch_bounds__(256, 4) __global__
     void q5_small_t_mma_kernel(const __nv_bfloat16* __restrict__ x,
                                const std::uint8_t* __restrict__ codes,
                                const std::uint8_t* __restrict__ high_bits,
                                const std::uint8_t* __restrict__ scales, Epilogue epilogue,
                                int columns) {
-    using Schedule             = Q5SmallTSchedule;
-    constexpr int kTileK       = Schedule::kTileKPerWarp;
-    constexpr int kWarps       = Schedule::kKWarps;
-    constexpr int kRowsPerCta  = Schedule::kRowsPerCta;
-    constexpr int kGroupK      = Schedule::kGroupK;
-    constexpr int kSlabs       = K / kGroupK;
+    using Schedule              = Q5SmallTSchedule;
+    constexpr int kTileK        = Schedule::kTileKPerWarp;
+    constexpr int kWarps        = Schedule::kKWarps;
+    constexpr int kRowsPerCta   = Schedule::kRowsPerCta;
+    constexpr int kGroupK       = Schedule::kGroupK;
+    constexpr int kSlabs        = K / kGroupK;
     constexpr int kGroupsPerRow = K / 64;
-    constexpr int kNt          = TileCols / 8;
-    static_assert(TileCols >= 8 && TileCols <= 32 && (TileCols % 8) == 0);
+    static_assert(XCols == 4 || XCols == 8);
+    static_assert(Stages == 1 || Stages == 2);
     static_assert(K % kGroupK == 0, "K must be a whole number of 512-wide slabs");
     static_assert(Rows % kRowsPerCta == 0);
 
+    struct Stage {
+        std::uint8_t codes[kRowsPerCta][Schedule::kCodeRowBytes + Schedule::kRowPad];
+        std::uint8_t high[kRowsPerCta][Schedule::kHighRowBytes + Schedule::kRowPad];
+        __nv_bfloat16 activations[kWarps][XCols * kTileK];
+        std::uint16_t scales[kRowsPerCta][kWarps];
+    };
     union SharedStorage {
-        struct {
-            std::uint8_t codes[kRowsPerCta][Schedule::kCodeRowBytes + Schedule::kRowPad];
-            std::uint8_t high[kRowsPerCta][Schedule::kHighRowBytes + Schedule::kRowPad];
-            __nv_bfloat16 activations[kWarps][TileCols * kTileK];
-            std::uint16_t scales[kRowsPerCta][kWarps];
-        } staging;
-
-        float partial[kWarps * kNt * 32 * 4];
+        Stage stages[Stages];
+        float partial[kWarps * 32 * 4];
     };
 
     __shared__ __align__(16) SharedStorage shared;
-    auto& code_shared  = shared.staging.codes;
-    auto& high_shared  = shared.staging.high;
-    auto& x_shared     = shared.staging.activations;
-    auto& scale_shared = shared.staging.scales;
+    __shared__ __align__(16) __nv_bfloat16 zero_row[8];
 
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -96,147 +96,130 @@ __launch_bounds__(256, 6) __global__
     const int gid  = lane >> 2;
     const int lid  = lane & 3;
     const int row0 = static_cast<int>(blockIdx.x) * kRowsPerCta;
+    if (tid < 8) { zero_row[tid] = __float2bfloat16_rn(0.0f); }
 
-    const auto stage_x = [&](int slab_k0) {
-        constexpr int kItems = TileCols * (kTileK / 8);
-        for (int item = lane; item < kItems; item += 32) {
-            const int col    = item / (kTileK / 8);
-            const int k8     = item - col * (kTileK / 8);
-            const int source = col < columns ? col : 0;
-            cp_async_zfill<16>(&x_shared[warp][col * kTileK + q5_small_t_swizzle_64(col, k8 * 8)],
-                               &x[static_cast<std::int64_t>(source) * K + slab_k0 + warp * kTileK +
-                                  k8 * 8],
-                               col < columns ? 16 : 0);
+    const auto stage_x = [&](int slab_k0, Stage& stage) {
+        const int items = columns * (kTileK / 8);
+        for (int item = lane; item < items; item += 32) {
+            const int col = item / (kTileK / 8);
+            const int k8  = item - col * (kTileK / 8);
+            cp_async<16>(&stage.activations[warp][col * kTileK + q5_small_t_swizzle_64(col, k8 * 8)],
+                         &x[static_cast<std::int64_t>(col) * K + slab_k0 + warp * kTileK + k8 * 8]);
         }
     };
 
-    const auto stage_weight = [&](int slab_k0) {
+    const auto stage_weight = [&](int slab_k0, Stage& stage) {
 #pragma unroll
         for (int row_item = 0; row_item < Schedule::kRowsPerLoaderWarp; ++row_item) {
             const int row        = warp * Schedule::kRowsPerLoaderWarp + row_item;
             const std::int64_t r = row0 + row;
             if (lane < Schedule::kCodeRowBytes / 16) {
-                cp_async<16, Cache::cg>(&code_shared[row][lane * 16],
+                cp_async<16, Cache::cg>(&stage.codes[row][lane * 16],
                                         codes + r * (K / 2) + slab_k0 / 2 + lane * 16);
             } else if (lane < Schedule::kCodeRowBytes / 16 + Schedule::kHighRowBytes / 16) {
                 const int chunk = lane - Schedule::kCodeRowBytes / 16;
-                cp_async<16, Cache::cg>(&high_shared[row][chunk * 16],
+                cp_async<16, Cache::cg>(&stage.high[row][chunk * 16],
                                         high_bits + r * (K / 8) + slab_k0 / 8 + chunk * 16);
             } else if (lane == Schedule::kCodeRowBytes / 16 + Schedule::kHighRowBytes / 16) {
-                cp_async<16>(&scale_shared[row][0],
-                             scales + (r * kGroupsPerRow + slab_k0 / 64) * 2);
+                cp_async<16>(&stage.scales[row][0], scales + (r * kGroupsPerRow + slab_k0 / 64) * 2);
             }
         }
     };
 
-    const int b_rin     = lane & 7;
+    const auto issue_slab = [&](int slab) {
+        if (slab < kSlabs) {
+            Stage& stage = shared.stages[slab % Stages];
+            stage_weight(slab * kGroupK, stage);
+            stage_x(slab * kGroupK, stage);
+        }
+        cp_commit(); // empty commits keep cp_wait<Stages - 1> exact through the tail
+    };
+
+    const int b_col     = lane & 7;
     const int b_koff    = ((lane >> 3) & 1) << 3;
+    const bool b_live   = b_col < columns;
     const int warp_byte = warp * (kTileK / 2);
     const int high_byte = warp * (kTileK / 8);
     const int shift     = lid * 2;
-    float acc[kNt][4]   = {};
+    float acc[4]        = {};
 
-    stage_weight(0);
-    stage_x(0);
-    cp_commit();
-    cp_wait<0>();
-    __syncthreads();
+#pragma unroll
+    for (int prefetch = 0; prefetch < Stages - 1; ++prefetch) { issue_slab(prefetch); }
 
 #pragma unroll 1
     for (int slab = 0; slab < kSlabs; ++slab) {
-        float group_acc[kNt][4] = {};
+        issue_slab(slab + Stages - 1);
+        cp_wait<Stages - 1>();
+        __syncthreads();
 
+        const Stage& stage = shared.stages[slab % Stages];
+        float group_acc[4] = {};
 #pragma unroll
         for (int ks = 0; ks < 4; ++ks) {
             // byte_col & 3 == lid, so this lane's two high bits sit at the same shift in every
             // high byte it reads; the +4 byte's bits are in the next high byte.
             const int byte_col   = warp_byte + ks * 8 + lid;
             const int high_col   = high_byte + ks * 2;
-            const unsigned h_top = static_cast<unsigned>(high_shared[gid][high_col]) >> shift;
-            const unsigned h_bot = static_cast<unsigned>(high_shared[gid + 8][high_col]) >> shift;
-            const unsigned h_top2 =
-                static_cast<unsigned>(high_shared[gid][high_col + 1]) >> shift;
+            const unsigned h_top = static_cast<unsigned>(stage.high[gid][high_col]) >> shift;
+            const unsigned h_bot = static_cast<unsigned>(stage.high[gid + 8][high_col]) >> shift;
+            const unsigned h_top2 = static_cast<unsigned>(stage.high[gid][high_col + 1]) >> shift;
             const unsigned h_bot2 =
-                static_cast<unsigned>(high_shared[gid + 8][high_col + 1]) >> shift;
-            const unsigned af0 = q5_small_t_bf16_pair(code_shared[gid][byte_col], h_top);
-            const unsigned af1 = q5_small_t_bf16_pair(code_shared[gid + 8][byte_col], h_bot);
-            const unsigned af2 = q5_small_t_bf16_pair(code_shared[gid][byte_col + 4], h_top2);
-            const unsigned af3 = q5_small_t_bf16_pair(code_shared[gid + 8][byte_col + 4], h_bot2);
-#pragma unroll
-            for (int nt = 0; nt < kNt; ++nt) {
-                unsigned bf0, bf1;
-                const int br = nt * 8 + b_rin;
-                ldmatrix_x2(bf0, bf1,
-                            smem_addr(&x_shared[warp][br * kTileK +
-                                                      q5_small_t_swizzle_64(br, ks * 16 + b_koff)]));
-                mma_bf16(group_acc[nt][0], group_acc[nt][1], group_acc[nt][2], group_acc[nt][3],
-                         af0, af1, af2, af3, bf0, bf1);
-            }
+                static_cast<unsigned>(stage.high[gid + 8][high_col + 1]) >> shift;
+            const unsigned af0 = q5_small_t_bf16_pair(stage.codes[gid][byte_col], h_top);
+            const unsigned af1 = q5_small_t_bf16_pair(stage.codes[gid + 8][byte_col], h_bot);
+            const unsigned af2 = q5_small_t_bf16_pair(stage.codes[gid][byte_col + 4], h_top2);
+            const unsigned af3 = q5_small_t_bf16_pair(stage.codes[gid + 8][byte_col + 4], h_bot2);
+            unsigned bf0, bf1;
+            ldmatrix_x2(bf0, bf1,
+                        smem_addr(b_live ? &stage.activations[warp][b_col * kTileK +
+                                                                    q5_small_t_swizzle_64(
+                                                                        b_col, ks * 16 + b_koff)]
+                                         : &zero_row[0]));
+            mma_bf16(group_acc[0], group_acc[1], group_acc[2], group_acc[3], af0, af1, af2, af3,
+                     bf0, bf1);
         }
 
-        const float top_scale = __half2float(__ushort_as_half(scale_shared[gid][warp]));
-        const float bot_scale = __half2float(__ushort_as_half(scale_shared[gid + 8][warp]));
-#pragma unroll
-        for (int nt = 0; nt < kNt; ++nt) {
-            acc[nt][0] = fmaf(group_acc[nt][0], top_scale, acc[nt][0]);
-            acc[nt][1] = fmaf(group_acc[nt][1], top_scale, acc[nt][1]);
-            acc[nt][2] = fmaf(group_acc[nt][2], bot_scale, acc[nt][2]);
-            acc[nt][3] = fmaf(group_acc[nt][3], bot_scale, acc[nt][3]);
-        }
-
-        if (slab + 1 < kSlabs) {
-            __syncthreads();
-            stage_weight((slab + 1) * kGroupK);
-            stage_x((slab + 1) * kGroupK);
-            cp_commit();
-            cp_wait<0>();
-            __syncthreads();
-        }
+        const float top_scale = __half2float(__ushort_as_half(stage.scales[gid][warp]));
+        const float bot_scale = __half2float(__ushort_as_half(stage.scales[gid + 8][warp]));
+        acc[0]                = fmaf(group_acc[0], top_scale, acc[0]);
+        acc[1]                = fmaf(group_acc[1], top_scale, acc[1]);
+        acc[2]                = fmaf(group_acc[2], bot_scale, acc[2]);
+        acc[3]                = fmaf(group_acc[3], bot_scale, acc[3]);
+        // The next iteration's issue_slab writes the stage this one just read.
+        __syncthreads();
     }
+    cp_wait<0>();
 
     // Reduce the eight K partials: odd warps publish, even warps fold their neighbour, then warp 0
     // sums the even warps -- the same order as the Q4 kernel.
     __syncthreads();
     auto* partial = shared.partial;
     if ((warp & 1) != 0) {
-#pragma unroll
-        for (int nt = 0; nt < kNt; ++nt) {
-            store_vec(partial + ((warp * kNt + nt) * 32 + lane) * 4,
-                      make_float4(acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3]));
-        }
+        store_vec(partial + (warp * 32 + lane) * 4, make_float4(acc[0], acc[1], acc[2], acc[3]));
     }
     __syncthreads();
     if ((warp & 1) == 0) {
-#pragma unroll
-        for (int nt = 0; nt < kNt; ++nt) {
-            const float4 partner =
-                load_vec<float4>(partial + (((warp + 1) * kNt + nt) * 32 + lane) * 4);
-            acc[nt][0] += partner.x;
-            acc[nt][1] += partner.y;
-            acc[nt][2] += partner.z;
-            acc[nt][3] += partner.w;
-            if (warp != 0) {
-                store_vec(partial + ((warp * kNt + nt) * 32 + lane) * 4,
-                          make_float4(acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3]));
-            }
+        const float4 partner = load_vec<float4>(partial + ((warp + 1) * 32 + lane) * 4);
+        acc[0] += partner.x;
+        acc[1] += partner.y;
+        acc[2] += partner.z;
+        acc[3] += partner.w;
+        if (warp != 0) {
+            store_vec(partial + (warp * 32 + lane) * 4, make_float4(acc[0], acc[1], acc[2], acc[3]));
         }
     }
     __syncthreads();
     if (warp == 0) {
+        float4 sum = make_float4(acc[0], acc[1], acc[2], acc[3]);
 #pragma unroll
-        for (int nt = 0; nt < kNt; ++nt) {
-            float4 sum = make_float4(acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3]);
-#pragma unroll
-            for (int split = 2; split < kWarps; split += 2) {
-                const float4 value =
-                    load_vec<float4>(partial + ((split * kNt + nt) * 32 + lane) * 4);
-                sum.x += value.x;
-                sum.y += value.y;
-                sum.z += value.z;
-                sum.w += value.w;
-            }
-            epilogue.store(row0 + gid, nt * 8 + 2 * lid, sum);
+        for (int split = 2; split < kWarps; split += 2) {
+            const float4 value = load_vec<float4>(partial + (split * 32 + lane) * 4);
+            sum.x += value.x;
+            sum.y += value.y;
+            sum.z += value.z;
+            sum.w += value.w;
         }
+        epilogue.store(row0 + gid, 2 * lid, sum);
     }
 }
 

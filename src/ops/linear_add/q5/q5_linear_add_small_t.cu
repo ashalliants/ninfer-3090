@@ -36,11 +36,11 @@ struct Q5SmallTResidualEpilogue {
     }
 };
 
-template <int K>
+template <int K, int XCols, int Stages>
 void launch(const Tensor& x, const Weight& w, Tensor& residual_out, cudaStream_t stream) {
     const Q5SmallTResidualEpilogue epilogue{static_cast<__nv_bfloat16*>(residual_out.data),
                                             x.ne[1]};
-    q5_small_t_mma_kernel<kRows, K, 8, Q5SmallTResidualEpilogue>
+    q5_small_t_mma_kernel<kRows, K, XCols, Stages, Q5SmallTResidualEpilogue>
         <<<kRows / Q5SmallTSchedule::kRowsPerCta, Q5SmallTSchedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
@@ -57,10 +57,15 @@ void q5_linear_add_small_t_mma_launch(const Tensor& x, const Weight& w, Tensor& 
     if (residual_out.ne[0] != kRows || w.n != kRows) {
         throw std::invalid_argument("q5 linear_add small-T MMA: rows must be 5120");
     }
+    // Up to four columns stage a four-column activation tile, which leaves room for a two-deep
+    // ring at four CTAs per SM -- enough slots for all 320 CTAs in one wave.
+    const bool narrow = x.ne[1] <= 4;
     if (w.k == 6144 && w.padded_shape[1] == 6144) {
-        launch<6144>(x, w, residual_out, stream);
+        narrow ? launch<6144, 4, 2>(x, w, residual_out, stream)
+               : launch<6144, 8, 1>(x, w, residual_out, stream);
     } else if (w.k == 17408 && w.padded_shape[1] == 17408) {
-        launch<17408>(x, w, residual_out, stream);
+        narrow ? launch<17408, 4, 2>(x, w, residual_out, stream)
+               : launch<17408, 8, 1>(x, w, residual_out, stream);
     } else {
         throw std::invalid_argument("q5 linear_add small-T MMA: unsupported exact K");
     }
