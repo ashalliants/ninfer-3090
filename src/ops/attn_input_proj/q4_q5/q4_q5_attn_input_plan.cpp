@@ -76,10 +76,17 @@ struct RouteSpec {
 //   small_t     94.2   93.2  109.6  145.4  162.8  183.3  194.6  200.7
 //   r32/c32    209.9  194.6  195.6  199.7  199.7  200.7  201.7  190.5
 //
-// small_t wins through 31; at exactly 32 columns the grouped tile is full and wins by 5%.
-constexpr std::array<RouteSpec, 6> kRoutes{{
-    {{1, 31}, Q4Q5AttnInputScheduleId::SmallTMma},
-    {{32, 32}, Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR32C32S4},
+// small_t won through 31; at exactly 32 columns the grouped tile was full and won by 5%. Once its
+// 16- and 32-column tiles shared each staged activation slab between two to four row tiles
+// (ops/common/small_t_layout.cuh), same bench, median min..p95 of 31 (us):
+//
+//   T              9           16           17           24           32
+//   small_t     87.0  84..88   90.1  85..92 132.1 131..133 133.1 131..134 135.2 134..136
+//   r32/c32    209.9 209..211 197.6 197..199 201.7 200..203 201.7 201..203 191.5 189..193
+//
+// so it takes all of 1..32 and the r32/c32 tile serves nothing.
+constexpr std::array<RouteSpec, 5> kRoutes{{
+    {{1, 32}, Q4Q5AttnInputScheduleId::SmallTMma},
     {{33, 64}, Q4Q5AttnInputScheduleId::MixedR32C64S3},
     {{65, 127}, Q4Q5AttnInputScheduleId::MixedR64C128S2},
     {{128, 192}, Q4Q5AttnInputScheduleId::MixedR32C64S3},

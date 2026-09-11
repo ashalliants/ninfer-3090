@@ -210,7 +210,8 @@ int main() {
                                                                          cols})
                                .schedule;
                        })},
-                       {"attn_input_proj.q4_q5.grouped_homogeneous_pair.mma.r32.c64.s4",
+                       {"attn_input_proj.q4_q5.grouped_homogeneous_pair.mma.r32.c32.s4",
+                        "attn_input_proj.q4_q5.grouped_homogeneous_pair.mma.r32.c64.s4",
                         "attn_input_proj.q4_q5.pair.r32.c64.s3",
                         "attn_input_proj.q4_q5.pair.r32.c64.s4",
                         "attn_input_proj.q4_q5.parent_split_fixed"}));
@@ -266,7 +267,7 @@ int main() {
     //
     // All of them are kept on purpose: deleting an upstream schedule costs merge effort at every
     // future catch-up for no measured gain here. The point is that the set is written down.
-    constexpr std::size_t kExpectedUnrouted = 30;
+    constexpr std::size_t kExpectedUnrouted = 31;
     if (total != kExpectedUnrouted) {
         std::cerr << "route coverage changed: " << total << " unrouted schedules, expected "
                   << kExpectedUnrouted
