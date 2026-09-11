@@ -189,7 +189,7 @@ Ordered by expected value, not by section.
 |---|---|---|---|
 | MoE expert gather is latency-bound | 2c | split the shared W8 path out of the 9-warp block, as `sparse_moe_d3_path_tiled_kernel` already does for multi-token; then confirm the 2.2x over-fetch on d4 with `dram__bytes_read.sum` | kernel work; `ncu` for the confirm |
 | Prefill MLP GEMMs at ~30% of INT8 peak | 2c | run `admin-profile.ps1` section 3 and read issue rate vs shared-memory feeding vs occupancy | one elevated run |
-| Eight lanes buy 3.6x (3.83x since the GDN tiles) | 2c | the 4x between `mma_r64_c16` and its weight-streaming floor is the target; **not** by narrowing the tile, which was tried and lost | kernel work |
+| Eight lanes buy 3.6x (4.05x with MTP3 since the small-T kernels) | 2c | gate_up at T=32 is ~68% of the bf16 MMA peak; the 5120-row Q5 shapes need split-K at T=32 (it bought only 0-2.5% at narrow T) | kernel work |
 | KV decode falloff, 3.21x per-key on fp8 | 2c | attack the per-key dequant-into-shared cost; `rk8v4` proves the floor is reachable without a shared arena | kernel work |
 | DFlash2 5→6 cliff | 2c/3 | remainder after the GDN tiles is the grouped kernel sitting at 27% of its own weight-streaming floor | same kernel as the KV item |
 | Routed prefill pipeline-depth threshold 7/4 | 2c | sweep the constant through the product on this card — the method the source comment endorses over the operator fixture | GPU time only |
@@ -713,6 +713,14 @@ roofline finally acquired a denominator; read them before the rest.
       guess a replacement constant without that measurement.
 
 - [ ] **Eight lanes buy 3.6x, not 8x, because no kernel amortises a weight read across 2-10 rows.**
+      **2026-09-11, largely addressed:** the small-T tensor-core kernels (`q4_small_t_mma.cuh`,
+      `q5_small_t_mma.cuh`, `ops/common/small_t_layout.cuh`) now serve every 1-32-column decode
+      extent of the Q4/Q5 GEMMs, and the SIMT families in the table below have no decode
+      instances left. MTP3 reasoning cohort on a Linux RTX 3090: C1 92.9, C8 376.2 tok/s (4.05x),
+      from 63.3 and 221.5. What remains is gate_up at T=32 running at ~68% of the bf16 MMA peak, and
+      the 5120-row Q5 shapes having too few CTAs at T=32. See
+      [docs/performance.md](docs/performance.md#small-t-tensor-core-kernels-for-verify-and-cohort-decode).
+      The measurements below are the pre-small-T profile and stay for the record.
       Measured 2026-09-09 on the 27B, int8 KV, no speculation, `--decode-tokens 512
       --max-context 8192`, via `tools/bench/run_serve_concurrency.py --suite decode-saturation`:
 

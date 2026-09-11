@@ -62,6 +62,96 @@ added to the findings in this section: only single-prompt smoke numbers exist on
 far, and pasting another architecture's corpus results beside them would read as agreement that
 has not been measured. DFlash2 rows will be added here once measured on a 3090.
 
+### Small-T tensor-core kernels for verify and cohort decode
+
+**Result.** Qwen3.8-27B MTP3 decode is 1.5x faster at C1 and 1.7x at C8 than v0.9.1, with
+perplexity bit-identical. Measured before/after on one rented RTX 3090 in one session: Linux,
+CUDA 12.8, 350 W, INT8 KV, MTP3 with the optimized draft head, CUDA Graphs, greedy unless noted.
+
+| workload | v0.9.1 | small-T kernels |
+|---|---:|---:|
+| thinking-off chat, C1 (their 8 prompts, C × 1000 / mean TPOT) | 74.6 tok/s | **113.2 tok/s** |
+| thinking-off chat, C1, temperature 0.7 | 72.6 tok/s | **112.8 tok/s** |
+| thinking-off chat, C8 | 268.6 tok/s | **460.4 tok/s** |
+| reasoning cohort C1 / C2 / C4 / C8 decode | 63 / 89 / 137 / 221 | **93 / 168 / 271 / 376** |
+| `ninfer_bench` plain / MTP3 | 39.98 / 53.96 | **47.15 / 85.29** |
+| perplexity, quick corpus | 4.342425 | 4.342425 |
+
+The thinking-off prompts are
+[syv-ai/qwen38-27b-rtx3090](https://github.com/syv-ai/qwen38-27b-rtx3090)'s
+`bench/prompts_real.jsonl`. That project serves the same model on the same card through patched
+vLLM, and reports 111-124 tok/s at C1 and 407.3 at C8 with the same metric. Their card is capped
+at 250 W and they report 5-8% run-to-run spread, so C1 is parity and C8 a lead, measured on
+different machines.
+
+**Why the round cost too much.** An MTP3 verify is four token columns and a C8 cohort round is 32.
+The profile attributing an MTP3 round against a plain decode step
+(`scripts/sweeps/decode-step-profile.sh 27b-decode 27b-decode-mtp3`) had the round at 38.2 ms
+against a 24.8 ms step, about 1.5x. vLLM/Marlin pays 1.14x for the same round on this card. The
+extra time sat in four families: Q4 gate_up, the Q5 residual projections, and the GDN and
+attention input projections. At four columns they ran either SIMT split kernels, whose cost grows
+with every column, or a Q4 small-T MMA that was instruction-bound. The round is now 25.7 ms
+against a 22.3 ms step, 1.15x.
+
+**What changed**, cold single-kernel medians in us, from the schedule benches
+(`bench/ops/*_schedule_bench.cu`):
+
+| Op (27B shape) | T | v0.9.1 route | now |
+|---|---:|---:|---:|
+| Q4 gate_up, 34816 × 5120 | 4 | 200.7 | **120.8** |
+| | 32 | 444.4 (c40 tile) | **~205** |
+| Q5 down, 5120 × 17408 | 4 | 99.3 (split2) | **82.9** |
+| | 32 | 289.8 (best MMA tile) | **144.4** |
+| Q5 out, 5120 × 6144 | 4 | 38.9 (split2) | **34.8** |
+| | 32 | 105.5 (best MMA tile) | **55.3** |
+| GDN input, Q4 4096 + Q5 12288 rows | 4 | 100.4 (independent) | **78.8** |
+| | 32 | 263.2 (grouped c32) | **153.6** |
+| attention input, Q4 7168 + Q5 7168 rows | 4 | 90.1 (parent split) | **68.6** |
+| | 32 | 191.5 (r32/c32) | **135.2** |
+
+- **Bank conflicts.** The Q4 small-T MMA staged its code rows 256 B apart, an 8-way shared-memory
+  bank conflict on every A load. Padding the rows was worth 9.6% at C1 on its own.
+- **Permuted k order.** The MMA's k slots may be any permutation of a group, provided A and B agree.
+  Giving each lane sixteen contiguous k makes its A operand one 64-bit code load, decoded to bf16
+  by a magic-bias `byte_perm` with no int-to-float, and its B operand two 128-bit loads with no
+  `ldmatrix`.
+- **A Q5 counterpart** (`q5_small_t_mma.cuh`) folds the high-bit plane into the same decode. It
+  replaces split2 from T=3 and the MMA tiles to 32 columns, for the residual projections, GDN
+  value/z and attention gate/value.
+- **Wide extents share activation slabs** (`ops/common/small_t_layout.cuh`). At 32 columns and one
+  16-row tile per CTA, gate_up re-read ~713 MB of staged activations per call against 89 MB of
+  weights. Two to four row tiles per CTA now share each staged slab, and at 24 columns each warp
+  feeds one B fragment to two tiles.
+- **The fused GDN conv projection is gone.** Batch-1 widths 1-3 and 5-6 of the GDN conv
+  forms ran a fused SIMT projection that lost at every width: 95.2 against 80.9 us at T=1, and
+  162.8 against 85.0 at T=5. At T=5 that was 4.8 ms of a four-draft-token round. Removing it made
+  plain decode 5% faster, and four or five draft tokens stopped costing more than they return.
+
+**Measured and rejected**, so nobody re-runs them:
+
+| idea | result |
+|---|---|
+| split-K across CTAs for the 5120-row Q5 shapes | 0-2.5% at narrow T; not worth a workspace |
+| magic-bias decode alone, before the k permutation | neutral in situ |
+| 2- and 3-stage cp.async rings for the narrow Q4 tile | slower; occupancy is the latency hiding |
+| deeper rings through dynamic shared memory (to 4 stages, 99 KB) | slower at every shape: occupancy loss outweighs the hidden latency |
+| two tiles per warp at 16 and 32 columns | slower (kept only at 24, where it wins 14%) |
+| `cp.async ... L2::256B` prefetch hint on weight loads | neutral |
+| a 40-65K-row prefix of the frequency-sorted draft head | acceptance 62.7% -> 56.5% at 40,960 rows; net 4% slower |
+| drafting with the full output head | +2% acceptance for 4 ms more per round |
+| programmatic dependent launch to hide kernel ramp | needs sm_90; compiled out on `sm_86` |
+
+What is left at C1 is mostly ramp-up and drain at the ~500 kernel boundaries of a round (the
+Q5 residual kernels reach 68-82% of their streaming floor, gate_up 89%). What is left at C8 is
+tensor-core rate: gate_up at T=32 runs at about 68% of the card's measured bf16 MMA peak.
+
+**Reproduce.** Build both trees with `-DNINFER_BUILD_APPS=ON -DNINFER_BUILD_BENCHMARKS=ON` and run
+each harness alternately against both `ninfer-serve` binaries on one card:
+`tools/bench/run_qwen38_replayssm_cohort_sweep.py` for the cohort. For the thinking-off numbers,
+send the eight prompts one at a time (or eight at once for C8) to `/v1/chat/completions` with
+`max_tokens` 1024, `reasoning_effort` `none` and `--spec mtp --draft-tokens 3 --lm-head-draft
+--kv-dtype int8`, and take C × 1000 / mean TPOT from the request log's decode timings.
+
 ### Choosing a KV format (RTX 3090, Qwen3.8-27B)
 
 All six SM86 KV formats, measured on Qwen3.8-27B.

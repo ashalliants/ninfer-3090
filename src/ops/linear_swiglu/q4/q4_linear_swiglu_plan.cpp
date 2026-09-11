@@ -44,6 +44,13 @@ constexpr std::array<RouteSpec, 5> kRoutes{{
     // SmallTTiled now wins to the kernel's 32-column limit, so the c40 tile keeps only 33..40. The
     // old 24/25 boundary was measured against the kernel before the rewrite (399 us at T=24, and
     // 446.5 against c40's 444.4 at T=25).
+    //
+    // Its 16-32-column tiles were then given shared activation slabs (KWarps 4/2, and two tiles
+    // per warp at 24 columns; q4_linear_swiglu_gemv.cu has the layout sweep). Same bench (us):
+    //
+    //   T            9     16     17     24     32
+    //   small_t  145.4  152.6  167.9  178.2  208.9     (24 then two tiles per warp: ~164)
+    //   c40      452.6  444.4  451.6  445.4  447.5
     {{2, 32}, Q4LinearSwiGluScheduleId::SmallTTiled},
     {{33, 40}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C40},
     {{41, 48}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C48},

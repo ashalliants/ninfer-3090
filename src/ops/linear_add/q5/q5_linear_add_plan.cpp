@@ -118,6 +118,15 @@ constexpr std::array<SupportSpec, 2> kSupports{{
 //
 // so it takes everything from 3 to its 32-column limit, including the C4 (16) and C8 (32) MTP3
 // verify widths the c16/c24/c32 tiles used to serve at 2-3x the cost.
+//
+// Those 16- and 32-column tiles then shared their staged activation slab between two row tiles
+// (KWarps 4; q5_linear_add_small_t.cu has the layout sweep). Same bench (us):
+//
+//   T                  9     16     17     24     32
+//   k=6144  small_t  36.9   37.9   49.2   50.2   55.3
+//           best MMA 106.6  99.3  109.6  105.5  105.5
+//   k=17408 small_t 106.5  107.6  128.0  132.1  144.4
+//           best MMA 285.7 277.5  294.9  294.9  289.8
 constexpr std::array<RouteSpec, 5> kK6144Routes{{
     {{1, 2}, Q5LinearAddScheduleId::Split2ExactResidual},
     {{3, 32}, Q5LinearAddScheduleId::SmallTMmaResidual},

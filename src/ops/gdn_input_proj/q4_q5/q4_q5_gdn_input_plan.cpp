@@ -103,7 +103,13 @@ struct RouteSpec {
 //   small_t    100.4  100.4  114.7  164.9  182.3  226.3
 //   grouped    238.6  235.7  239.6  261.1  263.2  256.0     (c16 to 16, c32 above)
 //
-// so it runs to its 32-column limit and the c8/c16/c32 tiles serve nothing below 33.
+// so it runs to its 32-column limit and the c8/c16/c32 tiles serve nothing below 33. With the
+// 16- and 32-column tiles sharing staged activation slabs (KWarps 4; q4_q5_gdn_input_small_t.cu
+// has the layout sweep), same bench (us):
+//
+//   T              9     16     17     24     32
+//   small_t     96.3  100.4  137.2  147.5  153.6
+//   grouped    240.6  240.6  265.2  268.3  263.2     (c16 to 16, c32 above)
 constexpr std::array<RouteSpec, 3> kRoutes{{
     {{1, 32}, Q4Q5GdnInputScheduleId::SmallTMma},
     {{33, 64}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C64},
