@@ -174,6 +174,9 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
 struct DensePostMixerPayload {
     Weight gate_up;
     Weight down;
+    // --mlp-a8-decode. Carried on the payload because Variant is stateless and the leaves take no
+    // features, while weight binding -- where this is decided -- has them.
+    bool a8_decode = false;
 };
 
 struct SplitAttentionProjectionPayload {

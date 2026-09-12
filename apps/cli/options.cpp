@@ -135,7 +135,8 @@ std::string usage_text(const char* argv0) {
            "toward --max-new.\n"
            "--devices N,M offloads the expert/MLP blocks to the second GPU; rank 0 keeps attention, "
            "the KV cache and the head, so nearly all of its memory becomes KV.\n"
-           "--lm-head-q4 and --gdn-state-fp16 are speed-for-quality trades, off by default; see "
+           "--lm-head-q4, --gdn-state-fp16 and --mlp-a8-decode are speed-for-quality trades, off by "
+           "default; see "
            "docs/maintainer/quality-trade-experiments.md for the measured cost of each.\n"
            "--kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
@@ -192,6 +193,8 @@ Options parse_options(int argc, char** argv) {
             options.lm_head_q4 = true;
         } else if (arg == "--gdn-state-fp16") {
             options.gdn_state_fp16 = true;
+        } else if (arg == "--mlp-a8-decode") {
+            options.mlp_a8_decode = true;
         } else if (arg == "--raw-output") {
             options.raw_output = true;
         } else if (arg == "--print-token-ids") {

@@ -15,6 +15,7 @@ struct StartupFeatures {
     ProposalHead proposal_head       = ProposalHead::Full;
     bool lm_head_q4                 = false;
     bool gdn_state_fp16             = false;
+    bool mlp_a8_decode              = false;
 
     bool operator==(const StartupFeatures&) const = default;
 
@@ -51,6 +52,7 @@ struct StartupFeatures {
         .proposal_head    = options.speculative.proposal_head,
         .lm_head_q4       = options.lm_head_q4,
         .gdn_state_fp16   = options.gdn_state_fp16,
+        .mlp_a8_decode    = options.mlp_a8_decode,
     };
 }
 

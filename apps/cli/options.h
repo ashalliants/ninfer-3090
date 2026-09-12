@@ -35,6 +35,7 @@ struct Options {
     bool use_cuda_graph = true;
     bool lm_head_q4     = false;
     bool gdn_state_fp16 = false;
+    bool mlp_a8_decode  = false;
 
     bool raw_output      = false;
     bool print_token_ids = false;

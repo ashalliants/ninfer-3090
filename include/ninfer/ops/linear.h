@@ -26,6 +26,11 @@ enum class LinearPolicy : std::uint8_t {
     /// scale per weight group and feeds groupwise-int weights to the integer tensor cores. Held
     /// to the same A8 activation allowance.
     AllowA8Int,
+    /// AllowA8Int plus the integer small-T route for the 27B gate_up at decode and verify widths
+    /// (ops/linear/q4/q4_small_t_mma_i8.cuh). Separate because that route is a quality trade the
+    /// prefill one is not asked to carry: it applies s8 activation quantisation to every decode
+    /// step rather than to full prefill tiles only, so it is opt-in per engine.
+    AllowA8IntDecode,
 };
 
 /**

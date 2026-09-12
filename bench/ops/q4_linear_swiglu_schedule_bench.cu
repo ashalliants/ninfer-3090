@@ -55,6 +55,12 @@ const Schedule kSchedules[] = {
     {"split_half_pair_c48", Id::MmaSplitHalfPairR32C48, 0},
     {"split_half_pair_c128", Id::MmaSplitHalfPairR32C128, 0},
     {"materialized", Id::Materialized, 0},
+    // Exploratory: int8 tensor-core small-T, T=32 only (see q4_small_t_mma_i8.cuh). Not in
+    // resolve_plan's route table; this row exists purely to compare it against small_t_tiled at the
+    // one width it currently supports.
+    {"small_t_tiled_i8", Id::SmallTTiledI8, 32},
+    // Prices the runtime column count against small_t_tiled, which now drops it at exact widths.
+    {"small_t_masked", Id::SmallTTiledMasked, 32},
 };
 constexpr int kScheduleCount = static_cast<int>(sizeof(kSchedules) / sizeof(kSchedules[0]));
 

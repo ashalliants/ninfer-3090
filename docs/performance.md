@@ -142,8 +142,33 @@ against a 22.3 ms step, 1.15x.
 | programmatic dependent launch to hide kernel ramp | needs sm_90; compiled out on `sm_86` |
 
 What is left at C1 is mostly ramp-up and drain at the ~500 kernel boundaries of a round (the
-Q5 residual kernels reach 68-82% of their streaming floor, gate_up 89%). What is left at C8 is
-tensor-core rate: gate_up at T=32 runs at about 68% of the card's measured bf16 MMA peak.
+Q5 residual kernels reach 68-82% of their streaming floor, gate_up 89%).
+
+**What is left at C8 is not tensor-core rate, though this page said so for a cycle.** The claim was
+that gate_up at T=32 runs at about 68% of the card's measured bf16 MMA peak -- 205 us against a
+139 us tensor floor -- which reads as a kernel most of the way to saturating its tensor cores.
+Counters disagree. `ncu` on the T=32 gate_up kernel, Windows RTX 3090 at 315 W:
+
+| | BF16 small-T | int8 small-T |
+|---|---:|---:|
+| tensor pipe active | **38.3%** | 21.0% |
+| L1/TEX throughput | 36.4% | 73.5% |
+| DRAM throughput | 39.4% | 42.7% |
+| warp occupancy | 30.9% | 45.4% |
+
+Nothing is near saturation in the BF16 column: tensor, L1 and DRAM all sit within three points of
+each other around 38%, at 31% occupancy, which is the signature of a latency-bound kernel rather
+than one limited by any unit. The 68% figure compares against a computed floor, not against a
+measured pipe, and the two do not agree.
+
+That distinction decided a real experiment. An int8 tensor-core route for this Op was built on the
+strength of the old reading, since s8 MMA is about 4.7x the bf16 rate on this hardware. It
+delivered 4-6%, not 4.7x, and the right column above says why: it did exactly what a denser MMA
+should, halving tensor-pipe pressure from 38.3% to 21.0%, but that pipe was never the constraint,
+and the cost of getting there landed on L1 at 73.5%. See
+[the quality-trade notes](maintainer/quality-trade-experiments.md) and
+`src/ops/linear/q4/q4_small_t_mma_i8.cuh`. Work aimed at C8 should target operand movement and
+occupancy; a wider tile that puts more work in flight is the lever the counters actually point at.
 
 **Reproduce.** Build both trees with `-DNINFER_BUILD_APPS=ON -DNINFER_BUILD_BENCHMARKS=ON` and run
 each harness against both `ninfer-serve` binaries on one card, interleaved in one sitting:

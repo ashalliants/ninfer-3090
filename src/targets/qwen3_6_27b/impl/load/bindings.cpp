@@ -185,9 +185,10 @@ Weight row_view(const Weight& block, std::int32_t row_begin, std::int32_t row_co
     return out;
 }
 
-DensePostMixerPayload load_mlp(const MlpPlan& plan,
+DensePostMixerPayload load_mlp(bool a8_decode, const MlpPlan& plan,
                                const artifact::MaterializedArtifact& materialized) {
     DensePostMixerPayload out;
+    out.a8_decode = a8_decode;
     out.gate_up = materialized_weight(materialized, plan.gate_up, 34816, 5120);
     out.down    = materialized_weight(materialized, plan.down, 5120, 17408);
     return out;
@@ -671,7 +672,7 @@ LoadedModelData::LoadedModelData(std::vector<BindingPlan> plans,
             target.output     = materialized_weight(backing, source.attention.output, 5120, 6144);
             target.post_attention_norm = artifact::materialized_tensor(
                 expert_backing, expert_source.post_attention_norm, NumericFormat::BF16, {5120});
-            target.post_mixer = load_mlp(expert_source.mlp, expert_backing);
+            target.post_mixer = load_mlp(plan.features.mlp_a8_decode, expert_source.mlp, expert_backing);
         } else {
             GdnWeights& target = gdn_layers.at(gdn_index++);
             target.input_norm  = artifact::materialized_tensor(backing, source.input_norm,
@@ -689,7 +690,7 @@ LoadedModelData::LoadedModelData(std::vector<BindingPlan> plans,
             target.output = materialized_weight(backing, source.gdn.output, 5120, 6144);
             target.post_attention_norm = artifact::materialized_tensor(
                 expert_backing, expert_source.post_attention_norm, NumericFormat::BF16, {5120});
-            target.post_mixer = load_mlp(expert_source.mlp, expert_backing);
+            target.post_mixer = load_mlp(plan.features.mlp_a8_decode, expert_source.mlp, expert_backing);
         }
     }
     if (full_index != full_layers.size() || gdn_index != gdn_layers.size()) {
@@ -739,7 +740,7 @@ LoadedModelData::LoadedModelData(std::vector<BindingPlan> plans,
                                                                 NumericFormat::W8G32_F16S, 5120, 6144);
         mtp.post_attention_norm = artifact::materialized_tensor(
             backing, plan.mtp.post_attention_norm, NumericFormat::BF16, {5120});
-        mtp.post_mixer = load_mlp(plan.mtp.mlp, backing);
+        mtp.post_mixer = load_mlp(plan.features.mlp_a8_decode, plan.mtp.mlp, backing);
         mtp.final_norm = artifact::materialized_tensor(backing, plan.mtp.final_norm,
                                                        NumericFormat::BF16, {5120});
     }

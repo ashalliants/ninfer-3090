@@ -344,6 +344,46 @@ batching accelerates decode, but does not multiply prompt ingestion. Consequentl
 844-862 input tok/s while queued requests increase mean TTFT. `Active-prefill speed` excludes queue
 waiting and measures only the server's recorded prefill phase.
 
+### Integer-activation MLP at decode (`--mlp-a8-decode`)
+
+Opt-in, off by default, Qwen3.8-27B on `sm_86`. The MLP gate_up projection already runs its full
+prefill tiles through the s8 tensor cores; this flag extends that to the widths a cohort round
+decodes at, quantising activations to s8 with one scale per (token, 64-k group) and feeding
+`mma.m16n8k32.s8.s8.s32`. It buys a little speed and costs a little fidelity.
+
+**The Op, paired against the BF16 small-T kernel inside one sitting** (the card drifts several
+percent between sittings, so only the pairing is meaningful), cold, median of 15:
+
+| columns | 8 | 12 | 16 | 20 | 24 | 28 | 32 |
+|---|---|---|---|---|---|---|---|
+| run 1 | +10.7% | -5.8% | -3.4% | -4.8% | -4.8% | -5.0% | -4.5% |
+| run 2 | +7.5% | +4.3% | -0.7% | -5.9% | -6.1% | -4.0% | -6.4% |
+
+It wins from sixteen columns up and loses at eight, so the route is admitted for 16..32 columns
+only and every narrower width stays on the BF16 kernel. A cohort round reaches those widths through
+concurrency: eight lanes verifying four MTP columns each is thirty-two.
+
+**End to end it is worth about a percent.** Eight concurrent thinking-off chat requests, MTP3,
+INT8 KV, greedy, four interleaved repetitions:
+
+| | decode |
+|---|---|
+| default | 431.5 tok/s |
+| `--mlp-a8-decode` | **437.0 tok/s** (+1.28%) |
+
+That is the expected size rather than a disappointment: gate_up is roughly a quarter of a C8 round,
+so four to six percent off it arrives as one percent overall. The flag won three of the four paired
+repetitions and tied the fourth, against a spread of about 1.7% within the unflagged arm alone.
+
+**What it costs.** Output changes -- this is a lossy trade, not a free one. Against an FP64 oracle
+the Op measures 0.0080 to 0.0371 relative L2 across 2..32 columns, inside the 0.04 allowance the
+integer-activation path is held to everywhere else in the tree. Perplexity cannot see this trade at
+all: scoring runs at prefill widths, where the route does not apply, so `ninfer-perplexity` reports
+the same score with and without the flag. Judge it on the oracle bound and on your own outputs.
+
+Not recommended for single-stream use, where it does nothing: one request decodes one column per
+step, far below the sixteen the route needs.
+
 ### RotorQuant KV (`rk8v4`)
 
 `rk8v4` is an experimental, opt-in KV-cache mode for Qwen3.8-27B: keys keep the rotated INT8

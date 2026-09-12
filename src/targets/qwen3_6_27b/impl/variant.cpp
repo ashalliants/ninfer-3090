@@ -85,6 +85,16 @@ ops::LinearPolicy text_policy(const Weight& weight) {
     }
 }
 
+// --mlp-a8-decode widens the gate_up policy to admit the integer small-T route at decode and
+// verify widths as well as full prefill tiles. Only where the base policy already admits integer
+// activations: the flag must not conjure an integer route on a build or shape that has none.
+ops::LinearPolicy mlp_policy(const DensePostMixerPayload& weights) {
+    const ops::LinearPolicy base = text_policy(weights.gate_up);
+    return (weights.a8_decode && base == ops::LinearPolicy::AllowA8Int)
+               ? ops::LinearPolicy::AllowA8IntDecode
+               : base;
+}
+
 constexpr std::size_t kMinimumLeafWorkspaceBytes = 1;
 
 std::size_t gdn_snapshot_workspace_bytes(const Tensor& hidden,
@@ -333,8 +343,7 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
                          WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope        = workspace.scope();
     Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, hidden.ne[1]});
-    ops::linear_swiglu(hidden, weights.gate_up, activation, text_policy(weights.gate_up), workspace,
-                       stream);
+    ops::linear_swiglu(hidden, weights.gate_up, activation, mlp_policy(weights), workspace, stream);
     ops::linear_add(activation, weights.down, residual, text_policy(weights.down), workspace,
                     stream);
 }

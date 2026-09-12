@@ -13,6 +13,8 @@
 // obvious in the output.
 
 #include "ops/linear_swiglu/q4a8/q4a8_linear_swiglu.h"
+#include "ops/linear_swiglu/q4/q4_linear_swiglu_kernels.h"
+#include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 
 #include "ops/op_check.h"
 #include "ops/op_tester.h"
@@ -144,6 +146,69 @@ int run_gate_up(std::int32_t tokens) {
     return failures;
 }
 
+// SmallTTiledI8 (q4_small_t_mma_i8.cuh): exploratory int8 tensor-core small-T route for the same
+// gate_up weight, T=32 only so far. Not routed by resolve_plan -- reached directly through
+// execute_schedule, the same way the schedule bench times it. Same oracle and allowance as the
+// prefill route above: same weight profile, same per-(token,64-group) s8 activation quantisation.
+int run_gate_up_small_t_i8(std::int32_t kTokens) {
+    constexpr std::int32_t kRows = 34816;
+    constexpr std::int32_t kCols = 5120;
+    constexpr std::int32_t kOut  = kRows / 2;
+
+    const PackedWeight host_weight =
+        qw::make_patterned_weight(QType::Q4G64_F16S, kRows, kCols, 4802U);
+    const std::vector<std::uint16_t> activation = make_activation(kCols, kTokens, 92U);
+
+    test::GuardedDeviceBuffer device_weight(host_weight.payload.size());
+    device_weight.copy_from_host(host_weight.payload.data(), host_weight.payload.size());
+    const Weight weight = host_weight.device_weight(device_weight.data());
+
+    test::GuardedDeviceBuffer device_x(activation.size() * sizeof(std::uint16_t));
+    device_x.copy_from_host(activation.data(), activation.size() * sizeof(std::uint16_t));
+
+    const std::size_t out_elements = static_cast<std::size_t>(kOut) * kTokens;
+    test::GuardedDeviceBuffer output(out_elements * sizeof(std::uint16_t));
+    output.fill(0xff);
+
+    WorkspaceArena workspace(std::max<std::size_t>(
+        ops::detail::q4_linear_swiglu_small_t_tiled_i8_workspace_bytes(kTokens), 256));
+    Tensor x(device_x.data(), DType::BF16, {kCols, kTokens});
+    Tensor destination(output.data(), DType::BF16, {kOut, kTokens});
+    ops::detail::q4_linear_swiglu_execute_schedule(
+        ops::detail::Q4LinearSwiGluScheduleId::SmallTTiledI8, x, weight, destination, workspace,
+        nullptr);
+    test::cuda_check(cudaDeviceSynchronize(), "synchronize q4 small-T i8 swiglu");
+
+    const std::string label = "LinearSwiGLU Q4_SMALL_T_I8 T=" + std::to_string(kTokens);
+    int failures            = 0;
+    failures += output.verify_guards(label);
+
+    const std::vector<double> got = read_bf16(output, out_elements);
+    Samples s;
+    std::vector<float> input(static_cast<std::size_t>(kCols));
+    for (int pick = 0; pick < 24; ++pick) {
+        const std::int32_t token = static_cast<std::int32_t>(
+            qw::detail::mix64(pick * 7927U + 3U) % static_cast<std::uint64_t>(kTokens));
+        const std::int32_t row = static_cast<std::int32_t>(
+            qw::detail::mix64(pick * 104743U + 11U) % static_cast<std::uint64_t>(kOut));
+        for (std::int32_t k = 0; k < kCols; ++k) {
+            input[static_cast<std::size_t>(k)] =
+                bf16_value(activation[static_cast<std::size_t>(token) * kCols + k]);
+        }
+        const double gate = qw::dot_fp64(host_weight, row, input.data(), kCols);
+        const double up   = qw::dot_fp64(host_weight, kOut + row, input.data(), kCols);
+        s.reference.push_back(gate / (1.0 + std::exp(-gate)) * up);
+        s.actual.push_back(got[static_cast<std::size_t>(token) * kOut + row]);
+    }
+
+    const ReductionStats stats = compute_reduction_stats(
+        s.actual.data(), s.reference.data(), static_cast<std::int64_t>(s.actual.size()));
+    std::cout << "  " << label << " relative_l2=" << stats.relative_l2 << " (allowance "
+              << kA8QuantizationAllowance << ")\n";
+    failures += verify_reduction(label, s.actual, s.reference, kA8Criterion);
+    return failures;
+}
+
 int run_down(std::int32_t tokens) {
     constexpr std::int32_t kRows = 5120;
     constexpr std::int32_t kCols = 17408;
@@ -252,6 +317,10 @@ int main() {
         for (const std::int32_t tokens : {128, 256, 512}) {
             failures += run_gate_up(tokens);
             failures += run_down(tokens);
+        }
+        // Every band of the T=2..32 dispatch, including widths that exercise column masking.
+        for (const std::int32_t t : {2, 5, 8, 9, 16, 17, 24, 25, 31, 32}) {
+            failures += run_gate_up_small_t_i8(t);
         }
         std::cout << (failures == 0 ? "OK" : "FAIL")
                   << " integer-activation prefill routes correctness\n";

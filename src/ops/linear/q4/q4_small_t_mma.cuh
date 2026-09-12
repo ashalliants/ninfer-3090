@@ -70,8 +70,9 @@ struct Q4SmallTStorage {
 // grid is output rows / (RowPolicy::kOutputRowsPerTile * kRowTiles).
 template <class Geometry, int TileCols, int ActiveCols, class Epilogue = Q4SmallTMmaStoreEpilogue,
           class RowPolicy = Q4SmallTMmaIdentityRows, bool MaskedColumns = false, int KWarps = 8,
-          int Stages = 1, int TilesPerWarp = 1>
-__launch_bounds__(256, (KWarps < 8 ? 2 : (TileCols <= 16 ? 6 : 4))) __global__
+          int Stages = 1, int TilesPerWarp = 1,
+          int MinBlocks = (KWarps < 8 ? 2 : (TileCols <= 16 ? 6 : 4))>
+__launch_bounds__(256, MinBlocks) __global__
     void q4_small_t_mma_kernel(const __nv_bfloat16* __restrict__ x,
                                const std::uint8_t* __restrict__ codes,
                                const std::uint8_t* __restrict__ scales,
@@ -315,7 +316,8 @@ __launch_bounds__(256, (KWarps < 8 ? 2 : (TileCols <= 16 ? 6 : 4))) __global__
 // Launches q4_small_t_mma_kernel over `blocks` CTAs.
 template <class Geometry, int TileCols, int ActiveCols, class Epilogue = Q4SmallTMmaStoreEpilogue,
           class RowPolicy = Q4SmallTMmaIdentityRows, bool MaskedColumns = false, int KWarps = 8,
-          int Stages = 1, int TilesPerWarp = 1>
+          int Stages = 1, int TilesPerWarp = 1,
+          int MinBlocks = (KWarps < 8 ? 2 : (TileCols <= 16 ? 6 : 4))>
 void q4_small_t_mma_launch(int blocks, cudaStream_t stream, const __nv_bfloat16* x,
                            const std::uint8_t* codes, const std::uint8_t* scales,
                            __nv_bfloat16* out, Epilogue epilogue = {}, RowPolicy row_policy = {},
@@ -323,7 +325,7 @@ void q4_small_t_mma_launch(int blocks, cudaStream_t stream, const __nv_bfloat16*
     constexpr int kBytes  = Q4SmallTStorage<KWarps, TileCols, Stages, TilesPerWarp>::kBytes;
     constexpr auto kernel = q4_small_t_mma_kernel<Geometry, TileCols, ActiveCols, Epilogue,
                                                   RowPolicy, MaskedColumns, KWarps, Stages,
-                                                  TilesPerWarp>;
+                                                  TilesPerWarp, MinBlocks>;
     static_assert(kBytes <= 48 * 1024, "small-T MMA stages must fit static shared memory");
     kernel<<<blocks, SmallTLayout<KWarps>::kThreads, 0, stream>>>(x, codes, scales, out, epilogue,
                                                                    row_policy, columns);
