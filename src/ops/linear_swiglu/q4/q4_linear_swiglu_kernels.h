@@ -20,6 +20,10 @@ void q4_linear_swiglu_mma_split_half_pair_r32_c48_launch(const Tensor& x, const 
                                                          Tensor& out, cudaStream_t stream);
 void q4_linear_swiglu_small_t_tiled_launch(const Tensor& x, const Weight& w, Tensor& out,
                                            cudaStream_t stream);
+// Bench-only: forces the runtime-column-count instantiation that the launcher above drops when a
+// width fills its tile exactly, so the cost of masking stays measurable rather than remembered.
+void q4_linear_swiglu_small_t_tiled_masked_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                                  cudaStream_t stream);
 
 // int8 tensor-core small-T route, T=2..32. Selected by LinearPolicy::AllowA8IntDecode rather than
 // by q4_linear_swiglu_resolve_plan's table, because it is a quality trade and therefore opt-in per

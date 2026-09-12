@@ -20,6 +20,9 @@ enum class Q4LinearSwiGluScheduleId {
     // q4_linear_swiglu_execute_schedule, for measuring against SmallTTiled before any decision to
     // wire it in. See q4_small_t_mma_i8.cuh and docs/performance.md's tensor-rate-bound C8 finding.
     SmallTTiledI8,
+    // Bench-only: SmallTTiled with the runtime column count it now avoids when the width fills its
+    // tile exactly. Kept so the cost of masking stays measurable rather than remembered.
+    SmallTTiledMasked,
 };
 
 struct Q4LinearSwiGluProblem {

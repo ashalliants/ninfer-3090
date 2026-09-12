@@ -90,7 +90,11 @@ struct Q4SwiGluSmallTTile {
     static constexpr int kTilesPerWarp = TileCols == 24 ? 2 : 1;
 };
 
-template <int ActiveCols>
+// Masked carries the column count at runtime, which the staging loop's trip count and the inner
+// loop's per-fragment bounds test both depend on. A cohort that exactly fills its tile -- eight
+// lanes verifying four MTP columns is thirty-two -- does not need either, and an unmasked
+// instantiation lets both fold away.
+template <int ActiveCols, bool Masked>
 void launch_small_t_active(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     constexpr int TileCols =
         ActiveCols <= 8 ? 8 : (ActiveCols <= 16 ? 16 : (ActiveCols <= 24 ? 24 : 32));
@@ -100,7 +104,7 @@ void launch_small_t_active(const Tensor& x, const Weight& w, Tensor& out, cudaSt
                                              Layout::kRowTiles);
     const Q4SwiGluSmallTEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data), x.ne[1]};
     q4_small_t_mma_launch<Q4SwiGluSmallTGeometry, TileCols, ActiveCols, Q4SwiGluSmallTEpilogue,
-                          Q4SwiGluSmallTRows, true, Tile::kKWarps, Tile::kStages,
+                          Q4SwiGluSmallTRows, Masked, Tile::kKWarps, Tile::kStages,
                           Tile::kTilesPerWarp>(
         kBlocks, stream, static_cast<const __nv_bfloat16*>(x.data),
         static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.scales),
@@ -108,13 +112,15 @@ void launch_small_t_active(const Tensor& x, const Weight& w, Tensor& out, cudaSt
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <std::size_t... Offsets>
+template <bool Masked, std::size_t... Offsets>
 constexpr auto make_small_t_launchers(std::index_sequence<Offsets...>) {
     return std::array<SmallTLauncher, sizeof...(Offsets)>{
-        &launch_small_t_active<8 * (1 + static_cast<int>(Offsets))>...};
+        &launch_small_t_active<8 * (1 + static_cast<int>(Offsets)), Masked>...};
 }
 
-constexpr auto kSmallTLaunchers = make_small_t_launchers(std::make_index_sequence<4>{});
+constexpr auto kSmallTLaunchers = make_small_t_launchers<true>(std::make_index_sequence<4>{});
+constexpr auto kSmallTExactLaunchers =
+    make_small_t_launchers<false>(std::make_index_sequence<4>{});
 
 using SmallTI8Launcher = void (*)(const Tensor&, const Weight&, Tensor&, const std::int8_t*,
                                   const __half*, cudaStream_t);
@@ -288,6 +294,32 @@ void q4_linear_swiglu_gemv_pair_launch(const Tensor& x, const Weight& w, Tensor&
 
 void q4_linear_swiglu_small_t_tiled_launch(const Tensor& x, const Weight& w, Tensor& out,
                                            cudaStream_t stream) {
+    if (x.ne[1] < 2 || x.ne[1] > 32) {
+        throw std::invalid_argument("Q4 LinearSwiGLU exact small-T requires T=2..32");
+    }
+    // A width that fills its tile needs no runtime column count, and dropping it is worth 2-4% at
+    // sixteen and twenty-four columns (bench/ops/q4_linear_swiglu_schedule_bench.cu prices it
+    // against small_t_masked; + is the exact instantiation winning):
+    //
+    //   T        8       16      24      32
+    //   run 1  -27.3%   +1.3%   +3.7%   +2.0%
+    //   run 2  -16.5%   +2.6%   +3.6%   +0.0%
+    //   run 3  -15.7%   +3.3%   +3.7%   +0.5%
+    //
+    // Eight columns is excluded because there the exact instantiation *spills*: ptxas reports 16
+    // bytes of cumulative stack against the masked build's none. A compile-time column count lets
+    // the staging loop unroll fully, and that clears the 42-register ceiling this schedule's
+    // __launch_bounds__(256, 6) imposes at KWarps 8. Every wider tile runs KWarps < 8, so it is
+    // bounded to 2 blocks per SM and unrolls with registers to spare.
+    const bool exact  = x.ne[1] % 8 == 0 && x.ne[1] > 8;
+    const auto& table = exact ? kSmallTExactLaunchers : kSmallTLaunchers;
+    table[static_cast<std::size_t>((x.ne[1] - 1) / 8)](x, w, out, stream);
+}
+
+// Always the runtime-column-count instantiation, so a bench can price masking against the exact
+// one above inside a single process. Nothing on the inference path should call this.
+void q4_linear_swiglu_small_t_tiled_masked_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                                  cudaStream_t stream) {
     if (x.ne[1] < 2 || x.ne[1] > 32) {
         throw std::invalid_argument("Q4 LinearSwiGLU exact small-T requires T=2..32");
     }

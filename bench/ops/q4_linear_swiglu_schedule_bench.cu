@@ -59,6 +59,8 @@ const Schedule kSchedules[] = {
     // resolve_plan's route table; this row exists purely to compare it against small_t_tiled at the
     // one width it currently supports.
     {"small_t_tiled_i8", Id::SmallTTiledI8, 32},
+    // Prices the runtime column count against small_t_tiled, which now drops it at exact widths.
+    {"small_t_masked", Id::SmallTTiledMasked, 32},
 };
 constexpr int kScheduleCount = static_cast<int>(sizeof(kSchedules) / sizeof(kSchedules[0]));
 
