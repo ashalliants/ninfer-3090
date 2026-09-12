@@ -1183,8 +1183,28 @@ What is left, in order of size:
       schedule's `__launch_bounds__(256, 6)` imposes; wider tiles run KWarps < 8 at two blocks per
       SM and unroll with registers to spare. And the same change **loses** on the GDN and attention
       query/key projections, which share the template: attention by 4.1% at thirty-two columns in
-      three identical runs, GDN by 11%. That is not registers (94 against 95, no stack either way)
-      and is unexplained; both were reverted rather than shipped on a story.
+      three identical runs, GDN by 11%. Both were reverted.
+
+      **Why they lose is an issue-efficiency effect, not a resource limit.** `ncu` on the attention
+      query/key kernel at T=32, exact against masked:
+
+      | | exact | masked (shipping) |
+      |---|---:|---:|
+      | issue active | 26.0% | **29.5%** |
+      | warps active | 22.6% | **24.6%** |
+      | tensor pipe | 32.1% | 33.4% |
+      | L1/TEX | 30.5% | 31.7% |
+      | DRAM | 25.2% | 27.2% |
+
+      Registers (94 against 95), shared memory and spills are all unchanged, and both builds have
+      the same theoretical occupancy -- two blocks per SM either way. What differs is that the exact
+      build issues an instruction 13.5% less often and keeps 8% fewer warps resident. Nothing is
+      above 34%, so this kernel is deeply latency-bound and its performance turns on instruction
+      scheduling rather than on any unit's throughput; a fully unrolled staging loop appears to
+      burst its copies and then stall where the runtime-bounded loop interleaves them. That is
+      consistent with gate_up reacting the other way -- it runs a different epilogue and row policy
+      at a higher 31% occupancy -- but the mechanism behind the sign flip is inferred from the issue
+      counters, not proven.
 
 - [ ] **C1 is mostly kernel-boundary ramp and drain.** A round is ~500 kernels; the Q5 residual
       projections reach 68-82% of their streaming floor and gate_up 89%, and the shortfall scales
