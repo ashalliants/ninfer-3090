@@ -88,6 +88,20 @@ struct Q4SwiGluSmallTTile {
     static constexpr int kKWarps       = TileCols <= 8 ? 8 : (TileCols <= 24 ? 4 : 2);
     static constexpr int kStages       = TileCols <= 16 ? 1 : 2;
     static constexpr int kTilesPerWarp = TileCols == 24 ? 2 : 1;
+    // Occupancy ceiling, and a measured dead end. ncu puts this kernel at 31% occupancy at T=32,
+    // register-limited to two blocks per SM, with tensor, L1 and DRAM all near 38% -- nothing
+    // saturated, which reads as an invitation to buy warps. It is not one: raising the ceiling caps
+    // registers, and at 96 registers this kernel needs them. Cold medians, us, and the number of
+    // instantiations ptxas reports spilling:
+    //
+    //   min blocks   T=16    T=24    T=32   spilling
+    //   2 (this)    161.8   175.1   205.8      0
+    //   3           162.8   321.5   227.3      4
+    //   4           161.8   543.7   281.6      4
+    //
+    // More warps in flight is still what the counters ask for; it has to come from a kernel that
+    // needs fewer registers, not from squeezing this one.
+    static constexpr int kMinBlocks = kKWarps < 8 ? 2 : (TileCols <= 16 ? 6 : 4);
 };
 
 // Masked carries the column count at runtime, which the staging loop's trip count and the inner
@@ -105,7 +119,7 @@ void launch_small_t_active(const Tensor& x, const Weight& w, Tensor& out, cudaSt
     const Q4SwiGluSmallTEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data), x.ne[1]};
     q4_small_t_mma_launch<Q4SwiGluSmallTGeometry, TileCols, ActiveCols, Q4SwiGluSmallTEpilogue,
                           Q4SwiGluSmallTRows, Masked, Tile::kKWarps, Tile::kStages,
-                          Tile::kTilesPerWarp>(
+                          Tile::kTilesPerWarp, Tile::kMinBlocks>(
         kBlocks, stream, static_cast<const __nv_bfloat16*>(x.data),
         static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.scales),
         static_cast<__nv_bfloat16*>(out.data), epilogue, Q4SwiGluSmallTRows{}, x.ne[1]);
@@ -118,9 +132,18 @@ constexpr auto make_small_t_launchers(std::index_sequence<Offsets...>) {
         &launch_small_t_active<8 * (1 + static_cast<int>(Offsets)), Masked>...};
 }
 
+// The eight-column slot of the exact table is deliberately the masked launcher: the dispatch below
+// never selects an exact eight-column width (it spills -- see the note there), and instantiating one
+// anyway would compile a spilling kernel nothing can call.
+template <std::size_t... Offsets>
+constexpr auto make_small_t_exact_launchers(std::index_sequence<Offsets...>) {
+    return std::array<SmallTLauncher, sizeof...(Offsets)>{
+        &launch_small_t_active<8 * (1 + static_cast<int>(Offsets)), Offsets == 0>...};
+}
+
 constexpr auto kSmallTLaunchers = make_small_t_launchers<true>(std::make_index_sequence<4>{});
 constexpr auto kSmallTExactLaunchers =
-    make_small_t_launchers<false>(std::make_index_sequence<4>{});
+    make_small_t_exact_launchers(std::make_index_sequence<4>{});
 
 using SmallTI8Launcher = void (*)(const Tensor&, const Weight&, Tensor&, const std::int8_t*,
                                   const __half*, cudaStream_t);
