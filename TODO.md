@@ -1131,6 +1131,43 @@ roofline finally acquired a denominator; read them before the rest.
       value is the *best* one that fits, and the alternatives were never swept on this hardware.
       Lower confidence than the two above, but it is untouched ground across every W8 Op.
 
+### Small-T decode kernels landed, and what they left (2026-09-11/12)
+
+PR #89 (`perf/small-t-mma`) put every 1-32-column Q4/Q5 decode GEMM on tensor-core small-T kernels
+and deleted the fused GDN projection-epilogue conv. MTP3 decode is 1.5x faster at C1 and 1.7x at
+C8 with perplexity bit-identical; the numbers, the per-Op table and the eight measured-and-rejected
+ideas live in [docs/performance.md](docs/performance.md#small-t-tensor-core-kernels-for-verify-and-cohort-decode).
+
+**Read those absolute microseconds with care.** They were measured on a rented Linux RTX 3090 at a
+350 W cap, whose probes read 892.8 GB/s and 81.8 TFLOPS BF16 -- not this box's 854.2 GB/s and 67.6
+TFLOPS. Ratios transfer; microseconds do not. Re-measure the three ceilings before quoting any of
+it here, exactly as "Handing this off to another machine" says.
+
+What is left, in order of size:
+
+- [ ] **C8 is tensor-rate bound.** Q4 gate_up at T=32 runs at ~68% of that card's measured bf16 MMA
+      peak (205 us against a 139 us tensor floor and a 106 us weight-streaming floor), and the Q5
+      shapes at 40-50%. Shared activation slabs (`ops/common/small_t_layout.cuh`) already took the
+      L2 traffic out; what remains is the MMA rate itself. The only large lever left is int8 tensor
+      cores -- W4A8 with per-(column, 64-k-group) activation scales, which is what the syv-ai stack
+      means by "int8 tensor-core GEMMs" -- and that is a quality trade, so it needs the same
+      before/after quality evidence as any other.
+
+- [ ] **C1 is mostly kernel-boundary ramp and drain.** A round is ~500 kernels; the Q5 residual
+      projections reach 68-82% of their streaming floor and gate_up 89%, and the shortfall scales
+      with how small the matrix is, which is the signature of per-launch ramp rather than of any
+      one kernel. Programmatic dependent launch is the fix and needs sm_90, so on `sm_86` the only
+      route is fusing work into fewer kernels.
+
+- [ ] **Two quality trades are implemented but never measured** on branch `perf/quality-trades`
+      (off #89): an int4 vocabulary head requantized in place at load
+      (`NINFER_LM_HEAD_Q4=1`, `ops/linear/q4/q4_requantize.h`) and FP16 GDN recurrent-state storage
+      (`NINFER_GDN_STATE_FP16=1`). Both compile and have tests (`ninfer_q4_requantize_test`,
+      `ninfer_gdn_state_fp16_test`); no run of either exists. Expected ~3% at C1 for the head and
+      ~2% C1 / 5-8% C8 for the state, plus a halved state image. Perplexity measures the head
+      directly but barely sees the FP16 state, which only rounds at prefill-chunk boundaries -- the
+      drift test and greedy-divergence checks exist for that reason.
+
 ### Found by this cycle's profiling, and not previously on this list
 
 The two entries below are the largest identified speed opportunities in the repository. Both come
