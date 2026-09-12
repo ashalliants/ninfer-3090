@@ -150,11 +150,10 @@ int run_gate_up(std::int32_t tokens) {
 // gate_up weight, T=32 only so far. Not routed by resolve_plan -- reached directly through
 // execute_schedule, the same way the schedule bench times it. Same oracle and allowance as the
 // prefill route above: same weight profile, same per-(token,64-group) s8 activation quantisation.
-int run_gate_up_small_t_i8() {
-    constexpr std::int32_t kRows   = 34816;
-    constexpr std::int32_t kCols   = 5120;
-    constexpr std::int32_t kOut    = kRows / 2;
-    constexpr std::int32_t kTokens = 32;
+int run_gate_up_small_t_i8(std::int32_t kTokens) {
+    constexpr std::int32_t kRows = 34816;
+    constexpr std::int32_t kCols = 5120;
+    constexpr std::int32_t kOut  = kRows / 2;
 
     const PackedWeight host_weight =
         qw::make_patterned_weight(QType::Q4G64_F16S, kRows, kCols, 4802U);
@@ -319,7 +318,10 @@ int main() {
             failures += run_gate_up(tokens);
             failures += run_down(tokens);
         }
-        failures += run_gate_up_small_t_i8();
+        // Every band of the T=2..32 dispatch, including widths that exercise column masking.
+        for (const std::int32_t t : {2, 5, 8, 9, 16, 17, 24, 25, 31, 32}) {
+            failures += run_gate_up_small_t_i8(t);
+        }
         std::cout << (failures == 0 ? "OK" : "FAIL")
                   << " integer-activation prefill routes correctness\n";
         return failures == 0 ? 0 : 1;

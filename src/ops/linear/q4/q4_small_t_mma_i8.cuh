@@ -5,11 +5,22 @@
 // instruction and rescale are proven at the 128-token prefill tile in
 // ops/linear_swiglu/q4a8/q4a8_linear_swiglu.h; this file narrows them to small T.
 //
-// Result at T=32 on the 27B gate_up, cold, median of 21, paired against the bf16 small-T kernel in
-// one sitting (the card drifts several percent between sittings, so only the pairing is meaningful):
-// 220.2 against 236.5, 193.5 against 203.8, 192.5 against 204.8 -- 5-7% faster in all three.
-// Relative L2 against the fp64 oracle is 0.0297, the same order as the prefill route's 0.023-0.031,
-// and the cost is the activation quantisation error the A16 route does not have.
+// Result on the 27B gate_up, cold, median of 15, each width paired against the bf16 small-T kernel
+// inside one sitting -- the card drifts several percent between sittings, so only the pairing is
+// meaningful. Two sittings, i8 against bf16:
+//
+//   T        8      12      16      20      24      28      32
+//   run 1  +10.7%  -5.8%   -3.4%   -4.8%   -4.8%   -5.0%   -4.5%
+//   run 2   +7.5%  +4.3%   -0.7%   -5.9%   -6.1%   -4.0%   -6.4%
+//
+// So it wins from sixteen columns up, by 4-6%, and loses at eight: a 64-k group of eight columns has
+// too little MMA work to pay for quantising the activations, which costs a fixed ~10us pre-pass
+// (measured by skipping it) plus a scale plane the A16 route does not read. Twelve is inside the
+// noise. A route table would want it from 16 upward and not below.
+//
+// Relative L2 against the fp64 oracle is 0.0080-0.0371 across T=2..32, against the prefill route's
+// 0.023-0.031 at its own widths, and the cost is the activation quantisation error the A16 route
+// does not have.
 //
 // What ncu says this kernel is, which is not what the roofline predicted. docs/performance.md put
 // gate_up at T=32 at ~68% of the card's bf16 MMA peak and called C8 tensor-rate bound, which is why
@@ -31,9 +42,21 @@
 //     -- same verdict the bf16 kernel records for 32 columns
 //   KWarps 2 with a 2- or 3-deep cp.async ring                  249.9 / 260.1us
 //   KWarps 4 with a 2-deep ring                                 263.2us
+//   a runtime column count instead of padding to the tile width  222.2us at T=28 against 196.6
+//     -- the staging bounds test cannot fold away and sits beside the tile-group test
 //
-// KWarps 4 with a single stage wins: at 20 outer steps rather than 40 it splits K harder, and the
-// ring it does without was never hiding DRAM latency in the first place -- see the L1 reading above.
+// KWarps 4 with a single stage wins at every width from sixteen columns up, and eight columns wants
+// KWarps 8: at 20 outer steps rather than 40 it splits K harder, and the ring it does without was
+// never hiding DRAM latency in the first place -- see the L1 reading above. Swept per band:
+//
+//   TileCols   KWarps 8   KWarps 4   KWarps 2
+//   8            137.2      139.3      237.6
+//   16           176.1      154.6      214.0
+//   24             --       179.2      220.2      (two stages: 198.7 / 233.5)
+//   32             --       220.2      255.0      (two stages: 262.1 / 255.0)
+//
+// Columns are padded to the tile width by the launcher rather than masked at runtime, for the
+// reason the rejected list gives.
 
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
@@ -182,7 +205,13 @@ __launch_bounds__(256) __global__
         for (int nt = 0; nt < kNt; ++nt) {
             if (nt % kTileGroups != tile_group) { continue; }
             const int col = nt * 8 + gid;
-            if (col >= live_columns) { continue; }
+            if (col >= live_columns) {
+                // Masked column. The compute loop zeroes its B fragment, but the rescale still
+                // multiplies by this scale, so zero it rather than leave the previous group's --
+                // a stale scale times a zero product is harmless, an uninitialised one need not be.
+                if (tig == 0) { stage.x_scale[k_split][col] = __float2half(0.0F); }
+                continue;
+            }
             const std::int8_t* src =
                 x_codes + static_cast<std::int64_t>(col) * kHidden + group_k0 + tig * 16;
             cp_async<16>(stage.activation[k_split][col] + tig * 16, src);
