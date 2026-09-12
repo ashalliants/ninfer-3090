@@ -198,6 +198,9 @@ struct EngineOptions {
     // per-slot host state image.
     bool lm_head_q4                        = false;
     bool gdn_state_fp16                    = false;
+    // Integer-activation MLP gate_up at decode and verify widths. Measured 4-6% off that Op from
+    // sixteen columns up; see docs/maintainer/quality-trade-experiments.md.
+    bool mlp_a8_decode                     = false;
     // Largest merged-token count one media item may occupy; larger media is downscaled at
     // preprocessing. Also bounds the overlay window.
     std::uint32_t vision_max_merged_tokens = 16384;

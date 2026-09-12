@@ -11,6 +11,7 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <stdexcept>
 #include <array>
 #include <utility>
@@ -293,6 +294,10 @@ void q4_linear_swiglu_small_t_tiled_launch(const Tensor& x, const Weight& w, Ten
     kSmallTLaunchers[static_cast<std::size_t>((x.ne[1] - 1) / 8)](x, w, out, stream);
 }
 
+bool q4_linear_swiglu_small_t_i8_supported(std::int32_t tokens) noexcept {
+    return tokens >= 16 && tokens <= 32;
+}
+
 std::size_t q4_linear_swiglu_small_t_tiled_i8_workspace_bytes(std::int32_t tokens) {
     // s8 codes plus one FP16 scale per (token, group), 256-aligned like q4a8_swiglu's workspace,
     // over the padded tile width rather than the request's: see the launch below for why the pad
@@ -315,8 +320,8 @@ void q4_linear_swiglu_small_t_tiled_i8_launch(const Tensor& x, const Weight& w, 
     // compile-time-width kernel rather than one carrying a runtime column count. Masking is not
     // free here: the staging loop's bounds test cannot fold away and it sits beside a tile-group
     // test, which measured T=28 at 222.2us against T=32's 193.5 on the same 32-wide tile. The
-    // epilogue already discards columns past the request, so the pad needs no handling beyond
     // being zero -- its MMAs were issued by the masked path too, only against a zeroed fragment.
+    // epilogue already discards columns past the request, so the pad needs no handling beyond
     const std::int32_t padded = (tokens + 7) / 8 * 8;
     auto scope                = workspace.scope();
     const DeviceSpan codes    = workspace.alloc_bytes(static_cast<std::size_t>(padded) * kK);

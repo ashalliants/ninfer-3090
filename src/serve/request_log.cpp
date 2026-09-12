@@ -702,6 +702,7 @@ std::string format_server_start_json(
              {"cuda_graph", engine_options.use_cuda_graph},
              {"lm_head_q4", engine_options.lm_head_q4},
              {"gdn_state_fp16", engine_options.gdn_state_fp16},
+             {"mlp_a8_decode", engine_options.mlp_a8_decode},
              {"prefix_reuse", options.allow_prefix_reuse},
              {"speculative_backend",
               product::speculative_backend_name(engine_options.speculative.backend)},
