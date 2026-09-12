@@ -1159,14 +1159,21 @@ What is left, in order of size:
       one kernel. Programmatic dependent launch is the fix and needs sm_90, so on `sm_86` the only
       route is fusing work into fewer kernels.
 
-- [ ] **Two quality trades are implemented but never measured** on branch `perf/quality-trades`
-      (off #89): an int4 vocabulary head requantized in place at load
-      (`NINFER_LM_HEAD_Q4=1`, `ops/linear/q4/q4_requantize.h`) and FP16 GDN recurrent-state storage
-      (`NINFER_GDN_STATE_FP16=1`). Both compile and have tests (`ninfer_q4_requantize_test`,
-      `ninfer_gdn_state_fp16_test`); no run of either exists. Expected ~3% at C1 for the head and
-      ~2% C1 / 5-8% C8 for the state, plus a halved state image. Perplexity measures the head
-      directly but barely sees the FP16 state, which only rounds at prefill-chunk boundaries -- the
-      drift test and greedy-divergence checks exist for that reason.
+- [x] **Two quality trades, measured 2026-09-12 and wired to CLI flags** on branch
+      `perf/quality-trades` (off #89): `--lm-head-q4` (int4 vocabulary head, requantized in place at
+      load) and `--gdn-state-fp16` (FP16 GDN recurrent-state storage). Full numbers, method, and the
+      verdict per trade are in `docs/maintainer/quality-trade-experiments.md`. Short version:
+      `--gdn-state-fp16` is a clean win (free within measurement noise, +2.0% real-text C8, halves
+      the host state image) and `--lm-head-q4` is a narrower one (+0.69% perplexity, altered greedy
+      output from ~char 210 onward, for +3.2% real-text C8 and ~0% C1). Both default off.
+
+      **The naive C1 expectation (~3% for the head) did not hold on real text**, and the first
+      MTP3-decode read (+41%, via `ninfer_bench`'s default corpus) was a measurement artifact of
+      `bench/fixtures/bench_corpus.ids`'s 98.4%-repeated-bigram content inflating acceptance —
+      exactly the pitfall this file already names elsewhere. `tools/bench/run_chat_decode.py` on
+      real prompts is what actually settled it; that script gained an `env=K=V` arm field so
+      env-gated trades (or anything else) can be A/B'd on one binary without losing the
+      interleaving this card's 3-5% process drift requires.
 
 ### Found by this cycle's profiling, and not previously on this list
 

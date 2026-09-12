@@ -191,6 +191,13 @@ struct EngineOptions {
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
     VisionResidency vision_residency       = VisionResidency::Resident;
+    // Speed-for-quality trades, opt-in and off by default. Measured in
+    // docs/maintainer/quality-trade-experiments.md: lm_head_q4 costs +0.69% perplexity for a
+    // C8 decode gain (~3%, real chat prompts); gdn_state_fp16 is free within measurement noise
+    // (bit-identical greedy output, unchanged perplexity) for a ~2% C8 gain and a halved
+    // per-slot host state image.
+    bool lm_head_q4                        = false;
+    bool gdn_state_fp16                    = false;
     // Largest merged-token count one media item may occupy; larger media is downscaled at
     // preprocessing. Also bounds the overlay window.
     std::uint32_t vision_max_merged_tokens = 16384;
