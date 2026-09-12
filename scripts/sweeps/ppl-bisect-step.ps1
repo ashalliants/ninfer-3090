@@ -48,6 +48,15 @@ param(
 )
 $ErrorActionPreference = 'Continue'
 
+# -Repo is used on both sides of a Set-Location -- the helper search below runs before the
+# directory change, Get-NInferModelDir -Root after it -- so a relative value would mean two
+# different directories. `-Repo repo` from a parent directory would find the helpers under
+# .\repo\scripts\sweeps and then probe repo\repo\models for the artifact, reporting a perfectly
+# good checkout as missing. Canonicalise once, here, against the directory the caller invoked from.
+$resolvedRepo = Resolve-Path -LiteralPath $Repo -ErrorAction SilentlyContinue
+if (-not $resolvedRepo) { Write-Error "-Repo does not exist: $Repo (resolved from $PWD)"; exit 1 }
+$Repo = $resolvedRepo.Path
+
 # Resolve the two shared helpers BEFORE Set-Location, and from either place they can legitimately
 # live, because this file is meant to be run from a copy outside the repo (see the header):
 #
