@@ -11,9 +11,12 @@ int main() {
     try {
         // Public numerical cases straddle each registered Q4 implementation interval. They make
         // no assertion about the private route selected for any T.
-        constexpr std::array<std::int32_t, 20> kTokenCases{
-            1,   2,   24,  25,  32,  33,  40,  41,  48,  49,
-            128, 129, 256, 257, 384, 385, 512, 513, 640, 641,
+        // 8, 16 and 17 straddle the small-T dispatch's exact-width boundary as well as the
+        // registered intervals: a width that fills its tile runs an instantiation with no runtime
+        // column count, and the widths either side of it do not (q4_linear_swiglu_gemv.cu).
+        constexpr std::array<std::int32_t, 23> kTokenCases{
+            1,   2,   8,   16,  17,  24,  25,  32,  33,  40,  41, 48,
+            49,  128, 129, 256, 257, 384, 385, 512, 513, 640, 641,
         };
         const int failures = run_profile(
             "LinearSwiGLU Q4_A16",
