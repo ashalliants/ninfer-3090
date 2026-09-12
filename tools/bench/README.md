@@ -159,6 +159,30 @@ worker aggregation uses the serving `throughput.host_work` interval deltas. The 
 temperature/top-p/top-k/min-p/presence/frequency profile explicitly, so model-default changes do
 not alter the measurement method.
 
+## Chat decode A/B (`run_chat_decode.py`)
+
+Decode rate on a chat prompt set through `ninfer-serve`'s OpenAI Chat Completions endpoint,
+reported as `concurrency x 1000 / mean TPOT` from the server's own request log -- the metric
+`vllm bench serve` prints, so results can be read against stacks that publish it. `output
+throughput` (generated tokens / wall clock) is printed alongside and includes prefill and the tail.
+
+Arms are interleaved, in order on even passes and reversed on odd, because between-process spread
+on one RTX 3090 is 3-5%; always A/B two binaries inside one sitting rather than across sessions.
+Each arm may drop or add server flags, so one binary can be compared against itself under different
+options.
+
+```bash
+python3 tools/bench/run_chat_decode.py \
+  --model models/qwen3_8_27b.ninfer --prompts prompts_real.jsonl \
+  --concurrency 1 --reps 2 --out profiles/bench/chat-decode \
+  --arm base=/path/to/baseline/ninfer-serve --arm new=./build/apps/ninfer-serve
+```
+
+The prompt file is one JSON object per line with a `prompt` string; the comparisons in
+[docs/performance.md](../../docs/performance.md#small-t-tensor-core-kernels-for-verify-and-cohort-decode)
+use the eight thinking-off prompts of syv-ai/qwen38-27b-rtx3090's `bench/prompts_real.jsonl`, which
+is that project's file and is not vendored here.
+
 ## Concurrent serving benchmark
 
 `run_serve_concurrency.py` selects `--suite decode-saturation` or `--suite corpus-makespan`.
