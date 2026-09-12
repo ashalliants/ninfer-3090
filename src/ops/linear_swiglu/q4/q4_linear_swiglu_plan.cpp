@@ -33,17 +33,26 @@ constexpr Q4LinearSwiGluProblem kShape{34816, 17408, 5120, 5120, 1};
 
 constexpr std::array<RouteSpec, 5> kRoutes{{
     {{1, 1}, Q4LinearSwiGluScheduleId::GemvPair},
-    // Measured on sm_86 with bench/ops/q4_linear_swiglu_schedule_bench.cu (cold, median of 11):
-    // SmallTTiled and the 40-wide pair tile cross between 24 and 25, us --
-    //     T=22  373.8 vs 438.3   T=24  390.1 vs 434.2   T=25  464.9 vs 436.2   T=32  507.9 vs 437.2
-    // so the tile is 6% faster at 25 and 14% at 32. That restores the boundary this fork always
-    // had. Its original comment justified 24 by a crossover against q4_linear_swiglu_small_t_exact,
-    // which upstream deleted, so I had replaced it with upstream's 32; the number turns out to be
-    // right for the tiled kernel too, which nobody had measured. 32 is separately the largest
-    // width SmallTTiled accepts at all -- past it the launch fails, so it is a capability limit
-    // rather than a tuning choice, and upstream's table simply ran the route to that limit.
-    {{2, 24}, Q4LinearSwiGluScheduleId::SmallTTiled},
-    {{25, 40}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C40},
+    // Re-measured 2026-09-11 on an RTX 3090 under Linux after the small-T MMA's rewrite (padded code
+    // rows, then a permuted k order with 64-bit code loads and no int-to-float decode -- see
+    // q4_small_t_mma.cuh). Cold, median of 31 (us):
+    //
+    //   T            2      4      8     12     16     20     24     25     32
+    //   small_t  118.8  120.8  123.9  164.9  201.7  268.3  290.8  358.4  431.1
+    //   c40      439.3  438.3  442.4  444.4  443.4  447.4  444.4  442.4  444.4
+    //
+    // SmallTTiled now wins to the kernel's 32-column limit, so the c40 tile keeps only 33..40. The
+    // old 24/25 boundary was measured against the kernel before the rewrite (399 us at T=24, and
+    // 446.5 against c40's 444.4 at T=25).
+    //
+    // Its 16-32-column tiles were then given shared activation slabs (KWarps 4/2, and two tiles
+    // per warp at 24 columns; q4_linear_swiglu_gemv.cu has the layout sweep). Same bench (us):
+    //
+    //   T            9     16     17     24     32
+    //   small_t  145.4  152.6  167.9  178.2  208.9     (24 then two tiles per warp: ~164)
+    //   c40      452.6  444.4  451.6  445.4  447.5
+    {{2, 32}, Q4LinearSwiGluScheduleId::SmallTTiled},
+    {{33, 40}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C40},
     {{41, 48}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C48},
     // Measured on sm_86 by bench/ops/q4_linear_swiglu_schedule_bench.cu, cold, median of 9-15,
     // repeated three to four times per width because this Op is noisier than the others here.

@@ -47,6 +47,7 @@ struct Schedule {
 // PairR32C64S4 both dispatch to grouped_mma_r32_c64_s4, so it appears once.
 const Schedule kSchedules[] = {
     {"parent_split_fixed", &ninfer::ops::detail::q4_q5_attn_input_small_t_launch, 12},
+    {"small_t_mma", &ninfer::ops::detail::q4_q5_attn_input_small_t_mma_launch, 32},
     {"grouped_r32_c32_s4", &ninfer::ops::detail::q4_q5_attn_input_grouped_mma_r32_c32_s4_launch, 0},
     {"grouped_r32_c64_s4", &ninfer::ops::detail::q4_q5_attn_input_grouped_mma_r32_c64_s4_launch, 0},
     {"mixed_r32_c64_s3", &ninfer::ops::detail::q4_q5_attn_input_mixed_r32_c64_s3_launch, 0},

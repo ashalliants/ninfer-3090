@@ -16,11 +16,7 @@ enum class Q4Q5GdnInputScheduleId {
     GroupedMixedMmaR64C32,
     GroupedMixedMmaR64C64,
     GroupedMixedMmaR64C128,
-};
-
-enum class Q4Q5GdnInputConvScheduleId {
-    ProjectionEpilogueFused,
-    Materialized,
+    SmallTMma,
 };
 
 struct Q4Q5GdnInputProblem {
@@ -37,17 +33,10 @@ struct Q4Q5GdnInputPlan {
     Q4Q5GdnInputScheduleId schedule;
 };
 
-struct Q4Q5GdnInputConvPlan {
-    Q4Q5GdnInputConvScheduleId schedule;
-};
-
 const char* q4_q5_gdn_input_schedule_name(Q4Q5GdnInputScheduleId schedule) noexcept;
-const char* q4_q5_gdn_input_conv_schedule_name(Q4Q5GdnInputConvScheduleId schedule) noexcept;
 
 bool q4_q5_gdn_input_admits(const Q4Q5GdnInputProblem& problem) noexcept;
 Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem);
-Q4Q5GdnInputConvPlan q4_q5_gdn_input_conv_resolve_plan(const Q4Q5GdnInputProblem& problem,
-                                                       std::int32_t batch_size);
 
 // Runs a schedule without first checking that it is the one resolve_plan would pick;
 // q4_q5_gdn_input_execute_plan is exactly this plus that check.

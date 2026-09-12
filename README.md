@@ -27,6 +27,10 @@ see [`docs/config-calculator.html`](docs/config-calculator.html).
 
 The goal is the make the utmost rippin Qwen inference stack for the 3000 series. Gladly taking PR's, all help much appreciated. 
 
+**New since v0.9.1: tensor-core small-T kernels for MTP verify and cohort decode.** Qwen3.8-27B
+MTP3 decode is 1.5x faster at C1 (113 tok/s on thinking-off chat) and 1.7x at C8; see
+[the results](#decode-after-the-small-t-kernels).
+
 Release notes for this branch: [v0.9.1](RELEASE_NOTES_0.9.1.md) — DFlash2 wants four draft tokens
 rather than seven (+22.6%), two more route tables re-measured for `sm_86` (up to 52.8%), and three
 races fixed in paths that produced wrong output rather than an error. Previous:
@@ -239,6 +243,59 @@ defaults on a typical machine: MSVC 14.4x from **VS 2022 BuildTools** (CUDA 12.8
 ```
 
 ## Qwen3.8-27B support and RTX 3090 results
+
+### Decode after the small-T kernels
+
+MTP3 decode is **1.5x faster at C1 and 1.7x at C8** than v0.9.1, measured before/after on the
+same card. The MTP verify round and the concurrent-cohort round both run 4-32 token columns, and
+those widths used to fall between the single-token GEMVs and the prefill GEMM tiles. They now
+run on tensor-core small-T kernels built for exactly that range; the
+[performance page](docs/performance.md#small-t-tensor-core-kernels-for-verify-and-cohort-decode)
+has the kernel-level story.
+
+Both builds ran side by side on one rented RTX 3090 (Linux, CUDA 12.8, 350 W power limit, ~1.56
+GHz under load) in one session, with INT8 KV, MTP3, the optimized draft head, CUDA Graphs and
+greedy sampling unless noted. Output quality is untouched: perplexity on the quick corpus is
+bit-identical (4.342425), and only decode-width routes changed.
+
+**Reasoning cohort**: `tools/bench/run_qwen38_replayssm_cohort_sweep.py`, the harness behind the
+v0.9.1 table further down, with 1,024 output tokens per request.
+
+| Cohort | v0.9.1 decode | small-T kernels | change |
+|---:|---:|---:|---:|
+| C1 | 63.25 tok/s | **92.88 tok/s** | +47% |
+| C2 | 88.76 tok/s | **168.03 tok/s** | +89% |
+| C4 | 136.95 tok/s | **270.79 tok/s** | +98% |
+| C8 | 221.46 tok/s | **376.16 tok/s** | +70% |
+
+**Thinking-off chat**: the eight prompts of
+[syv-ai/qwen38-27b-rtx3090](https://github.com/syv-ai/qwen38-27b-rtx3090)'s
+`bench/prompts_real.jsonl`, with 1,024 output tokens and `reasoning_effort: none`. Decode is their
+metric, C × 1000 / mean TPOT, so the right-hand column can be read against it.
+
+| | v0.9.1 | small-T kernels | their patched vLLM stack (their README) |
+|---|---:|---:|---:|
+| C1, greedy | 74.6 tok/s | **113.2 tok/s** | 111-124 tok/s (MTP) |
+| C1, temperature 0.7 | 72.6 tok/s | **112.8 tok/s** | — |
+| C8, greedy | 268.6 tok/s | **460.4 tok/s** | 407.3 tok/s |
+
+Read the last column with two caveats. Their card is capped at 250 W and this one ran at 350 W.
+They also report 5-8% run-to-run spread, so C1 is parity, not a win. Tokens per round did not
+move (2.88 at C1 on these prompts), so every gain here is round cost.
+
+`ninfer_bench` (256 tokens, three repetitions): plain decode 39.98 -> **47.15 tok/s**, MTP3
+53.96 -> **85.29 tok/s**. An MTP3 verify round now costs 1.15x a plain decode step, down from
+about 1.5x; vLLM/Marlin on the same card is 1.14x.
+
+Four and five draft tokens no longer cost more than they return. Until the GDN conv projection
+was moved onto the same kernels they measured 93.8 and 91.5 tok/s, against three draft tokens'
+109.4; now they land within 1% of it (108.7 and 108.1). `--draft-tokens 3` stays the
+recommendation.
+
+### v0.9.1 long-output cohort (earlier host)
+
+Measured on a different RTX 3090 host before the small-T kernels; compare within a table, not
+across the two sections.
 
 Qwen3.8-27B is validated from one through eight simultaneous users. ReplaySSM cuts the memory cost
 of speculative decoding, allowing the faster MTP3 mode to remain enabled at C8. The table below is

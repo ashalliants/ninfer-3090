@@ -189,7 +189,7 @@ Ordered by expected value, not by section.
 |---|---|---|---|
 | MoE expert gather is latency-bound | 2c | split the shared W8 path out of the 9-warp block, as `sparse_moe_d3_path_tiled_kernel` already does for multi-token; then confirm the 2.2x over-fetch on d4 with `dram__bytes_read.sum` | kernel work; `ncu` for the confirm |
 | Prefill MLP GEMMs at ~30% of INT8 peak | 2c | run `admin-profile.ps1` section 3 and read issue rate vs shared-memory feeding vs occupancy | one elevated run |
-| Eight lanes buy 3.6x (3.83x since the GDN tiles) | 2c | the 4x between `mma_r64_c16` and its weight-streaming floor is the target; **not** by narrowing the tile, which was tried and lost | kernel work |
+| Eight lanes buy 3.6x (4.05x with MTP3 since the small-T kernels) | 2c | gate_up at T=32 is ~68% of the bf16 MMA peak; the 5120-row Q5 shapes need split-K at T=32 (it bought only 0-2.5% at narrow T) | kernel work |
 | KV decode falloff, 3.21x per-key on fp8 | 2c | attack the per-key dequant-into-shared cost; `rk8v4` proves the floor is reachable without a shared arena | kernel work |
 | DFlash2 5→6 cliff | 2c/3 | remainder after the GDN tiles is the grouped kernel sitting at 27% of its own weight-streaming floor | same kernel as the KV item |
 | Routed prefill pipeline-depth threshold 7/4 | 2c | sweep the constant through the product on this card — the method the source comment endorses over the operator fixture | GPU time only |
@@ -713,6 +713,14 @@ roofline finally acquired a denominator; read them before the rest.
       guess a replacement constant without that measurement.
 
 - [ ] **Eight lanes buy 3.6x, not 8x, because no kernel amortises a weight read across 2-10 rows.**
+      **2026-09-11, largely addressed:** the small-T tensor-core kernels (`q4_small_t_mma.cuh`,
+      `q5_small_t_mma.cuh`, `ops/common/small_t_layout.cuh`) now serve every 1-32-column decode
+      extent of the Q4/Q5 GEMMs, and the SIMT families in the table below have no decode
+      instances left. MTP3 reasoning cohort on a Linux RTX 3090: C1 92.9, C8 376.2 tok/s (4.05x),
+      from 63.3 and 221.5. What remains is gate_up at T=32 running at ~68% of the bf16 MMA peak, and
+      the 5120-row Q5 shapes having too few CTAs at T=32. See
+      [docs/performance.md](docs/performance.md#small-t-tensor-core-kernels-for-verify-and-cohort-decode).
+      The measurements below are the pre-small-T profile and stay for the record.
       Measured 2026-09-09 on the 27B, int8 KV, no speculation, `--decode-tokens 512
       --max-context 8192`, via `tools/bench/run_serve_concurrency.py --suite decode-saturation`:
 
@@ -1122,6 +1130,43 @@ roofline finally acquired a denominator; read them before the rest.
       are honest that these are what fits. None of them record a measurement showing the chosen
       value is the *best* one that fits, and the alternatives were never swept on this hardware.
       Lower confidence than the two above, but it is untouched ground across every W8 Op.
+
+### Small-T decode kernels landed, and what they left (2026-09-11/12)
+
+PR #89 (`perf/small-t-mma`) put every 1-32-column Q4/Q5 decode GEMM on tensor-core small-T kernels
+and deleted the fused GDN projection-epilogue conv. MTP3 decode is 1.5x faster at C1 and 1.7x at
+C8 with perplexity bit-identical; the numbers, the per-Op table and the eight measured-and-rejected
+ideas live in [docs/performance.md](docs/performance.md#small-t-tensor-core-kernels-for-verify-and-cohort-decode).
+
+**Read those absolute microseconds with care.** They were measured on a rented Linux RTX 3090 at a
+350 W cap, whose probes read 892.8 GB/s and 81.8 TFLOPS BF16 -- not this box's 854.2 GB/s and 67.6
+TFLOPS. Ratios transfer; microseconds do not. Re-measure the three ceilings before quoting any of
+it here, exactly as "Handing this off to another machine" says.
+
+What is left, in order of size:
+
+- [ ] **C8 is tensor-rate bound.** Q4 gate_up at T=32 runs at ~68% of that card's measured bf16 MMA
+      peak (205 us against a 139 us tensor floor and a 106 us weight-streaming floor), and the Q5
+      shapes at 40-50%. Shared activation slabs (`ops/common/small_t_layout.cuh`) already took the
+      L2 traffic out; what remains is the MMA rate itself. The only large lever left is int8 tensor
+      cores -- W4A8 with per-(column, 64-k-group) activation scales, which is what the syv-ai stack
+      means by "int8 tensor-core GEMMs" -- and that is a quality trade, so it needs the same
+      before/after quality evidence as any other.
+
+- [ ] **C1 is mostly kernel-boundary ramp and drain.** A round is ~500 kernels; the Q5 residual
+      projections reach 68-82% of their streaming floor and gate_up 89%, and the shortfall scales
+      with how small the matrix is, which is the signature of per-launch ramp rather than of any
+      one kernel. Programmatic dependent launch is the fix and needs sm_90, so on `sm_86` the only
+      route is fusing work into fewer kernels.
+
+- [ ] **Two quality trades are implemented but never measured** on branch `perf/quality-trades`
+      (off #89): an int4 vocabulary head requantized in place at load
+      (`NINFER_LM_HEAD_Q4=1`, `ops/linear/q4/q4_requantize.h`) and FP16 GDN recurrent-state storage
+      (`NINFER_GDN_STATE_FP16=1`). Both compile and have tests (`ninfer_q4_requantize_test`,
+      `ninfer_gdn_state_fp16_test`); no run of either exists. Expected ~3% at C1 for the head and
+      ~2% C1 / 5-8% C8 for the state, plus a halved state image. Perplexity measures the head
+      directly but barely sees the FP16 state, which only rounds at prefill-chunk boundaries -- the
+      drift test and greedy-divergence checks exist for that reason.
 
 ### Found by this cycle's profiling, and not previously on this list
 

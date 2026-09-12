@@ -46,12 +46,11 @@ void launch_ksplit(const Tensor& hidden, const Weight& head, const Tensor& row_t
     const Q4KSplitTopKOutput output{static_cast<std::uint64_t*>(workspace.partial_keys.data),
                                     static_cast<const std::int32_t*>(row_to_global_ids.data),
                                     workspace.producer_groups, hidden.ne[1]};
-    q4_small_t_mma_kernel<Geometry, kTileColumns, Capacity, Q4KSplitTopKOutput,
-                          Q4SmallTMmaIdentityRows, true>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(static_cast<const __nv_bfloat16*>(hidden.data),
-                                                     static_cast<const std::uint8_t*>(head.qdata),
-                                                     static_cast<const std::uint8_t*>(head.scales),
-                                                     nullptr, output, Q4SmallTMmaIdentityRows{}, hidden.ne[1]);
+    q4_small_t_mma_launch<Geometry, kTileColumns, Capacity, Q4KSplitTopKOutput,
+                          Q4SmallTMmaIdentityRows, true>(
+        kBlocks, stream, static_cast<const __nv_bfloat16*>(hidden.data),
+        static_cast<const std::uint8_t*>(head.qdata), static_cast<const std::uint8_t*>(head.scales),
+        nullptr, output, Q4SmallTMmaIdentityRows{}, hidden.ne[1]);
     CUDA_CHECK(cudaGetLastError());
 }
 
