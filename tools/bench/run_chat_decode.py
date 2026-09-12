@@ -15,7 +15,10 @@ worth measuring. Always A/B inside one sitting.
 
 usage:
   python tools/bench/run_chat_decode.py --model MODEL.ninfer --prompts PROMPTS.jsonl \
-      --out DIR --arm name=/path/to/ninfer-serve [--arm name=/path/to/other[;drop=--flag,...][;add=--flag value ...]]
+      --out DIR --arm name=/path/to/ninfer-serve [--arm name=/path/to/other[;drop=--flag,...][;add=--flag value ...][;env=K=V,K2=V2]]
+
+  Arms may share one binary and differ only by environment (e.g. env=NINFER_LM_HEAD_Q4=1) --
+  useful for env-gated quality trades, where the interleaving above is what makes the A/B valid.
 
   PROMPTS.jsonl holds one object per line with a "prompt" string. Any chat prompt set works; the
   comparisons in docs/performance.md use the eight prompts of
@@ -36,16 +39,20 @@ from pathlib import Path
 def parse_arm(raw):
     parts = raw.split(";")
     name, server = parts[0].split("=", 1)
-    drop, add = [], []
+    drop, add, env = [], [], {}
     for part in parts[1:]:
         key, value = part.split("=", 1)
         if key == "drop":
             drop = value.split(",")
         elif key == "add":
             add = value.split()
+        elif key == "env":
+            for pair in value.split(","):
+                k, v = pair.split("=", 1)
+                env[k] = v
         else:
             raise SystemExit(f"unknown arm field: {key}")
-    return name, server, drop, add
+    return name, server, drop, add, env
 
 
 def wait_ready(proc, port, timeout=180.0):
@@ -80,7 +87,7 @@ def chat(port, prompt, seed, args):
         return json.load(response)
 
 
-def run_arm(name, server, drop, add, prompts, args, rep):
+def run_arm(name, server, drop, add, env, prompts, args, rep):
     out = Path(args.out) / f"rep{rep}_{name}"
     out.mkdir(parents=True, exist_ok=True)
     log = out / "requests.jsonl"
@@ -95,8 +102,9 @@ def run_arm(name, server, drop, add, prompts, args, rep):
         command.append("--greedy")
     command = [a for a in command if a not in drop] + add
 
+    proc_env = {**os.environ, **env}
     with open(out / "stdout.log", "w") as so, open(out / "stderr.log", "w") as se:
-        proc = subprocess.Popen(command, stdout=so, stderr=se)
+        proc = subprocess.Popen(command, stdout=so, stderr=se, env=proc_env)
         try:
             wait_ready(proc, args.port)
             chat(args.port, "Say hi.", 1, args)  # warm the first-request paths outside the measurement
@@ -161,8 +169,8 @@ def main():
     arms = [parse_arm(raw) for raw in args.arm]
     for rep in range(args.reps):
         ordered = arms if rep % 2 == 0 else list(reversed(arms))
-        for name, server, drop, add in ordered:
-            run_arm(name, server, drop, add, prompts, args, rep)
+        for name, server, drop, add, env in ordered:
+            run_arm(name, server, drop, add, env, prompts, args, rep)
 
 
 if __name__ == "__main__":
