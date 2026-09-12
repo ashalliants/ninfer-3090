@@ -146,11 +146,18 @@ Q5 residual kernels reach 68-82% of their streaming floor, gate_up 89%). What is
 tensor-core rate: gate_up at T=32 runs at about 68% of the card's measured bf16 MMA peak.
 
 **Reproduce.** Build both trees with `-DNINFER_BUILD_APPS=ON -DNINFER_BUILD_BENCHMARKS=ON` and run
-each harness alternately against both `ninfer-serve` binaries on one card:
-`tools/bench/run_qwen38_replayssm_cohort_sweep.py` for the cohort. For the thinking-off numbers,
-send the eight prompts one at a time (or eight at once for C8) to `/v1/chat/completions` with
-`max_tokens` 1024, `reasoning_effort` `none` and `--spec mtp --draft-tokens 3 --lm-head-draft
---kv-dtype int8`, and take C × 1000 / mean TPOT from the request log's decode timings.
+each harness against both `ninfer-serve` binaries on one card, interleaved in one sitting:
+`tools/bench/run_qwen38_replayssm_cohort_sweep.py` for the cohort, and for the thinking-off numbers
+
+```bash
+python tools/bench/run_chat_decode.py --model models/qwen3_8_27b.ninfer \
+  --prompts prompts_real.jsonl --concurrency 1 --reps 2 --out chat-decode \
+  --arm base=/path/to/old/ninfer-serve --arm new=./build/apps/ninfer-serve
+```
+
+with the eight prompts of syv-ai/qwen38-27b-rtx3090's `bench/prompts_real.jsonl` (that file is
+theirs and is not vendored here). `--concurrency 8` gives the C8 row. Both report decode as
+C × 1000 / mean TPOT from the server's own request log.
 
 ### Choosing a KV format (RTX 3090, Qwen3.8-27B)
 
