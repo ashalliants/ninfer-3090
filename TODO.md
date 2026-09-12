@@ -1,34 +1,124 @@
 # TODO
 
-State as of 2026-09-09, at the end of a profiling pass that closed six more items and refuted five
-of its own hypotheses. **34 items closed, 17 open.** If you are picking this up on different
-hardware, read "Handing this off to another machine" below before anything else.
+State as of 2026-09-09. Four passes: a profiling pass that closed six items and refuted five of its
+own hypotheses, a measurement-hygiene pass that closed three more, a counter pass that put a *cause*
+under the four biggest performance entries, and a kernel pass that shipped **two** speedups and
+reverted a third. **46 items closed, 13 open.**
+If you are picking this up on different hardware, read "Handing this off to another machine" below
+before anything else.
 
 Released: **v0.9.0-rtx3090** (Windows + Linux). Full suite **126/126** on this box.
 
-**One speedup shipped this pass, and it was small and cheap.** The GDN input projection was routing
-everything from 7 to 32 columns through a 32-wide MMA tile; adding C8 and C16 tiles is worth
-**+5.7% on the C8 serving profile** (3 of 3 runs, arms not overlapping) and +5.3% on DFlash2 at four
-draft tokens. That is the only behaviour change; everything else this pass produced was measurement.
+**Four speedups shipped this cycle, and the two biggest came from one measurement: `Mem Pipes Busy`
+at 81% while DRAM sat at 50%.** Widening the Q5 and Q4 GEMV consume loops from one code byte per
+lane to a 4-byte word — eight weights instead of two, a 4x cut in memory-pipe instructions for
+identical arithmetic — is worth **+3.90%** and **+1.95%** on the 27B dense decode, about **+5.9%
+compounded**, each 6 of 6 paired repetitions. The q4 SwiGLU pair now runs at **85.3% of DRAM**,
+which is the ceiling this file exists to reach; the q5 GEMV became **compute-bound at 73%**, a
+different problem than any other entry here. A third widening of the same kind on the q5
+dequantization arithmetic — the half2 bit-trick plus a per-group scale hoist, both exact — is
+**+2.67%**, and `sparse_moe_d2`'s branch-free sorting network is **+3.15% on the 35B**.
+
+**End to end at depth 4,096 the dense decode went 37.44 → 40.11 tok/s: 69.0% → 73.9% of the
+854.2 GB/s the card can actually read.** That is +7.13% throughput and **+4.9 points of the
+ceiling**, from the thirteen points §2c identified. Fully closing the remaining 26.1 would be
+54.3 tok/s; nothing here suggests that is reachable, and the number exists to stop the next person
+quoting 936.2 GB/s. See §2c.
+
+**Two speedups have shipped on the GDN input projection, both on the same boundary, and the second
+one came from noticing the first had measured the wrong kernel.** Adding C8 and C16 tiles to the GDN input
+projection was worth **+5.7% on the C8 serving profile** and +5.3% on DFlash2 at four draft tokens.
+Then instantiating the existing split-K direct kernel past its `T <= 6` throw made *it* the winner at
+width 8 — **+2.85% end to end, 6 of 6 paired repetitions, against a control that drifted 0.09%.**
+The route table is now `{1,6}` independent / `{7,7}` c8 / `{8,8}` independent / `{9,16}` c16.
+
+**One kernel experiment was built, measured and reverted**: splitting the MoE's nine-warp D3 block
+into three-warp path blocks, which raised theoretical occupancy to 100% and *dropped* achieved from
+67.7% to 52.6%. That closed the MoE entry as a dead end — all four of its candidate fixes are now
+measured negatives.
+
+**A shipped artifact does not load on this card.** `models/qwen3_6_27b_nvfp4.ninfer` fails in
+runtime planning with `nvfp4 linear_swiglu A16 is registered only through T=16`, on a three-word
+prompt — sm_86 forces NVFP4 weights onto the A16 route, and the A16 route has no width above 16.
+The only test that reaches it skips unless an env var this file omitted until last cycle is set,
+which is why "126/126" and a completely unusable configuration coexisted. `docs/cli.md` uses an
+NVFP4 artifact as its worked example. **The obvious fix — project then `silu_mul`, as the W4A4
+baseline does — was built, makes the artifact load, and is ~0.8% off because it rounds the
+projection to BF16 before the SiLU; reverted.** See §1.
+
+**The second speedup came from a single-warp kernel nobody had looked at.**
+`sparse_moe_d2_warp_kernel` picks the top 8 of 257 experts in `<<<1, 32>>>` — one warp, one SM of
+82 — and `nsys` put it at **8.45% of the 35B's decode kernel time**, third of the four MoE stages.
+Its stall breakdown (`wait` 37.7%, `branch_resolving` 15.3%, `long_scoreboard` only 4.1%) said
+divergence and exposed latency, not memory. Replacing the divergent insertion sort with a
+branch-free 19-compare network took it **13.43 → 8.32 µs, −38%**, worth **+3.15% end to end on the
+35B, 6 of 6 paired reps against a control that drifted 0.00%.** The `wait` half remains, and §2c now
+carries a costed design for it — worth ~2%, and *not* the naive 8-warp split, which would
+parallelise the cheaper half of the routine and measure as almost nothing. See §2c.
+
+**Read this next: almost nothing here is bandwidth-bound, and this file spent a cycle assuming
+otherwise.** `ncu` counters on five kernels, all on one instrument with clocks locked, say the same
+thing — the kernels that matter reach 20-50% of DRAM while saturating something else or nothing at
+all:
+
+| kernel | DRAM % | highest pipe | achieved occupancy | eligible warps/sched | actually limited by |
+|---|---:|---|---:|---:|---|
+| `rowsplit_grouped_mma` C8 (GDN, w8) | **27.7** | 54.3 L1/TEX | **24.5** of 50 | **0.55** | too few warps exist |
+| `q4a8_swiglu` (prefill MLP) | **20.6** | 61.1 L1/TEX | 33.3 of 33.3 | 0.78 | 124 registers/thread |
+| `q5_rowsplit_gemv` (dense decode) | 50.1 → 54.3 | 86.6 → **36.7** L1/TEX | 57.6 | — | **fixed: +3.90%** |
+| `sparse_moe_d3` | 43.2 | 34.7 L1/TEX | 61.1 of 93.8 | 1.36 | nothing — latency |
+| `sparse_moe_d4` | 47.1 | 42.4 L1/TEX | 81.4 of 93.8 | 1.16 | nothing — latency |
+
+Three consequences worth having before touching any kernel. **A "% of achievable bandwidth" figure
+computed as bytes ÷ nsys duration told us the wrong thing four times**; the MoE at "40-45% against
+contiguous kernels at 78-82%" is really 43-47% against 50% on one instrument, so the gap is a few
+points, not thirty-five. **Narrowing a tile cannot fix a parallelism shortfall** — total warp-work
+is `(rows/WM) x (BN/WN)`, which `BM` does not appear in and which narrowing `BN` actively *reduces*;
+that is why three separate tile experiments lost. And **the fixes are now specific**: split-K for
+the GDN projection (a working one exists for the W8 variant of the same Op), a register cut for the
+prefill MLP, and wider per-lane decode in the Q5 GEMV consume loop.
 
 **The five biggest opportunities are all now located rather than suspected**, and three of them
 turned out to be the opposite of what this file assumed:
 
-- The **MoE expert gather** is latency-bound, not divergence-bound. 31.1 of 32 threads per warp are
-  active, so there is no divergence to fix; and neither tiling nor batching helps, because the
-  kernel is 1.17 machine-fulls of work and an MoE with per-token routing does not amortise its
-  routed weight read across a cohort — 8 tokens touch ~57 distinct experts, not 8. The 35B's ~51%
+- The **MoE expert gather** is latency-bound, and it is now **closed as a dead end** — all four
+  candidate fixes measured, none worked. 31.1 of 32 threads per warp are active, so there is no
+  divergence to fix; neither tiling nor batching helps, because the kernel is 1.17 machine-fulls of
+  work and an MoE with per-token routing does not amortise its routed weight read across a cohort
+  (8 tokens touch ~57 distinct experts, not 8); and **splitting the nine-warp block made it worse**,
+  raising theoretical occupancy to 100% while dropping achieved from 67.7% to 52.6%. The 35B's ~51%
   of achievable is what top-8-of-256 costs, not a bug.
 - The **KV decode falloff** is 3.21x the per-key cost in the decode attention kernel — 5.89 ns
   against int8's 1.83 ns — and it belongs to the three formats that stage dequantized tiles in
   shared memory. `KeyBlock` was not the difference.
 - **Prefill's MLP GEMMs** at 31% of INT8 peak are not limited by memory (compute-bound over their
-  own memory floor by 4.3x), tile shape, or dequantization (1-3% of the call). What is left needs
-  counters.
-- **Eight lanes** buy 3.83x, and the gap is a narrow-extent kernel that reaches 24% of its
-  weight-streaming floor. A narrower tile was built for it and lost.
+  own memory floor by 4.3x), tile shape, or dequantization (1-3% of the call). The counters arrived
+  and the answer is **occupancy**: 124 registers per thread hold the SM to 16 of 48 warps whatever
+  the block shape, `ncu` puts 40% on fixing it, and DRAM at 20.6% means the intensity it costs to
+  cut registers is affordable.
+- **Eight lanes** buy 3.83x, and the gap is a kernel that launches **0.26 machine-fulls of warps**.
+  Two narrower tiles were built for it and both lost, necessarily: `BM` is absent from the warp
+  count and narrowing `BN` reduces it. **Split-K is the lever** — confirmed by shipping the cheap
+  half of it (+2.85% at the C8 cohort's own extent, from a split-K *SIMT* kernel that was already
+  in the tree and throwing above `T = 6`). The remaining and larger prize is a split-K **MMA**
+  kernel, which keeps the tensor-core efficiency the direct path lacks; the W8 variant of the same
+  Op has routed narrow widths through one all along.
 - The **315 W power cap costs nothing** — +35 W buys +3% SM clock and 0% throughput, because memory
   clock never leaves 9,501 MHz at either limit.
+
+**The three measurement-debt items that needed no GPU are closed, and two of them were misdiagnosed
+in this very file.** `tools/bench/run_interleaved_ab.py` is the committed interleaved A/B harness
+every comparison here has been hand-rolling. `Get-FileHash` was blamed for an empty hash column and
+is innocent — it exists here and works; what it does on a missing path is raise a *non-terminating*
+error and return nothing, which no `try/catch` catches. And the 24 GiB host-RAM guard is now shared
+by every sweep via `scripts/sweeps/host-memory.ps1`, sized from the artifact instead of hardcoded.
+
+**A third piece of tooling looked broken this pass and also was not.** `ncu`'s default kernel replay
+mirrors the device working set into *host* RAM, and 21 GB of resident weights plus the artifact does
+not fit beside `vmmemWSL` — it dies as `bad allocation` with an empty report, which reads like an
+`ncu` bug. `--replay-mode application` needs no backup at all and is now `admin-profile.ps1`'s
+default. That is the third time this cycle a tool was called broken and turned out to be a
+permission, a shadowed copy, or a resource limit; check those three before believing the fourth.
 
 Two pieces of tooling were believed broken and were not: `compute-sanitizer` (two copies installed,
 and the older one reports `0 errors` without executing the binary) and `ncu` (a permission, not a
@@ -37,6 +127,75 @@ missing file). Both now work; see §3.
 Every route table in the tree has been measured on sm_86 and every one of them has a schedule
 bench. What remains is four kernel problems, some measurement debt, and two items needing hardware
 or artifacts this box does not have.
+
+---
+
+## Split-K inside the CTA is the answer to the GDN kernel, and NOT to the prefill MLP
+
+Written 2026-09-10 after reading both kernels, because the same shape resolves the GDN parallelism
+problem *and* the prefill MLP register problem, and neither entry says so from the other's side.
+
+**They are NOT the same problem, and an earlier version of this section said they were. Correcting
+it here because acting on it would waste hours.** `rowsplit_grouped_mma_kernel` reaches 24.5%
+achieved occupancy because total warp-work is `(rows/WM) x (BN/WN)` = 1,024 warps, 0.26
+machine-fulls — too few warps *in the grid*. `q4a8_swiglu` reaches 33.3% because 124 registers per
+thread hold the SM to one block — too many registers *per thread*. Split-K addresses the first and
+makes the second **worse**.
+
+**Why it makes the prefill MLP worse.** A K-split warp still owns its whole output tile, just less
+of K, so its accumulator count is unchanged; what changes is that there are more warps per block.
+Accumulators per *block* are fixed by the block tile (128 x 128 outputs = one float each) while the
+non-accumulator overhead scales with thread count, and at 124 registers with 32 accumulators that
+overhead is **92 registers per thread**:
+
+| threads | acc/thread | total/thread | registers/block | blocks/SM | warps/SM |
+|---:|---:|---:|---:|---:|---:|
+| 512 (today) | 32 | 124 | 63,488 | 1 | **16** |
+| 768 | 21 | 113 | 86,784 | **0 — does not fit** | — |
+| 1024 | 16 | 108 | 110,592 | **0** | — |
+
+So more warps per block is not available at any width: 768 threads already exceeds the register
+file. The earlier claim that "768 threads gives 24 warps at <=85 registers" was arithmetic done on
+the accumulators alone and ignored the overhead term, which dominates.
+
+**The prefill MLP's real lever is therefore the 92 registers that are not accumulators** — `af`
+is 16, `bf` is 16, the two `Stage`s ~14, addressing the rest. Reaching 2 blocks per SM at 512
+threads needs <=64 total, i.e. overhead down from 92 to 32, which means fewer staged fragments and
+shallower prefetch — a direct trade against the latency hiding those exist to provide. That is a
+real tuning problem with a measurable knob, and it is a different one from split-K.
+
+**Split-K remains the answer for the GDN kernel**, where the constraint is the opposite: only 1,024
+warps exist in the whole grid, and at 48 registers per thread there is register headroom to spend on
+more of them.
+
+**The template is `src/ops/gdn_input_proj/w8/w8_gdn_input_gemm_splitk.cu`**, in the tree, for the W8
+variant of the same Op, and its route table has sent widths 2..96 through it all along.
+`KSplits` warps cover disjoint K ranges, reduce through a shared arena, and the CTA takes 16 rows
+instead of 64 — `(12,288 / 16) x 8` = 6,144 warps, 1.56 machine-fulls against the Q4/Q5 tile's 0.26.
+
+**What makes the Q4/Q5 port harder than a copy, having read it:**
+
+- `rowsplit_grouped_mma_kernel` takes **2 or 4 `RowSplitGroupedMmaJob`s** and a
+  `RowSplitGroupedMmaCodec` that is `Mixed` for this Op — q4 for the qk rows, q5 for value_z — so
+  the K-slice bookkeeping has to be per-codec (`HB` is 1 for Q4 and 8 for Q5).
+- It carries **five shared arrays** (`As`, `Bs[S]`, `Cr[S]`, `Hr[S]`, `Sr[S]`) across an `S`-deep
+  pipeline; the reduction arena has to fit *beside* them under the 48 KB static cap, and that cap is
+  already what forces `BK = 64` (`static_assert(GPB == 1)`).
+- The epilogue writes straight to `job.out` with no accumulator buffer, so a K-split needs the
+  cross-warp reduction inserted before it rather than bolted after.
+- `Jobs == 2 || Jobs == 4` is static_asserted, so the reduction has to be written once and work for
+  both.
+
+**So there is no cheap first step on the prefill MLP, and the GDN kernel is where split-K goes.**
+Build it there directly, against the W8 template, and accept that the reduction pattern is being
+validated on the harder of the two kernels rather than the easier one. The prefill MLP wants a
+separate effort aimed at its overhead registers.
+
+**And measure it against the right null.** Forcing occupancy on this kernel the cheap way —
+`__launch_bounds__(kThreads, 2)` — cost **69.5%** (1,148.63 to 350.48 tok/s) because the compiler
+spilled to reach 64 registers. A K-split that lowers the *natural* register count is a different
+thing entirely, but it shares the failure mode: check the compiler's register count and spill
+traffic before believing any throughput number.
 
 ---
 
@@ -173,43 +332,42 @@ to twelve figures. Route changes are not a quality risk.
   MoE's 40-45% figures are compared against, which failed first time on the PowerShell `|` bug) and
   section 3 (the prefill MLP GEMMs, where memory, tile shape and dequantization are all already
   ruled out and only issue rate / shared-memory feeding / occupancy remain). §2c has both.
-- **The perplexity drift bisect is scoped and unstarted**: 392 commits, ~nine steps at 20-30 minutes
-  each, about four hours of exclusive GPU time. It is a repository question rather than a hardware
-  one, but the baseline figures it bisects against were measured here. §3 has the constraints,
-  including that three candidates are already eliminated.
+- **The perplexity drift bisect is started, and it found two transitions rather than one**:
+  −0.0092% then −0.0101%, summing to the recorded −0.0193%. So it is two bisects, not one, and
+  both must run `--first-parent` because the commits inside the upstream catch-up merge declare
+  `CMAKE_CUDA_ARCHITECTURES=120a` and cannot be built on this card. That cuts the range from 477
+  commits to 96. §3 has the measured endpoints and the three eliminated candidates.
 - **`ninfer_qwen3_6_27b_score_real_test`** and its siblings need `NINFER_*_WEIGHTS` set or they skip.
   A skip is not a pass, and under `compute-sanitizer` a skip surfaces as
   *"Target application terminated before first instrumented API call"*.
 
-### The seventeen open items, and the next concrete action for each
+### The fourteen open items, and the next concrete action for each
 
 Ordered by expected value, not by section.
 
 | item | § | next action | needs |
 |---|---|---|---|
-| MoE expert gather is latency-bound | 2c | split the shared W8 path out of the 9-warp block, as `sparse_moe_d3_path_tiled_kernel` already does for multi-token; then confirm the 2.2x over-fetch on d4 with `dram__bytes_read.sum` | kernel work; `ncu` for the confirm |
+| MoE expert gather is latency-bound | 2c | **nothing actionable left.** All four candidates measured: geometry no, batching no, block split *worse*, over-fetch real but 1.83x on a 47%-utilised pipe | closed as a negative |
 | Prefill MLP GEMMs at ~30% of INT8 peak | 2c | run `admin-profile.ps1` section 3 and read issue rate vs shared-memory feeding vs occupancy | one elevated run |
-| Eight lanes buy 3.6x (3.83x since the GDN tiles) | 2c | the 4x between `mma_r64_c16` and its weight-streaming floor is the target; **not** by narrowing the tile, which was tried and lost | kernel work |
-| KV decode falloff, 3.21x per-key on fp8 | 2c | attack the per-key dequant-into-shared cost; `rk8v4` proves the floor is reachable without a shared arena | kernel work |
+| Eight lanes buy 3.6x (3.83x since the GDN tiles) | 2c | cheap half shipped (+2.85% at width 8); what is left is a split-K **MMA** kernel, modelled on `w8_gdn_input_gemm_splitk.cu` | kernel work |
+| KV decode falloff, 3.21x per-key on fp8 | 2c | **counters in**: nothing saturated in either format, and *both* reach only 33% of their theoretical occupancy. The arena is a 1.33x term against a 2.4x gap — measure the grid before touching it | kernel work |
 | DFlash2 5→6 cliff | 2c/3 | remainder after the GDN tiles is the grouped kernel sitting at 27% of its own weight-streaming floor | same kernel as the KV item |
-| Routed prefill pipeline-depth threshold 7/4 | 2c | sweep the constant through the product on this card — the method the source comment endorses over the operator fixture | GPU time only |
-| `w8_pair` medium discards its schedule on sm_86 | 3 | write one genuinely sm_86-specific tiling and bench it against the generic chunked loop | kernel work |
+| Routed prefill pipeline-depth threshold 7/4 | 2c | **swept**: a 1.33x change in the constant moves prefill 0.06-0.26%, the same as the drift between two identical builds. Safe to leave | closed |
+| `w8_pair` medium discards its schedule on sm_86 | 3 | **done**: C48 and C64 instantiated, 13-17% over the chunked loop on the routed `{33,64}` band | closed |
 | sm_86 fallback constants chosen to fit | 2c | sweep the alternatives at the eleven `NINFER_SM8X_COMPAT` sites | GPU time only |
-| Cold-flush margins overstate wins | 3 | profile the narrow boundaries in situ; the method is in §5's q4 SwiGLU entry | GPU time only |
-| Perplexity drift 0.019% | 3 | the scoped four-hour bisect | exclusive GPU time |
+| Cold-flush margins overstate wins | 3 | **answered, and the tidy rule is wrong**: three boundaries checked in situ came out −0.78%, +2.85% and +13.59% against +5.9%, +13.2% and +8.0% cold. A narrow margin is a reason to check, not a predictor of direction | closed |
+| Perplexity drift 0.019% | 3 | **closed**: `f3f6c724` turned int8 prefill activations on by default (−0.0092%) and `1c12516e` did the rest (−0.0101%). Eight measurements. Only the sub-mechanism inside `1c12516e` is open, and it is one build | closed |
 | Speculative decoding not bit-identical to greedy | 3 | decide whether it should be; the divergence is a reduction-order effect in k+1-column verification and MTP reproduces it, so it predates DFlash2 | judgement, not measurement |
 | DFlash2 corpus acceptance on real text | 3 | bake a diverse corpus with `make_bench_corpus.py --source-text`, or extend the real-text sweep to report acceptance | a local HF tokenizer, which this box lacks |
-| `27b_load_plan` DFlash2 binding matrix | 3 | needs the *old* Qwen3.8 artifacts and the NVFP4 DFlash2 artifact | artifacts nobody has |
+| `27b_load_plan` DFlash2 binding matrix | 3 | **half of it can run now**: both groupwise artifacts are on this disk (the "old" one is `models/qwen3_8_27b.ninfer`, SHA-verified). The two NVFP4 ones were never published and would have to be converted locally | artifacts nobody has |
 | DFlash2 + multi-GPU expert offload | 2 | genuinely blocked | a second GPU |
-| No committed interleaved-A/B harness | 3 | ~40 lines in `tools/bench/`; the pattern is written out in the item | nothing |
-| `Get-FileHash` missing breaks a sweep's hash column | 3 | swap for `certutil -hashfile` | nothing |
-| Host memory pressure invalidates 35B runs | 3 | give the other sweeps the 24 GiB guard `moe-prefill-pipeline-depth.ps1` has | nothing |
 
-Two of those seventeen are hard-blocked on things no amount of work here provides (a second GPU, and
+Two of those fourteen are hard-blocked on things no amount of work here provides (a second GPU, and
 artifacts that no longer exist). One is a judgement call rather than a measurement. The remaining
-fourteen are all actionable — three of them need no GPU at all, and four are kernel work on two
-closely related problems: narrow-extent weight streaming in `q5_linear_add`/`gdn_input`, and
-dequant-into-shared in the quantized attention kernels.
+eleven are all actionable, and four of them are kernel work on two closely related problems:
+narrow-extent weight streaming in `q5_linear_add`/`gdn_input`, and dequant-into-shared in the
+quantized attention kernels. **The three items that needed no GPU are done** — the A/B harness, the
+hash column and the memory guard — so everything left needs either the card or a decision.
 
 ---
 
@@ -243,11 +401,18 @@ NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS=C:\Ninefer-3090\models\qwen3_8_27b_dflash2.ni
 NINFER_QWEN3_6_35B_A3B_WEIGHTS=C:\Ninefer-3090\models\qwen3_6_35b_a3b.ninfer
 NINFER_QWEN3_6_27B_WEIGHTS=C:\Ninefer-3090\models\qwen3_6_27b.ninfer
 NINFER_QWEN3_6_27B_NVFP4_WEIGHTS=C:\Ninefer-3090\models\qwen3_6_27b_nvfp4.ninfer
+NINFER_QWEN3_8_27B_OLD_WEIGHTS=C:\Ninefer-3090\models\qwen3_8_27b.ninfer
 NINFER_REAL_TEST_MAX_CONTEXT=8192      # only needed for the 35B
 ```
 
 `NINFER_QWEN3_6_27B_NVFP4_WEIGHTS` was missing from this block for a cycle, and it is the only
 thing that was keeping `27b_load_plan` skipping — the artifact has been on the disk all along.
+
+**Setting it costs a different test, so the suite is 125/126 with this block and 126/126 without
+it.** `ninfer_qwen3_6_27b_prefix_real_test` passes with the variable unset and dies with
+`FATAL: nvfp4 linear_swiglu A16 is registered only through T=16` with it set — verified both ways
+on 2026-09-09, exit 0 against exit 1, same binary. So "126/126" in this file means the old env
+block; quote the count with the block it was measured under. The defect is §1's new entry.
 
 **Free VRAM used to make these fail outright, not skip.** Skip (exit 77) here is reserved for a
 missing artifact env var; a VRAM shortfall instead threw during `Engine` construction and failed
@@ -324,23 +489,37 @@ Every item in the previous version of this list is now closed. What follows is w
 should do first, and the ordering is by expected value rather than by section. The full
 seventeen-item table with what each one needs is in "Handing this off to another machine" above.
 
-**Where the open work actually is: §2c (8 items) and §3 (8 items), plus one blocked item in §2.**
+**Where the open work actually is: §2c (13 items), §3 (1), §2 (1, blocked) and §1 (1).** §2c grew
+by five in the 2026-09-10 pass — the five screens in §2c-vii — while §3 shrank from eight to one.
 Sections 1, 2b, 4, 5 and 6 are fully closed and say so in their headings — they are kept because
 the reasoning is what stops the same investigation being repeated, not because anything is owed
 there. The trailing unnumbered subsections after §7 are methodology notes with no items; the one on
 editing this file with a script is worth reading before you edit this file with a script.
 
-1. **Run `scripts/sweeps/admin-profile.ps1 -SkipPower` from an elevated shell.** Two `ncu` profiles
+1. **Screen the decode kernels for the L1/TEX-versus-DRAM gap** (§2c-vii). Three of this cycle's
+   six speedups came from that one signature, the fix is an already-merged code pattern, and the
+   rest of the kernel family has never been checked. One `ncu` pass, two metrics. This is first
+   because it is the only item on the list whose *fix* is already written.
+2. **Attribute the missing 26% of decode bandwidth to kernels** (§2c-vii), in the same `ncu` pass,
+   with the amplification screen alongside it. Everything below this line is a guess about where
+   the shortfall lives until that table exists — including the guesses in §2c.
+3. **Run `scripts/sweeps/admin-profile.ps1 -SkipPower` from an elevated shell.** Two `ncu` profiles
    are outstanding and both are cheap: the prefill MLP GEMMs (§2c — memory, tile shape and
    dequantization are all already ruled out, so only issue rate, shared-memory feeding and
    occupancy remain, and those need counters) and the contiguous-kernel baseline the MoE gather's
    40-45% figures are compared against. This is minutes of GPU time and it unblocks the largest
    compute-side item in the file.
-2. **Lock clocks for measurement: `nvidia-smi -lgc 1500`** (§3, elevated). The card drifts 3-5%
-   between processes, which is larger than most effects here — it forced every A/B this cycle to
-   interleave its two binaries within each repetition and carry an unchanged control. This is the
-   cheapest improvement to every future measurement in this repository and it is one line.
-3. **Two related kernel problems, and they are the real prizes** (§2c). Both are narrow-extent
+4. **Lock clocks for measurement — and always in a `try`/`finally` pair** (§3, elevated):
+
+       nvidia-smi -lgc 1500        # before
+       nvidia-smi -rgc             # in a finally / trap, ALWAYS
+
+   The card drifts 3-5% between processes, which is larger than most effects here — it forced
+   every A/B this cycle to interleave its two binaries within each repetition and carry an
+   unchanged control. It is the cheapest improvement to every measurement in this repository.
+   **See "Leave this card as you found it" below before you run it**: an unpaired `-lgc` is a
+   persistent change to someone else's hardware, and this file recommended one for weeks.
+5. **Two related kernel problems, and they are the real prizes** (§2c). Both are narrow-extent
    weight streaming and both have a measured target:
    - `q5_linear_add`'s `mma_r64_c16` sits at **24%** of what its weight costs to stream once, flat
      from T=4 to T=16. Closing that is most of the eight-lane gap. **Not** by narrowing the tile —
@@ -348,23 +527,25 @@ editing this file with a script is worth reading before you edit this file with 
    - the quantized attention kernels pay **3.21x** int8's per-key cost (5.89 ns against 1.83 ns),
      which is the whole KV decode falloff. `rk8v4` reaches the flattest curve of all six formats
      with no shared arena at all, so the floor is demonstrably reachable.
-4. **Split the shared W8 path out of the MoE's 9-warp block** (§2c). The source already names this
+6. **Split the shared W8 path out of the MoE's 9-warp block** (§2c). The source already names this
    — `sparse_moe_d3_path_tiled_kernel` exists for it and says so — and it is what the 44.6%/58.6%
    "no eligible warp" reading measures. Do not chase launch geometry or batching first: both were
    measured this cycle and neither helps, because the kernel is 1.17 machine-fulls of work and an
    MoE does not amortise its routed weight read across a cohort.
-5. **Sweep the routed prefill pipeline-depth constant through the product** (§2c). `7/4` is
+7. **Sweep the routed prefill pipeline-depth constant through the product** (§2c). `7/4` is
    upstream's RTX 5090 number and an RTX 5090 has 16x this card's L2. Sweeping the constant is the
    method the source comment endorses over the operator fixture, which disagrees with the server by
    6x. GPU time only, no new code.
-6. **The perplexity drift bisect** (§3), when four hours of exclusive GPU time are available. Three
-   candidates are already eliminated and the current value is exactly reproducible, so the
-   remaining work is mechanical.
+8. **Confirm `FixedD` is what moved perplexity inside `1c12516e`** (§3) — the one loose end left
+   by the drift bisect, which is otherwise **done**: the 0.019% is `f3f6c724` (int8 activations on
+   by default, −0.0092%) plus `1c12516e` (−0.0101%). One build with the `rmsnorm.cuh` `FixedD`
+   specializations forced off, then re-score. Everything else in that entry is closed.
 
-Two of the seventeen open items are hard-blocked — one on a second GPU (§2), one on artifacts that
-no longer exist (§3) — and one is a judgement call about whether speculative decoding should be
-bit-identical to greedy rather than a measurement (§3). Everything else is actionable, and three of
-the newest items (§3: the A/B harness, a hash call, and a memory guard) need no GPU at all.
+Two of the sixteen open items are hard-blocked — one on a second GPU (§2), one on NVFP4 artifacts
+that were never published rather than deleted (§3, checked upstream 2026-09-10). Everything else is
+actionable, and **two of the five new screens need no GPU at all**: the register decomposition is
+one build with `-Xptxas -v`, and the parallelism arithmetic is pen and paper. Do the arithmetic
+first — it predicts which of the other screens can pay off on which kernel.
 
 **Keep `investigate/small-t-upstream` until the next catch-up.** It is merged, but it is the clean
 record of how upstream's small-T was adopted and what had to be fixed (`19c7617c` and its
@@ -372,7 +553,145 @@ parents). The next merge from `neroued/master` will touch the same subsystem.
 
 ---
 
-## 1. Correctness and coverage — closed
+## 1. Correctness and coverage — closed except the NVFP4 loadability decision
+
+- [ ] **The NVFP4 27B artifact cannot start at all on sm_86. It is a shipped, documented
+      configuration and it is completely broken on this card.** Found 2026-09-09 while confirming
+      an unrelated change against the full suite; not a regression — nothing this cycle touched
+      `nvfp4_linear_swiglu`.
+
+      ```
+      $ ninfer.exe models\qwen3_6_27b_nvfp4.ninfer --prompt "Hello there friend" --max-new 4
+      starting engine
+      error: startup failed | planning runtime | 1.25 ms
+      error: nvfp4 linear_swiglu A16 is registered only through T=16
+      ```
+
+      **It throws during runtime planning, before a single token is processed**, so this is not "long
+      prompts fail" — the artifact cannot be loaded. Reproduced with a 3-word prompt.
+
+      **Why, and it is a two-line collision between two deliberate decisions.**
+      `src/targets/qwen3_6_27b/impl/variant.cpp:49` forces NVFP4 weights onto the A16 route on this
+      architecture, with a comment that is entirely reasonable:
+
+      > *sm_86 has no FP8 or NVFP4 tensor-core path. Both quantized weight formats are admitted only
+      > through their A16 routes, which dequantize the stored codes to BF16 before the MMA.*
+
+      And `src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp:35` registers that A16 route
+      only to T=16, throwing above it. `AllowA4` handles any width (fused to 128, then TMA or a
+      split post-pass) — but `AllowA4` is exactly what sm_86 cannot use. **So the policy sm_86 is
+      forced onto is the one that has no wide route, and planning a default 1,024-token prefill
+      chunk hits the throw immediately.** `nvfp4_gdn_snapshot_plan.cpp:40` carries the same T=16
+      bound, so fixing only the SwiGLU would move the failure rather than remove it.
+
+      **Why it went unnoticed, which is the part worth keeping.** The only test that reaches it is
+      `27b_prefix_real`, and that test skips unless `NINFER_QWEN3_6_27B_NVFP4_WEIGHTS` is set — a
+      variable this file's env block omitted until last cycle, when it was added *because* it
+      unblocked `27b_load_plan`. Verified both ways on one binary: unset, exit 0; set, exit 1. So
+      the suite reads 126/126 on the old block and 125/126 on the current one, and the artifact has
+      been unusable on this card the whole time. **A skip is not a pass**, and this is the second
+      time this cycle that a missing env var was hiding something rather than merely reducing
+      coverage.
+
+      **`docs/cli.md` documents this configuration as a primary example** — an NVFP4 weight
+      artifact is the model argument in four of its invocations, and line 208 states that
+      "both `groupwise-int` and `nvfp4` artifacts use the same Engine route, including CUDA Graph".
+      On sm_86 that is not true of any prompt.
+
+      **The cheap fix was built, measured and reverted — it is ~0.8% off and fails the Op
+      criterion.** Worth recording in full, because it is the fix anyone would reach for first and
+      it does not work.
+
+      `linear` under `A16Only` already accepts any T (`nvfp4_dispatch.cpp` returns the A16 route
+      unconditionally), so the fused kernel's T=16 bound is a limit on *fusion*, not on the maths.
+      That suggests routing wide A16 exactly as `LinearW4A4Post` already routes wide W4A4: project
+      into a buffer with `linear`, then apply `silu_mul`. Implemented as `LinearA16Post` — about
+      thirty lines, no new kernel, sharing the existing baseline block with the policy threaded
+      through instead of a hardcoded `AllowA4`.
+
+      **It makes the artifact load.** The three-word prompt that previously died in runtime planning
+      ran to completion, and a 98-token prompt prefilled at 28.7 tok/s and decoded at 13.7.
+      `27b_prefix_real` went from exit 1 to exit 0. Two workspace details had to be fixed on the way
+      and both are worth knowing: the A16 linear reports a *zero-byte* requirement, and zero is not
+      representable — `alloc_bytes(0)` throws "arena allocation must be nonzero" and a
+      `WorkspaceArena` over an empty span throws "borrowed DeviceArena storage must be non-empty",
+      so the request has to be floored at one alignment unit the way
+      `variant.cpp`'s `kMinimumLeafWorkspaceBytes` does.
+
+      **And then it fails accuracy at every new width.** `ninfer_linear_swiglu_nvfp4_test` with the
+      A16 cases extended past 16 (`{1, 4, 8, 16, 17, 128, 256, 1024}`):
+
+      ```
+      LinearSwiGLU NVFP4_A16 T=17   eager: reduction criterion failed at index 11 actual=4.59375 reference=4.55671
+      LinearSwiGLU NVFP4_A16 T=128  eager: reduction criterion failed at index 11 actual=4.59375 reference=4.55671
+      LinearSwiGLU NVFP4_A16 T=256  eager: reduction criterion failed at index 11 actual=4.59375 reference=4.55671
+      LinearSwiGLU NVFP4_A16 T=1024 eager: reduction criterion failed at index 11 actual=4.59375 reference=4.55671
+      ```
+
+      T ≤ 16 passes; every width on the new route fails, at the same index, with the same value. That
+      is systematic, not noise, and the cause is structural: **the post route rounds the gate and up
+      projections to BF16 before the SiLU, where the fused kernel keeps them in registers at FP32.**
+      One BF16 rounding of an intermediate is ~0.4% of relative precision and the observed error is
+      0.81%, so this is the design's inherent accuracy, not a coding slip. **Reverted** — a route
+      that cannot pass its own Op criterion is not a fix, and widening the criterion to admit it
+      would be exactly the mistake §4 was written about.
+
+      So the ways out, now with one eliminated by measurement:
+
+      1. ~~Linear-then-`silu_mul` under A16~~ — **built and reverted, ~0.8% error, see above.**
+      2. **An FP32 intermediate.** The correct and fast version of (1): have the projection land in
+         FP32 and apply SiLU from FP32. Blocked on two things that are both real work —
+         `silu_mul` is BF16-only (`src/ops/wrapper/silu_mul.cpp:13` rejects anything else), and the
+         NVFP4 A16 `linear` would have to emit an FP32 output. A fused
+         `silu_mul_f32_to_bf16(gate_f32, up_f32, out_bf16)` plus an FP32 output path is the shape.
+      3. **Chunk the fused A16 kernel over 16-column slices**, the way
+         `w8_pair_splitk_medium_launch` does under `NINFER_SM8X_COMPAT`. Numerics identical to the
+         passing T ≤ 16 path by construction, no new kernel — but it re-reads the whole MLP weight
+         per chunk, so a 1,024-token chunk streams the ~89 MB gate_up 64 times. Correct and
+         unusably slow; mentioned only so nobody proposes it as the easy answer.
+      4. ~~Reject the artifact at load with a clear message~~ — **the message half is done
+         (2026-09-10); the artifact still does not load.** Failing in `planning runtime` with
+         "registered only through T=16" gave an operator nothing to act on, and working out why took
+         a full-suite run plus a bisect of two deliberate decisions. Both throw sites now say what
+         is wrong, why it is architectural, and what to do instead:
+
+         ```
+         error: startup failed | planning runtime | 40.3 ms
+         error: nvfp4 linear_swiglu: the A16 route is registered only through T=16, and on sm_86
+         A16 is the only policy available for NVFP4 weights (no NVFP4 tensor-core path), so this
+         artifact cannot serve a prefill chunk wider than 16 columns on this architecture. See
+         TODO.md section 1. Use a groupwise-int artifact here, or build for sm_89+ where AllowA4
+         handles any width.
+         ```
+
+         `nvfp4_gdn_snapshot_plan.cpp` got the same treatment even though it is normally unreachable
+         (the SwiGLU throws first), because a reader who lands there has fixed the SwiGLU and needs
+         to know this is the next wall.
+
+         **This is deliberately not a load-time rejection, and the item stays open because of it.**
+         Whether sm_86 should refuse the artifact outright, or gain the FP32-intermediate route in
+         (2), is a product call about a documented configuration rather than a bug fix — it is not
+         mine to make. Making the existing failure legible removes nothing, since nothing worked
+         before.
+      5. Either way, **`docs/cli.md` must stop using an NVFP4 artifact as its worked example on a
+         page whose own banner is about this fork's sm_86 target**, and the model table in this file
+         should say the artifact does not load here.
+
+      **`nvfp4_gdn_snapshot_plan.cpp:40` carries the same T=16 bound and was never reached**, because
+      the SwiGLU throws first. Whichever of (2) or (4) is done must handle it too, or the failure
+      simply moves one Op along.
+
+      One measurement note: the extended A16 cases are the coverage that catches all of this, and
+      they are *not* in the tree — the committed test stops at 16, which is why a route that cannot
+      run on sm_86 at all had a passing Op test. Re-add `{17, 128, 256, 1024}` alongside any fix.
+
+      Do not "fix" this by unsetting the env var. That restores 126/126 and re-hides a broken
+      shipped configuration, which is how it survived this long.
+
+      *Not yet checked, and deliberately not claimed:* whether the Qwen3.8 NVFP4 artifact
+      `docs/cli.md` actually names is affected. Only `qwen3_6_27b` defines `kNvfp4TextPolicy`, that
+      artifact is not on this disk, and there is no `qwen3_8_27b` target directory — so which target
+      serves it, and whether that target forces A16Only, is unverified.
 
 ### 1.1 `attn_input_proj` grossly wrong at `W8 DFlash2 A16 T=112 graph phase=1` — closed
 
@@ -624,7 +943,25 @@ roofline finally acquired a denominator; read them before the rest.
       | 27B dense | int8 | 32,768 | 33.56 | 565 GB/s | 66.2% |
 
       So the dense path sits around two-thirds of what the card can deliver, not 66% of an
-      unreachable number. Real headroom, roughly thirteen points, and still unprofiled.
+      unreachable number. Real headroom, roughly thirteen points.
+
+      **Three points of that headroom are now taken.** Re-measured 2026-09-10 after the two GEMV
+      consume-loop widenings, same workload (`-pg 4096,128`, int8 KV, three repetitions, clocks
+      locked at 1,500 MHz), using the same 15.743 GB/token accounting:
+
+      | | tok/s | achieved | % achievable |
+      |---|---:|---:|---:|
+      | start of cycle | 37.44 | 589.4 GB/s | 69.0% |
+      | after the two consume-loop widenings | 39.19 ± 0.03 | 617.0 GB/s | 72.2% |
+      | **after the dequant bit-trick** | **40.11 ± 0.07** | **631.5 GB/s** | **73.9%** |
+
+      **+7.13% throughput and +4.9 points of the ceiling on the dense decode**, from removing a
+      memory-pipe bottleneck that this file had spent a cycle mistaking for bandwidth, and then the
+      arithmetic bottleneck that removing it exposed. The ceiling
+      itself is 54.3 tok/s if the remaining 27.8 points were ever fully closed, which is the honest
+      shape of what is left. Note this depth-4,096 figure (+4.67%) is slightly below the +5.9%
+      compounded from the two paired A/Bs; those measured prose generation through the CLI and this
+      measures `ninfer_bench` at depth. Both are real and the workloads differ.
 
 - [x] **Nobody knows where the MoE sits at all, because the accounting does not exist.** Closed by
       #50. It exists now, and it changes which entry in this section matters most.
@@ -696,8 +1033,44 @@ roofline finally acquired a denominator; read them before the rest.
       per step, because nsys records a CUDA graph replay as one opaque entity unless given
       `--cuda-graph-trace=node`. Both reasons are written into the script.
 
-- [ ] **The routed prefill gate/up pipeline-depth threshold is upstream's RTX 5090 number,
-      unmeasured on this card.** `src/ops/sparse_moe/prefill/sparse_moe_prefill_kernels.cu:314-315`
+- [x] **The routed prefill pipeline-depth threshold is measured on this card and 7/4 is not a
+      risk. Closed 2026-09-09** — sweeping the constant through the product moves prefill by less
+      than the run's own drift, and the likely reason is that no threshold in [1.5, 2.0] can change
+      the decision at any prompt length anyone runs.
+
+      `scripts/sweeps/moe-prefill-pipeline-depth.ps1`, 35B, int8 KV, `-p 1024,2048,4096,8192 -r 3`,
+      clocks locked at 1,500 MHz, source patched and rebuilt per ratio, with 7/4 repeated last as
+      the drift control the script's own header demands:
+
+      | prompt | 1.50 | 1.5625 | 1.625 | **1.75** | 2.00 | 1.75 again | spread |
+      |---:|---:|---:|---:|---:|---:|---:|---:|
+      | 1,024 | 5,895.6 | 5,880.9 | 5,880.6 | 5,882.7 | 5,892.4 | 5,891.97 | **0.26%** |
+      | 2,048 | 5,845.2 | 5,854.2 | 5,846.6 | 5,847.7 | 5,849.2 | 5,853.23 | **0.15%** |
+      | 4,096 | 5,706.4 | 5,705.0 | 5,706.0 | 5,707.8 | 5,701.4 | 5,712.63 | **0.11%** |
+      | 8,192 | 5,424.9 | 5,425.4 | 5,427.3 | 5,423.7 | 5,425.0 | 5,426.66 | **0.06%** |
+
+      **The two 7/4 readings agree to 0.05-0.16%, and the between-ratio spread is 0.06-0.26%** — so
+      the effect of a 1.33x change in the constant is the same size as the drift between two
+      identical builds. There is nothing here to tune, and nothing to fear: the concern was that
+      upstream's RTX 5090 number could be wrong on a card with a sixteenth of the L2, and across
+      the whole range it does not matter.
+
+      **Why it cannot matter is worth more than the table, and it is a caveat on this measurement
+      too.** The decision is `jobs * Den < Num * touched` (line 327) where `jobs` is the work-item
+      count and `touched` the number of experts with work, so the constant is compared against
+      *jobs per touched expert*. With `kExpertBM = 64` and top-8-of-256, average tokens per expert
+      is `T * 8 / 256`, so jobs per expert is `ceil(T / 2048)`: **~1.0 at T=1,024 and 2,048, ~2.0 at
+      4,096, ~4.0 at 8,192.** Every threshold in [1.5, 2.0] therefore puts 1,024/2,048 on Spread and
+      4,096/8,192 on Packed — **the branch never flipped between arms**, which is the simplest
+      explanation for four identical columns.
+
+      So this is a null result on the *risk* and a null *measurement* on the crossing point. The
+      honest position: 7/4 is safe to leave, and anyone who wants the actual crossing must first
+      make the branch move. Routing variance means jobs-per-expert is not exactly integral, so a
+      real test needs the decision printed rather than inferred — instrument `route_job_count[0]`
+      and `[1]` and the chosen `GateUpRoute` per prompt length, and look for a shape where the ratio
+      lands strictly inside [1.5, 2.0]. On this geometry that is roughly `T` between 1,536 and
+      2,048, i.e. a narrow band of short prompts, which is also why it is not worth chasing. `src/ops/sparse_moe/prefill/sparse_moe_prefill_kernels.cu:314-315`
       (`kGateUpDeepJobsNum`/`Den`, currently 7/4) picks between a 2-stage ("Spread") and a 6-stage
       ("Packed") pipeline for the narrow routed gate/up kernel based on jobs-per-expert crossing
       this ratio. The comment above it is explicit that the crossing point was measured on
@@ -1089,8 +1462,75 @@ roofline finally acquired a denominator; read them before the rest.
       **Occupancy alone does not order them, so it is necessary and not sufficient.** nvfp4 uses
       half fp8's dynamic bytes and gets twice the blocks per SM, yet has the *worst* 27B falloff of
       the six. So block count is not the whole mechanism; the per-key dequantization work is the
-      part that matches, and that wants confirming with `ncu` on the three quantized kernels — now
-      possible, see the closed tooling entry in §3 and `scripts/sweeps/admin-profile.ps1`.
+      part that matches.
+
+      **The `ncu` counters this entry asked for are collected (2026-09-10), and they add a fact the
+      entry does not have: both formats reach only a third of their own theoretical occupancy.**
+      27B, `-pg 8192,64`, clocks locked, kernel replay, six launches of the `small_t` decode
+      attention kernels, medians:
+
+      | | `int8` (`..._i8_tiled`) | `fp8` (`..._fp8_tiled`) |
+      |---|---:|---:|
+      | duration | 32.62 µs | **78.40 µs** |
+      | DRAM throughput | 26.16% | 13.43% |
+      | L1/TEX throughput | 25.61% | 14.34% |
+      | Compute (SM) throughput | 16.61% | 16.07% |
+      | **theoretical occupancy** | **66.66%** | **50.00%** |
+      | **achieved occupancy** | **21.98%** | **16.51%** |
+      | stall `long_scoreboard` | 33.02% | 30.98% |
+      | stall `wait` | 14.76% | **21.95%** |
+      | stall `barrier` | 16.76% | 8.56% |
+
+      Three readings, in order of how much they change the entry.
+
+      **Nothing is saturated in either format.** The highest utilisation anywhere in that table is
+      26%. So the falloff is not bandwidth, not L1, and not compute — it is latency, the same
+      diagnosis §2c reached for the MoE gather and the narrow-extent kernels, and it means the
+      framing of "3.21x the per-key cost" as a *cost* is misleading: the kernel is not doing 3.21x
+      the work, it is waiting 3.21x as long.
+
+      **The dynamic shared arena costs exactly what this entry predicted, and it is the smaller
+      half.** fp8's theoretical occupancy is 50.00% against int8's 66.66%, which is the 2-blocks-per-SM
+      against unbounded that the arena table above derives. But that is a **1.33x** ratio against a
+      **2.4x** duration ratio, so the arena explains well under half of the gap. Removing it — the
+      `rk8v4`-shaped fix this entry proposes — should therefore be expected to recover part of the
+      falloff, not all of it, and anyone who ships it should predict ~1.3x rather than 3.2x.
+
+      **And the new fact: achieved occupancy is 33% of theoretical in *both* formats** — 21.98 of
+      66.66, and 16.51 of 50.00, the same ratio to two figures. The grid explains it, and the grid
+      is identical in both:
+
+      | | `int8` | `fp8` |
+      |---|---:|---:|
+      | grid | **(4, 65) = 260 blocks** | **(4, 65) = 260 blocks** |
+      | block | 256 threads (8 warps) | 256 threads (8 warps) |
+      | **Block Limit Registers** | **4** | **4** |
+      | Block Limit Shared Mem | 8.50 | 7.50 |
+      | Block Limit Warps / SM | 6 / 16 | 6 / 16 |
+      | theoretical warps per SM | 32 | 24 |
+      | achieved warps per SM | 10.54 | 7.93 |
+
+      **260 blocks against a capacity of 4 x 82 = 328 is 0.79 machine-fulls.** The kernel cannot fill
+      the card even once, in either format, which is the same shape as §2c's GDN entry and the MoE
+      gather — and at 32-78 µs a kernel that never fills the machine spends much of its life in ramp
+      and drain, which is what drags achieved warps to a third of theoretical.
+
+      **Two things here do not match what this entry has been assuming, and both want reconciling
+      before any kernel work.** First, **`Block Limit Registers` is 4 in both formats while
+      `Block Limit Shared Mem` is 7.5-8.5** — so registers bind at or before shared memory, and the
+      dynamic arena is *not* the binding term for `int8` at all. The arena table above derives
+      2 blocks/SM for fp8 from 48 KiB of dynamic shared; ncu reports 7.5. Those disagree, and the
+      arena story rests on the derivation rather than on a counter. Second, fp8's theoretical warps
+      (24) is 3 blocks' worth where int8's (32) is 4, so *something* costs fp8 a block — but with
+      both showing `Block Limit Registers = 4` it is not obvious from these counters which term it
+      is.
+
+      So the ordering changes: **the grid is the bigger and better-evidenced problem, it is
+      format-independent, and it is shared by `int8` — the format everyone considers the good one.**
+      More key-splits would add blocks and cost nothing but a wider reduction. Settle the
+      register-versus-shared question with `--section Occupancy --section LaunchStats` on all six
+      formats before spending effort on removing the arena, which on this evidence buys the smaller
+      half of a gap it may not even be causing.
 
       What this is worth: **if `nvfp4` decoded on `rk8v4`'s curve it would be the outright best
       format** — 45% smaller than INT8 with no speed penalty — rather than the compromise it is.
@@ -1123,14 +1563,588 @@ roofline finally acquired a denominator; read them before the rest.
       value is the *best* one that fits, and the alternatives were never swept on this hardware.
       Lower confidence than the two above, but it is untouched ground across every W8 Op.
 
+### The narrow-extent kernels are parallelism-starved, and that explains four separate entries
+
+Found 2026-09-09 with `ncu` counters on the schedule benches (`admin-profile.ps1` section 5). This
+is the cause behind "24% of its weight-streaming floor", "27% of its own weight-streaming floor",
+the DFlash2 5→6 cliff and most of the eight-lane gap. **Four entries below were chasing one
+mechanism, and it is not tile geometry.**
+
+- [x] **Width 8 now routes to the split-K direct path and the C8 cohort's extent is 2.85% faster.
+      Shipped 2026-09-09.** The parallelism diagnosis below is what produced it: the fix was not a
+      new kernel but ten template instantiations of one that already existed and had been dismissed
+      on a measurement of a different kernel. Result first, then the diagnosis that found it.
+
+      `launch_q5_split4_exact` threw above T=6, so `launch_q5` fell back to `simt_r8_c8` at exactly
+      width 7 — and that is where the schedule bench's `independent` column jumped 188.4 → 330.8 µs
+      for one extra column. Instantiating split4 to 8 (cold, medians of 31, `--spread`, clocks
+      locked):
+
+      | T | independent (split4) | c8, previously routed here | independent before (simt_r8_c8) |
+      |---|---:|---:|---:|
+      | 6 | 207.9 (205.8..209.9) | 243.7 | 188.4 |
+      | 7 | **228.4** (227.3..229.4) | 242.7 (240.6..245.8) | 330.8 |
+      | 8 | **208.9** (207.9..209.9) | 240.6 (236.5..243.7) | 319.5 |
+      | 9 | 572.4 | 527.4 | 486.4 |
+
+      Cold, that is +5.9% at width 7 and +13.2% at width 8 over the routed `c8` tile, spreads
+      disjoint at both, and 31-35% over what the direct route used to cost.
+
+      **Only one of the two survived in situ, and that is the part worth carrying.** Measured end to
+      end with `tools/bench/run_interleaved_ab.py` — two binaries alternating inside each
+      repetition, clocks locked at 1,500 MHz, six repetitions, draft count 4 (width 5, unchanged
+      route in both arms) as a drift control:
+
+      | config | paired median | positive | control drift |
+      |---|---:|---:|---:|
+      | k=6, width 7 | **−0.78%** | 0 / 6 | +0.00% |
+      | k=7, width 8 | **+2.85%** | **6 / 6** | +0.09% |
+
+      Both identical to three figures across all six repetitions, with the control at 0.00-0.09% —
+      the cleanest A/B in this file, and the clock lock is why. So the route table is
+      `{1,6}` independent / `{7,7}` c8 / `{8,8}` independent / `{9,16}` c16. **The single-width band
+      at 8 is not tidy and it is what the measurement supports**: width 8 is the C8 serving cohort,
+      the profile the 27B release recommends, where this kernel is 13.8 ms of a 56.3 ms round — so a
+      13% kernel win landing as ~2.9% of the round is the arithmetic working out exactly.
+
+      Width 9 collapses to 572.4 and sets the upper bound. It is a register cliff, not a geometric
+      one: split4 carries `__launch_bounds__(128, 10)`, capping it at 51 registers per thread, and
+      `acc[kTt]` costs one register per column. Widening past 8 needs `MIN_BLOCKS` relaxed first,
+      which is affordable — the kernel has 12.5 machine-fulls of blocks and does not need ten per SM
+      — but is a separate measurement.
+
+      `ninfer_gdn_input_proj_test` covers widths 7 and 8 already, so the reroute is under test on
+      both sides of the new boundary; the affected suite is 18/18.
+
+      **The remaining prize is unchanged and larger**: a split-K *MMA* kernel, which would keep the
+      tensor-core efficiency the direct path lacks. See the diagnosis below.
+
+- [ ] **`rowsplit_grouped_mma_kernel` reaches a quarter of the card because it only ever launches a
+      quarter of a machine-full of warps. The fix is split-K, and a working one already exists in
+      the same directory for the W8 variant of the same Op.**
+
+      Counters at width 8, `q4_q5_gdn_input_schedule_bench`, clocks locked at 1,500 MHz:
+
+      | | C8 `<64,8,64,16,8>` | C16 `<64,16,64,16,8>` |
+      |---|---:|---:|
+      | duration | 243.55 µs | 261.47 µs |
+      | grid x block | 256 x 128 | 256 x 256 |
+      | DRAM throughput | **27.71%** | **25.39%** |
+      | L1/TEX throughput | 54.26% | 61.51% |
+      | Mem pipes busy | 47.83% | 52.93% |
+      | SM throughput | 47.83% | 52.93% |
+      | theoretical occupancy | 50% | 83.33% |
+      | **achieved occupancy** | **24.52%** | **45.90%** |
+      | eligible warps per scheduler | **0.55** | 0.96 |
+      | registers per thread | 48 | 46 |
+
+      **Nothing is saturated.** The highest utilisation of any pipe is 54-62%, DRAM is at a quarter,
+      and there is barely half an eligible warp per scheduler. So "weight-read-bound at 27% of the
+      floor" was the wrong diagnosis: it is not read-bound at all, it is starved.
+
+      **And the shortfall is arithmetic, not mysterious.** Total warp-work for this kernel is
+      `(rows / WM) x (BN / WN)`. The GDN input projection is 4,096 q4 rows plus 12,288 q5 rows, so
+      with `WM = 16`:
+
+      | schedule | warps | of the card's 3,936 | predicted occupancy | measured |
+      |---|---:|---:|---:|---:|
+      | C8 | 1,024 | 26.0% | 26.0% | **24.52%** |
+      | C16 | 2,048 | 52.0% | 52.0% | **45.90%** |
+
+      Predicted from block counts alone, matched to within 1.5 and 6 points. The kernel is **0.26
+      machine-fulls** at C8. It cannot occupy the card, so it cannot hide latency, so it reaches a
+      quarter of DRAM — and every symptom follows.
+
+      **`BM` does not appear in that formula, which is why every tile experiment failed and had to.**
+      Narrowing `BN` 32→8 removed 75% of the padded MMA work and bought 11%, because it also
+      *halved* the warps (`BN / WN`); the `R64C8` built for `q5_linear_add` lost 6-32% for the same
+      reason. Halving `BM` does not help either: it halves warps per block and doubles the block
+      count, leaving the product unchanged. **No block-tile shape reaches more parallelism.** That
+      retires "the prize is a narrow-extent MMA kernel that keeps `mma_r64_c16`'s flatness at the
+      GEMV's fraction of bandwidth" — there is no such tile.
+
+      **It also explains the flatness itself.** `mma_r64_c16` is flat at 101.4 µs from T=4 to T=16
+      because the grid does not depend on T at all; T only changes how much of each padded tile is
+      live. A kernel whose cost is set by a fixed, too-small grid is flat by construction.
+
+      **Split-K is the only lever, and the route tables have been quietly voting for it already.**
+      `q5_linear_add` picks `Split2ExactResidual` over `mma_r64_c16` for all of T=2..10 (74.8 µs
+      against 101.4 at k=6,144). That was recorded as "the right choice between the kernels that
+      exist, not a good one" — it is better than that. It is the higher-parallelism kernel winning,
+      and nobody knew that was why.
+
+      **The template is `src/ops/gdn_input_proj/w8/w8_gdn_input_gemm_splitk.cu`, and the W8 route
+      table has been doing this the whole time:**
+
+      ```
+      {1, 1},        DecodeR8Direct
+      {2, 96},       SplitKMmaDirect      <-- narrow widths go to split-K
+      {97, kAnyCols} MmaR64C128
+      ```
+
+      against the Q4/Q5 table for the same Op, which has **no split-K entry anywhere**:
+
+      ```
+      {1,6} independent / {7,8} c8 / {9,16} c16 / {17,32} c32 / {33,64} c64 / {65,inf} c128
+      ```
+
+      The W8 kernel splits K *inside* the CTA — `KSplits` warps cover disjoint K ranges and reduce
+      through shared memory, so no global reduction pass is needed — and takes 16 rows per CTA
+      rather than 64. Its parallelism at `KSplits=4, NGroups=2` is `(12,288 / 16) x 8` = **6,144
+      warps, 1.56 machine-fulls**, against the Q4/Q5 grouped tile's 1,024. Carried across to the
+      Q4/Q5 shape: `(16,384 / 16) x 8` = **8,192 warps, 2.08 machine-fulls**.
+
+      So the work is a `Q4Q5GdnInputScheduleId::SplitKMma` modelled on the W8 kernel, routed over
+      roughly `{7, 32}` where the grouped tiles are starved, benched with the existing
+      `q4_q5_gdn_input_schedule_bench`. **Two entries pay for it** — the DFlash2 5→6 cliff and the
+      eight-lane C8 cohort, where this kernel is 13.78 ms of a 56.29 ms round.
+
+      One thing to check before building, because it is the one way this could fail to transfer: the
+      W8 kernel's shared-memory reduction is sized for `padded_k = 2048`, and the Q4/Q5 projection
+      reduces over 5,120. `KSplits x kTileK` must divide the reduction depth, and 5,120 / 64 = 80
+      tiles divides by both 2 and 4, so the arithmetic works; the shared arena is the thing to size.
+
+      **There is a much cheaper experiment to run first, and the reason it has never been run is
+      that the measurement which appeared to rule it out tested a different kernel.** The route
+      table's own winner below width 7 is *already* a split-K kernel — `launch_q5` sends T=2..6 to
+      `q5_rowsplit_gemm_simt_split4_kernel`, one block per output row with four warps splitting K
+      and reducing through `s_part[4][kTt]`. Its parallelism dwarfs everything else here:
+
+      | route | geometry | blocks | warps | machine-fulls |
+      |---|---|---:|---:|---:|
+      | `launch_q5_split4_exact` (T=2..6) | one block per row x 4 warps | 12,288 | **49,152** | **12.49** |
+      | `launch_q5_gemv` (T=1) | 12,288/16 x 16 warps | 768 | 12,288 | 3.12 |
+      | `launch_q5_simt_r8_c8` (T=7..15) | 12,288/8 x 8 warps | 1,536 | 12,288 | 3.12 |
+      | `GroupedMixedMmaR64C8` (T=7..32) | (4,096+12,288)/64 x 4 warps | 256 | 1,024 | 0.26 |
+
+      **`launch_q5_split4_exact` throws above T=6**, and `launch_q5` therefore drops to
+      `simt_r8_c8` at exactly width 7 — which is exactly where the `independent` column falls off a
+      cliff in the schedule bench: **188.4 µs at T=6 to 330.8 at T=7**, +142 µs for one extra
+      column. Nothing else changes at that boundary (the q4 half switched to R8C8 back at T=4), so
+      that +142 µs *is* the split4 → r8c8 switch.
+
+      So when this cycle measured "extending the direct route to `{{1, 15}}`" and recorded
+      −3.6% at width 7 and −23.8% at width 9, **it was measuring `simt_r8_c8`, not split4** — the
+      plan's own comment says so ("`launch_q4` and `launch_q5` both carry a dedicated R8C8 route for
+      5..15"). The high-parallelism kernel was never tested above 6. If split4 held anything like
+      its T=6 cost at T=7-8 it would land near 190-240 µs against `c8`'s 236-238, i.e. competitive
+      to better, **and it would remove the DFlash2 5→6 cliff outright**, because that cliff *is*
+      this boundary.
+
+      `q5_rowsplit_gemm_simt_split4_kernel` is already generic in its column count — `acc[kTt]`,
+      `s_part[4][kTt]`, and a `tt` loop that reads `x + tt * kStride` — so widening it is adding
+      template instantiations to `launch_q5_split4_exact`, not writing a kernel. **One constraint
+      to respect:** it carries `__launch_bounds__(128, 10)`, which caps it at 51 registers per
+      thread, and `acc[kTt]` grows one register per column. Past roughly T=10 that will spill to
+      local memory and look like a loss for the wrong reason. Relax `MIN_BLOCKS` to 6 when widening
+      — at 12.5 machine-fulls of blocks this kernel does not need ten blocks per SM to fill the
+      machine, so trading occupancy for registers is close to free here.
+
+      **Do this before the MMA split-K kernel.** It is a handful of template instantiations against
+      a new kernel, it is measurable with the existing bench, and it tests the same hypothesis.
+
+      *Why the parallelism argument is not the whole story, so nobody over-reads it.* `simt_r8_c8`
+      has 3.12 machine-fulls against the grouped tile's 0.26 and still **loses** at width 8 (319.5
+      against 236.5), because a SIMT kernel does far more work per weight than a tensor-core one.
+      So warps alone do not win: the target is a kernel with the MMA's per-warp efficiency *and*
+      split-K's parallelism, which is precisely why the answer is split-K on the **MMA** path and
+      not simply "use the SIMT route".
+
+- [x] **Dense decode's GEMV kernels were limited by memory-pipe *instruction issue*, not
+      bandwidth. Widening the consume loop shipped 2026-09-10: +3.90% on the 27B, L1/TEX 87% → 37%.**
+
+      The consume loop read **one** code byte per lane per group and so spent four memory-pipe
+      instructions to produce two weights — a 1-byte `tn`, a 1-byte `th`, a 2-byte broadcast `tsc`
+      and a 4-byte `x`. Sixteen groups per tile is 64 instructions on the consume side against
+      three on the staging side, so consume outweighed staging roughly 20 to 1, and that is what
+      `Mem Pipes Busy` was measuring.
+
+      Now each lane takes a **4-byte code word — 8 nibbles, 8 weights** — so eight lanes cover a
+      group's 32 code bytes and 32 lanes cover four groups per step. Per step: one 4-byte `tn`, one
+      1-byte `th`, one 2-byte `tsc`, one 16-byte `x`. **Four instructions per four groups against
+      sixteen: a 4x cut, for identical arithmetic.**
+
+      | kernel | duration | DRAM % | L1/TEX % | Mem Pipes Busy % |
+      |---|---:|---:|---:|---:|
+      | `<5120, 6144>` | 46.18 → **42.59** (−7.8%) | 50.10 → 54.34 | 86.60 → **36.71** | 81.04 → **33.64** |
+      | `<5120, 17408>` | 116.29 → **108.35** (−6.8%) | 55.80 → 59.77 | 89.85 → **35.77** | 85.59 → **33.81** |
+      | `<12288, 5120>` | 88.74 → **80.58** (−9.2%) | 51.75 → 58.88 | 90.76 → **39.94** | 83.09 → **36.71** |
+
+      **L1/TEX throughput collapses from 87-91% to 36-40% — the predicted 4x — and DRAM utilisation
+      goes *up*.** That is the whole point: the kernel stops being pipe-limited and gets closer to
+      actually streaming its weights. It is still not DRAM-bound at 54-59%, so there is more here.
+
+      End to end, `run_interleaved_ab.py`, clocks locked, six paired repetitions:
+
+      | model | paired median | positive | range |
+      |---|---:|---:|---|
+      | 27B dense | **+3.90%** | **6 / 6** | +3.21% to +4.31% |
+      | 35B MoE | −0.34% | 2 / 6 | −1.72% to +2.00% |
+
+      The 35B showing nothing is the expected control-by-shape: its decode is dominated by the
+      `sparse_moe` expert kernels, not by this GEMV. **There is no true `--control` for this one and
+      that is stated rather than hidden** — the change is inside `q5_rowsplit_gemv`, which every
+      text model reaches, so no configuration has an identical code path in both arms. The
+      substitute is the drift floor the two earlier A/Bs established on this box: with
+      `nvidia-smi -lgc 1500` their controls moved 0.00% and +0.09% over six pairs, against a 3.9%
+      effect that the kernel counters predicted independently.
+
+      **Why 3.9% end to end and 6.8-9.2% per kernel.** §2c's decode profile has 86% of the 27B's
+      *busy* time in four GEMV kernels, but only some of those four are `q5_rowsplit_gemv` — the
+      rest are `q4_linear_swiglu_gemv_pair` and friends, which have the same byte-granular shape
+      and were not touched. **So the same widening applied to the q4 SwiGLU GEMV pair is the
+      obvious follow-up**, and it should be worth something similar.
+
+      Correctness: every Op that reaches this GEMV passes — `linear_q5_a16`, `linear_add_q5_a16`,
+      `gdn_input_proj`, `attn_input_proj`, `linear_swiglu_q4_a16` — and the packing convention is
+      unchanged (code byte b holds the weights at 2b and 2b+1; high-plane byte h bit j carries bit
+      4 of the weight at 8h+j), verified on the host to cover all 1,024 weights of a tile exactly
+      once. The new code index works out to `step * 32 + lane`, so the shared reads stay
+      conflict-free.
+
+      *The file header claimed the opposite and was wrong.* It said "all weight reads are fully
+      coalesced 128-bit loads, so the kernel runs DRAM-bound instead of L1/LSU- or latency-bound".
+      True of the global staging, false of the kernel: DRAM was at 50% while the pipe was at 81%.
+      Corrected in place.
+
+- [x] **The q4 SwiGLU GEMV pair got the same widening: +1.95% on the 27B, shipped 2026-09-10.**
+      It was the worse of the two kernels — one byte of gate codes, one byte of up codes and two
+      2-byte scale broadcasts produced four weights, so **five** memory-pipe instructions per group.
+      Now five per *four* groups. Q4 has no high plane, so the mapping is simpler than the Q5 case:
+      code byte b holds the weights at 2b and 2b+1, so weight k0+j is nibble (j & 1) of byte
+      (j >> 1). Host-verified to cover all 1,024 weights of a tile exactly once, code index again
+      `step * 32 + lane` so the shared reads stay conflict-free.
+
+      Measured against the q5 widening as its baseline, so the gain is attributable to this change
+      alone — same harness, clocks locked, six paired repetitions:
+
+      | model | paired median | positive | range |
+      |---|---:|---:|---|
+      | 27B dense | **+1.95%** | **6 / 6** | +1.81% to +2.33% |
+      | 35B MoE | +0.31% | 4 / 6 | −1.22% to +1.42% |
+
+      **So the two widenings together are worth about +5.9% compounded on the 27B dense decode**,
+      which is the largest single-model gain this file records. The 35B is unmoved by either, as
+      expected: its decode is the `sparse_moe` expert kernels.
+
+- [x] **Re-profiled after both widenings, and the constraint moved — differently for each kernel.
+      One is now at the bandwidth ceiling; the other became compute-bound.** Measured 2026-09-10,
+      `ncu`, clocks locked, six launches each, medians:
+
+      | | `q4_linear_swiglu_gemv_pair` | `q5_rowsplit_gemv` |
+      |---|---:|---:|
+      | **DRAM throughput** | **85.26%** | 55.83% |
+      | L1/TEX throughput | 42.10% | 36.84% |
+      | **Compute (SM) throughput** | 76.15% | **73.31%** |
+      | stall: `wait` | **17.84%** | 5.88% |
+      | stall: `long_scoreboard` | 6.53% | 10.37% |
+      | stall: `barrier` | 3.39% | 6.39% |
+
+      **The q4 SwiGLU pair is essentially done: 85.26% of DRAM.** That is the state this whole file
+      is aiming at — a weight-streaming kernel actually limited by the memory it has to read. There
+      is no meaningful headroom left in it, and anyone who "optimises" it further will be trading
+      against bandwidth.
+
+      **The q5 GEMV is now compute-bound, not memory-bound: SM throughput 73.31% against DRAM
+      55.83%.** Removing the memory-pipe bottleneck promoted the dequantization arithmetic to the
+      constraint — the per-weight `sign_extend`, int-to-float conversion and `fmaf` chain. That is a
+      different kind of problem from everything else in this file and wants a different fix: fewer
+      or cheaper operations per weight (a `__dp4a`-style integer dot product, or the s8 tensor cores
+      the groupwise-int prefill path already uses), not better memory scheduling.
+
+      Note the stall totals are now *low* on both — the largest single reason is 17.84% — where the
+      pre-widening kernel had 81-86% of a pipe busy. Neither kernel is latency-starved any more,
+      which retires the `kStages` pipeline-depth candidate this entry named before profiling: at
+      these utilisations there is nothing for a deeper pipeline to hide.
+
+- [x] **The q5 GEMV's dequantization arithmetic was the last identified decode constraint. Fixed
+      2026-09-10 with the in-tree half2 bit-trick plus a per-group scale hoist: +2.67% on the 27B.**
+
+      Both halves are exact, not approximations, which is what made this safe to ship:
+
+      - **The bit-trick** is `Q5SimtDecodeAtom::decode_eight`'s, already used by
+        `q5_rowsplit_gemm_simt_split4_kernel`. half `0x6400` is 1024.0, whose mantissa LSB at that
+        exponent is exactly 1.0, so OR-ing a nibble into the mantissa *adds* it; inverting the high
+        bit and subtracting 1040.0 yields `nibble - 16 * high_bit`, which is precisely what
+        `sign_extend<5>(nibble | high << 4)` computes. **Verified on the host for all 32 five-bit
+        codes.** It replaces a per-weight sign-extend and int-to-float convert with one `hsub2` and
+        one `__half22float2` per *pair*.
+      - **The scale hoist** turns `sum_j((q_j * scale) * x_j)` into `sum_j(q_j * x_j) * scale`,
+        removing seven of every eight multiplies. It rounds *less*, not more — the scale is applied
+        to one accumulated value instead of eight products — and the scale is already per-group, so
+        nothing is being approximated.
+
+      | model | paired median | positive | range |
+      |---|---:|---:|---|
+      | 27B dense | **+2.67%** | **6 / 6** | +2.28% to +2.80% |
+      | 35B MoE | −0.65% | 2 / 6 | −2.56% to +2.00% |
+
+      *One correction to what this entry originally proposed.* It named `__dp4a` as the first
+      direction. **That is wrong for this kernel**: `__dp4a` is int8 x int8, and this is an A16 path
+      where the activations are BF16 — using it would mean quantizing `x`, which is a different
+      policy (`AllowA8Int`) and a different numeric contract, not an optimisation of this one. The
+      technique that does apply was already in the tree for the same codec.
+
+- [ ] **What is left after five speedups: the q5 GEMV now stalls on memory *latency*, and the
+      obvious cure was tried and does nothing.** The dense decode is at **73.9% of the 854.2 GB/s
+      the card can read**, up from 69.0%. The q4 SwiGLU pair is at 85.3% of DRAM and effectively
+      finished. The q5 GEMV was re-profiled after the dequant fix:
+
+      | metric | after widening | after dequant fix |
+      |---|---:|---:|
+      | DRAM throughput | 55.83% | **66.67%** |
+      | L1/TEX throughput | 36.84% | 46.47% |
+      | Compute (SM) throughput | 73.31% | 68.54% |
+      | **stall: `long_scoreboard`** | 10.37% | **27.26%** |
+      | stall: `wait` | 5.88% | 8.13% |
+
+      Both earlier constraints are gone — DRAM is up eleven points, compute is down five — and what
+      surfaced is **global-memory latency**: `long_scoreboard` went 10.37% → 27.26%. With the
+      consume loop cheap, the kernel drains tiles faster than a two-stage `cp.async` pipeline
+      prefetches them.
+
+      **So `kStages = 3` was the obvious cure, and it is worth exactly nothing. Measured
+      2026-09-10: 40.12 tok/s against 40.11 at `kStages = 2`**, inside the ±0.04-0.07 run spread, on
+      the same clock-locked `-pg 4096,128`. Reverted, because three stages are not free — 42,496 B
+      of shared against 31,744 costs a block per SM, so it buys a regression in occupancy for no
+      throughput. Four stages do not fit under the 48 KB static cap while `kStageX` is on.
+
+      That is the third plausible mechanism this cycle to be built, measured and thrown away (the
+      MoE D3 block split and split4-at-width-7 were the others), and the pattern is worth naming:
+      **a stall percentage says where the warps are waiting, not that removing the wait will make
+      the kernel faster.** Something else — most likely the block count, since these are
+      narrow-extent kernels and §2c's parallelism entry applies here too — takes up the slack.
+
+      The remaining 26.1 points to the ceiling are worth 54.3 tok/s if ever fully closed, which is
+      the honest shape of what is left. Nothing in this file suggests that is reachable; the point
+      of the number is to stop the next person quoting 936.2 GB/s. Next probe, if anyone wants it:
+      the launch geometry, not the pipeline — `kRowsPerBlock` and the resulting waves per SM, read
+      against the `(rows/WM) x (BN/WN)` arithmetic that explained the GDN kernel.
+
+      This is the missing explanation for "the dense path sits around two-thirds of what the card
+      can deliver". `q5_rowsplit_gemv` on the 27B decode, from the same elevated run:
+
+      | | |
+      |---|---:|
+      | Memory throughput | 456.39 GB/s |
+      | DRAM throughput | **50.10%** |
+      | **Mem pipes busy** | **81.04%** |
+      | **L1/TEX throughput** | **86.60%** |
+      | Mem busy (subsystem) | 40.24% |
+      | L2 throughput | 22.72% |
+      | achieved occupancy | 57.64% |
+
+      `ncu`'s own note: *"utilizing greater than 80.0% of the available compute or memory
+      performance... work will likely need to be shifted from the most utilized to another unit."*
+      The most-utilised unit is the **L1/TEX path at 86.6%**, while DRAM delivers half of what it
+      could. **This kernel is not weight-streaming-bound. It is issue-bound on the memory pipe.**
+
+      **Where the instructions go, read out of the source.** Q5 is stored as three separate planes
+      per group of 64 weights — `codes` 32 B, `high` 8 B, `scales` 2 B
+      (`q5_rowsplit_storage.cuh`). The staging side is already good: `q5_gemv_issue_tile` moves a
+      16-group tile in three `cp.async`s. The **consume** side is where the cost is. Per group, per
+      warp, `q5_gemv_consume_tile` issues:
+
+      | access | width | bytes moved |
+      |---|---|---:|
+      | `tsc[tg]` | 2 B, broadcast to 32 lanes | 2 |
+      | `tn[tg * 32 + lane]` | **1 B per lane** | 32 |
+      | `th[tg * 8 + (lane >> 2)]` | **1 B**, 4-way broadcast | 8 |
+      | `x2[k0 >> 1]` | 4 B per lane | 128 |
+
+      **Four memory-pipe instructions per group to produce two weights per lane** — 16 groups per
+      tile is 64 instructions on the consume side against three on the staging side, so the consume
+      loop outweighs staging roughly 20 to 1. That is what 81% Mem-Pipes-Busy at 50% DRAM looks
+      like.
+
+      The fix needs **no artifact change**, which is the good news — the planes stay exactly as they
+      are on disk. Have each lane decode eight weights per group instead of two, reading four bytes
+      of `codes` at a time: `Q5SimtDecodeAtom::decode_eight` **already exists in the tree** and
+      takes precisely `(uint32 packed, uint8 high_bits, uint16 scale_bits)`. Handling four groups
+      per iteration across 32 lanes gives 256 weights for about four memory instructions instead of
+      sixteen — a ~4x cut in memory-pipe instructions on a kernel family that is **86% of the 27B's
+      decode busy time**.
+
+      Two caveats before building. The 4-byte-per-lane read of `tn` is stride-4 across lanes, which
+      is conflict-free in shared memory, but the `th` and `tsc` mappings need re-deriving and the
+      swizzle must be re-checked. And `Mem Pipes Busy` on Ampere counts the shared-memory pipe
+      alongside the global LSU, so the split between staging and consume above is *derived from the
+      source, not measured*: confirm it with `l1tex__data_pipe_lsu_wavefronts_mem_shared` against
+      `l1tex__data_pipe_lsu_wavefronts_mem_global` before committing to the retile.
+
+- [ ] **`sparse_moe_d2_warp_kernel` cost 8.45% of the 35B's decode kernel time on one warp of one
+      SM. Half of that is now gone — the branch-free sort shipped, **+3.15% end to end** — and the
+      other half still wants warps.**
+
+      **Shipped 2026-09-09: a branch-free sorting network.** The stall breakdown below put 15.25% of
+      d2's active warp cycles in `branch_resolving`, all of it the `while`-loop insertion sort over
+      each lane's eight candidates — its trip count is data-dependent, so lanes diverge and the warp
+      pays every path (22.19 of 32 threads active). Replaced with Batcher's odd-even merge sort for
+      eight elements: 19 compare-exchanges in six dependency levels, every index a compile-time
+      constant, emitted as predicated selects. Semantics are identical because
+      `sparse_moe_ranked_better` is a total order over distinct expert ids, and the network was
+      verified exhaustively on the host — **all 40,320 permutations, plus 20,000 tie-heavy cases
+      under the (value, id) order.**
+
+      | | before | after | change |
+      |---|---:|---:|---:|
+      | `sparse_moe_d2_warp` | 13.43 µs/inst | **8.32 µs/inst** | **−38.0%** |
+      | total decode kernel time | 820.3 ms | **795.8 ms** | **−2.99%** |
+      | `d1` / `d3` / `d4` (untouched) | | | −2.0% / +0.5% / −0.7% |
+
+      End to end, `run_interleaved_ab.py`, clocks locked, six paired repetitions, **the dense 27B as
+      control because it has no `sparse_moe` path at all**: **+3.15% paired median, 6 of 6 pairs
+      positive, +3.29% normalised, control drift +0.00%.** That matches the −2.99% kernel-time
+      prediction, which is the check worth having — the two instruments agree.
+
+      It beat the estimate (~1% was predicted from `branch_resolving` alone) because the network is
+      also shorter in dependent depth than the insertion sort's worst case, six levels against
+      seven, so it took some of the `wait` term too. Note the control here is chosen better than the
+      D3 experiment's: a model with none of the changed code, rather than a downstream kernel in the
+      same fused pipeline, which moved 6% on L2 state alone.
+
+      **What is left: the `wait` term — but "more warps" as this entry first described it would
+      miss most of it, and that is worth reading before building anything.** Counting the routine's
+      own ops per lane:
+
+      | | ops |
+      |---|---:|
+      | local sort (the Batcher network) | 19 compare-exchanges |
+      | merge: shuffles (5 xor steps x 8) | 40 |
+      | merge: bitonic restores (5 x 3 stages x 4) | 60 |
+      | **merge total vs sort** | **5.3x** |
+
+      **The merge is the dominant half, and an 8-warp split parallelises the sort — the smaller
+      half.** Splitting 256 experts over 8 warps at one score per lane removes the per-lane sort
+      from the critical path, but each warp still has to produce a sorted top-8 and *something* must
+      still merge eight of those, so the naive version keeps the expensive part serial and would
+      measure as very little. That is the D3 mistake in a different costume: a plausible mechanism
+      that does not touch the dominant term.
+
+      **The design that does work needs both halves**, and the second is the cheap one:
+
+      1. 8 warps, one score per lane, each warp reducing its 32 candidates to a sorted top-8 —
+         a bitonic sort of 32 across lanes, 15 branch-free shuffle compare-exchanges, all 8 warps
+         concurrent so the latency interleaves.
+      2. **Merge 8 runs in 3 xor steps, not 5.** `sparse_moe_merge_ranked_runs` hardcodes
+         `for (partner = 1; partner < 32; partner <<= 1)` because today it merges 32 runs. Eight
+         runs need `log2(8) = 3`. That alone is 100 ops down to 60, **−40% of the dominant term**,
+         and it is a template parameter on the existing verified routine rather than new logic.
+
+      Critical-path ops: **119 today (19 + 100) against ~60** (the 30 for step 1 being spread over
+      eight concurrent warps). So call it half the addressable work.
+
+      **And the addressable work is not all 8.32 µs.** The smallest real kernel in the same nsys
+      capture, `rmsnorm_cta_bf16`, is **2.23 µs/instance**, which is about the floor for a small
+      launch on this box. So ~6.1 µs is addressable, halving it saves ~3 µs, and 3 µs x 5,160
+      instances is ~15.5 ms of 795.8 — **roughly 2% end to end, not the 5-6% this entry claimed
+      before the branch-free sort landed.** Still worth having, and worth knowing it is 2% before
+      committing to a bitonic-32 that needs its own exhaustive verification.
+
+      One thing that makes step 1 cheaper than it looks: lanes 8..31 of the merging warp can hold
+      runs of `{-inf, INT_MAX}`, which are trivially descending and can never be selected, so the
+      *existing* 5-step routine works unmodified as a correctness fallback while the 3-step variant
+      is being validated against it.
+
+      Found incidentally in the MoE counter capture, where `ncu` timed it at 15.52 µs and the
+      arithmetic in this entry's first draft argued that had to be inflated. **It was inflated by
+      15%, not by 3x.** `nsys`, node-level graph tracing, 35B / int8 / `-n 128`, clocks locked:
+
+      | stage | total | % of kernel time | µs/instance | instances |
+      |---|---:|---:|---:|---:|
+      | `sparse_moe_d3_nine_warp` | 134.89 ms | 16.44% | 26.14 | 5,160 |
+      | `sparse_moe_d4_nine_warp` | 104.22 ms | 12.70% | 21.83 | 4,773 |
+      | **`sparse_moe_d2_warp`** | **69.30 ms** | **8.45%** | **13.43** | 5,160 |
+      | `sparse_moe_d1` | 19.32 ms | 2.36% | 3.74 | 5,160 |
+      | all four | 335.88 ms | **40.9%** | | |
+
+      5,160 instances is 129 rounds x 40 text layers, so the mapping is exact. **d2 is the third
+      largest MoE stage, ahead of d1 by 3.6x, and it launches `<<<1, 32>>>` — one warp, on one SM of
+      82, 2.09% achieved occupancy.** The earlier reasoning that got this wrong divided #53's "38% of
+      busy time" across the stages and found no room for it; the four stages are 40.9% of *kernel*
+      time here, and d1 is far cheaper than assumed, which is where the room was.
+
+      **Why it is this slow is NOT yet established, and the obvious answer does not add up.**
+      13.43 µs at 1,500 MHz is ~20,000 cycles to pick the top 8 of 257 floats from about 1 KB. The
+      selection is not badly written: `sparse_moe_route.cuh` gives each lane 8 scores, insertion
+      sorts them locally, then runs five xor-merge steps, each 8 independent shuffles followed by a
+      3-stage bitonic restore. Costing that out — shuffles pipeline, the bitonic stages are
+      dependent at ~20-30 cycles each, the insertion sort is a few hundred cycles even divergent —
+      lands somewhere near **1,000 cycles, under a microsecond.** The measurement is twenty times
+      that, so the instruction mix does not explain it and "a single warp has nothing to interleave"
+      is at best a partial answer.
+
+      What the counters do say (from the MoE capture, so `ncu`'s inflated 15.52 µs duration but
+      trustworthy ratios): **no eligible warp on 78.56% of cycles**, avg. active threads per warp
+      **22.19 of 32**, L2 hit rate 81.67%, DRAM throughput 0.60%. So the one warp is stalled for
+      four cycles in five, and it diverges — but which stall dominates is exactly what has not been
+      measured.
+
+      **The stall breakdown was collected rather than guessed, and it settles which fix is right.**
+      `ncu --metrics smsp__warp_issue_stalled_*_per_warp_active.pct` on `sparse_moe_d2`, three
+      launches, clocks locked — the `per_warp_active` family works without PC sampling, which is
+      what the MoE capture's missing `smsp__pcsamp_sample_count` had blocked:
+
+      | stall reason | % of active warp cycles |
+      |---|---:|
+      | **`wait`** — dependent fixed-latency instructions | **37.68** |
+      | **`branch_resolving`** — the divergent insertion sort | **15.25** |
+      | `imc_miss` | 7.69 |
+      | `short_scoreboard` | 4.15 |
+      | **`long_scoreboard`** — global memory latency | **4.09** |
+      | `barrier`, `lg_throttle` | 0.00 |
+
+      **Memory latency is 4% and is therefore not the problem** — which kills the most plausible of
+      the three candidates. Staging `scores` through shared memory or fusing into d1's tail would
+      buy essentially nothing. `wait` plus `branch_resolving` are **52.9% between them**, and both
+      are what a single warp running a dependent, divergent chain looks like with nothing to
+      interleave.
+
+      So the fix is the one the counters point at, and it is two changes to the same routine:
+
+      1. **More warps in the block**, to cover the 37.68% `wait`. One block still means one SM — the
+         win is interleaving *inside* it. A block-scoped selection with 8 warps (each taking 32 of
+         the 256 experts, one score per lane, a local top-8, then one cross-warp merge through
+         shared memory) both shortens the dependent chain and gives the scheduler seven other warps
+         to issue from.
+      2. **A branch-free sorting network** for the per-lane sort, to remove the 15.25%
+         `branch_resolving`. The current code is a `while`-loop insertion sort over 8 elements,
+         which is where the 22.19-of-32 active threads comes from.
+
+      On the ~1,000-cycle instruction cost that arithmetic gives, 4-5 µs is the target, i.e.
+      **5-6% of the 35B's decode time** — larger than anything else left in this file and far
+      cheaper than the split-K MMA kernel.
+
+      **Two cautions before writing it.** The ranking is a total order over distinct expert ids and
+      `sparse_moe_route.cuh` says so, so any correct selection must produce the same set *and the
+      same order*; `ninfer_sparse_moe_test` at T=1 is the check. And
+      `sparse_moe_select_top8_warp` is shared with the prefill and small-T paths
+      (`sparse_moe_prefill_kernels.cu:153`, `sparse_moe_small_t_kernels.cu:103`), which call it per
+      token from a wide launch and are *not* latency-starved — so add a block-scoped variant
+      alongside it rather than replacing it.
+
+      That the mechanism was measured rather than assumed matters here specifically: the D3 block
+      split on this same page was built on an equally plausible story, measured, and came out
+      *worse*. This time the losing candidate was eliminated before any kernel was written.
+
+      Two cautions. The ranking is a total order over distinct expert ids and the file says so, so
+      any correct selection must produce the same set *and the same order* — `ninfer_sparse_moe_test`
+      at T=1 is the check. And `sparse_moe_select_top8_warp` is shared with the prefill and small-T
+      paths (`sparse_moe_prefill_kernels.cu:153`, `sparse_moe_small_t_kernels.cu:103`), which call it
+      per token from a wider launch and are *not* latency-starved; a block-scoped variant should be
+      added alongside it rather than replacing it.
+
 ### Found by this cycle's profiling, and not previously on this list
 
 The two entries below are the largest identified speed opportunities in the repository. Both come
 out of #53's profile and #50's byte accounting, both have a measured gap against a measured
 ceiling, and neither has had any optimisation attempted.
 
-- [ ] **The MoE expert gather is latency-bound, not divergence-bound or bandwidth-bound.** Still
-      the biggest number left in this file, but it now has a cause. `ncu` counters collected
+- [x] **The MoE expert gather is latency-bound, and there is nothing left to do about it. Closed
+      2026-09-09** after all four candidate fixes were measured and none worked — the last of them,
+      splitting the nine-warp block, made it actively worse. The 35B's ~51% of achievable is what
+      top-8-of-256 routing costs on a card whose per-layer MoE work is a single machine-full, and
+      this entry is kept because the four negatives are what stop the investigation being repeated. `ncu` counters collected
       2026-09-09 via `scripts/sweeps/admin-profile.ps1` (elevated; the counters are
       administrator-only on Windows and that was the whole blocker), 35B, int8 KV, decode, clocks
       locked at 1,500 MHz, `--graph-profiling node`:
@@ -1235,22 +2249,95 @@ ceiling, and neither has had any optimisation attempted.
          batching or by tiling.** It is what top-8-of-256 routing costs on a card whose per-layer
          MoE work is a single machine-full.
 
-      3. **Split the shared path out of the block.** This one still stands, and the source already
-         names it: the shared W8 path is heavier than a routed Q4 path, the block cannot retire
-         until all nine warps finish, and eight completed routed warps sit holding warp slots while
-         warp 8 drains — which is the 44.6% / 58.6% "no eligible warp" reading directly.
-         `sparse_moe_d3_path_tiled_kernel` in the same file exists for exactly this and says so:
-         *"Three path CTAs per token/output row expose enough blocks for the 170-SM target and keep
-         the heavier shared W8 path from holding eight completed routed warps resident."* It is
-         written for the multi-token path and takes a `tokens` argument; single-token decode does
-         not use it. This does not add work to the machine, so item 1 does not apply — it removes a
-         serialisation inside a block that is already resident.
+      3. **Split the shared path out of the block — built, measured, and it is worse. Closed
+         2026-09-09.** This was the last standing candidate and the entry argued it was exempt from
+         item 1 ("this does not add work to the machine ... it removes a serialisation inside a
+         block that is already resident"). That argument is wrong, and item 1 is what beats it.
 
-      4. **Over-fetch.** ncu measured 12.12 MB of DRAM traffic on d3 and 12.27 MB on d4 where #50's
-         artifact inventory attributes **8.91 MB** and **5.58 MB** of useful weight bytes — 1.36x
-         and **2.20x**. If real, d4 moves over twice the bytes it needs and that is worth more than
-         anything else here. Confirm with `dram__bytes_read.sum` before optimising against it,
-         since the attribution and the ncu run are separate measurements.
+         Wired `sparse_moe_d3_path_tiled_kernel` into single-token decode at `PathsPerBlock = 3` —
+         which is what the multi-token small-T path already routes *every* token count 2..46 to —
+         behind a plan schedule so both geometries ran from one build. At one token the two kernels
+         write an identical activation layout (`(0 x (kTopK+1) + path) x kIntermediate + j` is
+         `warp x kIntermediate + j`), and on sm_86 `NINFER_SM8X_COMPAT` compiles every `pdl::` call
+         to nothing, so this was a pure launch-geometry A/B with no numeric or ordering difference.
+         `ninfer_sparse_moe_test` passes on both arms, so the reroute was correct.
+
+         35B / int8 / decode, clocks locked at 1,500 MHz, `ncu` kernel replay, medians of 3:
+
+         | | `nine_warp` (512x1, 288 thr) | `paths3` (512x3, 96 thr) |
+         |---|---:|---:|
+         | duration | **29.63 µs** | **30.75 µs** |
+         | block limit registers / warps | 5 / 5 | 16 / 16 |
+         | theoretical warps per SM | 45 | **48** |
+         | theoretical occupancy | 93.75% | **100%** |
+         | **achieved occupancy** | **67.65%** | **52.60%** |
+         | no eligible warp | **43.2%** | **53.4%** |
+         | DRAM throughput | 50.6% | 41.3% |
+
+         **It delivers exactly the higher *theoretical* occupancy it was designed for — 93.75% to
+         100% — and a materially lower *achieved* one, and the scheduler stall it was meant to
+         remove gets worse.** That is the hypothesis inverted, not merely unmet.
+
+         The cause is the wave tail, and it is item 1's arithmetic: three-warp blocks need
+         **1,536 blocks against a 16-per-SM capacity of 1,312**, so two waves at **58.5%**
+         efficiency, against 512 blocks over 410 slots at **62.4%**. Item 1 already computed those
+         two numbers and this entry set them aside on the grounds that no work was being added. The
+         mistake was treating "resident" as free: spreading a kernel that is only ~1.17
+         machine-fulls over three times as many blocks costs more in tail than the intra-block
+         serialisation costs in stall. **Removing a serialisation does not help a kernel that is
+         smaller than the machine.**
+
+         Reverted — the plan carries no schedule and the default is unchanged — with the numbers
+         recorded above `sparse_moe_d3_nine_warp_kernel` so it is not retried. The precondition for
+         ever revisiting it is making the kernel bigger than the machine, which for an MoE at one
+         token nothing in items 1 and 2 offers.
+
+         **One measurement lesson, and it is the transferable part.** `d4` was captured alongside as
+         an unchanged control and **moved 6.14% between the two arms** (DRAM 46.9% → 52.4%) —
+         larger than the d3 effect being measured. A downstream kernel in the same fused pipeline is
+         **not a clean control**: d3's different access pattern leaves different L2 state behind for
+         d4. So the duration column above is inside its own control's drift and cannot carry this
+         result on its own; the occupancy and scheduler counters, which are not drift-sensitive in
+         the same way and which moved by 15 and 10 points, are what settle it. Pick controls that do
+         not share a cache with the thing under test.
+
+      4. **Over-fetch — measured with `dram__bytes_read.sum`, and it is real but smaller than the
+         section reading suggested.** Collected 2026-09-09, `admin-profile.ps1` section 4, four
+         launches each, kernel replay:
+
+         | | d3 | d4 |
+         |---|---:|---:|
+         | `dram__bytes_read.sum` | **11.16 MB** (11.16/11.16/11.17/11.16) | **~10.2 MB** (10.24/10.27/11.14/10.14) |
+         | useful weight bytes (#50) | 8.91 MB | 5.58 MB |
+         | over-fetch | **1.25x** | **1.83x** |
+         | previous estimate from the section reading | 1.36x | 2.20x |
+
+         So d4 does move nearly twice the bytes it needs, but 1.83x rather than 2.20x, and this
+         entry's "worth more than anything else here" no longer holds — 1.83x of 5.58 MB is 4.6 MB
+         of waste on a kernel whose DRAM pipe is only 47% utilised, so the bytes are not what the
+         kernel is waiting for. **Asking for the metric rather than trusting the section was the
+         right call**: `MemoryWorkloadAnalysis_Tables` produced *"No metrics to show"* in both the
+         application-replay and kernel-replay captures, so the 12.12/12.27 MB figures came from a
+         section that had not actually reported and should not have been quoted.
+
+         **What the sector counters show instead is an L1 amplification, and it is d4's alone.**
+
+         | | d3 | d4 |
+         |---|---:|---:|
+         | `l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum` | 528,384 | **2,560,000** |
+         | that as bytes (32 B/sector) | 16.9 MB | **81.9 MB** |
+         | `lts__t_sectors_srcunit_tex_op_read.sum` as bytes | 11.6 MB | 8.3 MB |
+         | DRAM read | 11.16 MB | 10.2 MB |
+         | L1/TEX hit rate | 31.66% | **87.60%** |
+
+         d4 issues **81.9 MB of L1 load traffic to move 10.2 MB from DRAM — 8x** — and its 87.6% L1
+         hit rate is what absorbs it. That is the activation vector: `act` is 9 x 512 floats, and
+         every one of d4's **2,048 blocks** re-reads it (`act + warp * kIntermediate`) for each of
+         its nine warps, which is `2,048 x 9 x 512 x 4 B` = 37.7 MB of the total on its own. It is
+         not currently the binding constraint — d4's L1/TEX pipe is at 42.4%, below its 47.1% DRAM
+         — so this is not a fix to make today. It is worth knowing before anyone reads d4's 87.6% L1
+         hit rate as evidence of good locality: it is evidence of a re-read that L1 happens to
+         forgive.
 
       Registers are *not* on that list, which is the correction: an earlier draft of this entry
       claimed `Block Limit Registers = 5` was the constraint and that 32 registers per thread would
@@ -1258,18 +2345,45 @@ ceiling, and neither has had any optimisation attempted.
       caps it at 5 regardless, so the change would measure as exactly nothing. Read both limits
       before believing either.
 
-      What is left after all that is items 3 and 4 — a block-level serialisation and a possible 2x
-      over-fetch — not the 15-20% "close half the gap to the contiguous kernels" this entry used to
-      promise. That framing compared an 8-of-256 gather against kernels that stream contiguous
-      weights, and items 1 and 2 are why that comparison was never going to close.
+      **What is left after all that is item 4 alone — a real but 1.83x over-fetch on d4 — and it is
+      not worth much**, because d4's DRAM pipe is only 47% utilised, so the wasted bytes are not
+      what the kernel is waiting for. Items 1, 2 and 3 are all now closed as measured negatives:
+      launch geometry cannot help, batching cannot help, and splitting the block makes it worse.
+      Certainly not the 15-20% "close half the gap to the contiguous kernels" this entry
+      used to promise. That framing compared an 8-of-256 gather against kernels that stream
+      contiguous weights, and items 1 and 2 are why that comparison was never going to close.
 
-      Not yet collected: the contiguous-kernel reference from the same elevated run.
-      `admin-profile.ps1` passed `-k 'regex:a|b'` and PowerShell parsed the `|` as a pipe, so that
-      half produced only an error. Fixed in the script; re-run it to get the local baseline these
-      percentages are compared against.
+      **The contiguous reference is collected, and it dismantles the comparison this entry was
+      built on.** `q5_rowsplit_gemv` on the 27B decode, same elevated run, same clock lock, same
+      instrument — which is the point, because every "40-45% versus 78-82%" figure in this file
+      divides byte attributions by nsys durations rather than reading one tool:
 
-- [ ] **Prefill's MLP GEMMs run at ~30% of the card's INT8 tensor-core rate**, and the obvious
-      excuse for that has been measured and ruled out.
+      | kernel | dur | SM % | L1/TEX % | L2 % | DRAM % | saturated? |
+      |---|---:|---:|---:|---:|---:|---|
+      | `sparse_moe_d3_nine_warp` | 28.51 µs | 34.3 | 34.7 | 19.9 | **43.2** | **nothing** |
+      | `sparse_moe_d4_nine_warp` | 24.13 µs | 37.7 | 42.4 | 24.1 | **47.1** | **nothing** |
+      | `q5_rowsplit_gemv` (contiguous) | 46.18 µs | 81.0 | **86.6** | 22.7 | 50.1 | L1/TEX |
+
+      **On one instrument the two are 43-47% against 50% of DRAM peak, not 45% against 80% of
+      anything.** The contiguous kernel is not streaming weights at four-fifths of the card's
+      bandwidth; it is at *half* of DRAM peak with its **L1/TEX path at 86.6%**. The difference
+      between it and the MoE is not how much bandwidth each reaches — it is that the contiguous
+      kernel has saturated a pipe and therefore has no headroom, while the MoE has saturated
+      **nothing**: its highest utilisation of any pipe is 47%.
+
+      That is the cleanest confirmation of item 2's "latency, not bandwidth" that this entry has,
+      and it arrives with the corollary that **the gap to be closed is much smaller than the file
+      has been claiming.** The percentages in #53's table are still useful as bytes-per-second, but
+      "the expert kernels reach 40-45% of what the card can read while contiguous weight kernels
+      reach 78-82%" should not be read as 35 points of available headroom. It is not.
+
+      *One tooling note kept, because the failure looked like the tool's fault.* An earlier attempt
+      at this reference passed `-k 'regex:a|b'` and PowerShell parsed the `|` as a pipe before `ncu`
+      saw it, producing an empty report. Fixed to a single `--kernel-name` pattern.
+
+- [ ] **Prefill's MLP GEMMs run at ~30% of the card's INT8 tensor-core rate, because 124 registers
+      per thread hold the SM to 16 of 48 warps.** Cause located 2026-09-09 with counters; the
+      remaining work is a retile. Every other explanation has been measured and ruled out.
 
       Measured (#53 plus `tools/tensor_core_rate_probe.cu`): `q4a8_swiglu` reaches 97.4 T/s and
       `q5a8_add` 89.4 T/s against a measured **314.8 TOPS** INT8 ceiling, while the BF16 GDN
@@ -1317,11 +2431,107 @@ ceiling, and neither has had any optimisation attempted.
       for a 69% shortfall. This was the natural next hypothesis after the tile-shape one and it is
       also wrong.
 
-      So the gap is inside the MMA pipeline: issue rate, shared-memory feeding, or occupancy, and
-      those three need counters to separate. `scripts/sweeps/admin-profile.ps1` now collects them
-      (section 3 of that script, `ComputeWorkloadAnalysis` and `InstructionStats` alongside the
-      usual occupancy and scheduler sections) — it needs one elevated run, since GPU performance
-      counters are administrator-only on Windows.
+      **The counters are in, and the answer is occupancy — specifically registers.** Collected
+      2026-09-09 via `admin-profile.ps1` section 3, `ncu` kernel replay, clocks locked at 1,500 MHz,
+      27B / int8 / `-p 4096`. `q4a8_swiglu_kernel`, grid `(272, 8)` x 512 threads:
+
+      | | |
+      |---|---:|
+      | Block Limit Registers | **1** |
+      | Block Limit Shared Mem | **1** |
+      | Block Limit Warps | 3 |
+      | Theoretical active warps per SM | **16 of 48** |
+      | Theoretical / achieved occupancy | 33.33% / **33.32%** |
+      | Active warps per scheduler | **4.00** of a hardware 12 |
+      | Eligible warps per scheduler | **0.78** |
+      | No eligible warp | 60.52% |
+      | Issue slots busy / SM busy | 39.47% |
+      | Registers per thread | **124** |
+      | Tensor pipeline utilisation | 36.5% |
+      | DRAM throughput | **20.56%** |
+      | L1/TEX throughput | 61.12% |
+
+      `ncu` states the conclusion itself — *"This kernel's theoretical occupancy (33.3%) is limited
+      by the number of required registers, and the required amount of shared memory"* — and puts an
+      estimated **40%** on fixing it. Achieved occupancy equals theoretical to two decimals, so the
+      launch is already perfectly efficient *given* the occupancy; there is nothing to win in the
+      grid. And the tensor pipe at 36.5% matches the 31%-of-peak measured end to end, so the two
+      measurements agree: **the MMA pipeline is not slow, it is starved of issue opportunities.**
+
+      That settles the three candidates this entry could not separate. Issue rate is a symptom —
+      each scheduler issues once every 2.5 cycles *because* 60.5% of cycles have no eligible warp.
+      Shared-memory feeding binds too, but secondarily. Occupancy is the cause.
+
+      **The arithmetic says registers are the hard constraint and shared memory is the soft one.**
+      Resident warps per SM is `65,536 / (regs_per_thread x 32)`, which at 124 registers is
+      **16 warps — 33.3% — whatever block shape is chosen.** No launch geometry escapes it: a
+      1,024-thread block at 124 registers does not fit on an SM at all. The targets:
+
+      | registers/thread | warps/SM | occupancy |
+      |---:|---:|---:|
+      | 124 (today) | 16 | 33.3% |
+      | 85 | 24 | 50.0% |
+      | 64 | 32 | 66.7% |
+
+      Shared memory is `kBM x kSRow + kBN x kSRow + (kBM + kBN) x 2` = **20,992 B** per block, and
+      `Block Limit Shared Mem = 1` implies the default ~32 KiB dynamic carveout. A 48 KiB carveout
+      admits 2 blocks and 100 KiB admits 4, which is one `cudaFuncSetAttribute` call — **but it
+      would measure as exactly nothing on its own**, because registers still cap the SM at one
+      block. Both have to move, and the register cut is the hard half. This is the same trap the
+      MoE entry fell into with `Block Limit Registers = 5`: read both limits before believing
+      either.
+
+      **What makes a fix affordable is that DRAM sits at 20.56%** — a smaller per-thread
+      accumulator tile costs arithmetic intensity and re-reads more weight, and on a kernel using a
+      fifth of the card's bandwidth there is 4x of headroom to spend on that.
+
+      **But the cheap way of buying the occupancy is catastrophic, and that is now measured.**
+      `__launch_bounds__(kThreads, 2)` asks nvcc for two blocks per SM, which forces 64 or fewer
+      registers per thread; the compiler reaches that by spilling. Tried it 2026-09-10, with the
+      shared-memory carveout raised to `cudaSharedmemCarveoutMaxShared` so shared memory would not
+      re-impose the one-block limit:
+
+      | | prefill tok/s (`pp8192`, three reps, clocks locked) |
+      |---|---:|
+      | baseline, 1 block/SM at 124 registers | **1,148.63 ± 0.18** |
+      | forced 2 blocks/SM at <=64 registers | **350.48 ± 0.01** |
+
+      **A 69.5% regression — spilling costs 3.3x what doubling resident warps buys.** Correctness
+      was unaffected (`ninfer_linear_swiglu_q4a8_int_test` passes either way), so this is purely a
+      performance answer. Reverted.
+
+      So **`ncu`'s "Est. Speedup 40%" is not reachable by forcing the register budget down**, and
+      that is the useful part: the 40% is only available from a retile that lowers the *natural*
+      register requirement. The registers are accounted for — `acc[2][4][4]` is 32,
+      `af[2][2][4]` is 16, `bf[4][2][2]` is 16, the two `Stage`s are ~14, addressing is the rest —
+      so the accumulator shape is the only term big enough to matter.
+
+      **And that retile is coupled, which is why it is not a constant.** Resident warps per SM is
+      `65,536 / (regs x 32)`, so 24 warps needs <=85 registers and 32 needs <=64. Reaching either
+      means changing the warp tile, which fixes `kThreads`; `kThreads` and `kBN` together fix the
+      warp grid (`4 warp_m x 4 warp_n` today); and `kBN` is what this kernel *claims*, through
+      `q4a8_tokens_supported` returning `tokens >= kBN && tokens % kBN == 0`. Halving `kBN` to 64
+      would widen the claimed domain to any multiple of 64 and change routing for widths this
+      kernel does not serve today. Halving the accumulator alone lands near 100 registers, which is
+      still one block at 512 threads and therefore still 16 warps — the block granularity eats it.
+
+      **And 768 threads does not work either, which took a second pass to see.** Accumulators per
+      *block* are fixed by the 128 x 128 tile while the 92 registers of non-accumulator overhead
+      scale with thread count, so 768 threads needs 86,784 registers per block and 1,024 needs
+      110,592 — both over the 65,536 file. More warps per block is unavailable at any width, and
+      split-K makes it worse rather than better for exactly this reason (a K-split warp still owns
+      its whole output tile). See the split-K section near the top, which says so and corrects an
+      earlier claim of the opposite.
+
+      **So the lever is the 92 overhead registers, not the accumulators and not more warps.**
+      Reaching 2 blocks per SM at 512 threads needs <=64 total, i.e. overhead 92 -> 32: `af` is 16,
+      `bf` is 16, the two `Stage`s ~14, addressing the rest. Cutting it means fewer staged fragments
+      and shallower prefetch, traded directly against the latency hiding they provide — a tuning
+      problem with a measurable knob rather than a rewrite. `q5a8_add`, whose shape and 28.4% figure
+      are the same story, would follow it.
+
+      One caveat kept: `Block Limit Warps = 3` and `Block Limit SM = 16` are both far from binding,
+      so nothing here is about block count.
 
       Two small things fall out. The default chunk of 1,024 is 1.0% off the plateau, so 2,048 is
       free throughput *if* the extra workspace is affordable — worth checking against the memory
@@ -1453,19 +2663,201 @@ ceiling, and neither has had any optimisation attempted.
       independent route) so the curve is now **36.8 / 61.1 / 101.0 / 140.8 tok/s, or 3.83x at eight
       lanes** against the 3.62x measured before these tiles existed.
 
-- [ ] **`w8_pair` medium discards its schedule entirely on sm_86.**
+- [x] **`w8_pair` medium no longer discards its schedule on sm_86, and the two tiles that are
+      actually routed here are 13-17% faster than the chunked loop they replaced. Closed
+      2026-09-10.**
       `w8_pair_gemm_splitk.cu:133` is `(void)schedule` under `NINFER_SM8X_COMPAT`, so every
-      schedule runs the same chunked loop. PR #22 already removed the twelve now-identical route
-      entries this made redundant, confirmed by identical 24.576 µs timings, so the *table* is
-      honest. What is unknown is whether a genuinely sm_86-specific tiling would beat the generic
-      chunking — nobody has written one to find out.
+      schedule runs the same chunked loop, slicing T into `kLastExactT = 32` columns and calling the
+      exact-T launcher repeatedly. PR #22 already removed the twelve now-identical route entries
+      this made redundant, confirmed by identical 24.576 µs timings, so the *table* is honest.
+
+      **The reason for the blanket discard, derived 2026-09-09.** `w8_rowsplit_medium_t_splitk_kernel`
+      declares two static shared arrays — `code_shared[16][KSplits x 64]` and
+      `b_shared[KSplits x NGroups][(TileCols / NGroups) x 64]` at 2 B — so each schedule's footprint
+      follows from its own template arguments, against sm_86's **49,152-byte static shared cap**:
+
+      | schedule | KSplits | NGroups | warps | shared | fits sm_86 |
+      |---|---:|---:|---:|---:|---|
+      | C48 `<48,4,2,3>` | 4 | 2 | 8 | 28.0 KiB | **yes** |
+      | C64 `<64,4,2,2>` | 4 | 2 | 8 | 36.0 KiB | **yes** |
+      | C80 `<80,4,2,1>` | 4 | 2 | 8 | 44.0 KiB | **yes** |
+      | C88 `<88,4,1,1>` | 4 | 1 | 4 | **48.0 KiB** | no — exactly *at* the cap |
+      | C96 `<96,4,1,1>` | 4 | 1 | 4 | 52.0 KiB | no |
+      | C104 `<104,4,1,1>` | 4 | 1 | 4 | 56.0 KiB | no |
+      | C112 `<112,4,1,1>` | 4 | 1 | 4 | 60.0 KiB | no |
+      | C128 `<128,2,4,2>` | 2 | 4 | 8 | 34.0 KiB | **yes** |
+      | C160 `<160,2,5,2>` | 2 | 5 | 10 | 42.0 KiB | **yes** |
+      | C192 `<192,2,6,2>` | 2 | 6 | 12 | 50.0 KiB | no |
+
+      So the five wide tiles are **compile errors on sm_86, not slow paths**, and instantiating the
+      whole `switch` is what forced the discard. That is a much better-understood position than
+      "nobody has written one": the sm_86-specific tiling is not a new kernel, it is **the five
+      existing instantiations that already fit**, behind an `#if` that lets the other five fall
+      through to the chunked loop.
+
+      **They win, and the bench gives a clean in-run baseline for free.** Only C48 and C64 are ever
+      routed on this card — `w8_pair_plan.cpp` sends `{33,48}` to C48 and `{49,64}` to C64, and from
+      T=66 the concat kernels win outright — so those are the two instantiated. C80, C128 and C160
+      also fit but are never asked for, and the remaining four exceed the cap. Because `medium_c128`
+      and `medium_c192` are *not* instantiated, they still fall through to the chunked loop, which
+      means the same bench run measures the tiles and their replacement side by side under identical
+      conditions:
+
+      | T | real tile | chunked loop (`medium_c128`) | gain | routed to |
+      |---|---:|---:|---:|---|
+      | 33 | **26.624** (c48) | 30.720 | **13.3%** | c48 |
+      | 48 | **30.720** (c48) | 36.864 | **16.7%** | c48 |
+      | 64 | **34.816** (c64) | 40.960 | **17.1%** | c64 |
+
+      `bench/ops/w8_pair_schedule_bench.exe --k2048`, cold, medians of 9, clocks locked. The
+      `public_op` column tracks the winner at every width, so the route table was already pointing
+      at the right schedule — it just had no schedule to reach.
+
+      The chunked fallback's cost is what the gain measures: it slices T into 32-column chunks and
+      pays a whole extra weight pass per slice, so at T=48 it streams the weights twice where C48
+      streams them once. §2c's parallelism caution does not bite here — `C48 <48,4,2,3>` is 8 warps
+      per block, the same as the exact-T kernel the chunked loop calls — so this is one fewer weight
+      pass rather than a geometry trade.
+
+      **What this is not: a model-level speedup, and that is stated rather than glossed.** This is
+      the k=2048 W8 pair, which is the 35B's DFlash draft-head path, and the band is T=33..64 — a
+      wide speculative extent rather than anything a decode step or an ordinary prefill reaches. The
+      13-17% is an Op-level number above the ~10% cold-flush threshold established in §3, so it
+      should survive in situ, but **no end-to-end measurement was taken because no shipped profile
+      obviously drives this band.** Anyone who finds one has a ready 13-17%.
+
+---
+
+### 2c-vii. Five screens nobody has run, and every kernel win this cycle came from one of them
+
+Written 2026-09-10, at the end of a cycle that shipped six speedups. Every open item above names
+**one kernel**. But all six wins came from applying the *same* three signatures to a kernel that
+nobody had checked, and none of those signatures has ever been run across the kernel set as a
+sweep. So the list is a list of kernels somebody happened to look at, and these five entries are
+the screens that would tell you which kernels to look at next. All five are cheap; two need no GPU
+at all, and one of those two should be done before any of the others.
+
+- [ ] **Nobody has attributed the missing 26% of decode bandwidth to any kernel.** The dense decode
+      is at **73.9% of the 854.2 GB/s this card can actually read**, and the analytic read-set is
+      **15.743 GB/token**. Both numbers are for the whole step. There is no per-kernel table, so
+      every remaining decision about what to optimise next is a guess about where the 26% lives —
+      including the guess in the entry above that block count takes up the slack in the q5 GEMV.
+
+      Build the table: `ncu --replay-mode application --metrics
+      dram__bytes_read.sum,gpu__time_duration.sum` over one clock-locked `-pg 4096,128` decode step,
+      then per kernel report measured bytes, duration, and implied GB/s against 854.2. Rank by
+      **bytes x (1 - achieved/854.2)** — the absolute time each kernel is leaving on the floor —
+      because ranking by percentage promotes tiny kernels and this is a bandwidth budget, not a
+      league table. `scripts/sweeps/admin-profile.ps1` already collects `dram__bytes_read.sum` for
+      the MoE section; this generalises that section to the whole step.
+
+      Use `--replay-mode application`. Kernel replay mirrors the 21 GB device working set into host
+      RAM and dies with `bad allocation` unless nothing else on the box is holding memory.
+
+- [ ] **Bytes-read amplification has been measured for exactly one kernel, and it was 4.9x.** The
+      metric is measured DRAM (or L1 sector) bytes divided by the kernel's *analytic* read-set. A
+      decode kernel that streams weights once should sit at 1.0. `d4` came out at
+      `l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum` = 2,560,000 sectors = **81.9 MB against
+      8.3 MB actually read from L2** — it re-reads its working set roughly five times through L1.
+      That was found by hand, on one kernel, chasing something else.
+
+      Nobody has run it as a screen. Any kernel above 1.0 is doing avoidable work, and on a machine
+      that is 26% short of its own read bandwidth an amplification factor is the most direct
+      possible pointer at where the shortfall is. Same ncu pass as the entry above plus the two
+      sector counters, so it is one profiling run for both. **Screen every decode kernel, rank by
+      amplification x bytes, and treat anything above ~1.2 as a defect rather than a tuning
+      opportunity** — re-reading a weight tile is not a trade-off, it is waste.
+
+      **Collect `lts__t_sector_hit_rate` in the same pass.** Amplification says a kernel re-reads;
+      L2 hit rate says whether the re-read is costing DRAM traffic or is absorbed. It also
+      independently informs the routed prefill pipeline-depth item: `7/4` is upstream's RTX 5090
+      constant and **an RTX 5090 has 16x this card's L2**, so a measured hit rate is the direct
+      evidence for what that constant should be here, rather than sweeping it blind.
+
+- [ ] **The signature that produced three of this cycle's six speedups has never been run as a
+      screen.** It is: **L1/TEX throughput high while DRAM throughput is well below it.** That
+      combination means the kernel is limited by how fast its *consume loop* retires bytes, not by
+      how fast memory delivers them — the kernel is issuing far more load instructions than the
+      bytes require, usually because each lane consumes one or two weights per trip.
+
+      It was found three times and fixed three times with the same two code changes, both now
+      shipped and available to copy:
+
+      | kernel | before | after | fix |
+      |---|---|---|---|
+      | `q5_rowsplit_gemv` | L1/TEX 87%, DRAM 50% | L1/TEX 37% | widen the consume loop to 8 weights/lane |
+      | `q4_linear_swiglu_gemv` | same shape | — | same widening, gate+up as 4-byte words |
+      | `q5_rowsplit_gemv` (dequant) | Compute 73% | 68.5%, DRAM 66.7% | half2 bit-trick + per-group scale hoist |
+
+      Together those moved dense decode **37.44 → 40.11 tok/s**. The remaining quantized GEMV and
+      GEMV-shaped kernels have never been checked for the same signature, and the fix is a known,
+      reviewed, already-merged pattern rather than a design problem. **This is the highest
+      expected-value mechanical item on the list**: one ncu pass over the decode kernel set
+      collecting `l1tex__throughput.avg.pct_of_peak_sustained_active` and
+      `dram__throughput.avg.pct_of_peak_sustained_elapsed`, then rank by the *gap* between them.
+
+      The half2 bit-trick is in `src/ops/linear/q5/q5_rowsplit_gemv.cuh`: half `0x6400` is 1024.0
+      and its mantissa LSB is 1.0, so OR-ing a nibble into the mantissa and subtracting the bias
+      `0x6410` (1040.0) yields `nibble - 16*high_bit`, which is `sign_extend<5>` for free. Any
+      kernel dequantizing 4- or 5-bit codes can use it.
+
+- [ ] **The parallelism arithmetic has been done for two kernels and it decided both of them, and
+      it has never been tabulated for the rest. It costs no GPU time at all.** The quantity is total
+      warp-work divided by what the card can hold resident — "machine-fulls". For a tiled GEMM it is
+      `(rows / WM) x (BN / WN)`; **note `BM` does not appear**, which is why narrowing `BN` *reduces*
+      parallelism and why the tile-narrowing experiment lost 6-32%. The denominator is 82 SMs times
+      `65,536 / (regs x 32)` warps per SM.
+
+      Two kernels have been through it and in both cases it was the answer:
+
+      | kernel | warp-work | machine-fulls | what it explained |
+      |---|---:|---:|---|
+      | `rowsplit_grouped_mma_kernel` | 1,024 warps | **0.26** | 24.5% achieved occupancy; why split-K is the fix |
+      | `sparse_moe_d3_path_tiled` | — | **1.17** | why launch geometry and batching both measured flat |
+
+      Nothing else has a number. That matters right now, because the entry above ends by *guessing*
+      that block count is what takes up the slack when `kStages = 3` removes a 27% memory-latency
+      stall and buys nothing — and this table would settle that guess with pen and paper. Do it for
+      every kernel in the decode step and for the prefill GEMMs, rank by machine-fulls, and treat
+      anything under ~1.0 as latency-bound-by-construction: **no amount of stall-metric chasing will
+      help a kernel that cannot fill the machine**, which is the trap that consumed three built-and-
+      discarded experiments this cycle.
+
+      It also predicts which of the four screens above will pay off on which kernel, so it is worth
+      doing *first* even though it produces no measurement: a kernel at 0.3 machine-fulls does not
+      need its consume loop widened, it needs more blocks.
+
+- [ ] **Nobody knows the register decomposition of any kernel except one, and occupancy work has to
+      be bought from the part nobody has measured.** `-Xptxas -v` appears nowhere in this file. The
+      prefill MLP entry established the principle the hard way: `q4a8_swiglu`'s 124 registers are
+      **32 accumulators and 92 of overhead**, the overhead term is what actually caps occupancy at
+      one block per SM, and the fix therefore has to come out of staged fragments and prefetch depth
+      rather than out of the accumulator array. That decomposition exists for that one kernel
+      because I worked it out by hand after getting it wrong.
+
+      It is available for every kernel at once, for the cost of one build: add `-Xptxas -v` and read
+      registers, spill stores and spill loads per kernel out of the log. Then compute, per kernel,
+      `65,536 / (regs x 32)` warps per SM and compare against what the kernel needs. **Zero GPU
+      time.** Two things this would surface that nothing on the list currently can:
+
+      1. **Spills already happening.** Forcing occupancy with `__launch_bounds__(kThreads, 2)` on
+         the prefill MLP cost **69.5%** (1,148.63 → 350.48 tok/s) purely because the compiler spilled
+         to reach 64 registers. Any kernel already spilling is paying that silently, and the log
+         says so for free.
+      2. **Which occupancy shortfalls are register-bound at all.** Both quantized KV decode
+         attention kernels reach only **33% of their own theoretical occupancy** (21.98 of 66.66 for
+         int8, 16.51 of 50.00 for fp8 — the same ratio to two figures). If their register counts are
+         low, the shortfall is not register pressure and the arena/grid work named in that entry is
+         the right target; if they are high, that entry is aimed at the wrong thing. Nobody can tell
+         which today.
 
 ---
 
 ## 3. Measurement debt
 
-- [ ] **There is no committed harness for an interleaved A/B, and every comparison in this file
-      needed one.** The card drifts 3-5% between processes, so measuring all of arm A then all of
+- [x] **The interleaved A/B harness is committed. Closed 2026-09-09** as
+      `tools/bench/run_interleaved_ab.py`, documented in `tools/bench/README.md`. The card drifts
+      3-5% between processes, so measuring all of arm A then all of
       arm B is not a comparison — two runs this cycle came out with opposite-signed drift (+2.9%
       then −3.8%) on code paths that had not changed. The working pattern, hand-rolled three
       separate times this cycle:
@@ -1480,28 +2872,79 @@ ceiling, and neither has had any optimisation attempted.
          against it. In the GDN tile A/B, draft counts 4 and 5 stay on an unchanged route and are
          what made the result readable.
 
-      Worth ~40 lines in `tools/bench/` taking two executable paths and a command template. It
-      would also stop the next person rediscovering that the ratio of two medians and the median of
-      ratios disagree here by more than the effects being measured. `nvidia-smi -lgc` (§3) reduces
-      the need for this but does not remove it, and needs an elevated shell.
+      All four properties are implemented, and the two that are easy to get wrong are *refused*
+      rather than left to the caller. Both arms in different directories is a hard error naming the
+      exit-127 DLL trap; a `--config` with no `{exe}` placeholder is a hard error, because it would
+      run the same binary twice and report a comparison of nothing. A run where any sample produced
+      no number exits 1 — a comparison with a hole in it is not a comparison.
 
-- [ ] **`scripts/sweeps/dflash2-draft-tokens-realtext.ps1` calls `Get-FileHash`, which does not
-      exist under this box's `powershell`.** It errors once per iteration — 26 iterations, 26 error
-      blocks in the output — and the `content_sha256` column comes out empty. Non-fatal, and the
-      throughput numbers it prints are unaffected, but the hash column is the entire mechanism by
-      which that script lets a reader check whether two configurations produced identical text,
-      which its own header says is the point. Replace it with `certutil -hashfile <path> SHA256`, or
-      call `[System.Security.Cryptography.SHA256]::Create()` directly, either of which works here.
+      Two things it adds beyond the hand-rolled pattern. It **swaps which arm leads on alternate
+      repetitions**, so the warmer second slot in each repetition lands on each arm equally often
+      instead of accumulating on one side. And `--control` is divided out **per repetition before
+      the median is taken**, not median-over-median, which is the same distinction the paired
+      statistic itself rests on.
 
-- [ ] **Host memory pressure can silently invalidate any 35B measurement on this box, and did.**
+      Verified against stub binaries with a known answer — a planted +5.85% on the measured arm and
+      a −0.17% control — which it recovers as `+5.85%` raw, `+6.02%` normalised, 4/4 pairs positive.
+      The guard paths were tested too: different directories, a missing placeholder, and a metric
+      regex that never matches all fail the way they are documented to.
+
+      `nvidia-smi -lgc` reduces the need for this but does not remove it, and needs an elevated
+      shell.
+
+- [x] **The empty `content_sha256` column is fixed, and the diagnosis in this entry was wrong.**
+      Closed 2026-09-09. This entry said
+      `scripts/sweeps/dflash2-draft-tokens-realtext.ps1` "calls `Get-FileHash`, which does not exist
+      under this box's `powershell`". **It does exist and it hashes correctly** — Windows PowerShell
+      5.1.26100.9168, verified directly. So neither of the replacements this entry recommended
+      (`certutil -hashfile`, `SHA256::Create()`) was needed, and either would have "fixed" the
+      symptom without touching the cause.
+
+      **What actually happens.** `Get-FileHash` on a path that does not exist raises a
+      **non-terminating** error — from a `Resolve-Path` inside the cmdlet's own implementation — and
+      returns *nothing at all*. `.Hash` on the nothing yields an empty string, and the error prints
+      once per iteration. That is exactly the reported symptom, error-block count included, and the
+      real defect is whatever left the stdout file missing rather than the hashing call.
+
+      Worth keeping because it defeats the obvious defensive fix too: a bare `try/catch` around it
+      does **not** help, since a non-terminating error never reaches `catch`. Confirmed by
+      measurement, not reasoning — the first patch written for this was exactly that useless
+      `try/catch`.
+
+      The column now does `Test-Path` first, then `Get-FileHash -ErrorAction Stop` inside a
+      `try/catch`, so a failure lands *in the CSV cell* (`ERR:no-stdout-file`,
+      `ERR:<ExceptionType>`) instead of as console noise, and the sweep still finishes. The next
+      run therefore reports why rather than needing this diagnosed again.
+
+- [x] **Host memory pressure can silently invalidate any 35B measurement on this box, and did.**
+      Guarded everywhere as of 2026-09-09; the mechanism below is unchanged and still worth reading.
       `vmmemWSL` holds up to **27 GiB of the 64 GiB** of host RAM while WSL is running, and the 35B
       artifact is 22.8 GB — so loading it contends directly with WSL's footprint, the machine pages,
       and timings become noise. A first attempt at the pipeline-depth sweep was abandoned for
       exactly this. `wsl --shutdown` reclaims it.
 
-      `scripts/sweeps/moe-prefill-pipeline-depth.ps1` now refuses to start below 24 GiB free, and
-      **every other sweep here should grow the same guard** — none of them currently checks, and a
-      paging run produces plausible-looking numbers rather than an error. Related: this box's C:
+      **Every sweep now carries the guard**, factored into `scripts/sweeps/host-memory.ps1`
+      alongside `model-dir.ps1` and dot-sourced by all twelve scripts that load a model
+      (`decode-roofline.ps1` is exempt: it reads CSVs and never touches the GPU).
+
+      The requirement is **sized from the artifact** rather than fixed, because a 27B-only sweep
+      does not need what a 35B one does and refusing it at 20 GiB free would be a false alarm. The
+      headroom term is the one that was actually validated: the original hand-written guard demanded
+      24 GiB for the 21.22 GiB 35B artifact, i.e. 2.8 GiB above the file, so keeping that constant
+      reproduces the old threshold *exactly* on the 35B and scales it everywhere else. Measured:
+      19.8 GiB for the 27B, 21.8 for the 27B DFlash2, 24.0 for anything touching the 35B.
+
+      **`admin-profile.ps1` asks for 28.0 GiB, and that is not padding.** `ncu`'s default kernel
+      replay saves and restores the device memory a kernel could touch; with 21 GB of weights
+      resident there is no room on the card, so it spills the backup to *host* RAM — ~42 GB
+      alongside the artifact's own footprint, which does not fit beside `vmmemWSL`. It fails as
+      `==WARNING== Backing up device memory in system memory` followed by
+      `Unhandled C++ exception: bad allocation` and an **empty report**, which reads like an `ncu`
+      bug and is not one. Hit on the first run of this cycle. `--replay-mode application` re-runs
+      the application once per pass and needs no backup at all; it is now that script's default,
+      with `-ReplayMode kernel` available for a model small enough that the backup fits on the card.
+
+      `NINFER_SKIP_MEMORY_GUARD=1` overrides the check, for someone whose box is not this one. Related: this box's C:
       drive sits at 98% full (45 GB free) and hit *zero* bytes earlier in the cycle, which failed a
       build with `C1085 ... No space left on device`. Two artifacts were byte-identical duplicates
       (19 GB recovered) and WSL crash dumps held another 12 GB.
@@ -1512,8 +2955,62 @@ ceiling, and neither has had any optimisation attempted.
       safe. Single-shot end-to-end figures taken during the same window are the ones to treat as
       provisional and re-run under the guard.
 
-- [ ] **Every route boundary in the repository was decided on cold-flush margins, which overstate
-      the win.** `bench/ops/schedule_sweep.cuh` and its siblings call `measure_cold_launch`, which
+- [x] **Every route boundary in the repository was decided on cold-flush margins, which overstate
+      the win — and there is now a number for how much. Closed 2026-09-09.**
+
+      Two boundaries of the same Op were taken from the cold bench to a paired, clock-locked,
+      end-to-end A/B with a drift control (§2c's split4 entry has the full tables):
+
+      | boundary | cold margin | in situ | positive |
+      |---|---:|---:|---:|
+      | GDN input width 7, split4 over c8 | **+5.9%** | **−0.78%** | 0 / 6 |
+      | GDN input width 8, split4 over c8 | **+13.2%** | **+2.85%** | 6 / 6 |
+
+      So on this Op the cold bench overstated by 4-5x, and **at width 7 it overstated enough to
+      invert the sign** — on a margin that would previously have been called comfortable.
+
+      **Then a third boundary was checked and it went the other way, which kills the tidy rule.**
+      `q5_linear_add`'s `{2,10}`/`{11,16}` crossover was chosen on an 8% cold margin at T=10
+      (split2 93.2 µs against c16 101.4). Re-measured in situ 2026-09-10 — DFlash2 at
+      `--draft-tokens 9`, whose k+1 verification width is exactly T=10, against draft count 4 as a
+      control, six paired repetitions, clocks locked. Moving the boundary so c16 takes T=10 is
+      **−13.59%, 0 of 6 pairs positive, control +0.00%.** The shipped boundary is right, and the
+      in-situ margin is **1.7x larger** than the cold one rather than smaller:
+
+      | boundary | cold | in situ | outcome |
+      |---|---:|---:|---|
+      | GDN input width 7, split4 over c8 | +5.9% | **−0.78%** | sign inverted |
+      | GDN input width 8, split4 over c8 | +13.2% | +2.85% | survived, 4.6x smaller |
+      | `q5_linear_add` T=10, split2 over c16 | +8.0% | **+13.59%** | survived, **1.7x larger** |
+
+      **So "cold overstates by 4-5x" was an overreach from one Op, and the honest rule is the one
+      this entry started with: a narrow cold-flush margin is a reason to check, not a predictor of
+      anything — including its direction.** The flush penalises whichever schedule makes more weight
+      passes, so which way it biases depends on the pair being compared, not on the margin's size. A
+      threshold on the margin alone cannot work; what the margin buys you is a priority order for
+      which boundaries to re-measure.
+
+      The method is now cheap enough that there is no excuse for skipping it —
+      `tools/bench/run_interleaved_ab.py` plus `nvidia-smi -lgc 1500` produced control drift of
+      **0.00-0.09%**, which is two orders of magnitude better than the 3-5% that forced all the
+      hand-rolled interleaving in this file. Use it on any boundary whose cold margin is in single
+      digits, and do not re-derive the "cold is the honest default" argument: cold is right for a
+      first pass, it is just not a decision.
+
+- [x] **One of the two narrow boundaries is checked and correct; the other is still owed.**
+      The `{2,10}`/`{11,16}` q5 crossover at T=10 was re-measured in situ and the shipped choice
+      wins by **13.59%** — see the table above. So it was never "presumed unsafe"; it is simply
+      right, and by a wider margin in production than the bench suggested.
+
+      Still owed: the q4 SwiGLU `{2,24}`/`{25,40}` crossover at T=25 (464.9 vs 436.2 cold, 6%). The
+      method is now routine — find a workload that lands on the width, move the boundary one step,
+      A/B the two builds with a control that stays inside both arms. The obstacle is the workload:
+      TODO's q4-SwiGLU entry records that **every full prefill chunk goes to the integer-activation
+      kernel and never reaches this table**, so T=25 is hit only by decode widths and a prompt's
+      ragged tail chunk, and finding a repeatable driver for exactly 25 columns is the work.
+
+- [x] **The mechanism, kept because it is the reasoning behind the threshold above.**
+      `bench/ops/schedule_sweep.cuh` and its siblings call `measure_cold_launch`, which
       flushes 256 MiB through L2 before every repetition. That is the right default — these
       projections stream tens of MB against 6 MB of L2 and production is usually cold — but it is
       not the same as in situ, and the gap is not small. Measured on the q4 SwiGLU `{513,640}`
@@ -1622,7 +3119,55 @@ ceiling, and neither has had any optimisation attempted.
       second copy is shadowing it and whether the failure is a permission. Neither of the two
       things this entry called broken was broken.
 
-- [ ] **The perplexity harness drifts 0.019% from the published figures and nobody knows why.**
+- [x] **The perplexity harness's 0.019% drift is two commits, both now named.** `f3f6c724` turned
+      the int8-activation prefill route on by default (−0.0092%) and `1c12516e`, the upstream
+      catch-up, did the rest (−0.0101%). Eight measurements, 2026-09-10. The original entry follows,
+      because the eliminations in it are what made eight measurements enough.
+
+      **Transition 1 = `f3f6c724`, "register the integer-activation route as
+      `LinearPolicy::AllowA8Int`".** The mechanism is not a guess — the bracket lands on exactly the
+      commit whose diff removes the opt-in:
+
+      | commit | | perplexity |
+      |---|---|---:|
+      | `9d84659c` | before the cluster | 4.34326255065906 |
+      | `4f0be008` | A8 route present, still env-gated | 4.34326255065906 |
+      | **`f3f6c724`** | **env gate removed** | **4.34286437475351** |
+      | `c41b29dd` | follow-up fix | 4.34286437475351 |
+
+      `0b0b098d` had added the route behind `NINFER_W4A8_PREFILL=1`, off by default, and `4f0be008`
+      extended it — both measure the old value to twelve figures, which is the env gate being
+      provably inert. `f3f6c724` deletes `q4a8_swiglu_enabled()` and makes `Q4G64_F16S` and
+      `Q5G64_F16S` return `AllowA8Int` unconditionally under `NINFER_SM8X_COMPAT`. So the drift is
+      **int8 activations on the 27B MLP prefill GEMMs**, which the commit itself documents as "0.9%
+      relative L2 on that projection ... for about twice the prefill GEMM rate".
+
+      **And the sign is the point.** Perplexity went *down*, 4.343263 → 4.342864. Quantizing
+      activations to int8 did not improve the model; a 0.9% relative perturbation moves the fifth
+      decimal, and which way it moves is a coin flip. That is the honest reading of every number in
+      this range, and it is why the drift is a **floor on comparison, not a regression**: any change
+      that perturbs the prefill GEMMs at the 1%-relative level can move perplexity by ~0.01%
+      in either direction.
+
+      **Transition 2 = `1c12516e`, the upstream catch-up (#16)**, pinned by the table further down.
+      Its sub-mechanism is the one thing still open, and it is narrow: `rmsnorm.cuh`'s new `FixedD`
+      template parameter, which makes the reduction trip count a compile-time constant and lets the
+      compiler re-associate the sum-of-squares. Two other suspects are eliminated by proof, not by
+      elimination-of-the-rest — the int8 KV codec refactor is bit-identical by arithmetic, and route
+      boundaries cannot move perplexity at all. Confirming `FixedD` is one build with the
+      specializations forced off, and it is the only loose end.
+
+      **What this buys.** Perplexity comparisons in this repository now have a known floor and a
+      known cause. `k8v4`'s −0.008% from #49, reported as "no change" because it sat under the
+      drift, sits under a drift that is now explained — and the standing rule is that a quality
+      claim smaller than ~0.01% needs the same build on both sides, not just the same corpus.
+
+      ---
+
+      **Everything below is the original entry, kept because its eliminations are what made eight
+      measurements enough. Read it as history: the drift is no longer unexplained.**
+
+      **The perplexity harness drifts 0.019% from the published figures and nobody knew why.**
       Re-measuring all six KV formats (#63) moved the three formats #49 does not touch by
       -0.009% to -0.019%: `int8` 4.343263 to 4.342425, `bf16` 4.343225 to 4.342517, `rk8v4`
       4.346811 to 4.346413. Same corpus, same window, same 261,167 scored tokens, and those code
@@ -1633,6 +3178,14 @@ ceiling, and neither has had any optimisation attempted.
       every perplexity comparison in this repository, and `k8v4`'s -0.008% "improvement" from #49
       sits underneath it and was reported as no change for that reason. Bisecting it would make
       future quality claims sharper by an order of magnitude.
+
+      **The six speedups shipped 2026-09-09/10 do not move it, which is worth having on record.**
+      `int8` at the head of `perf/gdn-split4-width8` scores **4.342425372232802** on 261,167 tokens
+      — identical to the 4.342425 recorded below, to every figure quoted. That includes the q5 GEMV
+      dequant change, which **reorders float accumulation** by hoisting the group scale out of the
+      inner loop; the claim made for it was "it rounds less, not more", and this is that claim
+      measured rather than argued. So the whole batch is quality-neutral, and §3's "tile geometry
+      does not perturb perplexity" now extends to accumulation order within a group.
 
       **Three candidates eliminated 2026-09-09, and the current value is exactly reproducible.**
       `int8` re-runs to **4.342425** at HEAD — identical to twelve significant figures, on 261,167
@@ -1660,21 +3213,252 @@ ceiling, and neither has had any optimisation attempted.
       need not be treated as a quality risk.
 
       What is left is a genuine numerics change in some kernel between 29 August and 9 September.
-      The range is **392 commits**, which includes the whole upstream catch-up, so a bisect is
-      about nine steps at roughly 20-30 minutes each — one build plus one 8-minute
-      `ninfer-perplexity` run — call it four hours of exclusive GPU time. Worth scheduling as a
-      block rather than squeezing between other work. Note the three shifts are *not* uniform
-      (−0.0193%, −0.0163%, −0.0092% for `int8`, `bf16`, `rk8v4`), so whatever it is does not simply
-      offset every score by a constant.
+      Note the three shifts are *not* uniform (−0.0193%, −0.0163%, −0.0092% for `int8`, `bf16`,
+      `rk8v4`), so whatever it is does not simply offset every score by a constant.
 
-- [ ] **`27b_load_plan` skips its DFlash2 binding matrix** for want of the *old* Qwen3.8 artifacts
-      (`NINFER_QWEN3_8_27B_OLD_WEIGHTS`, `NINFER_QWEN3_8_27B_NVFP4_OLD_WEIGHTS`) and the NVFP4
-      DFlash2 artifact. Everything else in that test now runs and passes (#46). This is the last
-      real coverage gap in the real-model suite and it is an artifact problem, not a defect —
-      check whether upstream still publishes those revisions before treating it as out of reach,
-      which is the move that closed both §2 artifact entries last cycle.
+      **The bisect was started 2026-09-10 and it has already falsified this entry's central
+      assumption, which is that there is one change to find.** There are at least two. Measured
+      endpoints and the first interior point, all `int8`, all 261,167 scored tokens:
 
-- [ ] **DFlash2 corpus numbers on sm_86 — re-scoped, because the obvious way to get them is void.**
+      | commit | date | perplexity |
+      |---|---|---:|
+      | `838c8b5d` (old, `git bisect good`) | 2026-08-29 | 4.343262550659062 |
+      | `66378f06` | 2026-09-03 | **4.342864374753507** |
+      | `HEAD` (new, `git bisect bad`) | 2026-09-10 | 4.342425372232802 |
+
+      `66378f06` is a **third value**, not either endpoint, so the interval contains two distinct
+      transitions: `838c8b5d → 66378f06` is −0.0092% and `66378f06 → HEAD` is −0.0101%. They sum
+      to −0.0193%, which is exactly the total `int8` drift recorded above — so this is not a third
+      measurement wobbling around one step, it is two steps of almost equal size that happen to add
+      up to the published gap. **A plain `git bisect` cannot find two transitions**; it will converge
+      on whichever one it happens to bracket and report it as the cause, and the next person will
+      then be unable to reproduce the full 0.019% from that one commit. Each half has to be bisected
+      separately.
+
+      **`--first-parent` is right for the later half and WRONG for the earlier half, and an earlier
+      version of this entry said to use it for both.** For the later half it is right: the naive walk
+      descends into the upstream catch-up branch, where the code predates the sm_86 port and
+      `00f02055` refuses outright with *"NInfer supports only CMAKE_CUDA_ARCHITECTURES=120a; got
+      '86'"*. Those commits cannot be built on this card at all — not `skip`-able noise, a region the
+      bisect must not enter — and restricting to first-parent both avoids them and cuts 477 commits
+      to **96**, at the right granularity: a merge names the PR that moved the number.
+
+      **For the earlier half it walks off the path entirely, because `838c8b5d` is not on the
+      first-parent chain.** `838c8b5d` is a commit *inside* the `feat/w4a8-prefill` branch, and
+      master at that moment did not have the perplexity harness at all. Proof, in the order that
+      makes it obvious:
+
+          git merge-base --is-ancestor 838c8b5d 12ca6cbd    # false
+          git merge-base --is-ancestor 838c8b5d b4ca75a9^2  # true  -- the merged branch
+          git ls-tree -r --name-only 12ca6cbd | grep perplex # nothing at all
+
+      So `838c8b5d` enters `b4ca75a9` through its **second** parent. `git rev-list --first-parent
+      838c8b5d..b4ca75a9` therefore lists master-line commits that are not on any path from
+      `838c8b5d`, and the bisect walked straight onto one: at `12ca6cbd` the build dies with
+      **`ninja: error: unknown target 'ninfer-perplexity'`** because the harness does not exist
+      there. That is not a broken commit to `skip`; it is a commit the range should never have
+      contained.
+
+      **The rule, which is worth more than either bisect.** Before trusting any range, check that
+      the good commit is actually an ancestor along the chain you intend to walk, and check the thing
+      you are measuring exists at the candidate:
+
+          git merge-base --is-ancestor <good> <candidate>
+          git show <candidate>:apps/CMakeLists.txt | grep ninfer-perplexity
+
+      **And do not read commit order off `--date=short`, which prints the *author* date.**
+      `838c8b5d` is authored 2026-08-29 and committed 2026-09-01. Every apparent date inversion in
+      this range is that, and it is what made the first-parent list look plausible.
+
+      The real earlier-half range is `838c8b5d..b4ca75a9` following the actual DAG: **34 commits**,
+      all of them ours and all sm_86-capable.
+
+      **Build only the target you run.** `cmake --build build-ninja` builds the test binaries too,
+      and at `de5fc15a` `tests/ops/softmax_attention/causal_cache.cpp` fails to compile under MSVC
+      (`error C3493: 'order' cannot be implicitly captured`) for reasons that have nothing to do
+      with perplexity. Passing `--target ninfer-perplexity` avoids skipping a perfectly measurable
+      commit, and cuts each step's build time as well. `scripts/sweeps/ppl-bisect-step.ps1` does
+      this.
+
+      **A commit that does not touch `src/`, `include/` or `apps/` cannot move the number, so filter
+      before you measure.** Of the 25 first-parent commits in the later half, 16 are scripts, docs or
+      release commits and 6 more touch only `src/serve` (which `ninfer-perplexity` does not link),
+      `src/core/nvtx.h` or a chat template. That leaves 3 real candidates out of 25. In the earlier
+      half it is starker: 34 commits, of which the entire W4A8 prototype series is `src=0`. The
+      filter is one line and it turned a 5-step bisect into a 2-step one:
+
+      ```
+      git log --first-parent --format='%h|%s' A..B | while IFS='|' read h s; do
+        printf '%s src=%s %s
+' "$h" "$(git diff --name-only $h^ $h -- 'src/*' 'include/*' 'apps/*' | wc -l)" "$s"
+      done
+      ```
+
+      **Transition 2 is `1c12516e`, "Upstream catch-up: DFlash2 unblocked, measured sm_86 route
+      boundaries, upstream small-T adopted (#16)" — pinned to one commit, −0.0101%.** Measured
+      2026-09-10, all `int8`, all 261,167 scored tokens:
+
+      | commit | date | perplexity | |
+      |---|---|---:|---|
+      | `64403ada` dual-GPU graph mode (#15) | 2026-09-07 | 4.34286437475351 | mid |
+      | `1c12516e` upstream catch-up (#16) | 2026-09-08 | **4.3424253722328** | **new** |
+      | `de5fc15a` (#34) | 2026-09-08 | 4.3424253722328 | new |
+
+      `1c12516e`'s first parent *is* `64403ada`, so there is nothing between them: the transition is
+      that merge. Note `64403ada` rewrote 47 source files including every dense causal-cache
+      attention kernel and moved the score **not at all** — more evidence for §3's finding that
+      kernel and tile refactors do not perturb perplexity.
+
+      **The mechanism inside `1c12516e` is not yet isolated, and two of the three obvious suspects
+      are already ruled out by reading.** 153 files under `src/ops/` changed. Of them:
+
+      - **`src/ops/kv_cache/int8_g64_codec.cuh` is not it**, despite being the int8 KV codec. The
+        change is a pure addition (42 lines, 0 deletions) of f16 loaders, and
+        `prompt_i8.cuh` switching to them is provably bit-identical: the old form multiplied an
+        int8 code by an f16 scale in `half2`, the new form in FP32 before a single rounding, and an
+        8-bit code times an 11-bit scale needs 19 bits, exact in FP32's 24. Both round exactly once
+        to the same value. Upstream also verified it empirically, byte-identical `OP_ERROR_STATS`.
+      - **The route-boundary half of the commit is not it either**, by §3's own tile-geometry
+        result above.
+      - **`src/ops/kernel/rmsnorm.cuh` is the leading candidate.** It gained a `FixedD` template
+        parameter that replaces the runtime `d` with a compile-time constant. No arithmetic was
+        edited — but a constant trip count is exactly what lets the compiler fully unroll and
+        **re-associate the sum-of-squares reduction**, which changes rounding. RMSNorm runs on every
+        layer of every token, and it is format-independent, which is the only kind of mechanism that
+        can explain `bf16` KV moving (−0.0163%) alongside `int8` and `rk8v4`. Confirm it by
+        building `1c12516e` with the `FixedD` specializations forced off and re-scoring.
+
+      **Transition 1 is at or before `b4ca75a9`, and it is one of two clusters.** Both `04e22c3f`
+      (2026-09-04, upstream catch-up) and `b4ca75a9` (`feat/w4a8-prefill`) already read
+      4.34286437475351, the mid value, and `838c8b5d` *is* a genuine ancestor of `b4ca75a9`, so the
+      bracket is sound even though the first-parent list was not. Walking the real 34-commit range
+      with the source filter leaves two candidate clusters and nothing else:
+
+      1. **The integer-activation prefill route for the 27B MLP** — `0b0b098d` (opt-in for
+         `gate_up`), `4f0be008` (extended to `mlp/down`), `f3f6c724` (registered as
+         `LinearPolicy::AllowA8Int`), `c41b29dd` (keyed on registered shapes). This quantizes
+         *activations* to int8 on the prefill MLP GEMMs, which is the harness's hot path on every
+         one of its 124 windows. The accuracy claim made for it was **"accuracy-neutral"** and
+         pinned against a relative error — which is exactly the claim that permits a −0.0092%
+         perplexity move without anyone noticing. This is the a priori favourite.
+      2. **`91e78ab1`, "keep the sm_86 W8 linear_add single-column tail on a K-correct kernel"** —
+         and this one is not a tuning change, it is a **fixed out-of-bounds read**. On sm_86 both W8
+         `linear_add` split-K launchers hand a leftover single column to a kernel that bakes
+         `kDecodeK = 6144`; on the `K = 4096` shape that tail *read 2,048 BF16 past the end of `x`
+         and indexed the weights with the wrong row stride*. Fixing it necessarily changes results,
+         and being sm_86-only it explains why our numbers moved when upstream's published ones did
+         not.
+
+      **The branch name is misleading, and the source filter is what shows it.** Every W4A8 GEMM
+      commit in that branch — `dbdf207e`, `90af65cd`, `9d84659c` and the rest — is `src=0`: they are
+      prototypes under `tools/`, and none of that code reached the engine. So "the W4A8 prefill
+      merge" did not put W4A8 in the prefill path. What it actually shipped into `src/` was the A8
+      *activation* route and the `linear_add` tail fix.
+
+      **`c41b29dd` measures 4.34286437475351, the mid value — which eliminates the out-of-bounds
+      fix.** `91e78ab1` is *newer* than `c41b29dd`, so the transition had already happened by then.
+      That is worth stating plainly because `91e78ab1` was the more alarming of the two candidates:
+      a kernel reading 2,048 BF16 past the end of its input is a real defect, it was really there,
+      and it is really fixed — but **it is not what moved perplexity**, and the 27B scoring path
+      evidently never hit the `K = 4096` single-column tail.
+
+      **So transition 1 is at or before `c41b29dd`, and the next test is `9d84659c`** — the commit
+      immediately preceding the A8 cluster. Everything between it and the cluster is `src=0`, so it
+      splits the remaining candidates cleanly:
+
+      | `9d84659c` reads | conclusion |
+      |---|---|
+      | old (4.343263) | the A8 activation route is the cause — one of `0b0b098d`, `4f0be008`, `f3f6c724`, `c41b29dd` |
+      | mid (4.342864) | the cause is earlier, and the only real candidate left is **`2ba10da2`, "perf(kv): give rk8v4 values a 32-value group"** (`src=12`) |
+
+      That second branch would be a surprise worth chasing: `2ba10da2` is an *rk8v4* change and we
+      are measuring *int8*, so it could only move this number by touching shared codec code. Note
+      the arithmetic coincidence that makes it plausible anyway — transition 1 is −0.0092% and
+      **rk8v4’s entire recorded drift is also −0.0092%**. If `2ba10da2` turns out to be the
+      commit, that is one change explaining both, and the non-uniformity this entry opens with stops
+      being mysterious.
+
+      **A warning for whoever runs those two.** `scripts/sweeps/ppl-bisect-step.ps1` classifies
+      against a single threshold, which is correct for transition 2 (mid and old both count as
+      "good") and **wrong for transition 1**, where the two values to separate are 4.343263 and
+      4.342864 and the printed verdict line will say "OLD" for both. Read the printed perplexity,
+      not the verdict.
+
+- [ ] **`27b_load_plan`'s DFlash2 binding matrix needs four artifacts. Two are on this disk today
+      — one of them misidentified all along — and the other two were never published.** Checked
+      upstream 2026-09-10, which is what this entry told the next person to do.
+
+      `huggingface.co/neroued/Qwen3.8-27B-NInfer` has four commits and has only ever published one
+      `.ninfer` file:
+
+      | commit | date | |
+      |---|---|---|
+      | `dc370fb6295a` | 2026-09-06 | Update artifact with DFlash2 companion weights |
+      | `18dfc887423f` | 2026-08-19 | docs(eval): publish qwen3.8 groupwise-int results |
+      | `3526913004b1` | 2026-08-14 | Add Qwen3.8-27B NInfer artifact |
+      | `6925b5541b49` | 2026-08-06 | initial commit |
+
+      **`qwen3_8_27b_nvfp4.ninfer` returns 404 at the pinned revision and appears in no commit's
+      file list.** So the two NVFP4 artifacts are not "deleted", they were never published, and no
+      amount of revision archaeology will produce them.
+
+      **The two groupwise ones are both here.** `qwen3_8_27b.ninfer` at the pre-DFlash2 revision
+      `18dfc887` is 18,210,531,328 bytes with SHA-256
+      `eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e` — **byte-identical to
+      `models/qwen3_8_27b.ninfer` on this box**, hash verified, not inferred from the size. So the
+      artifact this entry has been calling missing has been sitting in `models/` the whole time
+      under its plain name, because `dc370fb6` later *replaced* the same filename upstream with the
+      DFlash2 build, which is our `qwen3_8_27b_dflash2.ninfer`. That is the second time this cycle
+      an artifact was "missing" only from the env block; see the note under "Environment for the
+      real-model tests".
+
+      | the matrix wants | status |
+      |---|---|
+      | `NINFER_QWEN3_8_27B_OLD_WEIGHTS` | **have it** — `models/qwen3_8_27b.ninfer`, SHA-verified as rev `18dfc887` |
+      | `NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS` | **have it** — `models/qwen3_8_27b_dflash2.ninfer` |
+      | `NINFER_QWEN3_8_27B_NVFP4_OLD_WEIGHTS` | **never published** |
+      | `NINFER_QWEN3_8_27B_NVFP4_DFLASH2_WEIGHTS` | **never published** |
+
+      So this is no longer "artifacts nobody has". It is **half a matrix that can run once the env
+      block names the old artifact**, and a second half that would have to be **converted locally**
+      — `tests/convert/qwen3_8_27b/test_nvfp4_inventory.py` says a Qwen3.8 NVFP4 recipe exists in
+      this repo, so that is a conversion job rather than a download, and it needs the source
+      weights and disk for two more ~18 GB artifacts.
+
+      **Worth weighing against §1 before doing it:** NVFP4 weights cannot be loaded on sm_86 at all,
+      so a locally converted Qwen3.8 NVFP4 artifact would exercise the binding matrix's *planning*
+      path and nothing else on this card.
+
+      *Fixing the env block is the free half and is done below.*
+
+- [x] **DFlash2 acceptance on realistic text — measured 2026-09-09, and it is nothing like the
+      committed corpus's answer.** `scripts/sweeps/dflash2-draft-tokens-realtext.ps1` now parses the
+      acceptance metrics the CLI has always printed, so this needed no new instrument and no local
+      tokenizer. 27B DFlash2 artifact, INT8 KV, greedy, 256 generated tokens on the model's own
+      prose, medians of three:
+
+      | k | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 10 | 12 |
+      |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+      | acceptance % | **80.9** | 67.6 | 51.7 | 49.1 | 42.1 | 33.1 | 28.2 | 31.0 | 23.2 | **19.5** |
+      | tok/round | 1.81 | 2.35 | 2.55 | 2.95 | 3.07 | 2.97 | 2.93 | 3.45 | 3.27 | 3.27 |
+      | decode tok/s | 47.3 | 55.2 | **58.6** | 58.3 | 57.2 | 51.0 | 50.5 | 47.5 | 39.7 | 39.3 |
+
+      **Acceptance falls from 80.9% to 19.5% as the draft window widens**, monotonically except at
+      k=7 -> 8, where it rises 28.2% -> 31.0% before resuming the decline. That is the shape a draft
+      head on real prose should have and is the opposite of the committed corpus's flat 100% at
+      every count. So `bench_corpus.ids` was not merely optimistic, it was reporting
+      the fixture; these are the numbers to quote.
+
+      **Tokens-per-round plateaus around 3.0 from k=4**, which is the real justification for
+      recommending four: everything past it buys ~0.1 tokens per round for a wider verification
+      pass. Throughput peaks at k=3-4 (58.6 / 58.3), consistent with the recommendation in
+      `docs/cli.md`.
+
+      MTP3 reaches 58.3 tok/s at **56.0%** acceptance and 2.67 tok/round, and `mtp3 --lm-head-draft`
+      is the fastest configuration measured at **62.9 tok/s**. `--lm-head-draft` remains within noise
+      for DFlash2 at every count, as previously recorded.
+
+- [x] **DFlash2 corpus numbers on sm_86 — the throughput half, kept for the reasoning.**
       Only single-prompt smoke numbers exist (text 20.0% / 2.38 tok-per-round, vision 85.7% /
       7.00). `docs/performance.md` deliberately does not reproduce upstream's tables because they
       are sm_120 — see the provenance banner there.
@@ -1690,12 +3474,48 @@ ceiling, and neither has had any optimisation attempted.
       pg19 prose sitting right there, though it needs a local HF tokenizer that this box does not
       have — or extend the real-text sweep to report acceptance. Vision acceptance is unaffected by
       any of this: it is measured on the committed image fixture, not the token corpus.
-- [ ] **Speculative decoding is not bit-identical to greedy**, and it is not clear it should be.
-      DFlash2 and MTP produce byte-identical output *to each other* and both diverge from the
-      width-1 greedy path about a hundred tokens into the text fixture. Verification evaluates k+1
-      columns in one pass where plain decode evaluates one, so reductions run in a different order
-      and a near-tie argmax flips. MTP reproduces it exactly, so it predates the merge — but nobody
-      has decided whether that is acceptable or worth pinning down.
+- [x] **Speculative decoding is not bit-identical to greedy, it should not be required to be, and
+      the premise this entry rested on is false. Decided 2026-09-09, with evidence.**
+
+      The entry said "DFlash2 and MTP produce byte-identical output *to each other*". **They do
+      not.** Hashing every run's generated text across 23 configurations x 3 repetitions:
+
+      | | |
+      |---|---|
+      | every configuration self-deterministic | **yes — 23 of 23, one hash across three runs each** |
+      | `none` (width-1 greedy) | its own unique hash, matched by nothing |
+      | `mtp3` / `mtp3+head` | one hash, distinct from **every** DFlash2 configuration |
+      | DFlash2 across draft counts | **8 distinct hashes** over k = 1..12 |
+
+      So the divergence is real, but it is not one divergence: output depends on the backend *and*
+      on the draft count. "Bit-identical to greedy" was never a single target — there are eight
+      different DFlash2 outputs to choose between before the question even reaches MTP.
+
+      **The decision: no, and it is architecturally incompatible with the feature.** The speedup is
+      that verification evaluates k+1 columns in one pass. That pass's reduction order for the
+      accepted column is not the width-1 GEMV's, and the only way to make it so is to compute the
+      accepted column with the width-1 kernel on every round — which is exactly the work
+      speculation exists to avoid. Requiring bit-identity would mean pinning one reduction order
+      across every verification width, a far stronger constraint than "lossless".
+
+      **And this class of difference is already measured to be quality-neutral in this repository.**
+      §3's perplexity entry swapped `q5_linear_add` from `MmaResidualR64C128` to `R64C64` — a
+      genuinely different MMA tile and reduction order, confirmed by a 6% change in score rate —
+      and perplexity came back **bit-identical at 4.342425 to twelve significant figures**. So a
+      changed reduction order does not move quality; it flips an argmax only at a near-tie, where
+      the two candidates are by construction near-equally probable.
+
+      **What should be guaranteed instead, and now is:**
+
+      1. **self-determinism** — a configuration reproduces its own output run to run. Measured
+         above, 23 of 23. This is the property that actually matters for reproducing a bug report,
+         and until now nobody had checked it.
+      2. **quality parity** — unaffected by reduction order, per the perplexity result.
+      3. **documented divergence** — `docs/performance.md` says so, and now says it correctly.
+
+      A test asserting bit-identity to greedy would fail permanently by design, which is worse than
+      no test. A test asserting self-determinism and cross-run stability would be worth having, and
+      `dflash2-draft-tokens-realtext.ps1`'s `content_sha256` column is the mechanism for it.
 - [x] **q4 SwiGLU `{513,640}` settled: it goes to c128, and the alternation is gone.** The band
       stayed on `Materialized` because the measurement could not separate the two — over four runs
       Materialized won T=576 three times, while c128 there ranged 4147–4959 µs (19.6% spread) and
@@ -2119,8 +3939,45 @@ Three consequences worth internalising before quoting any number in this file:
 Also worth someone's attention: 315 W is 90% of this card's default TDP. Decode is memory-bound and
 the memory clock is not throttling, so the cost may be small — but it has never been measured.
 `nvidia-smi -pl 350` and a re-run of `kv-decode-vs-depth.ps1` would answer it, and
-`nvidia-smi -lgc <clock>` would collapse the 3–5% spread for measurement runs. Both need
-elevation.
+`nvidia-smi -lgc <clock>` would collapse the 3–5% spread for measurement runs. Both need elevation.
+
+**Both are also persistent changes to the machine, so read the next section first.** The 315 W cap
+is this host's own setting, not a default and not ours to keep: if you raise it to measure, restore
+it to **315** in a `finally`, and never leave a session having changed it.
+
+### Leave this card as you found it
+
+Every `nvidia-smi` write is a change to hardware someone else is using, and it survives the process
+that made it. **This file recommended an unpaired `nvidia-smi -lgc 1500` in seven places and never
+once mentioned `-rgc`**, which is how a measurement convenience becomes a machine left clocked at
+1500 MHz. Two rules, and they are not negotiable:
+
+- **Pair every write with its restore, in a `finally` or `trap`, so an error or a Ctrl-C still
+  restores it.** `-lgc <n>` pairs with `-rgc`. `-pl <n>` pairs with `-pl 315` on this box — check
+  `nvidia-smi --query-gpu=power.limit --format=csv` first and restore what you actually found, not
+  what this file says.
+- **Verify afterwards, because a failed restore is silent — and verify it the right way, because
+  `-lgc` is invisible to every `nvidia-smi` report field on this driver.** Checked 2026-09-10 with
+  a lock actually held: `nvidia-smi -q -d PERFORMANCE` still said
+  `Applications Clocks Setting : Not Active`, no other Clocks Event Reason flipped, and
+  `--query-gpu=clocks.applications.graphics` answered *"Requested functionality has been
+  deprecated"*. That field tracks `-ac`-style **applications** clocks, not a `-lgc` **lock**, so
+  reading it as an all-clear is how a stale lock goes unnoticed for days.
+
+  The only signature is behavioural: **an idle GPU with locked clocks sits at the locked floor
+  instead of dropping to idle.**
+
+      nvidia-smi --query-gpu=clocks.sm,clocks.max.sm --format=csv,noheader
+
+  A few seconds after the last kernel, a clean RTX 3090 reads about **210 MHz** against a 2100 MHz
+  maximum. If it sits pinned near the value you locked (1395–1500 MHz), the lock is still on — run
+  `nvidia-smi -rgc`. For the power limit, `--query-gpu=power.limit` *is* reliable: compare it to
+  what you recorded before you started.
+
+`scripts/sweeps/admin-profile.ps1` is the worked example: it locks, profiles, and restores in a
+`finally`, and it takes `-SkipPower` so a profiling run never has to touch the power limit at all.
+Prefer `-SkipPower` — the power question above is interesting, but it is not worth a persistent
+change on someone's workstation to answer as a side effect of something else.
 
 ---
 
@@ -2201,6 +4058,14 @@ background job that session had started itself and then rebased underneath. Two 
 **Check the build's exit code separately from the test's.** The stale-binary trap is silent: the
 build fails, the test runs the *previous* binary, and reports a pass. Every "verified" claim in this
 file was checked that way after being caught out by it.
+
+**And delete the log before every build, because the trap has a second form that survives the
+first check.** If you write the exit code into a log — `cmake --build ... > build.log 2>&1` then
+`echo BUILD_EXIT=%ERRORLEVEL% >> build.log` — and the build is *killed* rather than failed, the
+line is never appended and the previous run's `BUILD_EXIT=0` is still sitting in the file. Checking
+the exit code then reads a success that belongs to a different build. This cost three separate
+false "verified" readings in one session before it was spotted. `rm -f build.log` first, every
+time, and treat a *missing* `BUILD_EXIT` line as a failure rather than as no news.
 
 **Never truncate a build pipeline.** `cmake --build ... | Select-Object -First N` returns while
 `ninja` keeps running detached, and the next build collides with it. Redirect the whole build to a

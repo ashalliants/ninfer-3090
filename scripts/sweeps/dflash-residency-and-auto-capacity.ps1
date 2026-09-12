@@ -6,18 +6,33 @@ Set-Location (Resolve-Path (Join-Path $PSScriptRoot '..\..'))
 # Both overridable so this is not welded to one machine. The output directory is created here
 # because it does not exist in a clean checkout -- profiles/ is gitignored.
 . "$PSScriptRoot\model-dir.ps1"
+. "$PSScriptRoot\host-memory.ps1"
 $modelDir = Get-NInferModelDir
 $out      = if ($env:NINFER_SWEEP_OUT) { $env:NINFER_SWEEP_OUT } else { 'profiles\sweeps' }
 New-Item -ItemType Directory -Force -Path $out | Out-Null
-
 $mdir = $modelDir
 
 # The loader rejects anything not named *.ninfer, which is why the first attempt at the DFlash
 # residency probe failed on the .pre-dflash.bak backup. Rename rather than copy: this artifact is
 # 20.84 GB and a copy would cost real disk for no reason. The new name is also clearer than a .bak
 # suffix about what the file actually is.
+#
+# Named before the guard, and $oldBak handed to it, because the rename happens after: on a box where
+# the backup is the only copy of the v1 artifact, a guard that measured $v1 alone would find nothing
+# measurable, print "guard skipped", and then this script would rename 20.84 GB into place and time
+# it under whatever pressure the host is under. The guard takes the largest artifact it can measure,
+# so listing both names covers the run whichever side of the rename the file is currently on.
 $oldBak = "$mdir\qwen3_6_35b_a3b.ninfer.pre-dflash.bak"
 $v1     = "$mdir\qwen3_6_35b_a3b_v1_no_dflash.ninfer"
+
+# Host memory pressure produces plausible numbers rather than an error, so it is guarded
+# rather than trusted -- see host-memory.ps1 for what goes wrong and why.
+Assert-NInferHostMemory -Artifacts @(
+    "$modelDir\qwen3_8_27b.ninfer",
+    "$modelDir\qwen3_6_35b_a3b.ninfer",
+    $v1,
+    $oldBak)
+
 if ((Test-Path $oldBak) -and -not (Test-Path $v1)) { Move-Item -LiteralPath $oldBak -Destination $v1 }
 "v1 artifact present: $(Test-Path $v1)"
 

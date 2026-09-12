@@ -15,10 +15,17 @@
 //   - Each warp does a warp-shuffle reduction and writes one bf16 output; there is
 //     no block barrier on the hot path.
 // A tile is 16 groups: 512 nibble bytes (32 uint4, one per lane), 128 high bytes
-// (8 uint4), 32 scale bytes (2 uint4). All weight reads are fully coalesced 128-bit
-// loads, so the kernel runs DRAM-bound instead of L1/LSU- or latency-bound.
+// (8 uint4), 32 scale bytes (2 uint4). All *global* weight reads are fully coalesced
+// 128-bit loads.
+//
+// That does NOT make the kernel DRAM-bound, which this comment used to claim. `ncu`
+// on the 27B decode measures DRAM throughput at 50.10% against L1/TEX at 86.60% and
+// Mem Pipes Busy at 81.04%: the limit is memory-pipe instruction issue, and it lives
+// in the shared-memory consume loop rather than in the staging. See the note on
+// q5_gemv_consume_tile for what that cost and how it was cut.
 
 #include "core/pdl.cuh"
+#include "ops/common/math.cuh" // bf16x2_bits_to_float2, for the widened consume loop
 #include "ops/common/math.h"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
@@ -61,22 +68,90 @@ __device__ __forceinline__ float q5_gemv_consume_tile(const __nv_bfloat162* __re
     constexpr int kGroupsPerTile       = 16;
     constexpr int kNibbleBytesPerGroup = 32;
     constexpr int kHighBytesPerGroup   = 8;
-    const auto* tn                     = reinterpret_cast<const std::uint8_t*>(s_nib);
+    // Eight weights per lane per step, not two, because this loop -- not the staging above -- is
+    // what the kernel is actually limited by.
+    //
+    // `ncu` on the 27B decode: DRAM throughput 50.10%, but **L1/TEX 86.60% and Mem Pipes Busy
+    // 81.04%**, with ncu's own note that the workload is over 80% of a pipe and work should be
+    // shifted off it. So the kernel is issue-bound on the memory pipe, not DRAM-bound (the file
+    // header used to claim the latter; it is wrong and now says so).
+    //
+    // The old shape read ONE code byte per lane per group and so spent four memory-pipe
+    // instructions to produce two weights: a 1-byte `tn`, a 1-byte `th`, a 2-byte broadcast `tsc`,
+    // and a 4-byte `x`. Sixteen groups per tile is 64 instructions on the consume side against
+    // three on the staging side, so consume outweighed staging roughly 20 to 1.
+    //
+    // Now each lane takes a 4-byte code word -- 8 nibbles, 8 weights -- so eight lanes cover a
+    // group's 32 code bytes and 32 lanes cover FOUR groups per step. Per step: one 4-byte `tn`,
+    // one 1-byte `th`, one 2-byte `tsc`, one 16-byte `x`. Four instructions per four groups
+    // against sixteen before: **a 4x cut in memory-pipe instructions for identical arithmetic.**
+    //
+    // The packing convention is unchanged and is this file's own, not another Op's: code byte b
+    // holds the weights at 2b (low nibble) and 2b+1 (high nibble), and high-plane byte h bit j
+    // carries bit 4 of the weight at 8h+j. Verified on the host that the (sub, pos) split covers
+    // all 1,024 weights of a tile exactly once.
+    //
+    // Bank behaviour is why this is free rather than a trade: the code index works out to
+    // `step * 32 + lane`, so lanes read consecutive 32-bit words and the access is
+    // conflict-free. `x` is likewise 16 consecutive bytes per lane.
+    const auto* tn32                   = reinterpret_cast<const std::uint32_t*>(s_nib);
     const auto* th                     = reinterpret_cast<const std::uint8_t*>(s_hi);
     const auto* tsc                    = reinterpret_cast<const std::uint16_t*>(s_sc);
     const int g0                       = tile * kGroupsPerTile;
+    constexpr int kWeightsPerLane      = 8;
+    constexpr int kLanesPerGroup       = kGroupK / kWeightsPerLane; // 8
+    constexpr int kGroupsPerStep       = 32 / kLanesPerGroup;       // 4
+    const int sub                      = lane / kLanesPerGroup;     // group within the step
+    const int pos                      = lane % kLanesPerGroup;     // 8-weight span in the group
 #pragma unroll
-    for (int tg = 0; tg < kGroupsPerTile; ++tg) {
-        const float scale       = __half2float(__ushort_as_half(tsc[tg]));
-        const std::uint8_t low  = tn[tg * kNibbleBytesPerGroup + lane];
-        const std::uint8_t high = th[tg * kHighBytesPerGroup + (lane >> 2)] >> ((lane & 3) * 2);
-        const int q0 = sign_extend<5>(static_cast<int>((low & 0x0fu) | ((high & 0x01u) << 4)));
-        const int q1 = sign_extend<5>(static_cast<int>((low >> 4) | ((high & 0x02u) << 3)));
+    for (int step = 0; step < kGroupsPerTile / kGroupsPerStep; ++step) {
+        const int tg             = step * kGroupsPerStep + sub;
+        const float scale        = __half2float(__ushort_as_half(tsc[tg]));
+        const std::uint32_t word = tn32[tg * (kNibbleBytesPerGroup / 4) + pos];
+        const std::uint32_t high = th[tg * kHighBytesPerGroup + pos];
 
-        const int k0    = (g0 + tg) * kGroupK + lane * 2;
-        const float2 xv = __bfloat1622float2(x2[k0 >> 1]);
-        acc             = fmaf(static_cast<float>(q0) * scale, xv.x, acc);
-        acc             = fmaf(static_cast<float>(q1) * scale, xv.y, acc);
+        const int k0    = (g0 + tg) * kGroupK + pos * kWeightsPerLane;
+        const uint4 xv  = load_vec<uint4>(reinterpret_cast<const uint4*>(x2 + (k0 >> 1)));
+        const float2 f0 = bf16x2_bits_to_float2(xv.x);
+        const float2 f1 = bf16x2_bits_to_float2(xv.y);
+        const float2 f2 = bf16x2_bits_to_float2(xv.z);
+        const float2 f3 = bf16x2_bits_to_float2(xv.w);
+        const float xs[kWeightsPerLane]{f0.x, f0.y, f1.x, f1.y, f2.x, f2.y, f3.x, f3.y};
+
+        // Dequantize two weights at a time through the half2 bit-trick, and apply the group scale
+        // ONCE for the whole group rather than once per weight.
+        //
+        // Both halves are about the arithmetic, because after the widening above this kernel is no
+        // longer memory-bound: `ncu` puts it at SM throughput 73.31% against DRAM 55.83%, so the
+        // per-weight unpacking is what is left.
+        //
+        // The trick is `Q5SimtDecodeAtom::decode_eight`'s, already used by
+        // q5_rowsplit_gemm_simt_split4_kernel, and it is exact rather than approximate. half
+        // 0x6400 is 1024.0, whose mantissa LSB at that exponent is exactly 1.0, so OR-ing a nibble
+        // into the mantissa *adds* it; inverting the high bit and subtracting 1040.0 then yields
+        // `nibble - 16 * high_bit`, which is precisely what `sign_extend<5>(nibble | high << 4)`
+        // computes. Verified on the host for all 32 five-bit codes. It replaces a per-weight
+        // sign-extend and int-to-float convert with one `hsub2` and one `__half22float2` per pair.
+        //
+        // Hoisting the scale is exact too -- `sum_j(q_j * x_j) * scale` against
+        // `sum_j((q_j * scale) * x_j)` -- and removes seven of every eight multiplies. It rounds
+        // *less*, not more, since the scale is applied to one accumulated value instead of eight
+        // products.
+        //
+        // Weight ordering is unchanged: bit-pair `pair` carries weights `pair` and `pair + 4`,
+        // which under this file's convention are the same k as before.
+        const std::uint32_t high_inv = high ^ 0xffu;
+        const __half2 bias           = __half2half2(__ushort_as_half(0x6410)); // 1040.0
+        float group_acc              = 0.0f;
+#pragma unroll
+        for (int pair = 0; pair < kWeightsPerLane / 2; ++pair) {
+            std::uint32_t bits = ((word >> (4 * pair)) & 0x000f000fu) | 0x64006400u;
+            bits |= (((high_inv >> pair) & 1u) << 4) | (((high_inv >> (pair + 4)) & 1u) << 20);
+            const float2 q = __half22float2(__hsub2(half2_from_bits(bits), bias));
+            group_acc      = fmaf(q.x, xs[pair], group_acc);
+            group_acc      = fmaf(q.y, xs[pair + 4], group_acc);
+        }
+        acc = fmaf(group_acc, scale, acc);
     }
     return acc;
 }

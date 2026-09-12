@@ -349,6 +349,12 @@ ninfer_add_op_test(ninfer_prepare_masked_block_test
 ninfer_add_op_test(ninfer_sparse_moe_test
   SOURCES ops/test_sparse_moe.cpp
   LIBRARIES ninfer_ops)
+# The routing sort on its own, exhaustively. The Op test above covers SparseMoe end to end and
+# would not localise a network that mis-sorts a minority of score permutations; this one runs the
+# device function over all 8! orderings and all 3^8 tie patterns.
+ninfer_add_op_test(ninfer_sparse_moe_route_network_test
+  SOURCES ops/test_sparse_moe_route_network.cu
+  LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_mtp_pack_test
   SOURCES ops/test_mtp_pack.cpp
   LIBRARIES ninfer_ops)

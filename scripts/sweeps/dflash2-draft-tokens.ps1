@@ -21,9 +21,13 @@ $ErrorActionPreference = 'Continue'
 Set-Location (Resolve-Path (Join-Path $PSScriptRoot '..\..'))
 
 . "$PSScriptRoot\model-dir.ps1"
+. "$PSScriptRoot\host-memory.ps1"
 $modelDir = Get-NInferModelDir
 $out      = if ($env:NINFER_SWEEP_OUT) { $env:NINFER_SWEEP_OUT } else { 'profiles\sweeps' }
 New-Item -ItemType Directory -Force -Path $out | Out-Null
+# Host memory pressure produces plausible numbers rather than an error, so it is guarded
+# rather than trusted -- see host-memory.ps1 for what goes wrong and why.
+Assert-NInferHostMemory -Artifacts @("$modelDir\qwen3_8_27b_dflash2.ninfer")
 
 # DFlash2 exists only in this artifact. It is a different file from the qwen3_8_27b.ninfer the rest
 # of the 27B numbers come from, which is why the no-speculation baseline below is measured on this

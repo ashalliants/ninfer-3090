@@ -334,8 +334,11 @@ int verify_vision_workspace_planning() {
         (void)workspace_capacity(16384);
     } catch (const std::invalid_argument& error) {
         const std::string_view message(error.what());
-        if (message.find("nvfp4 linear_swiglu A16 is registered only through T=16") ==
-            std::string_view::npos) {
+        // Match the stable clause, not the whole sentence. The throw site now carries the sm_86
+        // context and the remedy as well -- an operator hitting it in production needs those -- and
+        // pinning the full string made a message improvement look like a routing regression. The
+        // contract this is guarding is the *registration bound*, and that is the phrase to hold.
+        if (message.find("registered only through T=16") == std::string_view::npos) {
             std::cerr << "NVFP4 planning on sm_86 failed for an unexpected reason: " << message
                       << '\n';
             return 1;

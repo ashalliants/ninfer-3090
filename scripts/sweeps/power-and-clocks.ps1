@@ -20,11 +20,15 @@ $ErrorActionPreference = 'Continue'
 Set-Location (Resolve-Path (Join-Path $PSScriptRoot '..\..'))
 
 . "$PSScriptRoot\model-dir.ps1"
+. "$PSScriptRoot\host-memory.ps1"
 $modelDir = Get-NInferModelDir
 $out      = if ($env:NINFER_SWEEP_OUT) { $env:NINFER_SWEEP_OUT } else { 'profiles\sweeps' }
 $bench    = '.\build-ninja\bench\ninfer_bench.exe'
 $model    = "$modelDir\qwen3_8_27b.ninfer"
 New-Item -ItemType Directory -Force -Path $out | Out-Null
+# Host memory pressure produces plausible numbers rather than an error, so it is guarded
+# rather than trusted -- see host-memory.ps1 for what goes wrong and why.
+Assert-NInferHostMemory -Artifacts @("$modelDir\qwen3_8_27b.ninfer")
 if (-not (Test-Path $model)) { throw "model not found: $model" }
 
 nvidia-smi --query-gpu=power.limit,power.default_limit,power.max_limit,clocks.max.sm,clocks.max.memory `

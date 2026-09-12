@@ -130,7 +130,43 @@ void w8_pair_splitk_medium_launch(W8PairScheduleId schedule, const Tensor& x,
         throw std::invalid_argument("W8 medium pair requires [1024,2048] and T>=33");
     }
 #if defined(NINFER_SM8X_COMPAT)
-    (void)schedule;
+    // Two of this table's ten tiles are both reachable here and able to fit, so they are
+    // instantiated and the rest fall through to the chunked loop below.
+    //
+    // Why not all ten. w8_rowsplit_medium_t_splitk_kernel declares code_shared[16][KSplits*64] and
+    // b_shared[KSplits*NGroups][(TileCols/NGroups)*64] at 2 B, so each schedule's static shared
+    // footprint follows from its own template arguments, against sm_86's 49,152-byte cap:
+    //
+    //   C48  28.0 KiB   C64  36.0 KiB   C80  44.0 KiB   C128 34.0 KiB   C160 42.0 KiB   fit
+    //   C88  48.0 KiB (exactly AT the cap)   C96 52.0   C104 56.0   C112 60.0   C192 50.0   do not
+    //
+    // The five that do not fit are compile errors rather than slow paths, and instantiating the
+    // whole switch is what forced the blanket `(void)schedule` this replaces.
+    //
+    // Of the five that fit, only C48 and C64 are ever routed on this card: w8_pair_plan.cpp sends
+    // {33,48} to C48 and {49,64} to C64, and from T=66 the concat kernels win outright (that table
+    // measures medium at 44.0 us against concat's 39.9 at T=80, widening to 91.1 against 43.0 at
+    // T=192). So C80/C128/C160 would fit and would never be asked for.
+    switch (schedule) {
+    case W8PairScheduleId::DualSplitKMediumC48:
+        if (x.ne[1] <= 48) {
+            launch_medium<48, 4, 2, 3>(x, first_weight, second_weight, first_out, second_out,
+                                       stream);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+        break;
+    case W8PairScheduleId::DualSplitKMediumC64:
+        if (x.ne[1] <= 64) {
+            launch_medium<64, 4, 2, 2>(x, first_weight, second_weight, first_out, second_out,
+                                       stream);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+        break;
+    default:
+        break;
+    }
     std::int32_t offset = 0;
     while (offset < x.ne[1]) {
         const std::int32_t count = std::min<std::int32_t>(kLastExactT, x.ne[1] - offset);

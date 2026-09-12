@@ -20,21 +20,34 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\sweeps\dflash2-draft-tokens-realtext.ps1
 #
 # About 25 minutes. Greedy at every configuration, which is necessary but not sufficient for the
-# comparison to be of speed on identical output: TODO.md records DFlash2 and MTP producing
-# byte-identical output *to each other*, and both diverging from the width-1 greedy path within the
-# first hundred tokens -- squarely inside this sweep's --max-new 256 window. So this does not
-# assume identical output; it hashes each run's generated text (content_sha256 below) and leaves the
-# comparison to whoever reads the CSV, rather than asserting a thing that has been measured false.
+# comparison to be of speed on identical output. The hashes this sweep records are what settled
+# that: DFlash2 and MTP do NOT match each other, DFlash2's own output varies with the draft count
+# (eight distinct outputs across k = 1..12), and every speculative configuration diverges from the
+# width-1 greedy path within the first hundred tokens -- squarely inside this sweep's --max-new 256
+# window. See docs/performance.md, which carries the same finding and the retraction of the earlier
+# "byte-identical to each other" claim. So this asserts nothing about identity; it hashes each run's
+# generated text (content_sha256 below) and leaves the comparison to whoever reads the CSV.
+#
+# It also reports acceptance. TODO.md section 3 wants DFlash2's acceptance and tokens-per-round on
+# realistic text and records that the committed corpus cannot supply them -- it is 65,536 tokens
+# over 682 distinct ids and reports exactly 100% acceptance at every draft count, which is a
+# statement about the fixture. This sweep already generates real prose through the serving path, and
+# apps/cli/main.cpp already prints `<backend> acceptance rate` and `<backend> acceptance length`
+# to stderr, so the numbers only ever needed parsing out. Note `acceptance length` is
+# `1 + accepted/rounds`, i.e. tokens emitted per round including the always-free verified one --
+# the same quantity TODO's cliff table calls tok/round.
 $ErrorActionPreference = 'Continue'
 Set-Location (Resolve-Path (Join-Path $PSScriptRoot '..\..'))
 
 . "$PSScriptRoot\model-dir.ps1"
+. "$PSScriptRoot\host-memory.ps1"
 $modelDir = Get-NInferModelDir
 $out      = if ($env:NINFER_SWEEP_OUT) { $env:NINFER_SWEEP_OUT } else { 'profiles\sweeps' }
 New-Item -ItemType Directory -Force -Path $out | Out-Null
 
 $weights = "$modelDir\qwen3_8_27b_dflash2.ninfer"
 if (-not (Test-Path $weights)) { throw "Missing DFlash2 artifact: $weights" }
+Assert-NInferHostMemory -Artifacts @($weights)
 
 # A prompt that provokes a long, substantive, non-repetitive answer. Deliberately not a list or a
 # table: those are exactly the shapes a draft head finds easy, and the question here is what
@@ -51,7 +64,7 @@ foreach ($n in 1,2,3,4,5,6,7,8,10,12) {
 $configs += @{ label='mtp3';      args=@('--spec','mtp','--draft-tokens','3') }
 $configs += @{ label='mtp3+head'; args=@('--spec','mtp','--draft-tokens','3','--lm-head-draft') }
 
-"config,rep,decode_tok_s,generated_tokens,content_sha256"
+"config,rep,decode_tok_s,generated_tokens,rounds,drafted,accepted,acceptance_rate_pct,tok_per_round,content_sha256"
 foreach ($c in $configs) {
   for ($rep = 1; $rep -le 3; $rep++) {
     $stem = "$out\rt_$($c.label -replace '\+','p')_$rep"
@@ -63,12 +76,41 @@ foreach ($c in $configs) {
     # decode_tok_s and generated_tokens below) to stderr -- captured separately so $text is exactly
     # the model's output and can be hashed, rather than the merged stream this used to read.
     & .\build-ninja\apps\ninfer.exe @argv > $text 2> $log
-    if ($LASTEXITCODE -ne 0) { "$($c.label),$rep,FAILED,,"; Get-Content $log -Tail 2 | ForEach-Object { "    $_" }; continue }
+    if ($LASTEXITCODE -ne 0) { "$($c.label),$rep,FAILED,,,,,,,"; Get-Content $log -Tail 2 | ForEach-Object { "    $_" }; continue }
     $txt  = Get-Content $log -Raw
     $dec  = if ($txt -match 'decode speed\s+([\d.]+) tok/s') { $Matches[1] } else { '' }
     $gen  = if ($txt -match 'generated tokens\s+(\d+)')      { $Matches[1] } else { '' }
-    $hash = (Get-FileHash $text -Algorithm SHA256).Hash
-    "$($c.label),$rep,$dec,$gen,$hash"
+    # The backend prefixes every speculative metric with its own name ("dflash2 rounds", "mtp
+    # acceptance rate"), so match the label rather than a fixed backend -- one regex serves both
+    # arms and the unspeculated control simply leaves the columns empty.
+    $rounds = if ($txt -match '\S+ rounds\s+(\d+)')                          { $Matches[1] } else { '' }
+    $draft  = if ($txt -match '\S+ drafted tokens\s+(\d+)')                  { $Matches[1] } else { '' }
+    $acc    = if ($txt -match '\S+ accepted tokens\s+(\d+)')                 { $Matches[1] } else { '' }
+    # format_pretty_percent emits "12.3%" or the literal "n/a" when nothing was drafted; leave the
+    # column empty in the n/a case rather than writing a word into a numeric column.
+    $rate   = if ($txt -match '\S+ acceptance rate\s+([\d.]+)%')             { $Matches[1] } else { '' }
+    $tpr    = if ($txt -match '\S+ acceptance length\s+([\d.]+) tok/round') { $Matches[1] } else { '' }
+    # Hash the generated text so a reader can tell whether two configurations produced identical
+    # output.
+    #
+    # TODO.md recorded this column as coming out empty with "26 error blocks" and blamed a missing
+    # Get-FileHash. That diagnosis is wrong: Windows PowerShell 5.1.26100 on this box has the
+    # cmdlet and hashes fine. What actually happens is that Get-FileHash on a path that does not
+    # exist raises a **non-terminating** error from a Resolve-Path inside its own implementation
+    # and returns nothing at all -- so `.Hash` on the nothing yields an empty string and the error
+    # prints once per iteration, which is precisely the reported symptom. A bare try/catch does not
+    # help either, because a non-terminating error never reaches catch.
+    #
+    # So: -ErrorAction Stop to make it catchable, and the reason lands in the column instead of an
+    # error block. Whatever leaves $text missing is then visible in the CSV rather than inferred
+    # from console noise.
+    $hash = if (-not (Test-Path -LiteralPath $text)) {
+      'ERR:no-stdout-file'
+    } else {
+      try { (Get-FileHash -LiteralPath $text -Algorithm SHA256 -ErrorAction Stop).Hash }
+      catch { "ERR:$($_.Exception.GetType().Name)" }
+    }
+    "$($c.label),$rep,$dec,$gen,$rounds,$draft,$acc,$rate,$tpr,$hash"
   }
 }
 "== done =="

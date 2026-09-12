@@ -42,13 +42,63 @@ struct RouteSpec {
 // one place the direct path is competitive, by 1.3%, which is the R8C8 tile fitting exactly; 9
 // needs two passes through an 8-wide tile and collapses.
 //
-// The useful part is why. The grouped tile wins at width 7 *despite* padding 7 live columns into
-// 32 -- so the MMA path is not merely better per column, it is better by more than 4.6x of wasted
-// width. That says the opportunity here is a narrower grouped tile (R64C8 or R64C16), which would
-// keep the MMA efficiency and stop paying for 25 dead columns, not a wider direct route. Two
-// separate measurements want it: DFlash2 loses 15% crossing this boundary at k=5->6, and a C8
-// decode cohort spends 13.8 ms of a 56.3 ms round in this exact kernel at width 8. See TODO
-// sections 2c and 3.
+// THAT MEASUREMENT TESTED THE WRONG KERNEL, and correcting it moves the boundary from 6 to 8.
+//
+// `launch_q5` had two direct routes, not one: split4 for T=2..6 and simt_r8_c8 for T=7..15. The
+// {{1, 15}} experiment above therefore compared the *grouped tile* against simt_r8_c8, because
+// split4 threw above 6. Those two kernels are nothing alike in parallelism -- split4 is one block
+// per output row with four warps splitting K, so 12,288 blocks and 12.5 machine-fulls of warps,
+// against simt_r8_c8's 1,536 blocks and 3.12, against the grouped MMA tile's 256 and 0.26. TODO
+// section 2c establishes that the kernels here are parallelism-starved rather than
+// bandwidth-bound, and split4 is the one route that is not.
+//
+// Instantiating split4 to 8 and re-measuring (2026-09-09, cold, medians of 31 with --spread,
+// clocks locked at 1,500 MHz) makes the direct route the outright winner at 7 and 8:
+//
+//   T    independent (split4)      c8 (was routed here)     independent before (simt_r8_c8)
+//   6    207.9  206.8..208.9       243.7  239.6..540.7       188.4
+//   7    228.4  226.3..229.4       242.7  240.6..247.8       330.8
+//   8    208.9  206.8..209.9       240.6  237.6..244.7       319.5
+//   9    435.2  432.1..437.2       529.4  514.0..535.6       486.4
+//
+// So +5.9% at width 7 and +13.2% at width 8 over the c8 tile that was routed there, with the two
+// spreads completely disjoint at both widths, and 31-35% over what the direct route used to cost.
+//
+// AND THEN ONLY ONE OF THOSE TWO SURVIVED IN SITU, WHICH IS WHY WIDTH 7 STAYS ON c8.
+// Measured end to end through the serving path with tools/bench/run_interleaved_ab.py -- two
+// binaries alternating inside each repetition, clocks locked at 1,500 MHz, six repetitions, and
+// draft count 4 (width 5, on the independent route in both arms) carried as a drift control:
+//
+//   config                  paired median   positive   control drift
+//   k=6, width 7                  -0.78%       0 / 6          +0.00%
+//   k=7, width 8                  +2.85%       6 / 6          +0.09%
+//
+// The control moving 0.00-0.09% is what makes these readable, and both results were identical to
+// three figures across all six repetitions. So the cold bench overstates, and at width 7 it
+// overstates enough to invert the sign: a 5.9% cold margin is worth -0.78% in production, while a
+// 13.2% cold margin is worth +2.85%. That is a calibration point for TODO section 3's warning that
+// every boundary in this repository was decided on cold-flush margins -- the practical threshold is
+// somewhere between those two, and a cold margin under ~10% should not be trusted to survive.
+//
+// Hence {1,6} independent / {7,7} c8 / {8,8} independent. The single-width band at 8 looks odd and
+// is what the measurement supports: width 8 is the C8 serving cohort, the profile the 27B release
+// recommends for multi-user serving, and this kernel is 13.8 ms of its 56.3 ms round, so a 13%
+// kernel win landing as ~2.9% of the round is exactly the arithmetic working out. Width 7 is
+// DFlash2 at k=6. Both are real workloads; only one of them wants split4.
+//
+// Why width 8 and not 7, mechanically: split4 costs 228.4 us at width 7 against 208.9 at width 8,
+// so it is worse at the odd width, while c8 is flat (242.7 / 240.6) because its cost is set by
+// padded width. Eight divides split4's vector loads and seven does not.
+//
+// Width 9 collapses to 435.2 and that sets the new boundary. It is a register cliff rather than a
+// geometric one: split4 carries `__launch_bounds__(128, 10)`, capping it at 51 registers per
+// thread, and `acc[kTt]` costs one register per column. Hence the instantiations stop at 8 -- see
+// launch_q5_split4_exact. Anyone widening it further must relax MIN_BLOCKS first, which is
+// affordable (the kernel has 12.5 machine-fulls of blocks and does not need ten per SM) but is a
+// separate measurement.
+//
+// Two workloads pay for this: DFlash2's verification width is k+1, so its 5->6 cliff *is* the
+// 6/7 boundary, and a C8 decode cohort runs at width 8. See TODO sections 2c and 3.
 //
 // Below 32 the tile is chosen by measurement, not by which one exists. Every decode extent lives
 // here -- a verification round is k+1 wide (6 at the four draft tokens docs/cli.md recommends) and
@@ -84,9 +134,10 @@ struct RouteSpec {
 // not by the live token count, so the tile is chosen to be the narrowest one that still
 // covers the extent in a single pass. Decode extents (C8 with MTP3 is 32) get the 32-wide
 // tile; the 128-wide tile remains the prefill-chunk anchor.
-constexpr std::array<RouteSpec, 6> kRoutes{{
+constexpr std::array<RouteSpec, 7> kRoutes{{
     {{1, 6}, Q4Q5GdnInputScheduleId::IndependentDirectFixed},
-    {{7, 8}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C8},
+    {{7, 7}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C8},
+    {{8, 8}, Q4Q5GdnInputScheduleId::IndependentDirectFixed},
     {{9, 16}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C16},
     {{17, 32}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C32},
     {{33, 64}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C64},

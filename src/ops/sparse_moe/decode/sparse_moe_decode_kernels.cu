@@ -236,6 +236,37 @@ __device__ __forceinline__ void dot_two_rows(const std::uint8_t* codes, const st
     result1 = warp_reduce_sum(acc1);
 }
 
+// Nine warps: 0..7 take one routed expert each through RoutedCodec, warp 8 takes the shared expert
+// through W8Codec -- kTopK + 1, so eight warps would have nowhere to put the shared path.
+//
+// The block cannot retire until all nine warps finish, and the shared W8 path is heavier than a
+// routed Q4 one, so eight completed routed warps hold warp slots while warp 8 drains. ncu sees that
+// as no warp eligible to issue on 43-48% of cycles, and sparse_moe_d3_path_tiled_kernel below
+// exists to spread the same nine paths over three-warp blocks for exactly this reason.
+//
+// SPLITTING THE BLOCK WAS TRIED AT ONE TOKEN AND IT IS WORSE. Measured 2026-09-09, 35B / int8 /
+// decode, clocks locked at 1,500 MHz, ncu kernel replay, medians of 3 launches. The path-tiled
+// kernel at tokens == 1 writes an identical activation layout, so this was a pure geometry A/B:
+//
+//                            nine_warp (512x1, 288 thr)   paths3 (512x3, 96 thr)
+//   duration                          29.63 us                  30.75 us
+//   block limit registers / warps        5 / 5                    16 / 16
+//   theoretical warps per SM                45                        48
+//   theoretical occupancy                93.75%                      100%
+//   ACHIEVED occupancy                   67.65%                    52.60%
+//   no eligible warp                      43.2%                     53.4%
+//
+// So the split delivers the higher *theoretical* occupancy it was designed for and a materially
+// lower *achieved* one, and the scheduler stall it was meant to remove gets worse. The cause is the
+// wave tail: three-warp blocks need 1,536 blocks against a 16-per-SM capacity of 1,312, so two
+// waves at 58.5% efficiency, against 512 blocks over 410 slots at 62.4%. Removing a serialisation
+// inside the block does not pay for spreading a kernel that is only ~1.17 machine-fulls of work
+// over more waves. Do not retry this without first making the kernel bigger than the machine.
+//
+// One measurement note worth keeping: d4 was captured alongside as an unchanged control and moved
+// 6.1% between the two arms (DRAM 46.9% -> 52.4%), which is larger than the d3 effect. A downstream
+// kernel in the same fused pipeline is NOT a clean control -- d3's different access pattern leaves
+// different L2 state behind for d4. The occupancy counters above are what carry this result.
 template <class RoutedCodec>
 __global__ void sparse_moe_d3_nine_warp_kernel(
     const __nv_bfloat16* __restrict__ x, const int* __restrict__ ids,

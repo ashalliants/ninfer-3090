@@ -4,6 +4,43 @@ Maintainer orchestration for the public `ninfer_bench` throughput tool, serving 
 runners, and the external Serve TTFT client. Correctness is owned by the affected suites under
 [`tests/`](../../tests/README.md).
 
+## Interleaved A/B between two builds
+
+`run_interleaved_ab.py` compares two executables by alternating them **inside** each repetition.
+Use it for any before/after claim on this hardware. The card drifts 3-5% between processes as it
+heats and the power cap clamps, which is larger than most effects worth measuring here, so
+"all of arm A, then all of arm B" cannot separate a real change from the ramp -- two comparisons
+in TODO's history came out with opposite-signed drift on code paths that had not changed.
+
+```bash
+python tools/bench/run_interleaved_ab.py \
+    --arm-a build-ninja/apps/ninfer.exe \
+    --arm-b build-ninja/apps/ninfer-newtile.exe \
+    --reps 6 \
+    --config 'k6:{exe} models/qwen3_8_27b_dflash2.ninfer --prompt "..." --max-new 256 --greedy --spec dflash2 --draft-tokens 6' \
+    --control 'k4:{exe} models/qwen3_8_27b_dflash2.ninfer --prompt "..." --max-new 256 --greedy --spec dflash2 --draft-tokens 4'
+```
+
+It reports the **paired median** -- the median of per-repetition ratios -- and how many pairs came
+out positive. That is deliberately not the ratio of the two medians: on this box the two statistics
+disagree by more than the effects being measured.
+
+`--control` names a configuration whose code path is **identical in both arms**, so any ratio it
+shows is pure drift; the tool divides it out per repetition and prints a `normalised` column. In the
+GDN-tile comparison that control is what made the result readable, because draft counts 4 and 5
+stay on an unchanged route.
+
+Two things it refuses rather than lets you get wrong:
+
+- **both arms must sit in the same directory**, in practice `build-ninja/apps/` under different
+  names. An executable copied elsewhere fails DLL resolution on Windows, exits 127 and writes an
+  empty log, which reads exactly like a model-loading failure.
+- a `--config` with no `{exe}` placeholder, which would run the same binary twice.
+
+`--metric-regex` selects what to compare; it defaults to the CLI's `decode speed ... tok/s` summary
+line and needs changing for `ninfer_bench`, which prints CSV. A run where any sample produced no
+number exits 1, because a comparison with a hole in it is not a comparison.
+
 ## External Serve TTFT
 
 [`ttft/README.md`](ttft/README.md) defines the black-box latency benchmark. The measurement runner

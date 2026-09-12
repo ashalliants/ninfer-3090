@@ -27,9 +27,15 @@ $ErrorActionPreference = 'Continue'
 Set-Location (Resolve-Path (Join-Path $PSScriptRoot '..\..'))
 
 . "$PSScriptRoot\model-dir.ps1"
+. "$PSScriptRoot\host-memory.ps1"
 $modelDir = Get-NInferModelDir
 $out      = if ($env:NINFER_SWEEP_OUT) { $env:NINFER_SWEEP_OUT } else { 'profiles\sweeps' }
 New-Item -ItemType Directory -Force -Path $out | Out-Null
+# Host memory pressure produces plausible numbers rather than an error, so it is guarded
+# rather than trusted -- see host-memory.ps1 for what goes wrong and why.
+Assert-NInferHostMemory -Artifacts @(
+    "$modelDir\qwen3_8_27b.ninfer",
+    "$modelDir\qwen3_6_35b_a3b.ninfer")
 
 $nsys = if ($env:NINFER_NSYS) { $env:NINFER_NSYS } else {
   'C:\Program Files\NVIDIA Corporation\Nsight Systems 2024.6.2\target-windows-x64\nsys.exe' }

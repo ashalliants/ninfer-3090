@@ -19,13 +19,24 @@
 # Do not move this logic into a param() default in a calling script: $PSScriptRoot is empty while a
 # param default is being bound, so a repo-relative path written there resolves against the drive
 # root and silently yields C:\models. Measured, not assumed.
+#
+# -Root exists for the one caller that cannot use the default: ppl-bisect-step.ps1 is copied out of
+# the repository with this file beside it, so the $PSScriptRoot below is the copy's directory and
+# the candidates land next to the copy rather than in the checkout. That caller knows the
+# repository root (it takes -Repo) and passes it here; everyone else omits it and gets the
+# derived-from-this-file behaviour unchanged.
 function Get-NInferModelDir {
+    param([string]$Root = '')
+
     if ($env:NINFER_MODEL_DIR) { return $env:NINFER_MODEL_DIR }
     # $PSScriptRoot inside a function is the directory of the file that *defined* it, which is this
-    # one, regardless of which sweep dot-sourced it or what the current location is.
+    # one, regardless of which sweep dot-sourced it or what the current location is -- hence -Root
+    # for a caller running from a copy outside the repository.
+    $repoRoot = if ($Root) { [IO.Path]::GetFullPath($Root) }
+                else       { [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..')) }
     $candidates = @(
-        [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\models')),
-        [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\models'))
+        [IO.Path]::GetFullPath((Join-Path $repoRoot 'models')),
+        [IO.Path]::GetFullPath((Join-Path $repoRoot 'scripts\models'))
     )
     foreach ($candidate in $candidates) {
         if (Test-Path -Path (Join-Path $candidate '*.ninfer')) { return $candidate }
