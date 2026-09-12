@@ -189,7 +189,7 @@ Ordered by expected value, not by section.
 |---|---|---|---|
 | MoE expert gather is latency-bound | 2c | split the shared W8 path out of the 9-warp block, as `sparse_moe_d3_path_tiled_kernel` already does for multi-token; then confirm the 2.2x over-fetch on d4 with `dram__bytes_read.sum` | kernel work; `ncu` for the confirm |
 | Prefill MLP GEMMs at ~30% of INT8 peak | 2c | run `admin-profile.ps1` section 3 and read issue rate vs shared-memory feeding vs occupancy | one elevated run |
-| Eight lanes buy 3.6x (4.05x with MTP3 since the small-T kernels) | 2c | gate_up at T=32 is ~68% of the bf16 MMA peak; the 5120-row Q5 shapes need split-K at T=32 (it bought only 0-2.5% at narrow T) | kernel work |
+| Eight lanes buy 3.6x (4.05x with MTP3 since the small-T kernels) | 2c | **not tensor rate** -- `ncu` puts the T=32 gate_up kernel at 38% tensor pipe, 36% L1 and 39% DRAM at 31% occupancy, i.e. latency-bound. A wider tile that puts more work in flight is the untried lever; the 5120-row Q5 shapes still want split-K at T=32 (0-2.5% at narrow T) | kernel work |
 | KV decode falloff, 3.21x per-key on fp8 | 2c | attack the per-key dequant-into-shared cost; `rk8v4` proves the floor is reachable without a shared arena | kernel work |
 | DFlash2 5→6 cliff | 2c/3 | remainder after the GDN tiles is the grouped kernel sitting at 27% of its own weight-streaming floor | same kernel as the KV item |
 | Routed prefill pipeline-depth threshold 7/4 | 2c | sweep the constant through the product on this card — the method the source comment endorses over the operator fixture | GPU time only |
@@ -1145,13 +1145,46 @@ it here, exactly as "Handing this off to another machine" says.
 
 What is left, in order of size:
 
-- [ ] **C8 is tensor-rate bound.** Q4 gate_up at T=32 runs at ~68% of that card's measured bf16 MMA
-      peak (205 us against a 139 us tensor floor and a 106 us weight-streaming floor), and the Q5
-      shapes at 40-50%. Shared activation slabs (`ops/common/small_t_layout.cuh`) already took the
-      L2 traffic out; what remains is the MMA rate itself. The only large lever left is int8 tensor
-      cores -- W4A8 with per-(column, 64-k-group) activation scales, which is what the syv-ai stack
-      means by "int8 tensor-core GEMMs" -- and that is a quality trade, so it needs the same
-      before/after quality evidence as any other.
+- [x] **C8 is NOT tensor-rate bound -- this entry was wrong, and acting on it cost a kernel.**
+      It read: gate_up at T=32 runs at ~68% of the bf16 MMA peak (205 us against a 139 us tensor
+      floor), so the only large lever left is int8 tensor cores. Both halves are now measured and
+      the first one does not hold. `ncu` on the T=32 gate_up kernel, this box:
+
+      | | BF16 small-T | int8 small-T |
+      |---|---:|---:|
+      | tensor pipe active | **38.3%** | 21.0% |
+      | L1/TEX throughput | 36.4% | 73.5% |
+      | DRAM throughput | 39.4% | 42.7% |
+      | warp occupancy | 30.9% | 45.4% |
+
+      Tensor, L1 and DRAM all sit within three points of each other around 38%, at 31% occupancy:
+      nothing is saturated, which is a latency-bound kernel, not a tensor-rate-bound one. The 68%
+      compared against a computed floor rather than a measured pipe and the two disagree.
+
+      The int8 route was built anyway and is the evidence: it halved tensor-pipe pressure exactly as
+      a 4.7x-denser MMA should (38.3% -> 21.0%) and returned **4-6%**, because the pipe it relieved
+      was never the constraint and the cost landed on L1 at 73.5%. It ships behind `--mlp-a8-decode`
+      (docs/maintainer/quality-trade-experiments.md) since it is also a quality trade.
+
+      **What the counters point at instead:** operand movement and occupancy. The largest single win
+      in that whole exercise was deleting a redundant copy of the staged activation slab, and the
+      second was dropping a runtime column count so the staging loop could fold (below). A wider
+      tile that puts more work in flight is the untried lever.
+
+- [x] **A width that fills its tile does not need a runtime column count.** Every small-T call site
+      passed `MaskedColumns=true`, so the staging loop's trip count and the inner loop's bounds test
+      could never fold, even at exact widths -- and a C8 MTP3 cohort is exactly thirty-two columns.
+      Giving gate_up an unmasked instantiation is worth a median +4% at 16 columns, +3-6.5% at 24
+      (positive in all six runs) and +0.5-2.9% at 32, bit-identical.
+
+      Two things stopped it being universal, both worth knowing before trying it elsewhere. Eight
+      columns *spills* unmasked -- ptxas reports 16 bytes of cumulative stack -- because the
+      compile-time count lets the staging loop unroll past the 42-register ceiling that the KWarps 8
+      schedule's `__launch_bounds__(256, 6)` imposes; wider tiles run KWarps < 8 at two blocks per
+      SM and unroll with registers to spare. And the same change **loses** on the GDN and attention
+      query/key projections, which share the template: attention by 4.1% at thirty-two columns in
+      three identical runs, GDN by 11%. That is not registers (94 against 95, no stack either way)
+      and is unexplained; both were reverted rather than shipped on a story.
 
 - [ ] **C1 is mostly kernel-boundary ramp and drain.** A round is ~500 kernels; the Q5 residual
       projections reach 68-82% of their streaming floor and gate_up 89%, and the shortfall scales
