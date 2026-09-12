@@ -87,6 +87,8 @@ StateImageHostLayout plan_host_state_image(const StateImageSpec& spec) {
         spec.linear.value_heads <= 0 || spec.linear.value_head_dim <= 0 ||
         spec.linear.key_head_dim <= 0 || spec.linear.slot_count <= 0 ||
         (spec.linear.conv_dtype != DType::BF16 && spec.linear.conv_dtype != DType::FP32) ||
+        (spec.linear.recurrent_dtype != DType::FP32 &&
+         spec.linear.recurrent_dtype != DType::FP16) ||
         spec.hidden <= 0) {
         throw std::invalid_argument("StateImage host geometry is invalid");
     }
