@@ -16,6 +16,10 @@ enum class Q4LinearSwiGluScheduleId {
     MmaSplitHalfPairR32C48,
     Materialized,
     MmaSplitHalfPairR32C128,
+    // int8 tensor-core small-T route, T=32 only. Not in the route table -- reachable only through
+    // q4_linear_swiglu_execute_schedule, for measuring against SmallTTiled before any decision to
+    // wire it in. See q4_small_t_mma_i8.cuh and docs/performance.md's tensor-rate-bound C8 finding.
+    SmallTTiledI8,
 };
 
 struct Q4LinearSwiGluProblem {

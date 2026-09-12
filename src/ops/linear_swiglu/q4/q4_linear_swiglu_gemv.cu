@@ -5,6 +5,7 @@
 #include "ops/common/warp.cuh"
 #include "core/device.h" // CUDA_CHECK
 #include "ops/linear/q4/q4_small_t_mma.cuh"
+#include "ops/linear/q4/q4_small_t_mma_i8.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -244,6 +245,46 @@ void q4_linear_swiglu_small_t_tiled_launch(const Tensor& x, const Weight& w, Ten
         throw std::invalid_argument("Q4 LinearSwiGLU exact small-T requires T=2..32");
     }
     kSmallTLaunchers[static_cast<std::size_t>((x.ne[1] - 1) / 8)](x, w, out, stream);
+}
+
+std::size_t q4_linear_swiglu_small_t_tiled_i8_workspace_bytes(std::int32_t tokens) {
+    // s8 codes plus one FP16 scale per (token, group), 256-aligned like q4a8_swiglu's workspace.
+    const std::size_t t = static_cast<std::size_t>(tokens);
+    return ((t * kK + 255) / 256) * 256 + ((t * kGroups * sizeof(__half) + 255) / 256) * 256;
+}
+
+void q4_linear_swiglu_small_t_tiled_i8_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                              WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::int32_t tokens = x.ne[1];
+    if (tokens != 32) {
+        throw std::invalid_argument("Q4 LinearSwiGLU small-T i8 (first pass) requires T=32");
+    }
+    if (w.n != kN || w.k != kK || w.padded_shape[1] != kK) {
+        throw std::invalid_argument("q4 linear_swiglu small-T i8 requires weight [34816,5120]");
+    }
+
+    auto scope             = workspace.scope();
+    const DeviceSpan codes = workspace.alloc_bytes(static_cast<std::size_t>(tokens) * kK);
+    const DeviceSpan xscale =
+        workspace.alloc_bytes(static_cast<std::size_t>(tokens) * kGroups * sizeof(__half));
+    q4_small_t_quantize_activations(static_cast<const __nv_bfloat16*>(x.data), kK, tokens,
+                                    reinterpret_cast<std::int8_t*>(codes.data),
+                                    reinterpret_cast<__half*>(xscale.data), stream);
+
+    constexpr int kKWarps       = 4;
+    constexpr int kStages       = 1;
+    constexpr int kTilesPerWarp = 1;
+    using Layout                = SmallTLayout<kKWarps, kTilesPerWarp>;
+    constexpr int kBlocks =
+        kIntermediate / (Q4SwiGluSmallTRows::kOutputRowsPerTile * Layout::kRowTiles);
+    const Q4SwiGluSmallTEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data), tokens};
+    q4_small_t_mma_i8_launch<Q4SwiGluSmallTGeometry, 32, 32, Q4SwiGluSmallTEpilogue,
+                             Q4SwiGluSmallTRows, false, kKWarps, kStages, kTilesPerWarp>(
+        kBlocks, stream, reinterpret_cast<const std::int8_t*>(codes.data),
+        reinterpret_cast<const __half*>(xscale.data), static_cast<const std::uint8_t*>(w.qdata),
+        static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
+        epilogue, Q4SwiGluSmallTRows{}, tokens);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace ninfer::ops::detail

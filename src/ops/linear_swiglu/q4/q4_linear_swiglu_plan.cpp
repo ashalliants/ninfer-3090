@@ -160,6 +160,8 @@ const char* q4_linear_swiglu_schedule_name(Q4LinearSwiGluScheduleId schedule) no
         return "linear_swiglu.q4.materialized";
     case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128:
         return "linear_swiglu.q4.mma.split_half_pair.r32.c128";
+    case Q4LinearSwiGluScheduleId::SmallTTiledI8:
+        return "linear_swiglu.q4.mma.small_t.tiled_i8";
     }
     return "linear_swiglu.q4.unknown";
 }
@@ -191,6 +193,9 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
             return plan;
         case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128:
             return plan;
+        case Q4LinearSwiGluScheduleId::SmallTTiledI8:
+            // Never in kRoutes: exploratory only, reached solely via execute_schedule.
+            throw std::logic_error("q4 linear_swiglu: SmallTTiledI8 is not a routed schedule");
         }
     }
     throw std::logic_error("q4 linear_swiglu: admitted problem has no covering route");
@@ -254,6 +259,9 @@ void q4_linear_swiglu_execute_schedule(Q4LinearSwiGluScheduleId schedule, const 
     }
     case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128:
         q4_linear_swiglu_mma_split_half_pair_r32_c128_launch(x, w, out, stream);
+        return;
+    case Q4LinearSwiGluScheduleId::SmallTTiledI8:
+        q4_linear_swiglu_small_t_tiled_i8_launch(x, w, out, ws, stream);
         return;
     }
     throw std::logic_error("q4 linear_swiglu: unknown schedule");
