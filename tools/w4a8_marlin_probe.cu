@@ -50,9 +50,28 @@
 // ~449. If the rescale went away and streaming hid fully the kernel would be ~1,620 us / 226 TOP/s
 // -- 1.9x the shipped kernel, and past cuBLAS's 1,532 on an easier problem.
 //
-// **PANEL is free to decouple from BM**, which is what makes this shippable: at BM=128 the full
-// kernel measures 2,455 / 2,453 / 2,467 us for PANEL 128 / 64 / 32. One fixed panel size can serve
-// every consumer whatever tile it picks, so this does not weld the artifact to one kernel's BM.
+// **PANEL is free to decouple from BM, and the win saturates at a tiny panel.** At BM=128 the full
+// kernel measures 2,470 / 2,474 / 2,488 / 2,487 / 2,479 / 2,487 us for PANEL 64 / 32 / 16 / 8 / 4 /
+// 2 -- flat to within 0.7% across a 32x range. Halving the transactions per warp captures the whole
+// benefit; past that the compute path binds (compute-only is 2,092) and further coalescing buys
+// nothing.
+//
+// That matters because panel-major is *not* a free permutation engine-wide: it trades the decode
+// path for the prefill path. Every a8/MMA prefill consumer improves, but the whole GEMV decode
+// family is built on "one warp owns one row and streams its K", which panel-major scatters -- and
+// that family is already transaction-bound (q4_linear_swiglu_gemv.cu:278 records DRAM at 50% while
+// the memory pipes sat at 81%). A large panel would cost 4x the line fills there. A panel of 4
+// does not: the decode block already owns 4 consecutive gate rows and 4 consecutive up rows, so a
+// 4-row panel is exactly one 128-byte line that the block fully consumes, and the fetch needs a
+// lane remap rather than a restructure. **Pick PANEL to fit the decode block, not the prefill
+// tile.**
+//
+// Two things this probe does not model. The Q5/Q6 high plane and the scale plane are separate
+// planes with their own per-row strides, and permuting only the code plane leaves their scattered
+// per-row reads in place -- the scale-ring prefetch is BM scattered 16-byte reads, exactly what
+// this exists to fix, so there is unclaimed upside there. And row-range slicing is plain pointer
+// arithmetic (core/weight_view.cpp:215), valid under panel-major only while row_begin % PANEL == 0;
+// every current caller satisfies it and nothing enforces it.
 //
 // Two implementation notes that cost real time. The panel divide must be hoisted out of the issue
 // lambda -- left inside it is loop-invariant arithmetic competing with the accumulators for
