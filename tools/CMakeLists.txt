@@ -17,3 +17,12 @@ target_include_directories(ninfer-multi-gpu-probe PRIVATE ${CMAKE_SOURCE_DIR}/sr
 set_target_properties(ninfer-multi-gpu-probe PROPERTIES
   CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
+
+# Measures what the dequantise-to-int8 prefill route would cost on the weight side: the group-scale
+# spread within a row, and the relative L2 of reconstructing a weight as int8 with one scale per
+# row. Reads the real artifact, because the answer depends on the actual scale distribution.
+add_executable(ninfer-w4-row-scale-error w4_row_scale_error.cpp)
+target_link_libraries(ninfer-w4-row-scale-error PRIVATE ninfer_artifact)
+ninfer_internal_includes(ninfer-w4-row-scale-error)
+set_target_properties(ninfer-w4-row-scale-error PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
