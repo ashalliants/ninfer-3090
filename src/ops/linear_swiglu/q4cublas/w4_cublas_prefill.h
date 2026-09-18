@@ -28,6 +28,32 @@ namespace ninfer::ops::detail {
 // this fork has twice declined, at 1.2e-2 rising to 1.29e-1 on outlier-heavy inputs. Whether the
 // two together are affordable is a perplexity question, which is why nothing here is on by default.
 
+// CHOOSING THE PREFILL CHUNK. The route's dequantise pass is weight-sized and its GEMM is
+// token-sized, so everything about it is a function of the chunk. Measured end to end on the 27B at
+// pp4096 (local 3090, kv int8):
+//
+//   chunk   baseline   cuBLAS   speedup   workspace   one prefill step
+//     512      1,581    1,929     1.22x      268 MiB       ~265 ms
+//    1024      1,663    2,235     1.34x      365 MiB       ~460 ms
+//    2048      1,724    2,643     1.53x      543 MiB       ~775 ms
+//    4096      1,736    2,753     1.59x      661 MiB     ~1,490 ms
+//
+// The last column is the one serving cares about. The scheduler alternates prefill and decode at
+// exactly one `advance_prefill` call (runtime/engine/engine_core.h:2011-2023), which is one chunk,
+// so that is how long a concurrent decode lane stalls. 4096 buys the most throughput and stalls
+// other lanes for a second and a half; 512 still pays 1.22x and keeps steps short. 2048 is the
+// compromise. Workspace matters only near the context ceiling: 196,608 tokens loads at 512 and
+// fails at 4096, by 168 MiB.
+//
+// NOT DONE, and the measurement is why: inverting the prefill loops so the weight is materialised
+// once per *window* of chunks rather than once per chunk. It is feasible -- prefill captures no
+// CUDA graph, the layer loop is a plain for, and execution/text.cpp already has a chunk loop with
+// an unconditional break. But a window has to run inside one `advance_prefill` call, so it inherits
+// exactly the scheduling granularity of a chunk that size: it would buy the 4096 throughput at the
+// 512 workspace while stalling decode lanes as badly as 4096 does. That leaves it a pure memory
+// play, worth ~390 MiB against a restructure of the GDN state fork and capture-frontier handling.
+// Not a good trade at this size; revisit if the context ceiling ever binds.
+
 // TRIED AND REJECTED, 2026-09-18: overlapping the weight dequantise with the GEMM.
 //
 // The dequantise is memory bound and the GEMM is tensor-core bound, so splitting the weight's rows
