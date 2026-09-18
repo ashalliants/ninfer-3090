@@ -158,11 +158,28 @@ __global__ void channel_absmax(const __nv_bfloat16* __restrict__ x, int k, int t
 }
 
 // A sum of logs rather than a product: k is thousands of terms and the product underflows.
+//
+// One block, and a tree rather than an atomic, because this has to be reproducible. Float atomicAdd
+// commits in whatever order the blocks finish, so the geometric mean below -- and through it every
+// channel scale, and through those every rounding decision in the quantiser -- came out slightly
+// different on each run. That moved perplexity by ~0.04% between identical runs, which is a third
+// of what the whole route costs, and made greedy output non-reproducible.
 __global__ void channel_log_sum(const float* __restrict__ absmax, int k,
                                 float* __restrict__ log_sum) {
-    const int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= k) { return; }
-    atomicAdd(log_sum, logf(fmaxf(absmax[j], 1e-20F)));
+    __shared__ float partial[kThreads];
+    float sum = 0.0F;
+    for (int j = static_cast<int>(threadIdx.x); j < k; j += kThreads) {
+        sum += logf(fmaxf(absmax[j], 1e-20F));
+    }
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (int stride = kThreads / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < static_cast<unsigned>(stride)) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) { *log_sum = partial[0]; }
 }
 
 __global__ void channel_scales(const float* __restrict__ absmax, const float* __restrict__ log_sum,
@@ -325,7 +342,6 @@ void prepare_activations(const Tensor& x, std::int32_t tokens, std::int32_t k, c
     const float alpha = kChannelEqualisationAlpha;
     const int chan_blocks = (k + 255) / 256;
     if (alpha > 0.0F) {
-        CUDA_CHECK(cudaMemsetAsync(s.reduction, 0, sizeof(float), stream));
         CUDA_CHECK(cudaMemsetAsync(s.group_peak, 0, static_cast<std::size_t>(k) * sizeof(float),
                                    stream));
         // Enough token slices to fill the card, but never more than there are tokens.
@@ -334,7 +350,7 @@ void prepare_activations(const Tensor& x, std::int32_t tokens, std::int32_t k, c
                                static_cast<unsigned>(token_slices));
         channel_absmax<<<absmax_grid, 256, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), k, tokens, s.group_peak);
-        channel_log_sum<<<chan_blocks, 256, 0, stream>>>(s.group_peak, k, s.reduction);
+        channel_log_sum<<<1, kThreads, 0, stream>>>(s.group_peak, k, s.reduction);
         channel_scales<<<chan_blocks, 256, 0, stream>>>(s.group_peak, s.reduction, k, alpha,
                                                         s.channel_scale);
     } else {

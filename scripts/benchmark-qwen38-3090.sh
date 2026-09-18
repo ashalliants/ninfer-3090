@@ -9,8 +9,8 @@ PREFILL_PROMPT_CHARACTERS="${NINFER_BENCH_PREFILL_CHARS:-28000}"
 COHORTS="${NINFER_BENCH_COHORTS:-1,2,4,8}"
 KV_DTYPE="${NINFER_BENCH_KV_DTYPE:-rk8v4}"
 START_DELAY_SECONDS="${NINFER_BENCH_START_DELAY:-10}"
-# Hands wide prefill GEMMs to cuBLAS: about 1.73x prefill for +0.159% perplexity (4.343155 ->
-# 4.350060 on the 1M corpus). Set to 0 to measure the default-quality engine instead. The chunk
+# Hands wide prefill GEMMs to cuBLAS: about 1.73x prefill for +0.156% perplexity (4.343155 ->
+# 4.349944 on the 1M corpus). Set to 0 to measure the default-quality engine instead. The chunk
 # follows it, because the route only amortises its weight-sized dequantise over a call's tokens,
 # and at this sweep's usual 512 it is a loss.
 PREFILL_CUBLAS="${NINFER_BENCH_PREFILL_CUBLAS:-1}"
@@ -39,7 +39,7 @@ printf '  Decode output  : %s tokens\n' "$OUTPUT_TOKENS"
 printf '  Cohorts        : %s\n' "$COHORTS"
 printf '  KV cache       : %s\n' "$KV_DTYPE"
 if [[ "$PREFILL_CUBLAS" != '0' ]]; then
-  printf '  Prefill route  : cuBLAS, +0.159%% perplexity (NINFER_BENCH_PREFILL_CUBLAS=0 for the default engine)\n'
+  printf '  Prefill route  : cuBLAS, +0.156%% perplexity (NINFER_BENCH_PREFILL_CUBLAS=0 for the default engine)\n'
 else
   printf '  Prefill route  : default integer-activation\n'
 fi

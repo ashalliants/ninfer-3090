@@ -94,7 +94,7 @@ has not been measured. DFlash2 rows will be added here once measured on a 3090.
 
 ### Handing prefill GEMMs to cuBLAS (`--prefill-cublas`, opt-in)
 
-**Result.** Prompt processing is 43-83% faster again, for +0.159% perplexity. The weights are
+**Result.** Prompt processing is 43-83% faster again, for +0.156% perplexity. The weights are
 materialised as int8 with one scale per row and the GEMM is handed to cuBLAS, which runs this card's
 shapes about twice as fast as this fork's own integer mainloop can. Measured on one RTX 3090,
 Qwen3.8-27B groupwise-int, `--kv-dtype int8`, both arms on the same build and card in one session:
@@ -115,8 +115,8 @@ for the integer route:
 
 | | perplexity | change |
 |---|---:|---:|
-| MLP and out_proj on the route | 4.346990 | +0.088% |
-| plus the attention and GDN input projections | 4.350060 | +0.159% |
+| MLP and out_proj on the route | 4.346284 | +0.072% |
+| plus the attention and GDN input projections | 4.349944 | +0.156% |
 
 The second step is `--no-prefill-cublas-projections` to decline. For scale, this fork has accepted a
 trade at +0.082% and rejected one at +0.69%.
@@ -129,7 +129,7 @@ from per-group activation quantisation (`tools/w4_row_scale_error.cpp`). The act
 channels, so a token's absmax is set by those and everything else is quantised against far too
 large a step. Folding a per-channel scale out of the activations and into the weights is exact
 (`X[j,t]/s[j]` with `W[i,j]*s[j]` leaves the product unchanged) and took the cost from +0.474% to
-+0.088%.
++0.072%.
 
 **Chunk size is the knob.** The dequantise pass is weight-sized and the GEMM token-sized, so the
 route wants a large `--prefill-chunk` and the two settings belong together. The trade-off table,

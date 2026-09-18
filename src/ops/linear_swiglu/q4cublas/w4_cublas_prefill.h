@@ -32,12 +32,12 @@ namespace ninfer::ops::detail {
 // a 1,736 tok/s baseline with the route off, and perplexity on the 1M corpus against 4.343155:
 //
 //   route off                                1,736 tok/s   4.343155
-//   MLP and out_proj                         2,673  1.54x  4.346990   +0.088%
-//   ... plus attention and GDN projections   2,998  1.73x  4.350060   +0.159%
+//   MLP and out_proj                         2,673  1.54x  4.346284   +0.072%
+//   ... plus attention and GDN projections   2,998  1.73x  4.349944   +0.156%
 //
 // The second step is `prefill_cublas_projections`, separable because it is a different trade: the
 // attention and GDN input projections hold about a fifth of the linear parameters, and covering
-// them is worth +12% prefill for +0.071% perplexity. Nearly all of both sides of that come from
+// them is worth +12% prefill for +0.084% perplexity. Nearly all of both sides of that come from
 // GDN rather than attention -- attention alone measured +2.4%.
 //
 // UNALIGNED TOKEN COUNTS ARE WHERE THE ROUTE IS FURTHEST AHEAD, which the aligned benchmarks hide.

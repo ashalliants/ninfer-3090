@@ -3155,7 +3155,7 @@ ceiling, and neither has had any optimisation attempted.
       line has a ceiling: with streaming perfectly hidden its compute path still costs 2,092 us, so
       the best case is ~1.36x the shipped kernel -- parity with the stacks this entry is chasing,
       not a lead. Handing the GEMM to cuBLAS instead is worth 1.7x end to end. Prefill went
-      1,634 -> 2,989 tok/s at pp4096 on one card in one session (+83%), for +0.159% perplexity,
+      1,634 -> 2,989 tok/s at pp4096 on one card in one session (+83%), for +0.156% perplexity,
       behind `--prefill-cublas`. See `docs/performance.md` and
       `src/ops/linear_swiglu/q4cublas/w4_cublas_prefill.h`, which carries the chunk trade-off table
       and the two rejected experiments (overlapping the dequantise with the GEMM; inverting the

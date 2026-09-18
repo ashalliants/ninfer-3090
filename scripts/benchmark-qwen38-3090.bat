@@ -7,8 +7,8 @@ set "OUTPUT_TOKENS=1024"
 set "PREFILL_PROMPT_CHARACTERS=28000"
 set "COHORTS=1,2,4,8"
 set "KV_DTYPE=rk8v4"
-REM Hands wide prefill GEMMs to cuBLAS: about 1.73x prefill for +0.159%% perplexity (4.343155 ->
-REM 4.350060 on the 1M corpus). Set to 0 to measure the default-quality engine instead. The chunk
+REM Hands wide prefill GEMMs to cuBLAS: about 1.73x prefill for +0.156%% perplexity (4.343155 ->
+REM 4.349944 on the 1M corpus). Set to 0 to measure the default-quality engine instead. The chunk
 REM follows it, because the route only amortises its weight-sized dequantise over a call's tokens.
 set "PREFILL_CUBLAS=1"
 set "PREFILL_CHUNK="
@@ -37,7 +37,7 @@ echo   Shared context : %MAX_CONTEXT% tokens ^(C1 full; C8 capped at 8K per requ
 echo   Decode output  : %OUTPUT_TOKENS% tokens
 echo   Cohorts        : C1, C2, C4, C8
 echo   KV cache       : %KV_DTYPE%
-if "%PREFILL_CUBLAS%"=="0" (echo   Prefill route  : default integer-activation) else (echo   Prefill route  : cuBLAS, +0.159%% perplexity ^(set PREFILL_CUBLAS=0 for the default engine^))
+if "%PREFILL_CUBLAS%"=="0" (echo   Prefill route  : default integer-activation) else (echo   Prefill route  : cuBLAS, +0.156%% perplexity ^(set PREFILL_CUBLAS=0 for the default engine^))
 echo   Results        : %REPO%\benchmark_results\windows_3090_*
 if /I "%KV_DTYPE%"=="int8" if %MAX_CONTEXT% GTR 65536 echo WARNING: This high-context INT8 profile is not the recommended 3090 benchmark setting.
 echo.
