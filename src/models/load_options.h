@@ -25,6 +25,9 @@ struct LoadOptions {
     bool mlp_a8_decode = false;
     // Clearing this returns full prefill tiles to their A16 routes; see EngineOptions::prefill_a8.
     bool prefill_a8 = true;
+    // See EngineOptions::prefill_cublas: hands wide prefill GEMMs to cuBLAS, a further quality
+    // trade on top of prefill_a8 and therefore off unless asked for.
+    bool prefill_cublas = false;
     // Store the GDN recurrent state in FP16 between steps; the recurrence still computes in FP32.
     // Free within measurement noise for a ~2% C8 decode gain and a halved per-slot host state
     // image (docs/maintainer/quality-trade-experiments.md).
@@ -98,6 +101,7 @@ struct LoadOptions {
             .mtp_experts_q4 = options.mtp_experts_q4,
             .mlp_a8_decode  = options.mlp_a8_decode,
             .prefill_a8     = options.prefill_a8,
+            .prefill_cublas = options.prefill_cublas,
             .gdn_state_fp16 = options.gdn_state_fp16,
             .vision_max_merged_tokens = options.vision_max_merged_tokens,
             .vision_residency         = options.enable_vision ? options.vision_residency

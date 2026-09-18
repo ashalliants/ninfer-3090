@@ -32,12 +32,18 @@ enum class LinearPolicy : std::uint8_t {
     /// prefill one is not asked to carry: it applies s8 activation quantisation to every decode
     /// step rather than to full prefill tiles only, so it is opt-in per engine.
     AllowA8IntDecode,
+    /// AllowA8Int plus the cuBLAS prefill route at wide token counts: the weight is materialised as
+    /// int8 with one scale per row and the GEMM handed to cuBLAS, which runs it about twice as fast
+    /// as this fork's own integer mainloop can. It is a further quality trade -- per-row weight
+    /// scales and per-token activation scales, where the integer route carries per-group ones -- so
+    /// it is opt-in per engine, and it falls back to AllowA8Int below the width where it pays.
+    AllowPrefillCublas,
 };
 
 [[nodiscard]] constexpr bool valid_linear_policy(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
            policy == LinearPolicy::AllowA4 || policy == LinearPolicy::AllowA8Int ||
-           policy == LinearPolicy::AllowA8IntDecode;
+           policy == LinearPolicy::AllowA8IntDecode || policy == LinearPolicy::AllowPrefillCublas;
 }
 
 [[nodiscard]] constexpr bool allows_a8(LinearPolicy policy) noexcept {
@@ -50,8 +56,19 @@ enum class LinearPolicy : std::uint8_t {
 
 /// Integer-A8 (s8 activation, groupwise-int weight) profiles. Never implies the FP8 A8 path.
 [[nodiscard]] constexpr bool allows_a8_int(LinearPolicy policy) noexcept {
-    return policy == LinearPolicy::AllowA8Int || policy == LinearPolicy::AllowA8IntDecode;
+    return policy == LinearPolicy::AllowA8Int || policy == LinearPolicy::AllowA8IntDecode ||
+           policy == LinearPolicy::AllowPrefillCublas;
 }
+
+/// The cuBLAS prefill route. Only ever admitted above `kCublasPrefillMinTokens`, because its
+/// dequantise pass is weight-sized and has to be amortised over the tokens in the call.
+[[nodiscard]] constexpr bool allows_cublas_prefill(LinearPolicy policy) noexcept {
+    return policy == LinearPolicy::AllowPrefillCublas;
+}
+
+/// Below this width the route loses to the integer mainloop it replaces: the dequantise pass costs
+/// the same whatever the token count, so a narrow call pays for it without the GEMM to amortise it.
+inline constexpr std::int32_t kCublasPrefillMinTokens = 512;
 
 /**
  * Returns the caller-owned transient capacity required by Linear for every T in the inclusive

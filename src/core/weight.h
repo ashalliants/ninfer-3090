@@ -33,7 +33,16 @@ enum class QuantLayout : std::uint16_t {
 // Rows per stored panel. Four 32-byte records is exactly one 128-byte line, which is all the
 // prefill kernels need (measured flat from 2 to 64 in tools/w4a8_marlin_probe.cu), and it is the
 // least disruptive value for the GEMV decode kernels, whose blocks own four consecutive rows.
-inline constexpr int kRowSplitPanelRows = 4;
+inline constexpr int kRowSplitPanelRows  = 4;
+inline constexpr int kRowSplitPanelShift = 2;
+static_assert((1 << kRowSplitPanelShift) == kRowSplitPanelRows,
+              "the panel row count is addressed by shifting, so it must be a power of two");
+
+// Kernels address both layouts with one expression, where a shift of zero collapses the panel form
+// to the row-major one. Nothing but this decides which a kernel reads.
+[[nodiscard]] constexpr int row_split_panel_shift(QuantLayout layout) {
+    return layout == QuantLayout::RowSplitPanel ? kRowSplitPanelShift : 0;
+}
 
 struct Weight {
     const void* payload            = nullptr;

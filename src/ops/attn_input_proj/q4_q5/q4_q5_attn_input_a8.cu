@@ -12,6 +12,7 @@
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 
 #include "core/device.h"
+#include "core/weight_view.h"
 #include "ops/common/rowsplit_a8_mma.cuh"
 
 #include <cuda_bf16.h>
@@ -49,7 +50,7 @@ void launch_range(const Weight& weight, const std::int8_t* codes, const __half* 
         static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.qhigh),
         static_cast<const __half*>(weight.scales), codes, scales, tokens, Rows{row_begin},
-        a8::StoreEpilogue{dst, dst_rows, 0});
+        a8::StoreEpilogue{dst, dst_rows, 0}, row_split_panel_shift(weight.layout));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -77,10 +78,10 @@ void launch_all(const Tensor& x, const Weight& query_key, const Weight& gate_val
 bool q4_q5_attn_input_a8_supported(const Weight& query_key, const Weight& gate_value,
                                    std::int32_t tokens) {
     return a8::tokens_supported(tokens) && query_key.qtype == QType::Q4_G64_FP16 &&
-           query_key.layout == QuantLayout::RowSplit && query_key.n == kParentRows &&
+           is_row_split(query_key.layout) && query_key.n == kParentRows &&
            query_key.k == kHidden && query_key.group == a8::kGroup && query_key.qdata != nullptr &&
            query_key.scales != nullptr && gate_value.qtype == QType::Q5_G64_FP16 &&
-           gate_value.layout == QuantLayout::RowSplit && gate_value.n == kParentRows &&
+           is_row_split(gate_value.layout) && gate_value.n == kParentRows &&
            gate_value.k == kHidden && gate_value.group == a8::kGroup &&
            gate_value.qdata != nullptr && gate_value.qhigh != nullptr &&
            gate_value.scales != nullptr;

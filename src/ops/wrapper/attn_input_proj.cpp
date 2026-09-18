@@ -83,6 +83,10 @@ void validate_policy(LinearPolicy policy) {
     // below, where no such route is registered for their qtypes.
     case LinearPolicy::AllowA8Int:
     case LinearPolicy::AllowA8IntDecode:
+    // The cuBLAS prefill route is registered only for linear_swiglu and linear_add. Everywhere else
+    // this policy means exactly what AllowA8Int means, and is accepted rather than rejected so that
+    // one engine-wide setting does not have to be threaded per Op.
+    case LinearPolicy::AllowPrefillCublas:
         return;
     }
     throw std::invalid_argument("attn_input_proj: invalid compute policy");

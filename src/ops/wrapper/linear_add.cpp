@@ -18,6 +18,7 @@
 #include <string>
 
 #include "ops/linear_swiglu/q4a8/q4a8_linear_swiglu.h"
+#include "ops/linear_swiglu/q4cublas/w4_cublas_prefill.h"
 
 namespace ninfer::ops {
 namespace {
@@ -80,6 +81,10 @@ void validate_policy(LinearPolicy policy) {
     case LinearPolicy::AllowA4:
     case LinearPolicy::AllowA8Int:
     case LinearPolicy::AllowA8IntDecode:
+    // The cuBLAS prefill route is registered only for linear_swiglu and linear_add. Everywhere else
+    // this policy means exactly what AllowA8Int means, and is accepted rather than rejected so that
+    // one engine-wide setting does not have to be threaded per Op.
+    case LinearPolicy::AllowPrefillCublas:
         return;
     }
     throw std::invalid_argument("linear_add: invalid compute policy");
@@ -122,6 +127,13 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         const bool integer_shape =
             output_rows == 5120 && (input_rows == 17408 || input_rows == 6144);
         if (!allows_a8_int(policy) || !integer_shape) { return a16; }
+        // See linear_swiglu: where the cuBLAS route is admitted it is the widest claimant, so any
+        // interval reaching its width gate must reserve for it.
+        if (allows_cublas_prefill(policy) && max_tokens >= kCublasPrefillMinTokens) {
+            return std::max(a16, detail::w4_cublas_prefill_workspace_capacity_bytes(
+                                     output_rows, input_rows,
+                                     std::max(min_tokens, kCublasPrefillMinTokens), max_tokens));
+        }
         if (min_tokens == max_tokens) {
             return detail::q5a8_tokens_supported(min_tokens)
                        ? detail::q5a8_add_workspace_capacity_bytes(input_rows, min_tokens,
@@ -200,6 +212,13 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
     }
 
     if (w.qtype == QType::Q5_G64_FP16) {
+        // About 1.9x the integer route at 4096 tokens; below the width gate it loses, because the
+        // dequantise pass costs the same whatever the token count.
+        if (allows_cublas_prefill(policy) && t >= kCublasPrefillMinTokens &&
+            detail::q5a8_add_supported(w, t) && detail::w4_cublas_prefill_supported(w, t)) {
+            detail::w4_cublas_add_launch(x, w, residual_out, ws, stream);
+            return;
+        }
         if (allows_a8_int(policy) && detail::q5a8_add_supported(w, t)) {
             detail::q5a8_add_launch(x, w, residual_out, ws, stream);
             return;

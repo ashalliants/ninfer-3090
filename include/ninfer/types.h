@@ -223,6 +223,12 @@ struct EngineOptions {
     // Clearing it returns prefill to the A16 routes, which is the only way to measure what the
     // integer routes are worth on a whole request rather than per Op.
     bool prefill_a8                        = true;
+    // Hand wide prefill GEMMs to cuBLAS instead of this fork's integer mainloop: the weight is
+    // materialised as int8 with one scale per row and the activations quantised per token, which
+    // runs about twice as fast (ops/linear_swiglu/q4cublas/w4_cublas_prefill.h) and is a further
+    // quality trade on top of prefill_a8 -- hence off by default. Its dequantise pass is
+    // weight-sized, so it wants a large prefill_chunk to amortise; the two belong together.
+    bool prefill_cublas                    = false;
     // Largest merged-token count one media item may occupy; larger media is downscaled at
     // preprocessing. Also bounds the overlay window.
     std::uint32_t vision_max_merged_tokens = 16384;

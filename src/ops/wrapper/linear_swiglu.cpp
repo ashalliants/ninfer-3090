@@ -8,6 +8,7 @@
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_kernels.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q4a8/q4a8_linear_swiglu.h"
+#include "ops/linear_swiglu/q4cublas/w4_cublas_prefill.h"
 #include "ops/linear_swiglu/q8/q8_linear_swiglu_plan.h"
 
 #include <algorithm>
@@ -28,6 +29,10 @@ void validate_policy(LinearPolicy policy) {
     case LinearPolicy::AllowA4:
     case LinearPolicy::AllowA8Int:
     case LinearPolicy::AllowA8IntDecode:
+    // The cuBLAS prefill route is registered only for linear_swiglu and linear_add. Everywhere else
+    // this policy means exactly what AllowA8Int means, and is accepted rather than rejected so that
+    // one engine-wide setting does not have to be threaded per Op.
+    case LinearPolicy::AllowPrefillCublas:
         return;
     }
     throw std::invalid_argument("linear_swiglu: invalid compute policy");
@@ -57,6 +62,14 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
             gate_up_rows, gate_up_rows / 2, input_rows, input_rows, min_tokens, max_tokens);
         const bool integer_a8 = allows_a8_int(policy);
         if (!integer_a8 || gate_up_rows != 34816 || input_rows != 5120) { return a16; }
+        // The cuBLAS route holds a materialised int8 weight and an int32 output tile, so it is far
+        // and away the widest claimant wherever it is admitted. Any interval reaching its width
+        // gate has to reserve for it, because the resolver will pick it at that T.
+        if (allows_cublas_prefill(policy) && max_tokens >= kCublasPrefillMinTokens) {
+            return std::max(a16, detail::w4_cublas_prefill_workspace_capacity_bytes(
+                                     gate_up_rows, input_rows,
+                                     std::max(min_tokens, kCublasPrefillMinTokens), max_tokens));
+        }
         // The small-T integer route stages quantised activations too, over its padded tile width.
         const auto decode_bytes = [&](std::int32_t t) -> std::size_t {
             return (policy == LinearPolicy::AllowA8IntDecode &&
@@ -148,6 +161,15 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     if (nvfp4_weight) {
         (void)detail::validate_nvfp4_weight(gate_up_weight, "nvfp4 linear_swiglu");
         detail::nvfp4_linear_swiglu_dispatch(x, gate_up_weight, out, policy, ws, stream);
+        return;
+    }
+
+    // The cuBLAS route first, where it is admitted and wide enough to pay: about 2x the integer
+    // mainloop at 4096 tokens, 1.83x at 1024, and a loss below that -- hence the width gate rather
+    // than an unconditional preference. Everything narrower falls through to the routes below.
+    if (allows_cublas_prefill(policy) && t >= kCublasPrefillMinTokens && q4_weight &&
+        detail::w4_cublas_prefill_supported(gate_up_weight, t)) {
+        detail::w4_cublas_swiglu_launch(x, gate_up_weight, out, ws, stream);
         return;
     }
 

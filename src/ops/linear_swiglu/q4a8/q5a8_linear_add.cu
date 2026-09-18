@@ -10,6 +10,7 @@
 #include "ops/linear_swiglu/q4a8/q4a8_linear_swiglu.h"
 
 #include "core/device.h"
+#include "core/weight_view.h"
 #include "ops/common/rowsplit_a8_mma.cuh"
 
 #include <cuda_bf16.h>
@@ -46,7 +47,8 @@ void launch(const Tensor& x, const Weight& down, Tensor& residual, std::int32_t 
     kernel<<<grid, a8::kThreads, smem, stream>>>(
         static_cast<const std::uint8_t*>(down.qdata), static_cast<const std::uint8_t*>(down.qhigh),
         static_cast<const __half*>(down.scales), codes, scales, tokens, Rows{0},
-        a8::ResidualAddEpilogue{reinterpret_cast<__nv_bfloat16*>(residual.data), kRows});
+        a8::ResidualAddEpilogue{reinterpret_cast<__nv_bfloat16*>(residual.data), kRows},
+        row_split_panel_shift(down.layout));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -65,7 +67,7 @@ void launch_for_tile(const Tensor& x, const Weight& down, Tensor& residual, std:
 bool q5a8_tokens_supported(std::int32_t tokens) { return a8::tokens_supported(tokens); }
 
 bool q5a8_add_supported(const Weight& down, std::int32_t tokens) {
-    return down.qtype == QType::Q5_G64_FP16 && down.layout == QuantLayout::RowSplit &&
+    return down.qtype == QType::Q5_G64_FP16 && is_row_split(down.layout) &&
            down.n == kRows && (down.k == kDownCols || down.k == kMixerCols) &&
            down.group == a8::kGroup && down.qdata != nullptr && down.qhigh != nullptr &&
            down.scales != nullptr && a8::tokens_supported(tokens);

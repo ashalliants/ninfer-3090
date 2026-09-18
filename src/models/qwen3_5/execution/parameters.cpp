@@ -32,7 +32,11 @@ public:
         if (!model_.options().prefill_a8) { return; }
         if (p.policy == ops::LinearPolicy::A16Only && p.weight.qtype == format &&
             p.weight.n == n && p.weight.k == k) {
-            p.policy = ops::LinearPolicy::AllowA8Int;
+            // The cuBLAS route is a superset: it admits everything AllowA8Int does and adds the
+            // materialise-and-call-cuBLAS path above its width gate, so the resolver still picks
+            // the integer mainloop for narrow calls.
+            p.policy = model_.options().prefill_cublas ? ops::LinearPolicy::AllowPrefillCublas
+                                                       : ops::LinearPolicy::AllowA8Int;
         }
 #else
         (void)p; (void)format; (void)n; (void)k;
@@ -51,7 +55,8 @@ public:
         if (pair->first.qtype == first_format && pair->first.n == first_rows &&
             pair->first.k == input_rows && pair->second.qtype == second_format &&
             pair->second.n == second_rows && pair->second.k == input_rows) {
-            pair->policy = ops::LinearPolicy::AllowA8Int;
+            pair->policy = model_.options().prefill_cublas ? ops::LinearPolicy::AllowPrefillCublas
+                                                            : ops::LinearPolicy::AllowA8Int;
         }
 #else
         (void)projection; (void)first_format; (void)first_rows; (void)second_format;

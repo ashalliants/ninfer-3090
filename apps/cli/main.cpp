@@ -290,6 +290,7 @@ int main(int argc, char** argv) {
         engine_options.gdn_state_fp16           = cli.gdn_state_fp16;
         engine_options.mlp_a8_decode            = cli.mlp_a8_decode;
         engine_options.prefill_a8               = cli.prefill_a8;
+        engine_options.prefill_cublas               = cli.prefill_cublas;
         // One CLI invocation owns exactly one request, so retained cross-request context has no
         // consumer and must not reserve an extra Device StateImage or run terminal capture.
         engine_options.context_cache.enabled                = false;

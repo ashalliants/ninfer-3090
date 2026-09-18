@@ -16,6 +16,8 @@
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer_bench_common.h"
+#include "artifact/permute_row_split.h"
+#include "core/weight_view.h"
 #include "quantized_weight.cuh"
 
 #include <cuda_runtime.h>
@@ -25,6 +27,7 @@
 #include <cstdlib>
 #include <exception>
 #include <string>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -68,6 +71,9 @@ int main(int argc, char** argv) {
     std::vector<std::int32_t> tokens;
     int repeat = 9;
     int warmup = 3;
+    // Permute the weight into the panel layout and let the routes read it there, so the A8 column
+    // measures the production kernel -- epilogue included -- on the layout the probe measured.
+    bool panel = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
         if (arg == "--tokens" && i + 1 < argc) {
@@ -84,6 +90,8 @@ int main(int argc, char** argv) {
             repeat = std::atoi(argv[++i]);
         } else if (arg == "--warmup" && i + 1 < argc) {
             warmup = std::atoi(argv[++i]);
+        } else if (arg == "--panel") {
+            panel = true;
         } else {
             std::fprintf(stderr, "usage: %s [--tokens T,...] [--repeat N] [--warmup N]\n", argv[0]);
             return 2;
@@ -106,6 +114,17 @@ int main(int argc, char** argv) {
     for (const Profile& profile : kProfiles) {
         ninfer::bench::PackedQuantizedWeight packed = ninfer::bench::make_row_split_weight(
             profile.qtype, profile.rows, profile.cols, profile.cols, {0x31, 0xa5, 0x3c00});
+        if (panel) {
+            const std::uint64_t shape[2] = {static_cast<std::uint64_t>(profile.rows),
+                                            static_cast<std::uint64_t>(profile.cols)};
+            const auto geometry = ninfer::weight_geometry(
+                profile.qtype, ninfer::QuantLayout::RowSplitPanel,
+                std::span<const std::uint64_t>(shape, 2));
+            ninfer::artifact::permute_row_split_to_panel(
+                geometry, static_cast<std::byte*>(packed.storage.p), nullptr);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            packed.weight.layout = ninfer::QuantLayout::RowSplitPanel;
+        }
         ninfer::DeviceBuffer input(static_cast<std::size_t>(profile.cols) * max_tokens * 2);
         ninfer::DeviceBuffer output(static_cast<std::size_t>(profile.out_rows) * max_tokens * 2);
 
