@@ -100,8 +100,11 @@ void decode_row(const std::byte* codes, const std::byte* high, const std::byte* 
                     code |= bit2 << 5;
                 }
             }
-            const int bias = high_per_group ? (format == QType::Q6_G64_FP16 ? 32 : 16) : 8;
-            out[static_cast<std::size_t>(g) * 64 + j] = static_cast<float>(code - bias) * scale;
+            // Two's complement in the code's own width, matching Q4Codec/Q5Codec in
+            // ops/common/rowsplit_a8_mma.cuh: (v ^ half) - half, not an offset-binary v - half.
+            const int half = high_per_group ? (format == QType::Q6_G64_FP16 ? 32 : 16) : 8;
+            out[static_cast<std::size_t>(g) * 64 + j] =
+                static_cast<float>((code ^ half) - half) * scale;
         }
     }
 }
@@ -148,19 +151,29 @@ void analyse(const Reader& reader, ObjectHandle handle, const std::string& name)
                                                                         : spread < 32 ? 4 : 5;
         ++stats.spread_buckets[static_cast<std::size_t>(bucket)];
 
-        // One scale per row, chosen the way the materialiser would: absmax over the row / 127.
+        // One scale per row. Plain absmax/127 is the obvious choice and the wrong one: clipping a
+        // few outliers buys back more than it costs, which is why transcode_row_split already
+        // searches ratios per group rather than taking absmax. The same search applies here, so
+        // the number below is what a materialiser would actually achieve, not a strawman.
         float absmax = 0.0F;
         for (const float v : values) { absmax = std::max(absmax, std::fabs(v)); }
-        const float row_scale = absmax / 127.0F;
-        double row_error      = 0.0;
-        double row_value      = 0.0;
-        if (row_scale > 0.0F) {
-            for (const float v : values) {
-                const float q = std::round(v / row_scale);
-                const float r = std::clamp(q, -127.0F, 127.0F) * row_scale;
-                row_error += static_cast<double>(v - r) * (v - r);
-                row_value += static_cast<double>(v) * v;
+        double row_error = 0.0;
+        double row_value = 0.0;
+        for (const float v : values) { row_value += static_cast<double>(v) * v; }
+        if (absmax > 0.0F) {
+            double best = -1.0;
+            for (int step = 0; step < 25; ++step) {
+                const float ratio     = 0.70F + 0.02F * static_cast<float>(step);
+                const float row_scale = absmax * ratio / 127.0F;
+                double error          = 0.0;
+                for (const float v : values) {
+                    const float q = std::clamp(std::round(v / row_scale), -127.0F, 127.0F);
+                    const float r = q * row_scale;
+                    error += static_cast<double>(v - r) * (v - r);
+                }
+                if (best < 0.0 || error < best) { best = error; }
             }
+            row_error = best;
         }
         stats.sum_sq_error += row_error;
         stats.sum_sq_value += row_value;
