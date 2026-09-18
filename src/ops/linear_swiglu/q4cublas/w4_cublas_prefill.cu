@@ -16,6 +16,10 @@ namespace ninfer::ops::detail {
 namespace {
 
 constexpr int kGroup   = 64;
+// How much of the channel-magnitude spread moves from the activations into the weights. 0.5 is the
+// usual choice: it equalises the two sides rather than fully flattening either. 0 disables it and
+// makes every kernel below compute exactly what it computed before this existed.
+constexpr float kChannelEqualisationAlpha = 0.5F;
 constexpr int kThreads = 256;
 
 void check_blas(cublasStatus_t status, const char* what) {
@@ -56,6 +60,8 @@ template <bool kHasHigh>
 __global__ void dequantise_row_to_int8(const std::uint8_t* __restrict__ codes,
                                        const std::uint8_t* __restrict__ high,
                                        const __half* __restrict__ scales, int groups,
+                                       const float* __restrict__ channel_scale,
+                                       const float* __restrict__ group_peak,
                                        std::int8_t* __restrict__ out,
                                        float* __restrict__ row_scale) {
     const int row             = blockIdx.x;
@@ -70,7 +76,7 @@ __global__ void dequantise_row_to_int8(const std::uint8_t* __restrict__ codes,
     __shared__ float s_max[kThreads / 32];
     float local = 0.0F;
     for (int g = threadIdx.x; g < groups; g += kThreads) {
-        local = fmaxf(local, fabsf(__half2float(s_row[g])));
+        local = fmaxf(local, fabsf(__half2float(s_row[g])) * group_peak[g]);
     }
 #pragma unroll
     for (int offset = 16; offset; offset >>= 1) {
@@ -94,7 +100,7 @@ __global__ void dequantise_row_to_int8(const std::uint8_t* __restrict__ codes,
     for (int w = threadIdx.x; w < words; w += kThreads) {
         const std::uint32_t packed = c_row[w];
         const int base             = w * 8;
-        const float scale          = __half2float(s_row[base / kGroup]) * inv;
+        const float group          = __half2float(s_row[base / kGroup]) * inv;
         const std::uint32_t hbits  = kHasHigh ? h_row[(base / kGroup) * 8 + (base % kGroup) / 8] : 0u;
         std::int8_t bytes[8];
 #pragma unroll
@@ -104,8 +110,10 @@ __global__ void dequantise_row_to_int8(const std::uint8_t* __restrict__ codes,
             if (kHasHigh) { code |= static_cast<int>((hbits >> j) & 1u) << 4; }
             const int half = kHasHigh ? 16 : 8;
             bytes[j]       = static_cast<std::int8_t>(
-                fminf(fmaxf(rintf(static_cast<float>((code ^ half) - half) * scale), -127.0F),
-                            127.0F));
+                fminf(fmaxf(rintf(static_cast<float>((code ^ half) - half) * group *
+                                  channel_scale[base + j]),
+                            -127.0F),
+                      127.0F));
         }
         reinterpret_cast<std::uint32_t*>(o_row + base)[0] =
             *reinterpret_cast<const std::uint32_t*>(bytes);
@@ -114,8 +122,62 @@ __global__ void dequantise_row_to_int8(const std::uint8_t* __restrict__ codes,
     }
 }
 
+// --- activation channel equalisation --------------------------------------------------------
+//
+// One scale per token is what cuBLAS forces, and it is the expensive half of this route's quality
+// cost: activation outliers concentrate in a few input channels, so a token's absmax is set by
+// those channels and every other channel is quantised against a step far larger than it needs.
+// Measured at 1.2e-2 typically but 1.29e-1 on outlier-heavy inputs.
+//
+// The fix is exact rather than approximate. For a per-channel s, X[j,t]/s[j] paired with
+// W[i,j]*s[j] leaves X@W unchanged, so choosing s to flatten the channel magnitudes costs nothing
+// in the product while making the per-token quantisation of X far more accurate. The weight side is
+// free here because this route already rewrites every weight byte on its way to int8; it is only
+// affordable at all because of that.
+//
+// s[j] = (a[j] / geomean(a))^alpha with a[j] the channel's absmax over the chunk, so s is centred
+// on 1 and alpha picks how much of the spread moves. alpha = 0 disables it exactly.
+__global__ void fill_ones(float* __restrict__ out, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) { out[i] = 1.0F; }
+}
+
+__global__ void channel_absmax(const __nv_bfloat16* __restrict__ x, int k, int tokens,
+                               float* __restrict__ absmax, float* __restrict__ log_sum) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= k) { return; }
+    float peak = 0.0F;
+    for (int t = 0; t < tokens; ++t) {
+        peak = fmaxf(peak, fabsf(__bfloat162float(x[static_cast<std::size_t>(t) * k + j])));
+    }
+    absmax[j] = peak;
+    // A sum of logs rather than a product: k is thousands of terms and the product underflows.
+    atomicAdd(log_sum, logf(fmaxf(peak, 1e-20F)));
+}
+
+__global__ void channel_scales(const float* __restrict__ absmax, const float* __restrict__ log_sum,
+                               int k, float alpha, float* __restrict__ scale) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= k) { return; }
+    const float geo = __expf(*log_sum / static_cast<float>(k));
+    const float a   = fmaxf(absmax[j], 1e-20F);
+    scale[j]        = __powf(a / fmaxf(geo, 1e-20F), alpha);
+}
+
+// The weight's row bound has to see the channel scales, since W is multiplied by them: the tight
+// bound per group is its own fp16 scale times the largest channel scale inside it.
+__global__ void group_scale_peaks(const float* __restrict__ channel_scale, int groups,
+                                  float* __restrict__ peak) {
+    const int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= groups) { return; }
+    float best = 0.0F;
+    for (int j = 0; j < kGroup; ++j) { best = fmaxf(best, channel_scale[g * kGroup + j]); }
+    peak[g] = best;
+}
+
 // One block per token. x is [k, t] with k contiguous, so a token is one contiguous column.
 __global__ void quantise_tokens_to_int8(const __nv_bfloat16* __restrict__ x, int k,
+                                        const float* __restrict__ channel_scale,
                                         std::int8_t* __restrict__ out,
                                         float* __restrict__ token_scale) {
     const int token             = blockIdx.x;
@@ -125,7 +187,7 @@ __global__ void quantise_tokens_to_int8(const __nv_bfloat16* __restrict__ x, int
     __shared__ float s_absmax[kThreads / 32];
     float local = 0.0F;
     for (int i = threadIdx.x; i < k; i += kThreads) {
-        local = fmaxf(local, fabsf(__bfloat162float(x_col[i])));
+        local = fmaxf(local, fabsf(__bfloat162float(x_col[i]) / channel_scale[i]));
     }
 #pragma unroll
     for (int offset = 16; offset; offset >>= 1) {
@@ -142,8 +204,8 @@ __global__ void quantise_tokens_to_int8(const __nv_bfloat16* __restrict__ x, int
     __syncthreads();
     const float inv = s_absmax[0] > 0.0F ? 127.0F / s_absmax[0] : 0.0F;
     for (int i = threadIdx.x; i < k; i += kThreads) {
-        o_col[i] = static_cast<std::int8_t>(
-            fminf(fmaxf(rintf(__bfloat162float(x_col[i]) * inv), -127.0F), 127.0F));
+        o_col[i] = static_cast<std::int8_t>(fminf(
+            fmaxf(rintf(__bfloat162float(x_col[i]) / channel_scale[i] * inv), -127.0F), 127.0F));
     }
 }
 
@@ -193,11 +255,14 @@ std::int32_t cublas_token_tile(std::int32_t rows, std::int32_t tokens) {
 namespace {
 
 struct Scratch {
-    std::int8_t* w8    = nullptr;
-    float* row_scale   = nullptr;
-    std::int8_t* x8    = nullptr;
-    float* token_scale = nullptr;
-    int* c32           = nullptr;
+    std::int8_t* w8      = nullptr;
+    float* row_scale     = nullptr;
+    std::int8_t* x8      = nullptr;
+    float* token_scale   = nullptr;
+    int* c32             = nullptr;
+    float* channel_scale = nullptr;
+    float* group_peak    = nullptr;
+    float* reduction     = nullptr; // one float: the log-sum behind the geometric mean
 };
 
 std::size_t aligned_256(std::size_t bytes) { return ((bytes + 255) / 256) * 256; }
@@ -215,6 +280,10 @@ Scratch take_scratch(WorkspaceArena& ws, std::int32_t n, std::int32_t k, std::in
         ws.alloc_bytes(aligned_256(static_cast<std::size_t>(tokens) * sizeof(float))).data);
     s.c32 = static_cast<int*>(
         ws.alloc_bytes(aligned_256(static_cast<std::size_t>(n) * tile * sizeof(int))).data);
+    s.channel_scale = static_cast<float*>(
+        ws.alloc_bytes(aligned_256(static_cast<std::size_t>(k) * 2 * sizeof(float))).data);
+    s.group_peak = s.channel_scale + k; // the absmax pass borrows this before the peaks need it
+    s.reduction  = static_cast<float*>(ws.alloc_bytes(aligned_256(sizeof(float))).data);
     return s;
 }
 
@@ -228,16 +297,34 @@ void prepare(const Weight& weight, const Tensor& x, std::int32_t tokens, const S
     auto* codes       = static_cast<const std::uint8_t*>(weight.qdata);
     auto* high        = static_cast<const std::uint8_t*>(weight.qhigh);
     auto* scales      = static_cast<const __half*>(weight.scales);
-    if (q5) {
-        dequantise_row_to_int8<true><<<n, kThreads, 0, stream>>>(codes, high, scales, groups, s.w8,
-                                                                 s.row_scale);
+
+    // Channel equalisation first: the weight dequantise and the token quantise both consume it.
+    const float alpha = kChannelEqualisationAlpha;
+    const int chan_blocks = (k + 255) / 256;
+    if (alpha > 0.0F) {
+        CUDA_CHECK(cudaMemsetAsync(s.reduction, 0, sizeof(float), stream));
+        channel_absmax<<<chan_blocks, 256, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data), k,
+                                                        tokens, s.group_peak, s.reduction);
+        channel_scales<<<chan_blocks, 256, 0, stream>>>(s.group_peak, s.reduction, k, alpha,
+                                                        s.channel_scale);
     } else {
-        dequantise_row_to_int8<false><<<n, kThreads, 0, stream>>>(codes, nullptr, scales, groups,
-                                                                  s.w8, s.row_scale);
+        // A scale of one everywhere is the identity, so the kernels below need no second form.
+        fill_ones<<<chan_blocks, 256, 0, stream>>>(s.channel_scale, k);
+    }
+    group_scale_peaks<<<(groups + 255) / 256, 256, 0, stream>>>(s.channel_scale, groups,
+                                                                s.group_peak);
+    CUDA_CHECK(cudaGetLastError());
+
+    if (q5) {
+        dequantise_row_to_int8<true><<<n, kThreads, 0, stream>>>(
+            codes, high, scales, groups, s.channel_scale, s.group_peak, s.w8, s.row_scale);
+    } else {
+        dequantise_row_to_int8<false><<<n, kThreads, 0, stream>>>(
+            codes, nullptr, scales, groups, s.channel_scale, s.group_peak, s.w8, s.row_scale);
     }
     CUDA_CHECK(cudaGetLastError());
     quantise_tokens_to_int8<<<tokens, kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), k, s.x8, s.token_scale);
+        static_cast<const __nv_bfloat16*>(x.data), k, s.channel_scale, s.x8, s.token_scale);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -272,7 +359,8 @@ std::size_t w4_cublas_prefill_workspace_capacity_bytes(std::int32_t rows, std::i
     const auto t    = static_cast<std::size_t>(max_tokens);
     const auto tile = static_cast<std::size_t>(cublas_token_tile(rows, max_tokens));
     return aligned_256(n * k) + aligned_256(n * sizeof(float)) + aligned_256(k * t) +
-           aligned_256(t * sizeof(float)) + aligned_256(n * tile * sizeof(int));
+           aligned_256(t * sizeof(float)) + aligned_256(n * tile * sizeof(int)) +
+           aligned_256(k * 2 * sizeof(float)) + aligned_256(sizeof(float));
 }
 
 void w4_cublas_swiglu_launch(const Tensor& x, const Weight& gate_up, Tensor& out,
