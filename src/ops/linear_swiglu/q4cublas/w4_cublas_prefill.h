@@ -40,6 +40,17 @@ namespace ninfer::ops::detail {
 // them is worth +12% prefill for +0.071% perplexity. Nearly all of both sides of that come from
 // GDN rather than attention -- attention alone measured +2.4%.
 //
+// UNALIGNED TOKEN COUNTS ARE WHERE THE ROUTE IS FURTHEST AHEAD, which the aligned benchmarks hide.
+// The integer route's token tile wants an aligned width and loses about 40% without one; cuBLAS
+// does not care. gate_up, TOP/s, integer route against this one:
+//
+//   tokens     512    640   1000   1536   3000   4095
+//   integer   92.5   95.2   53.8   97.5   62.0   59.8
+//   cuBLAS   135.1  143.0  160.2  206.1  207.4  210.2
+//
+// A real prompt is an arbitrary length, so its last chunk is almost always unaligned. The end-to-end
+// numbers quoted elsewhere use round prompt sizes and therefore understate this.
+
 // CHOOSING THE PREFILL CHUNK. The route's dequantise pass is weight-sized and its GEMM is
 // token-sized, so everything about it is a function of the chunk. Measured end to end on the 27B at
 // pp4096 (local 3090, kv int8):
@@ -65,6 +76,12 @@ namespace ninfer::ops::detail {
 // 512 workspace while stalling decode lanes as badly as 4096 does. That leaves it a pure memory
 // play, worth ~390 MiB against a restructure of the GDN state fork and capture-frontier handling.
 // Not a good trade at this size; revisit if the context ceiling ever binds.
+
+// TRIED AND REJECTED: a larger tile budget. cuBLAS re-reads the materialised weight once per token
+// tile, so a budget big enough to make gate_up one tile at 4096 tokens saves ~356 MB of reads. It
+// measures 6,822 us against 7,025 at the shipped budget -- inside the ~10% spread the same
+// configuration showed across repeats -- and it would take the workspace past 1.1 GiB, because the
+// int32 output for one gate_up tile at 4096 tokens is 570 MB on its own. Not worth it.
 
 // TRIED AND REJECTED, 2026-09-18: overlapping the weight dequantise with the GEMM.
 //
