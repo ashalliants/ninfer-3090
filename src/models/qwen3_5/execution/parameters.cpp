@@ -55,8 +55,12 @@ public:
         if (pair->first.qtype == first_format && pair->first.n == first_rows &&
             pair->first.k == input_rows && pair->second.qtype == second_format &&
             pair->second.n == second_rows && pair->second.k == input_rows) {
-            pair->policy = model_.options().prefill_cublas ? ops::LinearPolicy::AllowPrefillCublas
-                                                            : ops::LinearPolicy::AllowA8Int;
+            // The split projections are the separable half of the trade, so they take the cuBLAS
+            // policy only when both settings ask for it.
+            pair->policy = model_.options().prefill_cublas &&
+                                   model_.options().prefill_cublas_projections
+                               ? ops::LinearPolicy::AllowPrefillCublas
+                               : ops::LinearPolicy::AllowA8Int;
         }
 #else
         (void)projection; (void)first_format; (void)first_rows; (void)second_format;

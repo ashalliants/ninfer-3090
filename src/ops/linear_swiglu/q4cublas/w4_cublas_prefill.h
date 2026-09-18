@@ -28,6 +28,18 @@ namespace ninfer::ops::detail {
 // this fork has twice declined, at 1.2e-2 rising to 1.29e-1 on outlier-heavy inputs. Whether the
 // two together are affordable is a perplexity question, which is why nothing here is on by default.
 
+// WHAT THE ROUTE COVERS, AND WHAT EACH PART COSTS. Measured at pp4096, chunk 4096, kv int8, against
+// a 1,736 tok/s baseline with the route off, and perplexity on the 1M corpus against 4.343155:
+//
+//   route off                                1,736 tok/s   4.343155
+//   MLP and out_proj                         2,673  1.54x  4.346990   +0.088%
+//   ... plus attention and GDN projections   2,998  1.73x  4.350060   +0.159%
+//
+// The second step is `prefill_cublas_projections`, separable because it is a different trade: the
+// attention and GDN input projections hold about a fifth of the linear parameters, and covering
+// them is worth +12% prefill for +0.071% perplexity. Nearly all of both sides of that come from
+// GDN rather than attention -- attention alone measured +2.4%.
+//
 // CHOOSING THE PREFILL CHUNK. The route's dequantise pass is weight-sized and its GEMM is
 // token-sized, so everything about it is a function of the chunk. Measured end to end on the 27B at
 // pp4096 (local 3090, kv int8):
@@ -100,5 +112,34 @@ void w4_cublas_swiglu_launch(const Tensor& x, const Weight& gate_up, Tensor& out
 // out[i, t] += C[i, t] rescaled. `residual` is read and written in place.
 void w4_cublas_add_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                           WorkspaceArena& workspace, cudaStream_t stream);
+
+// The attention and GDN input projections read one parent weight and write several destinations
+// from disjoint row ranges of it, so they share an activation quantisation and, per parent, a
+// single materialisation. About a fifth of this model's linear parameters live here -- query_key,
+// gate_value, qk and value_z -- and they were the part of prefill the route did not reach.
+struct CublasProjectionDestination {
+    void* data             = nullptr; // BF16, leading dimension `leading`
+    std::int32_t row_begin = 0;       // first row of the parent this destination takes
+    std::int32_t rows      = 0;       // how many parent rows it takes
+    std::int32_t leading   = 0;       // rows in the destination tensor; >= begin + rows
+    std::int32_t begin     = 0;       // first row within the destination, for packed outputs
+};
+
+struct CublasProjection {
+    const Weight* weight = nullptr;
+    const CublasProjectionDestination* destinations = nullptr;
+    int destination_count = 0;
+};
+
+[[nodiscard]] bool w4_cublas_projection_supported(const CublasProjection* parents, int parent_count,
+                                                  std::int32_t tokens);
+
+[[nodiscard]] std::size_t w4_cublas_projection_workspace_capacity_bytes(std::int32_t max_rows,
+                                                                        std::int32_t cols,
+                                                                        std::int32_t min_tokens,
+                                                                        std::int32_t max_tokens);
+
+void w4_cublas_projection_launch(const Tensor& x, const CublasProjection* parents, int parent_count,
+                                 WorkspaceArena& workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

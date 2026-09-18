@@ -24,8 +24,8 @@ COHORTS = tuple(int(value) for value in os.environ.get("NINFER_BENCH_COHORTS", "
 KV_DTYPE = os.environ.get("NINFER_BENCH_KV_DTYPE", "int8")
 # The cuBLAS prefill route, and the chunk it needs to pay for itself. Its dequantise pass is
 # weight-sized, so it only amortises over the tokens in a call: at the 512-token chunk this sweep
-# otherwise uses it is a loss, and the two settings have to move together. It costs +0.088%
-# perplexity (4.343155 -> 4.346990 on the 1M corpus), so results taken with it on are not
+# otherwise uses it is a loss, and the two settings have to move together. It costs +0.159%
+# perplexity (4.343155 -> 4.350060 on the 1M corpus), so results taken with it on are not
 # quality-identical to results taken with it off -- command.json records which was used.
 PREFILL_CUBLAS = os.environ.get("NINFER_BENCH_PREFILL_CUBLAS", "1").lower() not in ("0", "false", "no")
 PREFILL_CHUNK = os.environ.get("NINFER_BENCH_PREFILL_CHUNK", "4096" if PREFILL_CUBLAS else "512")

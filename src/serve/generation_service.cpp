@@ -292,6 +292,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.mlp_a8_decode            = options_.mlp_a8_decode;
     engine_options.prefill_a8               = options_.prefill_a8;
     engine_options.prefill_cublas               = options_.prefill_cublas;
+    engine_options.prefill_cublas_projections               = options_.prefill_cublas_projections;
     engine_options.speculative              = options_.speculative;
     engine_options.context_cache            = options_.context_cache;
     engine_options.devices                  = options_.devices;

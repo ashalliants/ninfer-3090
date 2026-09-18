@@ -229,6 +229,11 @@ struct EngineOptions {
     // quality trade on top of prefill_a8 -- hence off by default. Its dequantise pass is
     // weight-sized, so it wants a large prefill_chunk to amortise; the two belong together.
     bool prefill_cublas                    = false;
+    // Extends prefill_cublas to the attention and GDN input projections, which hold about a fifth
+    // of the linear parameters. Worth +13% prefill for +0.071% perplexity on top of what the route
+    // already costs, the GDN half carrying nearly all of both. Separable because that is a
+    // different trade from the MLP one and an owner may want only the cheaper half.
+    bool prefill_cublas_projections        = true;
     // Largest merged-token count one media item may occupy; larger media is downscaled at
     // preprocessing. Also bounds the overlay window.
     std::uint32_t vision_max_merged_tokens = 16384;

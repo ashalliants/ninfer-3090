@@ -363,6 +363,8 @@ BenchOptions parse_args(int argc, char** argv) {
             options.prefill_a8 = false;
         } else if (arg == "--prefill-cublas") {
             options.prefill_cublas = true;
+        } else if (arg == "--no-prefill-cublas-projections") {
+            options.prefill_cublas_projections = false;
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--device") {

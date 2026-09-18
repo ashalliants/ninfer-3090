@@ -2,6 +2,7 @@
 #include "ninfer/ops/gdn_input_proj.h"
 
 #include "core/layout.h"
+#include "ops/linear_swiglu/q4cublas/w4_cublas_prefill.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
@@ -749,6 +750,25 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
                     cudaStream_t stream) {
     validate_policy(policy);
     require_split_profile(x, qk_weight, value_z_weight, qkv, z);
+    // qk fills the head of `qkv`; value_z fills its tail and, from its own second row range, `z`.
+    // Both parents read the same activations, so one quantisation serves all three destinations.
+    if (allows_cublas_prefill(policy) && x.ne[1] >= kCublasPrefillMinTokens) {
+        const std::int32_t qkv_rows   = qkv.ne[0];
+        const std::int32_t z_rows     = z.ne[0];
+        const std::int32_t qk_rows    = qk_weight.n;
+        const std::int32_t value_rows = qkv_rows - qk_rows;
+        const detail::CublasProjectionDestination qk_dests[] = {
+            {qkv.data, 0, qk_rows, qkv_rows, 0}};
+        const detail::CublasProjectionDestination vz_dests[] = {
+            {qkv.data, 0, value_rows, qkv_rows, qk_rows},
+            {z.data, value_rows, z_rows, z_rows, 0}};
+        const detail::CublasProjection parents[] = {
+            {&qk_weight, qk_dests, 1}, {&value_z_weight, vz_dests, 2}};
+        if (value_rows > 0 && detail::w4_cublas_projection_supported(parents, 2, x.ne[1])) {
+            detail::w4_cublas_projection_launch(x, parents, 2, workspace, stream);
+            return;
+        }
+    }
     if (allows_a8_int(policy) &&
         detail::q4_q5_gdn_input_a8_supported(qk_weight, value_z_weight, x.ne[1])) {
         detail::q4_q5_gdn_input_a8_launch(x, qk_weight, value_z_weight, qkv, z, workspace, stream);
@@ -769,7 +789,14 @@ std::size_t gdn_input_proj_split_workspace_capacity_bytes(
                             value_z_qtype == QType::Q5_G64_FP16 && value_z_rows == 12288 &&
                             input_rows == 5120;
     if (!allows_a8_int(policy) || !registered) { return 0; }
-    return detail::q4_q5_gdn_input_a8_workspace_capacity_bytes(min_tokens, max_tokens);
+    const std::size_t a8 =
+        detail::q4_q5_gdn_input_a8_workspace_capacity_bytes(min_tokens, max_tokens);
+    if (allows_cublas_prefill(policy) && max_tokens >= kCublasPrefillMinTokens) {
+        return std::max(a8, detail::w4_cublas_projection_workspace_capacity_bytes(
+                                std::max(qk_rows, value_z_rows), input_rows,
+                                std::max(min_tokens, kCublasPrefillMinTokens), max_tokens));
+    }
+    return a8;
 }
 
 void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,

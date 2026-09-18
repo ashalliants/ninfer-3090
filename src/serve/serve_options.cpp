@@ -374,6 +374,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.prefill_a8 = false;
         } else if (arg == "--prefill-cublas") {
             options.prefill_cublas = true;
+        } else if (arg == "--no-prefill-cublas-projections") {
+            options.prefill_cublas_projections = false;
         } else if (arg == "--chat-template") {
             options.chat_template_path = require_value("--chat-template");
         } else if (arg == "--no-thinking") {

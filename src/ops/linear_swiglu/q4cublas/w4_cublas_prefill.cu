@@ -229,6 +229,24 @@ __global__ void swiglu_epilogue(const int* __restrict__ c, const float* __restri
         __float2bfloat16(silu(gate) * up);
 }
 
+// dst[r, t] = C[row_begin + r, t] rescaled. One destination of a split parent.
+__global__ void store_epilogue(const int* __restrict__ c, const float* __restrict__ row_scale,
+                               const float* __restrict__ token_scale, int n, int row_begin,
+                               int rows, int tokens, int token_base, int leading, int dst_begin,
+                               __nv_bfloat16* __restrict__ out) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= rows * tokens) { return; }
+    const int row   = index % rows;
+    const int token = index / rows;
+    const float value =
+        static_cast<float>(c[static_cast<std::size_t>(token) * n + row_begin + row]) *
+        row_scale[row_begin + row] * token_scale[token_base + token];
+    // The GDN input projection packs two parents' outputs into one tensor, so a destination is a
+    // row range of something wider rather than a tensor of its own.
+    out[static_cast<std::size_t>(token_base + token) * leading + dst_begin + row] =
+        __float2bfloat16(value);
+}
+
 __global__ void add_epilogue(const int* __restrict__ c, const float* __restrict__ row_scale,
                              const float* __restrict__ token_scale, int n, int tokens,
                              int token_base, __nv_bfloat16* __restrict__ residual, int out_ld) {
@@ -288,16 +306,11 @@ Scratch take_scratch(WorkspaceArena& ws, std::int32_t n, std::int32_t k, std::in
 }
 
 // Materialise the weight once, quantise the activations once, then walk the tokens in tiles.
-void prepare(const Weight& weight, const Tensor& x, std::int32_t tokens, const Scratch& s,
-             cudaStream_t stream) {
-    const auto n      = weight.n;
-    const auto k      = weight.k;
-    const int groups  = k / kGroup;
-    const bool q5     = weight.qtype == QType::Q5_G64_FP16;
-    auto* codes       = static_cast<const std::uint8_t*>(weight.qdata);
-    auto* high        = static_cast<const std::uint8_t*>(weight.qhigh);
-    auto* scales      = static_cast<const __half*>(weight.scales);
-
+// The activation half: channel equalisation and the per-token quantisation. Depends only on x and
+// k, so parents sharing an input share this.
+void prepare_activations(const Tensor& x, std::int32_t tokens, std::int32_t k, const Scratch& s,
+                         cudaStream_t stream) {
+    const int groups = k / kGroup;
     // Channel equalisation first: the weight dequantise and the token quantise both consume it.
     const float alpha = kChannelEqualisationAlpha;
     const int chan_blocks = (k + 255) / 256;
@@ -315,7 +328,21 @@ void prepare(const Weight& weight, const Tensor& x, std::int32_t tokens, const S
                                                                 s.group_peak);
     CUDA_CHECK(cudaGetLastError());
 
-    if (q5) {
+    quantise_tokens_to_int8<<<tokens, kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), k, s.channel_scale, s.x8, s.token_scale);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// The weight half. Separate because a split parent is materialised once and read by several
+// destinations, and because parents sharing an input share prepare_activations above.
+void materialise_weight(const Weight& weight, const Scratch& s, cudaStream_t stream) {
+    const auto n     = weight.n;
+    const auto k     = weight.k;
+    const int groups = k / kGroup;
+    auto* codes      = static_cast<const std::uint8_t*>(weight.qdata);
+    auto* high       = static_cast<const std::uint8_t*>(weight.qhigh);
+    auto* scales     = static_cast<const __half*>(weight.scales);
+    if (weight.qtype == QType::Q5_G64_FP16) {
         dequantise_row_to_int8<true><<<n, kThreads, 0, stream>>>(
             codes, high, scales, groups, s.channel_scale, s.group_peak, s.w8, s.row_scale);
     } else {
@@ -323,9 +350,12 @@ void prepare(const Weight& weight, const Tensor& x, std::int32_t tokens, const S
             codes, nullptr, scales, groups, s.channel_scale, s.group_peak, s.w8, s.row_scale);
     }
     CUDA_CHECK(cudaGetLastError());
-    quantise_tokens_to_int8<<<tokens, kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), k, s.channel_scale, s.x8, s.token_scale);
-    CUDA_CHECK(cudaGetLastError());
+}
+
+void prepare(const Weight& weight, const Tensor& x, std::int32_t tokens, const Scratch& s,
+             cudaStream_t stream) {
+    prepare_activations(x, tokens, weight.k, s, stream);
+    materialise_weight(weight, s, stream);
 }
 
 void gemm_tile(cublasHandle_t blas, const Scratch& s, std::int32_t n, std::int32_t k,
@@ -414,6 +444,79 @@ void w4_cublas_add_launch(const Tensor& x, const Weight& weight, Tensor& residua
         add_epilogue<<<blocks, 256, 0, stream>>>(s.c32, s.row_scale, s.token_scale, n, tile, base,
                                                  static_cast<__nv_bfloat16*>(residual.data), n);
         CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+bool w4_cublas_projection_supported(const CublasProjection* parents, int parent_count,
+                                   std::int32_t tokens) {
+    if (parents == nullptr || parent_count <= 0) { return false; }
+    const std::int32_t k = parents[0].weight != nullptr ? parents[0].weight->k : 0;
+    for (int p = 0; p < parent_count; ++p) {
+        const auto& parent = parents[p];
+        if (parent.weight == nullptr || parent.destination_count <= 0 ||
+            parent.destinations == nullptr) {
+            return false;
+        }
+        // One activation quantisation serves every parent, so they must share an input width.
+        if (parent.weight->k != k) { return false; }
+        if (!w4_cublas_prefill_supported(*parent.weight, tokens)) { return false; }
+        for (int d = 0; d < parent.destination_count; ++d) {
+            const auto& dst = parent.destinations[d];
+            if (dst.data == nullptr || dst.rows <= 0 || dst.row_begin < 0 ||
+                dst.row_begin + dst.rows > parent.weight->n || dst.begin < 0 ||
+                dst.begin + dst.rows > dst.leading) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+std::size_t w4_cublas_projection_workspace_capacity_bytes(std::int32_t max_rows, std::int32_t cols,
+                                                          std::int32_t min_tokens,
+                                                          std::int32_t max_tokens) {
+    return w4_cublas_prefill_workspace_capacity_bytes(max_rows, cols, min_tokens, max_tokens);
+}
+
+void w4_cublas_projection_launch(const Tensor& x, const CublasProjection* parents, int parent_count,
+                                 WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::int32_t tokens = x.ne[1];
+    if (!w4_cublas_projection_supported(parents, parent_count, tokens)) {
+        throw std::invalid_argument("cuBLAS projection: unsupported profile");
+    }
+    const std::int32_t k = parents[0].weight->k;
+    std::int32_t max_rows = 0;
+    for (int p = 0; p < parent_count; ++p) {
+        max_rows = std::max(max_rows, parents[p].weight->n);
+    }
+
+    const auto scope = workspace.scope();
+    const Scratch s  = take_scratch(workspace, max_rows, k, tokens);
+    prepare_activations(x, tokens, k, s, stream);
+
+    cublasHandle_t blas = handle_for_current_device();
+    check_blas(cublasSetStream(blas, stream), "cublasSetStream");
+    // One tile width for every parent, taken from the widest: the int32 output buffer is shared, and
+    // a narrower parent would otherwise be handed a larger tile than that buffer was sized for.
+    const std::int32_t step = cublas_token_tile(max_rows, tokens);
+
+    for (int p = 0; p < parent_count; ++p) {
+        const auto& parent      = parents[p];
+        const std::int32_t n    = parent.weight->n;
+        materialise_weight(*parent.weight, s, stream);
+        for (std::int32_t base = 0; base < tokens; base += step) {
+            const std::int32_t tile = std::min(step, tokens - base);
+            gemm_tile(blas, s, n, k, base, tile);
+            for (int d = 0; d < parent.destination_count; ++d) {
+                const auto& dst  = parent.destinations[d];
+                const int total  = dst.rows * tile;
+                const int blocks = (total + 255) / 256;
+                store_epilogue<<<blocks, 256, 0, stream>>>(
+                    s.c32, s.row_scale, s.token_scale, n, dst.row_begin, dst.rows, tile, base,
+                    dst.leading, dst.begin, static_cast<__nv_bfloat16*>(dst.data));
+            }
+            CUDA_CHECK(cudaGetLastError());
+        }
     }
 }
 
