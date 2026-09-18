@@ -28,6 +28,29 @@ namespace ninfer::ops::detail {
 // this fork has twice declined, at 1.2e-2 rising to 1.29e-1 on outlier-heavy inputs. Whether the
 // two together are affordable is a perplexity question, which is why nothing here is on by default.
 
+// TRIED AND REJECTED, 2026-09-18: overlapping the weight dequantise with the GEMM.
+//
+// The dequantise is memory bound and the GEMM is tensor-core bound, so splitting the weight's rows
+// into blocks and materialising block b+1 on a side stream while block b's GEMM runs looks like it
+// should hide a cost that is 21% of the call at 1024 tokens. It does not. Measured on gate_up
+// against the unmodified serial form (cuBLAS column, us):
+//
+//                        T=1024   T=4096
+//   serial (shipped)      2,243    7,410
+//   2 blocks, no overlap  2,010    7,281
+//   4 blocks, no overlap  2,255    7,817
+//   2 blocks, overlapped  2,070    7,318
+//   4 blocks, overlapped  2,173    7,752
+//
+// Overlapping is worse than not overlapping at every block count, and the block split alone is
+// inside the machine's drift over the run -- the untouched A8Int arm moved 3,299 to 3,823 across
+// the same sweep. Two plausible reasons, neither worth chasing: cuBLAS already moves enough bytes
+// that a concurrent memory-bound kernel takes bandwidth from it rather than filling a gap, and
+// splitting one GEMM into four costs more efficiency than the overlap returns.
+//
+// So the dequantise has to be made *rarer* rather than hidden, which is a prefill-loop question --
+// materialise once per window of chunks instead of once per chunk -- not a kernel one.
+
 // The int32 output buffer a token tile needs is n * tile * 4 bytes, so the tile is chosen per shape
 // against a budget rather than fixed. A fixed 1024 costs the narrow shapes real throughput -- down
 // ran 1.54x against 1.58x for out_proj at the same token count -- because a tall-thin GEMM has less
