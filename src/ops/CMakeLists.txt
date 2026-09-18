@@ -3,6 +3,9 @@ add_library(ninfer_ops STATIC)
 ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_archive(ninfer_ops)
 target_link_libraries(ninfer_ops PUBLIC ninfer_core)
+# The opt-in cuBLAS prefill route hands its GEMM to cuBLAS; see
+# ops/linear_swiglu/q4cublas/w4_cublas_prefill.h for why that route exists.
+target_link_libraries(ninfer_ops PRIVATE CUDA::cublas)
 
 # Warp-specialized SM120 NVFP4 kernels use setmaxnreg to transfer registers from
 # producer to consumer warpgroups. RDC makes ptxas discard that contract. These

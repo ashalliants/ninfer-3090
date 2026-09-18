@@ -56,6 +56,8 @@ ninfer_add_op_bench(ninfer_dense_linear_add_schedule_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/dense_linear_add_schedule_bench.cu")
 ninfer_add_op_bench(ninfer_a8_prefill_schedule_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/a8_prefill_schedule_bench.cu")
+# --panel applies the load-time weight permute, so this bench needs the artifact side of it.
+target_link_libraries(ninfer_a8_prefill_schedule_bench PRIVATE ninfer_artifact)
 ninfer_add_op_bench(ninfer_q8_dflash2_schedule_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/q8_dflash2_schedule_bench.cu")
 ninfer_add_op_bench(ninfer_q8_pair_schedule_bench
@@ -79,3 +81,7 @@ ninfer_add_op_bench(ninfer_context_kv_materialize_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/context_kv_materialize_bench.cu")
 ninfer_add_op_bench(ninfer_mtp_pack_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/mtp_pack_bench.cu")
 ninfer_add_op_bench(ninfer_proposal_remap_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/proposal_remap_bench.cu")
+
+# The opt-in cuBLAS prefill route against the integer-activation route it would replace.
+ninfer_add_op_bench(ninfer_w4_cublas_prefill_bench
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/w4_cublas_prefill_bench.cu")
