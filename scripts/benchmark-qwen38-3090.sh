@@ -9,6 +9,12 @@ PREFILL_PROMPT_CHARACTERS="${NINFER_BENCH_PREFILL_CHARS:-28000}"
 COHORTS="${NINFER_BENCH_COHORTS:-1,2,4,8}"
 KV_DTYPE="${NINFER_BENCH_KV_DTYPE:-rk8v4}"
 START_DELAY_SECONDS="${NINFER_BENCH_START_DELAY:-10}"
+# Hands wide prefill GEMMs to cuBLAS: about 1.6x prefill for +0.088% perplexity (4.343155 ->
+# 4.346990 on the 1M corpus). Set to 0 to measure the default-quality engine instead. The chunk
+# follows it, because the route only amortises its weight-sized dequantise over a call's tokens,
+# and at this sweep's usual 512 it is a loss.
+PREFILL_CUBLAS="${NINFER_BENCH_PREFILL_CUBLAS:-1}"
+PREFILL_CHUNK="${NINFER_BENCH_PREFILL_CHUNK:-}"
 # ==================================================================
 
 repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -32,6 +38,11 @@ printf '  Shared context : %s tokens (C1 full; C8 capped at 8K per request)\n' "
 printf '  Decode output  : %s tokens\n' "$OUTPUT_TOKENS"
 printf '  Cohorts        : %s\n' "$COHORTS"
 printf '  KV cache       : %s\n' "$KV_DTYPE"
+if [[ "$PREFILL_CUBLAS" != '0' ]]; then
+  printf '  Prefill route  : cuBLAS, +0.088%% perplexity (NINFER_BENCH_PREFILL_CUBLAS=0 for the default engine)\n'
+else
+  printf '  Prefill route  : default integer-activation\n'
+fi
 printf '  Results        : %s/benchmark_results/linux_3090_*\n' "$repo"
 if [[ "${KV_DTYPE,,}" == 'int8' && "$MAX_CONTEXT" -gt 65536 ]]; then
   printf 'WARNING: This high-context INT8 profile is not the recommended 3090 benchmark setting.\n'
@@ -47,6 +58,8 @@ NINFER_BENCH_OUTPUT_TOKENS="$OUTPUT_TOKENS" \
 NINFER_BENCH_PREFILL_CHARS="$PREFILL_PROMPT_CHARACTERS" \
 NINFER_BENCH_COHORTS="$COHORTS" \
 NINFER_BENCH_KV_DTYPE="$KV_DTYPE" \
+NINFER_BENCH_PREFILL_CUBLAS="$PREFILL_CUBLAS" \
+${PREFILL_CHUNK:+NINFER_BENCH_PREFILL_CHUNK="$PREFILL_CHUNK"} \
   uv run tools/bench/run_qwen38_windows_3090_benchmarks.py
 
 printf '\nBENCHMARK COMPLETE. Open the results directory printed above.\n'

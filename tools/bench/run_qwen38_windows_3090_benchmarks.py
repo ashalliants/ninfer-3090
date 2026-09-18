@@ -22,6 +22,13 @@ OUTPUT_TOKENS = int(os.environ.get("NINFER_BENCH_OUTPUT_TOKENS", "1024"))
 PREFILL_PROMPT_CHARACTERS = int(os.environ.get("NINFER_BENCH_PREFILL_CHARS", "28000"))
 COHORTS = tuple(int(value) for value in os.environ.get("NINFER_BENCH_COHORTS", "1,2,4,8").split(","))
 KV_DTYPE = os.environ.get("NINFER_BENCH_KV_DTYPE", "int8")
+# The cuBLAS prefill route, and the chunk it needs to pay for itself. Its dequantise pass is
+# weight-sized, so it only amortises over the tokens in a call: at the 512-token chunk this sweep
+# otherwise uses it is a loss, and the two settings have to move together. It costs +0.088%
+# perplexity (4.343155 -> 4.346990 on the 1M corpus), so results taken with it on are not
+# quality-identical to results taken with it off -- command.json records which was used.
+PREFILL_CUBLAS = os.environ.get("NINFER_BENCH_PREFILL_CUBLAS", "1").lower() not in ("0", "false", "no")
+PREFILL_CHUNK = os.environ.get("NINFER_BENCH_PREFILL_CHUNK", "4096" if PREFILL_CUBLAS else "512")
 PORT = 8093
 STARTUP_TIMEOUT_SECONDS = 90
 REQUEST_TIMEOUT_SECONDS = 900
@@ -92,11 +99,13 @@ def run_round(name: str, prompt: str, max_tokens: int, cohort: int) -> dict:
         str(SERVER), str(MODEL), "--host", "127.0.0.1", "--port", str(PORT),
         "--max-context", str(context_per_request), "--kv-capacity", str(kv_capacity),
         "--max-concurrency", str(cohort), "--max-pending-requests", "8",
-        "--pending-timeout-ms", "900000", "--prefill-chunk", "512",
+        "--pending-timeout-ms", "900000", "--prefill-chunk", PREFILL_CHUNK,
         "--kv-dtype", KV_DTYPE, "--spec", "mtp", "--draft-tokens", "3",
         "--lm-head-draft", "--greedy", "--no-prefix-reuse",
         "--request-log-jsonl", str(request_log),
     ]
+    if PREFILL_CUBLAS:
+        command.append("--prefill-cublas")
     (out / "command.json").write_text(json.dumps(command, indent=2), encoding="utf-8")
     with (out / "stdout.log").open("w", encoding="utf-8") as stdout, (out / "stderr.log").open("w", encoding="utf-8") as stderr:
         process = subprocess.Popen(command, stdout=stdout, stderr=stderr, creationflags=subprocess.CREATE_NO_WINDOW)
