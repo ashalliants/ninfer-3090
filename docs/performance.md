@@ -92,6 +92,50 @@ added to the findings in this section: only single-prompt smoke numbers exist on
 far, and pasting another architecture's corpus results beside them would read as agreement that
 has not been measured. DFlash2 rows will be added here once measured on a 3090.
 
+### Handing prefill GEMMs to cuBLAS (`--prefill-cublas`, opt-in)
+
+**Result.** Prompt processing is 43-83% faster again, for +0.159% perplexity. The weights are
+materialised as int8 with one scale per row and the GEMM is handed to cuBLAS, which runs this card's
+shapes about twice as fast as this fork's own integer mainloop can. Measured on one RTX 3090,
+Qwen3.8-27B groupwise-int, `--kv-dtype int8`, both arms on the same build and card in one session:
+
+| prefill tok/s | 1k | 4k | 16k | 51k |
+|---|---:|---:|---:|---:|
+| shipped integer-activation routes | 1,666.6 | 1,634.4 | 1,503.9 | 1,240.8 |
+| **`--prefill-cublas --prefill-chunk 4096`** | **2,379.8** | **2,988.7** | **2,609.0** | **1,904.1** |
+| change | +42.8% | +82.9% | +73.5% | +53.5% |
+
+Decode is untouched (45.1 against 45.7 tok/s, the route is gated to wide token counts), and the
+workspace grows from 155.6 MiB to 661.2 MiB.
+
+**It is off by default because it is a quality trade, not a free win.** cuBLAS reduces over the
+whole of K, so it cannot see a scale per 64 columns: the weight carries one scale per row and the
+activations one per token. Perplexity on `ninfer-ppl-1m-v1` (quick preset, kv int8) against 4.343155
+for the integer route:
+
+| | perplexity | change |
+|---|---:|---:|
+| MLP and out_proj on the route | 4.346990 | +0.088% |
+| plus the attention and GDN input projections | 4.350060 | +0.159% |
+
+The second step is `--no-prefill-cublas-projections` to decline. For scale, this fork has accepted a
+trade at +0.082% and rejected one at +0.69%.
+
+**Two things had to be true for the quality to land there.** The weight side is cheap because int8
+buys four more bits per code while only losing per-group scale granularity: measured on the real
+artifact it costs 8e-3 to 1.0e-2 relative L2, against the 9e-3 to 2.0e-2 this fork already accepts
+from per-group activation quantisation (`tools/w4_row_scale_error.cpp`). The activation side was
+*not* cheap until the channels were equalised -- activation outliers concentrate in a few input
+channels, so a token's absmax is set by those and everything else is quantised against far too
+large a step. Folding a per-channel scale out of the activations and into the weights is exact
+(`X[j,t]/s[j]` with `W[i,j]*s[j]` leaves the product unchanged) and took the cost from +0.474% to
++0.088%.
+
+**Chunk size is the knob.** The dequantise pass is weight-sized and the GEMM token-sized, so the
+route wants a large `--prefill-chunk` and the two settings belong together. The trade-off table,
+including what each chunk costs a concurrent decode lane, is in
+`src/ops/linear_swiglu/q4cublas/w4_cublas_prefill.h`.
+
 ### Integer activations for every registered prefill projection
 
 **Result.** Prompt processing is 22-29% faster than the previous state at every context length:

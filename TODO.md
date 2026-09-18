@@ -3151,6 +3151,21 @@ ceiling, and neither has had any optimisation attempted.
       row rather than per 64), per-token activation scales, and ~320 MB of scratch. Strictly worse
       than the layout change, which keeps 4-bit weights.
 
+      **RESOLVED, by leaving the kernel alone and changing who runs the GEMM.** The hand-written
+      line has a ceiling: with streaming perfectly hidden its compute path still costs 2,092 us, so
+      the best case is ~1.36x the shipped kernel -- parity with the stacks this entry is chasing,
+      not a lead. Handing the GEMM to cuBLAS instead is worth 1.7x end to end. Prefill went
+      1,634 -> 2,989 tok/s at pp4096 on one card in one session (+83%), for +0.159% perplexity,
+      behind `--prefill-cublas`. See `docs/performance.md` and
+      `src/ops/linear_swiglu/q4cublas/w4_cublas_prefill.h`, which carries the chunk trade-off table
+      and the two rejected experiments (overlapping the dequantise with the GEMM; inverting the
+      prefill loops).
+
+      The kernel work below stands as the record of why that was the right move, and the layout
+      work it produced is committed but parked: the panel-major layout is worth 12.5%, but only at
+      a 128x128/256-thread tile the engine does not use, and it trades the decode path for the
+      prefill path.
+
       **Marlin's design was then built and measured, and it does not pay.**
       `tools/w4a8_marlin_probe.cu` implements all of it at once over a permuted weight layout: the
       weight permuted within each group of 64 so one 8-byte shared load is a lane's whole A fragment
