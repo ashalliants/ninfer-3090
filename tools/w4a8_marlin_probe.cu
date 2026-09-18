@@ -29,51 +29,43 @@
 //   256 x 512   178 MB     713 MB   891 MB
 //
 // ---------------------------------------------------------------------------------------------
-// RESULT, 2026-09-18: Marlin's structure is worth ~7%, and the two-shape decomposition says why.
+// RESULT, 2026-09-18: the layout axis that pays is *across* rows, not within a group.
 //
-// Best full configuration (128x128, 256 threads, 2 blocks/SM, 3 stages, permuted layout, LOP3
-// dequant, one barrier per stage): 2,901 us / 125.8 TOP/s against the shipped 3,113 / 117.3. The
-// gate was 1,900 / 192, so the layout change is abandoned; TODO.md carries the decision.
+// Marlin's within-group permutation (the original subject of this probe) was worth 1.07x and is
+// documented below as a dead end. The thing it missed: our weights are row-major over K, so a
+// warp's cp.async for one k-group reads sixteen 32-byte fragments **K/2 = 2,560 bytes apart**, i.e.
+// sixteen memory transactions per instruction. PANEL_MAJOR stores each panel of rows' bytes for
+// one k-group contiguously, so that same instruction reads one 512-byte run.
 //
-// **The kernel has two different bottlenecks at two different shapes, and no shape escapes both.**
-// Per-thread accumulator count is BM*BN/THREADS, and 64 fp32 accumulators is what a 128-register
-// budget allows once fragments, addresses and the ring also live there. So a tile wide enough to
-// cut the streamed bytes forces 512 threads, and 512 threads is what wrecks the MMA issue rate.
+//   streaming path alone (ABLATE=2)   2,729 us  ->  1,453 us    1.88x
+//   full kernel, best configuration   2,901 us  ->  2,479 us    1.26x over the shipped 3,113
 //
-//   128x128, 256 threads            128x256, 512 threads
-//   -------------------------       --------------------------
-//   streaming alone   2,729 us      streaming alone   1,376 us
-//   MMAs alone        1,444         MMAs alone        1,704 (1,855 with the barriers)
-//   full              2,901         full              2,966
-//   -> memory bound                 -> issue bound, and the parts are additive
+// Best configuration: 128x128, 256 threads, 2 stages, PANEL=64. Correct at every configuration.
 //
-// The arithmetic we spent this campaign attacking is *not* the problem at the better shape. At
-// 128x128 the whole per-group rescale -- 64 int-to-float converts plus 64 FMAs per thread per
-// group, four ALU ops for every MMA -- is worth **44 us of 2,901** (ABLATE=1, int32 accumulate
-// rescaled once), and per-token activation scales are worth 42 us (ABLATE=7). Both are inside the
-// noise of a kernel sitting on its memory floor. Group-128 scales and per-token scales, the two
-// quality trades Marlin makes and this fork declines, would buy ~1.5% here. They are not the gap.
+// **This re-opens everything the memory floor was masking.** Before, streaming was 2,729 against a
+// 1,444 us MMA floor, so every arithmetic idea measured as noise; per-token activation scales were
+// worth 1.5%. On the new layout streaming is 1,453 against 1,439, roughly 70% of it hides behind
+// the MMAs, and per-token scales are worth **8%** (2,295 us / 159 TOP/s). The remaining stack at
+// the best shape: MMA floor 1,439, rescale ~475, shared reads + decode ~178, exposed streaming
+// ~449. If the rescale went away and streaming hid fully the kernel would be ~1,620 us / 226 TOP/s
+// -- 1.9x the shipped kernel, and past cuBLAS's 1,532 on an easier problem.
 //
-// **What the bytes say.** At 128x128: 1,712 MB of activation re-reads plus 856 MB of weights in
-// 2,729 us is 941 GB/s -- exactly this card's DRAM peak, i.e. no L2 reuse at all, although the
-// 786 KB activation tile is shared by all 164 concurrent blocks and ought to be L2-resident. At
-// 128x256 with 512 threads the same sum runs at 1,555 GB/s, 1.66x DRAM peak, so there the reuse
-// *is* happening. The difference between the two is memory-level parallelism, not bytes: the
-// 256-thread shape cannot keep enough cp.async in flight to reach L2's rate.
+// **PANEL is free to decouple from BM**, which is what makes this shippable: at BM=128 the full
+// kernel measures 2,455 / 2,453 / 2,467 us for PANEL 128 / 64 / 32. One fixed panel size can serve
+// every consumer whatever tile it picks, so this does not weld the artifact to one kernel's BM.
 //
-// So the one live question is whether the 128x256 shape is leaving ~3x of L2 bandwidth unclaimed,
-// and whether its streaming and its MMAs can be made to overlap instead of adding. Both are
-// `dram__bytes` / `lts__t_sectors` / issue-stall reads -- one `ncu` session with the elevation this
-// box needs (ERR_NVGPUCTRPERM), not another blind probe. Until then prefill kernel work is closed.
+// Two implementation notes that cost real time. The panel divide must be hoisted out of the issue
+// lambda -- left inside it is loop-invariant arithmetic competing with the accumulators for
+// registers, and it costs ~30%. And THREADS can exceed BM*2, so the surplus lanes need a guard;
+// without it the wide-tile configurations run off the tile.
 //
-// Byte-minimal shapes do not rescue it either: 256x128 at 512 threads streams the least of any
-// register-legal tile (1,712 MB) and runs 3,220 us, because 70 KB of shared memory drops it to one
-// block per SM.
-//
-// Dead ends recorded so nobody repeats them: half2 scale products underflow (both scales are ~2e-3,
+// Dead ends recorded so nobody repeats them: Marlin's within-group permutation, 1.07x; a grid
+// swizzle grouping row-blocks for L2 reuse, 3,375 us against 2,901 (actively worse); more
+// occupancy -- 24 warps is slower than 16; half2 scale products underflow (both scales are ~2e-3,
 // their product ~6e-6 against fp16's 6.1e-5 smallest normal); hoisting the token scales into
 // registers is worth nothing; independent accumulators for the two k-halves cost 24%; 1024-thread
-// blocks collapse.
+// blocks collapse; 256x128 at 512 threads, the byte-minimal register-legal tile, is worse than
+// both at 3,220 us because 70 KB of shared drops it to one block per SM.
 //
 // Sweep with -DBM_ROWS -DBN_TOKENS -DSTAGES_N -DTHREADS_N -DWARPS_M_N -DABLATE.
 //
@@ -146,6 +138,22 @@ constexpr int GROUPS = K / GROUP;
 #ifndef ABLATE
 #define ABLATE 0
 #endif
+// Row-blocks per rasterisation group; 0 = the plain x-major 2D grid.
+#ifndef SWIZ
+#define SWIZ 0
+#endif
+// 1 = panel-major weights: for one row-tile of BM rows, the BM*32 bytes belonging to one k-group
+// are stored contiguously, so a warp's cp.async reads 512 consecutive bytes instead of sixteen
+// 32-byte fragments 3 KB apart. Row-major (0) is what the artifact stores today.
+#ifndef PANEL_MAJOR
+#define PANEL_MAJOR 0
+#endif
+// Rows per stored panel. Production needs ONE value every consumer agrees on, independent of the
+// tile a given kernel picks, so this is deliberately decoupled from BM: a block whose BM spans
+// several panels reads BM/PANEL contiguous runs instead of one. 0 = tie it to BM.
+#ifndef PANEL_ROWS
+#define PANEL_ROWS 0
+#endif
 
 constexpr int BM      = BM_ROWS;
 constexpr int BN      = BN_TOKENS;
@@ -156,6 +164,8 @@ constexpr int WARPS_N = WARPS / WARPS_M;
 constexpr int MT      = BM / (WARPS_M * 16); // 16-row m-tiles per warp
 constexpr int NT      = BN / (WARPS_N * 8);  // 8-token n-tiles per warp
 constexpr int STAGES  = STAGES_N;
+constexpr int PANEL   = PANEL_ROWS == 0 ? BM_ROWS : PANEL_ROWS;
+static_assert(BM_ROWS % PANEL == 0, "BM must be a whole number of stored panels");
 
 static_assert(BM % (WARPS_M * 16) == 0, "BM must divide into 16-row tiles per warp row");
 static_assert(BN % (WARPS_N * 8) == 0, "BN must divide into 8-token tiles per warp column");
@@ -261,8 +271,25 @@ __global__ __launch_bounds__(THREADS) void w4a8_marlin(const unsigned char* __re
     const int warp_m = warp / WARPS_N;
     const int warp_n = warp % WARPS_N;
 
+    // Rasterisation order. The plain 2D grid launches x-major, so every block resident at once
+    // shares a token tile and streams a *different* slice of the weight -- the weight, which is the
+    // big stream, gets no L2 reuse at all. SWIZ walks SWIZ row-blocks x every token block as one
+    // group, so a resident wave forms a patch that reuses both operands.
+#if SWIZ > 0
+    const int nbm      = gridDim.x;
+    const int nbn      = gridDim.y;
+    const int bid      = blockIdx.x + blockIdx.y * nbm;
+    const int per_grp  = SWIZ * nbn;
+    const int grp      = bid / per_grp;
+    const int first_m  = grp * SWIZ;
+    const int gsize    = (nbm - first_m) < SWIZ ? (nbm - first_m) : SWIZ;
+    const int inner    = bid - grp * per_grp;
+    const int row_block = (first_m + (inner % gsize)) * BM;
+    const int col_block = inner / gsize;
+#else
     const int row_block = blockIdx.x * BM;
     const int col_block = blockIdx.y;
+#endif
 
     const unsigned char* const w_blk = w_perm + static_cast<size_t>(row_block) * (K / 2);
     const char* const x_blk = x_perm + static_cast<size_t>(col_block) * GROUPS * XSTAGE;
@@ -271,10 +298,39 @@ __global__ __launch_bounds__(THREADS) void w4a8_marlin(const unsigned char* __re
     const char* const ws_blk =
         reinterpret_cast<const char*>(w_scales) + static_cast<size_t>(row_block) * GROUPS * 2;
 
+#if PANEL_MAJOR
+    // This lane's global source and shared destination, resolved once. Leaving the panel divide
+    // inside the issue lambda costs ~30% -- it is loop-invariant arithmetic competing with the
+    // accumulators for registers on every group.
+    constexpr int WITER = (BM * 2 + THREADS - 1) / THREADS;
+    const unsigned char* w_lane[WITER];
+    int                  w_dst[WITER];
+#pragma unroll
+    for (int i = 0; i < WITER; ++i) {
+        // THREADS can exceed BM*2, so the surplus lanes must stay idle rather than run off the tile.
+        const int c    = tid + i * THREADS;
+        const int safe = c < BM * 2 ? c : 0;
+        const int row  = safe >> 1;
+        const int half = safe & 1;
+        w_lane[i]      = w_blk + static_cast<size_t>(row / PANEL) * PANEL * (K / 2) +
+                    ((row % PANEL) * 2 + half) * 16;
+        w_dst[i] = c < BM * 2 ? (row * WROW + half * 16) : -1;
+    }
+#endif
+
     auto issue = [&](int g, int buf) {
         char* const dst = s_base + buf * STAGE;
         // W stays packed in shared: half the bytes of the unpacked staging the shipped kernel uses,
         // which is what leaves room for the ring and the wider tile.
+#if PANEL_MAJOR
+#pragma unroll
+        for (int i = 0; i < WITER; ++i) {
+            if (w_dst[i] >= 0) {
+                cp_async16(dst + w_dst[i],
+                           w_lane[i] + static_cast<size_t>(g) * PANEL * (GROUP / 2));
+            }
+        }
+#else
 #pragma unroll
         for (int c = tid; c < BM * 2; c += THREADS) {
             const int row  = c >> 1;
@@ -282,6 +338,7 @@ __global__ __launch_bounds__(THREADS) void w4a8_marlin(const unsigned char* __re
             cp_async16(dst + row * WROW + half * 16,
                        w_blk + static_cast<size_t>(row) * (K / 2) + g * (GROUP / 2) + half * 16);
         }
+#endif
 #pragma unroll
         for (int c = tid; c < XSTAGE / 16; c += THREADS) {
             cp_async16(dst + WSTAGE + c * 16, x_blk + static_cast<size_t>(g) * XSTAGE + c * 16);
@@ -521,7 +578,13 @@ int main() {
     std::vector<unsigned char> hwp(w_bytes);
     for (int row = 0; row < N; ++row) {
         for (int g = 0; g < GROUPS; ++g) {
+#if PANEL_MAJOR
+            unsigned char* dst = &hwp[static_cast<size_t>(row / PANEL) * PANEL * (K / 2) +
+                                      static_cast<size_t>(g) * PANEL * (GROUP / 2) +
+                                      static_cast<size_t>(row % PANEL) * (GROUP / 2)];
+#else
             unsigned char* dst = &hwp[static_cast<size_t>(row) * (K / 2) + g * (GROUP / 2)];
+#endif
             for (int t4 = 0; t4 < 4; ++t4) {
                 for (int word = 0; word < 2; ++word) {
                     for (int j = 0; j < 4; ++j) {
