@@ -7,6 +7,7 @@ add_library(ninfer_artifact STATIC
   binder.cpp
   materializer.cpp
   transcode.cpp
+  permute_row_split.cu
   views.cpp
 )
 ninfer_internal_includes(ninfer_artifact)

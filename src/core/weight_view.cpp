@@ -95,7 +95,7 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
     const auto n       = shape[0];
     const auto k       = shape[1];
     out.padded_columns = k;
-    if (layout == QuantLayout::RowSplit) {
+    if (is_row_split(layout)) {
         std::uint64_t high_per_group = 0;
         switch (format) {
         case QType::Q4_G64_FP16:
@@ -209,6 +209,13 @@ WeightRowPlanes weight_row_planes(const WeightRegion& region) {
     WeightRowPlanes out;
     out.row_begin       = region.begin / g.shape[1];
     out.row_count       = (region.end - region.begin) / g.shape[1];
+    // Slicing a row range is plain pointer arithmetic below, which stays correct under the panel
+    // layout only while the slice starts on a panel boundary. Every row map in the tree splits on a
+    // multiple of 64, so this never fires -- but nothing else enforces it, and a mis-sliced parent
+    // would compute silently wrong rather than fail.
+    if (g.layout == QuantLayout::RowSplitPanel && out.row_begin % kRowSplitPanelRows) {
+        throw std::invalid_argument("panel-major row slice must begin on a panel boundary");
+    }
     out.code_row_bytes  = g.code_bytes_per_row;
     out.high_row_bytes  = g.high_bytes_per_row;
     out.scale_row_bytes = g.scale_bytes_per_row;
@@ -275,7 +282,7 @@ Weight native_weight(const WeightView& view, float input_divisor) {
     out.group                = g.group_size ? dimension(g.group_size) : 0;
     out.weight_scale_divisor = region.parent->weight_scale_divisor;
     out.input_scale_divisor  = input_divisor;
-    if (g.layout == QuantLayout::RowSplit) {
+    if (is_row_split(g.layout)) {
         out.scale_dtype = DType::FP16;
         out.scale_ne[0] = dimension(g.padded_columns / g.group_size);
         out.scale_ne[1] = out.n;

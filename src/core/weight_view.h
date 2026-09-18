@@ -54,6 +54,13 @@ struct WeightGeometry {
                                              std::span<const std::uint64_t> shape);
 [[nodiscard]] std::uint64_t weight_element_count(std::span<const std::uint64_t> shape);
 
+// RowSplitPanel is a permutation of RowSplit's bytes, so every byte-counting question about the
+// two has the same answer. Ask this rather than comparing against RowSplit, or the panel layout
+// silently falls through to "unknown layout".
+[[nodiscard]] constexpr bool is_row_split(QuantLayout layout) {
+    return layout == QuantLayout::RowSplit || layout == QuantLayout::RowSplitPanel;
+}
+
 struct WeightParent {
     WeightGeometry geometry;
     const std::byte* data      = nullptr;

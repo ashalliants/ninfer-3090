@@ -25,6 +25,13 @@ constexpr std::array kLayouts = {
     std::pair{QuantLayout::BlockScaleK16M128x4, std::string_view{"block_scale_k16_m128x4_v1"}},
 };
 
+// Layouts a device may hold but an artifact may never declare. They are produced by a load-time
+// permute, so `parse_layout` deliberately does not see them: a `.ninfer` claiming one would be
+// describing bytes the writer could not have produced.
+constexpr std::array kDeviceLayouts = {
+    std::pair{QuantLayout::RowSplitPanel, std::string_view{"row_split_panel4_v1"}},
+};
+
 } // namespace
 
 QType parse_format(std::string_view name) {
@@ -50,6 +57,9 @@ std::string_view format_name(QType format) noexcept {
 
 std::string_view layout_name(QuantLayout layout) noexcept {
     for (const auto& [value, spelling] : kLayouts) {
+        if (value == layout) { return spelling; }
+    }
+    for (const auto& [value, spelling] : kDeviceLayouts) {
         if (value == layout) { return spelling; }
     }
     return {};
