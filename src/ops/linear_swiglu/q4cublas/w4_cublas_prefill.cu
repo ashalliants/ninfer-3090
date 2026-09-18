@@ -142,17 +142,27 @@ __global__ void fill_ones(float* __restrict__ out, int count) {
     if (i < count) { out[i] = 1.0F; }
 }
 
+// One thread per channel walking every token leaves k/256 blocks -- twenty of them for this model,
+// on an eighty-two SM card -- so the grid is two-dimensional and the token axis is split across
+// blocks that combine with an atomic. For non-negative floats the IEEE bit pattern is monotonic, so
+// an integer atomicMax is an atomicMax on the value.
 __global__ void channel_absmax(const __nv_bfloat16* __restrict__ x, int k, int tokens,
-                               float* __restrict__ absmax, float* __restrict__ log_sum) {
+                               float* __restrict__ absmax) {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= k) { return; }
     float peak = 0.0F;
-    for (int t = 0; t < tokens; ++t) {
+    for (int t = blockIdx.y; t < tokens; t += gridDim.y) {
         peak = fmaxf(peak, fabsf(__bfloat162float(x[static_cast<std::size_t>(t) * k + j])));
     }
-    absmax[j] = peak;
-    // A sum of logs rather than a product: k is thousands of terms and the product underflows.
-    atomicAdd(log_sum, logf(fmaxf(peak, 1e-20F)));
+    atomicMax(reinterpret_cast<unsigned*>(absmax) + j, __float_as_uint(peak));
+}
+
+// A sum of logs rather than a product: k is thousands of terms and the product underflows.
+__global__ void channel_log_sum(const float* __restrict__ absmax, int k,
+                                float* __restrict__ log_sum) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= k) { return; }
+    atomicAdd(log_sum, logf(fmaxf(absmax[j], 1e-20F)));
 }
 
 __global__ void channel_scales(const float* __restrict__ absmax, const float* __restrict__ log_sum,
@@ -316,8 +326,15 @@ void prepare_activations(const Tensor& x, std::int32_t tokens, std::int32_t k, c
     const int chan_blocks = (k + 255) / 256;
     if (alpha > 0.0F) {
         CUDA_CHECK(cudaMemsetAsync(s.reduction, 0, sizeof(float), stream));
-        channel_absmax<<<chan_blocks, 256, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data), k,
-                                                        tokens, s.group_peak, s.reduction);
+        CUDA_CHECK(cudaMemsetAsync(s.group_peak, 0, static_cast<std::size_t>(k) * sizeof(float),
+                                   stream));
+        // Enough token slices to fill the card, but never more than there are tokens.
+        const int token_slices = std::min(tokens, 64);
+        const dim3 absmax_grid(static_cast<unsigned>(chan_blocks),
+                               static_cast<unsigned>(token_slices));
+        channel_absmax<<<absmax_grid, 256, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), k, tokens, s.group_peak);
+        channel_log_sum<<<chan_blocks, 256, 0, stream>>>(s.group_peak, k, s.reduction);
         channel_scales<<<chan_blocks, 256, 0, stream>>>(s.group_peak, s.reduction, k, alpha,
                                                         s.channel_scale);
     } else {
