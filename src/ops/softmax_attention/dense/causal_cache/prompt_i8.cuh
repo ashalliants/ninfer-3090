@@ -48,6 +48,36 @@
 #define NINFER_QUANTISE_P(x) (x)
 #endif
 
+// Ablations for sizing the INT8 PV work. Numerically meaningless, timing only.
+//   1 = skip the PV mma (everything else runs: QK, softmax, the V dequant, the epilogue)
+//   2 = skip the V dequant as well, which is the staging an INT8 PV would delete outright
+//
+// VERDICT, 2026-09-19: **do not do it**, and this is the measurement that says so. At 25,600
+// context, 4096 tokens:
+//
+//   full kernel              51,621 us
+//     PV mma (fp16)          14,263 us  27.6%
+//     V dequant to fp16       2,891 us   5.6%
+//     QK + softmax + rest    34,467 us  66.8%
+//
+// The reasoning that motivated this was that PV carries ~80% of the *tensor-core* time, being on a
+// path four times slower than QK's with identical FLOPs. That is true and it is not the point: this
+// kernel is only about a third tensor-bound, so PV is 27.6% of the wall clock, not 80%. Even a
+// perfect 4x on the mma plus a free replacement for the dequant leaves attention at 1.36x, which is
+// +11.6% on a 51k prefill and +1.4% on a 4k one, since attention is 39% of the former and 5% of the
+// latter. That is not worth a rewrite of the most delicate kernel in the engine.
+//
+// What it *would* take is attacking the other 66.8% -- QK, the online softmax's transcendentals,
+// the KV staging and the epilogue -- which is a different and much larger piece of work.
+//
+// The precision question was settled first and separately, and favourably (see
+// NINFER_SIMULATE_INT8_P above): int8 probabilities improve perplexity. The idea died on
+// throughput, not on quality, so if the kernel's structure ever changes enough to make PV dominant,
+// the precision half of the argument is already banked.
+#ifndef NINFER_PROMPT_I8_ABLATE
+#define NINFER_PROMPT_I8_ABLATE 0
+#endif
+
 #ifndef NINFER_PROMPT_I8_MAXNREG
 #define NINFER_PROMPT_I8_MAXNREG 120
 #endif
@@ -465,6 +495,9 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
                     }
                     vs = __shfl_sync(FullMask, vs, lane & ~(VLanesPerGroup - 1));
                     const float vsf = __half2float(vs);
+#if NINFER_PROMPT_I8_ABLATE >= 2
+                    store_vec(dst, make_int4(0, 0, 0, 0));
+#else
                     if constexpr (PackedValues) {
                         store_vec(dst, kv_cache_int4_dequant_f16x8_from(
                                            reinterpret_cast<const std::uint8_t*>(v_i8) +
@@ -474,6 +507,7 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
                         store_vec(dst,
                                   kv_cache_int8_dequant_f16x8_from(&v_i8[key_l * D + d], vsf));
                     }
+#endif
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));
                 }
@@ -512,8 +546,12 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
                 const int vcol = global_n * 8;
                 ldmatrix_x2_t(vf[0], vf[1],
                               smem_addr(&v_f16[vrow * D + causal_prompt_swz(vrow, vcol)]));
+#if NINFER_PROMPT_I8_ABLATE == 0
                 mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
                         vf[0], vf[1]);
+#else
+                acc[n][0] += static_cast<float>(vf[0] & 1u); // keep the loads live
+#endif
             }
         }
         if (has_next) { ninfer::ops::cp_wait<0>(); }
