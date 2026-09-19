@@ -5,7 +5,7 @@
 Both are measured, both are large, and both are deliberately parked until INT8 PV lands, because
 that change touches the same rounds and should be proven first.
 
-**1. DFlash2 at a large draft window is 2.25x the config we publish.** Measured at `-pg 4096,256`,
+**1. DONE 2026-09-19: DFlash2 at K=7 is 1.39x the config we published.** Measured at `-pg 4096,256`,
 kv int8, on one 3090:
 
   | config | decode tok/s | acceptance |
@@ -23,17 +23,25 @@ kv int8, on one 3090:
   acceptance the expected run saturates at 1/(1-0.868) = 7.6 tokens, which is why K=13 -> 15 moved
   only 319 -> 326.
 
-  Action: re-point `scripts/benchmark-qwen38-3090.*` and
-  `tools/bench/run_qwen38_windows_3090_benchmarks.py` from `--spec mtp --draft-tokens 3` to DFlash2
-  at a large K, **after** confirming on real chat prompts rather than the bench corpus -- acceptance
-  is workload-dependent and this corpus is natural-text continuation. Costs 18.33 GiB of weights
-  against 15.92 plus a 288 MiB graph allowance, which will bite at the context ceiling.
+  **Confirming it on real generation changed the answer, and this is why the corpus was not
+  enough.** Three prompts -- a reasoning question, a code question, a summarisation -- greedy, 400
+  tokens, mean tok/s: MTP3 124.3, MTP5 145.9, **DFlash2 K=7 172.3**, DFlash2 K=15 156.3. The
+  synthetic corpus says K=15 (326 against 249 for K=7) because it continues itself and acceptance
+  stays high; on real generation the extra columns stop being accepted and are paid for anyway, so
+  **K=15 loses to K=7**. The 2.25x above is a corpus artefact; the real number is 1.39x.
 
-**2. Context-lookup drafting belongs on the DFlash2 path, not the MTP one.** `--lookup-ngram` is
-implemented and hooks the MTP branch only, where it is worth ~3-5% because that drafter already
-accepts 95-96% and a perfect drafter is capped at +13%. DFlash2 at K=15 accepts 0.868, so its
-ceiling is 16 tokens per round against the 6.8 it gets -- **2.3x** -- and lookup delivers acceptance
-1.0 whenever it fires. That is where the remaining decode headroom is.
+  Done: the sweep now defaults to `--spec dflash2 --draft-tokens 7`, with the model default
+  following the backend so the two cannot drift apart, and `NINFER_BENCH_SPEC=mtp` to go back. Costs
+  18.33 GiB of weights against 15.92 plus a 288 MiB graph allowance, which will bite at the context
+  ceiling. Still unverified: whether DFlash2 keeps its lead at C2-C8, where batching already
+  amortises the weight sweep that speculation is exploiting.
+
+**2. Context-lookup drafting on the DFlash2 path -- smaller than it first looked.**
+`--lookup-ngram` is implemented and hooks the MTP branch only, where it is worth ~3-5% because that
+drafter already accepts 95-96%. The case for moving it to DFlash2 was K=15's 0.868 acceptance and a
+2.3x ceiling -- but K=15 is not the operating point on real generation, and at K=7 acceptance is
+0.95, which caps a perfect drafter at **+19%**. Worth doing, worth maybe half that in practice, and
+no longer the largest thing on this list.
 
 ## Open after the 2026-09-17 upstream catch-up (v3 artifacts, `src/models/qwen3_5`)
 

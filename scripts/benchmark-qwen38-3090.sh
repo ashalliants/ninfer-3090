@@ -13,12 +13,19 @@ START_DELAY_SECONDS="${NINFER_BENCH_START_DELAY:-10}"
 # 4.349944 on the 1M corpus). Set to 0 to measure the default-quality engine instead. The chunk
 # follows it, because the route only amortises its weight-sized dequantise over a call's tokens,
 # and at this sweep's usual 512 it is a loss.
+# DFlash2 at K=7 measured 172.3 tok/s against MTP3's 124.3 on realistic generation, so 1.39x. It
+# needs the artifact carrying the draft model (18.33 GiB of weights against 15.92), which the model
+# default below follows. K is workload-dependent: K=15 beats K=7 on the synthetic corpus and loses
+# to it on real generation, so tune it against the workload being sold.
+SPEC="${NINFER_BENCH_SPEC:-dflash2}"
+DRAFT_TOKENS="${NINFER_BENCH_DRAFT_TOKENS:-}"
 PREFILL_CUBLAS="${NINFER_BENCH_PREFILL_CUBLAS:-1}"
 PREFILL_CHUNK="${NINFER_BENCH_PREFILL_CHUNK:-}"
 # ==================================================================
 
 repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-model="${NINFER_BENCH_MODEL:-${NINFER_MODEL_DIR:-$repo/..}/qwen3_8_27b.ninfer}"
+if [[ "$SPEC" == 'dflash2' ]]; then default_model='qwen3_8_27b_dflash2.ninfer'; else default_model='qwen3_8_27b.ninfer'; fi
+model="${NINFER_BENCH_MODEL:-${NINFER_MODEL_DIR:-$repo/..}/$default_model}"
 server="${NINFER_BENCH_SERVER:-$repo/build-linux/apps/ninfer-serve}"
 
 if [[ ! -x "$server" ]]; then
@@ -38,6 +45,7 @@ printf '  Shared context : %s tokens (C1 full; C8 capped at 8K per request)\n' "
 printf '  Decode output  : %s tokens\n' "$OUTPUT_TOKENS"
 printf '  Cohorts        : %s\n' "$COHORTS"
 printf '  KV cache       : %s\n' "$KV_DTYPE"
+printf '  Speculation    : %s%s\n' "$SPEC" "${DRAFT_TOKENS:+ K=$DRAFT_TOKENS}"
 if [[ "$PREFILL_CUBLAS" != '0' ]]; then
   printf '  Prefill route  : cuBLAS, +0.156%% perplexity (NINFER_BENCH_PREFILL_CUBLAS=0 for the default engine)\n'
 else
@@ -58,6 +66,8 @@ NINFER_BENCH_OUTPUT_TOKENS="$OUTPUT_TOKENS" \
 NINFER_BENCH_PREFILL_CHARS="$PREFILL_PROMPT_CHARACTERS" \
 NINFER_BENCH_COHORTS="$COHORTS" \
 NINFER_BENCH_KV_DTYPE="$KV_DTYPE" \
+NINFER_BENCH_SPEC="$SPEC" \
+${DRAFT_TOKENS:+NINFER_BENCH_DRAFT_TOKENS="$DRAFT_TOKENS"} \
 NINFER_BENCH_PREFILL_CUBLAS="$PREFILL_CUBLAS" \
 ${PREFILL_CHUNK:+NINFER_BENCH_PREFILL_CHUNK="$PREFILL_CHUNK"} \
   uv run tools/bench/run_qwen38_windows_3090_benchmarks.py

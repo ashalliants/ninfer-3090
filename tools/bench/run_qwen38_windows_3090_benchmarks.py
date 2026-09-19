@@ -16,12 +16,26 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SERVER = Path(os.environ.get("NINFER_BENCH_SERVER", ROOT / "build-sm86-replayssm/apps/Release/ninfer-serve.exe"))
-MODEL = Path(os.environ.get("NINFER_BENCH_MODEL", ROOT.parent / "qwen3_8_27b.ninfer"))
+# DFlash2 needs the artifact that carries the draft model, which is a different file and 18.33 GiB
+# of weights against 15.92. The default follows the backend so the two cannot drift apart.
+_DEFAULT_MODEL = "qwen3_8_27b_dflash2.ninfer" if os.environ.get(
+    "NINFER_BENCH_SPEC", "dflash2") == "dflash2" else "qwen3_8_27b.ninfer"
+MODEL = Path(os.environ.get("NINFER_BENCH_MODEL", ROOT.parent / _DEFAULT_MODEL))
 MAX_CONTEXT = int(os.environ.get("NINFER_BENCH_MAX_CONTEXT", "65536"))
 OUTPUT_TOKENS = int(os.environ.get("NINFER_BENCH_OUTPUT_TOKENS", "1024"))
 PREFILL_PROMPT_CHARACTERS = int(os.environ.get("NINFER_BENCH_PREFILL_CHARS", "28000"))
 COHORTS = tuple(int(value) for value in os.environ.get("NINFER_BENCH_COHORTS", "1,2,4,8").split(","))
 KV_DTYPE = os.environ.get("NINFER_BENCH_KV_DTYPE", "int8")
+# Speculative backend and draft window. DFlash2 at K=7 measured 172.3 tok/s against MTP3's 124.3 on
+# realistic single-stream generation -- a reasoning, a code and a summarisation prompt, greedy, 400
+# tokens each -- so 1.39x, and it is the configuration this sweep should be measuring.
+#
+# K is workload-dependent and 7 is not the largest that ever wins: on the synthetic bench corpus
+# K=15 reaches 326 tok/s where K=7 reaches 249, because that corpus continues itself and acceptance
+# stays high. On real generation K=15 *loses* to K=7 (156.3 against 172.3): the extra columns stop
+# being accepted and are paid for anyway. Tune K against the workload being sold, not a corpus.
+SPEC = os.environ.get("NINFER_BENCH_SPEC", "dflash2")
+DRAFT_TOKENS = os.environ.get("NINFER_BENCH_DRAFT_TOKENS", "7" if SPEC == "dflash2" else "3")
 # The cuBLAS prefill route, and the chunk it needs to pay for itself. Its dequantise pass is
 # weight-sized, so it only amortises over the tokens in a call: at the 512-token chunk this sweep
 # otherwise uses it is a loss, and the two settings have to move together. It costs +0.156%
@@ -100,7 +114,7 @@ def run_round(name: str, prompt: str, max_tokens: int, cohort: int) -> dict:
         "--max-context", str(context_per_request), "--kv-capacity", str(kv_capacity),
         "--max-concurrency", str(cohort), "--max-pending-requests", "8",
         "--pending-timeout-ms", "900000", "--prefill-chunk", PREFILL_CHUNK,
-        "--kv-dtype", KV_DTYPE, "--spec", "mtp", "--draft-tokens", "3",
+        "--kv-dtype", KV_DTYPE, "--spec", SPEC, "--draft-tokens", DRAFT_TOKENS,
         "--lm-head-draft", "--greedy", "--no-prefix-reuse",
         "--request-log-jsonl", str(request_log),
     ]
