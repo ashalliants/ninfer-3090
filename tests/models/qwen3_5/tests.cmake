@@ -111,3 +111,7 @@ ninfer_add_test(ninfer_qwen3_5_mtp_graph_profiles_test
 ninfer_add_test(ninfer_qwen3_5_mlp_a8_decode_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mlp_a8_decode_wiring.cpp"
   LIBRARIES ninfer_model_runtime ninfer_ops)
+
+ninfer_add_test(ninfer_qwen3_5_lookup_draft_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lookup_draft.cpp"
+  LIBRARIES ninfer_core)

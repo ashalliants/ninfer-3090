@@ -15,6 +15,13 @@
 
 #include <cstdint>
 
+// Swept on sm_86: the shipped 120 comes from an SM120 tuning note, and shared memory (93,184 B of
+// the 99 KiB budget) pins this kernel to one CTA per SM on either card, so registers cannot buy
+// occupancy here -- only fewer spills. 512 threads x 128 registers is exactly the 65,536 file.
+#ifndef NINFER_PROMPT_I8_MAXNREG
+#define NINFER_PROMPT_I8_MAXNREG 120
+#endif
+
 namespace ninfer::ops {
 
 inline constexpr int kCausalPromptI8Warps      = 16;
@@ -72,7 +79,7 @@ static_assert(kCausalPromptI8SmemBytes == 93184);
 // half of the same V slot the INT8 coding uses, so the shared-memory footprint and therefore the
 // occupancy of both instantiations are identical; only the global traffic halves.
 template <typename Geometry, typename Metadata, bool PackedValues = false>
-__global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
+__global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8_kernel(
     const __nv_bfloat16* __restrict__ q, const std::int8_t* __restrict__ cache_k,
     const std::int8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
     const __half* __restrict__ cache_v_scale, Metadata metadata,

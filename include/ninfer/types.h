@@ -97,6 +97,12 @@ struct SpeculativeOptions {
     // Startup-fixed K: MTP 1..5; DFlash and DFlash2 1..15 (query width K+1).
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
+    // Context-lookup drafting: match this many trailing tokens against the sequence so far and
+    // propose whatever followed the last time they appeared. 0 disables it. It costs no device
+    // work, it is exact (verify rejects a wrong guess), and it is strongest exactly where a draft
+    // head is weakest -- output that repeats the input. Used as a draft source alongside the
+    // configured backend, preferred whenever it finds a match.
+    std::uint32_t lookup_ngram = 0;
 };
 
 enum class StartupPhase : std::uint8_t {

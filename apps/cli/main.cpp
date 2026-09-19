@@ -290,6 +290,7 @@ int main(int argc, char** argv) {
         engine_options.gdn_state_fp16           = cli.gdn_state_fp16;
         engine_options.mlp_a8_decode            = cli.mlp_a8_decode;
         engine_options.prefill_a8               = cli.prefill_a8;
+        engine_options.speculative.lookup_ngram     = cli.lookup_ngram;
         engine_options.prefill_cublas               = cli.prefill_cublas;
         engine_options.prefill_cublas_projections               = cli.prefill_cublas_projections;
         // One CLI invocation owns exactly one request, so retained cross-request context has no

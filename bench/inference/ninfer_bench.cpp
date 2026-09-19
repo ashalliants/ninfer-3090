@@ -158,6 +158,7 @@ int main(int argc, char** argv) {
         engine_options.speculative           = options.speculative;
         engine_options.use_cuda_graph        = options.use_cuda_graph;
         engine_options.prefill_a8            = options.prefill_a8;
+        engine_options.speculative.lookup_ngram  = options.lookup_ngram;
         engine_options.prefill_cublas            = options.prefill_cublas;
         engine_options.prefill_cublas_projections            = options.prefill_cublas_projections;
 

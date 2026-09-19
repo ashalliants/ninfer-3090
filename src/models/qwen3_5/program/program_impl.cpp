@@ -97,7 +97,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       context_cache(plan.context_cache),
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
-      prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
+      prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window), lookup_ngram(plan.lookup_ngram),
       speculative_backend(plan.speculative_backend), kv_storage(plan.kv_storage),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), causal_scoring(plan.causal_scoring),
