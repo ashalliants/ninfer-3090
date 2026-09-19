@@ -10,10 +10,11 @@ set "KV_DTYPE=rk8v4"
 REM Hands wide prefill GEMMs to cuBLAS: about 1.73x prefill for +0.156%% perplexity (4.343155 ->
 REM 4.349944 on the 1M corpus). Set to 0 to measure the default-quality engine instead. The chunk
 REM follows it, because the route only amortises its weight-sized dequantise over a call's tokens.
-REM DFlash2 at K=7 measured 172.3 tok/s against MTP3's 124.3 on realistic generation, so 1.39x.
-REM It needs the artifact carrying the draft model. K is workload-dependent: K=15 wins on the
-REM synthetic corpus and loses on real generation, so tune it against the workload being sold.
-set "SPEC=dflash2"
+REM This sweep stays on MTP3. DFlash2 at K=7 is much faster single-stream but measured through the
+REM serve path it wins only at C1 (97.7/147.5/187.8 aggregate tok/s at C1/C2/C4 against MTP3's
+REM 91.6/153.3/223.1) and at C8 it fails to start, its draft weights leaving too little for the
+REM runtime reservation. Set SPEC=dflash2 to measure it anyway; expect a win only at C1.
+set "SPEC=mtp"
 set "DRAFT_TOKENS="
 set "PREFILL_CUBLAS=1"
 set "PREFILL_CHUNK="

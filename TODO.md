@@ -5,7 +5,7 @@
 Both are measured, both are large, and both are deliberately parked until INT8 PV lands, because
 that change touches the same rounds and should be proven first.
 
-**1. DONE 2026-09-19: DFlash2 at K=7 is 1.39x the config we published.** Measured at `-pg 4096,256`,
+**1. RESOLVED 2026-09-19: DFlash2 is a single-stream optimisation only, and the sweep stays on MTP3.** Measured at `-pg 4096,256`,
 kv int8, on one 3090:
 
   | config | decode tok/s | acceptance |
@@ -30,11 +30,27 @@ kv int8, on one 3090:
   stays high; on real generation the extra columns stop being accepted and are paid for anyway, so
   **K=15 loses to K=7**. The 2.25x above is a corpus artefact; the real number is 1.39x.
 
-  Done: the sweep now defaults to `--spec dflash2 --draft-tokens 7`, with the model default
-  following the backend so the two cannot drift apart, and `NINFER_BENCH_SPEC=mtp` to go back. Costs
-  18.33 GiB of weights against 15.92 plus a 288 MiB graph allowance, which will bite at the context
-  ceiling. Still unverified: whether DFlash2 keeps its lead at C2-C8, where batching already
-  amortises the weight sweep that speculation is exploiting.
+  **And then the cohort measurement reversed the decision.** Through the serve path, aggregate
+  tok/s:
+
+  | C | MTP3 | DFlash2 K=7 | change |
+  |---:|---:|---:|---:|
+  | 1 | 91.6 | 97.7 | +6.7% |
+  | 2 | 153.3 | 147.5 | -3.8% |
+  | 4 | 223.1 | 187.8 | -15.8% |
+  | 8 | 265.8 | **fails to start** | - |
+
+  The mechanism that makes speculation pay is that a multi-column round costs about one sweep of the
+  weights -- and batching already amortises that sweep across lanes, so the advantage shrinks and
+  then inverts as the extra columns become pure cost. At C8 it does not start at all: the draft
+  model's weights are 18.3 GiB against 16.7, and the runtime reservation needs 4.64 GB where 3.78 GB
+  remains.
+
+  So the sweep stays on MTP3, which is what it was; `NINFER_BENCH_SPEC=dflash2` measures the other
+  arm. The single-stream win is real and large (172.3 against 124.3 tok/s through the CLI) and
+  belongs in the CLI's documentation rather than a cohort benchmark's default. Note also that the
+  CLI's 1.39x is only 1.07x through the serve path at C1 -- worth understanding before quoting
+  either number as *the* decode figure.
 
 **3. Adaptive draft window: the signal is free, acting on it is not.** Worth writing down because
 the idea is obvious and the obstacle is not.

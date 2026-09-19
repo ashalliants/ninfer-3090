@@ -13,11 +13,14 @@ START_DELAY_SECONDS="${NINFER_BENCH_START_DELAY:-10}"
 # 4.349944 on the 1M corpus). Set to 0 to measure the default-quality engine instead. The chunk
 # follows it, because the route only amortises its weight-sized dequantise over a call's tokens,
 # and at this sweep's usual 512 it is a loss.
-# DFlash2 at K=7 measured 172.3 tok/s against MTP3's 124.3 on realistic generation, so 1.39x. It
-# needs the artifact carrying the draft model (18.33 GiB of weights against 15.92), which the model
-# default below follows. K is workload-dependent: K=15 beats K=7 on the synthetic corpus and loses
-# to it on real generation, so tune it against the workload being sold.
-SPEC="${NINFER_BENCH_SPEC:-dflash2}"
+# This sweep stays on MTP3. DFlash2 at K=7 is much faster single-stream -- 172.3 tok/s against
+# MTP3's 124.3 through the CLI -- but measured through the serve path at the cohort levels this
+# sweep runs, it wins only at C1: aggregate tok/s C1/C2/C4 of 97.7/147.5/187.8 against MTP3's
+# 91.6/153.3/223.1, and at C8 it fails to start because the draft model's extra weights leave too
+# little for the runtime reservation. Batching already amortises the weight sweep that speculation
+# exploits, so the extra columns become pure cost as concurrency rises.
+# Set NINFER_BENCH_SPEC=dflash2 to measure it anyway, and expect a win only at C1.
+SPEC="${NINFER_BENCH_SPEC:-mtp}"
 DRAFT_TOKENS="${NINFER_BENCH_DRAFT_TOKENS:-}"
 PREFILL_CUBLAS="${NINFER_BENCH_PREFILL_CUBLAS:-1}"
 PREFILL_CHUNK="${NINFER_BENCH_PREFILL_CHUNK:-}"

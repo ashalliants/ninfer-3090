@@ -19,16 +19,32 @@ SERVER = Path(os.environ.get("NINFER_BENCH_SERVER", ROOT / "build-sm86-replayssm
 # DFlash2 needs the artifact that carries the draft model, which is a different file and 18.33 GiB
 # of weights against 15.92. The default follows the backend so the two cannot drift apart.
 _DEFAULT_MODEL = "qwen3_8_27b_dflash2.ninfer" if os.environ.get(
-    "NINFER_BENCH_SPEC", "dflash2") == "dflash2" else "qwen3_8_27b.ninfer"
+    "NINFER_BENCH_SPEC", "mtp") == "dflash2" else "qwen3_8_27b.ninfer"
 MODEL = Path(os.environ.get("NINFER_BENCH_MODEL", ROOT.parent / _DEFAULT_MODEL))
 MAX_CONTEXT = int(os.environ.get("NINFER_BENCH_MAX_CONTEXT", "65536"))
 OUTPUT_TOKENS = int(os.environ.get("NINFER_BENCH_OUTPUT_TOKENS", "1024"))
 PREFILL_PROMPT_CHARACTERS = int(os.environ.get("NINFER_BENCH_PREFILL_CHARS", "28000"))
 COHORTS = tuple(int(value) for value in os.environ.get("NINFER_BENCH_COHORTS", "1,2,4,8").split(","))
 KV_DTYPE = os.environ.get("NINFER_BENCH_KV_DTYPE", "int8")
-# Speculative backend and draft window. DFlash2 at K=7 measured 172.3 tok/s against MTP3's 124.3 on
-# realistic single-stream generation -- a reasoning, a code and a summarisation prompt, greedy, 400
-# tokens each -- so 1.39x, and it is the configuration this sweep should be measuring.
+# Speculative backend and draft window. **This sweep stays on MTP3, and the reason is the point.**
+#
+# DFlash2 at K=7 is much faster single-stream -- 172.3 tok/s against MTP3's 124.3 through the CLI on
+# realistic prompts -- and it was briefly the default here. Measured through the serve path at the
+# cohort levels this sweep actually runs, it is the wrong choice:
+#
+#   C        MTP3   DFlash2 K=7   change
+#   1        91.6          97.7    +6.7%
+#   2       153.3         147.5    -3.8%
+#   4       223.1         187.8   -15.8%
+#   8       265.8   fails to start
+#
+# Speculation pays because a multi-column round costs about one sweep of the weights; batching
+# already amortises that sweep across lanes, so the advantage shrinks and then inverts as the extra
+# columns become pure cost. At C8 it does not even start: the draft model's weights are 18.3 GiB
+# against 16.7, and the runtime reservation needs 4.64 GB where 3.78 GB is left.
+#
+# So DFlash2 is a single-stream optimisation. Set NINFER_BENCH_SPEC=dflash2 to measure it, and
+# expect it to win only at C1.
 #
 # Swept on realistic generation (mean of a reasoning, a code and a summarisation prompt, greedy,
 # 400 tokens, one run per cell):
@@ -50,7 +66,7 @@ KV_DTYPE = os.environ.get("NINFER_BENCH_KV_DTYPE", "int8")
 #
 # The synthetic bench corpus is no guide at all here: it picks K=15 (326 tok/s against 249 for K=7)
 # because it continues itself and acceptance stays high fifteen tokens out.
-SPEC = os.environ.get("NINFER_BENCH_SPEC", "dflash2")
+SPEC = os.environ.get("NINFER_BENCH_SPEC", "mtp")
 DRAFT_TOKENS = os.environ.get("NINFER_BENCH_DRAFT_TOKENS", "7" if SPEC == "dflash2" else "3")
 # The cuBLAS prefill route, and the chunk it needs to pay for itself. Its dequantise pass is
 # weight-sized, so it only amortises over the tokens in a call: at the 512-token chunk this sweep
