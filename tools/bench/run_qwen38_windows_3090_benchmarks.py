@@ -30,10 +30,26 @@ KV_DTYPE = os.environ.get("NINFER_BENCH_KV_DTYPE", "int8")
 # realistic single-stream generation -- a reasoning, a code and a summarisation prompt, greedy, 400
 # tokens each -- so 1.39x, and it is the configuration this sweep should be measuring.
 #
-# K is workload-dependent and 7 is not the largest that ever wins: on the synthetic bench corpus
-# K=15 reaches 326 tok/s where K=7 reaches 249, because that corpus continues itself and acceptance
-# stays high. On real generation K=15 *loses* to K=7 (156.3 against 172.3): the extra columns stop
-# being accepted and are paid for anyway. Tune K against the workload being sold, not a corpus.
+# Swept on realistic generation (mean of a reasoning, a code and a summarisation prompt, greedy,
+# 400 tokens, one run per cell):
+#
+#   K        3      4      5      6      7      8      9     10     12
+#   mean   128.0  146.0  159.0  169.6  172.3  163.7  163.3  160.2  159.2
+#
+# The peak is at 7, with 6 close behind and a decline past 8. That matches the published shape --
+# E[tokens/round] = (1 - a^(K+1))/(1 - a), with the optimum rising with the acceptance rate a and
+# diminishing returns reported at 5-8 for EAGLE-class drafters -- and it matches the mechanism here,
+# where a round costs about one sweep of the weights so extra columns are nearly free until they
+# stop being accepted.
+#
+# **The optimum is per-workload, and the mean hides it.** The reasoning prompt keeps improving to
+# K=12 (204.5, the best single cell in the sweep) while the summarisation prompt collapses there
+# (119.6 against 158.1 at K=7). Predictable structured output sustains acceptance far out; prose
+# does not. 7 is the best compromise, not a constant of nature -- a deployment serving one kind of
+# work should sweep its own.
+#
+# The synthetic bench corpus is no guide at all here: it picks K=15 (326 tok/s against 249 for K=7)
+# because it continues itself and acceptance stays high fifteen tokens out.
 SPEC = os.environ.get("NINFER_BENCH_SPEC", "dflash2")
 DRAFT_TOKENS = os.environ.get("NINFER_BENCH_DRAFT_TOKENS", "7" if SPEC == "dflash2" else "3")
 # The cuBLAS prefill route, and the chunk it needs to pay for itself. Its dequantise pass is
