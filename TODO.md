@@ -36,6 +36,34 @@ kv int8, on one 3090:
   ceiling. Still unverified: whether DFlash2 keeps its lead at C2-C8, where batching already
   amortises the weight sweep that speculation is exploiting.
 
+**3. Adaptive draft window: the signal is free, acting on it is not.** Worth writing down because
+the idea is obvious and the obstacle is not.
+
+  The engine already reads `accepted_drafts` and `licensed_counts` back to the host every round, so a
+  running per-sequence acceptance estimate costs nothing, and the optimal K for a given acceptance
+  has a closed form. What is not free is *acting* on it: within a captured graph the round executes
+  K+1 columns whatever the live extent, because the tail is masked by `target_valid_columns` rather
+  than skipped. Shrinking the extent therefore saves no time at all.
+
+  Over-drafting does cost real time, which is what makes this tempting. On a low-acceptance workload
+  K = 3/7/12 measures 58.9/53.2/46.1 tok/s -- **28% between K=3 and K=12** -- but the only thing that
+  moved there was the *captured* K, not the extent.
+
+  So adaptation means several captured graph profiles selected per round. Profiles are already keyed
+  on (batch size, frontier bucket); adding a K dimension multiplies the captured set against a fixed
+  graph allowance (128 MiB at `-p 512 -n 8`, 288 MiB with more shapes). And at C>1 the lanes share
+  one graph, so they must agree on a K -- the max wastes the low-acceptance lanes, the min wastes the
+  high -- which erodes the benefit exactly as concurrency rises.
+
+  **Prize, honestly**: perfect *per-prompt* selection is only +1.5% over fixed K=7 on the three
+  prompts swept, because 7 is already optimal for two of them. Per-*round* adaptation should be worth
+  more, since acceptance varies within a generation and the low-acceptance spread is 28%, but that is
+  an extrapolation rather than a measurement.
+
+  **Cheapest version worth trying first**: two profiles, not N -- capture at K=3 and K=7, switch on
+  one acceptance threshold. The curve is flat in the middle, so two points take most of the spread
+  for one extra graph and one bit of per-sequence state.
+
 **2. Context-lookup drafting on the DFlash2 path -- smaller than it first looked.**
 `--lookup-ngram` is implemented and hooks the MTP branch only, where it is worth ~3-5% because that
 drafter already accepts 95-96%. The case for moving it to DFlash2 was K=15's 0.868 acceptance and a
