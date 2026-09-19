@@ -1,5 +1,40 @@
 # TODO
 
+## Decode: two proven wins waiting on the attention work, 2026-09-19
+
+Both are measured, both are large, and both are deliberately parked until INT8 PV lands, because
+that change touches the same rounds and should be proven first.
+
+**1. DFlash2 at a large draft window is 2.25x the config we publish.** Measured at `-pg 4096,256`,
+kv int8, on one 3090:
+
+  | config | decode tok/s | acceptance |
+  |---|---:|---:|
+  | plain, no speculation | 45.1 | - |
+  | **MTP3 -- what the scripts and published numbers use** | 144.9 | 0.96 |
+  | MTP5 | 182.7 | 0.95 |
+  | DFlash2 K=7 | 249.3 | 0.95 |
+  | **DFlash2 K=15** | **326.2** | 0.87 |
+
+  The mechanism, which explains the size of it: a 16-column verify round takes 20.9 ms against a
+  22.2 ms one-column plain step, because decode is memory bound at ~87% of roofline and both are
+  one sweep of the 15.9 GiB of weights. **Extra columns are nearly free; acceptance is the only
+  thing that converts them into tokens.** It also says where it stops -- at 0.868 per-token
+  acceptance the expected run saturates at 1/(1-0.868) = 7.6 tokens, which is why K=13 -> 15 moved
+  only 319 -> 326.
+
+  Action: re-point `scripts/benchmark-qwen38-3090.*` and
+  `tools/bench/run_qwen38_windows_3090_benchmarks.py` from `--spec mtp --draft-tokens 3` to DFlash2
+  at a large K, **after** confirming on real chat prompts rather than the bench corpus -- acceptance
+  is workload-dependent and this corpus is natural-text continuation. Costs 18.33 GiB of weights
+  against 15.92 plus a 288 MiB graph allowance, which will bite at the context ceiling.
+
+**2. Context-lookup drafting belongs on the DFlash2 path, not the MTP one.** `--lookup-ngram` is
+implemented and hooks the MTP branch only, where it is worth ~3-5% because that drafter already
+accepts 95-96% and a perfect drafter is capped at +13%. DFlash2 at K=15 accepts 0.868, so its
+ceiling is 16 tokens per round against the 6.8 it gets -- **2.3x** -- and lookup delivers acceptance
+1.0 whenever it fires. That is where the remaining decode headroom is.
+
 ## Open after the 2026-09-17 upstream catch-up (v3 artifacts, `src/models/qwen3_5`)
 
 The fork now sits on Neroued/ninfer `f76e19c0`. Everything below this section predates that merge;

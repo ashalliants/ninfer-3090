@@ -18,6 +18,36 @@
 // Swept on sm_86: the shipped 120 comes from an SM120 tuning note, and shared memory (93,184 B of
 // the 99 KiB budget) pins this kernel to one CTA per SM on either card, so registers cannot buy
 // occupancy here -- only fewer spills. 512 threads x 128 registers is exactly the 65,536 file.
+// Simulation knob for the INT8 PV question, not a production path: it rounds the probabilities onto
+// the int8 grid and immediately back, leaving the FP16 storage and the FP16 mma untouched. The point
+// is to price the *precision* of an int8 P before paying for the kernel that would exploit it, since
+// the two questions are independent and only one of them is cheap to answer.
+//
+// The softmax here emits exp2(score - running_max), so P is already in [0, 1] with a maximum of one:
+// a fixed 1/127 needs no per-row scale. What it cannot represent is a row whose mass sits far below
+// its peak -- at a long context, entries under 1/254 of the maximum round to zero, and there can be
+// tens of thousands of them.
+//
+// MEASURED, 2026-09-19, Qwen3.8-27B, 1M corpus, kv int8:
+//
+//   context   baseline    int8 P   change
+//     4,096   4.343155  4.332216   -0.25%
+//    32,768   4.138860  4.118939   -0.48%
+//
+// It does not cost quality, it improves it, and by more at long context -- dropping the tail of
+// near-zero weights sharpens the distribution, and there is more tail to drop at 32k than at 4k.
+// The caveat perplexity cannot cover: it is an average, and this changes a tail behaviour. Dropping
+// small distant weights is the thing a needle-in-a-haystack retrieval depends on, so a long-context
+// retrieval check belongs beside perplexity before an INT8 PV kernel ships.
+#ifndef NINFER_SIMULATE_INT8_P
+#define NINFER_SIMULATE_INT8_P 0
+#endif
+#if NINFER_SIMULATE_INT8_P
+#define NINFER_QUANTISE_P(x) (rintf((x) * 127.0f) * (1.0f / 127.0f))
+#else
+#define NINFER_QUANTISE_P(x) (x)
+#endif
+
 #ifndef NINFER_PROMPT_I8_MAXNREG
 #define NINFER_PROMPT_I8_MAXNREG 120
 #endif
@@ -391,12 +421,18 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
                 const float p11 = score[nt][3] > -CUDART_INF_F
                                       ? exp2_approx(__fmaf_rn(score[nt][3], scale_l2, -nm1_scaled))
                                       : 0.0f;
-                bl0 += p00 + p01;
-                bl1 += p10 + p11;
-                p_s[row0 * Bc + causal_prompt_p_swz<Bc>(row0, col0)] = __float2half_rn(p00);
-                p_s[row0 * Bc + causal_prompt_p_swz<Bc>(row0, col1)] = __float2half_rn(p01);
-                p_s[row1 * Bc + causal_prompt_p_swz<Bc>(row1, col0)] = __float2half_rn(p10);
-                p_s[row1 * Bc + causal_prompt_p_swz<Bc>(row1, col1)] = __float2half_rn(p11);
+                // Quantise before the sum as well as before the store, so the denominator matches
+                // what the PV matmul will actually accumulate.
+                const float q00 = NINFER_QUANTISE_P(p00);
+                const float q01 = NINFER_QUANTISE_P(p01);
+                const float q10 = NINFER_QUANTISE_P(p10);
+                const float q11 = NINFER_QUANTISE_P(p11);
+                bl0 += q00 + q01;
+                bl1 += q10 + q11;
+                p_s[row0 * Bc + causal_prompt_p_swz<Bc>(row0, col0)] = __float2half_rn(q00);
+                p_s[row0 * Bc + causal_prompt_p_swz<Bc>(row0, col1)] = __float2half_rn(q01);
+                p_s[row1 * Bc + causal_prompt_p_swz<Bc>(row1, col0)] = __float2half_rn(q10);
+                p_s[row1 * Bc + causal_prompt_p_swz<Bc>(row1, col1)] = __float2half_rn(q11);
             }
             bl0        = warp_sum<4>(bl0, FullMask);
             bl1        = warp_sum<4>(bl1, FullMask);
