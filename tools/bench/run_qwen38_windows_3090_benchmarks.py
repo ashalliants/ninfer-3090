@@ -26,25 +26,27 @@ OUTPUT_TOKENS = int(os.environ.get("NINFER_BENCH_OUTPUT_TOKENS", "1024"))
 PREFILL_PROMPT_CHARACTERS = int(os.environ.get("NINFER_BENCH_PREFILL_CHARS", "28000"))
 COHORTS = tuple(int(value) for value in os.environ.get("NINFER_BENCH_COHORTS", "1,2,4,8").split(","))
 KV_DTYPE = os.environ.get("NINFER_BENCH_KV_DTYPE", "int8")
-# Speculative backend and draft window. **This sweep stays on MTP3, and the reason is the point.**
+# Speculative backend and draft window. **This sweep stays on MTP3, for memory rather than speed.**
 #
-# DFlash2 at K=7 is much faster single-stream -- 172.3 tok/s against MTP3's 124.3 through the CLI on
-# realistic prompts -- and it was briefly the default here. Measured through the serve path at the
-# cohort levels this sweep actually runs, it is the wrong choice:
+# DFlash2 at K=7 is faster at every concurrency it can run. Aggregate decode tok/s through the serve
+# path, thinking off, decode time taken from the server's own request log:
 #
 #   C        MTP3   DFlash2 K=7   change
-#   1        91.6          97.7    +6.7%
-#   2       153.3         147.5    -3.8%
-#   4       223.1         187.8   -15.8%
-#   8       265.8   fails to start
+#   1       135.0         187.1   +38.6%
+#   2       238.2         313.5   +31.6%
+#   4       387.4         406.2    +4.9%
+#   8       522.8   does not fit
 #
-# Speculation pays because a multi-column round costs about one sweep of the weights; batching
-# already amortises that sweep across lanes, so the advantage shrinks and then inverts as the extra
-# columns become pure cost. At C8 it does not even start: the draft model's weights are 18.3 GiB
-# against 16.7, and the runtime reservation needs 4.64 GB where 3.78 GB is left.
+# The lead shrinks with concurrency and the mechanism says why: speculation pays because a
+# multi-column round costs about one sweep of the weights, and batching already amortises that sweep
+# across lanes, so the baseline catches up. Acceptance itself does not degrade -- tokens per round
+# holds at ~3.5 for MTP3 and ~5.6 for DFlash2 across all levels.
 #
-# So DFlash2 is a single-stream optimisation. Set NINFER_BENCH_SPEC=dflash2 to measure it, and
-# expect it to win only at C1.
+# What stops it is memory. The draft model's weights are 18.3 GiB against 16.7, and at C8 the
+# runtime reservation needs 4.64 GB where 3.78 GB remains; dropping to a 4096-token KV still needs
+# 4.24 GB, and only a 2048-token KV fits, which is too little for eight streams to do useful work.
+# This sweep includes C8, so it stays on MTP3. A C1-C4 deployment should use DFlash2:
+# NINFER_BENCH_SPEC=dflash2.
 #
 # Swept on realistic generation (mean of a reasoning, a code and a summarisation prompt, greedy,
 # 400 tokens, one run per cell):

@@ -30,27 +30,32 @@ kv int8, on one 3090:
   stays high; on real generation the extra columns stop being accepted and are paid for anyway, so
   **K=15 loses to K=7**. The 2.25x above is a corpus artefact; the real number is 1.39x.
 
-  **And then the cohort measurement reversed the decision.** Through the serve path, aggregate
-  tok/s:
+  **The cohort measurement, done correctly.** Aggregate decode tok/s through the serve path,
+  thinking off, decode time read from the server's request log rather than a wall clock:
 
-  | C | MTP3 | DFlash2 K=7 | change |
-  |---:|---:|---:|---:|
-  | 1 | 91.6 | 97.7 | +6.7% |
-  | 2 | 153.3 | 147.5 | -3.8% |
-  | 4 | 223.1 | 187.8 | -15.8% |
-  | 8 | 265.8 | **fails to start** | - |
+  | C | MTP3 | DFlash2 K=7 | change | tokens/round |
+  |---:|---:|---:|---:|---|
+  | 1 | 135.0 | 187.1 | +38.6% | 3.51 / 5.57 |
+  | 2 | 238.2 | 313.5 | +31.6% | 3.51 / 5.82 |
+  | 4 | 387.4 | 406.2 | +4.9% | 3.54 / 5.63 |
+  | 8 | 522.8 | **does not fit** | - | - |
 
-  The mechanism that makes speculation pay is that a multi-column round costs about one sweep of the
-  weights -- and batching already amortises that sweep across lanes, so the advantage shrinks and
-  then inverts as the extra columns become pure cost. At C8 it does not start at all: the draft
-  model's weights are 18.3 GiB against 16.7, and the runtime reservation needs 4.64 GB where 3.78 GB
-  remains.
+  DFlash2 is faster at every level it can run, and the lead shrinks with concurrency exactly as the
+  mechanism predicts -- speculation pays because a multi-column round costs about one sweep of the
+  weights, and batching already amortises that sweep, so the baseline catches up. Acceptance itself
+  does not degrade: tokens per round holds flat across all levels.
 
-  So the sweep stays on MTP3, which is what it was; `NINFER_BENCH_SPEC=dflash2` measures the other
-  arm. The single-stream win is real and large (172.3 against 124.3 tok/s through the CLI) and
-  belongs in the CLI's documentation rather than a cohort benchmark's default. Note also that the
-  CLI's 1.39x is only 1.07x through the serve path at C1 -- worth understanding before quoting
-  either number as *the* decode figure.
+  What stops it is memory, not throughput. The draft weights are 18.3 GiB against 16.7; at C8 the
+  runtime reservation needs 4.64 GB against 3.78 GB free, a 4096-token KV still needs 4.24 GB, and
+  only 2048 fits -- too little for eight streams. **The sweep includes C8, so it stays on MTP3; a
+  C1-C4 deployment should use DFlash2.**
+
+  **An earlier version of this measurement said the opposite and it was wrong twice over**: it left
+  thinking mode on while the CLI comparisons had it off, which changes the generated text and so the
+  acceptance rate, and it timed wall clock per request, folding in HTTP, tokenisation, prefill and
+  queueing. Together those reported 98 tok/s where decode was actually 196, and made the serve path
+  look broken. It is not: whole-request host-exposed time is ~22 ms on a 2.2 s request, queue wait
+  ~1 ms, and serve decode matches the CLI to within 0.5% once the two are configured alike.
 
 **3. Adaptive draft window: the signal is free, acting on it is not.** Worth writing down because
 the idea is obvious and the obstacle is not.
