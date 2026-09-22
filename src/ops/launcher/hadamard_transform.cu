@@ -38,15 +38,14 @@ void silu_mul_hadamard_launch(const Tensor& plane, const Tensor& signs, Tensor& 
     const std::int32_t blocks_per_column = width / kHadamardTransformBlock;
     const std::int64_t columns           = out.numel() / width;
     const std::int64_t items             = columns * blocks_per_column;
-    const std::int64_t ctas              = (items + kWarpsPerCta - 1) / kWarpsPerCta;
-    if (ctas > std::numeric_limits<unsigned>::max()) {
+    if (items > std::numeric_limits<unsigned>::max()) {
         throw std::overflow_error("silu_mul_hadamard: grid exceeds the CUDA launch limit");
     }
-    silu_mul_hadamard_1024_kernel<kWarpsPerCta>
-        <<<static_cast<unsigned>(ctas), kWarpsPerCta * kWarpSize, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(plane.data),
-            static_cast<const __nv_bfloat16*>(signs.data), static_cast<__nv_bfloat16*>(out.data),
-            items, blocks_per_column);
+    silu_mul_hadamard_quarter_kernel<<<static_cast<unsigned>(items),
+                                       kHadamardQuarterWarps * kWarpSize, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(plane.data),
+        static_cast<const __nv_bfloat16*>(signs.data), static_cast<__nv_bfloat16*>(out.data), items,
+        blocks_per_column);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -63,10 +62,12 @@ void rmsnorm_hadamard_5120_launch(const Tensor& x, const Tensor& weight, float e
     auto* o        = static_cast<__nv_bfloat16*>(out.data);
     if (unit_offset) {
         rmsnorm_hadamard_5120_kernel<RmsEpilogue::Offset>
-            <<<static_cast<unsigned>(rows), 256, 0, stream>>>(x2, w2, s, o, rows, eps);
+            <<<static_cast<unsigned>(rows), kRmsnormHadamardThreads, 0, stream>>>(x2, w2, s, o,
+                                                                                  rows, eps);
     } else {
         rmsnorm_hadamard_5120_kernel<RmsEpilogue::Plain>
-            <<<static_cast<unsigned>(rows), 256, 0, stream>>>(x2, w2, s, o, rows, eps);
+            <<<static_cast<unsigned>(rows), kRmsnormHadamardThreads, 0, stream>>>(x2, w2, s, o,
+                                                                                  rows, eps);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -93,15 +94,14 @@ void sigmoid_mul_hadamard_launch(const Tensor& gate, const Tensor& x, const Tens
     const std::int32_t width             = signs.ne[0];
     const std::int32_t blocks_per_column = width / kHadamardTransformBlock;
     const std::int64_t items             = x.numel() / width * blocks_per_column;
-    const std::int64_t ctas              = (items + kWarpsPerCta - 1) / kWarpsPerCta;
-    if (ctas > std::numeric_limits<unsigned>::max()) {
+    if (items > std::numeric_limits<unsigned>::max()) {
         throw std::overflow_error("sigmoid_mul_hadamard: grid exceeds the CUDA launch limit");
     }
-    sigmoid_mul_hadamard_1024_kernel<kWarpsPerCta>
-        <<<static_cast<unsigned>(ctas), kWarpsPerCta * kWarpSize, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(gate.data), static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const __nv_bfloat16*>(signs.data), static_cast<__nv_bfloat16*>(out.data),
-            items, blocks_per_column);
+    sigmoid_mul_hadamard_quarter_kernel<<<static_cast<unsigned>(items),
+                                          kHadamardQuarterWarps * kWarpSize, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(gate.data), static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const __nv_bfloat16*>(signs.data), static_cast<__nv_bfloat16*>(out.data), items,
+        blocks_per_column);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -80,25 +80,36 @@ __global__ __launch_bounds__(Threads) void gdn_norm_gating_27_simt(
     }
     __syncthreads();
     if constexpr (Rotate) {
-        const int t = warp;
-        if (head < D / kHadamardTransformBlock && t < Tile && first + t < tokens) {
-            const std::int64_t row = std::int64_t(first + t) * D;
-            const int block_base   = head * kHadamardTransformBlock;
-            float v[kHadamardTransformLaneVectors][8];
+        // Four warps per (token, 1024-block): the tile's tokens in rounds of Warps / 4, every warp
+        // entering the quarter transform's barriers in each round.
+        constexpr int kGroups = Warps / kHadamardQuarterWarps;
+        __shared__ HadamardQuarterShared transform[kGroups];
+        const int group   = warp / kHadamardQuarterWarps;
+        const int quarter = warp % kHadamardQuarterWarps;
+        if (head >= D / kHadamardTransformBlock) { return; }
+        const int block_base = head * kHadamardTransformBlock;
 #pragma unroll
-            for (int r = 0; r < kHadamardTransformLaneVectors; ++r) {
-                const int offset = block_base + hadamard_lane_offset(lane, r);
+        for (int round = 0; round < (Tile + kGroups - 1) / kGroups; ++round) {
+            const int t = round * kGroups + group;
+            if (t < Tile && first + t < tokens) {
+                const std::int64_t row = std::int64_t(first + t) * D;
+                const int offset       = block_base + quarter * kWarpSize * 8 + lane * 8;
                 float xv[8];
                 float nv[8];
                 hadamard_unpack8(load_vec<uint4>(x + row + offset), xv);
                 hadamard_unpack8(load_vec<uint4>(nw + offset), nv);
+                float v[8];
 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
-                    v[r][j] =
-                        __bfloat162float(__float2bfloat16_rn(xv[j] * inverse[t] * (1 + nv[j])));
+                    v[j] = __bfloat162float(__float2bfloat16_rn(xv[j] * inverse[t] * (1 + nv[j])));
                 }
+                hadamard_quarter_forward_store(v, signs + block_base, h + row + block_base,
+                                               transform[group], quarter, lane,
+                                               [] { __syncthreads(); });
+            } else {
+                __syncthreads();
+                __syncthreads();
             }
-            hadamard_1024_forward_store(v, signs + block_base, h + row + block_base, lane);
         }
         return;
     }
