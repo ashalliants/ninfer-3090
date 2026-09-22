@@ -179,7 +179,9 @@ int verify_preserved(std::string_view label, const DeviceBuffer& device,
                         std::vector<std::uint16_t>(expected.begin(), expected.end()));
 }
 
-int run_profile(std::int32_t input_rows) {
+// Q8 takes the fused routes; Q4 and Q5 (a compressed drafter) go through Linear into the same BF16
+// plane and the shared finish.
+int run_profile(std::int32_t input_rows, QType qtype) {
     const std::vector<float> activation = make_activation(input_rows);
     std::vector<std::uint16_t> activation_bits(activation.size());
     std::transform(activation.begin(), activation.end(), activation_bits.begin(), f32_to_bf16);
@@ -191,8 +193,10 @@ int run_profile(std::int32_t input_rows) {
     weight_options.row_split_scale = quantized_weight::RowSplitScalePattern::Tiny;
     weight_options.row_split_codes = quantized_weight::RowSplitCodePattern::Hashed;
     input_projection::DevicePackedWeight projection_weight(quantized_weight::make_patterned_weight(
-        QType::Q8_G32_FP16, kHidden, input_rows, 503U + static_cast<std::uint32_t>(input_rows),
-        weight_options));
+        qtype, kHidden, input_rows, 503U + static_cast<std::uint32_t>(input_rows), weight_options));
+    const std::string format = qtype == QType::Q8_G32_FP16   ? "Q8"
+                               : qtype == QType::Q5_G64_FP16 ? "Q5"
+                                                             : "Q4";
     const std::vector<double> projection =
         projection_oracle(projection_weight.host, activation, input_rows);
 
@@ -253,10 +257,10 @@ int run_profile(std::int32_t input_rows) {
                 } else
                     launch(nullptr);
                 cuda_synchronize();
-                const std::string label = "dynamic conv add C=" + std::to_string(input_rows) +
-                                          " W=" + std::to_string(width) +
-                                          " B=" + std::to_string(batch_size) +
-                                          " graph=" + std::to_string(replay);
+                const std::string label =
+                    "dynamic conv add " + format + " C=" + std::to_string(input_rows) +
+                    " W=" + std::to_string(width) + " B=" + std::to_string(batch_size) +
+                    " graph=" + std::to_string(replay);
                 failures += verify_reduction(
                     label, gather_actual(residual_device.data(), width, batch_size), expected,
                     kCriterion);
@@ -286,7 +290,10 @@ int main() {
             std::cout << "SKIP: no usable CUDA device\n";
             return 77;
         }
-        const int failures = run_profile(4096) + run_profile(17408);
+        const int failures =
+            run_profile(4096, QType::Q8_G32_FP16) + run_profile(17408, QType::Q8_G32_FP16) +
+            run_profile(4096, QType::Q4_G64_FP16) + run_profile(17408, QType::Q4_G64_FP16) +
+            run_profile(17408, QType::Q5_G64_FP16);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " linear_dynamic_grouped_conv_add\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

@@ -26,6 +26,16 @@ from .sources.logical import EncodedRows, LogicalSource, array_source
 
 T2 = "t2_g128_fp16"
 
+# The DFlash2 adapter projections a ternary artifact encodes as Q4. The fused query/key/value
+# projection, which the context key/value Uses share, stays Q8 for its Q8-only three-output op.
+DFLASH2_Q4_PROJECTIONS = (
+    "/feature_projection",
+    "/attention/output",
+    "/mlp/gate",
+    "/mlp/up",
+    "/mlp/down",
+)
+
 HIDDEN = 5120
 INTERMEDIATE = 17408
 VOCABULARY = 248320
@@ -389,12 +399,11 @@ def bonsai2_27b_ternary(model, recipe, sources):
     validate(gguf)
     signs = sign_vectors(gguf)
     _optional(model, recipe)
-    # Against a 2.125-bit target, a Q8 drafter MLP is a large share of every draft step's bytes. Its
-    # gate/up take Q4 (the down projection stays Q8 for the fused dynamic-convolution kernel):
-    # with ProCreations' Bonsai 2 adapter this keeps acceptance, draws 448 MiB less device memory
-    # and decodes 2.6% faster than Q8.
+    # Against a 2.125-bit target, a Q8 drafter is a large share of every draft step's bytes, so the
+    # DFlash2 adapter's feature, output and MLP projections take Q4 (its dynamic-convolution kernel
+    # projections and the candidate selector keep the formats _optional gives them).
     for name in model.parameters:
-        if name.startswith("dflash2/") and name.endswith(("/mlp/gate", "/mlp/up")):
+        if name.startswith("dflash2/") and name.endswith(DFLASH2_Q4_PROJECTIONS):
             recipe.assign(name, format=Q4, method=grouped_absmax)
     encoded, direct = text_sources(gguf)
     for name, source in encoded.items():

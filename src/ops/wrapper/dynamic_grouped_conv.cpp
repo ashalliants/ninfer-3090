@@ -73,6 +73,14 @@ void require_finish_projection_weight(const Weight& weight, std::int32_t input_r
     }
 }
 
+// A row-split projection of any other format goes through Linear, which validates its registered
+// format and shape; the fused routes are Q8's.
+bool materialized_projection(const Weight& weight, std::int32_t input_rows) {
+    return weight.qtype != QType::Q8_G32_FP16 && weight.layout == QuantLayout::RowSplit &&
+           weight.ndim == 2 && weight.n == kHidden && weight.k == input_rows &&
+           weight.qdata != nullptr && weight.payload != nullptr;
+}
+
 struct Range {
     const void* pointer;
     std::size_t bytes;
@@ -95,14 +103,17 @@ bool overlaps(const Range& lhs, const Range& rhs) {
 void require_finish_nonoverlap(const Tensor& x, const Weight& projection_weight,
                                const Tensor& base_kernel, const Tensor& finish_delta,
                                const Tensor& residual, const WorkspaceArena& workspace) {
+    const bool q8 = projection_weight.qtype == QType::Q8_G32_FP16;
     const std::size_t code_bytes =
-        static_cast<std::size_t>(kHidden) * static_cast<std::size_t>(x.ne[0]);
+        q8 ? static_cast<std::size_t>(kHidden) * static_cast<std::size_t>(x.ne[0])
+           : static_cast<std::size_t>(projection_weight.payload_bytes);
     const std::size_t scale_bytes = static_cast<std::size_t>(kHidden) *
                                     static_cast<std::size_t>(x.ne[0] / 32) * sizeof(std::uint16_t);
     const std::array<Range, 7> ranges{{
         {x.data, x.bytes(), "x"},
-        {projection_weight.qdata, code_bytes, "projection codes"},
-        {projection_weight.scales, scale_bytes, "projection scales"},
+        {q8 ? projection_weight.qdata : projection_weight.payload, code_bytes,
+         q8 ? "projection codes" : "projection payload"},
+        {q8 ? projection_weight.scales : nullptr, q8 ? scale_bytes : 0, "projection scales"},
         {base_kernel.data, base_kernel.bytes(), "base_kernel"},
         {finish_delta.data, finish_delta.bytes(), "finish_delta"},
         {residual.data, residual.bytes(), "residual"},
@@ -214,6 +225,13 @@ void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_w
     require_tensor(finish_delta, DType::BF16, kGroups, kTaps, width, batch_size, kAddOp,
                    "finish_delta");
     require_tensor(residual, DType::BF16, kHidden, width, batch_size, 1, kAddOp, "residual");
+    if (materialized_projection(projection_weight, input_rows)) {
+        require_finish_nonoverlap(x, projection_weight, base_kernel, finish_delta, residual,
+                                  workspace);
+        detail::materialized_linear_dynamic_grouped_conv_add_dispatch(
+            x, projection_weight, base_kernel, finish_delta, residual, workspace, stream);
+        return;
+    }
     require_finish_projection_weight(projection_weight, input_rows);
     require_finish_nonoverlap(x, projection_weight, base_kernel, finish_delta, residual, workspace);
 

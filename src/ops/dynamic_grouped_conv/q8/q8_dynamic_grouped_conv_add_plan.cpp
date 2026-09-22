@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "ninfer/ops/linear.h"
 #include "ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_plan.h"
 #include "ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_kernels.h"
 #include <stdexcept>
@@ -52,5 +53,18 @@ void q8_linear_dynamic_grouped_conv_add_dispatch(const Tensor& x, const Weight& 
     Tensor projected(storage.data, DType::BF16, {5120, x.ne[1], x.ne[2]});
     q8_dynamic_grouped_conv_add_materialized_launch(plan.schedule, x, weight, base, delta, residual,
                                                     projected, stream);
+}
+
+void materialized_linear_dynamic_grouped_conv_add_dispatch(
+    const Tensor& x, const Weight& projection_weight, const Tensor& base_kernel,
+    const Tensor& finish_delta, Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream) {
+    const Plan plan           = resolve_plan(x.ne[0], x.ne[1], x.ne[2]);
+    auto scope                = workspace.scope();
+    const DeviceSpan storage  = workspace.alloc_bytes(plan.workspace_bytes);
+    const std::int32_t tokens = x.ne[1] * x.ne[2];
+    Tensor projected(storage.data, DType::BF16, {5120, tokens});
+    linear(x.view({x.ne[0], tokens}), projection_weight, projected, stream);
+    dynamic_grouped_conv_finish_launch(projected, base_kernel, finish_delta, residual, x.ne[1],
+                                       stream);
 }
 } // namespace ninfer::ops::detail

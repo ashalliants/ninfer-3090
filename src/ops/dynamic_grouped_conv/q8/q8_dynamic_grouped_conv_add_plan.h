@@ -24,4 +24,9 @@ void q8_linear_dynamic_grouped_conv_add_dispatch(const Tensor& x, const Weight& 
                                                  const Tensor& finish_delta, Tensor& residual,
                                                  WorkspaceArena& workspace, cudaStream_t stream);
 
+// Any other registered row-split projection: Linear into the plan's BF16 plane, then the finish.
+void materialized_linear_dynamic_grouped_conv_add_dispatch(
+    const Tensor& x, const Weight& projection_weight, const Tensor& base_kernel,
+    const Tensor& finish_delta, Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

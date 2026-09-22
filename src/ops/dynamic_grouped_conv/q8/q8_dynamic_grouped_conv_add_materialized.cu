@@ -94,14 +94,21 @@ void materialized(Q8DynamicConvAddSchedule schedule, const Tensor& x, const Weig
         launch_q8_a16_mma_r64x32_t64_k128_a1(flat, weight, result, stream);
         break;
     }
+    dynamic_grouped_conv_finish_launch(projected, base, delta, residual, x.ne[1], stream);
+}
+} // namespace
+
+void dynamic_grouped_conv_finish_launch(const Tensor& projected, const Tensor& base,
+                                        const Tensor& delta, Tensor& residual, std::int32_t width,
+                                        cudaStream_t stream) {
+    const int tokens = projected.ne[1] * projected.ne[2] * projected.ne[3];
     const dim3 grid((kRows + 255) / 256, tokens);
     finish_kernel<<<grid, 256, 0, stream>>>(static_cast<const __nv_bfloat16*>(projected.data),
                                             static_cast<const __nv_bfloat16*>(base.data),
                                             static_cast<const __nv_bfloat16*>(delta.data),
-                                            static_cast<__nv_bfloat16*>(residual.data), x.ne[1]);
+                                            static_cast<__nv_bfloat16*>(residual.data), width);
     CUDA_CHECK(cudaGetLastError());
 }
-} // namespace
 
 void q8_dynamic_grouped_conv_add_materialized_launch(Q8DynamicConvAddSchedule schedule,
                                                      const Tensor& x, const Weight& weight,

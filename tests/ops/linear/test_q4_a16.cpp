@@ -106,6 +106,19 @@ int q4_a16_conformance() {
     failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
                           {5120, 6144, 149U, Comparison::SampledRows, false, kN5120K6144});
 
+    // The DFlash2 adapter's hidden-width outputs of a Q4 drafter: the draft block and accepted
+    // columns (T <= 16) and prefill chunks, on n5120_k6144's ladder.
+    constexpr std::array kAdapterWidths{
+        graph(1),  graph(7), graph(8), graph(9), graph(16), graph(24), graph(25),
+        graph(33), a16(64),  a16(97),  a16(128), a16(257),  a16(1024),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
+                          {5120, 4096, 151U, Comparison::SampledRows, false, kAdapterWidths});
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
+                          {5120, 17408, 153U, Comparison::SampledRows, false, kAdapterWidths});
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
+                          {5120, 25600, 155U, Comparison::SampledRows, false, kAdapterWidths});
+
     // Full-output oracle covers every mechanism this geometry selects and both sides of every
     // switch boundary in the token extent.
     constexpr std::array kN7168K5120Full{
