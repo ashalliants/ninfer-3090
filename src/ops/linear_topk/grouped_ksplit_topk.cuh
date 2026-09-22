@@ -27,11 +27,13 @@ grouped_ksplit_topk_initialize(GroupedKSplitTopKStorage<Capacity, Warps>& storag
     __syncthreads();
 }
 
+// row_ids, when given, maps each head row to the id its key carries (an indexed head's shortlist),
+// so ties resolve by that id as they do for a full head.
 template <int Capacity, int TileColumns, int Warps>
 __device__ __forceinline__ void
-grouped_ksplit_topk_consume(const float* scores,
-                            GroupedKSplitTopKStorage<Capacity, Warps>& storage,
-                            std::int32_t row_begin, std::int32_t valid_rows, int columns) {
+grouped_ksplit_topk_consume(const float* scores, GroupedKSplitTopKStorage<Capacity, Warps>& storage,
+                            std::int32_t row_begin, std::int32_t valid_rows, int columns,
+                            const std::int32_t* row_ids = nullptr) {
     const int warp = static_cast<int>(threadIdx.x) >> 5;
     const int lane = static_cast<int>(threadIdx.x) & 31;
     for (int column = warp; column < columns; column += Warps) {
@@ -39,7 +41,8 @@ grouped_ksplit_topk_consume(const float* scores,
         if (lane < kLinearTopK) {
             const int row = row_begin + lane;
             if (row < valid_rows) {
-                key[0] = score_id_order_key(scores[lane * TileColumns + column], row);
+                key[0] = score_id_order_key(scores[lane * TileColumns + column],
+                                            row_ids != nullptr ? row_ids[row] : row);
             }
         } else {
             key[0] = storage.top_keys[column][lane - kLinearTopK];

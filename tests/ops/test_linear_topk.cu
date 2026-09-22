@@ -415,10 +415,12 @@ int run_full(QType qtype, const char* profile, const DeviceBuffer& hidden,
     return failures;
 }
 
-int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score) {
-    FixtureWeight fixture = make_rowsplit(QType::Q4_G64_FP16, kShortRows);
+// An indexed head: the Q4 proposal head, or a T2 shortlist of the same row count.
+int run_indexed(QType qtype, const char* profile, const DeviceBuffer& hidden,
+                const std::vector<double>& base_score) {
+    FixtureWeight fixture = make_rowsplit(qtype, kShortRows);
     for (std::size_t index = 0; index < kShortWinnerRows.size(); ++index) {
-        patch_rowsplit_row(fixture, QType::Q4_G64_FP16, kShortWinnerRows[index], factor_for(index));
+        patch_rowsplit_row(fixture, qtype, kShortWinnerRows[index], factor_for(index));
     }
     std::vector<std::int32_t> host_map(kShortRows);
     for (std::int32_t row = 0; row < kShortRows; ++row) { host_map[row] = kValidRows - 1 - row; }
@@ -426,8 +428,8 @@ int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score) {
     map.copy_from_host(host_map.data(), map.bytes);
     const auto expected = expected_order(kShortWinnerRows, &host_map);
 
-    const std::size_t capacity = ops::linear_topk_workspace_capacity_bytes(
-        QType::Q4_G64_FP16, kShortRows, kHidden, 1, kMaxColumns);
+    const std::size_t capacity =
+        ops::linear_topk_workspace_capacity_bytes(qtype, kShortRows, kHidden, 1, kMaxColumns);
     GuardedDeviceBuffer graph_scratch(capacity);
     WorkspaceArena workspace(DeviceSpan{graph_scratch.data(), graph_scratch.bytes()});
     DeviceBuffer ids(static_cast<std::size_t>(kTopK) * kMaxColumns * sizeof(std::int32_t));
@@ -453,8 +455,8 @@ int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score) {
         ops::linear_topk(hidden_tensor, fixture.weight, map_tensor, ids_tensor, scores_tensor,
                          point_workspace, nullptr);
         cuda_synchronize();
-        failures += verify_invocation("q4-optimized", columns, ids_tensor, scores_tensor,
-                                      base_score, expected);
+        failures +=
+            verify_invocation(profile, columns, ids_tensor, scores_tensor, base_score, expected);
         failures += out_ids.verify_guards("ids tail");
         failures += out_scores.verify_guards("scores tail");
         failures += scratch.verify_guards("workspace tail");
@@ -483,8 +485,8 @@ int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score) {
             },
             stream);
         cuda_check(cudaStreamDestroy(stream), "linear_topk destroy graph stream");
-        failures += verify_invocation("q4-optimized graph", graph_columns, graph_ids, graph_scores,
-                                      base_score, expected);
+        failures += verify_invocation((std::string(profile) + " graph").c_str(), graph_columns,
+                                      graph_ids, graph_scores, base_score, expected);
     }
     failures += graph_scratch.verify_guards("graph workspace tail");
     failures += verify_zero_ties(fixture, &map_tensor, &host_map);
@@ -514,7 +516,10 @@ int main() {
                              base_scores(QType::FP8_E4M3FN_ROW_BF16, host_hidden));
         failures += run_full(QType::T2_G128_FP16, "t2-full", hidden,
                              base_scores(QType::T2_G128_FP16, host_hidden));
-        failures += run_q4(hidden, base_scores(QType::Q4_G64_FP16, host_hidden));
+        failures += run_indexed(QType::Q4_G64_FP16, "q4-optimized", hidden,
+                                base_scores(QType::Q4_G64_FP16, host_hidden));
+        failures += run_indexed(QType::T2_G128_FP16, "t2-indexed", hidden,
+                                base_scores(QType::T2_G128_FP16, host_hidden));
         std::cout << (failures == 0 ? "OK" : "FAIL") << " linear_topk\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
