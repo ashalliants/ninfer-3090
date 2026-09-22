@@ -84,6 +84,20 @@ public:
                             [&] { return ops::prepare_linear_weight(model_.input(id)); });
     }
 
+    // A ternary output or proposal head takes the integer route at decode, verify and draft widths
+    // like the text projections (any row count of whole 64-row blocks at the hidden width).
+    LinearParameters head(WeightUseId id) const {
+        LinearParameters out = rotated_linear(id);
+        integer_route(out, QType::T2_G128_FP16, out.weight.n, 5120);
+        return out;
+    }
+
+    LinearParameters head(WeightId id) const {
+        LinearParameters out = rotated_linear(id);
+        integer_route(out, QType::T2_G128_FP16, out.weight.n, 5120);
+        return out;
+    }
+
     // Sites whose execution rotates the activation of a Hadamard-rotated matrix.
     LinearParameters rotated_linear(WeightId id) const {
         return with_context(model_.weight(id).name,
@@ -234,7 +248,7 @@ public:
         out.key_norm    = tensor(a.key_norm);
         out.output      = linear(a.output);
         out.ffn         = ffn(w.layer);
-        out.output_head = rotated_linear(w.output_head_use);
+        out.output_head = head(w.output_head_use);
         return out;
     }
 
@@ -307,7 +321,7 @@ public:
         out.feature_projection = linear(w.feature_projection);
         out.context_norm       = tensor(w.context_norm);
         out.final_norm         = tensor(w.final_norm);
-        out.output_head        = rotated_linear(w.output_head_use);
+        out.output_head        = head(w.output_head_use);
         out.layers.reserve(w.layers.size());
         for (std::size_t i = 0; i < w.layers.size(); ++i) {
             out.layers.push_back(with_context(
@@ -352,7 +366,7 @@ Parameters::Parameters(const Model& source) : model(source) {
     const Prepare prepare(model);
     const auto& w        = model.weights();
     text.token_embedding = native_weight(model.weight(w.text.token_embedding).view);
-    text.output_head     = prepare.rotated_linear(w.text.output_head_use);
+    text.output_head     = prepare.head(w.text.output_head_use);
     if (text.token_embedding.qtype == QType::T2_G128_FP16) {
         // A ternary checkpoint stores its token table rotated by the same hidden-width signs as
         // every 5120-wide input, the output head's among them; the table has no Use of its own.
@@ -386,8 +400,8 @@ Parameters::Parameters(const Model& source) : model(source) {
                              [&] { return prepare.draft(*w.draft); });
     }
     if (w.proposal) {
-        proposal = ProposalParameters{prepare.rotated_linear(w.proposal->head), std::nullopt,
-                                      w.proposal->rows};
+        proposal =
+            ProposalParameters{prepare.head(w.proposal->head), std::nullopt, w.proposal->rows};
         if (w.proposal->token_ids) { proposal->token_ids = prepare.tensor(*w.proposal->token_ids); }
     }
 }
