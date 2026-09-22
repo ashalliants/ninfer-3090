@@ -39,8 +39,12 @@ public:
 
     [[nodiscard]] const BoundWeight& weight(WeightId id) const { return bound_.at(id.index); }
 
+    // A Use whose matrix is Hadamard-rotated is only admitted where the execution layer rotates
+    // the activation: input() refuses it, rotated_input() carries its sign vector.
     [[nodiscard]] ops::WeightInput input(WeightUseId id) const;
     [[nodiscard]] ops::WeightInput input(WeightId id) const;
+    [[nodiscard]] ops::WeightInput rotated_input(WeightUseId id) const;
+    [[nodiscard]] ops::WeightInput rotated_input(WeightId id) const;
 
     [[nodiscard]] std::span<const BoundWeight> weight_data() const noexcept { return bound_; }
 

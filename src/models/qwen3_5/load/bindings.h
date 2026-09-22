@@ -51,7 +51,12 @@ public:
     std::vector<PendingWeight> weights;
 
 private:
+    // One device weight per distinct sign binding, however many Uses name it.
+    WeightId hadamard_signs(const artifact::Binding& binding, std::uint64_t width,
+                            const std::string& use);
+
     std::map<std::string, WeightId, std::less<>> parameters_;
+    std::map<std::string, WeightId, std::less<>> signs_;
 };
 
 [[nodiscard]] AttentionWeights bind_attention(Bindings& bindings, const TextConfig& config,

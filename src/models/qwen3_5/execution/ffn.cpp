@@ -1,6 +1,8 @@
 #include "models/qwen3_5/execution/ffn.h"
+#include "models/qwen3_5/execution/rotation.h"
 
 #include "core/layout.h"
+#include "ninfer/ops/hadamard_transform.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
@@ -10,6 +12,55 @@
 #include <stdexcept>
 
 namespace ninfer::models::qwen3_5::execution {
+namespace {
+
+bool rotated_dense(const DenseParameters& p) {
+    return rotated(p.gate_up.hadamard_signs) || rotated(p.down.hadamard_signs);
+}
+
+// A Hadamard-rotated Dense FFN projects gate/up into one plane from the rotated input; when down
+// is rotated, silu_mul_hadamard writes its input already in the rotated basis.
+std::size_t rotated_dense_workspace_bytes(const DenseParameters& p, std::int32_t first,
+                                          std::int32_t last) {
+    const auto& gu   = p.gate_up.weight;
+    const auto& down = p.down.weight;
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc(DType::BF16, {gu.n, last});
+    {
+        auto scope = layout.scope();
+        (void)layout.alloc_bytes(
+            rotated_workspace_bytes(p.gate_up.hadamard_signs, gu.k, last,
+                                    ops::linear_workspace_capacity_bytes(
+                                        gu.qtype, gu.n, gu.k, p.gate_up.policy, first, last)));
+    }
+    (void)layout.alloc(DType::BF16, {gu.n / 2, last});
+    (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(down.qtype, down.n, down.k,
+                                                                      p.down.policy, first, last));
+    return layout.peak_bytes(1);
+}
+
+void rotated_dense_ffn(const Tensor& hidden, const DenseParameters& p, Tensor& residual,
+                       WorkspaceArena& workspace, cudaStream_t stream) {
+    const auto columns      = hidden.ne[1];
+    const auto& gu          = p.gate_up.weight;
+    const auto intermediate = gu.n / 2;
+    Tensor plane            = workspace.alloc(DType::BF16, {gu.n, columns});
+    {
+        auto call      = workspace.scope();
+        const Tensor x = rotated_input(hidden, p.gate_up.hadamard_signs, workspace, stream);
+        ops::linear(x, gu, plane, p.gate_up.policy, workspace, stream);
+    }
+    Tensor activation = workspace.alloc(DType::BF16, {intermediate, columns});
+    if (rotated(p.down.hadamard_signs)) {
+        ops::silu_mul_hadamard(plane, p.down.hadamard_signs, activation, stream);
+    } else {
+        ops::silu_mul(plane.slice(0, 0, intermediate), plane.slice(0, intermediate, intermediate),
+                      activation, stream);
+    }
+    ops::linear_add(activation, p.down.weight, residual, p.down.policy, workspace, stream);
+}
+
+} // namespace
 
 std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t first,
                                 std::int32_t last, bool mtp, bool verify) {
@@ -18,7 +69,8 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
         return ops::sparse_moe_workspace_capacity_bytes(moe->routed_gate_up.qtype,
                                                         moe->routed_down.qtype, first, last);
     }
-    const auto& p    = std::get<DenseParameters>(parameters);
+    const auto& p = std::get<DenseParameters>(parameters);
+    if (rotated_dense(p)) { return rotated_dense_workspace_bytes(p, first, last); }
     const auto& gu   = p.gate_up.weight;
     const auto& down = p.down.weight;
     WorkspaceLayoutBuilder layout;
@@ -64,7 +116,11 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
                         execution);
         return;
     }
-    const auto& p    = std::get<DenseParameters>(parameters);
+    const auto& p = std::get<DenseParameters>(parameters);
+    if (rotated_dense(p)) {
+        rotated_dense_ffn(hidden, p, residual, workspace, stream);
+        return;
+    }
     const auto& gu   = p.gate_up.weight;
     const auto& down = p.down.weight;
     if (mtp) {

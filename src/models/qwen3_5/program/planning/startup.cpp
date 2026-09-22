@@ -1,4 +1,5 @@
 #include "models/qwen3_5/execution/attention.h"
+#include "models/qwen3_5/execution/rotation.h"
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/qwen3_5/execution/mtp.h"
@@ -365,13 +366,17 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     };
     const auto linear_scratch = [&](WorkspaceLayoutBuilder& layout,
                                     const execution::LinearParameters& p, int first, int last) {
-        scratch(layout, ops::linear_workspace_capacity_bytes(p.weight.qtype, p.weight.n, p.weight.k,
-                                                             p.policy, first, last));
+        scratch(layout, execution::rotated_workspace_bytes(
+                            p.hadamard_signs, p.weight.k, last,
+                            ops::linear_workspace_capacity_bytes(
+                                p.weight.qtype, p.weight.n, p.weight.k, p.policy, first, last)));
     };
     const auto add_scratch = [&](WorkspaceLayoutBuilder& layout,
                                  const execution::LinearParameters& p, int first, int last) {
-        scratch(layout, ops::linear_add_workspace_capacity_bytes(
-                            p.weight.qtype, p.weight.n, p.weight.k, p.policy, first, last));
+        scratch(layout, execution::rotated_workspace_bytes(
+                            p.hadamard_signs, p.weight.k, last,
+                            ops::linear_add_workspace_capacity_bytes(
+                                p.weight.qtype, p.weight.n, p.weight.k, p.policy, first, last)));
     };
     const auto target_body = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                  std::int32_t last, TextPhase phase, GdnWorkspacePath path,
@@ -685,9 +690,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                         matrix(layout, DType::BF16, dimension(draft->intermediate_size), tokens);
                         for (const auto& block : parameters.draft->layers) {
                             const auto& p = block.mlp.gate_up;
-                            scratch(layout, ops::linear_swiglu_workspace_capacity_bytes(
-                                                p.weight.qtype, p.weight.n, p.weight.k, p.policy,
-                                                tokens, tokens));
+                            scratch(layout, execution::rotated_workspace_bytes(
+                                                p.hadamard_signs, p.weight.k, tokens,
+                                                ops::linear_swiglu_workspace_capacity_bytes(
+                                                    p.weight.qtype, p.weight.n, p.weight.k,
+                                                    p.policy, tokens, tokens)));
                         }
                         scratch(
                             layout,
@@ -701,6 +708,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     const auto& head = plan.proposal_head == ProposalHead::Optimized
                                            ? parameters.proposal->head
                                            : parameters.draft->output_head;
+                    if (execution::rotated(head.hadamard_signs)) {
+                        matrix(layout, DType::BF16, dimension(config.hidden_size), mask_columns);
+                    }
                     scratch(layout, ops::linear_topk_workspace_capacity_bytes(
                                         head.weight.qtype, head.weight.n, head.weight.k,
                                         mask_columns, mask_columns));
@@ -736,9 +746,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     (void)workspace::dflash_mlp(layout, config, *draft, tokens);
                     for (const auto& block : parameters.draft->layers) {
                         const auto& p = block.mlp.gate_up;
-                        scratch(layout, ops::linear_swiglu_workspace_capacity_bytes(
-                                            p.weight.qtype, p.weight.n, p.weight.k, p.policy,
-                                            tokens, tokens));
+                        scratch(layout, execution::rotated_workspace_bytes(
+                                            p.hadamard_signs, p.weight.k, tokens,
+                                            ops::linear_swiglu_workspace_capacity_bytes(
+                                                p.weight.qtype, p.weight.n, p.weight.k, p.policy,
+                                                tokens, tokens)));
                     }
                     for (const auto& block : parameters.draft->layers) {
                         add_scratch(layout, block.mlp.down, tokens, tokens);

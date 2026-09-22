@@ -77,6 +77,17 @@ LinearPolicy common_policy(std::span<const WeightInput> inputs) {
     return result;
 }
 
+// Rows fused into one native operand read one activation, so they must agree on its rotation.
+Tensor common_signs(std::span<const WeightInput> inputs) {
+    const Tensor signs = inputs.front().hadamard_signs;
+    for (const auto& input : inputs) {
+        require(input.hadamard_signs.data == signs.data &&
+                    input.hadamard_signs.ne[0] == signs.ne[0],
+                "fused projection rows must share one Hadamard rotation");
+    }
+    return signs;
+}
+
 SingleProjectionWeight single(std::span<const WeightInput> inputs) {
     auto view         = concatenate_rows(inputs);
     const auto region = contiguous_weight_region(view);
@@ -109,7 +120,7 @@ SingleProjectionWeight single(std::span<const WeightInput> inputs) {
         // Keep that ABI detail out of the artifact's optional Use auxiliaries.
         if (divisor == 0) { divisor = 1.0F; }
     }
-    return {native_weight(view, divisor), policy};
+    return {native_weight(view, divisor), policy, common_signs(inputs)};
 }
 
 ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool attention) {
@@ -147,7 +158,8 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
     const bool t2 =
         first.weight.qtype == QType::T2_G128_FP16 && second.weight.qtype == QType::T2_G128_FP16;
     require(q4_q5 || t2, "input projection: paired native form requires Q4 and Q5, or two T2");
-    return PairedProjectionWeights{first.weight, second.weight};
+    return PairedProjectionWeights{first.weight, second.weight, LinearPolicy::A16Only,
+                                   common_signs(inputs)};
 }
 
 } // namespace

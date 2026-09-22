@@ -56,6 +56,15 @@ WeightId Bindings::parameter(std::string name, artifact::Shape shape,
         if (!ggml_block_parameter) { result.policy = ops::LinearPolicy::A16Only; }
 #endif
         for (const auto& [role, binding] : use.auxiliaries) {
+            if (role == "hadamard_signs") {
+                if (pending.reference.shape.size() != 2) {
+                    throw artifact::ArtifactError(name + "@" + input +
+                                                  ": Hadamard signs require a matrix");
+                }
+                result.hadamard_signs =
+                    hadamard_signs(binding, pending.reference.shape[1], name + "@" + input);
+                continue;
+            }
             if (role != "activation_input_divisor") {
                 throw artifact::ArtifactError(name + "@" + input + ": unknown auxiliary " + role);
             }
@@ -75,6 +84,31 @@ WeightId Bindings::parameter(std::string name, artifact::Shape shape,
     const WeightId id{weights.size()};
     parameters_.emplace(std::move(name), id);
     weights.push_back(std::move(pending));
+    return id;
+}
+
+WeightId Bindings::hadamard_signs(const artifact::Binding& binding, std::uint64_t width,
+                                  const std::string& use) {
+    if (width == 0 || width % 1024 != 0) {
+        throw artifact::ArtifactError(use + ": Hadamard rotation needs a multiple of 1024 columns");
+    }
+    std::string key = std::to_string(width);
+    for (const auto& part : binding.parts) {
+        const auto& object = binder.reader().directory().object(part.object);
+        key += "|" + artifact::object_id(object) + ":" + std::to_string(part.begin) + "-" +
+               std::to_string(part.end);
+    }
+    if (const auto found = signs_.find(key); found != signs_.end()) { return found->second; }
+    PendingWeight pending;
+    pending.reference = binder.binding("hadamard_signs/" + std::to_string(signs_.size()), binding,
+                                       {width}, artifact::Residency::Device, QType::BF16);
+    for (const auto& part : pending.reference.binding.parts) {
+        pending.source_objects.push_back(
+            artifact::object_id(binder.reader().directory().object(part.object)));
+    }
+    const WeightId id{weights.size()};
+    weights.push_back(std::move(pending));
+    signs_.emplace(std::move(key), id);
     return id;
 }
 

@@ -2,6 +2,7 @@
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/attention.h"
 #include "models/qwen3_5/execution/gdn.h"
+#include "models/qwen3_5/execution/linear.h"
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/execution/workspace.h"
@@ -51,11 +52,6 @@
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {
-
-void project(const Tensor& x, const LinearParameters& parameters, Tensor& out,
-             WorkspaceArena& workspace, cudaStream_t stream) {
-    ops::linear(x, parameters.weight, out, parameters.policy, workspace, stream);
-}
 
 void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
     if (source == nullptr || destination.dtype != DType::I32 || !destination.is_contiguous() ||
@@ -924,8 +920,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     }
     ops::sigmoid_mul(gate, a, s);
 
-    ops::linear_add(a.view({dimension(config_.attention->query_width()), T}), p.output.weight, x,
-                    p.output.policy, work_, s);
+    project_add(a.view({dimension(config_.attention->query_width()), T}), p.output, x, work_, s);
 }
 
 void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph) {
@@ -1063,8 +1058,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                            dimension(config_.gdn->linear_num_value_heads), T});
     ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, ctx_.execution_view());
 
-    ops::linear_add(on.view({dimension(config_.gdn->value_width()), T}), p.output.weight, x,
-                    p.output.policy, work_, s);
+    project_add(on.view({dimension(config_.gdn->value_width()), T}), p.output, x, work_, s);
 }
 
 ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {

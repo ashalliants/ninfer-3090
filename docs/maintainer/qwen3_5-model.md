@@ -213,6 +213,32 @@ The shared expert always executes and is outside top-k. Logical expert id e iden
 and the corresponding expert matrices. Physical bank ordering and fused dispatch preserve that
 relationship. Router loss coefficients and training-only outputs add no inference term.
 
+## Hadamard-rotated checkpoints
+
+Some checkpoints, such as the ternary Bonsai releases, store a projection as `W * diag(s) * H`
+per 1024-column block, where `H` is the normalized Sylvester Walsh-Hadamard matrix and `s` a
+fixed sign vector per input width. The rotation spreads outliers so the rotated matrix quantizes
+well; the product is unchanged when the activation is rotated the same way:
+
+```text
+y = W x = (W diag(s) H) (H diag(s) x) = W_r * hadamard_transform(x, s)
+```
+
+The artifact marks every such Use with a `hadamard_signs` auxiliary. The residual stream, the
+norms, the KV cache, GDN state, Vision and every draft component stay in the primal basis; only
+the inputs of rotated projections are transformed, and the model applies the transform where it
+can share it:
+
+- the mixer input once for the four attention or GDN input projections, never for the GDN A/B
+  control projections, which read the same normalized input unrotated;
+- the gated attention and GDN outputs before their output projections;
+- the FFN input before gate/up, and SwiGLU's output through `silu_mul_hadamard` before down;
+- the final hidden before every target, MTP, DFlash and proposal head call, on a copy where the
+  primal hidden is read again (the DFlash2 candidate selector).
+
+A rotated Use anywhere else, including MoE experts, is refused at load time. A token embedding
+stored rotated is converted back to the primal basis by the converter.
+
 ## Prefill, decode and MTP
 
 Text prefill gathers embedding columns, replaces media placeholders with Vision outputs, and runs

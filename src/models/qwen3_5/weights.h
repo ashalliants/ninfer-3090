@@ -28,6 +28,8 @@ struct WeightUse {
     std::string input;
     ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
     std::optional<float> activation_input_divisor;
+    // BF16 [K] sign vector of a Hadamard-rotated matrix, bound as its own device weight.
+    std::optional<WeightId> hadamard_signs;
 };
 
 struct BoundWeight {

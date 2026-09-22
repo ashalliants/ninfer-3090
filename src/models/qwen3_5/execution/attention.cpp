@@ -1,4 +1,5 @@
 #include "models/qwen3_5/execution/attention.h"
+#include "models/qwen3_5/execution/rotation.h"
 
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/rope.h"
@@ -24,27 +25,34 @@ std::size_t attention_projection_workspace_bytes(const AttentionParameters& para
     if (first <= 0 || last < first) {
         throw std::invalid_argument("attention projection: invalid column interval");
     }
+    const Tensor& signs = projection_signs(parameters.projection);
     if (const auto* single = std::get_if<LinearParameters>(&parameters.projection)) {
         const auto& weight = single->weight;
-        return ops::attn_input_proj_workspace_capacity_bytes(weight.qtype, weight.n, weight.k,
-                                                             single->policy, first, last);
+        return rotated_workspace_bytes(
+            signs, weight.k, last,
+            ops::attn_input_proj_workspace_capacity_bytes(weight.qtype, weight.n, weight.k,
+                                                          single->policy, first, last));
     }
     const auto& pair = std::get<ops::PairedProjectionWeights>(parameters.projection);
-    return ops::attn_input_proj_split_workspace_capacity_bytes(
-        pair.first.qtype, pair.first.n, pair.second.qtype, pair.second.n, pair.first.k, pair.policy,
-        first, last);
+    return rotated_workspace_bytes(signs, pair.first.k, last,
+                                   ops::attn_input_proj_split_workspace_capacity_bytes(
+                                       pair.first.qtype, pair.first.n, pair.second.qtype,
+                                       pair.second.n, pair.first.k, pair.policy, first, last));
 }
 
 void attention_projection(const Tensor& hidden, const AttentionParameters& parameters,
                           Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
                           WorkspaceArena& workspace, cudaStream_t stream) {
+    auto scope = workspace.scope();
+    const Tensor x =
+        rotated_input(hidden, projection_signs(parameters.projection), workspace, stream);
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
-        ops::attn_input_proj(hidden, pair->first, pair->second, query, gate, key, value,
-                             pair->policy, workspace, stream);
+        ops::attn_input_proj(x, pair->first, pair->second, query, gate, key, value, pair->policy,
+                             workspace, stream);
     } else {
         const auto& single = std::get<LinearParameters>(parameters.projection);
-        ops::attn_input_proj(hidden, single.weight, query, gate, key, value, single.policy,
-                             workspace, stream);
+        ops::attn_input_proj(x, single.weight, query, gate, key, value, single.policy, workspace,
+                             stream);
     }
 }
 

@@ -15,11 +15,16 @@ struct WeightInput {
     const WeightView& weight;
     LinearPolicy policy = LinearPolicy::A16Only;
     std::optional<float> activation_input_divisor;
+    // BF16 [K] signs of a Hadamard-rotated matrix: the Use multiplies the stored rows with
+    // hadamard_transform(input, signs) instead of the input. Empty for an ordinary matrix. No Op
+    // reads it; the caller rotates the activation (see the model's execution layer).
+    Tensor hadamard_signs{};
 };
 
 struct SingleProjectionWeight {
     Weight weight;
     LinearPolicy policy = LinearPolicy::A16Only;
+    Tensor hadamard_signs{};
 };
 
 struct PairedProjectionWeights {
@@ -27,6 +32,7 @@ struct PairedProjectionWeights {
     // Split parents reach their Op without a SingleProjectionWeight to carry the decision, so the
     // pair carries it. A16Only unless a registered route exists for these exact shapes.
     LinearPolicy policy = LinearPolicy::A16Only;
+    Tensor hadamard_signs{};
 };
 
 using ProjectionWeights = std::variant<SingleProjectionWeight, PairedProjectionWeights>;

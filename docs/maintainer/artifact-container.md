@@ -452,6 +452,21 @@ Writer 为需要许可的 projection 使用位置写出明确结果。某个 enc
 检查为正且有限。也可用 Part 引用一个 FP32 向量中的单个元素，保留相同 scalar 含义。
 Auxiliary Binding 的期望 shape、类型和作用由对应使用合同定义。
 
+`hadamard_signs` 标记 Hadamard 旋转的矩阵：Binding 为 `format=bf16, layout=contiguous_le_v1,
+shape=[K]`，K 为该 parameter 的输入宽度且是 1024 的倍数，元素为 +1 或 -1。该用途把存储的矩阵
+乘以 `hadamard_transform(input, signs)`（每个 1024 块先逐元素乘符号，再做归一化 Sylvester
+Walsh-Hadamard 变换）而不是原始输入。同一向量可被任意多个用途引用，loader 只绑定一次。
+执行层只在支持旋转的输入位置接受它；其余位置遇到该辅助输入时拒绝加载。
+
+```json
+{
+  "parameter": "text/layers/0/mlp/down",
+  "input": "text/layers/0/mlp/product",
+  "activation_policy": "A16Only",
+  "auxiliaries": {"hadamard_signs": {"object": "w.hadamard.signs_17408"}}
+}
+```
+
 DFlash/DFlash2 的 query K/V 使用 `attention/key`、`attention/value`，context K/V 使用
 `attention/context_key`、`attention/context_value`，各自建立 Binding 和 Use。
 两组绑定可以共享 parent 区域，也可以独立选择表示，见第 12.5 节。
