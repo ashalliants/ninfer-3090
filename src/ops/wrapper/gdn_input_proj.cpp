@@ -801,18 +801,22 @@ void t2_two_parent_project(const Tensor& x, const Weight& qk_weight, const Weigh
                                  static_cast<std::size_t>(cols), cudaMemcpyDeviceToDevice, stream));
 }
 
-std::size_t t2_two_parent_projection_bytes(std::int32_t columns,
+// Transient storage of t2_two_parent_project over each width in [min_columns, max_columns]: the
+// integer route's activation planes where it takes the width, otherwise the q/k and value planes of
+// the A16 route (whose T2 linears take no workspace).
+std::size_t t2_two_parent_projection_bytes(std::int32_t min_columns, std::int32_t max_columns,
                                            LinearPolicy policy = LinearPolicy::A16Only) {
-    std::size_t inner = 0;
-    for (const std::int32_t rows : {4096, 6144}) {
-        inner = std::max(inner, linear_workspace_capacity_bytes(QType::T2_G128_FP16, rows, 5120,
-                                                                policy, 1, columns));
+    std::size_t bytes = 0;
+    for (std::int32_t columns = min_columns; columns <= max_columns; ++columns) {
+        WorkspaceLayoutBuilder layout;
+        if (!detail::t2_a8_admits(policy) ||
+            !detail::t2_a8_layout_activations(layout, 5120, columns)) {
+            (void)layout.alloc(DType::BF16, {4096, columns});
+            (void)layout.alloc(DType::BF16, {6144, columns});
+        }
+        bytes = std::max(bytes, layout.peak_bytes(1));
     }
-    WorkspaceLayoutBuilder layout;
-    (void)layout.alloc(DType::BF16, {4096, columns});
-    (void)layout.alloc(DType::BF16, {6144, columns});
-    if (inner != 0) { (void)layout.alloc_bytes(inner); }
-    return layout.peak_bytes(1);
+    return bytes;
 }
 
 } // namespace
@@ -867,7 +871,7 @@ std::size_t gdn_input_proj_split_workspace_capacity_bytes(
             input_rows != 5120) {
             throw std::invalid_argument("gdn_input_proj workspace: unregistered T2 pair");
         }
-        return t2_two_parent_projection_bytes(max_tokens, policy);
+        return t2_two_parent_projection_bytes(min_tokens, max_tokens, policy);
     }
     const bool registered = qk_qtype == QType::Q4_G64_FP16 && qk_rows == 4096 &&
                             value_z_qtype == QType::Q5_G64_FP16 && value_z_rows == 12288 &&
@@ -1020,11 +1024,19 @@ std::size_t gdn_input_proj_split_conv_snapshot_workspace_capacity_bytes(QType qk
                                                                         std::int32_t batch_size,
                                                                         std::int32_t min_width,
                                                                         std::int32_t max_width) {
+    return gdn_input_proj_split_conv_snapshot_workspace_capacity_bytes(
+        qk_qtype, value_z_qtype, LinearPolicy::A16Only, batch_size, min_width, max_width);
+}
+
+std::size_t gdn_input_proj_split_conv_snapshot_workspace_capacity_bytes(
+    QType qk_qtype, QType value_z_qtype, LinearPolicy policy, std::int32_t batch_size,
+    std::int32_t min_width, std::int32_t max_width) {
     if (qk_qtype == QType::T2_G128_FP16 && value_z_qtype == QType::T2_G128_FP16) {
         require_snapshot_capacity_domain(batch_size, min_width, max_width);
         const std::int32_t columns = std::max(batch_size, 1) * max_width;
-        return composed_snapshot_capacity(2048 + 2048 + 6144, columns,
-                                          t2_two_parent_projection_bytes(columns));
+        return composed_snapshot_capacity(
+            2048 + 2048 + 6144, columns,
+            t2_two_parent_projection_bytes(std::max(batch_size, 1) * min_width, columns, policy));
     }
     if (qk_qtype == QType::Q4_G64_FP16 && value_z_qtype == QType::Q5_G64_FP16) {
         return gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, batch_size,
@@ -1038,9 +1050,17 @@ std::size_t gdn_input_proj_split_conv_record_workspace_capacity_bytes(QType qk_q
                                                                       std::int32_t batch_size,
                                                                       std::int32_t min_width,
                                                                       std::int32_t max_width) {
+    return gdn_input_proj_split_conv_record_workspace_capacity_bytes(
+        qk_qtype, value_z_qtype, LinearPolicy::A16Only, batch_size, min_width, max_width);
+}
+
+std::size_t gdn_input_proj_split_conv_record_workspace_capacity_bytes(
+    QType qk_qtype, QType value_z_qtype, LinearPolicy policy, std::int32_t batch_size,
+    std::int32_t min_width, std::int32_t max_width) {
     if (qk_qtype == QType::T2_G128_FP16 && value_z_qtype == QType::T2_G128_FP16) {
         require_record_capacity_domain(batch_size, min_width, max_width);
-        return t2_two_parent_projection_bytes(std::max(batch_size, 1) * max_width);
+        return t2_two_parent_projection_bytes(std::max(batch_size, 1) * min_width,
+                                              std::max(batch_size, 1) * max_width, policy);
     }
     if (qk_qtype == QType::Q4_G64_FP16 && value_z_qtype == QType::Q5_G64_FP16) {
         return gdn_input_proj_conv_record_workspace_capacity_bytes(2048, 2048, 6144, batch_size,
@@ -1107,6 +1127,19 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
                                   const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
                                   Tensor& value, Tensor& z, WorkspaceArena& ws,
                                   cudaStream_t stream) {
+    gdn_input_proj_conv_snapshot(x, qk_weight, value_z_weight, conv_weight, conv_states,
+                                 valid_columns, initial_state_slots, snapshot_base_slots, query,
+                                 key, value, z, LinearPolicy::A16Only, ws, stream);
+}
+
+void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
+                                  const Weight& value_z_weight, const Tensor& conv_weight,
+                                  Tensor& conv_states, const Tensor& valid_columns,
+                                  const Tensor& initial_state_slots,
+                                  const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
+                                  Tensor& value, Tensor& z, LinearPolicy policy, WorkspaceArena& ws,
+                                  cudaStream_t stream) {
+    validate_policy(policy);
     constexpr std::int32_t kHidden     = 5120;
     constexpr std::int32_t kQueryRows  = 2048;
     constexpr std::int32_t kKeyRows    = 2048;
@@ -1138,7 +1171,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
             [&](const Tensor& x_flat, Tensor& projected, Tensor& z_flat) {
                 if (ternary) {
                     t2_two_parent_project(x_flat, qk_weight, value_z_weight, projected, z_flat,
-                                          LinearPolicy::A16Only, ws, stream);
+                                          policy, ws, stream);
                 } else {
                     gdn_input_proj(x_flat, qk_weight, value_z_weight, projected, z_flat, stream);
                 }
@@ -1150,8 +1183,8 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
     auto scope                 = ws.scope();
     ProjectedWorkspace scratch = allocate_projected_workspace(ws, kChannels, geometry.width);
     if (ternary) {
-        t2_two_parent_project(x, qk_weight, value_z_weight, scratch.projected, z,
-                              LinearPolicy::A16Only, ws, stream);
+        t2_two_parent_project(x, qk_weight, value_z_weight, scratch.projected, z, policy, ws,
+                              stream);
     } else {
         gdn_input_proj(x, qk_weight, value_z_weight, scratch.projected, z, stream);
     }
@@ -1166,6 +1199,19 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                                 const Tensor& initial_state_slots, Tensor& conv_record,
                                 Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                 WorkspaceArena& workspace, cudaStream_t stream) {
+    gdn_input_proj_conv_record(x, qk_weight, value_z_weight, conv_weight, conv_states,
+                               valid_columns, initial_state_slots, conv_record, query, key, value,
+                               z, LinearPolicy::A16Only, workspace, stream);
+}
+
+void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
+                                const Weight& value_z_weight, const Tensor& conv_weight,
+                                const Tensor& conv_states, const Tensor& valid_columns,
+                                const Tensor& initial_state_slots, Tensor& conv_record,
+                                Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                                LinearPolicy policy, WorkspaceArena& workspace,
+                                cudaStream_t stream) {
+    validate_policy(policy);
     constexpr std::int32_t kHidden     = 5120;
     constexpr std::int32_t kQueryRows  = 2048;
     constexpr std::int32_t kKeyRows    = 2048;
@@ -1200,7 +1246,7 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                    [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
                        if (ternary) {
                            t2_two_parent_project(x_flat, qk_weight, value_z_weight, record_flat,
-                                                 z_flat, LinearPolicy::A16Only, workspace, stream);
+                                                 z_flat, policy, workspace, stream);
                        } else {
                            gdn_input_proj(x_flat, qk_weight, value_z_weight, record_flat, z_flat,
                                           stream);

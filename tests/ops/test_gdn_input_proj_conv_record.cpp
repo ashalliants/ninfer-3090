@@ -306,6 +306,58 @@ int run_q4_q5() {
     return failures;
 }
 
+// The ternary pair under both policies: A16 and the integer-activation routes, whose records must
+// stay bit-identical to a snapshot run under the same policy.
+int run_t2() {
+    constexpr std::int32_t kHidden    = 5120;
+    constexpr std::int32_t kValueRows = 6144;
+    constexpr std::int32_t kZRows     = 6144;
+    DevicePackedWeight qk(
+        quantized_weight::make_patterned_weight(QType::T2_G128_FP16, 4096, kHidden, 1411U));
+    DevicePackedWeight value_z(
+        quantized_weight::make_patterned_weight(QType::T2_G128_FP16, 12288, kHidden, 1413U));
+
+    int failures   = 0;
+    const auto run = [&](ops::LinearPolicy policy, std::int32_t width, std::int32_t batch,
+                         std::vector<std::int32_t> valid, std::uint32_t seed) {
+        const std::size_t snapshot_bytes =
+            ops::gdn_input_proj_split_conv_snapshot_workspace_capacity_bytes(
+                QType::T2_G128_FP16, QType::T2_G128_FP16, policy, batch, width, width);
+        const std::size_t record_bytes =
+            ops::gdn_input_proj_split_conv_record_workspace_capacity_bytes(
+                QType::T2_G128_FP16, QType::T2_G128_FP16, policy, batch, width, width);
+        const std::string tag = policy == ops::LinearPolicy::A16Only ? "T2 A16" : "T2 A8I";
+        return run_case(
+            tag + " B=" + std::to_string(batch) + " T=" + std::to_string(width), kHidden,
+            kValueRows, kZRows, width, batch, std::move(valid), snapshot_bytes, record_bytes,
+            [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid_columns,
+                const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
+                Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
+                ops::gdn_input_proj_conv_snapshot(x, qk.view(), value_z.view(), conv, state,
+                                                  valid_columns, initial, snapshot_base, q, k, v, z,
+                                                  policy, workspace, stream);
+            },
+            [&](const Tensor& x, const Tensor& conv, const Tensor& state,
+                const Tensor& valid_columns, const Tensor& initial, Tensor& record, Tensor& q,
+                Tensor& k, Tensor& v, Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
+                ops::gdn_input_proj_conv_record(x, qk.view(), value_z.view(), conv, state,
+                                                valid_columns, initial, record, q, k, v, z, policy,
+                                                workspace, stream);
+            },
+            seed);
+    };
+    for (auto policy : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8Int}) {
+        for (int width : {2, 4, 8, 16}) {
+            failures += run(policy, width, 1, {}, 1420U + width);
+            failures += run(policy, width, 8, ragged(width, 8), 1460U + width);
+        }
+        failures += run(policy, 5, 3, {5, 3, 1}, 1493U);
+    }
+    failures += qk.verify_preserved("T2 record qk weight");
+    failures += value_z.verify_preserved("T2 record value/z weight");
+    return failures;
+}
+
 int run_q8() {
     constexpr std::int32_t kHidden    = 2048;
     constexpr std::int32_t kValueRows = 4096;
@@ -468,6 +520,7 @@ int main() {
 
     int failures = 0;
     failures += run_q4_q5();
+    failures += run_t2();
     failures += run_q8();
     failures += run_nvfp4();
     failures += run_fp8();

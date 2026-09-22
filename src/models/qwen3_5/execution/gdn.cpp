@@ -25,7 +25,7 @@ std::size_t snapshot_scratch_bytes(const GdnParameters& parameters, const GdnCon
     std::size_t bytes;
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
         bytes = ops::gdn_input_proj_split_conv_snapshot_workspace_capacity_bytes(
-            pair->first.qtype, pair->second.qtype, batch, first_width, last_width);
+            pair->first.qtype, pair->second.qtype, pair->policy, batch, first_width, last_width);
     } else if (const auto& single = std::get<LinearParameters>(parameters.projection);
                single.weight.qtype != QType::Q8_G32_FP16) {
         const auto& w = single.weight;
@@ -46,7 +46,7 @@ std::size_t record_scratch_bytes(const GdnParameters& parameters, const GdnConfi
     std::size_t bytes;
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
         bytes = ops::gdn_input_proj_split_conv_record_workspace_capacity_bytes(
-            pair->first.qtype, pair->second.qtype, batch, first_width, last_width);
+            pair->first.qtype, pair->second.qtype, pair->policy, batch, first_width, last_width);
     } else if (const auto& single = std::get<LinearParameters>(parameters.projection);
                single.weight.qtype != QType::Q8_G32_FP16) {
         const auto& w = single.weight;
@@ -149,9 +149,9 @@ void gdn_projection_snapshot(const Tensor& hidden, const GdnParameters& paramete
     WorkspaceArena scratch(workspace.alloc_bytes(
         snapshot_scratch_bytes(parameters, config, hidden.ne[2], hidden.ne[1], hidden.ne[1])));
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
-        ops::gdn_input_proj_conv_snapshot(x, pair->first, pair->second, parameters.convolution,
-                                          conv_states, valid_columns, initial_slots,
-                                          destination_slots, query, key, value, z, scratch, stream);
+        ops::gdn_input_proj_conv_snapshot(
+            x, pair->first, pair->second, parameters.convolution, conv_states, valid_columns,
+            initial_slots, destination_slots, query, key, value, z, pair->policy, scratch, stream);
     } else {
         const auto& single = std::get<LinearParameters>(parameters.projection);
         ops::gdn_input_proj_conv_snapshot(x, single.weight, parameters.convolution, conv_states,
@@ -174,7 +174,7 @@ void gdn_projection_record(const Tensor& hidden, const GdnParameters& parameters
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
         ops::gdn_input_proj_conv_record(x, pair->first, pair->second, parameters.convolution,
                                         conv_states, valid_columns, initial_slots, conv_record,
-                                        query, key, value, z, scratch, stream);
+                                        query, key, value, z, pair->policy, scratch, stream);
     } else {
         const auto& single = std::get<LinearParameters>(parameters.projection);
         ops::gdn_input_proj_conv_record(x, single.weight, parameters.convolution, conv_states,
