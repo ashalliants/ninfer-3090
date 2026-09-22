@@ -4,10 +4,12 @@ The GGUF stores every text projection except the GDN A/B controls as Hadamard-ro
 rows with one binary16 scale per 128 columns, the token-embedding table rotated as well, and
 llama.cpp's exporter conventions: GDN value heads in tiled order, zero-centred norms as `1 + w`
 and `ssm_a = -exp(A_log)`. This module restores the grouped value-head order and the primal
-norm, A_log and embedding values, and exposes the rotated projections as encoded T2 rows whose
-Uses carry the sign vector of their input width, so the recipe stores them without rounding.
-MTP, Vision, the frontend resources and the DFlash2 adapter come from the vanilla companions
-given to `--model` and `--source dflash2`, which share the geometry.
+norm and A_log values, and exposes the rotated projections as encoded T2 rows whose Uses carry
+the sign vector of their input width, so the recipe stores them without rounding. The token table
+is stored the same way, inverse-rotated; the runtime restores each gathered row with the
+hidden-width signs. MTP, Vision, the frontend resources and the DFlash2 adapter come from the
+companions given to `--model` and `--source dflash2`, which share the geometry; `--source mtp`
+replaces the checkpoint's MTP head.
 """
 
 from __future__ import annotations
@@ -17,8 +19,8 @@ from typing import Callable
 import numpy as np
 import torch
 
-from .methods import AuxiliaryValue, cast_direct, grouped_absmax, import_encoded
-from .official_recipes import Q8, _optional
+from .methods import AuxiliaryValue, cast_direct, import_encoded
+from .official_recipes import _optional
 from .sources.gguf_ternary import GGUFFile
 from .sources.logical import EncodedRows, LogicalSource, array_source
 
@@ -195,24 +197,6 @@ def untile(array: np.ndarray, head_dim: int) -> np.ndarray:
     )
 
 
-def fwht_1024(x: torch.Tensor) -> torch.Tensor:
-    """Normalized Sylvester Walsh-Hadamard transform over every 1024-block of the last axis."""
-
-    if x.shape[-1] % HADAMARD_BLOCK:
-        raise ValueError(
-            f"last axis {x.shape[-1]} is not a multiple of {HADAMARD_BLOCK}"
-        )
-    shape = x.shape
-    y = x.reshape(-1, HADAMARD_BLOCK)
-    half = 1
-    while half < HADAMARD_BLOCK:
-        y = y.reshape(-1, HADAMARD_BLOCK // (2 * half), 2, half)
-        low, high = y[:, :, 0, :], y[:, :, 1, :]
-        y = torch.stack((low + high, low - high), dim=2)
-        half *= 2
-    return y.reshape(shape) * (1.0 / np.sqrt(HADAMARD_BLOCK))
-
-
 RowMap = Callable[[int, int], np.ndarray]
 
 
@@ -277,20 +261,6 @@ def ternary_source(
     return LogicalSource(shape, f"{tensor}{list(shape)}", _flat(values, k), encoded)
 
 
-def embedding_source(gguf: GGUFFile, signs: torch.Tensor) -> LogicalSource:
-    """The token-embedding table restored to the primal basis, `e = s * FWHT(z)`."""
-
-    def values(first: int, last: int) -> torch.Tensor:
-        blocks = gguf.read_ternary("token_embd.weight", first, last)
-        rotated = torch.from_numpy(blocks.values).float() * torch.from_numpy(
-            blocks.scales
-        ).float().unsqueeze(-1)
-        return fwht_1024(rotated.reshape(last - first, HIDDEN)) * signs
-
-    shape = (VOCABULARY, HIDDEN)
-    return LogicalSource(shape, "primal(token_embd.weight)", _flat(values, HIDDEN))
-
-
 def _direct(values: np.ndarray, dtype: torch.dtype, label: str) -> LogicalSource:
     return array_source(torch.from_numpy(np.ascontiguousarray(values)).to(dtype), label)
 
@@ -308,7 +278,11 @@ def text_sources(
     encoded = {
         "text/output_head": ternary_source(
             gguf, "output.weight", (VOCABULARY, HIDDEN), rows()
-        )
+        ),
+        # Stored inverse-rotated: the runtime restores each gathered row as s * FWHT(z).
+        "text/token_embedding": ternary_source(
+            gguf, "token_embd.weight", (VOCABULARY, HIDDEN), rows()
+        ),
     }
     direct = {"text/final_norm": _norm(gguf, "output_norm.weight", True)}
     for layer in range(LAYERS):
@@ -425,12 +399,6 @@ def bonsai2_27b_ternary(model, recipe, sources):
             method=cast_direct,
             source=source,
         )
-    recipe.assign(
-        "text/token_embedding",
-        format=Q8,
-        method=grouped_absmax,
-        source=embedding_source(gguf, signs[HIDDEN]),
-    )
     # The runtime's T2 input projections take the Q/K + gate/V and q/k + v/z parent pairs.
     for layer in range(LAYERS):
         p = f"text/layers/{layer}/"
@@ -460,9 +428,7 @@ __all__ = [
     "RECIPES",
     "attention_rows",
     "bonsai2_27b_ternary",
-    "embedding_source",
     "expected_tensors",
-    "fwht_1024",
     "sign_vectors",
     "ternary_source",
     "text_sources",

@@ -96,15 +96,16 @@ backend. Component availability and startup selection are independent.
 
 `bonsai2_27b_ternary` ([`ternary.py`](../tools/convert/ternary.py)) builds a Qwen3.8-27B artifact
 whose text tower comes from PrismML's `Ternary-Bonsai-2-27B-PQ2_0.gguf`. Every text projection
-except the GDN A/B controls, and the output head, is stored as `t2_g128_fp16`: the ternary codes
-and their per-128 scales are imported without rounding. Those matrices are Hadamard-rotated in the
-checkpoint, so each of their Uses carries the `hadamard_signs` auxiliary of its input width (three
-shared vectors in total), and the runtime rotates the matching activations. The recipe also undoes
-llama.cpp's exporter conventions: GDN value heads return from the tiled to the grouped order,
-norms from `1 + w` to `w`, `ssm_a` to `A_log`, and the token-embedding table from the rotated to
-the primal basis before its Q8 encoding. MTP, Vision, the frontend resources and DFlash2 come
-from the vanilla Qwen3.8-27B checkpoint and adapter, which share the geometry. A `--proposal`
-head gathered from the rotated output head inherits its rotation.
+except the GDN A/B controls, the output head and the token-embedding table are stored as
+`t2_g128_fp16`: the ternary codes and their per-128 scales are imported without rounding. Those
+matrices are Hadamard-rotated in the checkpoint, so each projection's Uses carry the
+`hadamard_signs` auxiliary of its input width (three shared vectors in total), and the runtime
+rotates the matching activations. The token table has no Use of its own: the runtime restores each
+gathered row to the primal basis with the hidden-width signs that the output head carries. The
+recipe also undoes llama.cpp's exporter conventions: GDN value heads return from the tiled to the
+grouped order, norms from `1 + w` to `w`, and `ssm_a` to `A_log`. MTP, Vision, the frontend
+resources and DFlash2 come from the vanilla Qwen3.8-27B checkpoint and adapter, which share the
+geometry. A `--proposal` head gathered from the rotated output head inherits its rotation.
 
 ```bash
 python3 -m tools.convert \

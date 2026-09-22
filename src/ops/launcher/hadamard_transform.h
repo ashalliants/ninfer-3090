@@ -3,6 +3,7 @@
 // ninfer::ops::detail - private launch prototype for hadamard_transform.
 
 #include "core/tensor.h"
+#include "core/weight.h"
 
 #include <cuda_runtime.h>
 
@@ -28,6 +29,8 @@ void gated_rmsnorm_hadamard_d128_launch(const Tensor& x, const Tensor& weight, c
                                         std::int32_t heads_per_column, Tensor& out,
                                         cudaStream_t stream);
 void sigmoid_mul_hadamard_launch(const Tensor& gate, const Tensor& x, const Tensor& signs,
+                                 Tensor& out, cudaStream_t stream);
+void embedding_rotated_t2_launch(const Tensor& ids, const Weight& table, const Tensor& signs,
                                  Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

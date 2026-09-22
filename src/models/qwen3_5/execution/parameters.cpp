@@ -1,4 +1,5 @@
 #include "models/qwen3_5/execution/parameters.h"
+#include "models/qwen3_5/execution/rotation.h"
 
 #include "core/weight_view.h"
 
@@ -352,6 +353,16 @@ Parameters::Parameters(const Model& source) : model(source) {
     const auto& w        = model.weights();
     text.token_embedding = native_weight(model.weight(w.text.token_embedding).view);
     text.output_head     = prepare.rotated_linear(w.text.output_head_use);
+    if (text.token_embedding.qtype == QType::T2_G128_FP16) {
+        // A ternary checkpoint stores its token table rotated by the same hidden-width signs as
+        // every 5120-wide input, the output head's among them; the table has no Use of its own.
+        if (!rotated(text.output_head.hadamard_signs) ||
+            text.output_head.hadamard_signs.ne[0] != text.token_embedding.k) {
+            throw std::invalid_argument(
+                "a T2 token embedding needs a rotated output head carrying the hidden-width signs");
+        }
+        text.token_embedding_signs = text.output_head.hadamard_signs;
+    }
     text.final_norm      = prepare.tensor(w.text.final_norm);
     text.rank_count = w.text.stages.stages();
     text.stage_begin.clear();

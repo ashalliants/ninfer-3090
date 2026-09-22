@@ -12,6 +12,7 @@
 #include "ops/kernel/rmsnorm.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -185,6 +186,60 @@ __launch_bounds__(WarpsPerCta* kWarpSize) __global__
     }
     hadamard_1024_forward_store(
         v, signs + static_cast<std::int64_t>(block) * kHadamardTransformBlock, out + base, lane);
+}
+
+// Rows of a Hadamard-rotated T2G128 table (a token embedding stored in the rotated basis) restored
+// to the primal basis on the way out: out[b*1024+i, t] = 2^-5 * signs[b*1024+i] * sum_j H[i][j] *
+// z[b*1024+j] with z = code * scale of row ids[t], one warp per (token, 1024-block). The codes are
+// two's complement over two bits, lowest element in the lowest bits, one FP16 scale per 128
+// columns; the dequantised values enter the butterfly unrounded.
+template <int WarpsPerCta>
+__launch_bounds__(WarpsPerCta* kWarpSize) __global__
+    void embed_gather_t2_hadamard_kernel(const std::int32_t* __restrict__ ids,
+                                         const std::uint8_t* __restrict__ codes,
+                                         const __half* __restrict__ scales,
+                                         const __nv_bfloat16* __restrict__ signs,
+                                         __nv_bfloat16* __restrict__ out, std::int64_t items,
+                                         std::int32_t width) {
+    const int lane          = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+    const int warp          = static_cast<int>(threadIdx.x) / kWarpSize;
+    const std::int64_t item = static_cast<std::int64_t>(blockIdx.x) * WarpsPerCta + warp;
+    if (item >= items) { return; }
+    const std::int32_t blocks_per_row = width / kHadamardTransformBlock;
+    const std::int64_t token          = item / blocks_per_row;
+    const int block                   = static_cast<int>(item - token * blocks_per_row);
+    const std::int64_t row            = ids[token];
+    const std::uint8_t* row_codes     = codes + row * (width / 4);
+    const __half* row_scales          = scales + row * (width / 128);
+    const int block_base              = block * kHadamardTransformBlock;
+
+    float v[kHadamardTransformLaneVectors][8];
+#pragma unroll
+    for (int r = 0; r < kHadamardTransformLaneVectors; ++r) {
+        const int first     = block_base + hadamard_lane_offset(lane, r);
+        const unsigned bits = *reinterpret_cast<const std::uint16_t*>(row_codes + first / 4);
+        const float scale   = __half2float(row_scales[first / 128]);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const unsigned code = (bits >> (2 * j)) & 3U;
+            v[r][j]             = code == 1U ? scale : (code == 3U ? -scale : 0.0f);
+        }
+    }
+
+    hadamard_1024_butterfly(v, lane);
+
+    const __nv_bfloat16* block_signs = signs + block_base;
+    __nv_bfloat16* out_block         = out + token * width + block_base;
+#pragma unroll
+    for (int r = 0; r < kHadamardTransformLaneVectors; ++r) {
+        float s[8];
+        hadamard_unpack8(load_vec<uint4>(block_signs + hadamard_lane_offset(lane, r)), s);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            v[r][j] = __fmul_rn(v[r][j], kHadamardTransformNormalizer) * s[j];
+        }
+        store_vec(out_block + hadamard_lane_offset(lane, r), hadamard_pack8(v[r]));
+    }
 }
 
 } // namespace ninfer::ops

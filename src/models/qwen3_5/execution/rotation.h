@@ -3,6 +3,8 @@
 #include "core/arena.h"
 #include "core/layout.h"
 #include "core/tensor.h"
+#include "core/weight.h"
+#include "ninfer/ops/embedding.h"
 #include "ninfer/ops/hadamard_transform.h"
 #include "ninfer/ops/weight_input.h"
 
@@ -37,6 +39,16 @@ enum class InputBasis : std::uint8_t { Primal, Rotated };
     Tensor out = workspace.alloc(DType::BF16, {x.ne[0], x.ne[1], x.ne[2], x.ne[3]});
     ops::hadamard_transform(x, signs, false, out, stream);
     return out;
+}
+
+// The token rows of `ids`, restored to the primal basis when the table is stored rotated.
+inline void embed_tokens(const Tensor& ids, const Weight& table, const Tensor& signs, Tensor& out,
+                         cudaStream_t stream) {
+    if (rotated(signs)) {
+        ops::embedding_rotated(ids, table, signs, out, stream);
+    } else {
+        ops::embedding(ids, table, out, stream);
+    }
 }
 
 // Workspace bytes of rotated_input over `columns` columns of `rows` features, followed by the

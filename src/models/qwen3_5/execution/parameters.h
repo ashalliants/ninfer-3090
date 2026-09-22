@@ -58,6 +58,9 @@ struct BlockParameters {
 
 struct TextParameters {
     Weight token_embedding;
+    // A token table stored in the rotated basis (T2) is restored after the gather with the
+    // hidden-width sign vector; empty for an ordinary table.
+    Tensor token_embedding_signs;
     LinearParameters output_head;
     Tensor final_norm;
     std::vector<BlockParameters> layers;

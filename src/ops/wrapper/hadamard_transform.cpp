@@ -229,4 +229,24 @@ void sigmoid_mul_hadamard(const Tensor& gate, const Tensor& x, const Tensor& sig
     detail::sigmoid_mul_hadamard_launch(gate, x, signs, out, stream);
 }
 
+void embedding_rotated(const Tensor& ids, const Weight& table, const Tensor& signs, Tensor& out,
+                       cudaStream_t stream) {
+    const std::int32_t width = require_rotation("embedding_rotated", signs, out);
+    if (ids.dtype != DType::I32 || !ids.is_contiguous() || ids.data == nullptr || ids.ne[1] != 1 ||
+        ids.ne[2] != 1 || ids.ne[3] != 1) {
+        throw std::invalid_argument("embedding_rotated: ids must be contiguous I32 [T]");
+    }
+    if (out.ne[0] != width || out.ne[1] != ids.ne[0] || out.ne[2] != 1 || out.ne[3] != 1) {
+        throw std::invalid_argument("embedding_rotated: out must be [K, T] with K the sign width");
+    }
+    if (table.qtype != QType::T2_G128_FP16 || table.layout != QuantLayout::RowSplit ||
+        table.qdata == nullptr || table.scales == nullptr || table.k != width || table.n <= 0 ||
+        table.scale_dtype != DType::FP16 || !aligned4(table.qdata)) {
+        throw std::invalid_argument(
+            "embedding_rotated: table must be a row-split t2_g128_fp16 [vocab, K] weight");
+    }
+    if (ids.ne[0] == 0) { return; }
+    detail::embedding_rotated_t2_launch(ids, table, signs, out, stream);
+}
+
 } // namespace ninfer::ops

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
 import torch
 
 from tools.artifact.codecs.row_split import decode_row_split_codes, encode_row_split
@@ -78,16 +77,6 @@ def test_query_and_gate_rows_split_each_interleaved_head():
     gate = ternary.attention_rows(True)(0, 3)
     assert query.tolist() == [250, 251, 252, 253, 254, 255, 512, 513, 514, 515]
     assert gate.tolist() == [256, 257, 258]
-
-
-def test_primal_embedding_inverts_the_activation_rotation():
-    generator = torch.Generator().manual_seed(7)
-    primal = torch.randn(4, 2048, generator=generator, dtype=torch.float64)
-    signs = torch.where(torch.rand(2048, generator=generator) < 0.5, -1.0, 1.0).double()
-    rotated = ternary.fwht_1024(primal * signs)
-    assert torch.allclose(ternary.fwht_1024(rotated) * signs, primal, atol=1e-12)
-    with pytest.raises(ValueError):
-        ternary.fwht_1024(torch.zeros(3, 1000))
 
 
 def test_sign_auxiliary_is_a_bf16_vector():
