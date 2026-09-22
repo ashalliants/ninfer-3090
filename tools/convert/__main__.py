@@ -118,7 +118,7 @@ def main(argv=None):
         action="append",
         default=[],
         metavar="NAME=PATH",
-        help="named source such as quantized, dflash or dflash2",
+        help="named source such as quantized, dflash, dflash2, or mtp (replaces the base MTP head)",
     )
     parser.add_argument(
         "--components",
@@ -210,6 +210,8 @@ def main(argv=None):
             companions = {
                 key: sources[key] for key in ("dflash", "dflash2") if key in components
             }
+            if "mtp" in components and "mtp" in paths:
+                companions["mtp"] = sources["mtp"]
             model = build_model(
                 base,
                 components=components,

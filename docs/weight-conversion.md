@@ -86,8 +86,9 @@ python3 -m tools.convert \
   --out models/qwen3_8_27b_nvfp4.ninfer
 ```
 
-MTP and Vision use the main source. DFlash and DFlash2 use the corresponding named source, supplied
-as `--source dflash=PATH` or `--source dflash2=PATH`. An artifact may contain several optional
+Vision uses the main source, and so does MTP unless `--source mtp=PATH` supplies a separately trained
+head under the checkpoint's `mtp.*` tensor names. DFlash and DFlash2 use the corresponding named
+source, supplied as `--source dflash=PATH` or `--source dflash2=PATH`. An artifact may contain several optional
 components; the Engine loads only the ones selected at startup, including at most one speculative
 backend. Component availability and startup selection are independent.
 

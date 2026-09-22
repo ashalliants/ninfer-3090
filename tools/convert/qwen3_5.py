@@ -971,9 +971,10 @@ def build_model(
             f"text/layers/{i}/", text_prefix + f"layers.{i}.", base, config, kind
         )
     if "mtp" in selected:
+        head = companions.get("mtp", base)
         builder.add(
             "mtp/input_projection",
-            base,
+            head,
             "mtp.fc.weight",
             (h, 2 * h),
             inputs=("mtp/stem_input",),
@@ -983,8 +984,8 @@ def build_model(
             ("hidden_norm", "pre_fc_norm_hidden"),
             ("final_norm", "norm"),
         ):
-            builder.add("mtp/" + role, base, "mtp." + field + ".weight", (h,))
-        builder.block("mtp/layers/0/", "mtp.layers.0.", base, config, "full_attention")
+            builder.add("mtp/" + role, head, "mtp." + field + ".weight", (h,))
+        builder.block("mtp/layers/0/", "mtp.layers.0.", head, config, "full_attention")
     if "vision" in selected:
         builder.vision(base, records["vision"]["config"], h)
     for backend in ("dflash", "dflash2"):

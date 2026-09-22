@@ -147,6 +147,26 @@ def test_model_mapping_preserves_query_gate_gdn_mtp_and_vision_axes(tmp_path):
             assert torch.equal(selected.reshape(8, 12), patch.reshape(8, 12))
 
 
+def test_mtp_companion_replaces_the_checkpoint_head(tmp_path):
+    q_gate = torch.arange(32 * 16).float().reshape(32, 16)
+    tensors = {
+        "model.language_model.layers.1.self_attn.q_proj.weight": q_gate,
+        "mtp.layers.0.self_attn.q_proj.weight": q_gate + 1000,
+    }
+    head = tmp_path / "head.safetensors"
+    save_file({"mtp.layers.0.self_attn.q_proj.weight": q_gate + 2000}, head)
+    with _checkpoint(tmp_path / "source", _config(), tensors) as source:
+        with SafetensorsSource(head) as companion:
+            model = build_model(
+                source, components=("text", "mtp"), companions={"mtp": companion}
+            )
+            query = q_gate.reshape(2, 2, 8, 16)[:, 0].reshape(16, 16)
+            assert torch.equal(
+                _values(model, "mtp/layers/0/attention/query"), query + 2000
+            )
+            assert torch.equal(_values(model, "text/layers/1/attention/query"), query)
+
+
 def test_expert_bank_uses_expert_major_gate_up_and_down_ranges(tmp_path):
     gate_up = torch.arange(3 * 16 * 16).float().reshape(3, 16, 16)
     down = torch.arange(3 * 16 * 8).float().reshape(3, 16, 8)
