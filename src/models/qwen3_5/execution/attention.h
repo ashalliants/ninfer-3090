@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "models/qwen3_5/execution/parameters.h"
+#include "models/qwen3_5/execution/rotation.h"
 
 namespace ninfer::models::qwen3_5::execution {
 
@@ -10,7 +11,8 @@ attention_projection_workspace_bytes(const AttentionParameters& parameters, std:
                                      std::int32_t last);
 void attention_projection(const Tensor& hidden, const AttentionParameters& parameters,
                           Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
-                          WorkspaceArena& workspace, cudaStream_t stream);
+                          WorkspaceArena& workspace, cudaStream_t stream,
+                          InputBasis basis = InputBasis::Primal);
 
 void text_rope(const Tensor& positions, const RopeConfig& config, Tensor& query,
                DeviceExecutionView execution);

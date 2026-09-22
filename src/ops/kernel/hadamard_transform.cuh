@@ -98,6 +98,43 @@ hadamard_1024_butterfly(float (&v)[kHadamardTransformLaneVectors][8], int lane) 
     }
 }
 
+// The forward transform's tail for a lane that already holds its 32 BF16-rounded inputs of one
+// block in v: signs, butterfly, normalisation and the store, in the order of
+// hadamard_transform_1024_kernel, so a producer that rounds its output to BF16 first and hands it
+// over here writes exactly what the producer followed by hadamard_transform would.
+__device__ __forceinline__ void
+hadamard_1024_forward_store(float (&v)[kHadamardTransformLaneVectors][8],
+                            const __nv_bfloat16* __restrict__ block_signs,
+                            __nv_bfloat16* __restrict__ out_block, int lane) {
+#pragma unroll
+    for (int r = 0; r < kHadamardTransformLaneVectors; ++r) {
+        float s[8];
+        hadamard_unpack8(load_vec<uint4>(block_signs + hadamard_lane_offset(lane, r)), s);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { v[r][j] *= s[j]; }
+    }
+
+    hadamard_1024_butterfly(v, lane);
+
+#pragma unroll
+    for (int r = 0; r < kHadamardTransformLaneVectors; ++r) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { v[r][j] = __fmul_rn(v[r][j], kHadamardTransformNormalizer); }
+        store_vec(out_block + hadamard_lane_offset(lane, r), hadamard_pack8(v[r]));
+    }
+}
+
+// Loads a lane's 32 elements of one BF16 block staged in shared memory.
+__device__ __forceinline__ void
+hadamard_1024_load_shared(const __nv_bfloat16* block, float (&v)[kHadamardTransformLaneVectors][8],
+                          int lane) {
+#pragma unroll
+    for (int r = 0; r < kHadamardTransformLaneVectors; ++r) {
+        hadamard_unpack8(*reinterpret_cast<const uint4*>(block + hadamard_lane_offset(lane, r)),
+                         v[r]);
+    }
+}
+
 template <bool SignsAfter, int WarpsPerCta>
 __launch_bounds__(WarpsPerCta* kWarpSize) __global__
     void hadamard_transform_1024_kernel(const __nv_bfloat16* __restrict__ x,

@@ -42,10 +42,10 @@ std::size_t attention_projection_workspace_bytes(const AttentionParameters& para
 
 void attention_projection(const Tensor& hidden, const AttentionParameters& parameters,
                           Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
-                          WorkspaceArena& workspace, cudaStream_t stream) {
+                          WorkspaceArena& workspace, cudaStream_t stream, InputBasis basis) {
     auto scope = workspace.scope();
     const Tensor x =
-        rotated_input(hidden, projection_signs(parameters.projection), workspace, stream);
+        rotated_input(hidden, projection_signs(parameters.projection), workspace, stream, basis);
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
         ops::attn_input_proj(x, pair->first, pair->second, query, gate, key, value, pair->policy,
                              workspace, stream);

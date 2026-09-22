@@ -25,10 +25,15 @@ namespace ninfer::models::qwen3_5::execution {
                       projection);
 }
 
+// Whether a projection input still needs its rotation, or arrives rotated from the op that produced
+// it (rmsnorm_hadamard and the other fused producers).
+enum class InputBasis : std::uint8_t { Primal, Rotated };
+
 // x itself, or its rotation in a workspace allocation that lives in the caller's scope.
 [[nodiscard]] inline Tensor rotated_input(const Tensor& x, const Tensor& signs,
-                                          WorkspaceArena& workspace, cudaStream_t stream) {
-    if (!rotated(signs)) { return x; }
+                                          WorkspaceArena& workspace, cudaStream_t stream,
+                                          InputBasis basis = InputBasis::Primal) {
+    if (!rotated(signs) || basis == InputBasis::Rotated) { return x; }
     Tensor out = workspace.alloc(DType::BF16, {x.ne[0], x.ne[1], x.ne[2], x.ne[3]});
     ops::hadamard_transform(x, signs, false, out, stream);
     return out;

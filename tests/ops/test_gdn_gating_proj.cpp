@@ -1,5 +1,6 @@
 #include "core/weight.h"
 #include "ninfer/ops/gdn_gating_proj.h"
+#include "ninfer/ops/hadamard_transform.h"
 #include "ninfer/ops/weight_input.h"
 
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
@@ -604,6 +605,81 @@ int verify_plan_across_sm_counts() {
 
 } // namespace
 
+// gdn_norm_gating_proj_rotated must write g and beta word for word as gdn_norm_gating_proj does,
+// and h as gdn_norm_gating_proj followed by hadamard_transform, on every norm/control route.
+int run_rotated_norm_case(std::int32_t tokens, std::uint32_t seed, DeviceExecutionView execution) {
+    constexpr float kEps               = 1.0e-6f;
+    const Geometry& geometry           = kQwen27;
+    const std::size_t h_elements       = std::size_t(geometry.hidden) * tokens;
+    const std::size_t control_elements = std::size_t(geometry.heads) * tokens;
+    std::vector<float> x(h_elements), norm_weight(geometry.hidden), signs(geometry.hidden);
+    std::vector<float> a_weight(std::size_t(geometry.heads) * geometry.hidden),
+        b_weight(a_weight.size());
+    std::vector<float> a_log(geometry.heads), dt_bias(geometry.heads);
+    fill_uniform(x, seed, -1.0f, 1.0f);
+    fill_uniform(norm_weight, seed + 1, -0.2f, 0.2f);
+    fill_uniform(a_weight, seed + 2, -0.015f, 0.015f);
+    fill_uniform(b_weight, seed + 3, -0.015f, 0.015f);
+    fill_uniform(a_log, seed + 4, -2.0f, 1.0f);
+    fill_uniform(dt_bias, seed + 5, -1.0f, 1.0f);
+    fill_uniform(signs, seed + 6, -1.0f, 1.0f);
+    for (auto& sign : signs) sign = sign < 0.0f ? -1.0f : 1.0f;
+    round_to_bf16(x);
+    round_to_bf16(norm_weight);
+    round_to_bf16(a_weight);
+    round_to_bf16(b_weight);
+    DeviceBuffer device_x     = to_device(bf16_bits(x)),
+                 device_norm  = to_device(bf16_bits(norm_weight)),
+                 device_a     = to_device(bf16_bits(a_weight)),
+                 device_b     = to_device(bf16_bits(b_weight)),
+                 device_signs = to_device(bf16_bits(signs)), device_a_log = to_device(a_log),
+                 device_dt_bias = to_device(dt_bias);
+    DeviceBuffer h_primal(h_elements * 2), h_composed(h_elements * 2),
+        g_primal(control_elements * 4), beta_primal(control_elements * 4);
+    GuardedDeviceBuffer h_rotated(h_elements * 2), g_rotated(control_elements * 4),
+        beta_rotated(control_elements * 4);
+    h_rotated.fill(0xff);
+    g_rotated.fill(0xff);
+    beta_rotated.fill(0xff);
+    Tensor tx(device_x.p, DType::BF16, {geometry.hidden, tokens}),
+        tn(device_norm.p, DType::BF16, {geometry.hidden}),
+        ts(device_signs.p, DType::BF16, {geometry.hidden}),
+        ta(device_a_log.p, DType::FP32, {geometry.heads}),
+        td(device_dt_bias.p, DType::FP32, {geometry.heads});
+    Tensor thp(h_primal.p, DType::BF16, {geometry.hidden, tokens}),
+        thc(h_composed.p, DType::BF16, {geometry.hidden, tokens}),
+        tgp(g_primal.p, DType::FP32, {geometry.heads, tokens}),
+        tbp(beta_primal.p, DType::FP32, {geometry.heads, tokens});
+    Tensor thr(h_rotated.data(), DType::BF16, {geometry.hidden, tokens}),
+        tgr(g_rotated.data(), DType::FP32, {geometry.heads, tokens}),
+        tbr(beta_rotated.data(), DType::FP32, {geometry.heads, tokens});
+    const auto wa = bf16_weight(device_a.p, geometry.heads, geometry.hidden);
+    const auto wb = bf16_weight(device_b.p, geometry.heads, geometry.hidden);
+    const auto capacity =
+        std::max<std::size_t>(ops::gdn_norm_gating_proj_workspace_capacity_bytes(
+                                  geometry.heads, geometry.hidden, tokens, tokens),
+                              256);
+    DeviceBuffer scratch(capacity);
+    WorkspaceArena workspace(DeviceSpan{scratch.p, capacity});
+    ops::gdn_norm_gating_proj(tx, tn, kEps, wa, wb, ta, td, workspace, thp, tgp, tbp, execution);
+    ops::hadamard_transform(thp, ts, false, thc, execution.stream);
+    ops::gdn_norm_gating_proj_rotated(tx, tn, kEps, wa, wb, ta, td, ts, workspace, thr, tgr, tbr,
+                                      execution);
+    cuda_synchronize(execution.stream);
+    const std::string label = "gdn_norm_gating_proj_rotated T=" + std::to_string(tokens);
+    int failures            = verify_exact((label + " h").c_str(),
+                                           from_device<std::uint16_t>(h_rotated.data(), h_elements),
+                                           from_device<std::uint16_t>(h_composed, h_elements));
+    failures += verify_exact((label + " g").c_str(),
+                             from_device<std::uint32_t>(g_rotated.data(), control_elements),
+                             from_device<std::uint32_t>(g_primal, control_elements));
+    failures += verify_exact((label + " beta").c_str(),
+                             from_device<std::uint32_t>(beta_rotated.data(), control_elements),
+                             from_device<std::uint32_t>(beta_primal, control_elements));
+    failures += h_rotated.verify_guards(label + " h guards");
+    return failures;
+}
+
 int main() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
@@ -659,6 +735,9 @@ int main() {
     for (int tokens : {2, 8, 15, 127, 128, 1024, 1025, 2048, 2049, 4097})
         failures += run_norm_projection_case(kQwen35, tokens, 0x7800u + tokens, norm_execution,
                                              tokens == 15);
+
+    for (int tokens : {1, 2, 3, 8, 14, 15, 28, 29, 64, 200, 1024})
+        failures += run_rotated_norm_case(tokens, 0x9000u + tokens, norm_execution);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_gating_proj correctness\n";
     return failures == 0 ? 0 : 1;

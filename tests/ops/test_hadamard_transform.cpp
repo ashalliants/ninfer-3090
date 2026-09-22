@@ -1,4 +1,7 @@
 #include "ninfer/ops/hadamard_transform.h"
+#include "ninfer/ops/gated_rmsnorm.h"
+#include "ninfer/ops/rmsnorm.h"
+#include "ninfer/ops/sigmoid_mul.h"
 #include "ops/op_tester.h"
 #include "core/device.h"
 #include "core/decode_graph.h"
@@ -255,6 +258,142 @@ int run_silu_mul_case(std::int32_t width, std::int64_t columns, bool replay, std
     return failures;
 }
 
+std::vector<float> random_signs(std::int32_t width, std::uint32_t seed) {
+    std::vector<float> signs(static_cast<std::size_t>(width));
+    fill_uniform(signs, seed, -1.0F, 1.0F);
+    for (auto& sign : signs) sign = sign < 0.0F ? -1.0F : 1.0F;
+    signs[0] = -1.0F;
+    signs[1] = 1.0F;
+    return signs;
+}
+
+std::vector<std::uint16_t> device_words(const DeviceBuffer& buffer, std::size_t count) {
+    return from_device<std::uint16_t>(buffer, count);
+}
+
+// rmsnorm_hadamard must equal rmsnorm followed by hadamard_transform word for word.
+int run_rmsnorm_hadamard_case(std::int32_t width, std::int64_t columns, bool unit_offset,
+                              bool replay, std::uint32_t seed) {
+    const std::size_t count = static_cast<std::size_t>(width) * static_cast<std::size_t>(columns);
+    std::vector<float> x(count), weight(static_cast<std::size_t>(width));
+    fill_uniform(x, seed, -3.0F, 3.0F);
+    fill_uniform(weight, seed + 1U, -0.5F, 0.5F);
+    round_to_bf16(x);
+    round_to_bf16(weight);
+    const auto signs           = random_signs(width, seed + 2U);
+    DeviceBuffer device_x      = to_device_bf16(x);
+    DeviceBuffer device_weight = to_device_bf16(weight);
+    DeviceBuffer device_signs  = to_device_bf16(signs);
+    DeviceBuffer normalized(count * 2), composed(count * 2);
+    GuardedDeviceBuffer fused(count * 2);
+    fused.fill(0xff);
+    const std::int32_t t = static_cast<std::int32_t>(columns);
+    Tensor tx(device_x.p, DType::BF16, {width, t}), tw(device_weight.p, DType::BF16, {width}),
+        ts(device_signs.p, DType::BF16, {width}), tn(normalized.p, DType::BF16, {width, t}),
+        tc(composed.p, DType::BF16, {width, t}), tf(fused.data(), DType::BF16, {width, t});
+    DeviceContext device;
+    ops::rmsnorm(tx, tw, 1.0e-6F, unit_offset, tn, device.stream);
+    ops::hadamard_transform(tn, ts, false, tc, device.stream);
+    const auto launch = [&] {
+        ops::rmsnorm_hadamard(tx, tw, 1.0e-6F, unit_offset, ts, tf, device.stream);
+    };
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable graph;
+    if (replay) {
+        definition.capture(device.stream, launch);
+        graph.instantiate(definition);
+        graph.launch(device.stream);
+    } else {
+        launch();
+    }
+    cuda_synchronize(device.stream);
+    const std::string label = std::string("rmsnorm_hadamard K=") + std::to_string(width) +
+                              " T=" + std::to_string(columns) + (unit_offset ? " offset" : "");
+    int failures            = verify_exact((label + " matches the composition").c_str(),
+                                           from_device<std::uint16_t>(fused.data(), count),
+                                           device_words(composed, count));
+    failures += fused.verify_guards(label + " guards");
+    return failures;
+}
+
+// gated_rmsnorm_hadamard over [128, heads, T] must equal gated_rmsnorm then the transform of each
+// [128 * heads] column word for word.
+int run_gated_rmsnorm_hadamard_case(std::int32_t heads, std::int64_t columns, std::uint32_t seed) {
+    constexpr std::int32_t kD = 128;
+    const std::int32_t width  = kD * heads;
+    const std::size_t count   = static_cast<std::size_t>(width) * static_cast<std::size_t>(columns);
+    std::vector<float> x(count), z(count), weight(kD);
+    fill_uniform(x, seed, -3.0F, 3.0F);
+    fill_uniform(z, seed + 1U, -4.0F, 4.0F);
+    fill_uniform(weight, seed + 2U, 0.5F, 1.5F);
+    round_to_bf16(x);
+    round_to_bf16(z);
+    round_to_bf16(weight);
+    const auto signs           = random_signs(width, seed + 3U);
+    DeviceBuffer device_x      = to_device_bf16(x);
+    DeviceBuffer device_z      = to_device_bf16(z);
+    DeviceBuffer device_weight = to_device_bf16(weight);
+    DeviceBuffer device_signs  = to_device_bf16(signs);
+    DeviceBuffer normalized(count * 2), composed(count * 2);
+    GuardedDeviceBuffer fused(count * 2);
+    fused.fill(0xff);
+    const std::int32_t t = static_cast<std::int32_t>(columns);
+    Tensor tx(device_x.p, DType::BF16, {kD, heads, t}), tz(device_z.p, DType::BF16, {kD, heads, t}),
+        tw(device_weight.p, DType::BF16, {kD}), ts(device_signs.p, DType::BF16, {width}),
+        tn(normalized.p, DType::BF16, {kD, heads, t}), tc(composed.p, DType::BF16, {width, t}),
+        tf(fused.data(), DType::BF16, {width, t});
+    DeviceContext device;
+    ops::gated_rmsnorm(tx, tw, tz, 1.0e-6F, tn, device.stream);
+    Tensor tn_columns = tn.view({width, t});
+    ops::hadamard_transform(tn_columns, ts, false, tc, device.stream);
+    ops::gated_rmsnorm_hadamard(tx, tw, tz, 1.0e-6F, ts, tf, device.stream);
+    cuda_synchronize(device.stream);
+    const std::string label =
+        "gated_rmsnorm_hadamard heads=" + std::to_string(heads) + " T=" + std::to_string(columns);
+    int failures = verify_exact((label + " matches the composition").c_str(),
+                                from_device<std::uint16_t>(fused.data(), count),
+                                device_words(composed, count));
+    failures += fused.verify_guards(label + " guards");
+    return failures;
+}
+
+// sigmoid_mul_hadamard must equal sigmoid_mul then the transform, in place or not.
+int run_sigmoid_mul_hadamard_case(std::int32_t width, std::int64_t columns, bool in_place,
+                                  std::uint32_t seed) {
+    const std::size_t count = static_cast<std::size_t>(width) * static_cast<std::size_t>(columns);
+    std::vector<float> gate(count), x(count);
+    fill_uniform(gate, seed, -6.0F, 6.0F);
+    fill_uniform(x, seed + 1U, -3.0F, 3.0F);
+    round_to_bf16(gate);
+    round_to_bf16(x);
+    const auto signs          = random_signs(width, seed + 2U);
+    DeviceBuffer device_gate  = to_device_bf16(gate);
+    DeviceBuffer device_x     = to_device_bf16(x);
+    DeviceBuffer gated        = to_device_bf16(x);
+    DeviceBuffer device_signs = to_device_bf16(signs);
+    DeviceBuffer composed(count * 2);
+    GuardedDeviceBuffer fused(count * 2);
+    fused.fill(0xff);
+    const std::int32_t t = static_cast<std::int32_t>(columns);
+    Tensor tg(device_gate.p, DType::BF16, {width, t}), tx(device_x.p, DType::BF16, {width, t}),
+        ts(device_signs.p, DType::BF16, {width}), tm(gated.p, DType::BF16, {width, t}),
+        tc(composed.p, DType::BF16, {width, t}),
+        tf(in_place ? device_x.p : fused.data(), DType::BF16, {width, t});
+    DeviceContext device;
+    ops::sigmoid_mul(tg, tm, device.stream);
+    ops::hadamard_transform(tm, ts, false, tc, device.stream);
+    ops::sigmoid_mul_hadamard(tg, tx, ts, tf, device.stream);
+    cuda_synchronize(device.stream);
+    const std::string label = "sigmoid_mul_hadamard K=" + std::to_string(width) +
+                              " T=" + std::to_string(columns) + (in_place ? " in place" : "");
+    const void* result      = in_place ? device_x.p : fused.data();
+    int failures =
+        verify_exact((label + " matches the composition").c_str(),
+                     from_device<std::uint16_t>(result, count), device_words(composed, count));
+    if (!in_place) failures += fused.verify_guards(label + " guards");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -286,6 +425,19 @@ int main() {
         failures += run_silu_mul_case(17408, t, t == 8, seed++);
     }
     failures += run_silu_mul_case(1024, 3, false, seed++);
+    for (const std::int64_t t : {1, 2, 4, 7, 8, 9, 16, 33, 1024}) {
+        failures += run_rmsnorm_hadamard_case(5120, t, true, t == 1 || t == 8, seed++);
+        failures += run_rmsnorm_hadamard_case(5120, t, false, false, seed++);
+    }
+    failures += run_rmsnorm_hadamard_case(6144, 3, true, false, seed++);
+    for (const std::int64_t t : {1, 2, 5, 8, 16, 40}) {
+        failures += run_gated_rmsnorm_hadamard_case(48, t, seed++);
+    }
+    failures += run_gated_rmsnorm_hadamard_case(8, 3, seed++);
+    for (const std::int64_t t : {1, 4, 8, 9, 64}) {
+        failures += run_sigmoid_mul_hadamard_case(6144, t, false, seed++);
+        failures += run_sigmoid_mul_hadamard_case(6144, t, true, seed++);
+    }
 
     std::cout << (failures ? "FAIL" : "OK") << " hadamard_transform\n";
     return failures ? 1 : 0;

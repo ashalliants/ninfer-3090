@@ -102,10 +102,10 @@ std::size_t gdn_record_workspace_bytes(const GdnParameters& parameters, const Gd
 }
 
 void gdn_projection(const Tensor& hidden, const GdnParameters& parameters, Tensor& qkv, Tensor& z,
-                    WorkspaceArena& workspace, cudaStream_t stream) {
+                    WorkspaceArena& workspace, cudaStream_t stream, InputBasis basis) {
     auto scope = workspace.scope();
     const Tensor x =
-        rotated_input(hidden, projection_signs(parameters.projection), workspace, stream);
+        rotated_input(hidden, projection_signs(parameters.projection), workspace, stream, basis);
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
         ops::gdn_input_proj(x, pair->first, pair->second, qkv, z, pair->policy, workspace, stream);
     } else {
@@ -114,10 +114,18 @@ void gdn_projection(const Tensor& hidden, const GdnParameters& parameters, Tenso
     }
 }
 
-void gdn_norm_control(const Tensor& residual, const Tensor& norm, float epsilon,
-                      const GdnParameters& parameters, Tensor& hidden, Tensor& g, Tensor& beta,
-                      WorkspaceArena& workspace, DeviceExecutionView execution) {
+InputBasis gdn_norm_control(const Tensor& residual, const Tensor& norm, float epsilon,
+                            const GdnParameters& parameters, Tensor& hidden, Tensor& g,
+                            Tensor& beta, WorkspaceArena& workspace,
+                            DeviceExecutionView execution) {
+    const Tensor& signs = projection_signs(parameters.projection);
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.control)) {
+        if (rotated(signs)) {
+            ops::gdn_norm_gating_proj_rotated(residual, norm, epsilon, pair->first, pair->second,
+                                              parameters.a_log, parameters.dt_bias, signs,
+                                              workspace, hidden, g, beta, execution);
+            return InputBasis::Rotated;
+        }
         ops::gdn_norm_gating_proj(residual, norm, epsilon, pair->first, pair->second,
                                   parameters.a_log, parameters.dt_bias, workspace, hidden, g, beta,
                                   execution);
@@ -126,6 +134,7 @@ void gdn_norm_control(const Tensor& residual, const Tensor& norm, float epsilon,
         ops::gdn_norm_gating_proj(residual, norm, epsilon, single.weight, parameters.a_log,
                                   parameters.dt_bias, workspace, hidden, g, beta, execution);
     }
+    return InputBasis::Primal;
 }
 
 void gdn_projection_snapshot(const Tensor& hidden, const GdnParameters& parameters,
@@ -133,10 +142,10 @@ void gdn_projection_snapshot(const Tensor& hidden, const GdnParameters& paramete
                              const Tensor& valid_columns, const Tensor& initial_slots,
                              const Tensor& destination_slots, Tensor& query, Tensor& key,
                              Tensor& value, Tensor& z, WorkspaceArena& workspace,
-                             cudaStream_t stream) {
+                             cudaStream_t stream, InputBasis basis) {
     auto scope = workspace.scope();
     const Tensor x =
-        rotated_input(hidden, projection_signs(parameters.projection), workspace, stream);
+        rotated_input(hidden, projection_signs(parameters.projection), workspace, stream, basis);
     WorkspaceArena scratch(workspace.alloc_bytes(
         snapshot_scratch_bytes(parameters, config, hidden.ne[2], hidden.ne[1], hidden.ne[1])));
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
@@ -155,10 +164,11 @@ void gdn_projection_record(const Tensor& hidden, const GdnParameters& parameters
                            const GdnConfig& config, const Tensor& conv_states,
                            const Tensor& valid_columns, const Tensor& initial_slots,
                            Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
-                           Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
+                           Tensor& z, WorkspaceArena& workspace, cudaStream_t stream,
+                           InputBasis basis) {
     auto scope = workspace.scope();
     const Tensor x =
-        rotated_input(hidden, projection_signs(parameters.projection), workspace, stream);
+        rotated_input(hidden, projection_signs(parameters.projection), workspace, stream, basis);
     WorkspaceArena scratch(workspace.alloc_bytes(
         record_scratch_bytes(parameters, config, hidden.ne[2], hidden.ne[1], hidden.ne[1])));
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {

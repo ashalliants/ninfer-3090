@@ -69,4 +69,35 @@ void hadamard_transform(const Tensor& x, const Tensor& signs, bool inverse, Tens
  */
 void silu_mul_hadamard(const Tensor& plane, const Tensor& signs, Tensor& out, cudaStream_t stream);
 
+
+/**
+ * Producers of a Hadamard-rotated projection input
+ *
+ * Each op below is the named op followed by the forward hadamard_transform of its output with
+ * `signs` (K = signs.ne[0], a multiple of 1024, is the projection's input width), fused where a
+ * route exists and composed otherwise. Both forms round the op's output to BF16 before the
+ * transform, so the result is bit-identical to running the two ops in sequence.
+ *
+ *   rmsnorm_hadamard:       rmsnorm over rows of K = x.ne[0], then the transform of each row.
+ *   gated_rmsnorm_hadamard: gated_rmsnorm over rows of D = x.ne[0], then the transform of each
+ *                           K-wide column of consecutive rows (K a multiple of D).
+ *   sigmoid_mul_hadamard:   the BF16 product x * sigmoid(gate), then the transform of each
+ *                           K-wide column; out may alias x exactly, never gate.
+ *
+ * Domain: the named op's own, plus contiguous 16-byte aligned signs and out holding whole
+ * K-wide columns (out has x's element count). Fused routes: rmsnorm at K = 5120; gated_rmsnorm at
+ * D = 128 with K / D a multiple of sixteen.
+ *
+ * Numeric: the named op's rounding followed by hadamard_transform's reduction criterion.
+ *
+ * Effects: writes all of out; inputs and signs are preserved (x only when out does not alias it).
+ * No workspace or persistent state.
+ */
+void rmsnorm_hadamard(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
+                      const Tensor& signs, Tensor& out, cudaStream_t stream);
+void gated_rmsnorm_hadamard(const Tensor& x, const Tensor& weight, const Tensor& z, float eps,
+                            const Tensor& signs, Tensor& out, cudaStream_t stream);
+void sigmoid_mul_hadamard(const Tensor& gate, const Tensor& x, const Tensor& signs, Tensor& out,
+                          cudaStream_t stream);
+
 } // namespace ninfer::ops

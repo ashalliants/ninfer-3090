@@ -94,4 +94,17 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           WorkspaceArena& ws, Tensor& h, Tensor& g, Tensor& beta,
                           DeviceExecutionView execution);
 
+
+/**
+ * gdn_norm_gating_proj over the split A/B parents with h written in the rotated basis of the input
+ * projection that consumes it: the forward hadamard_transform of h with `signs` (BF16 [5120],
+ * +1/-1). g and beta come from the primal h exactly as in gdn_norm_gating_proj, and h is
+ * bit-identical to that op followed by hadamard_transform. signs and h are 16-byte aligned.
+ */
+void gdn_norm_gating_proj_rotated(const Tensor& x, const Tensor& norm_weight, float eps,
+                                  const Weight& a_weight, const Weight& b_weight,
+                                  const Tensor& A_log, const Tensor& dt_bias, const Tensor& signs,
+                                  WorkspaceArena& ws, Tensor& h, Tensor& g, Tensor& beta,
+                                  DeviceExecutionView execution);
+
 } // namespace ninfer::ops

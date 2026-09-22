@@ -4,6 +4,7 @@
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
+#include "ops/kernel/hadamard_transform.cuh"
 
 #include <cuda_bf16.h>
 
@@ -11,11 +12,14 @@ namespace ninfer::ops::detail {
 namespace {
 // Each head computes both control dots and the complete norm. RMS scaling can be
 // applied after the dots; h is independently rounded from the full normalized input.
-template <int Tile, int Threads>
+// Rotate writes h already in the rotated basis of the input projection that consumes it: the head
+// CTAs of the first D / 1024 heads each transform one 1024-block of every token in their tile from
+// the same BF16 values the unrotated route stores.
+template <int Tile, int Threads, bool Rotate>
 __global__ __launch_bounds__(Threads) void gdn_norm_gating_27_simt(
     const __nv_bfloat16* x, const __nv_bfloat16* nw, const __nv_bfloat16* aw,
-    const __nv_bfloat16* bw, const float* alog, const float* bias, __nv_bfloat16* h, float* g,
-    float* beta, int tokens, float eps) {
+    const __nv_bfloat16* bw, const float* alog, const float* bias, const __nv_bfloat16* signs,
+    __nv_bfloat16* h, float* g, float* beta, int tokens, float eps) {
     constexpr int D = 5120, H = 48, Warps = Threads / 32;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, head = blockIdx.x,
               first = blockIdx.y * Tile;
@@ -75,6 +79,29 @@ __global__ __launch_bounds__(Threads) void gdn_norm_gating_27_simt(
         }
     }
     __syncthreads();
+    if constexpr (Rotate) {
+        const int t = warp;
+        if (head < D / kHadamardTransformBlock && t < Tile && first + t < tokens) {
+            const std::int64_t row = std::int64_t(first + t) * D;
+            const int block_base   = head * kHadamardTransformBlock;
+            float v[kHadamardTransformLaneVectors][8];
+#pragma unroll
+            for (int r = 0; r < kHadamardTransformLaneVectors; ++r) {
+                const int offset = block_base + hadamard_lane_offset(lane, r);
+                float xv[8];
+                float nv[8];
+                hadamard_unpack8(load_vec<uint4>(x + row + offset), xv);
+                hadamard_unpack8(load_vec<uint4>(nw + offset), nv);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    v[r][j] =
+                        __bfloat162float(__float2bfloat16_rn(xv[j] * inverse[t] * (1 + nv[j])));
+                }
+            }
+            hadamard_1024_forward_store(v, signs + block_base, h + row + block_base, lane);
+        }
+        return;
+    }
     // Disjoint, pair-aligned h slices across the 48 heads avoid a separate norm kernel.
     constexpr int PairsPerHead = (D / 2 + H - 1) / H;
     const int pair             = head * PairsPerHead + tid;
@@ -95,17 +122,25 @@ __global__ __launch_bounds__(Threads) void gdn_norm_gating_27_simt(
 void bf16_gdn_norm_gating_proj_27_launch(const Tensor& x, const Tensor& norm_weight, float eps,
                                          Tensor& h, const Weight& a_weight, const Weight& b_weight,
                                          const Tensor& alog, const Tensor& bias, Tensor& g,
-                                         Tensor& beta, cudaStream_t stream) {
+                                         Tensor& beta, const Tensor* signs, cudaStream_t stream) {
     const auto launch = [&]<int T, int Threads>() {
-        gdn_norm_gating_27_simt<T, Threads>
-            <<<dim3(48, (x.ne[1] + T - 1) / T), Threads, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(x.data),
-                static_cast<const __nv_bfloat16*>(norm_weight.data),
-                static_cast<const __nv_bfloat16*>(a_weight.qdata),
-                static_cast<const __nv_bfloat16*>(b_weight.qdata),
-                static_cast<const float*>(alog.data), static_cast<const float*>(bias.data),
-                static_cast<__nv_bfloat16*>(h.data), static_cast<float*>(g.data),
-                static_cast<float*>(beta.data), x.ne[1], eps);
+        const auto run = [&]<bool Rotate>() {
+            gdn_norm_gating_27_simt<T, Threads, Rotate>
+                <<<dim3(48, (x.ne[1] + T - 1) / T), Threads, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(x.data),
+                    static_cast<const __nv_bfloat16*>(norm_weight.data),
+                    static_cast<const __nv_bfloat16*>(a_weight.qdata),
+                    static_cast<const __nv_bfloat16*>(b_weight.qdata),
+                    static_cast<const float*>(alog.data), static_cast<const float*>(bias.data),
+                    Rotate ? static_cast<const __nv_bfloat16*>(signs->data) : nullptr,
+                    static_cast<__nv_bfloat16*>(h.data), static_cast<float*>(g.data),
+                    static_cast<float*>(beta.data), x.ne[1], eps);
+        };
+        if (signs != nullptr) {
+            run.template operator()<true>();
+        } else {
+            run.template operator()<false>();
+        }
     };
     const int tokens = x.ne[1];
     if (tokens <= 2)

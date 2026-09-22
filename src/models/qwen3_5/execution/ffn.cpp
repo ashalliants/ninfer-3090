@@ -40,14 +40,14 @@ std::size_t rotated_dense_workspace_bytes(const DenseParameters& p, std::int32_t
 }
 
 void rotated_dense_ffn(const Tensor& hidden, const DenseParameters& p, Tensor& residual,
-                       WorkspaceArena& workspace, cudaStream_t stream) {
+                       WorkspaceArena& workspace, cudaStream_t stream, InputBasis basis) {
     const auto columns      = hidden.ne[1];
     const auto& gu          = p.gate_up.weight;
     const auto intermediate = gu.n / 2;
     Tensor plane            = workspace.alloc(DType::BF16, {gu.n, columns});
     {
         auto call      = workspace.scope();
-        const Tensor x = rotated_input(hidden, p.gate_up.hadamard_signs, workspace, stream);
+        const Tensor x = rotated_input(hidden, p.gate_up.hadamard_signs, workspace, stream, basis);
         ops::linear(x, gu, plane, p.gate_up.policy, workspace, stream);
     }
     Tensor activation = workspace.alloc(DType::BF16, {intermediate, columns});
@@ -102,9 +102,16 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
     return layout.peak_bytes(1);
 }
 
+const Tensor* ffn_input_signs(const FfnParameters& parameters) {
+    const auto* dense = std::get_if<DenseParameters>(&parameters);
+    return dense != nullptr && rotated(dense->gate_up.hadamard_signs)
+               ? &dense->gate_up.hadamard_signs
+               : nullptr;
+}
+
 void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual,
          const ops::SparseMoeHints& hints, WorkspaceArena& workspace, DeviceExecutionView execution,
-         bool mtp, bool verify) {
+         bool mtp, bool verify, InputBasis basis) {
     const auto stream  = execution.stream;
     auto scope         = workspace.scope();
     const auto columns = hidden.ne[1];
@@ -118,7 +125,7 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
     }
     const auto& p = std::get<DenseParameters>(parameters);
     if (rotated_dense(p)) {
-        rotated_dense_ffn(hidden, p, residual, workspace, stream);
+        rotated_dense_ffn(hidden, p, residual, workspace, stream, basis);
         return;
     }
     const auto& gu   = p.gate_up.weight;
