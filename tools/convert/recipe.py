@@ -454,6 +454,9 @@ class Recipe:
 
         uses = []
         auxiliary_outputs = []
+        # Identical values other than activation divisors (such as one Hadamard sign vector
+        # named by every Use of its width) share one object.
+        shared_auxiliaries: dict[tuple, str] = {}
         for (name, input_name), policy in self.policies.items():
             # Explicitly shared weights retain independent Use and calibration records.
             key = (name, input_name, "activation_input_divisor")
@@ -481,6 +484,13 @@ class Recipe:
                 layout = default_layout(value.format)
                 if len(value.data) != encoded_size(layout, value.format, value.shape):
                     raise ValueError(f"{name}/{role}: auxiliary data length is invalid")
+                identity = (role, value.format, value.shape, value.data)
+                if (
+                    role != "activation_input_divisor"
+                    and identity in shared_auxiliaries
+                ):
+                    referenced[role] = {"object": shared_auxiliaries[identity]}
+                    continue
                 spec = TensorSpec(
                     f"auxiliary/{len(auxiliary_outputs):06d}",
                     value.shape,
@@ -488,6 +498,7 @@ class Recipe:
                     layout,
                 )
                 auxiliary_outputs.append((spec, value.data))
+                shared_auxiliaries[identity] = spec.id
                 referenced[role] = {"object": spec.id}
             if referenced:
                 use["auxiliaries"] = referenced

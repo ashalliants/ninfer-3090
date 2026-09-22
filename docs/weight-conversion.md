@@ -65,6 +65,7 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_6_35b_a3b` | Q4 experts, Q5/Q6 expert down, Q8 shared/projection weights | None |
 | `qwen3_6_27b_nvfp4` | Imported NVFP4, selected BF16 projections, Q8 vocabulary weights | `quantized` |
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
+| `bonsai2_27b_ternary` | Imported ternary T2 text tower with Hadamard-rotated Uses, Q8 primal embedding | `ternary` (GGUF) |
 
 These names select conversion choices. Runtime execution is selected from the architecture,
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;
@@ -89,6 +90,36 @@ MTP and Vision use the main source. DFlash and DFlash2 use the corresponding nam
 as `--source dflash=PATH` or `--source dflash2=PATH`. An artifact may contain several optional
 components; the Engine loads only the ones selected at startup, including at most one speculative
 backend. Component availability and startup selection are independent.
+
+### Ternary Bonsai 2 27B
+
+`bonsai2_27b_ternary` ([`ternary.py`](../tools/convert/ternary.py)) builds a Qwen3.8-27B artifact
+whose text tower comes from PrismML's `Ternary-Bonsai-2-27B-PQ2_0.gguf`. Every text projection
+except the GDN A/B controls, and the output head, is stored as `t2_g128_fp16`: the ternary codes
+and their per-128 scales are imported without rounding. Those matrices are Hadamard-rotated in the
+checkpoint, so each of their Uses carries the `hadamard_signs` auxiliary of its input width (three
+shared vectors in total), and the runtime rotates the matching activations. The recipe also undoes
+llama.cpp's exporter conventions: GDN value heads return from the tiled to the grouped order,
+norms from `1 + w` to `w`, `ssm_a` to `A_log`, and the token-embedding table from the rotated to
+the primal basis before its Q8 encoding. MTP, Vision, the frontend resources and DFlash2 come
+from the vanilla Qwen3.8-27B checkpoint and adapter, which share the geometry. A `--proposal`
+head gathered from the rotated output head inherits its rotation.
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/Qwen3.8-27B \
+  --recipe bonsai2_27b_ternary \
+  --source ternary=/path/to/Ternary-Bonsai-2-27B-PQ2_0.gguf \
+  --source dflash2=/path/to/Qwen3.8-27B-DFlash2 \
+  --components text,vision,mtp,dflash2 \
+  --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja \
+  --proposal \
+  --name bonsai2-27b \
+  --out models/bonsai2_27b.ninfer
+```
+
+A named source whose path ends in `.gguf` opens as a GGUF file; the recipe validates its header,
+tensor set and Hadamard metadata before reading anything.
 
 ## Change part of a recipe
 

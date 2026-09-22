@@ -62,6 +62,7 @@ def add_proposal(
         total[: model.token_count], rows, model.special_token_ids
     )
     ids = torch.from_numpy(selected).to(torch.int32)
+    derived = source is None
     if source is None:
         selections = recipe.selections["text/output_head"]
         if len(selections) != 1:
@@ -93,6 +94,21 @@ def add_proposal(
     recipe.add_parameter("proposal/head")
     recipe.add_parameter("proposal/token_ids")
     recipe.assign("proposal/head", format=format, method="grouped_absmax")
+    if derived:
+        # Rows gathered from a Hadamard-rotated head keep that head's input rotation.
+        signs = next(
+            (
+                value
+                for (parameter, _, role), value in recipe.auxiliary_overrides.items()
+                if parameter == "text/output_head" and role == "hadamard_signs"
+            ),
+            None,
+        )
+        if signs is not None:
+            for input_name in inputs:
+                recipe.use(
+                    "proposal/head", input_name, auxiliaries={"hadamard_signs": signs}
+                )
 
 
 def add_official_proposal(

@@ -11,7 +11,7 @@ from tools.artifact.codecs.row_split import decode_row_split_codes
 from tools.artifact.codecs.nvfp4 import encode_nvfp4
 from tools.artifact.schema import binding_parts
 from tools.artifact.writer import ArtifactWriter
-from tools.convert.methods import grouped_absmax, import_encoded
+from tools.convert.methods import AuxiliaryValue, grouped_absmax, import_encoded
 from tools.convert.model import Model, Parameter
 from tools.artifact.tensor_output import TensorOutput
 from tools.convert.recipe import Recipe
@@ -268,3 +268,27 @@ def test_private_component_storage_cannot_be_packed_with_target_weights():
     prepared = shared.prepare(device="cpu")
     assert len(prepared.weights) == 1
     assert prepared.bindings["draft"] == prepared.bindings["target"]
+
+
+def test_identical_non_divisor_auxiliaries_share_one_object():
+    model = _model(("query", "key"))
+    model.packing_groups = []
+    recipe = Recipe(model)
+    recipe.assign("*", format="q8_g32_fp16", method=grouped_absmax)
+    signs = AuxiliaryValue(
+        "bf16", (128,), struct.pack("<128H", *([0x3F80, 0xBF80] * 64))
+    )
+    for name in ("query", "key"):
+        recipe.use(
+            name,
+            "input",
+            auxiliaries={"hadamard_signs": signs, "activation_input_divisor": 2.0},
+        )
+    prepared = recipe.prepare(device="cpu")
+    references = [use["auxiliaries"] for use in prepared.uses]
+    assert references[0]["hadamard_signs"] == references[1]["hadamard_signs"]
+    assert (
+        references[0]["activation_input_divisor"]
+        != references[1]["activation_input_divisor"]
+    )
+    assert len(prepared.auxiliaries) == 3

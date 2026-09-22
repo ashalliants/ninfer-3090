@@ -293,11 +293,12 @@ GGML_CHUNK_BYTES = 16 * 1024 * 1024
 
 
 def import_encoded(request: PrepareRequest) -> PreparedMethod:
-    """Preserve the source's encoded words: FP8/NVFP4 codes, scales and weight divisor, or
+    """Preserve the source's encoded words: FP8/NVFP4/T2 codes, scales and weight divisor, or
     complete GGML blocks. The source rows must already be in the target format."""
     ggml = isinstance(get_format(request.target.format), GgmlBlockFormat)
     if (
-        not ggml and request.target.format not in ("nvfp4", "fp8_e4m3fn_row_bf16")
+        not ggml
+        and request.target.format not in ("nvfp4", "fp8_e4m3fn_row_bf16", "t2_g128_fp16")
     ) or len(request.target.shape) != 2:
         raise ValueError("import_encoded requires a known encoded matrix target")
     _preflight(request, values=False)

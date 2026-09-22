@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import struct
+
 import numpy as np
 import torch
 
+from tools.convert.methods import AuxiliaryValue
 from tools.convert.model import Model, Parameter
 from tools.convert.proposal import add_proposal
 from tools.convert.recipe import Recipe
@@ -39,3 +42,38 @@ def test_proposal_rows_ids_and_uses_follow_final_token_domain(tmp_path):
     assert torch.equal(selected, head[[0, 2, 5]])
     assert model.parameters["proposal/head"].inputs == ("mtp/final_hidden",)
     assert model.components["text"]["proposal"] == {"domain": "indexed", "rows": 3}
+
+
+def test_proposal_gathered_from_a_rotated_head_keeps_its_rotation(tmp_path):
+    head = torch.arange(8 * 4).reshape(8, 4).to(torch.bfloat16)
+    model = Model(
+        {
+            "text": {"config": {"vocab_size": 8}},
+            "mtp": {"config": {}, "target": "text"},
+        },
+        token_count=8,
+    )
+    model.add(
+        Parameter(
+            "text/output_head",
+            (8, 4),
+            array_source(head, "head"),
+            inputs=("text/final_hidden", "mtp/final_hidden"),
+        )
+    )
+    ranking = tmp_path / "ranking.i64"
+    np.array([[3, 2, 1, 0, 0, 0, 0, 0]], dtype="<i8").tofile(ranking)
+    recipe = Recipe(model)
+    signs = AuxiliaryValue(
+        "bf16", (4,), struct.pack("<4H", 0x3F80, 0xBF80, 0x3F80, 0xBF80)
+    )
+    recipe.use(
+        "text/output_head", "text/final_hidden", auxiliaries={"hadamard_signs": signs}
+    )
+    add_proposal(recipe, ranking=ranking, rows=2)
+    assert (
+        recipe.auxiliary_overrides[
+            ("proposal/head", "mtp/final_hidden", "hadamard_signs")
+        ]
+        == signs
+    )
