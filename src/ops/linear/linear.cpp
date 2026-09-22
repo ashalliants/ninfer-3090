@@ -9,6 +9,7 @@
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
 #include "ops/linear/q8/q8_dispatch.h"
+#include "ops/linear/t2/t2_a8.h"
 #include "ops/linear/t2/t2_dispatch.h"
 
 #include <cstdint>
@@ -38,14 +39,12 @@ bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
 }
 
+// The integer-A8 policies reach a plain linear for T2 weights, whose integer prefill route lives
+// here rather than in a fused op; every other format's dispatcher treats them as A16.
 void validate_linear_policy(LinearPolicy policy) {
-    switch (policy) {
-    case LinearPolicy::A16Only:
-    case LinearPolicy::AllowA8:
-    case LinearPolicy::AllowA4:
-        return;
+    if (!valid_linear_policy(policy)) {
+        throw std::invalid_argument("linear: invalid compute policy");
     }
-    throw std::invalid_argument("linear: invalid compute policy");
 }
 
 void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& out,
@@ -92,6 +91,11 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::q8_dispatch(x, w, out, policy, stream);
         return;
     case QType::T2_G128_FP16:
+        if (workspace != nullptr && detail::t2_a8_admits(policy) &&
+            detail::t2_a8_supported(w, x.ne[1])) {
+            detail::t2_a8_linear(x, w, out, *workspace, stream);
+            return;
+        }
         detail::t2_dispatch(x, w, out, policy, stream);
         return;
     case QType::BF16:
@@ -148,7 +152,7 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::T2_G128_FP16:
         (void)detail::select_t2_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_t2_launch(output_rows, input_rows, max_tokens, policy);
-        return 0;
+        return detail::t2_a8_workspace_bytes(output_rows, input_rows, policy, max_tokens);
     case QType::BF16:
         (void)detail::select_bf16_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_bf16_launch(output_rows, input_rows, max_tokens, policy);

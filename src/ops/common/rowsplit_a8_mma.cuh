@@ -114,17 +114,40 @@ __device__ __forceinline__ unsigned spread4(unsigned bits) {
 // Codes are two's complement in their own width, so (v ^ half) - half per byte centres them: Q4
 // reproduces the (n^8)-8 the A16 decode uses, Q5 the same over [-16,15] once the fifth bit is in.
 struct Q4Codec {
-    static constexpr bool kHasHigh = false;
+    static constexpr bool kHasHigh       = false;
+    static constexpr bool kTernary       = false;
+    static constexpr int kCodeBytes      = 32; // one row's 64-wide group
+    static constexpr int kGroupsPerScale = 1;
     __device__ static unsigned decode(unsigned pair, unsigned /*high_nibble*/) {
         return __vsub4(expand_nibbles(pair) ^ 0x08080808u, 0x08080808u);
     }
 };
 
 struct Q5Codec {
-    static constexpr bool kHasHigh = true;
+    static constexpr bool kHasHigh       = true;
+    static constexpr bool kTernary       = false;
+    static constexpr int kCodeBytes      = 32;
+    static constexpr int kGroupsPerScale = 1;
     __device__ static unsigned decode(unsigned pair, unsigned high_nibble) {
         const unsigned v = expand_nibbles(pair) | (spread4(high_nibble) << 4);
         return __vsub4(v ^ 0x10101010u, 0x10101010u);
+    }
+};
+
+// T2G128: four 2-bit two's-complement codes per byte, lowest k in the lowest bits, so one byte is
+// four consecutive k; (v ^ 2) - 2 per byte sign-extends each code to int8. A 64-wide group is 16
+// bytes of a row, and one FP16 scale covers two such groups.
+struct T2Codec {
+    static constexpr bool kHasHigh       = false;
+    static constexpr bool kTernary       = true;
+    static constexpr int kCodeBytes      = 16;
+    static constexpr int kGroupsPerScale = 2;
+
+    __device__ static unsigned decode(unsigned byte) {
+        const unsigned b = byte & 0xffu;
+        const unsigned spread =
+            ((b & 0x03u) | ((b & 0x0cu) << 6) | ((b & 0x30u) << 12) | ((b & 0xc0u) << 18));
+        return __vsub4(spread ^ 0x02020202u, 0x02020202u);
     }
 };
 
@@ -266,7 +289,9 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
     // leaving them in the lambda costs about 30% (measured in tools/w4a8_marlin_probe.cu): the row
     // map and the panel arithmetic compete with the accumulators for registers on every group.
     const std::size_t panel_mask = (std::size_t{1} << panel_shift) - 1;
-    constexpr int kWIter         = (BM * 2 + kThreads - 1) / kThreads;
+    constexpr int kCopiesPerRow  = Codec::kCodeBytes / 16;
+    constexpr int kRowBytes      = kCols / kGroup * Codec::kCodeBytes;
+    constexpr int kWIter         = (BM * kCopiesPerRow + kThreads - 1) / kThreads;
     constexpr int kHIter         = (BM + kThreads - 1) / kThreads;
     const std::uint8_t* w_lane[kWIter];
     int w_dst[kWIter];
@@ -274,13 +299,13 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
     for (int i = 0; i < kWIter; ++i) {
         // kThreads can exceed the work, so surplus lanes address row 0 and then stay idle.
         const int c           = tid + i * kThreads;
-        const int safe        = c < BM * 2 ? c : 0;
-        const int staged      = safe >> 1;
-        const int half        = safe & 1;
+        const int safe        = c < BM * kCopiesPerRow ? c : 0;
+        const int staged      = safe / kCopiesPerRow;
+        const int half        = safe % kCopiesPerRow;
         const std::size_t row = static_cast<std::size_t>(rows.weight_row(row_block, staged));
-        w_lane[i] = w_codes + (row & ~panel_mask) * (kCols / 2) +
-                    (row & panel_mask) * (kGroup / 2) + half * 16;
-        w_dst[i] = c < BM * 2 ? (staged * kWRow + half * 16) : -1;
+        w_lane[i]             = w_codes + (row & ~panel_mask) * kRowBytes +
+                                (row & panel_mask) * Codec::kCodeBytes + half * 16;
+        w_dst[i]              = c < BM * kCopiesPerRow ? (staged * kWRow + half * 16) : -1;
     }
     const std::uint8_t* h_lane[kHIter];
     int h_dst[kHIter];
@@ -295,12 +320,12 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
             h_dst[i] = staged < BM ? (kWBytes + staged * 8) : -1;
         }
     }
-    const int w_group_stride = (kGroup / 2) << panel_shift;
+    const int w_group_stride = Codec::kCodeBytes << panel_shift;
     const int h_group_stride = 8 << panel_shift;
 
     auto issue = [&](int g, int buf) {
         char* const dst = s_base + buf * kStage;
-        // W: one row's group is 32 contiguous bytes, so two 16-byte copies per row.
+        // W: one row's group is kCodeBytes contiguous bytes, copied 16 bytes at a time.
 #pragma unroll
         for (int i = 0; i < kWIter; ++i) {
             if (w_dst[i] >= 0) {
@@ -329,13 +354,16 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
         }
         // The scale ring rides the commit group of the stage that first reads it.
         if (g % kRingGroups == 0) {
+            constexpr int kScalesPerRow   = kGroups / Codec::kGroupsPerScale;
+            constexpr int kRingScaleBytes = kRingGroups / Codec::kGroupsPerScale * 2;
 #pragma unroll
             for (int staged = tid; staged < BM; staged += kThreads) {
                 const std::size_t row = static_cast<std::size_t>(rows.weight_row(row_block, staged));
-                cp_async<16>(s_ring + ((g / kRingGroups) % kRingBufs) * kRingBytes +
-                                 staged * kRingGroups * 2,
-                             reinterpret_cast<const char*>(w_scales) +
-                                 (row * kGroups + g) * sizeof(__half));
+                cp_async<kRingScaleBytes>(s_ring + ((g / kRingGroups) % kRingBufs) * kRingBytes +
+                                              staged * kRingGroups * 2,
+                                          reinterpret_cast<const char*>(w_scales) +
+                                              (row * kScalesPerRow + g / Codec::kGroupsPerScale) *
+                                                  sizeof(__half));
             }
         }
         asm volatile("cp.async.commit_group;");
@@ -393,10 +421,19 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
                     h2 = lds8(sh + r0 * 8 + byte + 2) >> shift;
                     h3 = lds8(sh + r1 * 8 + byte + 2) >> shift;
                 }
-                af[m][ks][0] = Codec::decode(lds16(sa + r0 * kWRow + off), h0);
-                af[m][ks][1] = Codec::decode(lds16(sa + r1 * kWRow + off), h1);
-                af[m][ks][2] = Codec::decode(lds16(sa + r0 * kWRow + off + 8), h2);
-                af[m][ks][3] = Codec::decode(lds16(sa + r1 * kWRow + off + 8), h3);
+                if constexpr (Codec::kTernary) {
+                    // Byte ks*8 + tig holds k = ks*32 + tig*4 .. +3, and k + 16 is 4 bytes on.
+                    const int byte = ks * 8 + tig;
+                    af[m][ks][0]   = Codec::decode(lds8(sa + r0 * kWRow + byte));
+                    af[m][ks][1]   = Codec::decode(lds8(sa + r1 * kWRow + byte));
+                    af[m][ks][2]   = Codec::decode(lds8(sa + r0 * kWRow + byte + 4));
+                    af[m][ks][3]   = Codec::decode(lds8(sa + r1 * kWRow + byte + 4));
+                } else {
+                    af[m][ks][0] = Codec::decode(lds16(sa + r0 * kWRow + off), h0);
+                    af[m][ks][1] = Codec::decode(lds16(sa + r1 * kWRow + off), h1);
+                    af[m][ks][2] = Codec::decode(lds16(sa + r0 * kWRow + off + 8), h2);
+                    af[m][ks][3] = Codec::decode(lds16(sa + r1 * kWRow + off + 8), h3);
+                }
             }
         }
 #pragma unroll
@@ -410,8 +447,9 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
 #pragma unroll
         for (int m = 0; m < MT; ++m) {
             const int sr    = RowMap::staged_row(warp_m, m, gid);
-            const float ws0 = __half2float(ring[sr * kRingGroups + (g % kRingGroups)]);
-            const float ws1 = __half2float(ring[(sr + 8) * kRingGroups + (g % kRingGroups)]);
+            const int ring_slot = (g % kRingGroups) / Codec::kGroupsPerScale;
+            const float ws0     = __half2float(ring[sr * kRingGroups + ring_slot]);
+            const float ws1     = __half2float(ring[(sr + 8) * kRingGroups + ring_slot]);
 #pragma unroll
             for (int n = 0; n < NT; ++n) {
                 int s[4] = {0, 0, 0, 0};

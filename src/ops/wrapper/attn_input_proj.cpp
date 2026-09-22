@@ -253,7 +253,7 @@ void require_split_profile(const Tensor& x, const Weight& query_key_weight,
 // a row view of its parent (q/k rows [0,6144)/[6144,7168), gate/v likewise).
 bool t2_pair_project(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
-                     cudaStream_t stream) {
+                     LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
     const bool qk = query_key_weight.qtype == QType::T2_G128_FP16;
     if (qk != (gate_value_weight.qtype == QType::T2_G128_FP16)) {
         throw std::invalid_argument("attn_input_proj: the two parents must share the T2 format");
@@ -269,10 +269,17 @@ bool t2_pair_project(const Tensor& x, const Weight& query_key_weight,
     require_matrix(v, kKvRows, cols, "v");
     require_rowsplit(query_key_weight, QType::T2_G128_FP16, kQRows + kKvRows, "query/key weight");
     require_rowsplit(gate_value_weight, QType::T2_G128_FP16, kQRows + kKvRows, "gate/value weight");
-    linear(x, detail::t2_row_view(query_key_weight, 0, kQRows), q, stream);
-    linear(x, detail::t2_row_view(query_key_weight, kQRows, kKvRows), k, stream);
-    linear(x, detail::t2_row_view(gate_value_weight, 0, kQRows), gate, stream);
-    linear(x, detail::t2_row_view(gate_value_weight, kQRows, kKvRows), v, stream);
+    const auto project = [&](const Weight& part, Tensor& out) {
+        if (workspace != nullptr) {
+            linear(x, part, out, policy, *workspace, stream);
+        } else {
+            linear(x, part, out, stream);
+        }
+    };
+    project(detail::t2_row_view(query_key_weight, 0, kQRows), q);
+    project(detail::t2_row_view(query_key_weight, kQRows, kKvRows), k);
+    project(detail::t2_row_view(gate_value_weight, 0, kQRows), gate);
+    project(detail::t2_row_view(gate_value_weight, kQRows, kKvRows), v);
     return true;
 }
 
@@ -282,7 +289,10 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
                      LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream) {
     validate_policy(policy);
-    if (t2_pair_project(x, query_key_weight, gate_value_weight, q, gate, k, v, stream)) { return; }
+    if (t2_pair_project(x, query_key_weight, gate_value_weight, q, gate, k, v, policy, &workspace,
+                        stream)) {
+        return;
+    }
     require_split_profile(x, query_key_weight, gate_value_weight, q, gate, k, v);
     // Both parents split into a query/gate half and a key/value half, and both read the same
     // activations, so the cuBLAS route materialises each parent once and shares one quantisation
@@ -324,11 +334,13 @@ std::size_t attn_input_proj_split_workspace_capacity_bytes(
             gate_value_rows != 7168 || input_rows != 5120) {
             throw std::invalid_argument("attn_input_proj workspace: unregistered T2 pair");
         }
+        std::size_t bytes = 0;
         for (const std::int32_t rows : {6144, 1024}) {
-            (void)linear_workspace_capacity_bytes(QType::T2_G128_FP16, rows, input_rows,
-                                                  LinearPolicy::A16Only, min_tokens, max_tokens);
+            bytes = std::max(bytes,
+                             linear_workspace_capacity_bytes(QType::T2_G128_FP16, rows, input_rows,
+                                                             policy, min_tokens, max_tokens));
         }
-        return 0;
+        return bytes;
     }
     const bool registered = query_key_qtype == QType::Q4_G64_FP16 && query_key_rows == 7168 &&
                             gate_value_qtype == QType::Q5_G64_FP16 && gate_value_rows == 7168 &&
@@ -347,7 +359,10 @@ std::size_t attn_input_proj_split_workspace_capacity_bytes(
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
                      cudaStream_t stream) {
-    if (t2_pair_project(x, query_key_weight, gate_value_weight, q, gate, k, v, stream)) { return; }
+    if (t2_pair_project(x, query_key_weight, gate_value_weight, q, gate, k, v,
+                        LinearPolicy::A16Only, nullptr, stream)) {
+        return;
+    }
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kQRows  = 6144;
     constexpr std::int32_t kKvRows = 1024;

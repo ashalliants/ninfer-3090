@@ -761,7 +761,8 @@ bool t2_two_parent(const Weight& qk_weight, const Weight& value_z_weight) {
 // value/z parent, each through the T2 linear routes, then the q/k and value planes are assembled
 // into the caller's [10240,T] qkv with two strided copies. z is written directly.
 void t2_two_parent_project(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
-                           Tensor& qkv, Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
+                           Tensor& qkv, Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
+                           cudaStream_t stream) {
     constexpr std::int32_t kQkRows    = 4096;
     constexpr std::int32_t kValueRows = 6144;
     constexpr std::int32_t kZRows     = 6144;
@@ -776,9 +777,11 @@ void t2_two_parent_project(const Tensor& x, const Weight& qk_weight, const Weigh
     auto scope         = workspace.scope();
     Tensor qk_plane    = workspace.alloc(DType::BF16, {kQkRows, cols});
     Tensor value_plane = workspace.alloc(DType::BF16, {kValueRows, cols});
-    linear(x, qk_weight, qk_plane, stream);
-    linear(x, detail::t2_row_view(value_z_weight, 0, kValueRows), value_plane, stream);
-    linear(x, detail::t2_row_view(value_z_weight, kValueRows, kZRows), z, stream);
+    linear(x, qk_weight, qk_plane, policy, workspace, stream);
+    linear(x, detail::t2_row_view(value_z_weight, 0, kValueRows), value_plane, policy, workspace,
+           stream);
+    linear(x, detail::t2_row_view(value_z_weight, kValueRows, kZRows), z, policy, workspace,
+           stream);
     auto* destination = static_cast<std::uint8_t*>(qkv.data);
     CUDA_CHECK(cudaMemcpy2DAsync(destination, kQkvRows * kBytes, qk_plane.data, kQkRows * kBytes,
                                  kQkRows * kBytes, static_cast<std::size_t>(cols),
@@ -788,14 +791,17 @@ void t2_two_parent_project(const Tensor& x, const Weight& qk_weight, const Weigh
                                  static_cast<std::size_t>(cols), cudaMemcpyDeviceToDevice, stream));
 }
 
-std::size_t t2_two_parent_projection_bytes(std::int32_t columns) {
-    (void)linear_workspace_capacity_bytes(QType::T2_G128_FP16, 4096, 5120, LinearPolicy::A16Only, 1,
-                                          columns);
-    (void)linear_workspace_capacity_bytes(QType::T2_G128_FP16, 6144, 5120, LinearPolicy::A16Only, 1,
-                                          columns);
+std::size_t t2_two_parent_projection_bytes(std::int32_t columns,
+                                           LinearPolicy policy = LinearPolicy::A16Only) {
+    std::size_t inner = 0;
+    for (const std::int32_t rows : {4096, 6144}) {
+        inner = std::max(inner, linear_workspace_capacity_bytes(QType::T2_G128_FP16, rows, 5120,
+                                                                policy, 1, columns));
+    }
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {4096, columns});
     (void)layout.alloc(DType::BF16, {6144, columns});
+    if (inner != 0) { (void)layout.alloc_bytes(inner); }
     return layout.peak_bytes(1);
 }
 
@@ -807,7 +813,7 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
     validate_policy(policy);
     if (t2_two_parent(qk_weight, value_z_weight)) {
         if (x.ne[1] <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
-        t2_two_parent_project(x, qk_weight, value_z_weight, qkv, z, workspace, stream);
+        t2_two_parent_project(x, qk_weight, value_z_weight, qkv, z, policy, workspace, stream);
         return;
     }
     require_split_profile(x, qk_weight, value_z_weight, qkv, z);
@@ -851,7 +857,7 @@ std::size_t gdn_input_proj_split_workspace_capacity_bytes(
             input_rows != 5120) {
             throw std::invalid_argument("gdn_input_proj workspace: unregistered T2 pair");
         }
-        return t2_two_parent_projection_bytes(max_tokens);
+        return t2_two_parent_projection_bytes(max_tokens, policy);
     }
     const bool registered = qk_qtype == QType::Q4_G64_FP16 && qk_rows == 4096 &&
                             value_z_qtype == QType::Q5_G64_FP16 && value_z_rows == 12288 &&
@@ -1121,8 +1127,8 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
             query, key, value, z, kQueryRows, kKeyRows, kValueRows, geometry, ws, stream,
             [&](const Tensor& x_flat, Tensor& projected, Tensor& z_flat) {
                 if (ternary) {
-                    t2_two_parent_project(x_flat, qk_weight, value_z_weight, projected, z_flat, ws,
-                                          stream);
+                    t2_two_parent_project(x_flat, qk_weight, value_z_weight, projected, z_flat,
+                                          LinearPolicy::A16Only, ws, stream);
                 } else {
                     gdn_input_proj(x_flat, qk_weight, value_z_weight, projected, z_flat, stream);
                 }
@@ -1134,7 +1140,8 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
     auto scope                 = ws.scope();
     ProjectedWorkspace scratch = allocate_projected_workspace(ws, kChannels, geometry.width);
     if (ternary) {
-        t2_two_parent_project(x, qk_weight, value_z_weight, scratch.projected, z, ws, stream);
+        t2_two_parent_project(x, qk_weight, value_z_weight, scratch.projected, z,
+                              LinearPolicy::A16Only, ws, stream);
     } else {
         gdn_input_proj(x, qk_weight, value_z_weight, scratch.projected, z, stream);
     }
@@ -1183,7 +1190,7 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                    [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
                        if (ternary) {
                            t2_two_parent_project(x_flat, qk_weight, value_z_weight, record_flat,
-                                                 z_flat, workspace, stream);
+                                                 z_flat, LinearPolicy::A16Only, workspace, stream);
                        } else {
                            gdn_input_proj(x_flat, qk_weight, value_z_weight, record_flat, z_flat,
                                           stream);

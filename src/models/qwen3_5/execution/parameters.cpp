@@ -121,8 +121,8 @@ public:
                                                  model_.rotated_input(w.up));
                                          }),
                             rotated_linear(w.down)};
-        integer_route(out.gate_up, {QType::Q4_G64_FP16}, 34816, 5120);
-        integer_route(out.down, {QType::Q4_G64_FP16, QType::Q5_G64_FP16}, 5120, 17408);
+        integer_route(out.gate_up, {QType::Q4_G64_FP16, QType::T2_G128_FP16}, 34816, 5120);
+        integer_route(out.down, {QType::Q4_G64_FP16, QType::Q5_G64_FP16, QType::T2_G128_FP16}, 5120, 17408);
         // --mlp-a8-decode is a separate verify-phase trade from --prefill-a8: it must admit the
         // decode route by this profile's own format/shape, not by whether prefill promotion
         // already ran, so the two flags stay orthogonal as documented.
@@ -165,11 +165,13 @@ public:
         out.ffn                 = ffn(w);
         if (const auto* a = std::get_if<AttentionWeights>(&w.mixer)) {
             LinearParameters attention_output = rotated_linear(a->output);
-            integer_route(attention_output, {QType::Q4_G64_FP16, QType::Q5_G64_FP16}, 5120, 6144);
+            integer_route(attention_output, {QType::Q4_G64_FP16, QType::Q5_G64_FP16, QType::T2_G128_FP16}, 5120, 6144);
             ops::ProjectionWeights attention_projection = ops::prepare_attn_input_proj_weights(
                 model_.rotated_input(a->query), model_.rotated_input(a->key),
                 model_.rotated_input(a->gate), model_.rotated_input(a->value));
             integer_route_pair(attention_projection, QType::Q4_G64_FP16, 7168, QType::Q5_G64_FP16,
+                               7168, 5120);
+            integer_route_pair(attention_projection, QType::T2_G128_FP16, 7168, QType::T2_G128_FP16,
                                7168, 5120);
             out.mixer = AttentionParameters{std::move(attention_projection), tensor(a->query_norm),
                                             tensor(a->key_norm), std::move(attention_output)};
@@ -178,12 +180,14 @@ public:
         } else {
             const auto& g              = std::get<GdnWeights>(w.mixer);
             LinearParameters gdn_output = rotated_linear(g.output);
-            integer_route(gdn_output, {QType::Q4_G64_FP16, QType::Q5_G64_FP16}, 5120, 6144);
+            integer_route(gdn_output, {QType::Q4_G64_FP16, QType::Q5_G64_FP16, QType::T2_G128_FP16}, 5120, 6144);
             ops::ProjectionWeights gdn_projection = ops::prepare_gdn_input_proj_weights(
                 model_.rotated_input(g.query), model_.rotated_input(g.key),
                 model_.rotated_input(g.value), model_.rotated_input(g.z));
             integer_route_pair(gdn_projection, QType::Q4_G64_FP16, 4096, QType::Q5_G64_FP16, 12288,
                                5120);
+            integer_route_pair(gdn_projection, QType::T2_G128_FP16, 4096, QType::T2_G128_FP16,
+                               12288, 5120);
             out.mixer = GdnParameters{
                 std::move(gdn_projection),
                 ops::prepare_gdn_gating_proj_weights(model_.input(g.a_projection),

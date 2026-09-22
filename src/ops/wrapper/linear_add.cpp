@@ -10,6 +10,7 @@
 #include "ops/linear/ggml/ggml_dispatch.h"
 #include "ops/linear/nvfp4/nvfp4_layout.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
+#include "ops/linear/t2/t2_a8.h"
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 #include "ops/linear_add/q4/q4_linear_add_dispatch.h"
@@ -141,7 +142,8 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
                                               min_tokens, max_tokens);
         WorkspaceLayoutBuilder layout;
         (void)layout.alloc(DType::BF16, {output_rows, max_tokens});
-        return layout.peak_bytes(1);
+        return std::max(layout.peak_bytes(1),
+                        detail::t2_a8_workspace_bytes(output_rows, input_rows, policy, max_tokens));
     }
     if (qtype == QType::BF16) {
         (void)detail::bf16_linear_add_select(output_rows, input_rows, min_tokens);
@@ -213,7 +215,11 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
     }
 
     if (w.qtype == QType::T2_G128_FP16) {
-        // Ternary rows have no fused residual epilogue: project, then add.
+        if (detail::t2_a8_admits(policy) && detail::t2_a8_supported(w, t)) {
+            detail::t2_a8_linear_add(x, w, residual_out, ws, stream);
+            return;
+        }
+        // The A16 ternary routes have no fused residual epilogue: project, then add.
         auto scope       = ws.scope();
         Tensor projected = ws.alloc(DType::BF16, {w.n, t});
         linear(x, w, projected, stream);
