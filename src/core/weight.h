@@ -33,6 +33,9 @@ enum class QType : std::uint16_t {
     GGML_REC_IQ1_M_Q2_0   = 20,
     // The MTP drafter's experts: Q2_0 gate, up and down.
     GGML_REC_Q2_0_Q2_0    = 21,
+    // Ternary codes {-1, 0, +1} as two-bit two's complement (0b10 unused), four per byte in
+    // column order, one binary16 multiplier per 128 columns. Row-split only.
+    T2_G128_FP16 = 22,
 };
 
 // One GGML block: `values` consecutive K values encoded in `bytes` bytes, scales included.

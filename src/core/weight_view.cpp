@@ -190,6 +190,9 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         case QType::Q8_G32_FP16:
             out.group_size = 32;
             break;
+        case QType::T2_G128_FP16:
+            out.group_size = 128;
+            break;
         default:
             throw std::invalid_argument("RowSplit requires a grouped integer format");
         }

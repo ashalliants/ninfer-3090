@@ -10,7 +10,11 @@ from tools.artifact.layouts import (
 )
 from tools.artifact.codecs.direct import decode_direct, encode_direct
 from tools.artifact.codecs.nvfp4 import decode_nvfp4_words, encode_nvfp4
-from tools.artifact.codecs.row_split import decode_row_split_codes, encode_row_split
+from tools.artifact.codecs.row_split import (
+    decode_row_split_codes,
+    dequantize_row_split,
+    encode_row_split,
+)
 
 
 def _signed_word(word: int, bits: int) -> int:
@@ -122,6 +126,17 @@ def test_direct_layout_preserves_exact_little_endian_words(
             b"",
             id="q8",
         ),
+        pytest.param(
+            "t2_g128_fp16",
+            130,
+            128,
+            256,
+            256,
+            (-1, 0, 1, 1, -1, 0, 0, 1),
+            b"\x53\x43",
+            b"",
+            id="t2",
+        ),
     ],
 )
 def test_row_split_matches_known_packed_bytes(
@@ -186,3 +201,12 @@ def test_nvfp4_known_vector_geometry_swizzle_tail_and_round_trip():
     assert torch.equal(decoded_packed, packed)
     assert torch.equal(decoded_scales, scales)
     assert bytes(decoded_divisor.reshape(1).view(torch.uint8).numpy()) == divisor
+
+
+def test_t2_dequantizes_ternary_codes_with_group_scales():
+    codes = torch.tensor([[[-1, 0, 1, 1] * 32, [1, 1, 0, -1] * 32]], dtype=torch.int8)
+    scales = torch.tensor([[0.5, 2.0]], dtype=torch.float16)
+    payload = encode_row_split(codes, scales, "t2_g128_fp16", (1, 256))
+    values = dequantize_row_split(payload, "t2_g128_fp16", (1, 256))
+    expected = (codes.float() * scales.float().unsqueeze(-1)).reshape(1, 256)
+    assert torch.equal(values.float(), expected)

@@ -61,9 +61,36 @@ def _pack_high_bits(codes: torch.Tensor, bits: int) -> torch.Tensor:
     return out
 
 
+def _pack_two_bit(codes: torch.Tensor) -> torch.Tensor:
+    groups, group_size = codes.shape
+    unsigned = codes.to(torch.int16) & 0x03
+    packed = (
+        unsigned[:, 0::4]
+        | (unsigned[:, 1::4] << 2)
+        | (unsigned[:, 2::4] << 4)
+        | (unsigned[:, 3::4] << 6)
+    )
+    return packed.to(torch.uint8).reshape(groups, group_size // 4)
+
+
+def _unpack_two_bit(packed: torch.Tensor, group_size: int) -> torch.Tensor:
+    groups = packed.shape[0]
+    unsigned = torch.empty((groups, group_size), dtype=torch.int16, device=packed.device)
+    unsigned[:, 0::4] = packed & 0x03
+    unsigned[:, 1::4] = (packed >> 2) & 0x03
+    unsigned[:, 2::4] = (packed >> 4) & 0x03
+    unsigned[:, 3::4] = (packed >> 6) & 0x03
+    return unsigned
+
+
 def _pack_codes(
     codes: torch.Tensor, spec: QuantFormat
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if spec.bits == 2:
+        return (
+            _pack_two_bit(codes),
+            torch.empty((codes.shape[0], 0), dtype=torch.uint8, device=codes.device),
+        )
     if spec.bits == 8:
         return (
             codes.contiguous().view(torch.uint8),
@@ -272,7 +299,7 @@ def _high_indices(
         if device_index is None
         else torch.device(device_type, device_index)
     )
-    if bits in (4, 8):
+    if bits in (2, 4, 8):
         empty = torch.empty(0, dtype=torch.long, device=device)
         return empty, empty
     bit_positions = torch.arange(group_size, device=device, dtype=torch.long) * (
@@ -299,6 +326,12 @@ def _unpack_codes(
         )
         return scales, codes
     packed = planes.base.reshape(groups, geometry.base_bytes_per_group).to(torch.int16)
+    if spec.bits == 2:
+        unsigned = _unpack_two_bit(packed, spec.group_size)
+        codes = torch.where((unsigned & 2) != 0, unsigned - 4, unsigned)
+        return scales, codes.to(torch.int8).reshape(
+            geometry.n, geometry.groups_per_row, spec.group_size
+        )
     low = torch.empty(
         (groups, spec.group_size), dtype=torch.int16, device=packed.device
     )
@@ -357,6 +390,13 @@ def _low_g64(base: torch.Tensor, groups: int) -> torch.Tensor:
     )
 
 
+def _dequant2(base, _high, scale, _byte_indices, _shifts):
+    scales = _scales(scale)
+    unsigned = _unpack_two_bit(base.reshape(scales.numel(), 32).to(torch.int16), 128)
+    codes = torch.where((unsigned & 2) != 0, unsigned - 4, unsigned).float()
+    return (codes * scales).to(torch.bfloat16)
+
+
 def _dequant4(base, _high, scale, _byte_indices, _shifts):
     scales = _scales(scale)
     unsigned = _low_g64(base, scales.numel())
@@ -393,6 +433,7 @@ def _dequant8(base, _high, scale, _byte_indices, _shifts):
 
 
 _EAGER_DEQUANTIZERS = {
+    2: _dequant2,
     4: _dequant4,
     5: _dequant5,
     6: _dequant6,

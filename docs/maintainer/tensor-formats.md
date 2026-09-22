@@ -26,6 +26,7 @@ Grouped quantized-weight formats preserve signed codes plus one scale per logica
 | `q5_g64_fp16` | 5 | 64 | `[-16, 15]` | one binary16 scale/group | 5.25 |
 | `q6_g64_fp16` | 6 | 64 | `[-32, 31]` | one binary16 scale/group | 6.25 |
 | `q8_g32_fp16` | 8 | 32 | `[-127, 127]` | one binary16 scale/group | 8.50 |
+| `t2_g128_fp16` | 2 | 128 | `[-1, 1]` | one binary16 scale/group | 2.125 |
 
 The block-scaled floating-point weight format is:
 
@@ -474,7 +475,15 @@ This is not offset binary, sign-magnitude encoding, a codebook index, or an unsi
 zero-point convention. A storage layout may split or reorder the bits, but after layout decoding the
 logical word and signed value must be exactly those defined here.
 
-### 5.2 Q8
+### 5.2 T2
+
+`t2_g128_fp16` stores ternary weights: a 2-bit two's-complement code restricted to `[-1, 1]`, so
+the word `0b10` (`-2`) is outside the valid artifact language, and one binary16 scale per 128
+columns. It is the native representation of ternary checkpoints, whose values are exactly
+`scale * {-1, 0, +1}`; a converter repacks them without rounding. The format is defined only in
+the row-split layout.
+
+### 5.3 Q8
 
 `q8_g32_fp16` uses an 8-bit two's-complement signed code with the deliberately restricted interval
 `[-127, 127]`. The byte pattern `0x80`, which would represent `-128`, is outside the valid artifact
