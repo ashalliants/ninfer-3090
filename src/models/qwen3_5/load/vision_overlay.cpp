@@ -10,8 +10,10 @@ namespace ninfer::models::qwen3_5::loading {
 namespace {
 
 // Eviction ladder: a higher rank sits nearer the arena end and is borrowed first. Only the
-// endpoint weights are ranked; together they are far larger than one encode window, so the
-// decoder layers are never touched.
+// endpoint weights and the loaded speculative component are ranked, so the decoder layers are
+// never touched. A ternary token table and output head are small enough that the drafter's
+// adapter has to make up an encode window.
+constexpr std::uint32_t kEvictRankDraft        = 300;
 constexpr std::uint32_t kEvictRankMtp          = 400;
 constexpr std::uint32_t kEvictRankProposalHead = 500;
 constexpr std::uint32_t kEvictRankEmbedding    = 600;
@@ -66,7 +68,11 @@ PinnedRange group_range(std::span<const WeightId> group, std::span<const BoundWe
 } // namespace
 
 void apply_vision_overlay_placement(Bindings& bindings, const ModelWeights& weights,
-                                    std::pair<std::size_t, std::size_t> mtp_parameters) {
+                                    std::pair<std::size_t, std::size_t> mtp_parameters,
+                                    std::pair<std::size_t, std::size_t> draft_parameters) {
+    for (std::size_t index = draft_parameters.first; index < draft_parameters.second; ++index) {
+        bindings.evict(WeightId{index}, kEvictRankDraft);
+    }
     for (std::size_t index = mtp_parameters.first; index < mtp_parameters.second; ++index) {
         bindings.evict(WeightId{index}, kEvictRankMtp);
     }

@@ -73,10 +73,13 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
         out->weights.mtp      = loading::bind_mtp(bindings, text, out->weights.text);
         mtp_parameters.second = bindings.weights.size();
     }
+    std::pair<std::size_t, std::size_t> draft_parameters{bindings.weights.size(),
+                                                         bindings.weights.size()};
     if (out->config.draft) {
         out->weights.draft =
             loading::bind_draft(bindings, *out->config.draft, text, out->weights.text,
                                 std::string(options.speculative_component()));
+        draft_parameters.second = bindings.weights.size();
     }
     if (options.proposal_enabled()) {
         const auto& proposal = reader.directory().component("text").proposal;
@@ -98,7 +101,8 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     }
     loading::apply_storage_trades(bindings, out->config, out->weights, options);
     if (options.overlay_vision()) {
-        loading::apply_vision_overlay_placement(bindings, out->weights, mtp_parameters);
+        loading::apply_vision_overlay_placement(bindings, out->weights, mtp_parameters,
+                                                draft_parameters);
     }
     out->weights.text.output_head_use =
         bindings.use(out->weights.text.output_head, "text/final_hidden");

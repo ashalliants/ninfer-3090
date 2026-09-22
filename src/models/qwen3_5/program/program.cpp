@@ -428,7 +428,7 @@ std::size_t prepare_vision_overlay(const execution::Parameters& parameters, Devi
         throw std::invalid_argument(
             "--vision-residency overlay needs " + mib(aligned) +
             " of evict-ranked weights for one encode window, but the loaded output head, "
-            "embedding, proposal head and MTP weights provide " +
+            "embedding, proposal head and MTP or drafter weights provide " +
             mib(pool->evictable_tail_bytes()) +
             "; lower --vision-max-merged, use --vision-residency resident, or drop a flag that "
             "shrinks those weights (--embedding-q4/q6, --lm-head-q4/q6)");
