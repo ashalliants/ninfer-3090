@@ -307,6 +307,41 @@ void DeviceKVPagePool::return_pages(std::int32_t begin, std::uint32_t count) {
     lent_pages_ -= count;
 }
 
+void DeviceKVPagePool::mark_graft_region(std::int32_t begin, std::uint32_t count) {
+    if (count == 0) { return; }
+    if (begin < 0 || static_cast<std::int64_t>(begin) + count > capacity_pages()) {
+        throw std::out_of_range("Phantom-KV graft region is outside the pool");
+    }
+    // Remove contiguous page indices from free runs so materialize skips them.
+    // Graft pages are never reclaimed — they survive dematerialization of other
+    // pages and remain resident for the lifetime of the program.
+    const std::int64_t end = static_cast<std::int64_t>(begin) + count;
+    for (std::size_t idx = 0; idx < free_page_runs_.size(); ++idx) {
+        const KVPageRun& run         = free_page_runs_[idx];
+        const std::int64_t run_end   = static_cast<std::int64_t>(run.begin) + run.count;
+        if (run.begin <= begin && end <= run_end) {
+            consume_free_run(idx, begin, count);
+            break;  // graft region must be contained in a single free run at init time
+        }
+    }
+    allocated_pages_ += count;
+    graft_pages_ += count;
+}
+
+bool DeviceKVPagePool::has_graft_region() const noexcept {
+    return graft_pages_ > 0;
+}
+
+std::uint32_t DeviceKVPagePool::graft_region_count() const noexcept {
+    return graft_pages_;
+}
+
+DeviceKVPageHandle DeviceKVPagePool::page_handle(std::int32_t index) const noexcept {
+    // Graft pages use the current generation; they're never dematerialized.
+    return DeviceKVPageHandle(this, index,
+                              page_generations_[static_cast<std::size_t>(index)]);
+}
+
 std::uint32_t
 DeviceKVPagePool::contiguous_run_count(std::span<const DeviceKVPageHandle> pages) const {
     if (pages.empty()) { return 0; }

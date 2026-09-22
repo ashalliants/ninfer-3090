@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "core/nvtx.h"
 #include "core/startup.h"
+#include "models/qwen3_5/program/storage/graft_registry.h"
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/request.h"
 #include "runtime/engine/causal_score_core.h"
@@ -308,6 +309,20 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
 
     runtime::ResolvedRequestOptions resolved_options = resolve_request_options(
         impl_->sampling_defaults, prompt.impl_->sampling_mode, std::move(options));
+
+    // Resolve phantom-kv graft spec against the engine registry.
+    if (options.execution.graft.has_value()) {
+        const auto* loaded = impl_->active->graft_registry.find(options.execution.graft->id);
+        if (!loaded) { throw std::invalid_argument("Unknown phantom-kv graft id"); }
+        resolved_options.execution.active_graft.id          = options.execution.graft->id;
+        resolved_options.execution.active_graft.layer_count = static_cast<std::uint32_t>(loaded->layers());
+    }
+    // Populate global reservation so every request accounts for physically reserved graft pages.
+    {
+        const std::uint32_t reserve = impl_->active->graft_registry.max_graft_layers();
+        resolved_options.execution.active_graft.global_reservation = reserve;
+        resolved_options.execution.graft_global_reserved            = reserve > 0;
+    }
     const ResolvedSamplingParameters resolved_sampling = resolved_options.execution.sampling;
 
     const PromptSummary prompt_summary = prompt.impl_->summary;
@@ -424,6 +439,12 @@ bool Engine::is_available() const {
             }
         },
         impl_->core);
+}
+
+// --- Phantom-KV graft registration ---
+void Engine::register_graft(const std::string& id, std::string_view path) const {
+    if (!impl_) { throw std::logic_error("Engine is moved from"); }
+    impl_->active->graft_registry.register_graft(id, path);
 }
 
 void Engine::reset_memory_peaks() noexcept {

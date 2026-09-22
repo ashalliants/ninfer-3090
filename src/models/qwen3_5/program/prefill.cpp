@@ -631,13 +631,34 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
         sequence.endpoint_valid = false;
         if (!preserving_source) { trim_sequence_kv(sequence, base, backend_kv_valid(sequence)); }
         bind_sequence_kv(sequence);
+
+        // ── Phantom-KV graft reservation & injection ──────────────────────────────
+        // Reserve physical pages [0..G) before token KV materialization so graft
+        // data is never overwritten by normal token KV allocation. Graft must be
+        // injected *before* ensure_sequence_kv_mapped because that call publishes
+        // block-table mappings that would clobber graft indices.
+        const std::string& graft_id = transaction.plan->impl_->active_graft_id;
+        std::uint32_t graft_layers  = 0;
+        if (!graft_id.empty() && graft_registry) {
+            if (const LoadedGraft* g = graft_registry->find(graft_id)) {
+                graft_layers = static_cast<std::uint32_t>(g->layers());
+            }
+        }
+        sequence.graft_layer_count = graft_layers;
+        if (graft_layers > 0) {
+            reserve_graft_region(sequence, graft_layers);
+            inject_graft_kv(sequence, transaction.plan->impl_.get());
+        }
+        // ──────────────────────────────────────────────────────────────────────────
+
         const std::uint32_t backend_materialized =
             speculative_backend == SpeculativeBackend::Mtp
                 ? std::min(capacity,
                            prompt_tokens + (initial_mtp_extent == 0 ? 0U : initial_mtp_extent - 1U))
             : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
                                                                 : 0U;
-        ensure_sequence_kv_mapped(sequence, prompt_tokens, backend_materialized);
+        ensure_sequence_kv_mapped(sequence, prompt_tokens, backend_materialized, graft_layers);
+
         install_sampling(sequence, request, request_plan.sampling);
         sequence.rope_delta = staged.prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
@@ -1059,7 +1080,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             std::uint32_t final_chunk_tokens = 0;
             bool finalized                   = false;
             while (remaining != 0) {
-                schedule_state.text_kv_base           = staged.cursor;
+                // When phantom-KV graft is active, prompt KV must begin past graft region.
+                schedule_state.text_kv_base           = staged.cursor + sequence.graft_layer_count;
                 selectors                             = state_selectors(sequence);
                 schedule_state.state_source_slot      = selectors.source;
                 schedule_state.state_destination_slot = selectors.destination;

@@ -776,6 +776,27 @@ public:
         return release_reference(handle, page.writer_references != 0);
     }
 
+    void mark_as_graft(LogicalKVPageHandle handle) {
+        if (!valid(handle)) { throw std::invalid_argument("graft mark on stale handle"); }
+        Page& page = pages_[handle.index_];
+        page.is_grafted = true;
+    }
+
+    // Mark a contiguous range of logical page indices as grafted. These pages are reserved
+    // before normal materialize runs, so their Page structs exist in pages_ but they have
+    // no valid PhysicalKVPage yet. This path is used for the initial graft region.
+    void mark_as_graft_range(std::uint32_t begin, std::uint32_t count) {
+        if (begin + count > pages_.size()) { throw std::out_of_range("graft range beyond page store"); }
+        for (std::uint32_t i = begin; i < begin + count; ++i) {
+            pages_[i].is_grafted = true;
+        }
+    }
+
+    [[nodiscard]] bool is_graft_page(LogicalKVPageHandle handle) const noexcept {
+        if (!valid(handle)) { return false; }
+        return pages_[handle.index_].is_grafted;
+    }
+
 private:
     struct Page {
         std::uint32_t generation        = 1;
@@ -788,6 +809,7 @@ private:
         std::uint8_t writer_references  = 0;
         bool destination_pinned         = false;
         bool occupied                   = false;
+        bool is_grafted                 = false;
         std::optional<DeviceKVPageLease> device_replica;
         std::optional<DeviceKVPageLease> pending_device_replica;
         std::optional<HostKVPageReplica> host_replica;
@@ -1437,21 +1459,53 @@ public:
 
     // Coverage is a lower bound. A speculative mapping may already extend beyond this stage's
     // needs; only an explicit truncate releases it, and commit_frontier publishes valid tokens.
+    // graft_layer_count > 0 means pages [0..G) are pre-reserved for phantom-KV graft.
     void ensure_mapped_to_tokens(KVAddressSpaceHandle handle, std::uint32_t tokens,
-                                 cudaStream_t stream = nullptr) {
-        Address& address           = require_active(handle);
-        const std::uint32_t target = pages_for_tokens(tokens);
-        if (target > entitlement(address)) {
+                                 cudaStream_t stream = nullptr,
+                                 std::uint32_t graft_layer_count = 0) {
+        // When graft_layer_count > 0, pages [0..G) contain valid K/V tensors injected by
+        // inject_graft_kv and must appear in the block table so attention sees them.
+        // Token KV allocation starts past these indices so graft data survives on-device.
+        const std::uint32_t graft_offset = graft_layer_count;
+        const std::uint32_t target       = pages_for_tokens(tokens);
+        Address& address                 = require_active(handle);
+
+        // Publish graft block table entries [0..G) -> physical [0..G) on first activation.
+        // Graft pages were pre-reserved by mark_graft_region() but never went through normal
+        // materialize, so we build DeviceKVPageHandle from the pool directly.
+        if (graft_offset > 0 && address.page_count == 0) {
+            publish_scratch_.clear();
+            publish_scratch_.reserve(graft_offset);
+            for (std::int32_t i = 0; i < static_cast<std::int32_t>(graft_offset); ++i) {
+                publish_scratch_.push_back(pages_->physical_pool().page_handle(i));
+            }
+            try {
+                tables_->publish(address.row->handle(), 0, publish_scratch_, stream);
+            } catch (...) {
+                publish_scratch_.clear();
+                throw;
+            }
+            publish_scratch_.clear();
+            // Mark graft logical pages as grafted so pressure planner eviction guards
+            // won't evict them. This is essential for correct long-term operation.
+            pages_->mark_as_graft_range(0, graft_offset);
+        }
+
+        // Entitlement already includes graft pages. Total physical pages needed = G + ceil(tokens/64).
+        const std::uint32_t adjusted_target = graft_offset + target;
+        if (adjusted_target > entitlement(address)) {
             throw std::invalid_argument(
                 "KV coverage exceeds active entitlement: tokens=" + std::to_string(tokens) +
-                " required_pages=" + std::to_string(target) +
+                " graft=" + std::to_string(graft_offset) +
+                " required_pages=" + std::to_string(adjusted_target) +
                 " mapped_pages=" + std::to_string(address.page_count) +
                 " reserved_pages=" + std::to_string(address.reservation.pages()) +
                 " entitlement=" + std::to_string(entitlement(address)));
         }
-        if (target <= address.page_count) { return; }
-        const std::uint32_t begin       = address.page_count;
-        const std::uint32_t count       = target - begin;
+        if (adjusted_target <= address.page_count) { return; }
+        // New token KV pages start at max(page_count, graft_offset).
+        const std::uint32_t begin       = std::max(address.page_count, graft_offset);
+        const std::uint32_t count       = adjusted_target - begin;
         const std::size_t address_index = static_cast<std::size_t>(&address - addresses_.data());
         std::span<LogicalKVPageHandle> added(
             memberships_.data() + address_index * page_capacity_ + begin, count);
@@ -1473,7 +1527,7 @@ public:
             throw;
         }
         for (const LogicalKVPageHandle page : added) { pages_->retain_active_reference(page); }
-        address.page_count = target;
+        address.page_count = adjusted_target;
     }
 
     void commit_frontier(KVAddressSpaceHandle handle, std::uint32_t frontier) {

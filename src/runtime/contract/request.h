@@ -14,6 +14,17 @@ struct ResolvedExecutionOptions {
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
     ThinkingControlOptions thinking;
+    // True when the graft registry contains registered grafts, inflating text_kv_page_entitlement
+    // so that even non-grafted sequences avoid physical [0..N) pages reserved by graft injection.
+    bool graft_global_reserved = false;
+    // Active phantom-kv graft resolution. Empty id means no graft; when set, layer_count
+    // specifies how many KV pages per attention layer the graft reserves.
+    struct GraftInfo {
+        std::string id;
+        std::uint32_t layer_count      = 0;
+        std::uint32_t global_reservation = 0; // globally-reserved graft pages (+N layers)
+    };
+    GraftInfo active_graft;
 };
 
 struct ResolvedRequestOptions {

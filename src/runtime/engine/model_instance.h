@@ -3,6 +3,7 @@
 #include "models/qwen3_5/model.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/program/runtime_types.h"
+#include "models/qwen3_5/program/storage/graft_registry.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/kv_capacity.h"
 
@@ -21,6 +22,8 @@ struct ModelInstance {
     KvCapacityResolution kv_capacity_resolution;
     const std::uint32_t capacity;
     std::unique_ptr<models::qwen3_5::Program> program;
+    // Phantom-KV graft registry — lives for full engine lifetime.
+    models::qwen3_5::GraftRegistry graft_registry;
 
     ModelInstance(std::unique_ptr<models::qwen3_5::Model> model, const EngineOptions& options);
     ~ModelInstance();

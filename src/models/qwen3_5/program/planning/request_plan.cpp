@@ -254,6 +254,20 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                                            ? 0U
                                            : base->summary.effective_output_tokens - 1U);
     base->text_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
+
+    // Phantom-KV graft: reserve one physical KV page per layer at the start of each block table.
+    // Propagate the resolved graft ID so it reaches start_sequence for injection.
+    // Inflation is needed even for non-grafted requests when the pool globally reserves
+    // physical indices [0..N) via mark_graft_region, so they must not allocate those pages.
+    base->active_graft_id   = options.active_graft.id;
+    if (!options.active_graft.id.empty() || options.graft_global_reserved) {
+        const std::uint32_t extra_pages =
+            !options.active_graft.id.empty() ? options.active_graft.layer_count
+                                             : options.active_graft.global_reservation;
+        if (extra_pages > 0) {
+            base->text_kv_page_entitlement += extra_pages;
+        }
+    }
     if (speculative_backend == SpeculativeBackend::Mtp) {
         const std::uint32_t mtp_tokens    = static_cast<std::uint32_t>(std::min<std::uint64_t>(
             capacity, static_cast<std::uint64_t>(reserved_context_tokens) + draft_window - 1ULL));
@@ -447,6 +461,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
     plan->sampling                    = base.sampling;
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
+    plan->active_graft_id             = base.active_graft_id;
     plan->root_rebuild_work           = base.root_rebuild_work;
     plan->root_rebuild_tail_begin     = base.root_rebuild_tail_begin;
 

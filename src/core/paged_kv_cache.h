@@ -230,6 +230,16 @@ public:
     // puts it back. The caller owns the memory only between these two calls.
     void lend_pages(std::int32_t begin, std::uint32_t count);
     void return_pages(std::int32_t begin, std::uint32_t count);
+
+    // Pre-mark physical page indices as allocated so materialize skips them.
+    // Used by phantom-KV graft reservation before token KV allocation.
+    // Pre-mark physical page indices as allocated so materialize skips them.
+    // Used by phantom-KV graft reservation before token KV allocation.
+    void mark_graft_region(std::int32_t begin, std::uint32_t count);
+    [[nodiscard]] bool has_graft_region() const noexcept;
+    [[nodiscard]] std::uint32_t graft_region_count() const noexcept;
+    /** Return a handle for a known physical page index. Caller must ensure validity. */
+    [[nodiscard]] DeviceKVPageHandle page_handle(std::int32_t index) const noexcept;
     [[nodiscard]] std::uint32_t
     contiguous_run_count(std::span<const DeviceKVPageHandle> pages) const;
 
@@ -288,6 +298,7 @@ private:
     std::uint32_t allocated_pages_          = 0;
     std::uint32_t reserved_pages_           = 0;
     std::uint32_t lent_pages_               = 0;
+    std::uint32_t graft_pages_              = 0;
 };
 
 struct DeviceKVPageReservationRequest {

@@ -209,7 +209,7 @@ select_kv_pressure_actions(const KVAddressSpaceStore& addresses, LogicalKVPageSt
                 const LogicalKVPageHandle logical = addresses.logical_page(address, page);
                 return selected[page] == 0 && pages.device_resident(logical) &&
                        pages.host_resident(logical) && pages.writer_references(logical) == 0 &&
-                       pages.source_pins(logical) == 0 &&
+                       pages.source_pins(logical) == 0 && !pages.is_graft_page(logical) &&
                        !protected_page(page, logical,
                                        qwen3_5::detail::PressureKVDecisionKind::DropHostDuplicate);
             };
@@ -260,8 +260,8 @@ select_kv_pressure_actions(const KVAddressSpaceStore& addresses, LogicalKVPageSt
                     require_host ? qwen3_5::detail::PressureKVDecisionKind::DropDeviceDuplicate
                                   : qwen3_5::detail::PressureKVDecisionKind::DemoteToHost;
                 return pages.device_resident(logical) && pages.writer_references(logical) == 0 &&
-                       pages.source_pins(logical) == 0 && replica_safe &&
-                       !addresses.has_active_reference(logical) &&
+                       pages.source_pins(logical) == 0 && !pages.is_graft_page(logical) &&
+                       replica_safe && !addresses.has_active_reference(logical) &&
                        !protected_page(page, logical, action);
             };
             while (end != 0 && !eligible(end - 1U)) { --end; }

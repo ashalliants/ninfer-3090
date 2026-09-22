@@ -13,6 +13,8 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/planning/checkpoint_recovery.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/transactions/materialization.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/storage/context.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/storage/graft_loader.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/storage/graft_registry.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/transactions/commit.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/transactions/capture.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/graphs.cpp"

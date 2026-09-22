@@ -101,6 +101,11 @@ public:
                               OutputSink* sink                     = nullptr,
                               const CancellationView& cancellation = {});
 
+    // Phantom-KV graft management.
+    // Loads a .phantom artifact into the engine graft registry under the given id.
+    // Must be called before submit() if requests use ExecutionOptions.graft.
+    void register_graft(const std::string& id, std::string_view path) const;
+
     [[nodiscard]] const EngineOptions& options() const;
     [[nodiscard]] LoadSummary load_summary() const;
     [[nodiscard]] MemorySummary memory_summary() const;

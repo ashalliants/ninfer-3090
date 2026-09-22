@@ -1,4 +1,5 @@
 #pragma once
+#include "models/qwen3_5/program/storage/graft_registry.h"
 #include "models/qwen3_5/program/internal.h"
 
 #include "core/arena.h"
@@ -182,6 +183,7 @@ struct RequestBasePlanImpl {
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
+    std::string active_graft_id;             // phantom-kv graft for this sequence
     std::shared_ptr<const qwen3_5::VisionControlPlan> vision_control_plan;
     std::optional<qwen3_5::RewriteCheckpointSpec> rewrite_checkpoint;
     std::vector<CaptureGroup> capture_groups;
@@ -246,6 +248,7 @@ struct AdmissionCandidateImpl : ResourceCandidateState {
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
+    std::string active_graft_id;             // phantom-kv graft for this sequence
     runtime::LaneId destination{};
     std::uint64_t destination_epoch = 0;
     runtime::PrefillWork root_rebuild_work;
@@ -367,6 +370,7 @@ struct SequenceState {
     RewriteCheckpoint rewrite_checkpoint;
     std::vector<LongAnchorCheckpoint> long_anchors;
     std::vector<std::uint32_t> shared_prefix_references;
+    std::uint32_t graft_layer_count = 0;
     runtime::PrefillWork rebuild_work;
     std::uint32_t rebuild_tail_begin = 0;
 };
@@ -457,8 +461,19 @@ public:
     };
 
     ProgramImpl(const execution::Parameters& parameters, const SequencePlanImpl& plan,
-                DeviceContext& device, const StartupObserver& startup_observer);
+                DeviceContext& device, const StartupObserver& startup_observer,
+                ::ninfer::models::qwen3_5::GraftRegistry const* graft_registry_ = nullptr);
+
+    /// Overload without graft registry for builds that don't use phantom-KV.
+    ProgramImpl(const execution::Parameters& parameters, const SequencePlanImpl& plan,
+                DeviceContext& device, const StartupObserver& startup_observer)
+        : ProgramImpl(parameters, plan, device, startup_observer, nullptr) {}
+
     ~ProgramImpl() noexcept;
+
+    /** Inject grafted KV pages for an active phantom-kv request. */
+    void inject_graft_kv(SequenceState& sequence,
+                         AdmissionCandidateImpl const* admission) const;
 
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,
                                                const runtime::ResolvedExecutionOptions& options);
@@ -563,6 +578,8 @@ public:
 
     const execution::Parameters& parameters;
     DeviceContext& device;
+    // Engine-level graft registry for phantom-KV. May be null if grafts are not enabled.
+    ::ninfer::models::qwen3_5::GraftRegistry const* graft_registry = nullptr;
     const std::uint32_t capacity;
     const std::uint32_t kv_capacity;
     const std::uint32_t max_concurrency;
@@ -1194,8 +1211,11 @@ private:
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
+    /** Reserve physical pages [0..count) for phantom-KV graft before token KV allocation. */
+    void reserve_graft_region(SequenceState& sequence, std::uint32_t count);
     void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
-                                   std::uint32_t backend_tokens = 0);
+                                   std::uint32_t backend_tokens = 0,
+                                   std::uint32_t graft_layer_count = 0);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                           std::uint32_t backend_tokens = 0);
     void release_sequence_growth_entitlement(SequenceState& sequence) noexcept;

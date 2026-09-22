@@ -2,6 +2,7 @@
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen3_5/program/storage/graft_registry.h"
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -244,6 +245,11 @@ CapturePressurePlanningSession::seal(AssessedPressureTarget&& assessed) {
 }
 
 Program::Program(std::unique_ptr<detail::ProgramImpl> impl) noexcept : impl_(std::move(impl)) {}
+
+std::unique_ptr<Program>
+Program::create_from_impl(std::unique_ptr<detail::ProgramImpl> impl) noexcept {
+    return std::unique_ptr<Program>(new Program(std::move(impl)));
+}
 
 Program::~Program() noexcept = default;
 
@@ -518,16 +524,16 @@ std::size_t prepare_vision_overlay(const execution::Parameters& parameters, Devi
 }
 
 std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
-                                        SequencePlan&& plan, DeviceContext& device,
-                                        const StartupObserver& startup_observer) {
+                                        SequencePlan&& plan, const ::ninfer::models::qwen3_5::GraftRegistry* graft_registry,
+                                        DeviceContext& device, const StartupObserver& startup_observer) {
     if (plan.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
     if (plan.impl_->parameters != &parameters) {
         throw std::invalid_argument("sequence plan belongs to another model instance");
     }
-    auto impl =
-        std::make_unique<detail::ProgramImpl>(parameters, *plan.impl_, device, startup_observer);
+    auto impl = std::make_unique<detail::ProgramImpl>(parameters, *plan.impl_, device,
+                                                      startup_observer, graft_registry);
     plan.impl_.reset();
-    return std::unique_ptr<Program>(new Program(std::move(impl)));
+    return Program::create_from_impl(std::move(impl));
 }
 
 } // namespace ninfer::models::qwen3_5

@@ -4,6 +4,7 @@
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "models/qwen3_5/program/storage/graft_registry.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -850,6 +851,9 @@ public:
                                                const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] std::vector<float> causal_score(PreparedPrompt&& prompt,
                                                   std::uint32_t first_target);
+    // Factory: construct from an already-created ProgramImpl (for graft path)
+    [[nodiscard]] static std::unique_ptr<Program>
+    create_from_impl(std::unique_ptr<detail::ProgramImpl> impl) noexcept;
     [[nodiscard]] std::optional<AdmissionCandidate> inspect_admission(
         const PreparedPrompt& prompt, const RequestBasePlan& base, runtime::LaneId destination,
         const ContinuationHandle* source, const SharedPrefixHandle* shared_source,
@@ -947,6 +951,7 @@ private:
     std::unique_ptr<detail::ProgramImpl> impl_;
 
     friend std::unique_ptr<Program> create_program(const execution::Parameters&, SequencePlan&&,
+                                                   ::ninfer::models::qwen3_5::GraftRegistry const*,
                                                    DeviceContext&, const StartupObserver&);
 };
 
@@ -1111,7 +1116,10 @@ struct RuntimeContractAccess {
                                                  const EngineOptions& options);
 
 [[nodiscard]] std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
-                                                      SequencePlan&& plan, DeviceContext& device,
+                                                      SequencePlan&& plan,
+                                                      ::ninfer::models::qwen3_5::GraftRegistry const*
+                                                          graft_registry,
+                                                      DeviceContext& device,
                                                       const StartupObserver& startup_observer);
 
 } // namespace ninfer::models::qwen3_5

@@ -348,6 +348,9 @@ ProgramImpl::owner_exclusive_resources(const SequenceState& sequence) const {
             if (!addresses.valid(address)) { throw std::logic_error("stale KV address space"); }
             for (std::uint32_t page = 0; page < addresses.mapped_pages(address); ++page) {
                 const LogicalKVPageHandle logical = addresses.logical_page(address, page);
+                // Grafted pages are immune to eviction — they belong to phantom-KV grafts,
+                // not to any individual sequence's KV cache.
+                if (pages.is_graft_page(logical)) { continue; }
                 // A shared logical page contributes to aggregate occupancy once. Releasing this
                 // address cannot free either replica while another address still references it,
                 // so it is not part of this owner's exact transition effect.
@@ -1412,6 +1415,16 @@ void ProgramImpl::bind_sequence_kv(SequenceState& sequence) {
     }
 }
 
+void ProgramImpl::reserve_graft_region(SequenceState& sequence, std::uint32_t count) {
+    // Pre-reserve physical pages [0..count) for phantom-KV graft. Must be called once per program
+    // (or at least before any sequence KV allocation) because it mutates the pool's free runs.
+    const PagedKVCache* kv_backend = backend_kv_cache();
+    if (!kv_backend) { return; }
+    DeviceKVPagePool& pool          = const_cast<DeviceKVPagePool&>(kv_backend->page_pool());
+    if (pool.has_graft_region()) { return; }  // already reserved
+    pool.mark_graft_region(0, static_cast<std::int32_t>(count));
+}
+
 void ProgramImpl::unbind_sequence_kv(SequenceState& sequence) noexcept {
     if (!sequence.kv) { return; }
     try {
@@ -1427,14 +1440,16 @@ void ProgramImpl::unbind_sequence_kv(SequenceState& sequence) noexcept {
 }
 
 void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
-                                            std::uint32_t backend_tokens) {
+                                            std::uint32_t backend_tokens,
+                                            std::uint32_t graft_layer_count) {
     if (!sequence.kv || main_tokens > capacity || backend_tokens > capacity) {
         throw std::logic_error("KV materialization request is outside the sequence bundle");
     }
     if (backend_tokens != 0 && !sequence.kv->backend) {
         throw std::logic_error("backend KV materialization requested without an allocation");
     }
-    text_kv_addresses->ensure_mapped_to_tokens(sequence.kv->text, main_tokens, device.stream);
+    text_kv_addresses->ensure_mapped_to_tokens(sequence.kv->text, main_tokens,
+                                               device.stream, graft_layer_count);
     if (backend_tokens != 0) {
         backend_kv_addresses->ensure_mapped_to_tokens(*sequence.kv->backend, backend_tokens,
                                                       device.stream);

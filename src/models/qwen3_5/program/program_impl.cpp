@@ -1,4 +1,5 @@
 #include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen3_5/program/storage/graft_registry.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/execution/linear.h"
@@ -91,8 +92,10 @@ std::vector<DeviceArena> make_rank_workspaces(DeviceContext& device,
 } // namespace
 
 ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const SequencePlanImpl& plan,
-                         DeviceContext& device_in, const StartupObserver& startup_observer)
-    : parameters(parameters_in), device(device_in), capacity(plan.capacity),
+                         DeviceContext& device_in, const StartupObserver& startup_observer,
+                         ::ninfer::models::qwen3_5::GraftRegistry const* graft_registry_)
+    : parameters(parameters_in), device(device_in), graft_registry(graft_registry_),
+      capacity(plan.capacity),
       kv_capacity(plan.kv_capacity), max_concurrency(plan.max_concurrency),
       context_cache(plan.context_cache),
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
@@ -722,5 +725,143 @@ void ProgramImpl::reset_memory_peaks() noexcept {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Phantom-KV graft injection
+// ---------------------------------------------------------------------------
+namespace {
+
+// Copy from host [slots, head_dim] row-major BF16 into device
+// [ne0, ne1, ne2, N] page-major BF16, performing the permutation.
+static void copy_graft_page_into_device_plane(
+    const uint8_t* host_tensor,
+    std::int64_t host_row_stride,
+    int total_slots,
+    int head_dim,
+    void* dev_plane_start,
+    int dev_nb0,
+    int dev_nb1,
+    int dev_nb2,
+    int dev_nb3,
+    int dev_ne0,
+    int dev_ne1,
+    int dev_ne2,
+    int num_pages)
+{
+    if (dev_ne0 * dev_ne2 != head_dim) {
+        throw std::logic_error(
+            "Phantom-KV graft: device [ne0=" + std::to_string(dev_ne0) +
+            "] * [ne2=" + std::to_string(dev_ne2) +
+            "] != host head_dim=" + std::to_string(head_dim) + "");
+    }
+
+    for (int p = 0; p < num_pages; ++p) {
+        uint8_t* dst_page = reinterpret_cast<uint8_t*>(dev_plane_start) +
+                            static_cast<std::size_t>(p) * static_cast<std::size_t>(dev_nb3);
+
+        int tokens_in_page = dev_ne1;
+        int first_slot     = p * dev_ne1;
+        if (first_slot >= total_slots) {
+            break;
+        }
+        if (first_slot + tokens_in_page > total_slots) {
+            tokens_in_page = total_slots - first_slot;
+        }
+
+        for (int t = 0; t < tokens_in_page; ++t) {
+            int slot_global  = first_slot + t;
+            const uint8_t* slot_src = host_tensor + static_cast<std::size_t>(slot_global) *
+                                                        static_cast<std::size_t>(host_row_stride);
+            for (int e = 0; e < head_dim; ++e) {
+                const int chunk = e % dev_ne0;
+                const int head  = e / dev_ne0;
+                if (head >= dev_ne2) { continue; }
+                const std::int64_t dst_off =
+                    static_cast<std::int64_t>(chunk) * dev_nb0 +
+                    static_cast<std::int64_t>(t) * dev_nb1 +
+                    static_cast<std::int64_t>(head) * dev_nb2;
+                uint8_t* dst_el      = dst_page + static_cast<std::size_t>(dst_off);
+                dst_el[0] = slot_src[e * 2];
+                dst_el[1] = slot_src[e * 2 + 1];
+            }
+        }
+    }
+}
+
+} // anonymous namespace
+
+void ProgramImpl::inject_graft_kv(SequenceState& sequence,
+                                  const AdmissionCandidateImpl* admission) const {
+    auto* registry = this->graft_registry;
+    if (!registry || registry->empty()) {
+        return;
+    }
+
+    // Fast path: no active graft for this sequence.
+    if (admission->active_graft_id.empty()) {
+        return;
+    }
+
+    // Locate the loaded graft.
+    const LoadedGraft* graft = registry->find(admission->active_graft_id);
+    if (!graft || graft->layers() <= 0) {
+        return;
+    }
+
+    // Resolve the Text KV cache and its physical pool.
+    assert(sequence.kv && "KV bundle must be present after bind_sequence_kv");
+    const PagedKVCache* kv_backend = backend_kv_cache();
+    assert(kv_backend != nullptr && "Text KV cache is unavailable");
+    const DeviceKVPagePool& pool   = kv_backend->page_pool();
+    const KVPageGeometry& geometry  = pool.geometry();
+    const std::uint32_t graft_pages = static_cast<std::uint32_t>(graft->layers());
+
+    if (geometry.page_tokens != kPagedKVPageSize) {
+        throw std::logic_error(
+            "Phantom-KV graft requires paged KV with page_tokens == 64");
+    }
+
+    for (std::uint32_t layer = 0;
+         layer < static_cast<std::uint32_t>(graft->layers());
+         ++layer) {
+        const LayerGrafitData& layer_data = graft->layer(layer);
+
+        for (int plane_idx = 0; plane_idx < 2; ++plane_idx) {
+            const size_t plane_index  = 2ULL * layer + plane_idx;
+            const Tensor& dev_plane   = pool.plane(plane_index);
+
+            void* host_ptr = plane_idx == 0 ? layer_data.k_tensor.data : layer_data.v_tensor.data;
+            if (!host_ptr) {
+                throw std::logic_error(
+                    "Phantom-KV graft tensor pointer is null for this layer/plane");
+            }
+
+            const KVPlaneByteRange range =
+                pool.plane_page_range(plane_index, 0, graft_pages);
+            if (range.bytes == 0) {
+                continue;
+            }
+
+            // Permutation-aware H2D copy.
+            const int slots   = layer_data.slots;
+            const int hd      = layer_data.head_dim;
+            const std::int64_t row_stride =
+                static_cast<std::int64_t>(layer_data.k_tensor.nb[1]);
+
+            copy_graft_page_into_device_plane(
+                reinterpret_cast<const uint8_t*>(host_ptr),
+                row_stride,
+                slots, hd,
+                const_cast<void*>(range.base),
+                static_cast<int>(dev_plane.nb[0]),
+                static_cast<int>(dev_plane.nb[1]),
+                static_cast<int>(dev_plane.nb[2]),
+                static_cast<int>(dev_plane.nb[3]),
+                dev_plane.ne[0], dev_plane.ne[1], dev_plane.ne[2], graft_pages);
+        }
+    }
+
+    device.synchronize();
+}
 
 } // namespace ninfer::models::qwen3_5::detail

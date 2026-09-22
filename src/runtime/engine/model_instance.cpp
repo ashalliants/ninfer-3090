@@ -4,6 +4,7 @@
 #include "core/startup.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/measurement.h"
+#include "models/qwen3_5/program/storage/graft_loader.h"
 
 #include <algorithm>
 #include <chrono>
@@ -191,8 +192,9 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
     instance->kv_capacity_resolution = resolution;
     planning.complete();
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
-    instance->program = models::qwen3_5::create_program(instance->parameters, std::move(sequence),
-                                                        device, options.startup_observer);
+    instance->program = models::qwen3_5::create_program(
+        instance->parameters, std::move(sequence), &instance->graft_registry, device,
+        options.startup_observer);
     device.synchronize();
     program.complete();
     instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();

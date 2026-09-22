@@ -322,11 +322,23 @@ struct ThinkingControlOptions {
     std::optional<std::uint32_t> budget;
 };
 
+// Phantom-kv graft specification for per-request KV cache injection.
+// When present, the engine reserves initial pages at position 0 of every layer's block table and
+// writes pre-computed K/V tensors into them before any prompt tokens. From the model's view it is
+// indistinguishable from conversation history — attention attends over [graft | prompt | output].
+struct GraftSpec {
+    std::string id;   // Unique identifier used when registering the graft with the Engine.
+};
+
 struct ExecutionOptions {
     SamplingOverrides sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
     ThinkingControlOptions thinking;
+    // Optional phantom-kv graft spec. Non-empty enables KV-injected context at positions 0..M-1
+    // of every attention layer. The Engine must have registered the named graft via register_graft()
+    // before submit().
+    std::optional<GraftSpec> graft;
 };
 
 struct OutputOptions {
