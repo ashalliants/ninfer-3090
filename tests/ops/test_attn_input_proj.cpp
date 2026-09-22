@@ -179,6 +179,64 @@ int run_q4_q5() {
     return failures;
 }
 
+// The ternary pair through the policy form: the integer routes (one quantisation, each parent split
+// into its two destinations), the small-T kernel up to 128 tokens and the padded GEMM above it.
+int run_t2_case(DevicePackedWeight& query_key, DevicePackedWeight& gate_value, int tokens) {
+    constexpr int hidden = 5120, qrows = 6144, kvrows = 1024;
+    constexpr ops::LinearPolicy policy = ops::LinearPolicy::AllowA8Int;
+    const auto activation              = make_bf16_activation(hidden, tokens, 131U + tokens);
+    const auto activation_bits         = bf16_bits(activation);
+    DeviceBuffer input                 = to_device(activation_bits);
+    GuardedBf16Tensor query(qrows, tokens), gate(qrows, tokens), key(kvrows, tokens),
+        value(kvrows, tokens);
+    Tensor x(input.p, DType::BF16, {hidden, tokens}), q = query.tensor(), g = gate.tensor(),
+                                                      k = key.tensor(), v = value.tensor();
+    const auto capacity = ops::attn_input_proj_split_workspace_capacity_bytes(
+        QType::T2_G128_FP16, 7168, QType::T2_G128_FP16, 7168, hidden, policy, tokens, tokens);
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
+    DeviceArena workspace(DeviceSpan{scratch.data(), std::max<std::size_t>(capacity, 1)});
+    DeviceContext device;
+    scratch.fill(0x5a);
+    for (Tensor* out : {&q, &g, &k, &v})
+        CUDA_CHECK(
+            cudaMemsetAsync(out->data, 0xff, std::size_t(out->ne[0]) * tokens * 2, device.stream));
+    ops::attn_input_proj(x, query_key.view(), gate_value.view(), q, g, k, v, policy, workspace,
+                         device.stream);
+    cuda_synchronize(device.stream);
+    const std::string suffix = " T2 allow-a8-int T=" + std::to_string(tokens);
+    int failures = verify_output("attn q" + suffix, query, query_key.host, 0, qrows, activation,
+                                 hidden, tokens, kAttnInputProjA8Tolerance, 31);
+    failures += verify_output("attn k" + suffix, key, query_key.host, qrows, kvrows, activation,
+                              hidden, tokens, kAttnInputProjA8Tolerance, 31);
+    failures += verify_output("attn gate" + suffix, gate, gate_value.host, 0, qrows, activation,
+                              hidden, tokens, kAttnInputProjA8Tolerance, 31);
+    failures += verify_output("attn value" + suffix, value, gate_value.host, qrows, kvrows,
+                              activation, hidden, tokens, kAttnInputProjA8Tolerance, 31);
+    failures += verify_preserved("attn input" + suffix, input, activation_bits);
+    failures += scratch.verify_guards(suffix);
+    if (workspace.used() != 0 || workspace.peak_used() > capacity) {
+        std::cerr << "T2 attention projection workspace exceeds query or leaks a scope\n";
+        ++failures;
+    }
+    failures += query_key.verify_preserved("attn T2 query/key" + suffix);
+    failures += gate_value.verify_preserved("attn T2 gate/value" + suffix);
+    return failures;
+}
+
+int run_t2() {
+    constexpr std::int32_t kHidden = 5120;
+    constexpr std::int32_t kParent = 7168;
+    DevicePackedWeight query_key(
+        quantized_weight::make_patterned_weight(QType::T2_G128_FP16, kParent, kHidden, 151U));
+    DevicePackedWeight gate_value(
+        quantized_weight::make_patterned_weight(QType::T2_G128_FP16, kParent, kHidden, 157U));
+    int failures = 0;
+    for (int t : {1, 2, 4, 8, 9, 16, 17, 33, 64, 65, 100, 128, 129, 200, 1007, 1024}) {
+        failures += run_t2_case(query_key, gate_value, t);
+    }
+    return failures;
+}
+
 std::vector<double> bf16_attention_oracle(const HostWeight& weight,
                                           std::span<const float> activation) {
     std::vector<double> result(static_cast<std::size_t>(weight.n));
@@ -661,6 +719,7 @@ int main(int argc, char** argv) {
     if (inputs_only) { return run_weight_inputs() == 0 ? 0 : 1; }
     if (!dflash2_only) {
         failures += run_q4_q5();
+        failures += run_t2();
         failures += run_bf16_target();
         failures += run_nvfp4_target();
         failures += run_fp8_target();

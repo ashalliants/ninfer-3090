@@ -280,6 +280,7 @@ const char* policy_name(LinearPolicy policy) {
     if (policy == LinearPolicy::A16Only) { return "A16"; }
     if (policy == LinearPolicy::AllowA8) { return "A8"; }
     if (policy == LinearPolicy::AllowA4) { return "A4"; }
+    if (policy == LinearPolicy::AllowA8Int) { return "A8I"; }
     throw std::invalid_argument("unsupported Linear benchmark policy");
 }
 
@@ -307,7 +308,8 @@ LinearPolicy parse_policy(std::string_view text) {
     if (value == "a16" || value == "a16only") { return LinearPolicy::A16Only; }
     if (value == "a8" || value == "allowa8") { return LinearPolicy::AllowA8; }
     if (value == "a4" || value == "allowa4") { return LinearPolicy::AllowA4; }
-    throw std::invalid_argument("Linear benchmark policy must be a16, a8, or a4");
+    if (value == "a8int" || value == "allowa8int") { return LinearPolicy::AllowA8Int; }
+    throw std::invalid_argument("Linear benchmark policy must be a16, a8, a4, or a8int");
 }
 
 std::uint64_t parse_u64(std::string_view text, const char* label) {
@@ -372,7 +374,7 @@ void usage(const char* argv0) {
                  "GGML formats: ggml_iq4_xs, ggml_iq3_s, ggml_q6_k, ggml_iq4_nl, ggml_q8_0, ggml_q2_0;\n"
                  "they register only the A8 (Q8_1) profile, so they need --policy a8.\n\n"
                  "Options:\n"
-                 "  --policy a16|a8|a4 Activation-compute policy (default a16).\n"
+                 "  --policy a16|a8|a4|a8int Activation-compute policy (default a16).\n"
                  "  --execution MODE   eager (default) or graph; time the complete Op.\n"
                  "  --graph-calls N    Calls per timed graph (1..64, default 1); report per call.\n"
                  "  --profile          Capture exactly one post-warmup public Linear call.\n"

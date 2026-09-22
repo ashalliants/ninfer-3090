@@ -36,9 +36,10 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
 
 /**
  * Policy-bearing split form. AllowA8Int admits the integer-activation route for the registered
- * Q4 plus Q5 [7168,5120] pair at full prefill tiles (T a positive multiple of 128); every other
- * width, shape or policy takes the A16 schedules and needs no transient bytes. Size the transient
- * storage with attn_input_proj_split_workspace_capacity_bytes().
+ * Q4 plus Q5 [7168,5120] pair at full prefill tiles (T a positive multiple of 128) and for the T2
+ * [7168,5120] pair at 1..128 tokens (the small-T kernel) and above (padded inside); every
+ * other width, shape or policy takes the A16 schedules. Size the transient storage with
+ * attn_input_proj_split_workspace_capacity_bytes().
  */
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,

@@ -471,23 +471,29 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
         __syncthreads();
     }
 
+    // A caller may pad T up to the tile: the padded columns were never quantised, so their results
+    // are discarded here rather than written past the destination.
     const std::int32_t out_base = row_block * RowMap::kRowsPerBlock;
     const std::int32_t col_base = col_block * BN;
 #pragma unroll
     for (int n = 0; n < NT; ++n) {
-        const int c0 = col_base + (warp_n * NT + n) * 8 + tig * 2;
+        const int c0     = col_base + (warp_n * NT + n) * 8 + tig * 2;
+        const bool keep0 = c0 < tokens;
+        const bool keep1 = c0 + 1 < tokens;
 #pragma unroll
         for (int half = 0; half < 2; ++half) {
             if constexpr (Epilogue::kPaired) {
                 const int row = out_base + RowMap::output_row(warp_m, 0, gid) + half * 8;
-                epilogue(row, c0, acc[0][n][half * 2], acc[1][n][half * 2]);
-                epilogue(row, c0 + 1, acc[0][n][half * 2 + 1], acc[1][n][half * 2 + 1]);
+                if (keep0) { epilogue(row, c0, acc[0][n][half * 2], acc[1][n][half * 2]); }
+                if (keep1) {
+                    epilogue(row, c0 + 1, acc[0][n][half * 2 + 1], acc[1][n][half * 2 + 1]);
+                }
             } else {
 #pragma unroll
                 for (int m = 0; m < MT; ++m) {
                     const int row = out_base + RowMap::output_row(warp_m, m, gid) + half * 8;
-                    epilogue(row, c0, acc[m][n][half * 2]);
-                    epilogue(row, c0 + 1, acc[m][n][half * 2 + 1]);
+                    if (keep0) { epilogue(row, c0, acc[m][n][half * 2]); }
+                    if (keep1) { epilogue(row, c0 + 1, acc[m][n][half * 2 + 1]); }
                 }
             }
         }

@@ -30,12 +30,13 @@ int verify_output_range(std::string_view label, const GuardedBf16Tensor& output,
                         std::int32_t full_rows, std::int32_t output_row_offset,
                         std::int32_t output_rows, const quantized_weight::PackedWeight& weight,
                         std::int32_t weight_row_offset, const std::vector<float>& activation,
-                        std::int32_t hidden, std::int32_t tokens) {
+                        std::int32_t hidden, std::int32_t tokens,
+                        const ReductionCriterion& criterion = kGdnInputProjA16Tolerance) {
     const std::vector<double> actual =
         gather_rows(output.values(), full_rows, output_row_offset, output_rows, tokens);
     const std::vector<double> expected =
         projection_oracle(weight, weight_row_offset, output_rows, activation, hidden, tokens);
-    return compare(label, actual, expected, kGdnInputProjA16Tolerance);
+    return compare(label, actual, expected, criterion);
 }
 
 int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_weight,
@@ -169,6 +170,73 @@ int run_q4_q5() {
     // slice (129 = 128 + 1).
     for (const std::int32_t tokens : {7, 8, 9, 10, 12, 13, 33, 65, 129}) {
         failures += run_q4_q5_graph_case(query_key, value_z_weight, tokens);
+    }
+    return failures;
+}
+
+// The ternary parents through the policy form: the integer routes (the small-T kernel up to 128
+// tokens, the padded prefill GEMM above) write q/k and value straight into qkv and z into its plane
+// from one quantisation.
+int run_t2_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_weight,
+                std::int32_t tokens) {
+    constexpr std::int32_t kHidden      = 5120;
+    constexpr std::int32_t kQkRows      = 4096;
+    constexpr std::int32_t kValueRows   = 6144;
+    constexpr std::int32_t kZRows       = 6144;
+    constexpr std::int32_t kRows        = kQkRows + kValueRows;
+    constexpr ops::LinearPolicy kPolicy = ops::LinearPolicy::AllowA8Int;
+    const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 431U + tokens);
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    DeviceBuffer device_activation                   = to_device(activation_bits);
+    GuardedBf16Tensor qkv(kRows, tokens);
+    GuardedBf16Tensor z(kZRows, tokens);
+    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor output              = qkv.tensor();
+    Tensor z_output            = z.tensor();
+    const std::size_t capacity = ops::gdn_input_proj_split_workspace_capacity_bytes(
+        QType::T2_G128_FP16, kQkRows, QType::T2_G128_FP16, kValueRows + kZRows, kHidden, kPolicy,
+        tokens, tokens);
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
+    DeviceArena workspace(DeviceSpan{scratch.data(), std::max<std::size_t>(capacity, 1)});
+    scratch.fill(0x5a);
+    ops::gdn_input_proj(x, query_key.view(), value_z_weight.view(), output, z_output, kPolicy,
+                        workspace, nullptr);
+    cuda_synchronize();
+
+    const std::string suffix = " T2 allow-a8-int T=" + std::to_string(tokens);
+    int failures             = qkv.verify_guards("gdn qkv" + suffix);
+    failures += z.verify_guards("gdn z" + suffix);
+    failures += qkv.verify_fully_written("gdn qkv" + suffix);
+    failures += z.verify_fully_written("gdn z" + suffix);
+    failures += verify_output_range("gdn qk" + suffix, qkv, kRows, 0, kQkRows, query_key.host, 0,
+                                    activation, kHidden, tokens, kFp8GdnInputProjA8Tolerance);
+    failures += verify_output_range("gdn value" + suffix, qkv, kRows, kQkRows, kValueRows,
+                                    value_z_weight.host, 0, activation, kHidden, tokens,
+                                    kFp8GdnInputProjA8Tolerance);
+    failures +=
+        verify_output_range("gdn z" + suffix, z, kZRows, 0, kZRows, value_z_weight.host, kValueRows,
+                            activation, kHidden, tokens, kFp8GdnInputProjA8Tolerance);
+    failures += verify_preserved("gdn x" + suffix, device_activation, activation_bits);
+    failures += scratch.verify_guards("gdn workspace" + suffix);
+    if (workspace.used() != 0 || workspace.peak_used() > capacity) {
+        std::cerr << "T2 GDN projection workspace exceeds query or leaks a scope\n";
+        ++failures;
+    }
+    failures += query_key.verify_preserved("gdn T2 query/key weight" + suffix);
+    failures += value_z_weight.verify_preserved("gdn T2 value/z weight" + suffix);
+    return failures;
+}
+
+int run_t2() {
+    constexpr std::int32_t kHidden = 5120;
+    DevicePackedWeight query_key(
+        quantized_weight::make_patterned_weight(QType::T2_G128_FP16, 4096, kHidden, 433U));
+    DevicePackedWeight value_z_weight(
+        quantized_weight::make_patterned_weight(QType::T2_G128_FP16, 12288, kHidden, 439U));
+    int failures = 0;
+    for (const std::int32_t tokens :
+         {1, 2, 4, 8, 9, 16, 17, 33, 64, 65, 100, 128, 129, 200, 1007, 1024}) {
+        failures += run_t2_case(query_key, value_z_weight, tokens);
     }
     return failures;
 }
@@ -462,6 +530,7 @@ int main() {
 
     int failures = 0;
     failures += run_q4_q5();
+    failures += run_t2();
     failures += run_q8();
     failures += run_nvfp4();
     failures += run_fp8();

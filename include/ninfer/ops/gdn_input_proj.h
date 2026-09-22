@@ -45,9 +45,10 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
 
 /**
  * Policy-bearing split form. AllowA8Int admits the integer-activation route for the registered
- * Q4 [4096,5120] plus Q5 [12288,5120] pair at full prefill tiles (T a positive multiple of 128);
- * every other width, shape or policy takes the A16 schedules and needs no transient bytes. The
- * transient storage is sized by gdn_input_proj_split_workspace_capacity_bytes().
+ * Q4 [4096,5120] plus Q5 [12288,5120] pair at full prefill tiles (T a positive multiple of 128) and
+ * for the T2 pair of the same shapes at 1..128 tokens (the small-T kernel) and above (padded
+ * inside); every other width, shape or policy takes the A16 schedules. The transient storage is
+ * sized by gdn_input_proj_split_workspace_capacity_bytes().
  */
 void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                     Tensor& qkv, Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,

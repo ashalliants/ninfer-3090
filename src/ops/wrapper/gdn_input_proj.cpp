@@ -4,6 +4,7 @@
 #include "core/device.h"
 #include "core/layout.h"
 #include "ninfer/ops/linear.h"
+#include "ops/linear/t2/t2_a8.h"
 #include "ops/linear/t2/t2_weight_view.h"
 #include "ops/linear_swiglu/q4cublas/w4_cublas_prefill.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.h"
@@ -757,9 +758,10 @@ bool t2_two_parent(const Weight& qk_weight, const Weight& value_z_weight) {
     return qk;
 }
 
-// Ternary two-parent projection: q/k from the whole qk parent and value/z from row views of the
-// value/z parent, each through the T2 linear routes, then the q/k and value planes are assembled
-// into the caller's [10240,T] qkv with two strided copies. z is written directly.
+// Ternary two-parent projection. On the integer route both parents take one quantisation of x and
+// write straight into qkv and z. Otherwise q/k come from the whole qk parent and value/z from row
+// views of the value/z parent, each through the T2 linear routes, and the q/k and value planes are
+// assembled into the caller's [10240,T] qkv with two strided copies; z is written directly.
 void t2_two_parent_project(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                            Tensor& qkv, Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
                            cudaStream_t stream) {
@@ -774,7 +776,15 @@ void t2_two_parent_project(const Tensor& x, const Weight& qk_weight, const Weigh
     require_matrix(z, kZRows, cols, "z");
     require_rowsplit(qk_weight, QType::T2_G128_FP16, kQkRows, "qk weight");
     require_rowsplit(value_z_weight, QType::T2_G128_FP16, kValueRows + kZRows, "value/z weight");
-    auto scope         = workspace.scope();
+    auto scope = workspace.scope();
+    if (detail::t2_a8_admits(policy) && detail::t2_a8_supported(qk_weight, cols) &&
+        detail::t2_a8_supported(value_z_weight, cols)) {
+        // One quantisation of x; q/k and value land in qkv directly and z in its own plane.
+        const auto activations = detail::t2_a8_quantize(x, workspace, stream);
+        detail::t2_a8_project_split_pair(activations, {qk_weight, qkv, 0, kQkRows, qkv, 0},
+                                         {value_z_weight, qkv, kQkRows, kValueRows, z, 0}, stream);
+        return;
+    }
     Tensor qk_plane    = workspace.alloc(DType::BF16, {kQkRows, cols});
     Tensor value_plane = workspace.alloc(DType::BF16, {kValueRows, cols});
     linear(x, qk_weight, qk_plane, policy, workspace, stream);

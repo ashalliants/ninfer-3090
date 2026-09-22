@@ -1,6 +1,7 @@
 #include "core/weight.h"
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/linear.h"
+#include "ops/linear/t2/t2_a8.h"
 #include "ops/linear/t2/t2_weight_view.h"
 
 #include "ops/linear_swiglu/q4cublas/w4_cublas_prefill.h"
@@ -249,8 +250,9 @@ void require_split_profile(const Tensor& x, const Weight& query_key_weight,
     require_rowsplit(gate_value_weight, QType::Q5_G64_FP16, kQRows + kKvRows, "gate/value weight");
 }
 
-// Ternary pair: both parents are T2 and each part is projected through the T2 linear routes from
-// a row view of its parent (q/k rows [0,6144)/[6144,7168), gate/v likewise).
+// Ternary pair: both parents are T2 (q/k rows [0,6144)/[6144,7168), gate/v likewise). The integer
+// route quantises x once and splits each parent's rows into its two destinations; otherwise each
+// part is projected through the T2 linear routes from a row view of its parent.
 bool t2_pair_project(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
                      LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
@@ -269,6 +271,16 @@ bool t2_pair_project(const Tensor& x, const Weight& query_key_weight,
     require_matrix(v, kKvRows, cols, "v");
     require_rowsplit(query_key_weight, QType::T2_G128_FP16, kQRows + kKvRows, "query/key weight");
     require_rowsplit(gate_value_weight, QType::T2_G128_FP16, kQRows + kKvRows, "gate/value weight");
+    if (workspace != nullptr && detail::t2_a8_admits(policy) &&
+        detail::t2_a8_supported(query_key_weight, cols) &&
+        detail::t2_a8_supported(gate_value_weight, cols)) {
+        // One quantisation of x and one pass over each parent, split into its two destinations.
+        auto scope             = workspace->scope();
+        const auto activations = detail::t2_a8_quantize(x, *workspace, stream);
+        detail::t2_a8_project_split_pair(activations, {query_key_weight, q, 0, kQRows, k, 0},
+                                         {gate_value_weight, gate, 0, kQRows, v, 0}, stream);
+        return true;
+    }
     const auto project = [&](const Weight& part, Tensor& out) {
         if (workspace != nullptr) {
             linear(x, part, out, policy, *workspace, stream);
