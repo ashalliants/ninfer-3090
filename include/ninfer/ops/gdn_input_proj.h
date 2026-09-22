@@ -107,6 +107,16 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
 
 /**
+ * Two-parent snapshot capacity keyed by the parents' formats. The Q4/Q5 pair answers as the
+ * row-count query above; a T2 pair (ternary checkpoints, both parents T2_G128_FP16) projects every
+ * part through the T2 linear routes, so it adds its private projection planes to the materialized
+ * convolution path at every batch size.
+ */
+[[nodiscard]] std::size_t gdn_input_proj_split_conv_snapshot_workspace_capacity_bytes(
+    QType qk_qtype, QType value_z_qtype, std::int32_t batch_size, std::int32_t min_width,
+    std::int32_t max_width);
+
+/**
  * Returns the transient capacity for a registered [16384,5120] NVFP4 or row-scaled FP8 snapshot
  * profile. `batch_size` is exact and the query covers every W in the inclusive width interval.
  * B=1 preserves the format-specific fused/materialized resolver; B=2..8 covers its aggregate
@@ -195,6 +205,14 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
 [[nodiscard]] std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
+
+/**
+ * Two-parent record capacity keyed by the parents' formats: zero for the Q4/Q5 pair, the private
+ * projection planes of every recorded column for a T2 pair.
+ */
+[[nodiscard]] std::size_t gdn_input_proj_split_conv_record_workspace_capacity_bytes(
+    QType qk_qtype, QType value_z_qtype, std::int32_t batch_size, std::int32_t min_width,
+    std::int32_t max_width);
 
 /**
  * Returns the transient capacity for a registered [16384,5120] NVFP4 or row-scaled FP8

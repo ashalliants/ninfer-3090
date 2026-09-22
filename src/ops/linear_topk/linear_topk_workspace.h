@@ -16,6 +16,8 @@ inline constexpr std::int32_t kLinearTopKFullRows        = 248320;
 inline constexpr std::int32_t kLinearTopKFullValidRows   = 248077;
 inline constexpr std::int32_t kLinearTopKOptimizedRows   = 131072;
 inline constexpr std::int32_t kLinearTopKHidden          = 5120;
+// The T2 full head materializes BF16 logits per chunk, so its chunks stay small-T wide.
+inline constexpr std::int32_t kLinearTopKT2ChunkColumns = 16;
 
 struct LinearTopKWorkspace {
     std::int32_t tile_columns = 0;

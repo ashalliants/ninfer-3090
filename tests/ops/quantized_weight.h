@@ -159,13 +159,28 @@ inline QuantSpec quant_spec(QType qtype) {
         return {6, 64, 31, -32};
     case QType::Q8_G32_FP16:
         return {8, 32, 127, -127};
+    case QType::T2_G128_FP16:
+        return {2, 128, 1, -1};
     default:
         throw std::invalid_argument("row-split test packer: unsupported qtype");
     }
 }
 
+// T2 admits only the codes {00, 01, 11}; a random byte may carry the illegal field 0b10, which
+// the fixture rewrites to 0b11 (-1) so every generated group is a valid artifact word.
+inline std::uint8_t legalize_t2_byte(std::uint8_t value) {
+    std::uint8_t out = 0;
+    for (int field = 0; field < 4; ++field) {
+        std::uint8_t code = static_cast<std::uint8_t>((value >> (field * 2)) & 0x03u);
+        if (code == 0x02u) { code = 0x03u; }
+        out |= static_cast<std::uint8_t>(code << (field * 2));
+    }
+    return out;
+}
+
 inline int nibble_bytes_per_group(const QuantSpec& spec) {
-    return spec.bits == 8 ? spec.group_size : spec.group_size / 2;
+    if (spec.bits == 8) { return spec.group_size; }
+    return spec.bits == 2 ? spec.group_size / 4 : spec.group_size / 2;
 }
 
 inline int high_bytes_per_group(const QuantSpec& spec) {
@@ -182,6 +197,13 @@ inline void pack_lowbit_group(const std::int8_t* codes, const QuantSpec& spec,
     if (spec.bits == 8) {
         for (int i = 0; i < spec.group_size; ++i) {
             nibble_out[i] = static_cast<std::uint8_t>(codes[i]);
+        }
+        return;
+    }
+    if (spec.bits == 2) {
+        for (int i = 0; i < spec.group_size; ++i) {
+            const std::uint32_t u = static_cast<std::uint32_t>(codes[i]) & 0x03u;
+            nibble_out[i >> 2] |= static_cast<std::uint8_t>(u << ((i & 3) * 2));
         }
         return;
     }
@@ -209,6 +231,10 @@ inline void pack_lowbit_group(const std::int8_t* codes, const QuantSpec& spec,
 inline int unpack_lowbit_code(const std::uint8_t* nibble, const std::uint8_t* high,
                               const QuantSpec& spec, int index) {
     if (spec.bits == 8) { return static_cast<std::int8_t>(nibble[index]); }
+    if (spec.bits == 2) {
+        const std::uint32_t u = (nibble[index >> 2] >> ((index & 3) * 2)) & 0x03u;
+        return (u & 0x2u) ? static_cast<int>(u) - 4 : static_cast<int>(u);
+    }
     const std::uint8_t low_byte = nibble[index >> 1];
     const std::uint32_t low     = (index & 1) ? (low_byte >> 4) : (low_byte & 0x0fu);
     std::uint32_t hi            = 0;
@@ -524,6 +550,7 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
                 std::uint8_t code = static_cast<std::uint8_t>(
                     (row_mix * 37u + group * 29u + byte * 17u + seed) & 0xffu);
                 if (qtype == QType::Q8_G32_FP16 && code == 0x80u) { code = 0x81u; }
+                if (qtype == QType::T2_G128_FP16) { code = detail::legalize_t2_byte(code); }
                 packed
                     .payload[static_cast<std::size_t>(group_index * code_bytes_per_group + byte)] =
                     code;
@@ -544,6 +571,7 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
                 state              = detail::mix64(state + byte);
                 std::uint8_t value = static_cast<std::uint8_t>(state >> 56);
                 if (qtype == QType::Q8_G32_FP16 && value == 0x80U) { value = 0x81U; }
+                if (qtype == QType::T2_G128_FP16) { value = detail::legalize_t2_byte(value); }
                 code_patterns[pattern][byte] = value;
             }
             for (std::size_t byte = 0; byte < high_bytes_per_group; ++byte) {

@@ -1,5 +1,8 @@
+#include "core/layout.h"
 #include "core/weight.h"
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_swiglu.h"
+#include "ninfer/ops/silu_mul.h"
 
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
@@ -47,6 +50,13 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     validate_policy(policy);
     if (min_tokens <= 0 || max_tokens < min_tokens || (gate_up_rows % 2) != 0) {
         throw std::invalid_argument("linear_swiglu workspace: invalid profile or token interval");
+    }
+    if (qtype == QType::T2_G128_FP16) {
+        (void)linear_workspace_capacity_bytes(qtype, gate_up_rows, input_rows,
+                                              LinearPolicy::A16Only, min_tokens, max_tokens);
+        WorkspaceLayoutBuilder layout;
+        (void)layout.alloc(DType::BF16, {gate_up_rows, max_tokens});
+        return layout.peak_bytes(1);
     }
     if (qtype == QType::Q8_G32_FP16) {
         (void)detail::q8_linear_swiglu_resolve_plan(
@@ -148,8 +158,23 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         gate_up_weight.qhigh == nullptr && gate_up_weight.high_plane_bytes == 0 && common_row_split;
     const bool nvfp4_weight = large_shape && gate_up_weight.qtype == QType::NVFP4;
     const bool fp8_weight   = large_shape && gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16;
-    if (!q4_weight && !q8_weight && !nvfp4_weight && !fp8_weight) {
+    const bool t2_weight    = large_shape && gate_up_weight.qtype == QType::T2_G128_FP16 &&
+                              gate_up_weight.qhigh == nullptr &&
+                              gate_up_weight.high_plane_bytes == 0 && common_row_split;
+    if (!q4_weight && !q8_weight && !nvfp4_weight && !fp8_weight && !t2_weight) {
         throw std::invalid_argument("linear_swiglu: unsupported weight");
+    }
+
+    if (t2_weight) {
+        // Ternary rows project gate and up into one plane; SwiGLU is a separate elementwise pass
+        // over its two halves. A16 by construction.
+        auto scope     = ws.scope();
+        Tensor gate_up = ws.alloc(DType::BF16, {gate_up_weight.n, t});
+        linear(x, gate_up_weight, gate_up, stream);
+        const Tensor gate = gate_up.slice(0, 0, out.ne[0]);
+        const Tensor up   = gate_up.slice(0, out.ne[0], out.ne[0]);
+        silu_mul(gate, up, out, stream);
+        return;
     }
 
     if (fp8_weight) {

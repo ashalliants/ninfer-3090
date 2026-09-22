@@ -250,6 +250,8 @@ const char* qtype_name(QType qtype) {
         return "Q6";
     case QType::Q8_G32_FP16:
         return "Q8";
+    case QType::T2_G128_FP16:
+        return "T2";
     case QType::BF16:
         return "BF16";
     case QType::NVFP4:
@@ -287,6 +289,7 @@ QType parse_qtype(std::string_view text) {
     if (value == "q5" || value == "q5_g64_fp16") { return QType::Q5_G64_FP16; }
     if (value == "q6" || value == "q6_g64_fp16") { return QType::Q6_G64_FP16; }
     if (value == "q8" || value == "q8_g32_fp16") { return QType::Q8_G32_FP16; }
+    if (value == "t2" || value == "t2_g128_fp16") { return QType::T2_G128_FP16; }
     if (value == "bf16") { return QType::BF16; }
     if (value == "nvfp4") { return QType::NVFP4; }
     if (value == "fp8" || value == "fp8_e4m3fn_row_bf16") { return QType::FP8_E4M3FN_ROW_BF16; }
@@ -362,8 +365,8 @@ Sweep parse_sweep(std::string_view text) {
 void usage(const char* argv0) {
     std::fprintf(stderr,
                  "Usage:\n"
-                 "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8|GGML_<FORMAT> --n N --k K --t T [options]\n"
-                 "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8|GGML_<FORMAT> --n N --k K "
+                 "  %s --qtype Q4|Q5|Q6|Q8|T2|BF16|NVFP4|FP8|GGML_<FORMAT> --n N --k K --t T [options]\n"
+                 "  %s --qtype Q4|Q5|Q6|Q8|T2|BF16|NVFP4|FP8|GGML_<FORMAT> --n N --k K "
                  "--sweep START:END[:STEP] [options]\n"
                  "  %s --suite qwen3_6_27b|qwen3_6_35b_a3b|qwen3_8_flash_next|all [options]\n\n"
                  "GGML formats: ggml_iq4_xs, ggml_iq3_s, ggml_q6_k, ggml_iq4_nl, ggml_q8_0, ggml_q2_0;\n"
@@ -673,7 +676,8 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
     // headroom an integer-activation route would actually be competing for.
     const bool groupwise_int =
         point.qtype == QType::Q4_G64_FP16 || point.qtype == QType::Q5_G64_FP16 ||
-        point.qtype == QType::Q6_G64_FP16 || point.qtype == QType::Q8_G32_FP16;
+        point.qtype == QType::Q6_G64_FP16 || point.qtype == QType::Q8_G32_FP16 ||
+        point.qtype == QType::T2_G128_FP16;
     if (groupwise_int) {
         const double peak = bench::device_specs().bf16_f32acc_tflops;
         if (std::isfinite(peak)) {

@@ -142,8 +142,11 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
     require(dense, "input projection: unsupported multi-parent geometry");
     const auto first  = single(inputs.first<2>());
     const auto second = single(inputs.last<2>());
-    require(first.weight.qtype == QType::Q4_G64_FP16 && second.weight.qtype == QType::Q5_G64_FP16,
-            "input projection: paired native form requires Q4 and Q5");
+    const bool q4_q5 =
+        first.weight.qtype == QType::Q4_G64_FP16 && second.weight.qtype == QType::Q5_G64_FP16;
+    const bool t2 =
+        first.weight.qtype == QType::T2_G128_FP16 && second.weight.qtype == QType::T2_G128_FP16;
+    require(q4_q5 || t2, "input projection: paired native form requires Q4 and Q5, or two T2");
     return PairedProjectionWeights{first.weight, second.weight};
 }
 

@@ -1,5 +1,7 @@
 #include "core/weight.h"
 #include "ninfer/ops/attn_input_proj.h"
+#include "ninfer/ops/linear.h"
+#include "ops/linear/t2/t2_weight_view.h"
 
 #include "ops/linear_swiglu/q4cublas/w4_cublas_prefill.h"
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
@@ -33,14 +35,17 @@ void require_matrix(const Tensor& tensor, std::int32_t rows, std::int32_t cols, 
 }
 
 void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, const char* label) {
-    const bool q4_planes =
-        qtype != QType::Q4_G64_FP16 || (weight.qhigh == nullptr && weight.high_plane_bytes == 0);
+    const bool no_high   = weight.qhigh == nullptr && weight.high_plane_bytes == 0;
+    const bool q4_planes = qtype != QType::Q4_G64_FP16 || no_high;
+    const bool t2_planes = qtype != QType::T2_G128_FP16 || no_high;
     const bool q5_planes =
         qtype != QType::Q5_G64_FP16 || (weight.qhigh != nullptr && weight.high_plane_bytes != 0);
+    const std::int32_t group = qtype == QType::T2_G128_FP16 ? 128 : 64;
     if (weight.qtype != qtype || weight.layout != QuantLayout::RowSplit ||
-        weight.scale_dtype != DType::FP16 || weight.group_size != 64 || weight.group != 64 ||
-        weight.ndim != 2 || weight.n != rows || weight.k != 5120 || weight.shape[0] != rows ||
-        weight.shape[1] != 5120 || weight.padded_shape[0] != rows ||
+        weight.scale_dtype != DType::FP16 ||
+        weight.group_size != static_cast<std::uint32_t>(group) || weight.group != group ||
+        !t2_planes || weight.ndim != 2 || weight.n != rows || weight.k != 5120 ||
+        weight.shape[0] != rows || weight.shape[1] != 5120 || weight.padded_shape[0] != rows ||
         weight.padded_shape[1] != 5120 || !q4_planes || !q5_planes ||
         !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 4) ||
         (qtype == QType::Q5_G64_FP16 && !aligned_to(weight.qhigh, 16))) {
@@ -217,6 +222,7 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
     case QType::Q4_G64_FP16:
     case QType::Q5_G64_FP16:
     case QType::Q6_G64_FP16:
+    case QType::T2_G128_FP16:
     case QType::FP32:
     case QType::INT32:
         break;
@@ -243,12 +249,40 @@ void require_split_profile(const Tensor& x, const Weight& query_key_weight,
     require_rowsplit(gate_value_weight, QType::Q5_G64_FP16, kQRows + kKvRows, "gate/value weight");
 }
 
+// Ternary pair: both parents are T2 and each part is projected through the T2 linear routes from
+// a row view of its parent (q/k rows [0,6144)/[6144,7168), gate/v likewise).
+bool t2_pair_project(const Tensor& x, const Weight& query_key_weight,
+                     const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
+                     cudaStream_t stream) {
+    const bool qk = query_key_weight.qtype == QType::T2_G128_FP16;
+    if (qk != (gate_value_weight.qtype == QType::T2_G128_FP16)) {
+        throw std::invalid_argument("attn_input_proj: the two parents must share the T2 format");
+    }
+    if (!qk) { return false; }
+    constexpr std::int32_t kQRows  = 6144;
+    constexpr std::int32_t kKvRows = 1024;
+    const std::int32_t cols        = x.ne[1];
+    require_matrix(x, 5120, cols, "x");
+    require_matrix(q, kQRows, cols, "q");
+    require_matrix(gate, kQRows, cols, "gate");
+    require_matrix(k, kKvRows, cols, "k");
+    require_matrix(v, kKvRows, cols, "v");
+    require_rowsplit(query_key_weight, QType::T2_G128_FP16, kQRows + kKvRows, "query/key weight");
+    require_rowsplit(gate_value_weight, QType::T2_G128_FP16, kQRows + kKvRows, "gate/value weight");
+    linear(x, detail::t2_row_view(query_key_weight, 0, kQRows), q, stream);
+    linear(x, detail::t2_row_view(query_key_weight, kQRows, kKvRows), k, stream);
+    linear(x, detail::t2_row_view(gate_value_weight, 0, kQRows), gate, stream);
+    linear(x, detail::t2_row_view(gate_value_weight, kQRows, kKvRows), v, stream);
+    return true;
+}
+
 } // namespace
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
                      LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream) {
     validate_policy(policy);
+    if (t2_pair_project(x, query_key_weight, gate_value_weight, q, gate, k, v, stream)) { return; }
     require_split_profile(x, query_key_weight, gate_value_weight, q, gate, k, v);
     // Both parents split into a query/gate half and a key/value half, and both read the same
     // activations, so the cuBLAS route materialises each parent once and shares one quantisation
@@ -285,6 +319,17 @@ std::size_t attn_input_proj_split_workspace_capacity_bytes(
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("attn_input_proj workspace: invalid token interval");
     }
+    if (query_key_qtype == QType::T2_G128_FP16 || gate_value_qtype == QType::T2_G128_FP16) {
+        if (query_key_qtype != gate_value_qtype || query_key_rows != 7168 ||
+            gate_value_rows != 7168 || input_rows != 5120) {
+            throw std::invalid_argument("attn_input_proj workspace: unregistered T2 pair");
+        }
+        for (const std::int32_t rows : {6144, 1024}) {
+            (void)linear_workspace_capacity_bytes(QType::T2_G128_FP16, rows, input_rows,
+                                                  LinearPolicy::A16Only, min_tokens, max_tokens);
+        }
+        return 0;
+    }
     const bool registered = query_key_qtype == QType::Q4_G64_FP16 && query_key_rows == 7168 &&
                             gate_value_qtype == QType::Q5_G64_FP16 && gate_value_rows == 7168 &&
                             input_rows == 5120;
@@ -302,6 +347,7 @@ std::size_t attn_input_proj_split_workspace_capacity_bytes(
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
                      cudaStream_t stream) {
+    if (t2_pair_project(x, query_key_weight, gate_value_weight, q, gate, k, v, stream)) { return; }
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kQRows  = 6144;
     constexpr std::int32_t kKvRows = 1024;

@@ -7,4 +7,5 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/q4.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q4_m64.cu"
   "${CMAKE_CURRENT_LIST_DIR}/merge.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/t2.cu"
 )

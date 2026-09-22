@@ -9,6 +9,7 @@
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
 #include "ops/linear/q8/q8_dispatch.h"
+#include "ops/linear/t2/t2_dispatch.h"
 
 #include <cstdint>
 #include <limits>
@@ -90,6 +91,9 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     case QType::Q8_G32_FP16:
         detail::q8_dispatch(x, w, out, policy, stream);
         return;
+    case QType::T2_G128_FP16:
+        detail::t2_dispatch(x, w, out, policy, stream);
+        return;
     case QType::BF16:
         detail::bf16_dispatch(x, w, out, policy, stream);
         return;
@@ -140,6 +144,10 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::Q8_G32_FP16:
         (void)detail::select_q8_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_q8_launch(output_rows, input_rows, max_tokens, policy);
+        return 0;
+    case QType::T2_G128_FP16:
+        (void)detail::select_t2_launch(output_rows, input_rows, min_tokens, policy);
+        (void)detail::select_t2_launch(output_rows, input_rows, max_tokens, policy);
         return 0;
     case QType::BF16:
         (void)detail::select_bf16_launch(output_rows, input_rows, min_tokens, policy);

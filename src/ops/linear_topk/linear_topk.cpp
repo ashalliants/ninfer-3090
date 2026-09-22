@@ -18,6 +18,7 @@ enum class HeadProfile : std::uint8_t {
     Q8Full,
     Fp8Full,
     Q4Optimized,
+    T2Full,
 };
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
@@ -48,6 +49,9 @@ HeadProfile resolve_profile(QType qtype, std::int32_t head_rows, std::int32_t in
     if (head_rows == detail::kLinearTopKOptimizedRows && qtype == QType::Q4_G64_FP16) {
         return HeadProfile::Q4Optimized;
     }
+    if (head_rows == detail::kLinearTopKFullRows && qtype == QType::T2_G128_FP16) {
+        return HeadProfile::T2Full;
+    }
     throw std::invalid_argument("linear_topk: unsupported head profile");
 }
 
@@ -58,6 +62,8 @@ struct Plan {
 };
 
 Plan plan_for(HeadProfile profile, int columns) {
+    // T2 materializes BF16 logits per chunk and the producer reduces them in grouped K-split.
+    if (profile == HeadProfile::T2Full) { return {detail::kLinearTopKGroupedRows, 0}; }
     if (profile == HeadProfile::Q4Optimized) {
         if (columns <= 16) return {16, 0};
         if (columns <= 32) return {64, 32};
@@ -130,17 +136,31 @@ void require_q4(const Weight& head) {
     if (!common) { throw std::invalid_argument("linear_topk: invalid Q4 optimized head"); }
 }
 
+void require_t2(const Weight& head) {
+    const bool common =
+        head.qtype == QType::T2_G128_FP16 && head.layout == QuantLayout::RowSplit &&
+        head.scale_dtype == DType::FP16 && head.group_size == 128 && head.group == 128 &&
+        head.ndim == 2 && head.n == detail::kLinearTopKFullRows &&
+        head.k == detail::kLinearTopKHidden && head.shape[0] == head.n && head.shape[1] == head.k &&
+        head.padded_shape[0] == head.n && head.padded_shape[1] == head.k && head.qhigh == nullptr &&
+        head.high_plane_bytes == 0 && aligned_to(head.qdata, 16) && aligned_to(head.scales, 16);
+    if (!common) { throw std::invalid_argument("linear_topk: invalid T2 full head"); }
+}
+
 void require_no_weight_overlap(const Weight& head, const Tensor& hidden,
                                const Tensor& candidate_ids, const Tensor& candidate_scores,
                                const Tensor* id_map, const detail::LinearTopKWorkspace& scratch) {
-    const std::size_t code_bytes = head.qtype == QType::Q4_G64_FP16
-                                       ? static_cast<std::size_t>(head.n) * head.k / 2
-                                       : static_cast<std::size_t>(head.n) * head.k;
+    const std::size_t code_bytes =
+        head.qtype == QType::Q4_G64_FP16    ? static_cast<std::size_t>(head.n) * head.k / 2
+        : head.qtype == QType::T2_G128_FP16 ? static_cast<std::size_t>(head.n) * head.k / 4
+                                            : static_cast<std::size_t>(head.n) * head.k;
     const std::size_t scale_bytes =
         head.qtype == QType::Q8_G32_FP16
             ? static_cast<std::size_t>(head.n) * (head.k / 32) * sizeof(std::uint16_t)
         : head.qtype == QType::Q4_G64_FP16
             ? static_cast<std::size_t>(head.n) * (head.k / 64) * sizeof(std::uint16_t)
+        : head.qtype == QType::T2_G128_FP16
+            ? static_cast<std::size_t>(head.n) * (head.k / 128) * sizeof(std::uint16_t)
             : static_cast<std::size_t>(head.n) * sizeof(std::uint16_t);
     const Tensor* tensors[]{&hidden,
                             &candidate_ids,
@@ -183,14 +203,20 @@ Tensor column_slice(const Tensor& tensor, int first, int columns) {
 
 void execute(const Tensor& hidden, const Weight& head, const Tensor* id_map, Tensor& ids,
              Tensor& scores, WorkspaceArena& workspace, cudaStream_t stream) {
-    const auto profile = resolve_profile(head.qtype, head.n, head.k);
+    const auto profile      = resolve_profile(head.qtype, head.n, head.k);
+    const int chunk_columns = profile == HeadProfile::T2Full ? detail::kLinearTopKT2ChunkColumns
+                                                             : detail::kLinearTopKMaxChunkColumns;
     for (int first = 0; first < hidden.ne[1];) {
-        const int columns  = std::min(detail::kLinearTopKMaxChunkColumns, hidden.ne[1] - first);
-        auto x             = column_slice(hidden, first, columns);
-        auto out_ids       = column_slice(ids, first, columns);
-        auto out_scores    = column_slice(scores, first, columns);
-        const auto plan    = plan_for(profile, columns);
-        auto scope         = workspace.scope();
+        const int columns = std::min(chunk_columns, hidden.ne[1] - first);
+        auto x            = column_slice(hidden, first, columns);
+        auto out_ids      = column_slice(ids, first, columns);
+        auto out_scores   = column_slice(scores, first, columns);
+        const auto plan   = plan_for(profile, columns);
+        auto scope        = workspace.scope();
+        Tensor logits;
+        if (profile == HeadProfile::T2Full) {
+            logits = workspace.alloc(DType::BF16, {head.n, columns}, 256);
+        }
         const auto scratch = detail::allocate_linear_topk_workspace(
             workspace, head.n, columns, plan.rows, plan.tile, plan.block_k);
         require_scratch_nonoverlap(hidden, ids, scores, id_map, scratch);
@@ -201,6 +227,9 @@ void execute(const Tensor& hidden, const Weight& head, const Tensor* id_map, Ten
         else if (profile == HeadProfile::Fp8Full)
             detail::linear_topk_fp8_launch(x, head, detail::kLinearTopKFullValidRows, scratch,
                                            stream);
+        else if (profile == HeadProfile::T2Full)
+            detail::linear_topk_t2_launch(x, head, detail::kLinearTopKFullValidRows, logits,
+                                          scratch, stream);
         else
             detail::linear_topk_q4_launch(x, head, *id_map, scratch, stream);
         detail::linear_topk_merge_launch(scratch, out_ids, out_scores, stream);
@@ -216,6 +245,17 @@ std::size_t linear_topk_workspace_capacity_bytes(QType qtype, std::int32_t head_
     if (min_columns < 1 || max_columns < min_columns)
         throw std::invalid_argument("linear_topk workspace: invalid column interval");
     WorkspaceLayoutBuilder layout;
+    if (profile == HeadProfile::T2Full) {
+        // Chunks are at most kLinearTopKT2ChunkColumns wide and every allocation grows with the
+        // column count, so the widest reachable chunk is the peak.
+        const int columns = std::min(detail::kLinearTopKT2ChunkColumns, max_columns);
+        const auto plan   = plan_for(profile, columns);
+        auto scope        = layout.scope();
+        (void)layout.alloc(DType::BF16, {head_rows, columns}, 256);
+        (void)detail::allocate_linear_topk_workspace(layout, head_rows, columns, plan.rows,
+                                                     plan.tile, plan.block_k);
+        return layout.peak_bytes();
+    }
     for (int columns = 1; columns <= detail::kLinearTopKMaxChunkColumns; ++columns) {
         bool reachable = columns >= min_columns && columns <= max_columns;
         if (max_columns > detail::kLinearTopKMaxChunkColumns) {
@@ -248,6 +288,8 @@ void linear_topk(const Tensor& hidden, const Weight& head, std::int32_t valid_ro
     }
     if (profile == HeadProfile::Q8Full) {
         require_q8(head);
+    } else if (profile == HeadProfile::T2Full) {
+        require_t2(head);
     } else {
         (void)detail::validate_fp8_weight(head, "linear_topk FP8 full head");
     }

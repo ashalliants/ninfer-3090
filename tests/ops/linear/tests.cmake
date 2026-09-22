@@ -20,6 +20,10 @@ ninfer_add_op_test(ninfer_linear_q8_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q8_a16.cpp"
   LIBRARIES ninfer_linear_test_support)
 
+ninfer_add_op_test(ninfer_linear_t2_a16_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_t2_a16.cpp"
+  LIBRARIES ninfer_linear_test_support)
+
 ninfer_add_op_test(ninfer_linear_nvfp4_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_nvfp4_a16.cpp"
   LIBRARIES ninfer_linear_test_support)

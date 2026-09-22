@@ -45,6 +45,8 @@ inline QuantizedGeometry quantized_geometry(QType qtype) {
         return {64, 16};
     case QType::Q8_G32_FP16:
         return {32, 0};
+    case QType::T2_G128_FP16:
+        return {128, 0};
     default:
         throw std::invalid_argument("unsupported benchmark quantized format");
     }
