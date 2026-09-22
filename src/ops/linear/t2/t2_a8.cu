@@ -2,9 +2,9 @@
 // the attention/GDN mixer output 6144 and the MLP intermediate 17408) and any row count that is a
 // whole number of 64-row blocks. Two routes share the activation contract (s8 codes, one binary16
 // scale per token and 64-wide group): from t2_a8_min_tokens() up the shared prefill GEMM, with T
-// padded to a multiple of 128 whose padded columns cost MMA work the int8 rate absorbs; inside the
-// small-T band (T <= 128 by default, in launches of at most 32 columns) the ternary small-T kernel
-// of t2_small_t_i8.cuh, where the A16 kernels are tensor-rate bound at every width.
+// padded to its cheapest column tile, whose padded columns cost MMA work the int8 rate absorbs;
+// inside the small-T band (T <= 192 by default, in launches of at most 32 columns) the ternary
+// small-T kernel of t2_small_t_i8.cuh, where the A16 kernels are tensor-rate bound at every width.
 
 #include "ops/linear/t2/t2_a8.h"
 
@@ -27,10 +27,28 @@ namespace a8 = rowsplit_a8;
 
 using Rows = a8::ContiguousRows<1>;
 
-constexpr std::int32_t kPaddedTile = 128;
-
+// The padded width a ragged T runs at. Every column tile streams the whole weight, and a wider
+// tile costs less per column: on the RTX 3090 one 128-, 256- and 512-column tile of the text layers
+// take 1 : 1.4 : 2.2 (ninfer_linear_bench, 2026-09-22), so 300 tokens run as one 512-column tile
+// (2.2) rather than three of 128 (3.0), and 600 as three of 256 rather than five of 128.
 std::int32_t padded_tokens(std::int32_t tokens) {
-    return (tokens + kPaddedTile - 1) / kPaddedTile * kPaddedTile;
+    struct Tile {
+        std::int32_t columns;
+        std::int32_t cost; // tenths of a 128-column tile
+    };
+
+    constexpr Tile kTiles[] = {{128, 10}, {256, 14}, {512, 22}};
+    std::int32_t best       = 0;
+    std::int32_t best_cost  = 0;
+    for (const Tile& tile : kTiles) {
+        const std::int32_t count = (tokens + tile.columns - 1) / tile.columns;
+        const std::int32_t cost  = count * tile.cost;
+        if (best == 0 || cost < best_cost) {
+            best      = count * tile.columns;
+            best_cost = cost;
+        }
+    }
+    return best;
 }
 
 struct SmallBand {
@@ -112,9 +130,9 @@ using SmallSchedule8  = T2SmallTI8Schedule<8, 1, 1, 2, 4, 2>;
 using SmallSchedule16 = T2SmallTI8Schedule<8, 1, 2, 2, 4, 2>;
 using SmallSchedule32 = T2SmallTI8Schedule<4, 1, 4, 2, 3, 2>;
 
-// Launches of at most 32 columns each: from 33 columns the weights stream once per launch, and four
-// launches (128 columns) still beat the A16 route and the prefill GEMM padded to 128 by 1.2-3x on
-// every text-layer shape (the padded GEMM reloads its 128 activation columns in every 64-row CTA).
+// Launches of at most 32 columns each: from 33 columns the weights stream once per launch, and six
+// launches (192 columns) still beat the A16 route and the prefill GEMM's 256-column tile on the
+// text-layer shapes (the padded GEMM reloads its activation columns in every 64-row CTA).
 template <class Epilogue>
 void small_route(const T2A8Activations& x, const SmallParent<Epilogue>& first,
                  const SmallParent<Epilogue>* second, cudaStream_t stream) {
@@ -290,7 +308,8 @@ bool t2_a8_supported(const Weight& w, std::int32_t tokens) {
 std::size_t t2_a8_activation_bytes(std::int32_t input_rows, std::int32_t max_tokens) {
     std::size_t bytes = 0;
     if (max_tokens >= t2_a8_min_tokens()) {
-        bytes = a8::activation_workspace_bytes(input_rows, padded_tokens(max_tokens));
+        // padded_tokens never exceeds the next multiple of 512, whatever T in [1, max_tokens].
+        bytes = a8::activation_workspace_bytes(input_rows, (max_tokens + 511) / 512 * 512);
     }
     const SmallBand band = small_band();
     if (band.lo <= band.hi && max_tokens >= band.lo) {

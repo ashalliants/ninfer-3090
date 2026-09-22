@@ -174,7 +174,7 @@ int run_q4_q5() {
     return failures;
 }
 
-// The ternary parents through the policy form: the integer routes (the small-T kernel up to 128
+// The ternary parents through the policy form: the integer routes (the small-T kernel up to 192
 // tokens, the padded prefill GEMM above) write q/k and value straight into qkv and z into its plane
 // from one quantisation.
 int run_t2_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_weight,
@@ -235,7 +235,7 @@ int run_t2() {
         quantized_weight::make_patterned_weight(QType::T2_G128_FP16, 12288, kHidden, 439U));
     int failures = 0;
     for (const std::int32_t tokens :
-         {1, 2, 4, 8, 9, 16, 17, 33, 64, 65, 100, 128, 129, 200, 1007, 1024}) {
+         {1, 2, 4, 8, 9, 16, 17, 33, 65, 128, 129, 192, 193, 300, 600, 1007, 1024}) {
         failures += run_t2_case(query_key, value_z_weight, tokens);
     }
     return failures;

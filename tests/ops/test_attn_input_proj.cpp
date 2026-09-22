@@ -180,7 +180,7 @@ int run_q4_q5() {
 }
 
 // The ternary pair through the policy form: the integer routes (one quantisation, each parent split
-// into its two destinations), the small-T kernel up to 128 tokens and the padded GEMM above it.
+// into its two destinations), the small-T kernel up to 192 tokens and the padded GEMM above it.
 int run_t2_case(DevicePackedWeight& query_key, DevicePackedWeight& gate_value, int tokens) {
     constexpr int hidden = 5120, qrows = 6144, kvrows = 1024;
     constexpr ops::LinearPolicy policy = ops::LinearPolicy::AllowA8Int;
@@ -231,7 +231,7 @@ int run_t2() {
     DevicePackedWeight gate_value(
         quantized_weight::make_patterned_weight(QType::T2_G128_FP16, kParent, kHidden, 157U));
     int failures = 0;
-    for (int t : {1, 2, 4, 8, 9, 16, 17, 33, 64, 65, 100, 128, 129, 200, 1007, 1024}) {
+    for (int t : {1, 2, 4, 8, 9, 16, 17, 33, 65, 128, 129, 192, 193, 300, 600, 1007, 1024}) {
         failures += run_t2_case(query_key, gate_value, t);
     }
     return failures;

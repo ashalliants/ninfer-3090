@@ -1,6 +1,6 @@
 #pragma once
 
-// T2G128 RowSplit x int8 small-T tensor-core GEMM (T = 1..128), the integer counterpart of
+// T2G128 RowSplit x int8 small-T tensor-core GEMM (T = 1..192), the integer counterpart of
 // t2_small_t_v2.cuh. On GeForce Ampere m16n8k16 with an FP32 accumulator runs at a quarter of the
 // s8 m16n8k32 rate, and an n8 tile costs the same tensor time at T = 1 as at T = 8: the bf16 kernel
 // spends about three quarters of the weight stream's time in the tensor pipe at every T <= 8 and
@@ -11,7 +11,7 @@
 // lane takes), the CTA covers 8 / KWarps sets of TilesPerWarp sixteen-row tiles; codes and scales
 // are staged by cp.async; activations are read straight from global memory through L1. They arrive
 // quantised to s8 with one binary16 scale per (token, 64-k group), as in the integer prefill route:
-// codes [T, K] token-major, scales [K / 64, 128] group-major, so a lane's two output columns share
+// codes [T, K] token-major, scales [K / 64, 192] group-major, so a lane's two output columns share
 // one 32-bit scale load. One launch covers up to 32 columns from column col0; wider T takes
 // several.
 //
@@ -33,7 +33,7 @@
 
 namespace ninfer::ops::detail {
 
-inline constexpr int kT2I8MaxColumns    = 128;
+inline constexpr int kT2I8MaxColumns    = 192;
 inline constexpr int kT2I8LaunchColumns = 32;
 inline constexpr int kT2I8ActivationK   = 64;
 
@@ -342,7 +342,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void t2_s
 }
 
 // One warp per (token, 64-k group) of a BF16 [K, T] activation: s8 codes at [T, K] and the binary16
-// scale absmax / 127 at [K / 64, 128]. Warps of the padding columns up to the next multiple of 8
+// scale absmax / 127 at [K / 64, 192]. Warps of the padding columns up to the next multiple of 8
 // write a zero scale, so the GEMM's masked accumulators (exact zeros) never meet an uninitialised
 // one.
 __global__ void t2_small_t_i8_quantize_kernel(const __nv_bfloat16* __restrict__ x, std::int32_t k,

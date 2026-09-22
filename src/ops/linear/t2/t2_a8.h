@@ -23,7 +23,7 @@ namespace ninfer::ops::detail {
 inline constexpr std::int32_t kT2A8MinTokens = 64;
 // The widths the small-T kernel takes by default; NINFER_T2_I8_SMALL=off|lo,hi overrides them.
 inline constexpr std::int32_t kT2I8SmallMinTokens = 1;
-inline constexpr std::int32_t kT2I8SmallMaxTokens = 128;
+inline constexpr std::int32_t kT2I8SmallMaxTokens = 192;
 // kT2A8MinTokens, or NINFER_T2_A8_MIN when it is set (benchmark A/B of the crossover).
 [[nodiscard]] std::int32_t t2_a8_min_tokens();
 
