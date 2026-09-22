@@ -19,8 +19,8 @@ from typing import Callable
 import numpy as np
 import torch
 
-from .methods import AuxiliaryValue, cast_direct, import_encoded
-from .official_recipes import _optional
+from .methods import AuxiliaryValue, cast_direct, grouped_absmax, import_encoded
+from .official_recipes import Q4, _optional
 from .sources.gguf_ternary import GGUFFile
 from .sources.logical import EncodedRows, LogicalSource, array_source
 
@@ -389,6 +389,13 @@ def bonsai2_27b_ternary(model, recipe, sources):
     validate(gguf)
     signs = sign_vectors(gguf)
     _optional(model, recipe)
+    # Against a 2.125-bit target, a Q8 drafter MLP is a large share of every draft step's bytes. Its
+    # gate/up take Q4 (the down projection stays Q8 for the fused dynamic-convolution kernel):
+    # with ProCreations' Bonsai 2 adapter this keeps acceptance, draws 448 MiB less device memory
+    # and decodes 2.6% faster than Q8.
+    for name in model.parameters:
+        if name.startswith("dflash2/") and name.endswith(("/mlp/gate", "/mlp/up")):
+            recipe.assign(name, format=Q4, method=grouped_absmax)
     encoded, direct = text_sources(gguf)
     for name, source in encoded.items():
         recipe.assign(name, format=T2, method=import_encoded, source=source)
