@@ -1,10 +1,11 @@
 #pragma once
 
-// Integer-activation routes for T2G128 row-split weights on sm_86 (the codes are exact int8
-// {-1, 0, +1}; the activations are quantised to int8 with one scale per token and 64-wide group):
-// the small-T kernel of t2_small_t_i8.cuh for T in [kT2I8SmallMinTokens, kT2I8SmallMaxTokens], and
-// above it, from t2_a8_min_tokens() up, the shared int8 GEMM of ops/common/rowsplit_a8_mma.cuh with
-// the ternary codec, which pads T to a multiple of 128 internally.
+// Integer-activation routes for T2G128 row-split weights (the codes are exact int8 {-1, 0, +1};
+// the activations are quantised to int8 with one scale per token and 64- or 128-wide group): the
+// small-T kernel of t2_small_t_i8.cuh for T in [kT2I8SmallMinTokens, kT2I8SmallMaxTokens], and
+// above it, from t2_a8_min_tokens() up, the tile GEMM of t2_prefill_i8.cuh, which pads T to a
+// multiple of 64 internally (NINFER_T2_A8_TILE=off: the shared int8 GEMM of
+// ops/common/rowsplit_a8_mma.cuh with the ternary codec).
 
 #include "core/arena.h"
 #include "core/layout.h"
