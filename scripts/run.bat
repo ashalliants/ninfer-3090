@@ -80,7 +80,7 @@ if "%MODEL_KEY%"=="" goto :choose_model
 if /i "%MODEL_KEY%"=="-h" goto :help
 if /i "%MODEL_KEY%"=="--help" goto :help
 if /i "%MODEL_KEY%"=="qwen38-27b" (
-  set "ARTIFACT=qwen3_8_27b.ninfer"
+  set "ARTIFACT=qwen3_8_27b_dflash2.v3.ninfer"
   set "TITLE=Qwen3.8-27B"
   set "GRAFT_FILE=v1_q38_nf4_trained.bin"
   goto :model_known
@@ -117,7 +117,7 @@ exit /b 0
 :model_known
 rem The default model path matches what download-model.bat writes and how the release archive is
 rem laid out: this launcher sits beside models\.
-set "MODEL=%~dp0models\%ARTIFACT%"
+set "MODEL=%~dp0..\models\%ARTIFACT%"
 rem An explicit NINFER_MODEL_DIR is taken verbatim and never probed, as in run.sh, so a model
 rem downloaded there with download-model.bat is found here.
 if not "%NINFER_MODEL_DIR%"=="" set "MODEL=%NINFER_MODEL_DIR%\%ARTIFACT%"
