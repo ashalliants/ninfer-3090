@@ -262,7 +262,17 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         // resource revision whenever the capacity moves.
         vision_broker->enable_kv_tier(
             *kv_arena, decoder->text_kv.page_pool(),
-            [this] { return !has_context_transaction() && !pressure_planning_active_; },
+            [this] {
+                if (has_context_transaction() || pressure_planning_active_) {
+                    return false;
+                }
+                for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+                    if (requests[lane].prefill && requests[lane].lifecycle == Lifecycle::Empty) {
+                        return false;
+                    }
+                }
+                return true;
+            },
             [this] { advance_resource_revision(); });
     }
     state_images = std::make_unique<qwen3_5::StateImageDevicePool>(backings,
