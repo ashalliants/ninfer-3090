@@ -194,10 +194,51 @@ void selected_contracts(ninfer::text::GrammarCompiler& compiled) {
     }
 }
 
+// A constrained turn cannot end inside its thinking: the tool grammar admits EOS only after the
+// canonical close, even right after a complete call written in the thinking. The free parser's
+// recovery of calls stranded in unclosed thinking therefore never applies to constrained output.
+void thinking_cannot_end_with_eos(ninfer::text::GrammarCompiler& compiled) {
+    constexpr std::string_view close = "\n</think>\n\n";
+    ninfer::ToolChoice required;
+    required.mode = ninfer::ToolChoiceMode::Required;
+    for (const auto& bound :
+         {contract(schema({{"type", "integer"}}), false),
+          contract(schema({{"type", "integer"}}), true, required)}) {
+        require(bound->constrained, "thinking EOS check needs a constrained contract");
+        auto matcher = frontend::compile_tool_grammar(compiled, *bound, close, {});
+        std::vector<std::uint32_t> words(matcher->mask_words());
+        const auto eos_allowed = [&] {
+            require(matcher->masks({}, words) == 0, "tool grammar dead end inside thinking");
+            return (words[256 / 32] & 1u) != 0;
+        };
+        const auto feed = [&](std::string_view text) {
+            for (unsigned char c : text) {
+                require(!eos_allowed(), "tool grammar admitted EOS inside open thinking");
+                require((words[c / 32] & (1u << (c % 32))) != 0,
+                        "tool grammar rejected thinking text");
+                matcher->accept(c);
+                matcher->confirm();
+            }
+        };
+        feed("I will call it.\n" + call("2") + std::string(close.substr(0, close.size() - 1)));
+        require(!eos_allowed(), "tool grammar admitted EOS one byte before the thinking close");
+        matcher->accept(static_cast<unsigned char>(close.back()));
+        matcher->confirm();
+        for (unsigned char c : call("2")) {
+            require(matcher->masks({}, words) == 0 && (words[c / 32] & (1u << (c % 32))) != 0,
+                    "tool grammar rejected a call after the thinking close");
+            matcher->accept(c);
+            matcher->confirm();
+        }
+        require(eos_allowed(), "tool grammar did not admit EOS after a call in the answer");
+    }
+}
+
 void run() {
     auto compiled = compiler();
     basic_contracts(compiled);
     selected_contracts(compiled);
+    thinking_cannot_end_with_eos(compiled);
     ninfer::ToolChoice required;
     required.mode = ninfer::ToolChoiceMode::Required;
     auto fixed =

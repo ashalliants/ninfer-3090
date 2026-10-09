@@ -551,6 +551,8 @@ struct ToolCallParseDiagnostics {
     // Repeated parameter names in a published call; the last value is kept.
     std::uint32_t duplicate_parameters_repaired = 0;
     ToolCallParseFallbackReason fallback_reason = ToolCallParseFallbackReason::None;
+    // The structured calls came from free tool output whose turn ended inside unclosed thinking.
+    bool recovered_from_reasoning = false;
 
     [[nodiscard]] friend constexpr bool
     operator==(const ToolCallParseDiagnostics&, const ToolCallParseDiagnostics&) noexcept = default;
