@@ -621,10 +621,28 @@ the tool consumer can report the validation error and continue the agent loop. S
 supported explicit type retain untyped inference. NInfer does not apply defaults, enforce required
 properties, or perform recursive JSON Schema validation on this route.
 
-On the unconstrained route, string parameters preserve function/tool-call markers and balanced nested
+On the unconstrained route, the parser also accepts the XML call forms agent harnesses such as
+Claude Code prompt models with: a `<function_calls>` wrapper, bare `<function ...>` and
+`<invoke ...>` calls (closed by the matching `</function>` or `</invoke>`), `name="..."` or
+`name='...'` attributes in place of `=name`, and `<param ...>...</param>` parameters. Opening and
+closing tags must match. Repeated parameter names keep the last value at the first key's position,
+as on the constrained route; `duplicate_parameters_repaired` in the
+[structured request log](#structured-request-log) counts them.
+
+String parameters preserve function/tool-call markers and balanced nested
 `<parameter=...>...</parameter>` text as value bytes. The Qwen wire format has no delimiter escape,
-so an unmatched nested parameter opener or a standalone `</parameter>` cannot be represented
-unambiguously; either causes the complete tool-call region to fall back to ordinary content.
+so a standalone `</parameter>` ends a value only when whitespace and then another parameter, the
+function's closer, or the end of the output follow it; any other one is value text, such as a shell
+command that echoes the markup. An unmatched nested parameter opener, or a quoted closer that is
+followed by the next token, cannot be represented unambiguously and makes that tool-call region
+ordinary content. Later content is still examined: the first tool-call region (any accepted marker
+form, or a later `<tool_call>` after one that failed) that parses to the end of the output becomes
+the structured turn, and any quoted markup before it stays ordinary content. A marker inside a
+Markdown code fence (```` ``` ```` or `~~~`) or inline code of the answer is a quoted example and
+stays content even when it is a complete call; only the text before the marker decides, so streamed
+and complete responses agree. A marker after a closed fence, or after a sentence on the same line,
+still opens a call. Inline code is tracked per paragraph, so an unpaired backtick earlier in the
+same paragraph also makes a later marker text.
 
 ### Tool constraints
 
@@ -1058,7 +1076,12 @@ The normal lifecycle is:
 Function arguments use `response.function_call_arguments.delta` and `.done`. IDs, output indices,
 and content indices remain stable, and concatenated deltas equal the terminal Item. Responses SSE
 does not emit the Chat Completions `[DONE]` sentinel. With tools enabled, ordinary answer text still
-streams immediately; only an ambiguous `<tool_call>` suffix or the structured tool region is held.
+streams immediately; only a suffix that may start a tool-call marker, or the tool region after one,
+is held. On the unconstrained route every accepted marker form counts (`<tool_call>`,
+`<function_calls>`, `<function=`/`<function `, `<invoke=`/`<invoke `, and their quoted variants),
+so answer prose that writes such a tag outside Markdown code stops streaming there and the rest of
+the turn arrives at the end, as ordinary text if it does not parse as calls. Constrained output
+holds only at `<tool_call>`.
 On the unconstrained route, malformed tool markup is flushed back as ordinary text without losing bytes.
 
 ### Local response state and resources
@@ -1406,9 +1429,9 @@ unspecified. `enable_thinking` records whether the response starts in thinking m
 
 `request_done.result.tool_call_parse` records whether a complete marker was seen, the structured
 call count, empty non-string arguments omitted during normalization, schema-mismatched arguments
-preserved for consumer validation, and a stable text-fallback reason. Fallback reasons are `none`,
-`malformed_structure`, `duplicate_parameter`, `invalid_tool_name`, `undeclared_tool`, and
-`trailing_content`. These counters contain no tool arguments or generated text.
+preserved for consumer validation, repeated parameter names resolved to their last value
+(`duplicate_parameters_repaired`), and a stable text-fallback reason. Fallback reasons are `none`,
+`malformed_structure`, `invalid_tool_name`, `undeclared_tool`, and `trailing_content`. These counters contain no tool arguments or generated text.
 
 `request_done.constraint` carries the same constraint observation as the HTTP terminal result,
 or `null` for unconstrained requests. Preparation failures and execution errors use the existing

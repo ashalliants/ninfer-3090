@@ -96,8 +96,23 @@ void basic_contracts(ninfer::text::GrammarCompiler& compiled) {
             "generic argument syntax rejected repeated keys");
     frontend::ToolCallOutputDecoder duplicate(integer, 64);
     (void)duplicate.feed(repeated);
-    require(duplicate.finish().tool_calls.at(0).arguments_json == R"({"x":2})",
+    const auto resolved = duplicate.finish();
+    require(resolved.tool_calls.at(0).arguments_json == R"({"x":2})",
             "non-strict duplicate was not resolved to one final value");
+    // The repair is counted as on the free route, per repeated name across every call.
+    require(resolved.diagnostics.duplicate_parameters_repaired == 1 &&
+                resolved.diagnostics.fallback_reason == ninfer::ToolCallParseFallbackReason::None,
+            "constrained duplicate repair was not counted");
+    frontend::ToolCallOutputDecoder repeated_twice(integer, 64);
+    (void)repeated_twice.feed(repeated + "\n" + call("3"));
+    (void)repeated_twice.feed("\n" + repeated);
+    const auto twice = repeated_twice.finish();
+    require(twice.tool_calls.size() == 3 && twice.diagnostics.duplicate_parameters_repaired == 2,
+            "constrained duplicate repairs were not counted per repeat");
+    frontend::ToolCallOutputDecoder single(integer, 64);
+    (void)single.feed(call("3"));
+    require(single.finish().diagnostics.duplicate_parameters_repaired == 0,
+            "a call without repeats counted a duplicate repair");
 
     // These requests share the same compiled envelope but have different value normalization.
     const auto string = contract(schema({{"type", "string"}}), false);
