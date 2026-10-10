@@ -35,7 +35,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--dflash2-only")
         return run_guarded("dflash2", run_softmax_attention_dflash2_tests);
     if (argc == 2 && std::string_view(argv[1]) == "--int8-prompt-only")
-        return run_guarded("int8 prompt", run_softmax_attention_int8_prompt_tests);
+        return run_guarded("int8-family prompt", run_softmax_attention_int8_prompt_tests);
     if (argc == 2 && std::string_view(argv[1]) == "--nvfp4-only") {
         return run_guarded("nvfp4", run_softmax_attention_nvfp4_tests);
     }

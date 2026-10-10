@@ -59,12 +59,12 @@ struct ContextAttentionExecutionEnvelope {
  * plain FP8 V plane is not rotated, so its reduction has no inverse-rotation step).
  *
  * The qualified BFloat16 compute profile keeps Q/K and persistent K at BF16 and uses native BF16
- * QK plus FP16 P/V MMA. INT8-G64 uses native signed-INT8 Q/K MMA; its prompt route uses FP16 P/V
- * MMA and its small-T route uses BF16 P/V MMA. On sm_80/86/89 the INT8-G64 prompt route over more
- * than 256 visible keys accumulates P/V in FP16 over each 64-key tile and promotes that tile
- * partial to FP32 once (over fewer keys it accumulates in FP32); a tile
- * whose largest represented V scale exceeds 8 decodes V with its scales divided by an exact power
- * of two (and multiplies the promoted partial back) so the partial, bounded by 64 * 127 * scale,
+ * QK plus FP16 P/V MMA. The INT8 family (INT8-G64, rk8v4, rk4v4) uses native signed-INT8 Q/K MMA;
+ * its prompt route uses FP16 P/V MMA and its small-T route uses BF16 P/V MMA. On sm_80/86/89 the
+ * INT8-family prompt route accumulates P/V in FP16 over each 64-key tile and promotes that tile
+ * partial to FP32 once; a tile whose largest represented V scale exceeds 8 (INT8 codes) or 127
+ * (packed INT4 codes) decodes V with its scales divided by an exact power of two (and multiplies
+ * the promoted partial back) so the partial, bounded by 64 * 127 * scale or 64 * 8 * scale,
  * stays finite in FP16. sm_100a/sm_120a use native E4M3FN QK MMA for FP8
  * and K8V4's key plane; this fork's sm_86/sm_89 build has no FP8 tensor-core path at all (unlike
  * INT8), so FP8, K8V4, and NVFP4 instead dequantize both K and V to BF16/FP16 up front and run QK
