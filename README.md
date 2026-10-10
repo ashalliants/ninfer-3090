@@ -684,7 +684,7 @@ features, or a role in project decisions.
 The Qwen3.8-Flash-Next work adapts code from [Infernix](https://github.com/wallawalla47/infernix)
 by [wallawalla47](https://github.com/wallawalla47) (Apache-2.0), itself a fork of NInfer: so far the n-gram volume format, the
 model's config keys and n-gram hash derivation, and the offloaded sparse-MoE Op (its contract,
-routing, dispatch, CPU worker team, and its canonical-arithmetic method).
+routing, dispatch, staging, CPU worker team and miss service, and its canonical-arithmetic method).
 Each adapted file says so in its header.
 
 ## Contributors

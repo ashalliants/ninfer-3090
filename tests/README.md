@@ -198,7 +198,12 @@ cast bit for bit against an independent FP64 formulation, the exact sub-block de
 IQ2_XXS, IQ1_M and Q2_0 against the host decoder above, the CPU expert engine against the FP64
 expert oracle at T in {1, 2, 7, 8}, and AVX2, scalar and the worker team at 1-16 workers for equal
 bits. The layer test checks routing (exact top-10 with ties to the lower id) and dispatch exactly,
-and the combine against FP64.
+then requires every routed output of the GPU narrow route to equal the CPU engine's bits for records
+in device frames, read zero-copy, staged through 1, 3 or 64 slots, and served by the CPU miss service
+at 1 and 6 workers (T in {1, 2, 7, 8, 16}), and the whole layer, with a shared expert composed of
+GGML linears and the combine, against FP64. With `NINFER_TEST_ARTIFACT` it repeats the placements on
+32 real experts of every expert bank of the artifact. `--small` runs a reduced set for
+compute-sanitizer.
 
 The real loading test accepts an explicit artifact path and optional component selection:
 
