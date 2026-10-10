@@ -1042,6 +1042,18 @@ Run separate invocations for `K=1..15`, `full|optimized`, representative context
 `--no-cuda-graph`. This complete-round benchmark measures the DFlash model's actual greedy
 acceptance. Transaction correctness is covered by the state and Engine tests.
 
+For n-gram copy rounds (DFlash2, `--corpus` for a realistic prompt):
+
+- `--copy-width W [--copy-lanes N]` records the request's own greedy continuation and hands it to
+  the first `N` lanes (default: all of `--batch`) as a proposal-only source, so their copy rounds
+  verify a full `W-1` drafts; the other lanes decode the same prompt without copies. It times the
+  rounds in which every copying lane accepts all of its drafts: the cost of a `W`-column copy round,
+  and with `--batch 2 --copy-lanes 1` the cost a copying lane imposes on a drafting one.
+- `--ngram-idle W` runs ordinary rounds with `W`-column copy rounds configured but no copy index,
+  the cost n-gram drafting adds to output that never copies.
+- `--prefill-tail N` times a final `N`-token prefill chunk at the context depth, a proxy for verify
+  widths the round Ops do not reach.
+
 ## Token-decision Op benchmarks
 
 The G1 benchmark calls public `argmax` for the Qwen3.6-35B full physical vocabulary with 248077
