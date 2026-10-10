@@ -203,6 +203,16 @@ entry retains the preceding numerical layer. After real-scenario acceptance, a m
 promote quantized values into the C++ table. The detailed `--json` report is diagnostic provenance
 and is not a runtime input.
 
+## Hyper-connection and FP32 projection benchmarks
+
+`ninfer_hyper_connection_bench [--tokens T,...] [--chain N]` times `hyper_connection_mix` at
+Qwen3.8-Flash-Next's geometry (S = 4, H = 2560, rank 320, BF16 weights) with and without injection
+rows, from graph replays after an L2 flush: one call per graph (`single`, which includes the graph's
+launch latency) and `N` calls per graph on distinct weight copies (`chained`, the per-call cost
+inside a decode graph). `ninfer_projection_fp32_bench [--tokens T,...]` times `projection_fp32` on
+the BF16 router plus shared-expert gate [513, 2560] and the IQ4_XS LM head [248320, 2560]. Both
+call only the public Ops.
+
 ## Linear Op benchmark
 
 `ninfer_linear_bench` measures only the public pure `linear()` contract. It supports Q4, Q5, Q6,

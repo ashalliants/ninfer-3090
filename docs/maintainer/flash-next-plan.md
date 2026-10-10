@@ -14,7 +14,7 @@ references, `engine-architecture.md`).
 | 2 | C++ registration and materialization of the GGML formats and layouts; host exact decoder | done |
 | 2b | Infernix-aligned artifact: `ggml_expert_record_v1` expert banks and three record formats (Python and C++), the n-gram table as an Infernix-format volume with IQ4_NL rows, Infernix's text config keys; replaces PR 1's two-object banks and `ggml_rows_page4k_v1` | done |
 | 3 | Dense GGML linears: `linear`/`linear_add` for IQ4_XS, IQ3_S, Q6_K, IQ4_NL, Q8_0, Q2_0 at the model's 19 dense problems, Q8_1 activation profile | done (perf gates below) |
-| 4-6 | Hyper-connections and FP32 head, QSA, PLE | not started |
+| 6 | Ops from Infernix: `hyper_connection` (mix, inject, expand), `ple` (IQ4_NL `ple_embed`, gate, stateful convolution, commit), `projection_fp32` (BF16 router; IQ4_XS head on PR 3's decode route), `rows` | done (HC perf gate missed, below) |
 | 7a | `offloaded_sparse_moe` contract, routing, dispatch, combine, canonical A8 arithmetic, CPU expert engine (scalar, AVX2, worker team) | done |
 | 7b | `offloaded_sparse_moe` GPU narrow route (device frames, staging, zero-copy), CPU miss channel and service | done (perf gate missed, see below) |
 | 8-9 | Model skeleton, Program and Engine integration | not started |
@@ -37,6 +37,22 @@ cast plus int8 MMA with dequantize-to-FP16 plus cuBLAS (`cublasGemmEx`, FP32 com
 | Wide, T = 512 / 4096, ours over dequant + cuBLAS | 1.02-2.02x for five formats; Q6_K 0.96x / 0.77x |
 
 The 80% decode gate is not met; see the PR 3 description for the tuning that was tried.
+
+## PR 6 measurements
+
+RTX 3090, CUDA 12.8, L2 flushed before each graph replay. "Chained" is 8 calls per graph on
+distinct weight copies (the per-call cost inside a decode graph).
+
+| Workload | Result |
+|---|---|
+| `hyper_connection_mix`, T = 1, 13.2 MB BF16 (block mixer / final mixer) | chained 28.2 / 26.8 us = 50% / 52% of 936 GB/s; single call 30.7 / 28.7 us |
+| Same bytes, loads only (a probe of a rejected one-kernel variant, chained) | 17.3 us = 81% |
+| `hyper_connection_mix`, fused route T = 2 / 4 / 8 / 16; composed route T = 17 / 64 | 35 / 49 / 76 / 122 us; 34 / 66 us |
+| `projection_fp32` IQ4_XS head [248320, 2560], T = 1 / 2 / 8 | 392 / 396-400 / 583 us = 92% / 91% / 63% |
+| `projection_fp32` BF16 router + shared gate [513, 2560], T = 1 / 8 / 9 | 10.2 / 14.3 / 26.6 us |
+
+The 80% HC gate is not met: the fused mixer is latency-bound on sm_86, and above T = 2 it is
+slower than the composed route. See the PR 6 description.
 
 ## PR 7 measurements
 
@@ -117,6 +133,13 @@ Infernix is Apache-2.0; each adapted file carries the notice the spec's licensin
 | `src/ops/offloaded_sparse_moe/cpu/expert_team.cpp` | `src/ops/offloaded_sparse_moe/cpu/expert_team.{h,cpp}` | GGML jobs; units of 32 intermediates; no A16, AVX-VNNI or AVX-512 |
 | `src/ops/offloaded_sparse_moe/cpu/miss_service.cpp` | `src/ops/offloaded_sparse_moe/cpu/miss_service.{h,cpp}` | No tiered requests; fixes a startup race (the first request could be taken as already answered) |
 | `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu` | `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu` (`398cf2cc`) | Route, dispatch, staging, CPU plan/wait and combine kept; narrow kernels rewritten for GGML sub-blocks |
+| `include/ninfer/ops/hyper_connection.h` | `include/infernix/ops/hyper_connection.h` | see PR 6 |
+| `src/ops/hyper_connection/hyper_connection.cu` | `src/ops/hyper_connection/hyper_connection.cu` | see PR 6 |
+| `src/ops/hyper_connection/hyper_connection_mix_fused.{h,cu}` | `src/ops/hyper_connection/hyper_connection_mix_fused.{h,cu}` | see PR 6 |
+| `include/ninfer/ops/ple.h`, `src/ops/ple/ple.cu` | `include/infernix/ops/ple.h`, `src/ops/ple/ple.cu` | see PR 6 |
+| `include/ninfer/ops/projection_fp32.h`, `src/ops/projection_fp32/projection_fp32.cu` | `include/infernix/ops/projection_fp32.h`, `src/ops/projection_fp32/projection_fp32.cu` | see PR 6 |
+| `include/ninfer/ops/rows.h`, `src/ops/rows/rows.cu` | `include/infernix/ops/rows.h`, `src/ops/rows/rows.cu` | see PR 6 |
+| `tests/ops/test_hyper_connection.cpp`, `test_projection_fp32.cpp`, `test_rows.cpp` | `tests/ops/test_hyper_connection.cpp`, `tests/ops/linear/test_projection_fp32.cpp`, `tests/ops/test_rows.cpp` | see PR 6 |
 
 ## Export conventions of this GGUF
 
