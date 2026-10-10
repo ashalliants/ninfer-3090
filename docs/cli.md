@@ -206,7 +206,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--spec mtp\|dflash\|dflash2` | speculative backend; see [Speculative decoding](#speculative-decoding) | off |
 | `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 | unset |
 | `--lm-head-draft` | optimized proposal head; implied by `--spec`, accepted for compatibility | on with `--spec` |
-| `--ngram-draft-tokens 0\|15` | n-gram copy drafting beside `--spec dflash2`: when the text being written already appeared in the request (the prompt, a tool result -- including `cat -n` numbered ones -- or the output so far), a round verifies up to 15 copied tokens instead of the draft model's proposal; verification licenses every token, so a wrong copy costs speed, never output. One lane only for now; see [Speculative decoding](#n-gram-copy-drafting) | `0` (off) |
+| `--ngram-draft-tokens 0\|15` | n-gram copy drafting beside `--spec dflash2`: when the text being written already appeared in the request (the prompt, a tool result -- including `cat -n` numbered ones -- or the output so far), a round verifies up to 15 copied tokens instead of the draft model's proposal; verification licenses every token, so a wrong copy costs speed, never output. Copies run at one or two lanes in a round; see [Speculative decoding](#n-gram-copy-drafting) | `0` (off) |
 | `--ngram-min-match N` | tokens the end of the text must match before a copy is proposed, `4..64` | `12` |
 | `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [performance](performance.md)) | off |
 | `--no-prefill-cublas-projections` | with `--prefill-cublas`, keep the attention and GDN input projections off that route | projections on |
@@ -326,10 +326,14 @@ so far. When they occurred before, the round verifies the 15 tokens that followe
 16-column pass and skips the draft model; otherwise it is an ordinary 8-column DFlash2 round. It
 pays when the answer repeats its input -- returning a file, applying an edit, quoting a tool result.
 As with any draft, every token is licensed by the target's own verification, and a copy that is
-wrong, or that a grammar forbids, is rejected. It runs with one lane (`--max-concurrency 1`) for
-now; the counters are in the request log and `/metrics` (see [serving](serving.md)). On an agent
-replay it decoded 38% faster overall and up to 77% faster on turns that return a file, at 0.7-0.8%
-on output that never copies; see
+wrong, or that a grammar forbids, is rejected; a request whose copies keep missing asks for a longer
+match before it copies again. With two lanes a round copies only when a copy offers at least 12
+tokens, because the other lane's row is verified at the copy width too and decodes about a third
+slower in that round; with three or more lanes in a round nothing is copied. The counters are in
+the request log and `/metrics` (see [serving](serving.md)). On an agent replay at one lane it
+decoded 42% faster overall and up to 76% faster on turns that return a file, at about 0.7% on
+output that never copies. At two lanes the replay finished 12% sooner, but a request sharing rounds
+with a copying one decoded up to a fifth slower; see
 [performance](performance.md#n-gram-copy-drafting-rtx-3090-qwen38-27b).
 
 ## CUDA synchronization

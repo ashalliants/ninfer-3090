@@ -550,56 +550,107 @@ DFlash2's `--lm-head-draft` is within noise of unset at every count and can be l
 
 ### N-gram copy drafting (RTX 3090, Qwen3.8-27B)
 
-`--ngram-draft-tokens 15` beside DFlash2 K=7 (draft head, `rk4v4`, one lane). A copy round verifies
-16 columns and skips the drafter, so it pays only if a 16-column verify costs well under twice an
-8-column DFlash2 round. Measured with the round bench's teacher-forced copy mode (every timed copy
-round accepts all of its drafts; GPU time per round, median of 30, corpus prompt):
+`--ngram-draft-tokens 15` beside DFlash2 K=7 (draft head, `rk4v4`). A copy round verifies 16
+columns; at one lane it skips the drafter, at two lanes the drafter still proposes for the lane
+that does not copy. It pays only while a 16-column round costs well under twice an 8-column DFlash2
+round. Measured with the round bench (`ninfer_qwen3_5_dflash_round_bench --copy-width 16`): every
+timed copy round accepts all of its drafts; GPU ms per round, median (copy) or mean (neural) of 30,
+corpus prompt:
 
-| context | DFlash2 round, 8 columns | copy round, 8 | 12 | 16 | 16 / DFlash2 |
-|---|---:|---:|---:|---:|---:|
-| 2,048 | 28.8 ms | 26.1 | 32.0 | 35.4 | 1.23 |
-| 32,768 | 31.3 ms | 28.4 | 36.8 | 39.6 | 1.27 |
-| 131,072 | 39.2 ms | 36.1 | 50.3 | 55.2 | 1.41 |
-
-A full copy round yields 16 tokens for 1.2-1.4 DFlash2 rounds, which yield about 7.4. Wider windows
-need the verification Ops extended past 16 columns; a final-prefill-chunk proxy for them (same route
-resolver, prefill GDN instead of the record path, so only indicative) costs 1.9-7.1x an 8-token
-chunk at 32 tokens and 4.9-8.2x at 64, against 1.3-1.5x at 16, because those widths fall to the
-prompt attention route. Windows of 31 and 63 are not worth building on this card on that evidence.
-
-**Agent replay** (`tools/bench/agent_replay`: 4 sessions, 112-113 turns of Read/Edit/explain traffic
-growing to 39-115K tokens, greedy; two runs per arm, alternating; decode tok/s over committed
-tokens, both runs agree within 0.3%):
-
-| category | off | `--ngram-draft-tokens 15` | change | share of output copied |
+| context | lanes | DFlash2 round, 8 columns | copy round, 16 columns | ratio |
 |---|---:|---:|---:|---:|
-| rewrite a file | 187.5 | 332.5 | +77% | 88% |
-| apply a change | 198.4 | 341.0 | +72% | 90% |
-| edit a function | 230.3 | 352.2 | +53% | 86% |
-| revert a diff | 212.6 | 204.9 | **-3.6%** | 24% |
-| explore | 163.1 | 193.9 | +19% | 51% |
-| explain | 74.8 | 72.2 | **-3.5%** | 2% |
-| all turns | 174.6 | 240.4 | +38% | 73% |
+| 2,048 | 1 | 28.8 ms | 34.9 | 1.22 |
+| 32,768 | 1 | 31.5 ms | 39.5 | 1.26 |
+| 65,536 | 1 | 33.9 ms | 44.6 | 1.32 |
+| 131,072 | 1 | 39.2 ms | 55.2 | 1.41 |
+| 2,048 | 2, one copying | 38.4 ms | 55.3 | 1.44 |
+| 32,768 | 2, one copying | 43.3 ms | 63.7 | 1.47 |
+| 65,536 | 2, one copying | 48.4 ms | 72.1 | 1.49 |
+| 2,048 | 2, both copying | 38.4 ms | 56.9 | 1.48 |
+| 32,768 | 2, both copying | 43.3 ms | 66.4 | 1.53 |
+| 2,048 | 3, one copying | 48.9 ms | 118.9 | 2.43 |
+| 2,048 | 4, one copying | 58.7 ms | 138.8 | 2.36 |
 
-Whole replay wall time drops from 789 s to 676 s. Copies were accepted 92% of the time (58,147 of
-63,393 copied tokens). Two categories got slower. Reverting a diff proposes copies that are often
-wrong (46% accepted), and each costs a 16-column round. Explaining copies almost nothing, so it
-pays the small fixed cost below; its outputs also differ between arms (6,924 against 6,837 tokens),
-so that row is not a like-for-like pair. The offline simulation of this replay predicted 1.36x
-overall at a 16-column cost of 1.1x; the measured cost is 1.23-1.41x and the measured gain 1.38x.
+(The 131,072 row is from the one-lane measurement before two lanes were built.) A full copy round
+yields 16 tokens for 1.2-1.4 DFlash2 rounds, which yield about 7.4 on copyable text. Beside a lane
+that does not copy it costs 1.44-1.49 rounds, so the other lane decodes **about a third slower in
+those rounds**; a two-lane round therefore copies only when the longest copy offers at least 12
+drafts (12 + 1 + p >= 1.47 (7.4 + p) for a free lane's p = 2-3 tokens per round). From three lanes
+the 48-64-column round costs 2.4x and returns less than it costs, so copy rounds run at one and two
+lanes only and the copy family captures no larger batch. Wider windows need the verification Ops
+extended past 16 columns; a final-prefill-chunk proxy for them (same route resolver, prefill GDN
+instead of the record path, so only indicative) costs 1.9-7.1x an 8-token chunk at 32 tokens and
+4.9-8.2x at 64, against 1.3-1.5x at 16, because those widths fall to the prompt attention route.
+Windows of 31 and 63 are not worth building on this card on that evidence.
 
-**Without copies** (`ninfer_bench -n 512` on the bench corpus, two alternating rounds against the
-build before this feature): with the flag off DFlash2 decodes 64.00 and 63.88 tok/s against 64.72
-and 63.84 (the first run of a session is the high one in every row, as plain and MTP decode show
-too). With it on, DFlash2 decodes 63.49 and 63.43, 0.8% and 0.7% below the flag-off runs of the
-same rounds, with identical rounds and acceptance: the corpus never copies.
-That is the price of rounds sized for 16 columns (the context catch-up and buffers run at the
-widest family); it is not yet attributed more precisely.
+**Copy misses.** A request whose copy round commits fewer than 4 of its copied tokens doubles the
+match it needs before it copies again (12, then 24, then 36 tokens); each round that copies well
+lowers it one step. Reverting a diff is where this matters: the file and both sides of the diff
+offer near-identical text, and without the backoff its copies were accepted 46% of the time.
 
-**Memory.** The copy family's CUDA Graphs add 24 MiB at 8K context and 79 MiB at 172K; the planner
-reserves 170 MiB more at the Windows DFlash2 launcher profile (188,416 tokens). The launcher keeps
-its default: the profile started with 0.79 GB of runtime headroom left on the day it was measured,
-so the flag fits without stepping the context down, but it is not on in the launchers yet.
+**Agent replay, one lane** (`tools/bench/agent_replay`: 4 sessions, 112-114 turns of Read/Edit/
+explain traffic growing to 39-117K tokens, greedy, 131,072-token KV; two runs per arm, alternating,
+each arm's runs within 0.2% of each other, and one run of the build before the backoff in the same
+session, which reproduced that build's own runs within 0.2%; decode tok/s over committed tokens):
+
+| category | off | on, before the backoff | on | change | share of output copied |
+|---|---:|---:|---:|---:|---:|
+| rewrite a file | 187.4 | 332.8 | 330.5 | +76% | 87% |
+| apply a change | 198.5 | 341.4 | 342.7 | +73% | 90% |
+| edit a function | 230.2 | 352.5 | 352.1 | +53% | 85% |
+| revert a diff | 212.8 | 204.9 (-3.7%) | 212.5 | **-0.1%** | 9% |
+| explore | 163.2 | 193.7 | 199.9 | +22% | 45% |
+| explain | 74.9 | 72.2 (-3.6%) | 71.3 | **-4.8%** | 1% |
+| all turns | 174.6 | 240.5 | 248.0 | +42% | 72% |
+
+Whole replay wall time drops from 786 s to 677 s. Copies were accepted 95% of the time (117,476 of
+124,280 copied tokens). The backoff took reverting a diff from 243 copy rounds per run at 46%
+acceptance to 88 at 51% and back to the speed it has without copies; the file-returning categories
+moved by -0.7% to +0.4%. Explaining is the one category still slower, and not by its round cost:
+its rounds take 32.90 ms against 32.76 ms off (+0.4%, with 5 copy rounds per run), while its answers
+differ between the arms (6,179 against 6,837 tokens) and the "on" answers draft worse (2.34 against
+2.45 tokens per round). It is not a like-for-like pair.
+
+**Agent replay, two lanes** (the same replay with two sessions in flight, `--max-concurrency 2`,
+147,456-token KV; two runs per arm, alternating; which turns share rounds depends on timing, so runs
+of an arm differ by up to 20% per category):
+
+| category | off | `--ngram-draft-tokens 15` | change |
+|---|---:|---:|---:|
+| rewrite a file | 108.9 (109.3 / 108.4) | 179.2 (159.7 / 198.8) | +65% |
+| apply a change | 103.3 (107.4 / 99.2) | 164.4 (176.8 / 152.0) | +59% |
+| edit a function | 152.1 (157.7 / 146.5) | 177.9 (182.0 / 173.7) | +17% |
+| revert a diff | 110.5 (114.8 / 106.1) | 89.3 (88.3 / 90.3) | **-19%** |
+| explore | 95.1 (85.8 / 104.3) | 81.9 (82.3 / 81.4) | **-14%** |
+| explain | 40.2 (40.0 / 40.5) | 40.1 (40.7 / 39.4) | -0.4% |
+| all turns, per request | 99.2 | 124.0 | +25% |
+| both lanes together (output tok/s over wall time) | 117.8 / 120.1 | 139.4 / 134.8 | +15% |
+
+Wall time drops from 674-677 s to 593-604 s. The losses are the other lane's: a turn that copies
+little shares its rounds with a partner that copies, and those rounds verify 16 columns for both. A
+diff revert's rounds take 78 ms against 61-65 off at the same tokens per round (6.95 against 6.97),
+an exploring turn's 76-85 ms against 52-60. Explaining turns, which mostly overlapped each other, are
+unchanged. Two lanes trade the latency of the lane that does not copy for throughput: the batch
+gains 15%, a copying request up to 65%, and a request beside it loses up to a fifth.
+
+**Without copies.** The bench corpus (`ninfer_bench -n 512`, two alternating rounds) never copies.
+At one lane DFlash2 decodes 63.40 and 63.29 tok/s with the flag on against 63.96 and 63.66 off
+(-0.7%); the one-lane build before two lanes measured 63.30 and 63.18 in the same rounds. An Nsight
+Systems trace puts the difference inside the round's GPU time (28.2 ms against 27.8 ms; host submit
++0.02 ms), spread over the same kernels with the same launch counts, each about 1% slower; no extra
+work runs in the rounds. The round bench, with the same families configured but no copy index, shows
+no difference at one lane (2K: 28.54-28.71 ms on against 28.74-28.78 off; 32K: 31.29-31.49 against
+31.47), so the cost is not attributed further. At two lanes the bench corpus decodes 87.55 and 87.57
+tok/s per batch with the flag on against 85.98 and 86.42 off (+1.6%, identical rounds and
+acceptance, also not attributed). Rounds now catch the draft context up at their own width: at two
+lanes a configuration that never copies cost 43.68 ms per round at 32K against 43.50 off (three
+alternating pairs) when the catch-up ran at the copy width, and costs 43.50 now.
+
+**Memory.** At the Windows DFlash2 launcher profile (188,416 tokens, one lane) the planner reserves
+170 MiB more with the flag on (5,616,887,552 against 5,438,487,040 bytes, the same as the one-lane
+build), and it starts with 991 MiB of device memory free. At two lanes (65,536 tokens) it reserves
+340 MiB more, of which about 100 MiB is actually used after startup (2.61 against 2.71 GiB free).
+The launchers keep the flag off.
 
 ### Choosing a KV format (RTX 3090, Qwen3.8-27B)
 

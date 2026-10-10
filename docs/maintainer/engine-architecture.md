@@ -335,8 +335,14 @@ round frame、ReplaySSM records、grammar mask staging 和 DFlash pending featur
 分配，每轮以自身宽度的 dense view 使用，提交按该轮记录的 `verify_drafts` 索引 egress。DFlash2 有
 draft window 宽度的 neural family，`--ngram-draft-tokens` 时再加一个 copy family：batch 1 的 copy
 round 不运行 drafter（仍做 context catch-up），由 `speculative_overlay_copy_proposals` 把请求自身的
-n-gram copy 写成 one-hot sparse law 交给同一个 sparse verifier。是否走 copy round 只取决于已提交
-ledger，与输出预算无关，所以预算截断的末轮与不截断时算术相同。
+n-gram copy 写成 one-hot sparse law 交给同一个 sparse verifier。batch 2 的 copy round 仍以 draft
+window 运行 drafter，把它的 drafts/candidates/q 从 K 宽的 dense view 摊到 copy 宽度 frame 的前 K
+列，再只覆盖有 copy 的行；没有 copy 的行按 K 验证。copy round 让同 batch 的每一行都付 copy 宽度，
+因此 batch 2 只在最长 copy 至少 12 个 draft 时才走 copy round，batch 3 及以上不走（copy family
+也只捕获 batch 1、2）。每轮 context catch-up 以本 family 的宽度追加上一轮的 target features；上一轮
+是更宽的 copy round 时，在 neural round 之前先 eager 追加。是否走 copy round 只取决于已提交
+ledger 和已提交轮次（连续 copy miss 会提高请求所需的匹配长度），与输出预算无关，所以预算截断的末轮
+与不截断时算术相同。
 长度档位限制资源范围；Program 不复制 Attention Op 私有 kernel 的分派边界。
 
 本 fork 的多 GPU layer pipeline（`--devices A,B,...`，Linux；每个 stage 整层拥有权重、KV plane、GDN
