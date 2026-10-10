@@ -114,6 +114,21 @@ void basic_contracts(ninfer::text::GrammarCompiler& compiled) {
     require(single.finish().diagnostics.duplicate_parameters_repaired == 0,
             "a call without repeats counted a duplicate repair");
 
+    // A repeat inside a call that never completes is discarded with that call, so it is not
+    // counted; the repeats of the calls that did complete still are.
+    const std::string unfinished = "<tool_call>\n<function=call>\n<parameter=x>\n1\n</parameter>\n"
+                                   "<parameter=x>\n2\n</parameter>\n";
+    frontend::ToolCallOutputDecoder cut_alone(integer, 64);
+    (void)cut_alone.feed(unfinished);
+    const auto alone = cut_alone.finish(ninfer::FinishReason::OutputLimit);
+    require(alone.tool_calls.empty() && alone.diagnostics.duplicate_parameters_repaired == 0,
+            "an unfinished call's duplicate repair was counted without a published call");
+    frontend::ToolCallOutputDecoder cut_after(integer, 64);
+    (void)cut_after.feed(repeated + "\n" + unfinished);
+    const auto after = cut_after.finish(ninfer::FinishReason::OutputLimit);
+    require(after.tool_calls.size() == 1 && after.diagnostics.duplicate_parameters_repaired == 1,
+            "a completed call's duplicate repair was lost or inflated by an unfinished one");
+
     // These requests share the same compiled envelope but have different value normalization.
     const auto string = contract(schema({{"type", "string"}}), false);
     for (const auto& bound : {integer, string}) {
@@ -232,6 +247,66 @@ void thinking_cannot_end_with_eos(ninfer::text::GrammarCompiler& compiled) {
         }
         require(eos_allowed(), "tool grammar did not admit EOS after a call in the answer");
     }
+// The serve layer lowers a free-form `custom` tool (Codex's apply_patch) to this strict schema.
+// Its top-level pure-string parameter must come back byte for byte, so a patch keeps its leading
+// spaces, blank lines and markers, and the grammar must make `input` the only, required argument.
+void custom_tool_input(ninfer::text::GrammarCompiler& compiled) {
+    const Json lowered{
+        {"type", "object"},
+        {"properties",
+         {{"input",
+           {{"type", "string"},
+            {"description", "The tool's complete free-form input, passed to it exactly as written "
+                            "(not JSON). It must match this lark grammar:\nstart: begin_patch "
+                            "hunk+ end_patch\nbegin_patch: \"*** Begin Patch\" LF"}}}}},
+        {"required", {"input"}},
+        {"additionalProperties", false}};
+    const auto automatic = contract(lowered, true);
+    ninfer::ToolChoice required;
+    required.mode       = ninfer::ToolChoiceMode::Required;
+    const auto forced   = contract(lowered, true, required);
+    const auto custom_call = [](std::string_view input) {
+        return "<tool_call>\n<function=call>\n<parameter=input>\n" + std::string(input) +
+               "\n</parameter>\n</function>\n</tool_call>";
+    };
+    const std::string patch = "*** Begin Patch\n"
+                              "*** Update File: src/app.py\n"
+                              "@@ def main():\n"
+                              "-    print(\"hi\")\n"
+                              "+    print(\"hello\")\n"
+                              " \n"
+                              "+\n"
+                              "+    return 0\n"
+                              "\n"
+                              "*** Add File: notes/todo.md\n"
+                              "+  - indented item\t(tab)\n"
+                              "*** End Patch";
+    for (const std::string& input : {patch, patch + "\n", "\n  " + patch, std::string("  ")}) {
+        const std::string text = custom_call(input);
+        require(accepts(compiled, *automatic, text) && accepts(compiled, *forced, text),
+                "custom tool grammar rejected a free-form input");
+        for (const std::size_t width : {std::size_t{1}, std::size_t{7}, text.size()}) {
+            frontend::ToolCallOutputDecoder decoder(forced, 64);
+            for (std::size_t at = 0; at < text.size(); at += width)
+                require(decoder.feed(std::string_view(text).substr(at, width)).empty(),
+                        "custom tool bytes leaked as content");
+            const auto result = decoder.finish();
+            require(result.tool_calls.size() == 1 &&
+                        Json::parse(result.tool_calls[0].arguments_json) ==
+                            Json{{"input", input}},
+                    "custom tool input changed in the raw string encoding");
+        }
+    }
+    require(!accepts(compiled, *forced, "<tool_call>\n<function=call>\n</function>\n</tool_call>"),
+            "custom tool call admitted a missing input");
+    require(!accepts(compiled, *forced,
+                     "<tool_call>\n<function=call>\n<parameter=input>\nx\n</parameter>\n"
+                     "<parameter=extra>\ny\n</parameter>\n</function>\n</tool_call>"),
+            "custom tool call admitted a second argument");
+    require(!accepts(compiled, *forced,
+                     "<tool_call>\n<function=call>\n<parameter=patch>\nx\n</parameter>\n"
+                     "</function>\n</tool_call>"),
+            "custom tool call admitted a renamed argument");
 }
 
 void run() {
@@ -239,6 +314,7 @@ void run() {
     basic_contracts(compiled);
     selected_contracts(compiled);
     thinking_cannot_end_with_eos(compiled);
+    custom_tool_input(compiled);
     ninfer::ToolChoice required;
     required.mode = ninfer::ToolChoiceMode::Required;
     auto fixed =

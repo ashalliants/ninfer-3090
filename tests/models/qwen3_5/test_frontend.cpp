@@ -2446,6 +2446,198 @@ int test_constrained_thinking_control(const Frontend& frontend) {
     return failures;
 }
 
+// Without a thinking budget the model's thinking tokens are still counted (upstream
+// Neroued/ninfer#373: model_thinking_tokens stayed 0 unless a budget was set). The count covers
+// the thinking and the close marker token, not the answer, and equals the presentation count.
+int test_thinking_tokens_without_budget(const Frontend& frontend) {
+    auto prompt  = thinking_prompt(frontend);
+    auto session = frontend.make_output_session(prompt, {});
+    const std::vector<ninfer::TokenId> thought = fixture_tokenizer().encode("weighing it up");
+    std::vector<ninfer::TokenId> tokens        = thought;
+    tokens.push_back(248069); // "</think>"
+    const std::vector<ninfer::TokenId> answer = fixture_tokenizer().encode("\n\nanswer");
+    tokens.insert(tokens.end(), answer.begin(), answer.end());
+    (void)session.preview_model(tokens, 64, ninfer::FinishReason::OutputLimit);
+    const auto output                       = session.commit_preview();
+    const ninfer::ThinkingBudgetStats stats = session.thinking_stats();
+    return check(channel_text(output, ninfer::OutputChannel::Reasoning) == "weighing it up" &&
+                     channel_text(output, ninfer::OutputChannel::Content) == "answer" &&
+                     !stats.requested_budget && !stats.effective_budget &&
+                     stats.model_thinking_tokens == thought.size() + 1U &&
+                     stats.model_thinking_tokens < tokens.size() &&
+                     stats.model_thinking_tokens == session.reasoning_tokens() &&
+                     stats.injected_tokens == 0 && !stats.applied,
+                 "thinking tokens were not counted without a thinking budget");
+}
+
+// The reasoning-loop guard through a real output session: thinking that keeps rewriting one
+// verification pass fires the guard at a check boundary (Stop ends the request; Conclude requests
+// the thinking-close control, after which the model answers in content); varied thinking and Off
+// never fire; Conclude without room for the control and one more token, or with early close
+// unavailable, stops instead; under a Basic tool constraint the grammar accepts the control and a
+// declared call after it.
+int test_reasoning_loop_guard(const Frontend& frontend) {
+    std::string varied;
+    unsigned state = 7;
+    for (int s = 0; s < 260; ++s) {
+        state = state * 1103515245U + 12345U;
+        varied += "step " + std::to_string(s) + " checks value " +
+                  std::to_string((state >> 8) % 9973) + " against bound " +
+                  std::to_string((state >> 4) % 811) + ". ";
+    }
+    std::string looping = varied;
+    for (int i = 0; i < 60; ++i) {
+        looping += "Wait, let me double-check the case where the list is empty. Then the function "
+                   "returns zero, which matches the expected output, so that case is fine. ";
+    }
+    const std::vector<ninfer::TokenId> loop_tokens   = fixture_tokenizer().encode(looping);
+    const std::vector<ninfer::TokenId> varied_tokens = fixture_tokenizer().encode(varied + varied);
+    constexpr std::size_t kRound                     = 200;
+    constexpr std::uint32_t kLarge                   = 1'000'000;
+    using ninfer::ReasoningLoopAction;
+    using ninfer::runtime::ContinuationAction;
+
+    // Feeds `tokens` in rounds until a decision ends or asks for control; returns that decision.
+    const auto run = [&](auto& session, const std::vector<ninfer::TokenId>& tokens,
+                         std::uint32_t budget) {
+        ninfer::runtime::OutputDecision last{};
+        for (std::size_t at = 0; at < tokens.size(); at += kRound) {
+            const std::size_t n = std::min(kRound, tokens.size() - at);
+            last = session.preview_model(std::span<const ninfer::TokenId>(tokens.data() + at, n),
+                                         budget, ninfer::FinishReason::OutputLimit);
+            (void)session.commit_preview();
+            budget -= last.accepted_tokens;
+            if (last.finished() || last.continuation == ContinuationAction::ApplyTargetControl) {
+                break;
+            }
+        }
+        return last;
+    };
+    const auto loop_options = [](ReasoningLoopAction action) {
+        return ninfer::ThinkingControlOptions{.loop = action};
+    };
+
+    int failures = 0;
+    {
+        auto session        = frontend.make_output_session(thinking_prompt(frontend), {}, {},
+                                                           loop_options(ReasoningLoopAction::Stop));
+        const auto decision = run(session, loop_tokens, kLarge);
+        const auto stats    = session.thinking_stats();
+        failures += check(decision.finish_reason == ninfer::FinishReason::OutputLimit &&
+                              stats.loop_detected && stats.loop_coverage >= 0.25F &&
+                              stats.loop_thinking_tokens >= 512 && !stats.applied,
+                          "Stop did not end a looping reasoning at a check");
+    }
+    std::uint32_t fired_after = 0;
+    {
+        auto session = frontend.make_output_session(thinking_prompt(frontend), {}, {},
+                                                    loop_options(ReasoningLoopAction::Conclude));
+        const auto decision = run(session, loop_tokens, kLarge);
+        fired_after         = session.thinking_stats().model_thinking_tokens;
+        failures += check(!decision.finished() &&
+                              decision.continuation == ContinuationAction::ApplyTargetControl &&
+                              session.model_token_budget_remaining(kLarge) == 0,
+                          "Conclude did not request the thinking-close control");
+        const std::span<const ninfer::TokenId> pending = session.pending_control_tokens();
+        const std::vector<ninfer::TokenId> control(pending.begin(), pending.end());
+        failures += check(!control.empty(), "Conclude exposed no control span");
+        if (!control.empty()) {
+            (void)session.preview_control(control, kLarge);
+            (void)session.commit_preview();
+            (void)session.preview_model(std::array<ninfer::TokenId, 1>{0}, kLarge,
+                                        ninfer::FinishReason::OutputLimit);
+            const auto answer = session.commit_preview();
+            const auto stats  = session.thinking_stats();
+            failures += check(channel_text(answer, ninfer::OutputChannel::Content) == "x" &&
+                                  stats.applied && stats.loop_detected &&
+                                  stats.injected_tokens == control.size(),
+                              "Conclude did not close the thinking and answer in content");
+        }
+    }
+    {
+        auto session = frontend.make_output_session(thinking_prompt(frontend), {}, {},
+                                                    loop_options(ReasoningLoopAction::Conclude));
+        const auto decision = run(session, varied_tokens, kLarge);
+        failures += check(!decision.finished() &&
+                              decision.continuation == ContinuationAction::Decode &&
+                              !session.thinking_stats().loop_detected,
+                          "the guard fired on varied reasoning");
+    }
+    {
+        auto session        = frontend.make_output_session(thinking_prompt(frontend), {}, {},
+                                                           ninfer::ThinkingControlOptions{});
+        const auto decision = run(session, loop_tokens, kLarge);
+        failures += check(!decision.finished() && !session.thinking_stats().loop_detected,
+                          "the guard fired while Off");
+    }
+    {
+        // An output limit one token past the firing point leaves no room for the control span
+        // plus one post-close token.
+        auto session = frontend.make_output_session(thinking_prompt(frontend), {}, {},
+                                                    loop_options(ReasoningLoopAction::Conclude));
+        const auto decision = run(session, loop_tokens, fired_after + 1U);
+        failures += check(decision.finish_reason == ninfer::FinishReason::OutputLimit &&
+                              session.thinking_stats().loop_detected &&
+                              !session.thinking_stats().applied,
+                          "Conclude without room for the control did not stop");
+    }
+    {
+        // A capacity that left no room for early close (a budget the Engine could not enforce)
+        // makes Conclude stop even when the output limit is far away.
+        auto session = frontend.make_output_session(
+            thinking_prompt(frontend), {}, {},
+            ninfer::ThinkingControlOptions{.budget                = kLarge - 1U,
+                                           .early_close_available = false,
+                                           .loop = ReasoningLoopAction::Conclude});
+        const auto decision = run(session, loop_tokens, kLarge);
+        failures += check(decision.finish_reason == ninfer::FinishReason::OutputLimit &&
+                              session.thinking_stats().loop_detected &&
+                              !session.thinking_stats().applied &&
+                              session.pending_control_tokens().empty(),
+                          "Conclude with early close unavailable did not stop");
+    }
+    {
+        // The default Basic tool constraint masks generation from the first thinking token; the
+        // guard's control span must be grammar-accepted, and a declared call must still follow.
+        ninfer::PromptInput input;
+        input.options.enable_thinking = true;
+        input.messages.push_back({.role  = ninfer::ChatRole::User,
+                                  .parts = {{.kind = ninfer::MessagePartKind::Text, .text = "x"}}});
+        input.options.tool_jsons.push_back(
+            R"({"type":"function","function":{"name":"record","parameters":{"type":"object","properties":{"x":{"type":"string"}},"required":["x"]}}})");
+        auto session = frontend.make_output_session(frontend.prepare(input), {}, {},
+                                                    loop_options(ReasoningLoopAction::Conclude));
+        failures += check(session.constrained(), "declared tools did not constrain the output");
+        const auto decision = run(session, loop_tokens, kLarge);
+        failures += check(decision.continuation == ContinuationAction::ApplyTargetControl,
+                          "Conclude did not fire under a tool constraint");
+        const std::span<const ninfer::TokenId> pending = session.pending_control_tokens();
+        const std::vector<ninfer::TokenId> control(pending.begin(), pending.end());
+        if (control.empty()) {
+            return failures + check(false, "Conclude exposed no control under a tool constraint");
+        }
+        try {
+            (void)session.preview_control(control, kLarge);
+            (void)session.commit_preview();
+            std::vector<ninfer::TokenId> call = fixture_tokenizer().encode(
+                "<tool_call>\n<function=record>\n<parameter=x>\nready\n</parameter>\n</"
+                "function>\n</tool_call>");
+            call.push_back(frontend.default_stop_policy().token_ids.front());
+            const auto end = session.preview_model(call, kLarge, ninfer::FinishReason::OutputLimit);
+            (void)session.commit_preview();
+            const auto calls = session.take_tool_calls();
+            failures += check(end.finish_reason == ninfer::FinishReason::StopToken &&
+                                  calls.size() == 1 && calls[0].name == "record" &&
+                                  session.thinking_stats().applied,
+                              "the tool constraint lost its call after Conclude");
+        } catch (const std::exception& error) {
+            std::cerr << error.what() << '\n';
+            failures += check(false, "the tool grammar rejected the Conclude control span");
+        }
+    }
+    return failures;
+}
+
 int test_thinking_budget_control(const Frontend& frontend) {
     auto prompt = thinking_prompt(frontend);
     ninfer::StopPolicy stop;
@@ -3068,6 +3260,67 @@ int test_media_preparation_cancellation() {
     return check(false, "cancelled media preparation completed successfully");
 }
 
+// N-gram proposal sources come only from tool results, de-numbered, and never change the target
+// prompt or its identity; the prepared index proposes from them.
+int test_ngram_sources_from_tool_results() {
+    const auto text_message = [](ninfer::ChatRole role, std::string text) {
+        ninfer::ChatMessage message;
+        message.role = role;
+        message.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        return message;
+    };
+    const std::string numbered_user = "1: alpha\n2: beta\n3: gamma\n";
+    const std::string numbered_tool =
+        "    10\xe2\x86\x92" "def f():\n    11\xe2\x86\x92    x = 1\n    12\xe2\x86\x92    return x\n";
+    const auto input = [&] {
+        ninfer::PromptInput result;
+        result.messages.push_back(text_message(ninfer::ChatRole::User, numbered_user));
+        result.messages.push_back(text_message(ninfer::ChatRole::Assistant, "reading"));
+        result.messages.push_back(text_message(ninfer::ChatRole::Tool, numbered_tool));
+        return result;
+    };
+    ninfer::models::qwen3_5::FrontendOptions options;
+    options.vision_enabled = false;
+    options.max_context    = 4'096;
+    const Frontend plain   = make_frontend(resources(), options);
+    options.ngram_index    = true;
+    const Frontend indexed = make_frontend(resources(), options);
+
+    const auto plain_prompt   = plain.prepare(input());
+    const auto indexed_prompt = indexed.prepare(input());
+    const auto& without       = FrontendFactory::inspect(plain_prompt);
+    const auto& with          = FrontendFactory::inspect(indexed_prompt);
+    int failures = check(without.ngram_sources.empty() && !without.ngram_index.index,
+                         "a Frontend without n-gram indexes built sources or an index");
+    failures += check(with.ngram_sources ==
+                          std::vector<std::vector<ninfer::TokenId>>{
+                              indexed.tokenize_text("def f():\n    x = 1\n    return x\n")},
+                      "n-gram sources are not exactly the de-numbered tool result");
+    failures += check(with.token_ids == without.token_ids && with.positions == without.positions &&
+                          with.context_cache.opportunities == without.context_cache.opportunities &&
+                          with.identity.rewrite_execution_frontiers ==
+                              without.identity.rewrite_execution_frontiers,
+                      "n-gram sources changed the target prompt or its identity");
+    if (!with.ngram_index.index) { return failures + check(false, "no prepared n-gram index"); }
+    failures += check(with.ngram_index.index->indexed() == with.token_ids.size(),
+                      "the prepared index does not cover exactly the prompt ledger");
+    // Writing the de-numbered code continues from the proposal-only source; the numbered prompt
+    // text never holds these lines contiguously.
+    std::vector<ninfer::TokenId> ledger = with.token_ids;
+    const auto written                  = indexed.tokenize_text("def f():\n    x = 1\n");
+    ledger.insert(ledger.end(), written.begin(), written.end());
+    const auto proposal = with.ngram_index.index->propose_for_round(ledger, 15, 7, 12);
+    failures += check(proposal.tokens == indexed.tokenize_text("    return "),
+                      "the prepared index did not propose from the de-numbered tool source");
+    // Token-only preparation indexes its tokens and has no tool sources.
+    const auto tokens = indexed.prepare_tokens(without.token_ids);
+    failures += check(FrontendFactory::inspect(tokens).ngram_sources.empty() &&
+                          FrontendFactory::inspect(tokens).ngram_index.index,
+                      "token-only preparation did not build its n-gram index");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -3086,6 +3339,7 @@ int main() {
     failures += test_assistant_continuation();
     failures += test_rewrite_checkpoint_trace();
     failures += test_adjacent_tool_message_boundary();
+    failures += test_ngram_sources_from_tool_results();
     failures += test_literal_cache_boundary();
     failures += test_selected_template_recovery_boundary();
     failures += test_official_resource_guards();
@@ -3114,8 +3368,10 @@ int main() {
     failures += test_open_reasoning_tool_recovery();
     failures += test_constraint_refuses_caller_stops(frontend);
     failures += test_reasoning_split(frontend);
+    failures += test_thinking_tokens_without_budget(frontend);
     failures += test_thinking_budget_control(frontend);
     failures += test_thinking_budget_branches(frontend);
+    failures += test_reasoning_loop_guard(frontend);
     failures += test_constrained_thinking_control(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
     failures += test_media_cache_reuses_immutable_payload();
