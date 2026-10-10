@@ -38,6 +38,16 @@ ninfer_add_op_test(ninfer_ggml_blocks_decode_test NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_blocks_decode.cpp"
   LIBRARIES ninfer_core)
 
+# offloaded_sparse_moe over GGML expert records. The CPU test needs no GPU: the canonical A8 cast,
+# the exact sub-block decode, the FP64 expert oracle, AVX2 = scalar and the worker team. The layer
+# test runs routing, dispatch and the combine on the GPU.
+ninfer_add_op_test(ninfer_offloaded_moe_cpu_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_cpu.cpp"
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_offloaded_moe_layer_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_layer.cu"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_linear_topk_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"
   LIBRARIES ninfer_ops)

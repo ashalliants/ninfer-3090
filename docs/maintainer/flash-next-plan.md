@@ -14,12 +14,16 @@ references, `engine-architecture.md`).
 | 2 | C++ registration and materialization of the GGML formats and layouts; host exact decoder | done |
 | 2b | Infernix-aligned artifact: `ggml_expert_record_v1` expert banks and three record formats (Python and C++), the n-gram table as an Infernix-format volume with IQ4_NL rows, Infernix's text config keys; replaces PR 1's two-object banks and `ggml_rows_page4k_v1` | done |
 | 3 | Dense GGML linears: `linear`/`linear_add` for IQ4_XS, IQ3_S, Q6_K, IQ4_NL, Q8_0, Q2_0 at the model's 19 dense problems, Q8_1 activation profile | done (perf gates below) |
-| 4-9 | Hyper-connections and FP32 head, QSA, PLE frontend and stream residency, model skeleton, MoE on GPU, MoE on CPU | not started |
+| 4-6 | Hyper-connections and FP32 head, QSA, PLE | not started |
+| 7a | `offloaded_sparse_moe` contract, routing, dispatch, combine, canonical A8 arithmetic, CPU expert engine (scalar, AVX2, worker team) | done |
+| 7b | `offloaded_sparse_moe` GPU narrow route (device frames, staging, zero-copy), CPU miss channel and service | not started |
+| 8-9 | Model skeleton, Program and Engine integration | not started |
 | 10 | Whole model at 32K, quality gate against Strata | not started |
 | 11-14 | Residency policy and miss split, 128K, MTP, vision | not started |
 
 The C++ loader reads and places every `ggml_*` and `ggml_rec_*` object. Linear and LinearAdd execute
-the six dense formats (PR 3); the expert record formats wait for the MoE Op (PR 7).
+the six dense formats (PR 3); offloaded_sparse_moe's CPU expert engine executes the three expert
+record formats (PR 7a); its GPU route follows (PR 7b).
 
 ## PR 3 measurements
 
@@ -87,6 +91,10 @@ Infernix is Apache-2.0; each adapted file carries the notice the spec's licensin
 |---|---|---|
 | `tools/artifact/ngram_volume.py` | `tools/convert/qwen4_exp.py` (`ngram_geometry`, `read_ngram_volume_id`, `write_ngram_volume`) | Version 2 header with a row-format field; streams GGML rows from any source |
 | `tools/convert/qwen4_exp.py` (config keys, `layer_multipliers`, `head_tables`, expert bank parameter, volume binding) | `src/models/qwen4_exp/config.cpp`, `tools/flash_next/ngram.py`, `tools/convert/qwen4_exp.py` (`ExpertBankSource`, `import_expert_bank`), `tools/convert/__main__.py` | Sourced from GGUF metadata; GGML expert records instead of NVFP4 banks |
+| `include/ninfer/ops/offloaded_sparse_moe.h` | `include/infernix/ops/offloaded_sparse_moe.h` | GGML record formats, no per-expert scales; routing, dispatch, combine and the CPU engine (the GPU expert route follows) |
+| `src/ops/common/canonical_math.h` | `src/ops/common/canonical_math.h` (`0cf68068`) | IEEE helpers, BF16, exp and SiLU only |
+| `src/ops/offloaded_sparse_moe/cpu/expert_team.cpp` | `src/ops/offloaded_sparse_moe/cpu/expert_team.{h,cpp}` | GGML jobs; units of 32 intermediates; no A16, AVX-VNNI or AVX-512 |
+| `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu` | `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu` | Route, dispatch and combine |
 
 ## Export conventions of this GGUF
 

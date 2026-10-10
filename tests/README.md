@@ -192,6 +192,14 @@ the wide route's cast kernel and through the public Op on both routes, and the a
 `--format NAME` and `--shape N K` select problems; the full run takes about a minute, most of it the
 host oracle.
 
+`ninfer_offloaded_moe_cpu_test` (host only) and `ninfer_offloaded_moe_layer_test` qualify
+offloaded_sparse_moe over the three GGML expert record formats. The CPU test checks the canonical A8
+cast bit for bit against an independent FP64 formulation, the exact sub-block decode of IQ2_S,
+IQ2_XXS, IQ1_M and Q2_0 against the host decoder above, the CPU expert engine against the FP64
+expert oracle at T in {1, 2, 7, 8}, and AVX2, scalar and the worker team at 1-16 workers for equal
+bits. The layer test checks routing (exact top-10 with ties to the lower id) and dispatch exactly,
+and the combine against FP64.
+
 The real loading test accepts an explicit artifact path and optional component selection:
 
 ```bash
