@@ -5,6 +5,7 @@
 //   ./build/bench/ninfer_linear_bench --qtype q4 --n 4096 --k 5120 --sweep 1:32:1
 //   ./build/bench/ninfer_linear_bench --qtype fp8 --policy a8 --n 14336 --k 5120 --t 1
 //   ./build/bench/ninfer_linear_bench --suite qwen3_6_27b
+//   ./build/bench/ninfer_linear_bench --qtype ggml_iq4_xs --policy a8 --n 10240 --k 2560 --t 1
 //   ncu --profile-from-start off ./build/bench/ninfer_linear_bench \
 //       --qtype q4 --n 4096 --k 5120 --t 8 --profile
 
@@ -26,9 +27,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -95,6 +98,29 @@ constexpr SuiteEntry kQwen35bEntries[] = {
     {"35b.vision_fc2", QType::Q5_G64_FP16, 1152, 4304, TClass::VisionStep4},
     {"35b.vision_merger_fc1", QType::Q8_G32_FP16, 4608, 4608, TClass::VisionStep4},
     {"35b.vision_merger_fc2", QType::Q8_G32_FP16, 2048, 4608, TClass::VisionStep4},
+};
+
+// Qwen3.8-Flash-Next dense projections in their GGUF formats (A8: the Q8_1 activation profile).
+constexpr SuiteEntry kFlashNextEntries[] = {
+    {"fn.gdn_qkv", QType::GGML_IQ4_XS, 10240, 2560, TClass::Continuous},
+    {"fn.gdn_qkv", QType::GGML_IQ3_S, 10240, 2560, TClass::Continuous},
+    {"fn.gate", QType::GGML_IQ4_XS, 6144, 2560, TClass::Continuous},
+    {"fn.gate", QType::GGML_IQ3_S, 6144, 2560, TClass::Continuous},
+    {"fn.gate", QType::GGML_Q6_K, 6144, 2560, TClass::Continuous},
+    {"fn.attn_q", QType::GGML_IQ4_XS, 12288, 2560, TClass::Continuous},
+    {"fn.attn_q", QType::GGML_IQ3_S, 12288, 2560, TClass::Continuous},
+    {"fn.attn_kv", QType::GGML_IQ4_XS, 512, 2560, TClass::Continuous},
+    {"fn.attn_kv", QType::GGML_IQ3_S, 512, 2560, TClass::Continuous},
+    {"fn.attn_kv", QType::GGML_Q6_K, 512, 2560, TClass::Continuous},
+    {"fn.output", QType::GGML_IQ4_XS, 2560, 6144, TClass::Continuous},
+    {"fn.output", QType::GGML_IQ3_S, 2560, 6144, TClass::Continuous},
+    {"fn.output", QType::GGML_Q6_K, 2560, 6144, TClass::Continuous},
+    {"fn.shexp_gate_up", QType::GGML_IQ4_XS, 640, 2560, TClass::Continuous},
+    {"fn.shexp_gate_up", QType::GGML_IQ3_S, 640, 2560, TClass::Continuous},
+    {"fn.shexp_gate_up", QType::GGML_Q6_K, 640, 2560, TClass::Continuous},
+    {"fn.shexp_down", QType::GGML_IQ4_NL, 2560, 640, TClass::Continuous},
+    {"fn.shexp_down", QType::GGML_Q8_0, 2560, 640, TClass::Continuous},
+    {"fn.shexp_down", QType::GGML_Q2_0, 2560, 640, TClass::Continuous},
 };
 
 struct Sweep {
@@ -230,6 +256,18 @@ const char* qtype_name(QType qtype) {
         return "NVFP4";
     case QType::FP8_E4M3FN_ROW_BF16:
         return "FP8";
+    case QType::GGML_IQ4_XS:
+        return "GGML_IQ4_XS";
+    case QType::GGML_IQ3_S:
+        return "GGML_IQ3_S";
+    case QType::GGML_Q6_K:
+        return "GGML_Q6_K";
+    case QType::GGML_IQ4_NL:
+        return "GGML_IQ4_NL";
+    case QType::GGML_Q8_0:
+        return "GGML_Q8_0";
+    case QType::GGML_Q2_0:
+        return "GGML_Q2_0";
     default:
         break;
     }
@@ -252,6 +290,12 @@ QType parse_qtype(std::string_view text) {
     if (value == "bf16") { return QType::BF16; }
     if (value == "nvfp4") { return QType::NVFP4; }
     if (value == "fp8" || value == "fp8_e4m3fn_row_bf16") { return QType::FP8_E4M3FN_ROW_BF16; }
+    if (value == "ggml_iq4_xs") { return QType::GGML_IQ4_XS; }
+    if (value == "ggml_iq3_s") { return QType::GGML_IQ3_S; }
+    if (value == "ggml_q6_k") { return QType::GGML_Q6_K; }
+    if (value == "ggml_iq4_nl") { return QType::GGML_IQ4_NL; }
+    if (value == "ggml_q8_0") { return QType::GGML_Q8_0; }
+    if (value == "ggml_q2_0") { return QType::GGML_Q2_0; }
     throw std::invalid_argument("unknown qtype: " + std::string(text));
 }
 
@@ -318,10 +362,12 @@ Sweep parse_sweep(std::string_view text) {
 void usage(const char* argv0) {
     std::fprintf(stderr,
                  "Usage:\n"
-                 "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8 --n N --k K --t T [options]\n"
-                 "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8 --n N --k K --sweep START:END[:STEP] "
-                 "[options]\n"
-                 "  %s --suite qwen3_6_27b|qwen3_6_35b_a3b|all [options]\n\n"
+                 "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8|GGML_<FORMAT> --n N --k K --t T [options]\n"
+                 "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8|GGML_<FORMAT> --n N --k K "
+                 "--sweep START:END[:STEP] [options]\n"
+                 "  %s --suite qwen3_6_27b|qwen3_6_35b_a3b|qwen3_8_flash_next|all [options]\n\n"
+                 "GGML formats: ggml_iq4_xs, ggml_iq3_s, ggml_q6_k, ggml_iq4_nl, ggml_q8_0, ggml_q2_0;\n"
+                 "they register only the A8 (Q8_1) profile, so they need --policy a8.\n\n"
                  "Options:\n"
                  "  --policy a16|a8|a4 Activation-compute policy (default a16).\n"
                  "  --execution MODE   eager (default) or graph; time the complete Op.\n"
@@ -400,8 +446,10 @@ Options parse_args(int argc, char** argv) {
         throw std::invalid_argument("--t and --sweep are mutually exclusive");
     }
     if (opt.have_suite) {
-        if (opt.suite != "qwen3_6_27b" && opt.suite != "qwen3_6_35b_a3b" && opt.suite != "all") {
-            throw std::invalid_argument("--suite must be qwen3_6_27b, qwen3_6_35b_a3b, or all");
+        if (opt.suite != "qwen3_6_27b" && opt.suite != "qwen3_6_35b_a3b" &&
+            opt.suite != "qwen3_8_flash_next" && opt.suite != "all") {
+            throw std::invalid_argument(
+                "--suite must be qwen3_6_27b, qwen3_6_35b_a3b, qwen3_8_flash_next, or all");
         }
         if (opt.have_qtype || opt.have_n || opt.have_k || opt.have_t || opt.have_sweep) {
             throw std::invalid_argument("--suite cannot be combined with an explicit point");
@@ -452,10 +500,11 @@ void append_point(std::vector<BenchPoint>& points, BenchPoint point) {
 template <std::size_t N>
 void append_suite(std::vector<BenchPoint>& points, const SuiteEntry (&entries)[N]) {
     for (const SuiteEntry& entry : entries) {
+        // GGML formats register only the A8 (Q8_1) profile.
+        const LinearPolicy policy =
+            is_ggml_block(entry.qtype) ? LinearPolicy::AllowA8 : LinearPolicy::A16Only;
         for (const std::int32_t t : default_t_values(entry.t_class)) {
-            append_point(
-                points,
-                {entry.qtype, LinearPolicy::A16Only, entry.n, entry.k, t, {entry.label}, false});
+            append_point(points, {entry.qtype, policy, entry.n, entry.k, t, {entry.label}, false});
         }
     }
 }
@@ -468,6 +517,9 @@ std::vector<BenchPoint> expand_points(const Options& opt) {
         }
         if (opt.suite == "qwen3_6_35b_a3b" || opt.suite == "all") {
             append_suite(points, kQwen35bEntries);
+        }
+        if (opt.suite == "qwen3_8_flash_next" || opt.suite == "all") {
+            append_suite(points, kFlashNextEntries);
         }
         return points;
     }
@@ -503,7 +555,43 @@ std::vector<PointGroup> group_points(const std::vector<BenchPoint>& points) {
     return groups;
 }
 
+// Random code bytes (every pattern is a valid code) with finite binary16 block scales of either
+// sign; timing does not depend on the values.
+LinearBenchWeight make_ggml_weight(QType qtype, std::int32_t n, std::int32_t k) {
+    const GgmlBlock block = ggml_block(qtype);
+    if (k % static_cast<std::int32_t>(block.values) != 0) {
+        throw std::invalid_argument("GGML K must be a multiple of the block's value count");
+    }
+    const std::uint64_t blocks = checked_mul(static_cast<std::uint64_t>(n),
+                                             static_cast<std::uint64_t>(k / block.values), "blocks");
+    std::vector<std::uint8_t> bytes(checked_mul(blocks, block.bytes, "GGML weight bytes"));
+    std::mt19937 rng(501U);
+    for (auto& b : bytes) b = static_cast<std::uint8_t>(rng());
+    const std::size_t d_offset = qtype == QType::GGML_Q6_K ? 208 : 0;
+    for (std::uint64_t i = 0; i < blocks; ++i) {
+        const auto h = static_cast<std::uint16_t>((rng() & 1 ? 0x8000 : 0) | ((15 - 12) << 10) |
+                                                  (rng() & 0x3FF));
+        std::memcpy(&bytes[i * block.bytes + d_offset], &h, 2);
+    }
+    DeviceBuffer storage(bytes.size());
+    storage.copy_from_host(bytes.data(), bytes.size());
+    Weight w;
+    w.payload       = storage.p;
+    w.payload_bytes = bytes.size();
+    w.qtype         = qtype;
+    w.layout        = QuantLayout::GgmlBlocks;
+    w.ndim          = 2;
+    w.n = w.shape[0] = w.padded_shape[0] = n;
+    w.k = w.shape[1] = w.padded_shape[1] = k;
+    w.qdata      = storage.p;
+    w.group      = static_cast<std::int32_t>(block.values);
+    w.group_size = block.values;
+    const std::uint64_t model_bytes = bytes.size();
+    return {std::move(storage), w, model_bytes};
+}
+
 LinearBenchWeight make_weight(QType qtype, std::int32_t n, std::int32_t k) {
+    if (is_ggml_block(qtype)) { return make_ggml_weight(qtype, n, k); }
     if (qtype == QType::BF16) {
         bench::DirectBf16Weight direct  = bench::make_direct_bf16_weight(n, k);
         const std::uint64_t model_bytes = direct.model_weight_bytes();
@@ -570,6 +658,11 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
         (point.n == 16384 && point.k == 5120 && point.t >= 17) ||
         (point.n == 34816 && point.k == 5120 && point.t >= 5) ||
         (point.n == 5120 && (point.k == 6144 || point.k == 17408) && point.t >= 17);
+    // GGML formats above the decode route run the int8 MMA (s8 x s8 -> s32).
+    if (is_ggml_block(point.qtype) && point.t > 8) {
+        profile = "INT8_I32ACC";
+        return bench::device_specs().int8_tops;
+    }
     if (point.qtype == QType::FP8_E4M3FN_ROW_BF16 && point.policy == LinearPolicy::AllowA8 &&
         fp8_problem && fp8_tensor_route) {
         profile = "MXFP8_F32ACC";

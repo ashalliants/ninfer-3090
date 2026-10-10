@@ -13,12 +13,27 @@ references, `engine-architecture.md`).
 | 1 | GGUF reader, nine exact GGML block formats, `ggml_blocks_v1` / `ggml_rows_page4k_v1`, `qwen4_exp` name map, tokenizer synthesis, `--subset dev` | done (Python only) |
 | 2 | C++ registration and materialization of the GGML formats and layouts; host exact decoder | done |
 | 2b | Infernix-aligned artifact: `ggml_expert_record_v1` expert banks and three record formats (Python and C++), the n-gram table as an Infernix-format volume with IQ4_NL rows, Infernix's text config keys; replaces PR 1's two-object banks and `ggml_rows_page4k_v1` | done |
-| 3-9 | Dense GGML linears, hyper-connections and FP32 head, QSA, PLE frontend and stream residency, model skeleton, MoE on GPU, MoE on CPU | not started |
+| 3 | Dense GGML linears: `linear`/`linear_add` for IQ4_XS, IQ3_S, Q6_K, IQ4_NL, Q8_0, Q2_0 at the model's 19 dense problems, Q8_1 activation profile | done (perf gates below) |
+| 4-9 | Hyper-connections and FP32 head, QSA, PLE frontend and stream residency, model skeleton, MoE on GPU, MoE on CPU | not started |
 | 10 | Whole model at 32K, quality gate against Strata | not started |
 | 11-14 | Residency policy and miss split, 128K, MTP, vision | not started |
 
-The C++ loader reads and places every `ggml_*` and `ggml_rec_*` object; nothing executes them
-until PR 3 (dense) and PR 7 (experts).
+The C++ loader reads and places every `ggml_*` and `ggml_rec_*` object. Linear and LinearAdd execute
+the six dense formats (PR 3); the expert record formats wait for the MoE Op (PR 7).
+
+## PR 3 measurements
+
+RTX 3090, CUDA 12.8, cold L2. Decode is IQ4_XS [10240, 2560] (13.93 MB); wide compares the Q8_1
+cast plus int8 MMA with dequantize-to-FP16 plus cuBLAS (`cublasGemmEx`, FP32 compute).
+
+| Workload | Result |
+|---|---|
+| Decode T = 1, kernel (nsys) | 20.2 us = 74% of the 936 GB/s spec; a plain read of the same bytes takes 17.2-17.7 us (79-81%) |
+| Decode T = 1, public Op in a graph (events) | 22.5 us = 66% |
+| Decode vs Strata `native_mmvq`, same bytes (nsys) | T = 1: 20.2 vs 21.1 us (+2.1 us Strata quantize); T = 8: 30.9 vs 62.9 us |
+| Wide, T = 512 / 4096, ours over dequant + cuBLAS | 1.02-2.02x for five formats; Q6_K 0.96x / 0.77x |
+
+The 80% decode gate is not met; see the PR 3 description for the tuning that was tried.
 
 ## Artifact decisions
 

@@ -63,7 +63,11 @@ formats (Section 3.6):
 | `ggml_rec_iq1_m_q2_0` | `ggml_iq1_m` | `ggml_q2_0` |
 
 The C++ registry accepts the GGML block and expert record formats and materializes them to Device,
-Host or Pinned memory unchanged. No Op consumes them yet; an Op that does declares its own support.
+Host or Pinned memory unchanged. Linear and LinearAdd consume `ggml_iq4_xs`, `ggml_iq3_s`, `ggml_q6_k`,
+`ggml_iq4_nl`, `ggml_q8_0` and `ggml_q2_0` at the registered problems in
+[`linear.h`](../../include/ninfer/ops/linear.h) and
+[`linear_add.h`](../../include/ninfer/ops/linear_add.h), through their Q8_1 activation profile;
+no Op consumes the expert record formats yet. An Op that consumes a format declares its own support.
 
 Each name fixes a code and scale contract. The format registry is implemented in
 [`tools/artifact/formats.py`](../../tools/artifact/formats.py) and
@@ -357,7 +361,11 @@ The Python decoders are
 exact host decoder that GGML Ops are qualified against is
 [`tests/ops/ggml_blocks_decode.h`](../../tests/ops/ggml_blocks_decode.h). Both read tables that
 `tools/artifact/gen_ggml_tables.py` copies from ggml in one pass, with ggml's MIT notice in
-[`third_party/ggml/LICENSE`](../../third_party/ggml/LICENSE). NInfer has no encoder for these
+[`third_party/ggml/LICENSE`](../../third_party/ggml/LICENSE): the Python module
+`tools/artifact/codecs/ggml_tables.py` and the C++ header
+[`third_party/ggml/ggml-common-tables.h`](../../third_party/ggml/ggml-common-tables.h), which the
+host decoder and the device kernels of the GGML Ops (`src/ops/linear/ggml`) both include, so there
+is one C++ table set. NInfer has no encoder for these
 formats: a converter imports blocks from a source already in the same format.
 
 ### 3.6 GGML expert record formats

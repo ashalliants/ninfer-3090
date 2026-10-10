@@ -4,6 +4,7 @@
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
 #include "ops/linear/fp8/fp8_geometry.h"
 #include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/ggml/ggml_dispatch.h"
 #include "ops/linear/nvfp4/nvfp4_layout.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
@@ -113,6 +114,9 @@ std::size_t grouped_integer_workspace_bytes(std::size_t a16, std::int32_t output
                     detail::a8_add_workspace_capacity_bytes(input_rows, min_tokens, max_tokens));
 }
 
+// GGML formats register only the Q8_1 (A8) profile; any policy except A16Only admits it.
+bool ggml_a8_admitted(LinearPolicy policy) { return allows_a8(policy) || allows_a8_int(policy); }
+
 } // namespace
 
 std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output_rows,
@@ -172,6 +176,12 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         }
         return detail::fp8_linear_add_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                                min_tokens, max_tokens);
+    }
+    if (is_ggml_block(qtype)) {
+        detail::ggml_require_registered(qtype, output_rows, input_rows, true,
+                                        ggml_a8_admitted(policy));
+        return detail::ggml_linear_workspace_capacity_bytes(qtype, output_rows, input_rows, true,
+                                                            min_tokens, max_tokens);
     }
     throw std::invalid_argument("linear_add workspace: unsupported weight format");
 }
@@ -299,6 +309,15 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             throw std::invalid_argument("linear_add: FP8 requires 16-byte x/residual alignment");
         }
         detail::fp8_linear_add_dispatch(x, w, residual_out, policy, ws, stream);
+        return;
+    }
+
+    if (is_ggml_block(w.qtype)) {
+        detail::ggml_require_registered(w.qtype, w.n, w.k, true, ggml_a8_admitted(policy));
+        if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16)) {
+            throw std::invalid_argument("linear_add: GGML requires 16-byte x/residual alignment");
+        }
+        detail::ggml_linear_dispatch(x, w, residual_out, true, &ws, stream);
         return;
     }
 
