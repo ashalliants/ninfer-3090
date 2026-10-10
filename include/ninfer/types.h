@@ -420,6 +420,17 @@ struct StopPolicy {
     bool publish_stop_token     = false;
 };
 
+// What the reasoning-loop guard does when the open thinking keeps repeating whole passages (every
+// 512 thinking tokens, the share of the last 2,000 words inside a 12-word passage seen three times
+// reaches 25 %).
+enum class ReasoningLoopAction : std::uint8_t {
+    Off,      // no check
+    Stop,     // end the request there (FinishReason::OutputLimit)
+    Conclude, // inject the thinking-close control (as a reached thinking budget does) and let the
+              // model answer; Stop when early close is unavailable or the remaining output budget
+              // cannot hold the control span and one more token
+};
+
 struct ThinkingControlOptions {
     // Positive maximum accepted model-origin tokens while the Qwen thinking phase remains open.
     // Omitted means unlimited. Injected target-control tokens consume the total output budget but
@@ -430,6 +441,7 @@ struct ThinkingControlOptions {
     std::optional<std::uint32_t> effective_budget;
     // Whether canonical early-close guidance and control tokens can be inserted.
     bool early_close_available = true;
+    ReasoningLoopAction loop   = ReasoningLoopAction::Off;
 };
 
 struct ExecutionOptions {
@@ -1046,11 +1058,17 @@ struct SpeculativeStats {
 struct ThinkingBudgetStats {
     std::optional<std::uint32_t> requested_budget;
     std::optional<std::uint32_t> effective_budget;
-    // Model-origin tokens accepted while capped thinking remained open.
+    // Model-origin tokens accepted while thinking remained open, with or without a budget.
     std::uint32_t model_thinking_tokens = 0;
     // Complete tokenizer-derived target-control suffix committed by Engine.
     std::uint32_t injected_tokens = 0;
     bool applied                  = false;
+    // The reasoning-loop guard fired: after this many model-origin thinking tokens, at this
+    // repeated-passage coverage (ThinkingControlOptions::loop decided the action; `applied` tells
+    // whether it concluded).
+    bool loop_detected                 = false;
+    std::uint32_t loop_thinking_tokens = 0;
+    float loop_coverage                = 0.0F;
 };
 
 enum class ConstraintCacheAccess : std::uint8_t { Hit, Built, Waited };
