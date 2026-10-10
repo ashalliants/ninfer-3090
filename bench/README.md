@@ -326,6 +326,24 @@ cmake --build build -j --target ninfer_benches
 ./build/bench/ninfer_benches ninfer_linear_topk_bench --profile q4-optimized --columns 129 --repeat 60
 ```
 
+## QSA Op benchmark
+
+`ninfer_qsa_bench` measures the four public QSA Ops of `include/ninfer/ops/qsa.h` at the registered
+geometry (4 x 128 indexer, R=4, budget 2048, D256/Q24/KV2 Int8Group64 cache): `index_query`,
+`pool_keys`, `select` and `attention` for one call of `T` columns ending at the last position of a
+context `L`, each captured alone, and `all` (the four in one graph). Pooled keys, queries and cache
+codes are random, so the selection picks scattered blocks; the page table is shuffled. The
+attention stage reads the selection the select stage produced. Each sample replays a CUDA Graph,
+after a 256 MiB L2 eviction read by default (`--cache warm` skips it). Defaults: `T=1,2048`,
+`L=8192,32768,131072`, 5 warmups, 30 samples. Output is CSV
+`stage,T,context,cache,median_us,min_us,p95_us,graph_nodes`. These are Op measurements.
+
+```bash
+cmake --build build -j --target ninfer_benches
+./build/bench/ninfer_benches ninfer_qsa_bench
+./build/bench/ninfer_benches ninfer_qsa_bench --tokens 1 --contexts 32768 --repeat 100
+```
+
 ## CandidateSelectorPath Op benchmark
 
 `ninfer_candidate_selector_bench` measures the complete public conditional selector for
