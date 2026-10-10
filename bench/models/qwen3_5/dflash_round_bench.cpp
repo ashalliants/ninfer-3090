@@ -188,11 +188,12 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--copy-lanes needs --copy-width and at most --batch lanes");
     }
     if (options.prefill_tail != 0) {
-        if (options.copy_width != 0 || options.prefill_tail >= options.prefill_chunk ||
+        if (options.copy_width != 0 || options.ngram_idle_width != 0 ||
+            options.prefill_tail >= options.prefill_chunk ||
             options.context_tokens % options.prefill_chunk != 0 || options.batch_size != 1) {
             throw std::invalid_argument(
                 "--prefill-tail needs batch 1, a tail below --prefill-chunk and a context that "
-                "is a multiple of it, and excludes --copy-width");
+                "is a multiple of it, and excludes --copy-width and --ngram-idle");
         }
     }
     return options;
