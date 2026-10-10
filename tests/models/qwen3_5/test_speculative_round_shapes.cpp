@@ -2,7 +2,8 @@
 //
 // A Program captures one Forward/Finish graph family per SpeculativeRoundShape. Without n-gram
 // drafting the set must stay exactly one neural family at the configured draft window, so the
-// captured executables, graph allowance and round buffers match a single-width Program. Round
+// captured executables, graph allowance and round buffers match a single-width Program. N-gram
+// copy drafting adds exactly one copy family at its window. Round
 // storage is allocated at the widest family and viewed densely at each round's width: the views
 // must alias the allocated storage, keep the batch capacity and leave the catch-up append width
 // alone, because host ingress/egress index every row at row * (k + 1).
@@ -62,12 +63,12 @@ bool same_shape(const ninfer::Tensor& tensor, std::initializer_list<std::int32_t
 
 void check_round_shapes() {
     using ninfer::SpeculativeBackend;
-    expect(qwen::detail::speculative_round_shapes(SpeculativeBackend::None, 0).empty(),
+    expect(qwen::detail::speculative_round_shapes(SpeculativeBackend::None, 0, 0).empty(),
            "no speculative backend has no round families");
     for (const auto backend :
          {SpeculativeBackend::Mtp, SpeculativeBackend::DFlash, SpeculativeBackend::DFlash2}) {
         for (const std::uint32_t k : {1U, 3U, 7U, 15U}) {
-            const auto shapes = qwen::detail::speculative_round_shapes(backend, k);
+            const auto shapes = qwen::detail::speculative_round_shapes(backend, k, 0);
             const std::string label =
                 "backend " + std::to_string(static_cast<int>(backend)) + " K" + std::to_string(k);
             expect(shapes == std::vector<SpeculativeRoundShape>{{SpeculativeRoundKind::Neural, k}},
@@ -75,6 +76,16 @@ void check_round_shapes() {
             expect(qwen::detail::max_verify_drafts(shapes) == k,
                    label + ": widest family is the draft window");
         }
+    }
+    for (const std::uint32_t k : {1U, 7U, 15U}) {
+        const auto shapes =
+            qwen::detail::speculative_round_shapes(SpeculativeBackend::DFlash2, k, 15);
+        const std::string label = "DFlash2 K" + std::to_string(k) + " NG15";
+        expect(shapes == std::vector<SpeculativeRoundShape>{{SpeculativeRoundKind::Neural, k},
+                                                            {SpeculativeRoundKind::Copy, 15}},
+               label + ": the neural family plus exactly one copy family at the copy window");
+        expect(qwen::detail::max_verify_drafts(shapes) == 15,
+               label + ": round storage is allocated at the copy window");
     }
     expect(qwen::detail::max_verify_drafts({}) == 0, "no families verify no drafts");
     const std::vector<SpeculativeRoundShape> mixed{{SpeculativeRoundKind::Neural, 7},
@@ -124,6 +135,17 @@ void check_dflash_frame_views() {
     expect(narrow.draft_tokens.data == frame.draft_tokens.data &&
                same_shape(narrow.draft_tokens, {7, kBatch}),
            "drafts are a dense [7,C] view");
+    expect(native.copy_drafts.data == frame.copy_drafts.data &&
+               same_shape(native.copy_drafts, {15, kBatch}) &&
+               narrow.copy_drafts.data == frame.copy_drafts.data &&
+               same_shape(narrow.copy_drafts, {7, kBatch}) &&
+               same_shape(frame.copy_rows, {kBatch}),
+           "copies are a dense [k,C] view of the ingress tail");
+    expect(qwen::kDFlashDecodeIngressNeuralBytes < sizeof(qwen::DFlashDecodeIngress) &&
+               static_cast<const std::byte*>(frame.copy_rows.data) ==
+                   static_cast<const std::byte*>(frame.ingress.data) +
+                       qwen::kDFlashDecodeIngressNeuralBytes,
+           "a round without copies transfers the ingress up to the copy fields only");
     expect(same_shape(narrow.target_hidden, {64, 8, kBatch}) &&
                same_shape(narrow.target_logits, {96, 8, kBatch}),
            "target hidden/logits are dense [*,8,C] views");

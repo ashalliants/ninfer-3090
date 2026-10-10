@@ -1260,10 +1260,19 @@ private:
                 counters.accepted_tokens - observed.accepted_tokens;
             cumulative_stats_.speculative_fallback_steps +=
                 counters.fallback_steps - observed.fallback_steps;
-            observed.rounds          = counters.rounds;
-            observed.drafted_tokens  = counters.drafted_tokens;
-            observed.accepted_tokens = counters.accepted_tokens;
-            observed.fallback_steps  = counters.fallback_steps;
+            cumulative_stats_.speculative_ngram_rounds +=
+                counters.ngram_rounds - observed.ngram_rounds;
+            cumulative_stats_.speculative_ngram_draft_tokens +=
+                counters.ngram_drafted_tokens - observed.ngram_drafted_tokens;
+            cumulative_stats_.speculative_ngram_accepted_tokens +=
+                counters.ngram_accepted_tokens - observed.ngram_accepted_tokens;
+            observed.rounds                = counters.rounds;
+            observed.drafted_tokens        = counters.drafted_tokens;
+            observed.accepted_tokens       = counters.accepted_tokens;
+            observed.fallback_steps        = counters.fallback_steps;
+            observed.ngram_rounds          = counters.ngram_rounds;
+            observed.ngram_drafted_tokens  = counters.ngram_drafted_tokens;
+            observed.ngram_accepted_tokens = counters.ngram_accepted_tokens;
             if (cancelled[row] || failed[row]) {
                 request->generation_timings = committed.rows[row].timings;
                 request->speculative_stats  = std::move(committed.rows[row].speculative);

@@ -214,6 +214,8 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--spec mtp\|dflash\|dflash2` | speculative backend; see [Speculative decoding](#speculative-decoding) | off |
 | `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 | unset |
 | `--lm-head-draft` | optimized proposal head; implied by `--spec`, accepted for compatibility | on with `--spec` |
+| `--ngram-draft-tokens 0\|15` | n-gram copy drafting beside `--spec dflash2`: when the text being written already appeared in the request (the prompt, a tool result -- including `cat -n` numbered ones -- or the output so far), a round verifies up to 15 copied tokens instead of the draft model's proposal; verification licenses every token, so a wrong copy costs speed, never output. One lane only for now; see [Speculative decoding](#n-gram-copy-drafting) | `0` (off) |
+| `--ngram-min-match N` | tokens the end of the text must match before a copy is proposed, `4..64` | `12` |
 | `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [performance](performance.md)) | off |
 | `--no-prefill-cublas-projections` | with `--prefill-cublas`, keep the attention and GDN input projections off that route | projections on |
 | `--no-prefill-a8` | return full prefill tiles to their A16 routes, which is how the integer routes are measured on a whole request | integer routes on |
@@ -311,8 +313,7 @@ guessing right.
   returning the whole file -- 11 to 15 is up to 1.85x faster than three, and for a coding assistant
   that mostly writes new code seven is about 10% faster. The former MTP-only context lookup
   (`--lookup-ngram`) added nothing on top of MTP there, because the head already copies; it has
-  been removed, and n-gram copy drafting, which verifies a copy wider than the neural window, is
-  being built to replace it.
+  been removed in favour of n-gram copy drafting beside DFlash2 (below).
 - **DFlash2:** seven is the checkpoint recommendation and the best mean on this card. The best K
   still depends on the workload, so a deployment serving one kind of work should sweep its own.
   The optimized proposal head, which `--spec` now always enables, measured within noise of the full head for
@@ -324,6 +325,21 @@ The tables and sweeps are in [performance](performance.md#choosing-the-draft-cou
 The published [performance results](performance.md) use MTP with three draft tokens and DFlash with
 seven, both with the optimized proposal head. Draft counts of eight and above add a second CUDA Graph
 topology class on the 27B, which reserves about 64 MiB more per lane.
+
+### N-gram copy drafting
+
+`--ngram-draft-tokens 15` (with `--spec dflash2`) adds copy rounds. Before each round the request's
+own text is searched for the last 12 or more tokens written (`--ngram-min-match`): the prompt, each
+tool result, a de-numbered copy of each `cat -n` / Read-style numbered tool result, and the output
+so far. When they occurred before, the round verifies the 15 tokens that followed them there in one
+16-column pass and skips the draft model; otherwise it is an ordinary 8-column DFlash2 round. It
+pays when the answer repeats its input -- returning a file, applying an edit, quoting a tool result.
+As with any draft, every token is licensed by the target's own verification, and a copy that is
+wrong, or that a grammar forbids, is rejected. It runs with one lane (`--max-concurrency 1`) for
+now; the counters are in the request log and `/metrics` (see [serving](serving.md)). On an agent
+replay it decoded 38% faster overall and up to 77% faster on turns that return a file, at 0.7-0.8%
+on output that never copies; see
+[performance](performance.md#n-gram-copy-drafting-rtx-3090-qwen38-27b).
 
 ## CUDA synchronization
 

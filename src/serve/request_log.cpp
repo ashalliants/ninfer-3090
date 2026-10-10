@@ -351,7 +351,11 @@ Json speculative_json(const GenerationMetrics& metrics) {
                 {"drafted_tokens", metrics.speculative_draft_tokens},
                 {"accepted_tokens", metrics.speculative_accepted_tokens},
                 {"fallback_steps", metrics.speculative_fallback_steps},
-                {"accepted_per_position", metrics.speculative_accepted_per_position}};
+                {"accepted_per_position", metrics.speculative_accepted_per_position},
+                {"ngram_draft_tokens", metrics.speculative_ngram_draft_tokens},
+                {"ngram_rounds", metrics.speculative_ngram_rounds},
+                {"ngram_drafted_tokens", metrics.speculative_ngram_drafted_tokens},
+                {"ngram_accepted_tokens", metrics.speculative_ngram_accepted_tokens}};
 }
 
 Json scheduling_json(const ninfer::GenerationSchedulingStats& stats) {
@@ -537,6 +541,16 @@ std::string speculative_str(const GenerationMetrics& metrics) {
         const double accept_pct = 100.0 * static_cast<double>(metrics.speculative_accepted_tokens) /
                                   static_cast<double>(metrics.speculative_draft_tokens);
         out << " (" << std::setprecision(1) << accept_pct << "%)";
+    }
+    if (metrics.speculative_ngram_draft_tokens != 0) {
+        out << " ngram " << metrics.speculative_ngram_rounds << " rounds";
+        if (metrics.speculative_ngram_drafted_tokens > 0) {
+            out << ' ' << metrics.speculative_ngram_accepted_tokens << '/'
+                << metrics.speculative_ngram_drafted_tokens << " ("
+                << 100.0 * static_cast<double>(metrics.speculative_ngram_accepted_tokens) /
+                       static_cast<double>(metrics.speculative_ngram_drafted_tokens)
+                << "%)";
+        }
     }
     return out.str();
 }

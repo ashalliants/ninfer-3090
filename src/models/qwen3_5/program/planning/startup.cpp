@@ -931,6 +931,26 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         }
         break;
     }
+    if (options.speculative.ngram_min_match < 4 || options.speculative.ngram_min_match > 64) {
+        throw std::invalid_argument("n-gram minimum match must be in [4,64]");
+    }
+    if (options.speculative.ngram_draft_tokens != 0) {
+        // A copy round runs without the drafter beside DFlash2's sparse verifier. Its window is
+        // bounded by the 16-column verification domain and must exceed the drafter's own window
+        // to have a family of its own. A batched copy round is not built yet.
+        if (options.speculative.backend != SpeculativeBackend::DFlash2) {
+            throw std::invalid_argument("n-gram copy drafting requires the DFlash2 backend");
+        }
+        if (options.speculative.ngram_draft_tokens > kDFlashDecodeMaximumDrafts ||
+            options.speculative.ngram_draft_tokens < options.speculative.draft_tokens) {
+            throw std::invalid_argument("n-gram copy window must be in [draft_tokens,15]");
+        }
+        if (options.max_concurrency != 1) {
+            throw std::invalid_argument(
+                "n-gram copy drafting needs max_concurrency 1; copies above one lane are not "
+                "built yet");
+        }
+    }
     if (device.compute_capability() != 80 && device.compute_capability() != 86 &&
         device.compute_capability() != 89) {
         throw std::invalid_argument(
@@ -953,6 +973,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->max_concurrency      = inputs.max_concurrency;
     impl->prefill_chunk        = inputs.prefill_chunk;
     impl->draft_window         = inputs.draft_window;
+    impl->ngram_draft_tokens   = inputs.ngram_draft_tokens;
+    impl->ngram_min_match      = inputs.ngram_min_match;
     impl->speculative_backend  = inputs.speculative_backend;
     impl->proposal_head        = inputs.proposal_head;
     impl->features             = inputs.features;
@@ -962,7 +984,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->multiprocessor_count = inputs.multiprocessor_count;
     impl->context_cache        = inputs.context_cache;
     impl->kv_storage           = inputs.kv_storage;
-    impl->round_shapes = speculative_round_shapes(inputs.speculative_backend, inputs.draft_window);
+    impl->round_shapes = speculative_round_shapes(inputs.speculative_backend, inputs.draft_window,
+                                                  inputs.ngram_draft_tokens);
     impl->persistent   = persistent_layout(*impl);
     if (!impl->context_cache.host_capacity_bytes) {
         // Default Host capacity covers 8 GiB of KV bytes plus eight complete StateImages.
@@ -1011,8 +1034,9 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
                                                       "MTP exact-b graph allowance");
         } else {
-            const auto class_allowance = [&](std::uint32_t verify_drafts,
+            const auto class_allowance = [&](const SpeculativeRoundShape& shape,
                                              std::uint32_t batch_size) {
+                const std::uint32_t verify_drafts = shape.verify_drafts;
                 const auto profiles = dflash_graph_profiles(
                     impl->speculative_backend, impl->capacity, verify_drafts, batch_size);
                 return graph_topology_allowance(
@@ -1021,6 +1045,15 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                         const std::uint64_t final_visible = std::min<std::uint64_t>(
                             impl->capacity,
                             static_cast<std::uint64_t>(profile.max) + verify_drafts + 1ULL);
+                        if (shape.kind == SpeculativeRoundKind::Copy) {
+                            // The copy family's executables are captured after the neural
+                            // family's, which already materialized the shared driver execution
+                            // storage the neural classes reserve for. Measured on sm_86 (27B,
+                            // B=1): the whole copy family adds 24 MiB of device memory at 8K
+                            // context and 79 MiB at 172K (six classes), and the neural family
+                            // grows by 24 MiB beside it.
+                            return (final_visible <= 4096 ? 16ULL : 32ULL) * kMiB;
+                        }
                         // Long profiles also materialize driver execution storage; that shared
                         // cost does not shrink with the number of graph executables.
                         return (final_visible <= 4096 ? 64ULL : 192ULL) * kMiB;
@@ -1035,7 +1068,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                      ++batch_size) {
                     impl->graph_allowance_bytes =
                         checked_add(impl->graph_allowance_bytes,
-                                    class_allowance(shape.verify_drafts, batch_size) + 8ULL * kMiB,
+                                    class_allowance(shape, batch_size) + 8ULL * kMiB,
                                     "DFlash exact-b graph allowance");
                 }
             }
@@ -1102,6 +1135,8 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .max_concurrency      = options.max_concurrency,
         .prefill_chunk        = std::min(options.prefill_chunk, options.max_context),
         .draft_window         = options.speculative.draft_tokens,
+        .ngram_draft_tokens   = options.speculative.ngram_draft_tokens,
+        .ngram_min_match      = options.speculative.ngram_min_match,
         .speculative_backend  = options.speculative.backend,
         .kv_storage           = options.kv_cache,
         .proposal_head        = options.speculative.proposal_head,

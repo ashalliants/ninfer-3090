@@ -85,12 +85,13 @@ the idea is obvious and the obstacle is not.
   one acceptance threshold. The curve is flat in the middle, so two points take most of the spread
   for one extra graph and one bit of per-sequence state.
 
-**2. Copy drafting on the DFlash2 path -- in progress.**
-The MTP-only `--lookup-ngram` is removed: it verified at the head's own width, so it could never
-widen a round, and measured equal to off. Its replacement is n-gram copy drafting (indexed
-proposer and tool-result de-numbering ported from Infernix), which pays only by verifying a copy
-*wider* than the neural window -- at K=7 acceptance is 0.95, which caps a perfect same-width drafter
-at **+19%**, so the width is the prize, not the source of the drafts.
+**2. Copy drafting on the DFlash2 path -- one lane done, two lanes next.**
+`--ngram-draft-tokens 15` verifies n-gram copies in 16-column rounds beside DFlash2 at one lane:
++38% decode on the agent replay, up to +77% on turns that return a file, -0.7% on output that never
+copies (performance.md). Open: copies above one lane (drafter at K plus overlay, and a gate on
+how long a copy must be before a whole batch pays 16 columns); attributing and removing the -0.7%;
+whether the agent launcher should turn it on by default. Windows of 31/63 are not worth the Op work
+on this card (their prefill proxy costs 2-8x an 8-token chunk).
 
 ## Open after the 2026-09-17 upstream catch-up (v3 artifacts, `src/models/qwen3_5`)
 

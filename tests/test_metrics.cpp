@@ -41,6 +41,9 @@ int main() {
     running.generated_tokens += 5;
     running.speculative_draft_tokens += 6;
     running.speculative_accepted_tokens = 3;
+    running.speculative_ngram_rounds          = 2;
+    running.speculative_ngram_draft_tokens    = 30;
+    running.speculative_ngram_accepted_tokens = 28;
     running.running_requests            = 1;
     running.host_context_occupied_bytes = 4096;
     running.host_context_reserved_bytes = 1024;
@@ -50,6 +53,10 @@ int main() {
           "live generated count must exclude startup warmup");
     check(live.find("ninfer_spec_decode_draft_tokens_total 6\n") != std::string::npos,
           "speculative work must be observable before request completion");
+    check(live.find("ninfer_spec_decode_ngram_rounds_total 2\n") != std::string::npos &&
+              live.find("ninfer_spec_decode_ngram_draft_tokens_total 30\n") != std::string::npos &&
+              live.find("ninfer_spec_decode_ngram_accepted_tokens_total 28\n") != std::string::npos,
+          "n-gram copy rounds must be exported with the speculative counters");
     check(live.find("ninfer_time_to_first_token_seconds_count 1\n") != std::string::npos &&
               live.find("ninfer_requests_total{outcome=\"completed\"} 0\n") != std::string::npos,
           "TTFT must be visible before completion");

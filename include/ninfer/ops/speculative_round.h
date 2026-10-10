@@ -58,6 +58,36 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
                                     cudaStream_t stream);
 
 /**
+ * Op: speculative_overlay_copy_proposals
+ *
+ * Math / indexing:
+ *   For each row b with copy_rows[b] != 0 and 0<=j<K, let t = copy_drafts[j,b]:
+ *     drafts[j,b]       = t;
+ *     candidates[s,j,b] = (t + s) mod token_domain        for 0<=s<16, when the sparse planes are
+ *     proposal_q[s,j,b] = 1 when s == 0, otherwise 0       present.
+ *   That is the deterministic proposal t written as a one-hot sparse law: candidate 0 is t with
+ *   q = 1, and the other 15 candidates are distinct ids different from t with q = 0, which is
+ *   the sparse verifier's representation of an exact draft. Rows with copy_rows[b] == 0 are left
+ *   unchanged.
+ *
+ * Logical shapes:
+ *   All tensors are contiguous. copy_rows is I32 [B]; copy_drafts and drafts are I32 [K,B];
+ *   candidates is I32 [16,K,B] and proposal_q is FP32 [16,K,B], or both are empty (a verifier
+ *   without sparse planes). K>=1 and B in [1,8]. With sparse planes, token_domain >= 16 and every
+ *   copy_drafts value of a flagged row is in [0,token_domain). Inputs and outputs do not overlap.
+ *
+ * Effects:
+ *   Exact element writes; inputs remain unchanged. The row selection is read on the device, so one
+ *   captured launch serves any mixture of copied and unchanged rows.
+ *
+ * Workspace:
+ *   None.
+ */
+void speculative_overlay_copy_proposals(const Tensor& copy_rows, const Tensor& copy_drafts,
+                                        Tensor& drafts, Tensor& candidates, Tensor& proposal_q,
+                                        std::int32_t token_domain, cudaStream_t stream);
+
+/**
  * Op: speculative_accept_greedy_drafts
  *
  * Algorithm:

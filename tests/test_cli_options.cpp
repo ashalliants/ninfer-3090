@@ -169,6 +169,41 @@ int main() {
                                        "--lookup-ngram", "5"});
                       }) && help.find("--lookup-ngram") == std::string::npos,
                       "CLI still accepts or advertises the removed --lookup-ngram");
+    // N-gram copy drafting: off by default, 15 is the only window, and it rides DFlash2.
+    failures += check(route_defaults.speculative.ngram_draft_tokens == 0 &&
+                          route_defaults.speculative.ngram_min_match == 12,
+                      "n-gram copy drafting is on by default or its minimum match moved");
+    const ninfer::cli::Options ngram =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "dflash2",
+               "--draft-tokens", "7", "--ngram-draft-tokens", "15", "--ngram-min-match", "8"});
+    failures += check(ngram.speculative.ngram_draft_tokens == 15 &&
+                          ngram.speculative.ngram_min_match == 8,
+                      "CLI did not parse the n-gram copy controls");
+    for (const char* window : {"7", "16", "31", "63"}) {
+        failures += check(rejects([window] {
+                              (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                           "--spec", "dflash2", "--draft-tokens", "7",
+                                           "--ngram-draft-tokens", window});
+                          }),
+                          "CLI accepted an n-gram copy window other than 0 or 15");
+    }
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
+                                       "mtp", "--draft-tokens", "3", "--ngram-draft-tokens",
+                                       "15"});
+                      }) && rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--ngram-draft-tokens", "15"});
+                      }),
+                      "CLI accepted n-gram copy drafting without DFlash2");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--ngram-min-match", "3"});
+                      }),
+                      "CLI accepted an n-gram minimum match below 4");
+    failures += check(help.find("--ngram-draft-tokens") != std::string::npos &&
+                          help.find("--ngram-min-match") != std::string::npos,
+                      "CLI help omits the n-gram copy controls");
     const ninfer::cli::Options logging =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--log-level", "debug"});
     failures += check(logging.log_level == ninfer::product::LogLevel::Debug,

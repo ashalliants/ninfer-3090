@@ -38,6 +38,30 @@ __global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* anc
     }
 }
 
+// One block per row. A flagged row takes the copy as its drafts and, with sparse planes, the
+// one-hot law of each copied token over 16 distinct candidate ids.
+__global__ void speculative_overlay_copy_proposals_kernel(
+    const std::int32_t* copy_rows, const std::int32_t* copy_drafts, std::int32_t* drafts,
+    std::int32_t* candidates, float* proposal_q, std::int32_t k, std::int32_t token_domain) {
+    const int row = static_cast<int>(blockIdx.x);
+    if (copy_rows[row] == 0) { return; }
+    const std::int32_t* source = copy_drafts + static_cast<std::size_t>(row) * k;
+    for (int j = static_cast<int>(threadIdx.x); j < k; j += static_cast<int>(blockDim.x)) {
+        drafts[static_cast<std::size_t>(row) * k + j] = source[j];
+    }
+    if (candidates == nullptr) { return; }
+    const int planes = k * kSparseSpeculativeCandidates;
+    for (int i = static_cast<int>(threadIdx.x); i < planes; i += static_cast<int>(blockDim.x)) {
+        const int step      = i / kSparseSpeculativeCandidates;
+        const int slot      = i - step * kSparseSpeculativeCandidates;
+        std::int32_t id     = source[step] + slot;
+        id                  = id >= token_domain ? id - token_domain : id;
+        const std::size_t o = static_cast<std::size_t>(row) * planes + i;
+        candidates[o]       = id;
+        proposal_q[o]       = slot == 0 ? 1.0F : 0.0F;
+    }
+}
+
 template <typename T>
 __device__ inline T* speculative_workspace_offset(T* ptr, std::size_t byte_offset) {
     return ptr == nullptr

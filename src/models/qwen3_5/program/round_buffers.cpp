@@ -367,6 +367,9 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
         ingress_tensor(offsetof(DFlashDecodeIngress, state_destination_slots), DType::I32, {batch});
     sampling = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) + offsetof(DFlashDecodeIngress, sampling));
+    copy_rows = ingress_tensor(offsetof(DFlashDecodeIngress, copy_rows), DType::I32, {batch});
+    copy_drafts =
+        ingress_tensor(offsetof(DFlashDecodeIngress, copy_drafts), DType::I32, {drafts, batch});
     licensed_tokens =
         egress_tensor(offsetof(DFlashDecodeEgress, licensed_tokens), DType::I32, {width, batch});
     licensed_counts =
@@ -399,7 +402,9 @@ DFlashDecodeState DFlashDecodeState::narrowed(std::uint32_t k) const {
                            &result.verify_positions, &result.verify_ids, &result.target_argmax}) {
         *tensor = Tensor(tensor->data, tensor->dtype, {width, rows});
     }
-    result.draft_tokens = Tensor(draft_tokens.data, draft_tokens.dtype, {drafts, rows});
+    for (Tensor* tensor : {&result.draft_tokens, &result.copy_drafts}) {
+        *tensor = Tensor(tensor->data, tensor->dtype, {drafts, rows});
+    }
     for (Tensor* tensor : {&result.target_hidden, &result.target_logits}) {
         *tensor = Tensor(tensor->data, tensor->dtype, {tensor->ne[0], width, rows});
     }

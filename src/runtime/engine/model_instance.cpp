@@ -163,7 +163,8 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
                                .media_preprocess_threads = options.media_preprocess_threads,
                                .vision_max_merged_tokens = options.vision_max_merged_tokens,
                                .grafts                   = models::qwen3_5::load_prompt_grafts(
-                                   options.grafts, model->config().text)})),
+                                   options.grafts, model->config().text),
+                               .ngram_index = options.speculative.ngram_draft_tokens != 0})),
       capacity(options.max_context) {}
 
 ModelInstance::~ModelInstance() = default;

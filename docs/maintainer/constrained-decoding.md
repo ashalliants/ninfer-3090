@@ -590,7 +590,11 @@ Runtime integrity 错误不被包装成用户 schema 错误。例如 row members
 B × (K+1) × ceil(V/32) × 4 bytes
 ```
 
-V=262144 的示例中，一行32 KiB；B=8、K=15 时4 MiB。Host/Device 分别占用，另加少量位置状态和 draft IDs。这里是容量估算，不是实际传输耗时。
+其中 K 是最宽 round family 的 `verify_drafts`：`--ngram-draft-tokens 15` 时为 15（copy round 16
+列），即使 draft window 是 7。V=262144 的示例中，一行32 KiB；B=8、K=15 时4 MiB；单 lane 的
+DFlash2 K7 + NG15 为 16 × 32 KiB = 512 KiB。Copy round 与 neural round 走同一条 mask 路径：Forward
+发布本轮被验证的 draft（copy 或 neural），CPU 据此填 mask；被 grammar 禁止的 copy token 的 target
+p 为 0，按 one-hot q 必然被拒绝。Host/Device 分别占用，另加少量位置状态和 draft IDs。这里是容量估算，不是实际传输耗时。
 
 核心优化选择：词表和编译复用；按请求推进 matcher；没有每轮完整输出重放；mask buffer 预分配；GPU 中直接消费位图；speculative CPU mask 与 target forward 重叠；约束与无约束共享两段执行。
 

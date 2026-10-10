@@ -5,6 +5,7 @@
 #include <string_view>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -891,6 +892,162 @@ struct SparseAcceptSuite {
             targets, logits, drafts, ids, q, extents, lengths, anchors, configs, history, {false});
     }
 
+    // An n-gram copy is verified as a one-hot sparse law (speculative_overlay_copy_proposals). At
+    // T>0 a copied token d is accepted with probability p(d) and a rejection samples (p-q)+, so the
+    // first committed token must follow the target law p whatever the copy is. Every row and trial
+    // is checked against the exact oracle for the first trials, and the empirical law of the
+    // first committed token over all trials against p. `masked` excludes the copied token from
+    // the grammar mask, so p(d) = 0 and the copy is always rejected.
+    int copy_law_case(bool masked) {
+        constexpr int kTokens[] = {1000, 1001, 1002, 1003};
+        constexpr double kLaw[] = {0.5, 0.25, 0.15, 0.10};
+        const int copied        = kTokens[0];
+        std::vector<std::uint16_t> logits(static_cast<std::size_t>(kSparsePhysicalRows) *
+                                              kSparseColumns * kSparseBatch,
+                                          f32_to_bf16(-1.0e4F));
+        for (int row = 0; row < kSparseBatch; ++row)
+            for (int col = 0; col < kSparseColumns; ++col) {
+                for (int t = 0; t < 4; ++t)
+                    logits[sparse_logit_index(row, col, kTokens[t])] =
+                        f32_to_bf16(static_cast<float>(std::log(kLaw[t])));
+                for (int v = kSparseTokenDomain; v < kSparsePhysicalRows; ++v)
+                    logits[sparse_logit_index(row, col, v)] = f32_to_bf16(100.0F);
+            }
+        masks.clear();
+        if (masked) {
+            masks.assign(static_cast<std::size_t>(kSparseColumns) * kSparseBatch * mask_words,
+                         0xffffffffU);
+            for (int row = 0; row < kSparseBatch; ++row)
+                for (int col = 0; col < kSparseColumns; ++col)
+                    masks[(row * kSparseColumns + col) * mask_words + copied / 32] &=
+                        ~(1U << (copied % 32));
+        }
+        std::vector<std::int32_t> copy(static_cast<std::size_t>(kSparseDrafts) * kSparseBatch,
+                                       copied);
+        std::vector<std::int32_t> rows(kSparseBatch, 1), extents(kSparseBatch, kSparseDrafts),
+            targets(kSparseColumns * kSparseBatch, copied);
+        std::vector<std::int32_t> token_counts(
+            static_cast<std::size_t>(kSparseTokenDomain) * kSparseBatch, 0);
+
+        DeviceBuffer d_logits = to_device(logits), d_targets = to_device(targets);
+        DeviceBuffer d_rows = to_device(rows), d_copy = to_device(copy);
+        DeviceBuffer d_extents = to_device(extents);
+        DeviceBuffer d_drafts(copy.size() * sizeof(std::int32_t));
+        DeviceBuffer d_candidates(static_cast<std::size_t>(kSparseCandidates) * copy.size() *
+                                  sizeof(std::int32_t));
+        DeviceBuffer d_q(static_cast<std::size_t>(kSparseCandidates) * copy.size() *
+                         sizeof(float));
+        d_candidates.fill(0xff);
+        d_q.fill(0);
+        Tensor rows_tensor(d_rows.p, DType::I32, {kSparseBatch});
+        Tensor copy_tensor(d_copy.p, DType::I32, {kSparseDrafts, kSparseBatch});
+        Tensor drafts_tensor(d_drafts.p, DType::I32, {kSparseDrafts, kSparseBatch});
+        Tensor candidate_tensor(d_candidates.p, DType::I32,
+                                {kSparseCandidates, kSparseDrafts, kSparseBatch});
+        Tensor q_tensor(d_q.p, DType::FP32, {kSparseCandidates, kSparseDrafts, kSparseBatch});
+        ops::speculative_overlay_copy_proposals(rows_tensor, copy_tensor, drafts_tensor,
+                                                candidate_tensor, q_tensor, kSparseTokenDomain,
+                                                nullptr);
+        cuda_synchronize();
+        const auto drafts        = from_device<std::int32_t>(d_drafts, copy.size());
+        const auto candidate_ids = from_device<std::int32_t>(d_candidates, static_cast<std::size_t>(candidate_tensor.numel()));
+        const auto proposal_q    = from_device<float>(d_q, static_cast<std::size_t>(q_tensor.numel()));
+
+        std::optional<DeviceBuffer> d_masks;
+        if (masked) d_masks.emplace(to_device(masks));
+        const std::size_t workspace_bytes =
+            ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
+                kSparseTokenDomain, {false}, kSparseDrafts, kSparseDrafts, kSparseBatch,
+                kSparseBatch);
+        DeviceBuffer scratch(std::max<std::size_t>(workspace_bytes, 1));
+        WorkspaceArena workspace(DeviceSpan{scratch.p, scratch.bytes});
+        DeviceBuffer d_lengths(kSparseBatch * sizeof(std::int32_t));
+        DeviceBuffer d_anchors(kSparseBatch * sizeof(std::int32_t));
+        DeviceBuffer d_licensed(kSparseColumns * kSparseBatch * sizeof(std::int32_t));
+        DeviceBuffer d_counts(kSparseBatch * sizeof(std::int32_t));
+        DeviceBuffer d_accepted(kSparseBatch * sizeof(std::int32_t));
+        Tensor targets_tensor(d_targets.p, DType::I32, {kSparseColumns, kSparseBatch});
+        Tensor logits_tensor(d_logits.p, DType::BF16,
+                             {kSparsePhysicalRows, kSparseColumns, kSparseBatch});
+        Tensor extent_tensor(d_extents.p, DType::I32, {kSparseBatch});
+        Tensor lengths_tensor(d_lengths.p, DType::I32, {kSparseBatch});
+        Tensor anchors_tensor(d_anchors.p, DType::I32, {kSparseBatch});
+        Tensor licensed_tensor(d_licensed.p, DType::I32, {kSparseColumns, kSparseBatch});
+        Tensor counts_tensor(d_counts.p, DType::I32, {kSparseBatch});
+        Tensor accepted_tensor(d_accepted.p, DType::I32, {kSparseBatch});
+
+        constexpr int kTrials       = 256;
+        constexpr int kOracleTrials = 6;
+        const std::string label = std::string("copy one-hot law K=") +
+                                  std::to_string(kSparseDrafts) + (masked ? " masked" : "");
+        std::array<int, 4> first{};
+        int other    = 0;
+        int failures = 0;
+        for (int trial = 0; trial < kTrials; ++trial) {
+            std::vector<ops::SamplingConfig> configs(kSparseBatch);
+            std::vector<std::int32_t> lengths(kSparseBatch);
+            for (int row = 0; row < kSparseBatch; ++row) {
+                configs[row].temperature = 1.0F;
+                configs[row].top_k       = 20;
+                configs[row].top_p       = 1.0F;
+                configs[row].seed        = 0x5eed0000ULL + 131ULL * trial + row;
+                lengths[row]             = 3000 + 17 * row + trial;
+            }
+            std::vector<ops::SamplingConfig> device_configs = configs;
+            if (masked)
+                for (int row = 0; row < kSparseBatch; ++row)
+                    device_configs[row].mask = {static_cast<const std::uint32_t*>(d_masks->p) +
+                                                    row * kSparseColumns * mask_words,
+                                                mask_words};
+            DeviceBuffer d_configs = to_device(device_configs);
+            d_lengths.copy_from_host(lengths.data(), d_lengths.bytes);
+            ops::speculative_accept_sparse_drafts(
+                targets_tensor, logits_tensor, drafts_tensor, candidate_tensor, q_tensor,
+                extent_tensor, lengths_tensor, anchors_tensor, licensed_tensor, counts_tensor,
+                accepted_tensor, kSparseTokenDomain,
+                static_cast<const ops::SamplingConfig*>(d_configs.p), {false}, workspace, nullptr);
+            cuda_synchronize();
+            const auto licensed =
+                from_device<std::int32_t>(d_licensed, kSparseColumns * kSparseBatch);
+            if (trial < kOracleTrials) {
+                const SparseExpected expected =
+                    sparse_accept_oracle(logits, drafts, candidate_ids, proposal_q, extents,
+                                         lengths, configs, token_counts);
+                failures += verify_exact((label + " oracle tokens").c_str(), licensed,
+                                         expected.licensed_tokens);
+                failures += verify_exact((label + " oracle counts").c_str(),
+                                         from_device<std::int32_t>(d_counts, kSparseBatch),
+                                         expected.licensed_counts);
+            }
+            for (int row = 0; row < kSparseBatch; ++row) {
+                const int token = licensed[static_cast<std::size_t>(row) * kSparseColumns];
+                const int index = static_cast<int>(
+                    std::find(std::begin(kTokens), std::end(kTokens), token) - std::begin(kTokens));
+                if (index < 4) ++first[index]; else ++other;
+            }
+        }
+        // The target law over the four tokens, renormalized without the masked copy.
+        const double samples = static_cast<double>(kTrials) * kSparseBatch;
+        const double total   = masked ? 1.0 - kLaw[0] : 1.0;
+        for (int t = 0; t < 4; ++t) {
+            const double p         = masked && t == 0 ? 0.0 : kLaw[t] / total;
+            const double frequency = first[t] / samples;
+            const double tolerance = 5.0 * std::sqrt(std::max(p * (1.0 - p), 1e-6) / samples) +
+                                     0.01;
+            if (std::abs(frequency - p) > tolerance) {
+                std::cerr << label << ": first-token frequency " << frequency << " for token "
+                          << kTokens[t] << " is outside " << p << " +- " << tolerance << '\n';
+                ++failures;
+            }
+        }
+        if (other != 0) {
+            std::cerr << label << ": committed a token outside the target support\n";
+            ++failures;
+        }
+        masks.clear();
+        return failures;
+    }
+
     int sparse_general_mixed_case() {
         std::vector<std::int32_t> targets(kSparseColumns * kSparseBatch);
         std::vector<std::uint16_t> logits(static_cast<std::size_t>(kSparsePhysicalRows) *
@@ -1627,8 +1784,173 @@ int masked_sparse_accept_case(bool sampling) {
     return failures;
 }
 
+// speculative_overlay_copy_proposals against an exact host scatter: copied rows take the copy and
+// its one-hot sparse law, the other rows and every guard byte stay untouched. Copy tokens near the
+// end of the domain exercise the candidate wrap. A captured launch replays with a different row
+// selection and different copies.
+int overlay_copy_case(int k, int batch, bool sparse) {
+    constexpr int kDomain = kSparseTokenDomain;
+    const std::string label = "overlay K=" + std::to_string(k) + " B=" + std::to_string(batch) +
+                              (sparse ? " sparse" : " dense");
+    const std::size_t plane = static_cast<std::size_t>(kSparseCandidates) * k * batch;
+    std::vector<std::int32_t> initial_drafts(static_cast<std::size_t>(k) * batch);
+    std::vector<std::int32_t> initial_candidates(sparse ? plane : 0);
+    std::vector<float> initial_q(sparse ? plane : 0);
+    for (std::size_t i = 0; i < initial_drafts.size(); ++i)
+        initial_drafts[i] = 7000 + static_cast<std::int32_t>(i);
+    for (std::size_t i = 0; i < initial_candidates.size(); ++i) {
+        initial_candidates[i] = 50000 + static_cast<std::int32_t>(i);
+        initial_q[i]          = 0.0625F;
+    }
+    GuardedDeviceBuffer d_rows(batch * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_copy(initial_drafts.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_drafts(initial_drafts.size() * sizeof(std::int32_t));
+    std::optional<GuardedDeviceBuffer> d_candidates, d_q;
+    if (sparse) {
+        d_candidates.emplace(plane * sizeof(std::int32_t));
+        d_q.emplace(plane * sizeof(float));
+    }
+    Tensor rows(d_rows.data(), DType::I32, {batch});
+    Tensor copy(d_copy.data(), DType::I32, {k, batch});
+    Tensor drafts(d_drafts.data(), DType::I32, {k, batch});
+    Tensor candidates = sparse ? Tensor(d_candidates->data(), DType::I32,
+                                        {kSparseCandidates, k, batch})
+                               : Tensor{};
+    Tensor q = sparse ? Tensor(d_q->data(), DType::FP32, {kSparseCandidates, k, batch}) : Tensor{};
+
+    DeviceContext context;
+    const auto launch = [&] {
+        ops::speculative_overlay_copy_proposals(rows, copy, drafts, candidates, q, kDomain,
+                                                context.stream);
+    };
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable graph;
+    int failures = 0;
+    for (int pass = 0; pass < 3; ++pass) {
+        std::vector<std::int32_t> copy_rows(batch), copy_drafts(initial_drafts.size());
+        for (int b = 0; b < batch; ++b) copy_rows[b] = ((b + pass) % 3) != 1 ? 1 : 0;
+        if (batch == 1) copy_rows[0] = pass == 1 ? 0 : 1;
+        for (int b = 0; b < batch; ++b)
+            for (int j = 0; j < k; ++j)
+                copy_drafts[b * k + j] = (b + j + pass) % 4 == 0
+                                             ? kDomain - 1 - ((j + pass) % 16)
+                                             : 100 + 977 * b + 31 * j + 5 * pass;
+        initialize(d_rows, copy_rows);
+        initialize(d_copy, copy_drafts);
+        initialize(d_drafts, initial_drafts);
+        if (sparse) {
+            initialize(*d_candidates, initial_candidates);
+            initialize(*d_q, initial_q);
+        }
+        cuda_synchronize();
+        if (pass == 0) {
+            launch();
+        } else {
+            if (!graph.ready()) {
+                definition.capture(context.stream, launch);
+                graph.instantiate(definition);
+            }
+            graph.launch(context.stream);
+        }
+        context.synchronize();
+
+        std::vector<std::int32_t> expected_drafts = initial_drafts;
+        std::vector<std::int32_t> expected_candidates = initial_candidates;
+        std::vector<float> expected_q                 = initial_q;
+        for (int b = 0; b < batch; ++b) {
+            if (copy_rows[b] == 0) continue;
+            for (int j = 0; j < k; ++j) {
+                const std::int32_t token = copy_drafts[b * k + j];
+                expected_drafts[b * k + j] = token;
+                if (!sparse) continue;
+                for (int s = 0; s < kSparseCandidates; ++s) {
+                    const std::size_t index =
+                        (static_cast<std::size_t>(b) * k + j) * kSparseCandidates + s;
+                    expected_candidates[index] = static_cast<std::int32_t>(
+                        (static_cast<std::int64_t>(token) + s) % kDomain);
+                    expected_q[index] = s == 0 ? 1.0F : 0.0F;
+                }
+            }
+        }
+        const std::string phase = label + " pass " + std::to_string(pass);
+        failures += verify_exact((phase + " drafts").c_str(),
+                                 read<std::int32_t>(d_drafts, expected_drafts.size()),
+                                 expected_drafts);
+        if (sparse) {
+            const auto got_candidates = read<std::int32_t>(*d_candidates, plane);
+            failures += verify_exact((phase + " candidates").c_str(), got_candidates,
+                                     expected_candidates);
+            failures += verify_exact((phase + " q").c_str(), read<float>(*d_q, plane), expected_q);
+            // The law the sparse verifier requires: distinct in-domain ids, the copy at q = 1.
+            for (int b = 0; b < batch; ++b) {
+                if (copy_rows[b] == 0) continue;
+                for (int j = 0; j < k; ++j) {
+                    const std::size_t base =
+                        (static_cast<std::size_t>(b) * k + j) * kSparseCandidates;
+                    std::vector<std::int32_t> ids(got_candidates.begin() + base,
+                                                  got_candidates.begin() + base +
+                                                      kSparseCandidates);
+                    std::sort(ids.begin(), ids.end());
+                    if (std::adjacent_find(ids.begin(), ids.end()) != ids.end() ||
+                        ids.front() < 0 || ids.back() >= kDomain) {
+                        std::cerr << phase << ": candidate ids are not a distinct in-domain set\n";
+                        ++failures;
+                    }
+                }
+            }
+        }
+        failures += verify_exact((phase + " rows readonly").c_str(),
+                                 read<std::int32_t>(d_rows, copy_rows.size()), copy_rows);
+        failures += verify_exact((phase + " copy readonly").c_str(),
+                                 read<std::int32_t>(d_copy, copy_drafts.size()), copy_drafts);
+    }
+    failures += d_rows.verify_guards(label + " rows");
+    failures += d_copy.verify_guards(label + " copy");
+    failures += d_drafts.verify_guards(label + " drafts");
+    if (sparse) {
+        failures += d_candidates->verify_guards(label + " candidates");
+        failures += d_q->verify_guards(label + " q");
+    }
+    return failures;
+}
+
+int overlay_copy_contract_case() {
+    int failures = 0;
+    DeviceBuffer rows = to_device(std::vector<std::int32_t>(9, 1));
+    DeviceBuffer ids  = to_device(std::vector<std::int32_t>(16 * 15 * 9, 0));
+    DeviceBuffer qs   = to_device(std::vector<float>(16 * 15 * 9, 0.0F));
+    const auto rejects = [&](const char* what, auto&& call) {
+        try {
+            call();
+            std::cerr << "overlay accepted " << what << '\n';
+            ++failures;
+        } catch (const std::invalid_argument&) {}
+    };
+    rejects("B=9", [&] {
+        Tensor r(rows.p, DType::I32, {9}), c(ids.p, DType::I32, {15, 9}),
+            d(ids.p, DType::I32, {15, 9}), none{};
+        ops::speculative_overlay_copy_proposals(r, c, d, none, none, kSparseTokenDomain, nullptr);
+    });
+    rejects("one sparse plane", [&] {
+        Tensor r(rows.p, DType::I32, {1}), c(ids.p, DType::I32, {15, 1}),
+            d(ids.p, DType::I32, {15, 1}), cand(ids.p, DType::I32, {16, 15, 1}), none{};
+        ops::speculative_overlay_copy_proposals(r, c, d, cand, none, kSparseTokenDomain, nullptr);
+    });
+    rejects("a domain smaller than the candidates", [&] {
+        Tensor r(rows.p, DType::I32, {1}), c(ids.p, DType::I32, {15, 1}),
+            d(ids.p, DType::I32, {15, 1}), cand(ids.p, DType::I32, {16, 15, 1}),
+            q(qs.p, DType::FP32, {16, 15, 1});
+        ops::speculative_overlay_copy_proposals(r, c, d, cand, q, 15, nullptr);
+    });
+    return failures;
+}
+
 int transforms_conformance() {
     int failures = 0;
+    for (int k = 1; k <= 15; ++k)
+        for (int batch = 1; batch <= 8; ++batch)
+            for (bool sparse : {false, true}) failures += overlay_copy_case(k, batch, sparse);
+    failures += overlay_copy_contract_case();
     for (int k = 1; k <= 15; ++k)
         for (int batch : {1, 8}) failures += prepare_verify_case(k, batch);
     for (int width = 2; width <= 16; ++width)
@@ -1727,6 +2049,13 @@ int main(int argc, char** argv) {
     }
     failures += masked_sparse_accept_case(false);
     failures += masked_sparse_accept_case(true);
+    // n-gram copies: the one-hot law keeps the target law at T>0, and a grammar-illegal copy is
+    // always rejected through its masked p.
+    for (int k : {1, 15}) {
+        for (bool masked : {false, true}) {
+            failures += SparseAcceptSuite(k, 8).copy_law_case(masked);
+        }
+    }
     for (int k : {1, 7, 15}) {
         SparseAcceptSuite suite(k, 8);
         failures += suite.sparse_general_mixed_case();

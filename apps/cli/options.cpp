@@ -140,6 +140,7 @@ std::string usage_text(const char* argv0) {
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N] [--devices N,M,...] [--stage-layers A,B,...]\n"
            "       [--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N]\n"
+           "       [--ngram-draft-tokens 0|15] [--ngram-min-match N]\n"
            "       [--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4]\n"
            "       [--gdn-state-fp16] [--mlp-a8-decode] [--no-prefill-a8]\n"
            "       [--prefill-cublas [--no-prefill-cublas-projections]]\n"
@@ -183,6 +184,12 @@ std::string usage_text(const char* argv0) {
            "perplexity cost (docs/performance.md), off by default, and it wants a larger "
            "--prefill-chunk to pay. --no-prefill-cublas-projections keeps the attention and GDN "
            "input projections off that route.\n"
+           "--ngram-draft-tokens 15 adds n-gram copy drafting beside --spec dflash2: when the "
+           "text being written already appeared in the request (a tool result, the prompt or the "
+           "output so far), a round verifies up to 15 copied tokens instead of the draft model's "
+           "proposal. Verification licenses every token, so a wrong copy costs speed, never "
+           "output. 0 (the default) disables it; --ngram-min-match N (4..64, default 12) is how "
+           "many tokens must match before a copy is proposed.\n"
            "--kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom.\n"
@@ -247,6 +254,10 @@ Options parse_options(int argc, char** argv) {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
+        } else if (arg == "--ngram-draft-tokens") {
+            options.speculative.ngram_draft_tokens = parse_u32(value(arg), "ngram-draft-tokens", true);
+        } else if (arg == "--ngram-min-match") {
+            options.speculative.ngram_min_match = parse_u32(value(arg), "ngram-min-match");
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--lm-head-q4") {

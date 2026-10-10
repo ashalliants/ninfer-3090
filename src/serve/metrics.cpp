@@ -260,6 +260,12 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
             "Draft tokens accepted by native verification.");
     COUNTER(speculative_fallback_steps, "spec_decode_fallback_steps_total",
             "Speculative fallback steps without drafts.");
+    COUNTER(speculative_ngram_rounds, "spec_decode_ngram_rounds_total",
+            "Speculative rounds that verified an n-gram copy.");
+    COUNTER(speculative_ngram_draft_tokens, "spec_decode_ngram_draft_tokens_total",
+            "N-gram copy tokens evaluated by native verification.");
+    COUNTER(speculative_ngram_accepted_tokens, "spec_decode_ngram_accepted_tokens_total",
+            "N-gram copy tokens accepted by native verification.");
     GAUGE(device_state_occupied_slots, "device_state_used_slots",
           "Occupied device StateImage slots.");
     gauge("device_state_capacity_slots",

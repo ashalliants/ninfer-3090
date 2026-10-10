@@ -93,6 +93,9 @@ struct SequencePlanningInputs {
     std::uint32_t max_concurrency           = 1;
     std::uint32_t prefill_chunk             = 0;
     std::uint32_t draft_window              = 0;
+    // N-gram copy drafting: the copy window (0 when off) and the tail match it requires.
+    std::uint32_t ngram_draft_tokens        = 0;
+    std::uint32_t ngram_min_match           = 0;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
     ProposalHead proposal_head              = ProposalHead::Full;
@@ -112,6 +115,9 @@ struct SequencePlanImpl {
     std::uint32_t max_concurrency           = 1;
     std::uint32_t prefill_chunk             = 0;
     std::uint32_t draft_window              = 0;
+    // N-gram copy drafting: the copy window (0 when off) and the tail match it requires.
+    std::uint32_t ngram_draft_tokens        = 0;
+    std::uint32_t ngram_min_match           = 0;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
     ProposalHead proposal_head              = ProposalHead::Full;

@@ -204,6 +204,10 @@ SpeculativeStats aggregate_speculative(const TestResult& result) {
         out.drafted_tokens += in.drafted_tokens;
         out.accepted_tokens += in.accepted_tokens;
         out.fallback_steps += in.fallback_steps;
+        out.ngram_draft_tokens = std::max(out.ngram_draft_tokens, in.ngram_draft_tokens);
+        out.ngram_rounds += in.ngram_rounds;
+        out.ngram_drafted_tokens += in.ngram_drafted_tokens;
+        out.ngram_accepted_tokens += in.ngram_accepted_tokens;
         if (out.accepted_per_position.size() < in.accepted_per_position.size()) {
             out.accepted_per_position.resize(in.accepted_per_position.size());
         }
@@ -264,6 +268,10 @@ void append_speculative_json(std::ostringstream& out, const SpeculativeStats& st
         << indent << "  \"drafted_tokens\": " << stats.drafted_tokens << ",\n"
         << indent << "  \"accepted_tokens\": " << stats.accepted_tokens << ",\n"
         << indent << "  \"fallback_steps\": " << stats.fallback_steps << ",\n"
+        << indent << "  \"ngram_draft_tokens\": " << stats.ngram_draft_tokens << ",\n"
+        << indent << "  \"ngram_rounds\": " << stats.ngram_rounds << ",\n"
+        << indent << "  \"ngram_drafted_tokens\": " << stats.ngram_drafted_tokens << ",\n"
+        << indent << "  \"ngram_accepted_tokens\": " << stats.ngram_accepted_tokens << ",\n"
         << indent << "  \"acceptance_rate\": ";
     if (stats.drafted_tokens == 0) {
         out << "null";
@@ -344,6 +352,8 @@ std::string usage_text(std::string_view program) {
         << "  --draft-tokens <n>         MTP, DFlash, DFlash2: 1..15\n"
         << "  --lm-head-draft             use the optimized proposal head; requires a speculative "
            "backend\n"
+        << "  --ngram-draft-tokens <0|15> n-gram copy drafting beside DFlash2 (default: 0, off)\n"
+        << "  --ngram-min-match <n>       tokens a copy must match first, 4..64 (default: 12)\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
         << "  --no-cuda-graph             use eager decode\n"
         << "  --no-prefill-a8             full prefill tiles keep their A16 routes\n"
@@ -423,6 +433,12 @@ BenchOptions parse_args(int argc, char** argv) {
             options.speculative.backend = product::parse_speculative_backend(value("--spec"));
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value("--draft-tokens"), "draft-tokens");
+        } else if (arg == "--ngram-draft-tokens") {
+            options.speculative.ngram_draft_tokens =
+                parse_u32(value("--ngram-draft-tokens"), "ngram-draft-tokens", true);
+        } else if (arg == "--ngram-min-match") {
+            options.speculative.ngram_min_match =
+                parse_u32(value("--ngram-min-match"), "ngram-min-match");
         } else if (arg == "--no-prefill-a8") {
             options.prefill_a8 = false;
         } else if (arg == "--prefill-cublas") {
@@ -466,6 +482,9 @@ BenchOptions parse_args(int argc, char** argv) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
     product::validate_speculative_cli_options(options.speculative);
+    if (options.speculative.ngram_draft_tokens != 0 && options.concurrency > 1) {
+        throw std::invalid_argument("--ngram-draft-tokens needs --concurrency 1 for now");
+    }
     return options;
 }
 
@@ -692,7 +711,8 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << " spec=" << product::speculative_backend_name(env.speculative.backend)
         << " draft_tokens=" << env.speculative.draft_tokens
         << " proposal_head=" << proposal_head_name(env.speculative.proposal_head)
-        << " decode_path=" << decode_path_name(env.use_cuda_graph, env.speculative)
+        << " ngram_draft_tokens=" << env.speculative.ngram_draft_tokens
+        << " ngram_min_match=" << env.speculative.ngram_min_match << " decode_path=" << decode_path_name(env.use_cuda_graph, env.speculative)
         << " graph_prime="
         << (env.decode_graph_primed
                 ? std::to_string(env.decode_graph_prime_output_tokens) + " outputs"
@@ -736,6 +756,21 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
     };
     print_row(headings);
     for (const auto& row : rows) { print_row(row); }
+    if (env.speculative.ngram_draft_tokens != 0) {
+        out << "\nn-gram copies (a subset of the spec rounds and acceptance):\n";
+        for (const TestResult& result : results) {
+            const SpeculativeStats spec = aggregate_speculative(result);
+            out << "  " << result.test.label << ": rounds " << spec.ngram_rounds << ", accepted "
+                << spec.ngram_accepted_tokens << '/' << spec.ngram_drafted_tokens;
+            if (spec.ngram_drafted_tokens != 0) {
+                out << " ("
+                    << number(static_cast<double>(spec.ngram_accepted_tokens) /
+                              static_cast<double>(spec.ngram_drafted_tokens))
+                    << ')';
+            }
+            out << '\n';
+        }
+    }
     return out.str();
 }
 
@@ -817,6 +852,8 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"speculative_backend\": \""
         << product::speculative_backend_name(env.speculative.backend) << "\",\n"
         << "    \"draft_tokens\": " << env.speculative.draft_tokens << ",\n"
+        << "    \"ngram_draft_tokens\": " << env.speculative.ngram_draft_tokens << ",\n"
+        << "    \"ngram_min_match\": " << env.speculative.ngram_min_match << ",\n"
         << "    \"proposal_head\": \"" << proposal_head_name(env.speculative.proposal_head)
         << "\",\n"
         << "    \"use_cuda_graph\": " << (env.use_cuda_graph ? "true" : "false") << ",\n"
@@ -922,6 +959,7 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
            "cuda_graph_allowance_bytes,"
            "workspace_peak_bytes,workspace_allocator_peak_bytes,"
            "spec_rounds,spec_fallback_steps,spec_acceptance_rate,"
+           "ngram_draft_tokens,ngram_rounds,ngram_drafted_tokens,ngram_accepted_tokens,"
            "repetitions,prefill_tok_s_mean,prefill_tok_s_stddev,decode_output_tok_s_mean,"
            "decode_output_tok_s_stddev,decode_engine_tok_s_mean,decode_engine_tok_s_stddev,"
            "prepare_seconds_mean,prefill_seconds_mean,decode_seconds_mean,total_seconds_mean,"
@@ -964,8 +1002,9 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
                     : std::string())
             << ',' << env.memory.cuda_graph_allowance_bytes << ',' << result.workspace_peak_bytes
             << ',' << result.workspace_allocator_peak_bytes << ',' << spec.rounds << ','
-            << spec.fallback_steps << ',' << acceptance << ','
-            << result.reps.size() / result.concurrency << ',' << mean(prefill_tok_s_series(result))
+            << spec.fallback_steps << ',' << acceptance << ',' << env.speculative.ngram_draft_tokens
+            << ',' << spec.ngram_rounds << ',' << spec.ngram_drafted_tokens << ','
+            << spec.ngram_accepted_tokens << ',' << result.reps.size() / result.concurrency << ',' << mean(prefill_tok_s_series(result))
             << ',' << stddev(prefill_tok_s_series(result)) << ','
             << mean(decode_output_tok_s_series(result)) << ','
             << stddev(decode_output_tok_s_series(result)) << ','

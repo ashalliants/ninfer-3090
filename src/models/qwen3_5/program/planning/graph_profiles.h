@@ -10,8 +10,9 @@ struct DFlashEnvelopes;
 namespace ninfer::models::qwen3_5::detail {
 
 // How a speculative round proposes the drafts it verifies. A neural round verifies the draft
-// model's (MTP or DFlash) own proposal.
-enum class SpeculativeRoundKind : std::uint8_t { Neural };
+// model's (MTP or DFlash) own proposal; a copy round verifies an n-gram copy from the request's own
+// text and, at batch one, does not run the draft model.
+enum class SpeculativeRoundKind : std::uint8_t { Neural, Copy };
 
 // One speculative round family: its proposal kind and the drafts it verifies (verify_drafts + 1
 // target columns). Each family captures its own Forward/Finish graphs for every exact batch size.
@@ -23,9 +24,11 @@ struct SpeculativeRoundShape {
 };
 
 // The round families a Program runs: none without a speculative backend, otherwise one neural
-// family at the configured draft window.
+// family at the configured draft window and, with n-gram copy drafting, one copy family at its
+// window.
 [[nodiscard]] std::vector<SpeculativeRoundShape>
-speculative_round_shapes(SpeculativeBackend backend, std::uint32_t draft_window);
+speculative_round_shapes(SpeculativeBackend backend, std::uint32_t draft_window,
+                         std::uint32_t ngram_draft_tokens);
 // The widest family's verify_drafts, zero without families. Round frames, ReplaySSM records,
 // grammar-mask staging and DFlash pending features are allocated at this width and viewed at each
 // round's own.

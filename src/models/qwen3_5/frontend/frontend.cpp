@@ -830,6 +830,11 @@ const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prom
     return PreparedPromptAccess::view(prompt);
 }
 
+PreparedPromptData& FrontendTestAccess::edit(PreparedPrompt& prompt) {
+    if (!prompt.data_) { throw std::invalid_argument("prepared prompt is empty"); }
+    return *prompt.data_;
+}
+
 PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& control) const {
     fi::check_preparation_control(control);
     const auto start              = Clock::now();

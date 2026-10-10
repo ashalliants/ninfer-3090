@@ -55,6 +55,11 @@ struct GenerationMetrics {
     std::uint64_t speculative_accepted_tokens = 0;
     std::uint64_t speculative_fallback_steps  = 0;
     std::vector<std::uint64_t> speculative_accepted_per_position;
+    // N-gram copy drafting: the window (0 when off) and the copy rounds, a subset of the above.
+    std::uint32_t speculative_ngram_draft_tokens    = 0;
+    std::uint64_t speculative_ngram_rounds          = 0;
+    std::uint64_t speculative_ngram_drafted_tokens  = 0;
+    std::uint64_t speculative_ngram_accepted_tokens = 0;
     std::uint32_t prefix_cache_hit_tokens     = 0;
     ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::Root;
 };

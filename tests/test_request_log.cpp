@@ -445,6 +445,10 @@ int main() {
     outcome.metrics.speculative_accepted_tokens       = 720;
     outcome.metrics.speculative_fallback_steps        = 2;
     outcome.metrics.speculative_accepted_per_position = {290, 240, 190};
+    outcome.metrics.speculative_ngram_draft_tokens    = 15;
+    outcome.metrics.speculative_ngram_rounds          = 40;
+    outcome.metrics.speculative_ngram_drafted_tokens  = 600;
+    outcome.metrics.speculative_ngram_accepted_tokens = 540;
     outcome.metrics.engine_request_id                 = 991;
     outcome.metrics.scheduling                        = {
                                .preemptions          = 3,
@@ -556,6 +560,11 @@ int main() {
     failures +=
         check(done.at("speculative").at("accepted_per_position") == Json::array({290, 240, 190}),
               "speculative position counts missing");
+    failures += check(done.at("speculative").at("ngram_draft_tokens") == 15 &&
+                          done.at("speculative").at("ngram_rounds") == 40 &&
+                          done.at("speculative").at("ngram_drafted_tokens") == 600 &&
+                          done.at("speculative").at("ngram_accepted_tokens") == 540,
+                      "n-gram copy counters missing");
     failures += check(
         done.at("engine_timing").at("queue_wait_seconds") == 0.001 &&
             std::abs(done.at("engine_timing").at("host_exposed_seconds").at("total").get<double>() -
@@ -693,7 +702,8 @@ int main() {
         pretty_done.message ==
             "req#7 done | openai-chat | output limit | prompt 401 | output 1,024 | cache 101 "
             "(25.2%, checkpoint) | TTFT 358 ms | total 5.7s | prefill 1.28k tok/s | "
-            "decode 191.4 tok/s | mtp accepted 720/900 (80.0%) | thinking 256/256, control 19",
+            "decode 191.4 tok/s | mtp accepted 720/900 (80.0%) | copies accepted 540/600 (90.0%) "
+            "| thinking 256/256, control 19",
         "pretty request-done record mismatch");
 
     GenerationOutcome normalized_tool_outcome = outcome;
