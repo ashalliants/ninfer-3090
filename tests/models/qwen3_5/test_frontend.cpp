@@ -2267,9 +2267,11 @@ int test_open_reasoning_tool_recovery() {
         ninfer::ToolCallParseDiagnostics diagnostics;
     };
     // `streamed` commits one token per round, as decode does; otherwise one round holds the turn.
-    const auto run = [&](const std::string& generated, bool end_with_eos, bool streamed = false) {
+    const auto run = [&](const std::string& generated, bool end_with_eos, bool streamed = false,
+                         const ninfer::StopPolicy& stop = {},
+                         std::optional<ninfer::TokenId> end_token = std::nullopt) {
         auto session = frontend.make_output_session(
-            prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64}, {}, {}, free_calls);
+            prompt, stop, ninfer::OutputOptions{.tool_name_max_length = 64}, {}, {}, free_calls);
         std::vector<ninfer::TokenId> tokens = fixture_tokenizer().encode(generated);
         Turn turn;
         const auto commit = [&] {
@@ -2285,7 +2287,7 @@ int test_open_reasoning_tool_recovery() {
             }
             tokens.clear();
         }
-        if (end_with_eos) { tokens.push_back(eos); }
+        if (end_with_eos) { tokens.push_back(end_token.value_or(eos)); }
         const auto budget = static_cast<std::uint32_t>(tokens.size() + (end_with_eos ? 8U : 0U));
         (void)session.preview_model(tokens, budget, ninfer::FinishReason::OutputLimit);
         commit();
@@ -2318,6 +2320,24 @@ int test_open_reasoning_tool_recovery() {
     failures += rejected(run("I could emit <tool_call> now, but the question needs no tool.\n", true),
                          "a quoted marker");
     failures += rejected(run(planning + call, false), "a turn cut by its output budget");
+    // A caller-supplied stop id is the client's own end of turn, not the model's: it ends the turn
+    // without recovering the call, while the checkpoint's stop token still does.
+    {
+        const auto& defaults = frontend.default_stop_policy().token_ids;
+        // <|im_end|>: a valid fixture token that is not the checkpoint's eos and not in the text.
+        const ninfer::TokenId caller_token = 248046;
+        failures += check(std::find(defaults.begin(), defaults.end(), caller_token) == defaults.end(),
+                          "fixture caller stop token is a checkpoint default");
+        ninfer::StopPolicy caller_stop;
+        caller_stop.token_ids.push_back(caller_token);
+        failures += rejected(run(planning + call, true, false, caller_stop, caller_token),
+                             "a caller-supplied stop token");
+        failures += rejected(run(planning + call, true, true, caller_stop, caller_token),
+                             "a caller-supplied stop token across rounds");
+        const Turn model_stop = run(planning + call, true, false, caller_stop);
+        failures += check(model_stop.calls.size() == 1 && model_stop.diagnostics.recovered_from_reasoning,
+                          "the checkpoint stop token stopped recovering calls beside a caller stop");
+    }
     return failures;
 }
 
