@@ -229,6 +229,17 @@ void test_resolution_and_atomic_upserts() {
                    rtx3090.summary.prefill_source ==
                        ninfer::ContextCostPresetSource::CompiledDefault,
                "RTX 3090 compiled defaults did not resolve for a measured artifact signature");
+        // The Qwen3.8-27B DFlash2 bundle the launchers download, Vision disabled and enabled: the
+        // artifact the 27B fit was measured on, which had fallen back to the generic prices.
+        for (const char* signature :
+             {"34e6977811057a534eb4c60bb56e9e9c0520ff0ecadf4852cbb176756c104c02",
+              "55d6cf832e5d519bcd43097cf00ba696ca5182ae8ec2570f05baf6cae1fc0c7b"}) {
+            const auto launcher_27b = ninfer::runtime::resolve_context_machine_cost(
+                {.hardware_class = "nvidia-geforce-rtx-3090-sm86", .prefill_signature = signature});
+            expect(launcher_27b.summary.prefill_source ==
+                       ninfer::ContextCostPresetSource::CompiledDefault,
+                   "RTX 3090 compiled prefill default did not resolve for the launcher 27B artifact");
+        }
 
         const auto measured = ninfer::runtime::resolve_context_machine_cost({
             .hardware_class    = compiled_identity.hardware_class,

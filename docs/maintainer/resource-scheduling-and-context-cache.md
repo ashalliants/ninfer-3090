@@ -257,11 +257,13 @@ Host 内容，将 Device 槽交给新的 active identity；只有 Device 副本�
 内容是否可恢复。缓存回收另用实际恢复覆盖损失，不估计未来请求概率；实际许可由 Native 申请。
 
 编译进二进制的机器预设位于 `src/runtime/engine/context_cache/context_cost_defaults.cpp`。除上游的
-`nvidia-geforce-rtx-5090-sm120` 外，本 fork 增加 `nvidia-geforce-rtx-3090-sm86`：传输成本与
-groupwise-int Qwen3.8-27B、Qwen3.6-35B-A3B 的 prefill 拟合于 2026-09-14 在 fork 主机（Windows 11、
-CUDA 12.8、315 W 上限）用 `ninfer_context_cost_bench`（`--max-context 65536`）测得。通用 prefill 模型
-预测 55,000-token 的 Qwen3.8-27B prefill 为 26.0 s，3090 实际为 57 s，该拟合预测 58.1 s。没有匹配
-签名的配置使用通用缺省值。
+`nvidia-geforce-rtx-5090-sm120` 外，本 fork 增加 `nvidia-geforce-rtx-3090-sm86`：传输成本于
+2026-09-14 测得；Qwen3.8-27B（launcher 下载的 DFlash2 bundle）与 Qwen3.6-35B-A3B 的 prefill 拟合于
+2026-10-10 在 fork 主机（Windows 11、CUDA 12.8、315 W 上限）用 `ninfer_context_cost_bench --suite prefill`
+按 launcher 的 prefill 配置（`--kv-dtype rk4v4 --prefill-cublas --gdn-state-fp16 --prefill-chunk 4096`）
+测得，每个系数取三次独立校准的中位数。拟合范围外的 32K/64K/128K-token prefill，27B 预测误差为
++0.0/+1.0/+2.5%，35B 为 +2.2/+3.4/+4.8%。运行时价格只按硬件类别与 prefill 签名选择，不区分 KV
+dtype 或 GEMM 路线；没有匹配签名的配置使用通用缺省值。
 
 来源评估只读。Native 计算来源的 Move/Fork、兼容携带点与获准退休的旧点，并根据首个合法单元
 检查 State、缺失 KV、增长页和尾页需求。暂停恢复仍检查完整恢复许可。实际回收可以改变副本与

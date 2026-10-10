@@ -1,5 +1,6 @@
-// ninfer::ops - INT8-G64 causal prompt attention launcher for the FA2-style kernel: plan the CTA
-// shape and key splits, launch the attention kernel and, for a split launch, the FP32 merge.
+// ninfer::ops - INT8-family (INT8-G64, rk8v4, rk4v4) causal prompt attention launcher for the
+// FA2-style kernel: plan the CTA shape and key splits, launch the attention kernel and, for a split
+// launch, the FP32 merge.
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
 #include "core/device.h" // CUDA_CHECK
@@ -14,7 +15,7 @@
 namespace ninfer::ops::detail {
 namespace {
 
-template <typename Geometry, typename Metadata>
+template <typename Geometry, typename Metadata, bool PackedValues, bool PackedKeys>
 void launch_for(const Tensor& q, const Tensor& positions, float scale, const Tensor& k_pages,
                 const Tensor& v_pages, const Tensor& k_scale_pages, const Tensor& v_scale_pages,
                 Metadata metadata, CausalAttentionExecutionEnvelope envelope,
@@ -30,12 +31,13 @@ void launch_for(const Tensor& q, const Tensor& positions, float scale, const Ten
     }
 
     const auto launch = [&]<int Warps, bool Split>() {
-        using Shape = CausalPromptFa2Shape<Warps>;
-        const auto kernel =
-            causal_attention_prompt_i8_fa2_kernel<Geometry, Metadata, Warps, Split>;
+        using Shape       = CausalPromptFa2Shape<Warps, PackedValues, PackedKeys>;
+        const auto kernel = causal_attention_prompt_i8_fa2_kernel<Geometry, Metadata, Warps, Split,
+                                                                  PackedValues, PackedKeys>;
         configure_cuda_device_once([] {
             return cudaFuncSetAttribute(
-                causal_attention_prompt_i8_fa2_kernel<Geometry, Metadata, Warps, Split>,
+                causal_attention_prompt_i8_fa2_kernel<Geometry, Metadata, Warps, Split,
+                                                      PackedValues, PackedKeys>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, Shape::SmemBytes);
         });
         const dim3 grid(static_cast<unsigned>(div_up(width, Shape::Br)),
@@ -77,18 +79,31 @@ void launch_geometry(const Tensor& q, const Tensor& positions, float scale, cons
                      Metadata metadata, CausalAttentionExecutionEnvelope envelope,
                      WorkspaceArena& workspace, std::int32_t multiprocessor_count, Tensor& out,
                      cudaStream_t stream) {
-    if (cache.storage != KvCacheStorage::Int8Group64) {
-        throw std::logic_error("FA2 prompt attention serves the INT8-G64 cache only");
-    }
-    if (q.ne[1] == CausalD256H24Kv4::QHeads) {
-        launch_for<CausalD256H24Kv4>(q, positions, scale, cache.k_pages, cache.v_pages,
-                                     cache.k_scale_pages, cache.v_scale_pages, metadata, envelope,
-                                     workspace, multiprocessor_count, out, stream);
+    const auto launch = [&]<bool PackedValues, bool PackedKeys>() {
+        if (q.ne[1] == CausalD256H24Kv4::QHeads) {
+            launch_for<CausalD256H24Kv4, Metadata, PackedValues, PackedKeys>(
+                q, positions, scale, cache.k_pages, cache.v_pages, cache.k_scale_pages,
+                cache.v_scale_pages, metadata, envelope, workspace, multiprocessor_count, out,
+                stream);
+            return;
+        }
+        launch_for<CausalD256H16Kv2, Metadata, PackedValues, PackedKeys>(
+            q, positions, scale, cache.k_pages, cache.v_pages, cache.k_scale_pages,
+            cache.v_scale_pages, metadata, envelope, workspace, multiprocessor_count, out, stream);
+    };
+    switch (cache.storage) {
+    case KvCacheStorage::Int8Group64:
+        launch.template operator()<false, false>();
         return;
+    case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+        launch.template operator()<true, false>();
+        return;
+    case KvCacheStorage::RotatedLloyd4KeyInt4Value:
+        launch.template operator()<true, true>();
+        return;
+    default:
+        throw std::logic_error("FA2 prompt attention serves the INT8 cache family only");
     }
-    launch_for<CausalD256H16Kv2>(q, positions, scale, cache.k_pages, cache.v_pages,
-                                 cache.k_scale_pages, cache.v_scale_pages, metadata, envelope,
-                                 workspace, multiprocessor_count, out, stream);
 }
 
 } // namespace

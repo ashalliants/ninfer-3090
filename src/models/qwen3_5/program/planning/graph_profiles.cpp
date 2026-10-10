@@ -5,6 +5,7 @@
 #include <array>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace ninfer::models::qwen3_5::detail {
 namespace {
@@ -36,41 +37,30 @@ std::vector<GraphExecutionProfile> causal_resource_profiles(std::uint32_t capaci
     return graph_profiles_through(capacity - 1, ends);
 }
 
-std::vector<GraphExecutionProfile> dflash_base_profiles(std::uint32_t capacity,
-                                                        std::uint32_t draft_window) {
-    if (draft_window == 0 || capacity == 0) { return {}; }
-    const std::uint32_t block        = draft_window + 1;
-    const std::uint32_t max_frontier = capacity - 1;
+// Resource and split-policy frontier ends of a DFlash round; route changes are added from the
+// verify launch shape itself (dflash_graph_profiles).
+std::vector<std::uint32_t> dflash_base_ends(std::uint32_t draft_window) {
+    const std::uint32_t block = draft_window + 1;
     std::vector<std::uint32_t> ends{
         96U, 127U, 511U, 1023U, 2047U, 4095U, 8191U, 16383U, 32767U, 65536U, 131072U, 196608U,
     };
-    const auto add_target_boundary = [&](std::uint32_t visible_end) {
-        if (visible_end >= block) { ends.push_back(visible_end - block); }
-    };
     for (const std::uint32_t visible_end : {128U, 512U, 2048U, 4096U, 8198U, 16390U, 32768U}) {
-        add_target_boundary(visible_end);
+        if (visible_end >= block) { ends.push_back(visible_end - block); }
     }
-    if (draft_window >= 6 && draft_window <= 15) {
-        add_target_boundary(draft_window <= 11 ? 512U : 1024U);
-    }
-    std::sort(ends.begin(), ends.end());
-    ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
-    return graph_profiles_through(max_frontier, ends);
+    return ends;
 }
 
-// Mirror of the 35B (16 query heads) verify route table, which is the geometry DFlash targets.
-bool verify_uses_chunked_small_t(std::uint32_t draft_window, std::uint32_t batch_size,
-                                 std::uint32_t max_visible_keys) {
-    const std::uint32_t tokens = draft_window + 1;
-    if (tokens <= 6) { return false; }
-    if (batch_size > 1) { return true; }
-    // At batch one the route only depends on the target while the width is inside the verify
-    // domain; past it causal_attention_resolve_route returns Prompt for every envelope. Without
-    // this line the mirror claims a target dependence the route does not have, which costs a
-    // second topology class at widths no verify path can request.
-    if (tokens > 16) { return false; }
-    const std::uint32_t prompt_visible_limit = tokens <= 12 ? 512U : 1024U;
-    return max_visible_keys > prompt_visible_limit;
+// The target verify a DFlash round records at one execution frontier: T=K+1 over E+K+1 keys.
+ops::CausalAttentionLaunchShape dflash_verify_shape(std::uint32_t capacity,
+                                                    std::uint32_t draft_window,
+                                                    std::uint32_t batch_size,
+                                                    std::uint32_t frontier,
+                                                    const MtpGraphAttention& attention) {
+    const auto visible = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+        capacity, static_cast<std::uint64_t>(frontier) + draft_window + 1ULL));
+    return ops::causal_softmax_attention_launch_shape(
+        attention.geometry, attention.storage, {1U, visible}, static_cast<std::int32_t>(batch_size),
+        static_cast<std::int32_t>(draft_window) + 1, {nullptr, attention.multiprocessor_count});
 }
 
 // How every causal attention an MTP round records at one execution frontier executes: the target
@@ -214,7 +204,8 @@ std::vector<GraphExecutionProfile> mtp_graph_profiles(std::uint32_t capacity,
 std::vector<GraphExecutionProfile> dflash_graph_profiles(SpeculativeBackend backend,
                                                          std::uint32_t capacity,
                                                          std::uint32_t draft_window,
-                                                         std::uint32_t batch_size) {
+                                                         std::uint32_t batch_size,
+                                                         const MtpGraphAttention& attention) {
     if (capacity == 0 || draft_window == 0 || draft_window > 15) {
         throw std::invalid_argument("invalid masked draft graph dimensions");
     }
@@ -225,16 +216,29 @@ std::vector<GraphExecutionProfile> dflash_graph_profiles(SpeculativeBackend back
         }
         return profiles;
     }
-    // The sm_86 verify route table keeps a target-dependent chunked small-T route, so the target
-    // still contributes a topology class at its route flip (see verify_uses_chunked_small_t).
-    std::vector<GraphExecutionProfile> profiles = dflash_base_profiles(capacity, draft_window);
+    // The sm_86 verify route table depends on the target (prompt, small-T, or chunked small-T
+    // whose chunk width, and so node count, changes with the key band), so the frontier breaks
+    // wherever the verify launch shape changes, and profiles share a class exactly when the verify
+    // enqueues the same kernels and the sliding-window draft splits alike.
+    const std::uint32_t max_frontier = capacity - 1;
+    const auto shape                 = [&](std::uint32_t frontier) {
+        return dflash_verify_shape(capacity, draft_window, batch_size, frontier, attention);
+    };
+    std::vector<std::uint32_t> ends = dflash_base_ends(draft_window);
+    std::vector<std::uint32_t> changes;
+    collect_shape_changes(0U, max_frontier, shape, changes);
+    for (const std::uint32_t change : changes) { ends.push_back(change - 1U); }
+    std::sort(ends.begin(), ends.end());
+    ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
+
+    std::vector<GraphExecutionProfile> profiles = graph_profiles_through(max_frontier, ends);
+    std::vector<std::pair<std::uint32_t, bool>> classes;
     for (GraphExecutionProfile& profile : profiles) {
-        const std::uint32_t target_max = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-            capacity, static_cast<std::uint64_t>(profile.max) + draft_window + 1ULL));
-        const bool split_swa           = profile.max > 96U;
-        const bool chunked_target =
-            verify_uses_chunked_small_t(draft_window, batch_size, target_max);
-        profile.topology_class = (chunked_target ? 2U : 0U) | (split_swa ? 1U : 0U);
+        const std::pair<std::uint32_t, bool> key{shape(profile.max).kernel_nodes,
+                                                 profile.max > 96U};
+        const auto found       = std::find(classes.begin(), classes.end(), key);
+        profile.topology_class = static_cast<std::uint32_t>(found - classes.begin());
+        if (found == classes.end()) { classes.push_back(key); }
     }
     return profiles;
 }

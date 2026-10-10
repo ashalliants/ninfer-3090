@@ -1,6 +1,6 @@
 #pragma once
 
-// Host plan of the FA2-style INT8-G64 prompt kernel (prompt_i8_fa2.cuh): its CTA shape and key
+// Host plan of the FA2-style INT8-family prompt kernel (prompt_i8_fa2.cuh): its CTA shape and key
 // splits, and the FP32 partials a split launch publishes. Shared by the launcher, the workspace
 // capacity query and the launch-shape query so all three see the same route facts.
 //
@@ -51,15 +51,14 @@ inline constexpr std::size_t kCausalPromptFa2SplitBudgetBytes = std::size_t{64} 
 // 128K keys, where the faster split counts exceed the split budget) and 12-14 % (H24 192-320
 // columns and H16 192 columns over 128K keys, whose light partial last row block the model does
 // not price). Infernix's 5090 constants (0.8, 0.5/24, whole waves) scored 3.8 % / 33 % with 17
-// cells slower than unsplit on the same data.
+// cells slower than unsplit on the same data. One plan serves the whole INT8 family: the same
+// forced sweep on rk4v4 (2026-10-10, cell pass-to-pass median 1.1 %) scores these constants at
+// 1.6 % mean and 19.7 % worst regret, never slower than unsplit, and constants refitted to rk4v4
+// alone improve the mean by 0.2 points.
 inline constexpr double kCausalPromptFa2NarrowSweep     = 0.65;
 inline constexpr double kCausalPromptFa2SplitSweep      = 1.05;
 inline constexpr double kCausalPromptFa2SplitPerRowHead = 1.0 / 24.0;
 inline constexpr double kCausalPromptFa2WholeWaves      = 0.85;
-// At or below this many visible keys the INT8-G64 cache keeps the tiled prompt kernel
-// (prompt_i8.cuh): there a launch is one or a few key tiles and the FA2 CTA's per-warp Q encoding
-// (16 rows per warp against the tiled kernel's 4) dominates, 1.1-1.5x slower at 7-128 columns.
-inline constexpr std::uint32_t kCausalPromptFa2MinVisibleKeys = 256;
 
 struct CausalPromptFa2Partials {
     Tensor rows;
@@ -105,8 +104,12 @@ inline CausalPromptFa2Plan causal_prompt_fa2_plan(std::int32_t q_heads, std::int
     const double keys        = static_cast<double>(visible_keys);
     const std::int32_t pages = causal_prompt_fa2_pages(visible_keys);
 
+    // Up to 64 columns both CTA shapes launch the same CTAs at the same rate, and the eight-warp
+    // one spreads the Q encoding over twice the warps. Measured 2026-10-10 on rk4v4: 64 columns
+    // over no history 33.5 -> 23.3 us per layer, and 2-19 % faster unsplit over 4K-128K keys
+    // (INT8-G64 is 1-2 % slower there, where those launches mostly split anyway).
     const std::int64_t narrow_ctas = static_cast<std::int64_t>((width + 63) / 64) * q_heads;
-    CausalPromptFa2Plan best{4, 1};
+    CausalPromptFa2Plan best{width <= 64 ? 8 : 4, 1};
     double best_cost = waves(narrow_ctas) * kCausalPromptFa2NarrowSweep * keys;
     const std::int64_t ctas = static_cast<std::int64_t>((width + 127) / 128) * q_heads;
     const double rate       = width <= 64 ? kCausalPromptFa2NarrowSweep : 1.0;

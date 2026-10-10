@@ -135,7 +135,8 @@ It has two independent suites:
   vary bytes and operation count to represent StateImage components and identify device bandwidth.
   It uses synthetic non-compressible buffers and never inspects an artifact or loads a model.
 - `prefill` loads one artifact through the public Engine and measures its Text/Vision recomputation
-  cost under the canonical BF16/no-spec configuration. Its result is keyed only by hardware class
+  cost without speculation, under the prefill configuration it is given: `--kv-dtype` (default bf16),
+  `--prefill-cublas`, `--gdn-state-fp16` and `--prefill-chunk`. Its result is keyed only by hardware class
   and the actual Text/Vision `prefill_signature`.
 
 The runtime models are:
@@ -175,9 +176,15 @@ Measure prefill separately when the GPU has room for the artifact:
   --suite prefill \
   --artifact out/qwen3_6_27b.ninfer \
   --corpus bench/fixtures/bench_corpus.ids \
+  --kv-dtype rk4v4 --prefill-cublas --gdn-state-fp16 --prefill-chunk 4096 --max-context 32768 \
   --json profiles/bench/qwen3_6_27b_prefill_cost.json \
   --preset-out profiles/bench/context_cost_presets.json
 ```
+
+The runtime keys a prefill price by hardware class and prefill signature only, not by KV dtype or
+GEMM route, although both change prefill time severalfold, so calibrate the configuration the
+machine serves with. The RTX 3090 compiled defaults use the launcher's prefill flags shown above
+(the grid then reaches 6.5 chunks, 26,624 tokens).
 
 `--suite all` performs transfer first, releases its fixtures, then loads the artifact for prefill.
 The JSON report retains every repetition, median/MAD, floating and quantized coefficients, and
