@@ -114,6 +114,12 @@ void check_dflash_frame_views() {
           std::tuple{&narrow.target_argmax, &frame.target_argmax, "argmax"}}) {
         expect(view->data == base->data && same_shape(*view, {8, kBatch}),
                std::string(name) + " is a dense [8,C] view of its storage");
+        // A narrowed round repacks the leading bytes of the widest storage: rows are packed at
+        // the round width (every reader and writer of the round uses that width) and the view
+        // never extends past the allocation.
+        expect(view->is_contiguous() && view->nb[1] == 8 * view->nb[0] &&
+                   view->bytes() <= base->bytes(),
+               std::string(name) + " is packed at the round width within its allocation");
     }
     expect(narrow.draft_tokens.data == frame.draft_tokens.data &&
                same_shape(narrow.draft_tokens, {7, kBatch}),
