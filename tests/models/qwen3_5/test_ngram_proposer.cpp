@@ -1,8 +1,8 @@
 // N-gram copy proposer and tool-result de-numbering (CPU only).
 //
 // The proposer and de-numbering cases are ported from Infernix (Apache-2.0,
-// tests/models/qwen3_5/test_ngram_proposer.cpp); the capacity, per-request index and lazy ledger
-// cases are this fork's.
+// tests/models/qwen3_5/test_ngram_proposer.cpp); the capacity, per-request index, lazy ledger and
+// copy backoff cases are this fork's.
 #include "models/qwen3_5/frontend/ngram_sources.h"
 #include "models/qwen3_5/program/speculative/ngram_proposer.h"
 
@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+using ninfer::models::qwen3_5::detail::NgramCopyBackoff;
 using ninfer::models::qwen3_5::detail::NgramProposer;
 using ninfer::models::qwen3_5::detail::NgramRequestIndex;
 using ninfer::models::qwen3_5::detail::ngram_index_capacity;
@@ -334,6 +335,52 @@ void test_request_index() {
     require(text.indexed() == shorter.size(), "a shorter ledger did not resynchronize");
 }
 
+void test_copy_backoff() {
+    NgramCopyBackoff backoff;
+    require(backoff.level() == 0 && backoff.required_match(12) == 12,
+            "backoff starts at the minimum");
+    // A miss commits fewer than four copied tokens (or fewer than all, when fewer were verified).
+    backoff.record(15, 4);
+    backoff.record(3, 3);
+    require(backoff.level() == 0,
+            "a copy that commits four tokens, or all it verified, is no miss");
+    backoff.record(15, 3);
+    require(backoff.level() == 1 && backoff.required_match(12) == 24, "a miss doubles the match");
+    backoff.record(15, 0);
+    backoff.record(2, 1);
+    require(backoff.level() == 2 && backoff.required_match(12) == 36,
+            "misses raise the match to three times the minimum and no further");
+    require(backoff.required_match(40) == 64, "the required match is capped at the match history");
+    backoff.record(15, 15);
+    require(backoff.level() == 1 && backoff.required_match(12) == 24, "a hit lowers it one step");
+    backoff.record(15, 9);
+    backoff.record(15, 9);
+    require(backoff.level() == 0, "hits return it to the minimum and no lower");
+
+    // Through the index: after a miss, a copy whose match is shorter than twice the minimum is no
+    // longer proposed, while a longer one still is.
+    std::vector<Token> prompt(300);
+    std::iota(prompt.begin(), prompt.end(), 1000);
+    // A ledger that ends by repeating prompt[first..120) after an unrelated token.
+    const auto matching = [&](std::ptrdiff_t first) {
+        std::vector<Token> ledger = prompt;
+        ledger.push_back(5);
+        ledger.insert(ledger.end(), prompt.begin() + first, prompt.begin() + 120);
+        return ledger;
+    };
+    const auto copy_length = [&](const std::vector<Token>& ledger, const NgramCopyBackoff& state) {
+        NgramRequestIndex index(ngram_index_capacity(4096), {});
+        index.index_prompt(prompt, 0, {});
+        return index.propose_for_round(ledger, 15, 7, state.required_match(12)).tokens.size();
+    };
+    NgramCopyBackoff request;
+    require(copy_length(matching(100), request) == 15, "a 20-token match copies at the minimum");
+    request.record(15, 0);
+    require(copy_length(matching(100), request) == 0, "a 20-token match still copies after a miss");
+    require(copy_length(matching(80), request) == 15,
+            "a 40-token match stopped copying after a miss");
+}
+
 void test_numbered_sources() {
     for (const auto& delimiter : {std::string(": "), std::string("\t"),
                                   std::string("\xe2\x86\x92"), std::string(" | "),
@@ -387,6 +434,7 @@ int main() {
         test_proposer();
         test_capacity();
         test_request_index();
+        test_copy_backoff();
         test_numbered_sources();
         std::cout << "ngram proposer tests passed\n";
     } catch (const std::exception& error) {

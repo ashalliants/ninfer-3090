@@ -228,6 +228,8 @@ struct RequestControl {
     // This request's n-gram copy index (null unless the Frontend builds them). It lives with the
     // control, which a pause moves into the ResumeState together with the ledger it indexes.
     std::unique_ptr<NgramRequestIndex> ngram;
+    // How much longer a match this request's next copy needs after missed copies.
+    NgramCopyBackoff ngram_backoff;
 
     struct Prefill {
         PreparedPromptData prompt;
