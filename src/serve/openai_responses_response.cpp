@@ -55,22 +55,6 @@ bool is_custom_tool(const OpenAIResponsesCreateRequest& request, std::string_vie
     return position != request.tool_identities.end() && position->second.custom;
 }
 
-// A custom tool's free-form input from its Engine-side call. Custom tools are lowered as strict
-// functions whose only, required parameter is the raw string `input`, so the constrained decoder
-// cannot produce any other argument shape; anything else is an internal contract violation, not
-// model output to pass through.
-std::string custom_tool_input(const ninfer::GeneratedToolCall& call) {
-    const Json arguments = Json::parse(call.arguments_json, nullptr, false);
-    if (arguments.is_object() && arguments.size() == 1) {
-        if (const auto input = arguments.find(kCustomToolInputParameter);
-            input != arguments.end() && input->is_string()) {
-            return input->get<std::string>();
-        }
-    }
-    throw std::logic_error("custom tool '" + call.name +
-                           "' call does not carry exactly one string input argument");
-}
-
 // The output Item of one generated call: a function_call, or a custom_tool_call with its raw input.
 Json tool_call_item(const OpenAIResponsesCreateRequest& request,
                     const ninfer::GeneratedToolCall& call, const std::string& id,

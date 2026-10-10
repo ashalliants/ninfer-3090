@@ -328,7 +328,28 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index)
     }
 }
 
-std::vector<ToolCall> parse_assistant_tool_calls(const Json& message, std::size_t index) {
+bool declared_tool(const GenerationRequest& request, const std::string& name) {
+    return std::any_of(request.tools.begin(), request.tools.end(),
+                       [&](const ToolDefinition& tool) { return tool.name == name; });
+}
+
+// A name that refers to a declared tool must use that tool's kind: a call of a custom tool is
+// answered as `custom` and one of a function as `function`, so mixing them has no valid answer.
+void require_tool_kind(const OpenAIChatRequest& request, const std::string& name, bool custom,
+                       const char* param, const char* code) {
+    if (!declared_tool(request.generation, name)) { return; }
+    if (request.custom_tools.contains(name) != custom) {
+        bad_request("tool '" + name + "' is declared as a " +
+                        (custom ? "function" : "custom tool") + " but referenced as a " +
+                        (custom ? "custom tool" : "function"),
+                    param, code);
+    }
+}
+
+// An assistant history call: `function` with JSON arguments, or `custom` with free-form input,
+// which becomes the custom tool's single `input` argument on the Engine side.
+std::vector<ToolCall> parse_assistant_tool_calls(const Json& message, std::size_t index,
+                                                 const OpenAIChatRequest& request) {
     std::vector<ToolCall> calls;
     if (!message.contains("tool_calls") || message.at("tool_calls").is_null()) { return calls; }
     const Json& values = message.at("tool_calls");
@@ -341,9 +362,28 @@ std::vector<ToolCall> parse_assistant_tool_calls(const Json& message, std::size_
         if (!value.is_object() || !value.contains("id") || !value.at("id").is_string()) {
             bad_request("tool_calls entries must contain a string id", "messages");
         }
-        if (!value.contains("type") || !value.at("type").is_string() ||
-            value.at("type").get<std::string>() != "function") {
-            bad_request("only function tool_calls are supported", "messages",
+        const std::string type = value.contains("type") && value.at("type").is_string()
+                                     ? value.at("type").get<std::string>()
+                                     : std::string();
+        if (type == "custom") {
+            if (!value.contains("custom") || !value.at("custom").is_object()) {
+                bad_request("custom tool_calls must contain a custom object", "messages");
+            }
+            const Json& custom = value.at("custom");
+            if (!custom.contains("input") || !custom.at("input").is_string()) {
+                bad_request("custom tool_calls must contain a string input", "messages");
+            }
+            std::string name = require_function_name(custom, "messages");
+            require_tool_kind(request, name, true, "messages", "invalid_tool_history");
+            const std::string& input = custom.at("input").get_ref<const std::string&>();
+            require_representable_custom_tool_input(input, "messages");
+            calls.push_back(ToolCall{.id             = value.at("id").get<std::string>(),
+                                     .name           = std::move(name),
+                                     .arguments_json = custom_tool_arguments_json(input)});
+            continue;
+        }
+        if (type != "function") {
+            bad_request("only function and custom tool_calls are supported", "messages",
                         "tool_type_not_supported");
         }
         if (!value.contains("function") || !value.at("function").is_object()) {
@@ -353,15 +393,17 @@ std::vector<ToolCall> parse_assistant_tool_calls(const Json& message, std::size_
         if (!function.contains("arguments") || !function.at("arguments").is_string()) {
             bad_request("function tool_calls must contain string arguments", "messages");
         }
+        std::string name = require_function_name(function, "messages");
+        require_tool_kind(request, name, false, "messages", "invalid_tool_history");
         calls.push_back(ToolCall{.id             = value.at("id").get<std::string>(),
-                                 .name           = require_function_name(function, "messages"),
+                                 .name           = std::move(name),
                                  .arguments_json = function.at("arguments").get<std::string>()});
     }
     return calls;
 }
 
-std::optional<ToolCall> parse_legacy_assistant_function_call(const Json& message,
-                                                             std::size_t index) {
+std::optional<ToolCall> parse_legacy_assistant_function_call(const Json& message, std::size_t index,
+                                                             const OpenAIChatRequest& request) {
     if (!message.contains("function_call") || message.at("function_call").is_null()) {
         return std::nullopt;
     }
@@ -374,8 +416,10 @@ std::optional<ToolCall> parse_legacy_assistant_function_call(const Json& message
     if (!call.contains("arguments") || !call.at("arguments").is_string()) {
         bad_request("assistant function_call must contain string arguments", "messages");
     }
+    std::string name = require_function_name(call, "messages");
+    require_tool_kind(request, name, false, "messages", "invalid_tool_history");
     return ToolCall{.id             = {},
-                    .name           = require_function_name(call, "messages"),
+                    .name           = std::move(name),
                     .arguments_json = call.at("arguments").get<std::string>()};
 }
 
@@ -473,7 +517,8 @@ ChatTurn parse_tool_message(const Json& item, std::size_t index, bool legacy_fun
     return turn;
 }
 
-ChatTurn parse_assistant_message(const Json& item, std::size_t index) {
+ChatTurn parse_assistant_message(const Json& item, std::size_t index,
+                                 const OpenAIChatRequest& request) {
     if (item.contains("audio") && !item.at("audio").is_null()) {
         bad_request("assistant audio history requires resolving a previous audio response, which "
                     "NInfer cannot provide",
@@ -482,8 +527,9 @@ ChatTurn parse_assistant_message(const Json& item, std::size_t index) {
 
     ChatTurn turn;
     turn.role       = ChatRole::Assistant;
-    turn.tool_calls = parse_assistant_tool_calls(item, index);
-    if (std::optional<ToolCall> legacy_call = parse_legacy_assistant_function_call(item, index)) {
+    turn.tool_calls = parse_assistant_tool_calls(item, index, request);
+    if (std::optional<ToolCall> legacy_call =
+            parse_legacy_assistant_function_call(item, index, request)) {
         turn.tool_calls.insert(turn.tool_calls.begin(), std::move(*legacy_call));
     }
     const std::optional<std::string> reasoning = parse_assistant_reasoning(item, index);
@@ -523,7 +569,7 @@ ChatTurn parse_regular_message(const Json& item, std::size_t index, ChatRole rol
     return turn;
 }
 
-ChatTurn parse_message(const Json& item, std::size_t index) {
+ChatTurn parse_message(const Json& item, std::size_t index, const OpenAIChatRequest& request) {
     if (!item.is_object() || !item.contains("role") || !item.at("role").is_string()) {
         bad_request("message " + std::to_string(index) + " must be an object with a string role",
                     "messages");
@@ -538,11 +584,12 @@ ChatTurn parse_message(const Json& item, std::size_t index) {
 
     if (role == ChatRole::Tool) { return parse_tool_message(item, index, legacy_function); }
     validate_non_tool_call_id(item);
-    if (role == ChatRole::Assistant) { return parse_assistant_message(item, index); }
+    if (role == ChatRole::Assistant) { return parse_assistant_message(item, index, request); }
     return parse_regular_message(item, index, role);
 }
 
-void parse_messages(const Json& body, GenerationRequest& output) {
+void parse_messages(const Json& body, OpenAIChatRequest& request) {
+    GenerationRequest& output = request.generation;
     if (!body.contains("messages")) { bad_request("missing required field: messages", "messages"); }
     const Json& messages = body.at("messages");
     if (!messages.is_array() || messages.empty()) {
@@ -550,11 +597,65 @@ void parse_messages(const Json& body, GenerationRequest& output) {
     }
     output.messages.reserve(messages.size());
     for (std::size_t index = 0; index < messages.size(); ++index) {
-        output.messages.push_back(parse_message(messages.at(index), index));
+        output.messages.push_back(parse_message(messages.at(index), index, request));
     }
 }
 
-void parse_tools(const Json& body, GenerationRequest& output) {
+[[noreturn]] void reject_kind_collision(const std::string& name) {
+    bad_request("tool '" + name + "' is declared both as a custom tool and as a function", "tools",
+                "duplicate_tool_name");
+}
+
+// A free-form custom tool, `{type:"custom", custom:{name, description?, format?}}`. It is lowered
+// strictly to a function with one required string parameter, `input` (see
+// custom_tool_input_schema_json); a declared grammar is described there and not enforced.
+ToolDefinition parse_custom_tool(const Json& item, std::size_t index) {
+    if (!item.contains("custom") || !item.at("custom").is_object()) {
+        bad_request("custom tools must contain a custom object", "tools");
+    }
+    const Json& custom = item.at("custom");
+    ToolDefinition tool;
+    tool.schema_param = "tools/" + std::to_string(index) + "/custom";
+    tool.name         = require_function_name(custom, "tools");
+    tool.strict       = true;
+    if (custom.contains("description") && !custom.at("description").is_null()) {
+        if (!custom.at("description").is_string()) {
+            bad_request("custom tool description must be a string", "tools");
+        }
+        tool.description = custom.at("description").get<std::string>();
+    }
+    std::optional<CustomToolGrammar> grammar;
+    if (custom.contains("format") && !custom.at("format").is_null()) {
+        const Json& format = custom.at("format");
+        if (!format.is_object() || !format.contains("type") || !format.at("type").is_string()) {
+            bad_request("custom tool format must be an object with a string type", "tools");
+        }
+        const std::string type = format.at("type").get<std::string>();
+        if (type == "grammar") {
+            if (!format.contains("grammar") || !format.at("grammar").is_object()) {
+                bad_request("custom tool grammar format must contain a grammar object", "tools");
+            }
+            const Json& wire = format.at("grammar");
+            if (!wire.contains("syntax") || !wire.at("syntax").is_string() ||
+                (wire.at("syntax").get<std::string>() != "lark" &&
+                 wire.at("syntax").get<std::string>() != "regex")) {
+                bad_request("custom tool grammar syntax must be lark or regex", "tools");
+            }
+            if (!wire.contains("definition") || !wire.at("definition").is_string()) {
+                bad_request("custom tool grammar must contain a string definition", "tools");
+            }
+            grammar = CustomToolGrammar{.syntax     = wire.at("syntax").get<std::string>(),
+                                        .definition = wire.at("definition").get<std::string>()};
+        } else if (type != "text") {
+            bad_request("custom tool format type must be text or grammar", "tools");
+        }
+    }
+    tool.input_schema_json = custom_tool_input_schema_json(grammar);
+    return tool;
+}
+
+void parse_tools(const Json& body, OpenAIChatRequest& request) {
+    GenerationRequest& output = request.generation;
     if (!body.contains("tools") || body.at("tools").is_null()) { return; }
     const Json& tools = body.at("tools");
     if (!tools.is_array()) { bad_request("tools must be an array", "tools"); }
@@ -567,6 +668,13 @@ void parse_tools(const Json& body, GenerationRequest& output) {
             bad_request("tools entries must contain a string type", "tools");
         }
         const std::string type = item.at("type").get<std::string>();
+        if (type == "custom") {
+            ToolDefinition tool = parse_custom_tool(item, output.tools.size());
+            if (declared_tool(output, tool.name)) { reject_kind_collision(tool.name); }
+            request.custom_tools.insert(tool.name);
+            output.tools.push_back(std::move(tool));
+            continue;
+        }
         if (type != "function") {
             // A hosted tool would have been executed by the server. NInfer cannot, and the client
             // is not waiting on it either, so drop it and carry on: the model is never told the
@@ -605,11 +713,25 @@ void parse_tools(const Json& body, GenerationRequest& output) {
             }
             tool.strict = function.at("strict").get<bool>();
         }
+        if (request.custom_tools.contains(tool.name)) { reject_kind_collision(tool.name); }
         output.tools.push_back(std::move(tool));
     }
 }
 
-void apply_allowed_tools(const Json& config, GenerationRequest& output) {
+// The tool named by a typed tool reference: OpenAI's nested `{type, <type>:{name}}` form, or the
+// flat `{type, name}` form that Responses-style clients send.
+std::string referenced_tool_name(const Json& item, const std::string& type, const char* param) {
+    if (item.contains(type) && !item.at(type).is_null()) {
+        if (!item.at(type).is_object()) {
+            bad_request("tool_choice " + type + " reference must be an object", param);
+        }
+        return require_function_name(item.at(type), param);
+    }
+    return require_function_name(item, param);
+}
+
+void apply_allowed_tools(const Json& config, OpenAIChatRequest& request) {
+    GenerationRequest& output = request.generation;
     if (!config.is_object()) {
         bad_request("tool_choice.allowed_tools must be an object", "tool_choice");
     }
@@ -630,19 +752,16 @@ void apply_allowed_tools(const Json& config, GenerationRequest& output) {
         if (!item.is_object() || !item.contains("type") || !item.at("type").is_string()) {
             bad_request("allowed tool entries must contain a string type", "tool_choice");
         }
-        if (item.at("type").get<std::string>() != "function") {
-            bad_request(
-                "allowed_tools can select only function tools because NInfer does not provide "
-                "custom tool output",
-                "tool_choice", "tool_type_not_supported");
+        const std::string type = item.at("type").get<std::string>();
+        if (type != "function" && type != "custom") {
+            bad_request("allowed_tools can select only function and custom tools", "tool_choice",
+                        "tool_type_not_supported");
         }
-        const std::string name = require_function_name(item, "tool_choice");
-        const bool declared =
-            std::any_of(output.tools.begin(), output.tools.end(),
-                        [&](const ToolDefinition& tool) { return tool.name == name; });
-        if (!declared) {
+        const std::string name = referenced_tool_name(item, type, "tool_choice");
+        if (!declared_tool(output, name)) {
             bad_request("allowed tool '" + name + "' is not present in tools", "tool_choice");
         }
+        require_tool_kind(request, name, type == "custom", "tool_choice", "invalid_tool_choice");
         if (std::find(allowed_names.begin(), allowed_names.end(), name) == allowed_names.end()) {
             allowed_names.push_back(name);
         }
@@ -652,7 +771,8 @@ void apply_allowed_tools(const Json& config, GenerationRequest& output) {
     output.tool_choice.mode = mode == "required" ? ToolChoiceMode::Required : ToolChoiceMode::Auto;
 }
 
-void parse_tool_choice(const Json& body, GenerationRequest& output) {
+void parse_tool_choice(const Json& body, OpenAIChatRequest& request) {
+    GenerationRequest& output = request.generation;
     if (!body.contains("tool_choice") || body.at("tool_choice").is_null()) { return; }
     const Json& choice = body.at("tool_choice");
     if (choice.is_string()) {
@@ -664,8 +784,9 @@ void parse_tool_choice(const Json& body, GenerationRequest& output) {
         } else if (value == "required") {
             output.tool_choice.mode = ToolChoiceMode::Required;
         } else {
-            bad_request("tool_choice must be 'auto', 'none', 'required', or a function choice",
-                        "tool_choice");
+            bad_request(
+                "tool_choice must be 'auto', 'none', 'required', or a function or custom choice",
+                "tool_choice");
         }
     } else if (choice.is_object()) {
         if (!choice.contains("type") || !choice.at("type").is_string()) {
@@ -674,19 +795,18 @@ void parse_tool_choice(const Json& body, GenerationRequest& output) {
         const std::string type = choice.at("type").get<std::string>();
         if (type == "allowed_tools") {
             apply_allowed_tools(
-                choice.contains("allowed_tools") ? choice.at("allowed_tools") : choice, output);
-        } else if (type == "function") {
-            if (!choice.contains("function") || !choice.at("function").is_object()) {
-                bad_request("function tool_choice must contain a function object", "tool_choice");
+                choice.contains("allowed_tools") ? choice.at("allowed_tools") : choice, request);
+        } else if (type == "function" || type == "custom") {
+            if (!choice.contains(type) || !choice.at(type).is_object()) {
+                bad_request(type + " tool_choice must contain a " + type + " object",
+                            "tool_choice");
             }
-            const std::string name  = require_function_name(choice.at("function"), "tool_choice");
-            output.tool_choice.mode = ToolChoiceMode::Required;
+            const std::string name = require_function_name(choice.at(type), "tool_choice");
+            require_tool_kind(request, name, type == "custom", "tool_choice",
+                              "invalid_tool_choice");
+            output.tool_choice.mode          = ToolChoiceMode::Required;
             output.tool_choice.allowed_names = std::vector<std::string>{name};
             output.tool_choice.parallel      = false;
-        } else if (type == "custom") {
-            bad_request(
-                "custom tool_choice requires custom tool output, which NInfer does not provide",
-                "tool_choice", "tool_type_not_supported");
         } else {
             bad_request("unsupported tool_choice type: " + type, "tool_choice");
         }
@@ -847,10 +967,10 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
 
     const OpenAIPromptCachePolicy cache_policy = parse_openai_prompt_cache_policy(body);
 
-    parse_tools(body, output.generation);
-    parse_tool_choice(body, output.generation);
+    parse_tools(body, output);
+    parse_tool_choice(body, output);
     parse_parallel_tool_calls(body, output.generation);
-    parse_messages(body, output.generation);
+    parse_messages(body, output);
     parse_stop(body, output.generation);
     parse_sampling(body, output.generation);
     parse_stream_options(body, output);

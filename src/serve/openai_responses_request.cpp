@@ -479,7 +479,8 @@ ToolCall parse_custom_tool_call_item(
         bad_request("custom_tool_call input must be a string", "input");
     }
     const std::string input = item.at("input").get<std::string>();
-    call.arguments_json     = Json{{kCustomToolInputParameter, input}}.dump();
+    require_representable_custom_tool_input(input, "input");
+    call.arguments_json = custom_tool_arguments_json(input);
     if (item.contains("status") && !item.at("status").is_null() &&
         (!item.at("status").is_string() || item.at("status").get<std::string>() != "completed")) {
         bad_request("partial custom_tool_call Items cannot be represented in model history",
@@ -871,8 +872,7 @@ parse_custom_tool(const Json& item, std::optional<std::string> wire_namespace,
     validate_allowed_callers(item, "custom tool");
 
     Json format = Json{{"type", "text"}};
-    std::string input_description =
-        "The tool's complete free-form input, passed to it exactly as written (not JSON).";
+    std::optional<CustomToolGrammar> grammar;
     if (item.contains("format") && !item.at("format").is_null()) {
         const Json& wire = item.at("format");
         if (!wire.is_object() || !wire.contains("type") || !wire.at("type").is_string()) {
@@ -894,8 +894,8 @@ parse_custom_tool(const Json& item, std::optional<std::string> wire_namespace,
             format = Json{{"type", "grammar"},
                           {"syntax", wire.at("syntax")},
                           {"definition", wire.at("definition")}};
-            input_description += " It must match this " + wire.at("syntax").get<std::string>() +
-                                 " grammar:\n" + wire.at("definition").get<std::string>();
+            grammar = CustomToolGrammar{.syntax     = wire.at("syntax").get<std::string>(),
+                                        .definition = wire.at("definition").get<std::string>()};
         } else if (type == "text") {
             static const std::unordered_set<std::string> text_members = {"type"};
             reject_nonnull_unknown_members(wire, text_members, "tools");
@@ -903,14 +903,7 @@ parse_custom_tool(const Json& item, std::optional<std::string> wire_namespace,
             bad_request("custom tool format type must be text or grammar", "tools");
         }
     }
-    parsed.definition.input_schema_json =
-        Json{{"type", "object"},
-             {"properties",
-              Json{{kCustomToolInputParameter,
-                    Json{{"type", "string"}, {"description", std::move(input_description)}}}}},
-             {"required", Json::array({kCustomToolInputParameter})},
-             {"additionalProperties", false}}
-            .dump();
+    parsed.definition.input_schema_json = custom_tool_input_schema_json(grammar);
     parsed.canonical = {{"type", "custom"}, {"name", identity.name}, {"format", std::move(format)}};
     if (!tool_description.empty()) { parsed.canonical["description"] = std::move(tool_description); }
     if (item.contains("allowed_callers") && !item.at("allowed_callers").is_null()) {

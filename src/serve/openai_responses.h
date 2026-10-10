@@ -32,9 +32,6 @@ struct OpenAIResponsesFunctionIdentity {
     bool operator==(const OpenAIResponsesFunctionIdentity&) const = default;
 };
 
-// The Engine-side parameter that carries a custom tool's free-form input.
-inline constexpr const char* kCustomToolInputParameter = "input";
-
 struct OpenAIResponsesPromptRequest {
     std::string model;
     GenerationRequest generation;

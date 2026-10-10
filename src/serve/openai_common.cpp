@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdio>
 #include <random>
+#include <stdexcept>
 #include <vector>
 #include <string_view>
 #include <utility>
@@ -51,6 +52,48 @@ bool is_hosted_openai_tool_type(std::string_view type) noexcept {
         }
     }
     return false;
+}
+
+std::string custom_tool_input_schema_json(const std::optional<CustomToolGrammar>& grammar) {
+    std::string description =
+        "The tool's complete free-form input, passed to it exactly as written (not JSON).";
+    if (grammar) {
+        description +=
+            " It must match this " + grammar->syntax + " grammar:\n" + grammar->definition;
+    }
+    // Insertion order is the rendered order of the tool's parameters in the prompt.
+    return RequestJson{
+        {"type", "object"},
+        {"properties",
+         RequestJson{{kCustomToolInputParameter,
+                      RequestJson{{"type", "string"}, {"description", std::move(description)}}}}},
+        {"required", RequestJson::array({kCustomToolInputParameter})},
+        {"additionalProperties", false}}
+        .dump();
+}
+
+std::string custom_tool_arguments_json(const std::string& input) {
+    return RequestJson{{kCustomToolInputParameter, input}}.dump();
+}
+
+void require_representable_custom_tool_input(const std::string& input, const std::string& param) {
+    if (input.find("\n</parameter>") != std::string::npos) {
+        bad_request("custom tool call input cannot contain a line break followed by </parameter>, "
+                    "which is the tool format's value delimiter",
+                    param, "invalid_tool_history");
+    }
+}
+
+std::string custom_tool_input(const ninfer::GeneratedToolCall& call) {
+    const Json arguments = Json::parse(call.arguments_json, nullptr, false);
+    if (arguments.is_object() && arguments.size() == 1) {
+        if (const auto input = arguments.find(kCustomToolInputParameter);
+            input != arguments.end() && input->is_string()) {
+            return input->get<std::string>();
+        }
+    }
+    throw std::logic_error("custom tool '" + call.name +
+                           "' call does not carry exactly one string input argument");
 }
 
 bool parse_openai_prompt_cache_breakpoint(const RequestJson& value, std::string_view param) {
