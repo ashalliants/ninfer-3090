@@ -190,6 +190,15 @@ the wide route's cast kernel and through the public Op on both routes, and the a
 `--format NAME` and `--shape N K` select problems; the full run takes about a minute, most of it the
 host oracle.
 
+The Qwen3.8-Flash-Next Ops ported from Infernix have their own suites, each a few seconds:
+`ninfer_hyper_connection_test` (the mixer against its FP64 formula on both arithmetic profiles,
+fused T ≤ 16 and composed above, column invariance, graph equal to eager; inject and expand exact),
+`ninfer_ple_test` (the IQ4_NL row decode exact against the host decoder; the gate and the stateful
+convolution against FP64, states bit for bit, split calls equal to one call, commit equal to the
+in-place update), `ninfer_projection_fp32_test` (BF16 router segments and the IQ4_XS head against
+FP64 within the FP32 accumulation bound, column invariance) and `ninfer_rows_test` (exact splits and
+gathers with guard bytes).
+
 The real loading test accepts an explicit artifact path and optional component selection:
 
 ```bash
