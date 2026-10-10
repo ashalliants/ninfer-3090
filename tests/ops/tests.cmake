@@ -42,6 +42,12 @@ ninfer_add_op_test(ninfer_linear_topk_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"
   LIBRARIES ninfer_ops)
 
+# Query-sparse attention: index query, pooled keys, block selection and attention, each against its
+# FP64 or exact oracle. `--small` runs the quick subset used under compute-sanitizer.
+ninfer_add_op_test(ninfer_qsa_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qsa.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_candidate_selector_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_candidate_selector.cpp"
   LIBRARIES ninfer_ops)
