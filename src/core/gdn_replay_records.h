@@ -56,6 +56,10 @@ struct GdnReplayRecords {
     GdnReplayRecords(DeviceSpan backing, const GdnReplayRecordLayout& layout);
 
     [[nodiscard]] GdnReplayRecordLayer layer(std::int32_t layer, std::int32_t rows) const;
+
+    // The same planes viewed densely at a narrower `width` in [1, spec.width], for a round that
+    // records fewer columns. The views alias these records, so only one may hold a pending round.
+    [[nodiscard]] GdnReplayRecords narrowed(std::int32_t width) const;
 };
 
 } // namespace ninfer

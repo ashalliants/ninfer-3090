@@ -330,6 +330,10 @@ CUDA Graph 按合法 exact-`B` topology 建立，page ID、请求身份、state 
 Op 拥有声明执行范围内的 Graph 更新兼容性，Program 在启动时捕获并验证同类更新。
 Speculative unit 使用 Forward、Finish 两段 Graph，CPU 在两段之间准备约束 mask，并可与 target
 forward 重叠；两段共享同一个资源预留和提交边界。
+每个 speculative round family（proposal kind 与 `verify_drafts`）各自捕获 Forward/Finish Graph；
+round frame、ReplaySSM records、grammar mask staging 和 DFlash pending features 按最宽 family
+分配，每轮以自身宽度的 dense view 使用，提交按该轮记录的 `verify_drafts` 索引 egress。目前只有
+draft window 宽度的 neural family。
 长度档位限制资源范围；Program 不复制 Attention Op 私有 kernel 的分派边界。
 
 本 fork 的多 GPU layer pipeline（`--devices A,B,...`，Linux；每个 stage 整层拥有权重、KV plane、GDN

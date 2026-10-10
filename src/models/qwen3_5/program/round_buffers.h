@@ -21,6 +21,8 @@ struct RoundStateSpec {
     std::int32_t hidden          = 0;
     std::int32_t output_rows     = 0;
     std::uint32_t batch_capacity = 1;
+    // The widest round family's drafts; a speculative frame is allocated at draft_window + 1
+    // columns per row and each round views it at its own width.
     std::uint32_t draft_window   = 0;
     SpeculativeBackend backend   = SpeculativeBackend::None;
     bool causal_scoring          = false;
@@ -308,6 +310,12 @@ struct DFlashDecodeState {
     DFlashDecodeState() = default;
     DFlashDecodeState(DeviceSpan backing, const DFlashDecodeStateLayout& layout,
                       std::uint32_t batch_capacity, std::uint32_t draft_window);
+
+    // The same storage viewed densely as a round of `k` drafts: every per-column tensor becomes
+    // [k+1 or k, batch_capacity] over its leading elements, matching host ingress/egress indexed
+    // at row * (k + 1). Append positions keep the allocated width, since a round's context
+    // catch-up covers the previous round, which may have run a wider family.
+    [[nodiscard]] DFlashDecodeState narrowed(std::uint32_t k) const;
 };
 
 struct RoundState {

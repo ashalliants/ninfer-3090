@@ -572,8 +572,10 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             throw std::logic_error("DFlash decode batch state is incomplete");
         }
         state.execution.work.reset();
-        qwen3_5::DFlashDecodeState& frame = state.frame;
-        const std::int32_t width          = static_cast<std::int32_t>(k) + 1;
+        // Forward and Finish derive the same view of the frame at the round's width, so Finish
+        // reads what Forward wrote.
+        qwen3_5::DFlashDecodeState frame = state.frame.narrowed(k);
+        const std::int32_t width         = static_cast<std::int32_t>(k) + 1;
         if (phase == SpeculativePhase::Forward) {
             CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
                                        sizeof(qwen3_5::DFlashDecodeIngress), cudaMemcpyHostToDevice,
@@ -606,10 +608,11 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
 
         if (phase == SpeculativePhase::Forward) {
             state.execution.work.reset();
+            // Catch-up appends the previous round's columns, at the frame's allocated width.
             Tensor compact_features = state.execution.work.alloc(
                 DType::BF16,
-                {dimension(state.execution.parameters.draft->feature_projection.weight.k), width,
-                 batch_size});
+                {dimension(state.execution.parameters.draft->feature_projection.weight.k),
+                 frame.append_positions.ne[0], batch_size});
             ops::prepare_ragged_prefix(
                 dflash_state(state).pending_features, active_lanes, context_starts, frontiers,
                 compact_features, append_positions, append_counts, state.execution.device.stream);
