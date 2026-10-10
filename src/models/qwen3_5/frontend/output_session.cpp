@@ -400,6 +400,9 @@ public:
     ToolCallParseDiagnostics tool_call_parse;
     bool preview_ready                 = false;
     FinishReason preview_finish_reason = FinishReason::None;
+    // Whether the previewed stop token is one of the checkpoint's own end-of-turn tokens, as
+    // opposed to a caller-supplied stop id merged into the same policy.
+    bool preview_stop_is_model_default = false;
     std::unique_ptr<text::GrammarSession> grammar;
     bool combined                 = false;
     bool saw_content              = false;
@@ -514,6 +517,7 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
     impl_->preview_prefix_execution = impl_->prefix_execution;
     impl_->preview_execution_split_after.reset();
     impl_->preview_output.clear();
+    impl_->preview_stop_is_model_default = false;
 
     const auto complete = [&](std::uint32_t count, FinishReason reason,
                               runtime::ContinuationAction continuation =
@@ -577,6 +581,10 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         }
 
         if (stop_token) {
+            const auto& defaults = impl_->tokenizer->default_stop_token_ids();
+            impl_->preview_stop_is_model_default =
+                std::find(defaults.begin(), defaults.end(), static_cast<int>(token)) !=
+                defaults.end();
             if (!impl_->policy.publish_stop_token) {
                 impl_->preview_state  = std::move(before_state);
                 impl_->preview_output = std::move(before_output);
@@ -724,9 +732,13 @@ PublishedOutput OutputSession::commit_preview() {
     if (impl_->state.terminal &&
         (!impl_->combined || impl_->branch == ConstraintOutputBranch::Tools)) {
         // The reasoning channel is still open only when the model ended the turn without closing
-        // its thinking.
+        // its thinking. A caller-supplied stop id is the client's own end, not the model's, so it
+        // does not recover calls from that thinking.
+        const bool model_ended = impl_->preview_finish_reason != FinishReason::StopToken ||
+                                 impl_->preview_stop_is_model_default;
         const std::string_view open_reasoning =
-            impl_->state.in_reasoning ? std::string_view(impl_->open_reasoning) : std::string_view{};
+            impl_->state.in_reasoning && model_ended ? std::string_view(impl_->open_reasoning)
+                                                     : std::string_view{};
         fi::ToolCallOutputDecoder::Terminal terminal =
             impl_->tool_call_output.finish(impl_->preview_finish_reason, open_reasoning);
         impl_->tool_calls      = std::move(terminal.tool_calls);
