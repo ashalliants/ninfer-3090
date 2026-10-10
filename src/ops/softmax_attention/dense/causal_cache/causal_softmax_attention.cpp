@@ -388,6 +388,8 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::i
                 // share INT8's cutoff; rk8v4 and rk4v4 used to fall through to small-T. On the 27B
                 // (2026-09-24) that made 9-16 columns over 64-224 keys 1.1-1.9x faster, except
                 // rk8v4 at 9 columns over 224 keys (12% slower), the same trade INT8 makes there.
+                // That was measured on the tiled prompt kernel; the FA2-style kernel that replaced
+                // it takes 0.73-0.95x its time on these launches (2026-10-10).
                 prompt_limit = width <= 8 ? 0 : 256;
                 break;
             case KvCacheStorage::Fp8E4M3Row256:
@@ -452,14 +454,14 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
 
 #if defined(NINFER_SM8X_COMPAT)
     // The sm_86 small-T routes size their split grid from fixed per-geometry caps measured on the
-    // RTX 3090 (see geometry.cuh); the INT8-G64 prompt route plans its key splits from the device
-    // SM count at the envelope's maximum, which bounds every launch inside the envelope
+    // RTX 3090 (see geometry.cuh); the INT8-family prompt route plans its key splits from the
+    // device SM count at the envelope's maximum, which bounds every launch inside the envelope
     // (prompt_i8_fa2_plan.h).
+    const bool int8_family = cache_storage == KvCacheStorage::Int8Group64 ||
+                             cache_storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
+                             cache_storage == KvCacheStorage::RotatedLloyd4KeyInt4Value;
     const auto prompt_capacity = [&](std::int32_t width) {
-        if (cache_storage != KvCacheStorage::Int8Group64 ||
-            envelope.max_visible_keys <= detail::kCausalPromptFa2MinVisibleKeys) {
-            return std::size_t{0};
-        }
+        if (!int8_family) { return std::size_t{0}; }
         const detail::CausalPromptFa2Plan plan = detail::causal_prompt_fa2_plan(
             q_heads, width, envelope.max_visible_keys, execution.multiprocessor_count);
         return detail::causal_prompt_fa2_split_bytes(q_heads, width, plan.splits);
@@ -496,9 +498,9 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
             maximum = std::max(maximum, exact_capacity(width));
         }
     }
-    // Wider calls are single-row prompt launches; only an INT8-G64 split needs scratch, and a
+    // Wider calls are single-row prompt launches; only an INT8-family split needs scratch, and a
     // split needs at least two runs of kCausalPromptFa2MinPagesPerSplit pages.
-    if (max_width > kMaximumVerifyTokens && cache_storage == KvCacheStorage::Int8Group64 &&
+    if (max_width > kMaximumVerifyTokens && int8_family &&
         detail::causal_prompt_fa2_pages(envelope.max_visible_keys) >=
             2 * detail::kCausalPromptFa2MinPagesPerSplit) {
         for (std::int32_t width = std::max(min_width, kMaximumVerifyTokens + 1);
@@ -547,16 +549,13 @@ CausalAttentionLaunchShape causal_softmax_attention_launch_shape(
     // The prompt route appends the new K/V and then attends; a small-T launch appends inside its
     // partial kernel and then reduces. Both are two kernels, and the chunked route repeats the
     // small-T pair once per chunk. BF16 is either grouped + merge or append + tiled: two kernels.
-    // An INT8-G64 prompt launch over few keys keeps the tiled kernel; otherwise its CTA shape and
-    // split choice are distinct kernel instantiations and part of the route, and a launch that
-    // splits its keys adds the merge kernel.
+    // An INT8-family prompt launch's CTA shape and split choice are distinct kernel instantiations
+    // and part of the route, and a launch that splits its keys adds the merge kernel.
     CausalAttentionLaunchShape shape{.route = static_cast<std::uint32_t>(route), .kernel_nodes = 2U};
     if (route == detail::CausalAttentionRoute::Prompt &&
-        cache_storage == KvCacheStorage::Int8Group64 &&
-        envelope.max_visible_keys <= detail::kCausalPromptFa2MinVisibleKeys) {
-        shape.route |= 1U << 18U;
-    } else if (route == detail::CausalAttentionRoute::Prompt &&
-               cache_storage == KvCacheStorage::Int8Group64) {
+        (cache_storage == KvCacheStorage::Int8Group64 ||
+         cache_storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
+         cache_storage == KvCacheStorage::RotatedLloyd4KeyInt4Value)) {
         const detail::CausalPromptFa2Plan plan = detail::causal_prompt_fa2_plan(
             geometry.query_heads, tokens, envelope.max_visible_keys,
             execution.multiprocessor_count);

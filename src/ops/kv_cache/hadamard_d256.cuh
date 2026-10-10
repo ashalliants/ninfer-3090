@@ -6,18 +6,22 @@ namespace ninfer::ops {
 
 // Apply the five lane dimensions of a Sylvester transform to independent columns. Keeping the
 // column loop inside each stage exposes their independent shuffle instructions while preserving
-// the butterfly and rounding order of every column.
+// the butterfly and rounding order of every column. The butterfly is written branch-free:
+// (-value) + peer is exactly peer - value, and a lane-dependent select between the two forms made
+// ptxas guard every shuffle with its own divergence check (BRA.DIV), which serialized them: on the
+// RTX 3090 a one-tile, 64-column FA2 prompt launch took 43.7 us with it and 33.5 us without.
 template <int Columns>
 __device__ __forceinline__ void hadamard_d32_columns_inplace(float (&values)[Columns], int lane) {
     constexpr unsigned FullMask = 0xffffffffu;
 
 #pragma unroll
     for (int stride = 1; stride <= 16; stride <<= 1) {
+        const float sign = (lane & stride) == 0 ? 1.0f : -1.0f;
 #pragma unroll
         for (int column = 0; column < Columns; ++column) {
             const float value = values[column];
             const float peer  = __shfl_xor_sync(FullMask, value, stride);
-            values[column] = (lane & stride) == 0 ? __fadd_rn(value, peer) : __fsub_rn(peer, value);
+            values[column]    = __fadd_rn(__fmul_rn(sign, value), peer);
         }
     }
 }
