@@ -3,6 +3,7 @@
 
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
+#include "ops/linear/ggml/ggml_dispatch.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q5/q5_dispatch.h"
@@ -98,8 +99,16 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     case QType::FP8_E4M3FN_ROW_BF16:
         detail::fp8_dispatch(x, w, out, policy, workspace, stream);
         return;
-    case QType::FP32:
-    case QType::INT32:
+    case QType::GGML_IQ4_XS:
+    case QType::GGML_IQ3_S:
+    case QType::GGML_Q6_K:
+    case QType::GGML_IQ4_NL:
+    case QType::GGML_Q8_0:
+    case QType::GGML_Q2_0:
+        detail::ggml_require_registered(w.qtype, w.n, w.k, false, allows_a8(policy));
+        detail::ggml_linear_dispatch(x, w, out, false, workspace, stream);
+        return;
+    default:
         break;
     }
     throw std::invalid_argument("linear: unsupported weight qtype");
@@ -142,8 +151,16 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::FP8_E4M3FN_ROW_BF16:
         return detail::fp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                            min_tokens, max_tokens);
-    case QType::FP32:
-    case QType::INT32:
+    case QType::GGML_IQ4_XS:
+    case QType::GGML_IQ3_S:
+    case QType::GGML_Q6_K:
+    case QType::GGML_IQ4_NL:
+    case QType::GGML_Q8_0:
+    case QType::GGML_Q2_0:
+        detail::ggml_require_registered(qtype, output_rows, input_rows, false, allows_a8(policy));
+        return detail::ggml_linear_workspace_capacity_bytes(qtype, output_rows, input_rows, false,
+                                                            min_tokens, max_tokens);
+    default:
         break;
     }
     throw std::invalid_argument("linear workspace: unsupported weight qtype");

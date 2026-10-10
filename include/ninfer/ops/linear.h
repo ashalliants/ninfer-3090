@@ -114,6 +114,13 @@ inline constexpr std::int32_t kCublasPrefillMinTokens = 512;
  * `{4,8,...,131072}` or merged-token V in `[1,32768]`; a matrix column does not inherently
  * represent a text token. FP32 is unsupported.
  *
+ * GGML block formats in layout `ggml_blocks_v1` (tensor-formats.md Section 3.5) register the dense
+ * projections of Qwen3.8-Flash-Next at every positive T: GGML_IQ4_XS and GGML_IQ3_S at `[N,K]` in
+ * `{[10240,2560], [6144,2560], [12288,2560], [512,2560], [2560,6144], [640,2560]}`, GGML_Q6_K at
+ * `{[6144,2560], [512,2560], [2560,6144], [640,2560]}`, and GGML_IQ4_NL, GGML_Q8_0 and GGML_Q2_0
+ * at `[2560,640]`. The weight view is the codes-only native form (no scale or high plane); IQ4_XS
+ * rows are 8-byte aligned, the others 2-byte aligned.
+ *
  * @par Numerical contract
  * Test fixture code materializes the persistent weight as its logical FP32 dequantized matrix.
  * The one Linear oracle accepts that matrix and the FP32 values represented by the BF16 activation,
@@ -124,6 +131,15 @@ inline constexpr std::int32_t kCublasPrefillMinTokens = 512;
  * activation-compute path; none is copied into the oracle. Kernel, schedule, template instance,
  * host launcher, and T region do not create separate criteria inside one path.
  *
+ * GGML block formats are the exception: their activation enters through the Q8_1 cast, a semantic
+ * boundary of these formats, so the ideal result replaces `FP32(x)` with its cast. For every column
+ * t and every group of 32 consecutive k (k = 32g..32g+31), with a = max |FP32(x_{k,t})| over the
+ * group, d = a / 127 and q_{k,t} = rint(FP32(x_{k,t}) * (127 / a)) -- FP32 divisions and product,
+ * rounding to nearest with ties to even, q = 0 when a = 0 -- the ideal is
+ * `sum_k FP32Dequant(w)_{n,k} * q_{k,t} * d_{g,t}` evaluated exactly. The oracle applies the same
+ * cast to the represented activation; FP32Dequant is ggml's reference `dequantize_row_*`.
+ * Non-finite activations give unspecified results.
+ *
  * @par Compute policy
  * `policy` specifies the permitted private activation-compute set. A permission does not require a
  * corresponding low-precision route: the resolved plan may remain A16 when that is the qualified
@@ -132,8 +148,9 @@ inline constexpr std::int32_t kCublasPrefillMinTokens = 512;
  * qualified A16 or A8 route for the registered problem and T. FP8 `[248320,5120]` retains A16
  * compute under every policy at every positive T. NVFP4 uses A16 for A16Only and
  * AllowA8; AllowA4 permits the private resolver to select either a qualified A16 route or
- * activation quantization to NVFP4 at every positive T. The selected route depends only on the
- * registered problem and T.
+ * activation quantization to NVFP4 at every positive T. GGML block formats register only the Q8_1
+ * (A8) profile above: AllowA8 and AllowA4 admit it, and A16Only, including the A16 convenience
+ * overload, is rejected for them. The selected route depends only on the registered problem and T.
  *
  * @par Workspace
  * `workspace` is caller-owned call-scoped transient storage sized by

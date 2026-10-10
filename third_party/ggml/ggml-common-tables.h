@@ -5,19 +5,33 @@
 //
 // Copyright (c) 2023-2026 The ggml authors. Distributed under the MIT License; the full notice is
 // in third_party/ggml/LICENSE.
+//
+// One header serves host and device code, as ggml-common.h does with GGML_TABLE_BEGIN. By default
+// every table is an `inline constexpr` host array. A CUDA translation unit that reads a table in
+// device code defines both macros before including this header, for example
+//
+//   #define NINFER_GGML_TABLE_BEGIN(type, name, size) static __device__ const type name[size] = {
+//   #define NINFER_GGML_TABLE_END() };
+//
+// and includes it no other way.
 #pragma once
 
 #include <cstdint>
 
-namespace ninfer::test::ggml {
+#ifndef NINFER_GGML_TABLE_BEGIN
+#define NINFER_GGML_TABLE_BEGIN(type, name, size) inline constexpr type name[size] = {
+#define NINFER_GGML_TABLE_END() };
+#endif
+
+namespace ninfer::ggml_tables {
 
 inline constexpr char kRelease[] = "b11316";
 
-inline constexpr std::uint8_t kmask_iq2xs[8] = {
+NINFER_GGML_TABLE_BEGIN(std::uint8_t, kmask_iq2xs, 8)
     0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
-};
+NINFER_GGML_TABLE_END()
 
-inline constexpr std::uint8_t ksigns_iq2xs[128] = {
+NINFER_GGML_TABLE_BEGIN(std::uint8_t, ksigns_iq2xs, 128)
     0x00, 0x81, 0x82, 0x03, 0x84, 0x05, 0x06, 0x87, 0x88, 0x09, 0x0a, 0x8b,
     0x0c, 0x8d, 0x8e, 0x0f, 0x90, 0x11, 0x12, 0x93, 0x14, 0x95, 0x96, 0x17,
     0x18, 0x99, 0x9a, 0x1b, 0x9c, 0x1d, 0x1e, 0x9f, 0xa0, 0x21, 0x22, 0xa3,
@@ -29,9 +43,9 @@ inline constexpr std::uint8_t ksigns_iq2xs[128] = {
     0x60, 0xe1, 0xe2, 0x63, 0xe4, 0x65, 0x66, 0xe7, 0xe8, 0x69, 0x6a, 0xeb,
     0x6c, 0xed, 0xee, 0x6f, 0xf0, 0x71, 0x72, 0xf3, 0x74, 0xf5, 0xf6, 0x77,
     0x78, 0xf9, 0xfa, 0x7b, 0xfc, 0x7d, 0x7e, 0xff,
-};
+NINFER_GGML_TABLE_END()
 
-inline constexpr std::uint64_t iq2xxs_grid[256] = {
+NINFER_GGML_TABLE_BEGIN(std::uint64_t, iq2xxs_grid, 256)
     0x0808080808080808ULL, 0x080808080808082bULL, 0x0808080808081919ULL, 0x0808080808082b08ULL,
     0x0808080808082b2bULL, 0x0808080808190819ULL, 0x0808080808191908ULL, 0x08080808082b0808ULL,
     0x08080808082b082bULL, 0x08080808082b2b08ULL, 0x08080808082b2b2bULL, 0x0808080819080819ULL,
@@ -96,9 +110,9 @@ inline constexpr std::uint64_t iq2xxs_grid[256] = {
     0x2b19190819081908ULL, 0x2b19191919190819ULL, 0x2b192b082b080819ULL, 0x2b192b19082b0808ULL,
     0x2b2b08080808082bULL, 0x2b2b080819190808ULL, 0x2b2b08082b081919ULL, 0x2b2b081908082b19ULL,
     0x2b2b082b08080808ULL, 0x2b2b190808192b08ULL, 0x2b2b2b0819190808ULL, 0x2b2b2b1908081908ULL,
-};
+NINFER_GGML_TABLE_END()
 
-inline constexpr std::uint64_t iq2s_grid[1024] = {
+NINFER_GGML_TABLE_BEGIN(std::uint64_t, iq2s_grid, 1024)
     0x0808080808080808ULL, 0x080808080808082bULL, 0x0808080808081919ULL, 0x0808080808082b08ULL,
     0x0808080808082b2bULL, 0x0808080808190819ULL, 0x0808080808191908ULL, 0x080808080819192bULL,
     0x0808080808192b19ULL, 0x08080808082b0808ULL, 0x08080808082b082bULL, 0x08080808082b1919ULL,
@@ -355,9 +369,9 @@ inline constexpr std::uint64_t iq2s_grid[1024] = {
     0x2b2b2b0808082b2bULL, 0x2b2b2b08082b2b08ULL, 0x2b2b2b082b2b082bULL, 0x2b2b2b1919191908ULL,
     0x2b2b2b192b08192bULL, 0x2b2b2b2b08082b08ULL, 0x2b2b2b2b08082b2bULL, 0x2b2b2b2b082b0808ULL,
     0x2b2b2b2b082b082bULL, 0x2b2b2b2b082b2b08ULL, 0x2b2b2b2b2b082b08ULL, 0x2b2b2b2b2b2b2b2bULL,
-};
+NINFER_GGML_TABLE_END()
 
-inline constexpr std::uint32_t iq3s_grid[512] = {
+NINFER_GGML_TABLE_BEGIN(std::uint32_t, iq3s_grid, 512)
     0x01010101U, 0x01010103U, 0x01010105U, 0x0101010bU, 0x0101010fU, 0x01010301U, 0x01010303U, 0x01010305U,
     0x01010309U, 0x0101030dU, 0x01010501U, 0x01010503U, 0x0101050bU, 0x01010707U, 0x01010901U, 0x01010905U,
     0x0101090bU, 0x0101090fU, 0x01010b03U, 0x01010b07U, 0x01010d01U, 0x01010d05U, 0x01010f03U, 0x01010f09U,
@@ -422,13 +436,13 @@ inline constexpr std::uint32_t iq3s_grid[512] = {
     0x0f030509U, 0x0f030907U, 0x0f03090bU, 0x0f050103U, 0x0f050109U, 0x0f050301U, 0x0f05030dU, 0x0f050503U,
     0x0f050701U, 0x0f050b03U, 0x0f070105U, 0x0f070705U, 0x0f07070bU, 0x0f070b07U, 0x0f090103U, 0x0f09010bU,
     0x0f090307U, 0x0f090501U, 0x0f090b01U, 0x0f0b0505U, 0x0f0b0905U, 0x0f0d0105U, 0x0f0d0703U, 0x0f0f0101U,
-};
+NINFER_GGML_TABLE_END()
 
-inline constexpr std::int8_t kvalues_iq4nl[16] = {
+NINFER_GGML_TABLE_BEGIN(std::int8_t, kvalues_iq4nl, 16)
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
-};
+NINFER_GGML_TABLE_END()
 
-inline constexpr std::uint64_t iq1s_grid[2048] = {
+NINFER_GGML_TABLE_BEGIN(std::uint64_t, iq1s_grid, 2048)
     0xffffffffffffffffULL, 0xffffffffffffff01ULL, 0xffffffffffff0000ULL, 0xffffffffffff01ffULL,
     0xffffffffffff0101ULL, 0xffffffffff00ff00ULL, 0xffffffffff000000ULL, 0xffffffffff01ffffULL,
     0xffffffffff01ff01ULL, 0xffffffffff0101ffULL, 0xffffffffff010101ULL, 0xffffffff00ff0000ULL,
@@ -941,6 +955,6 @@ inline constexpr std::uint64_t iq1s_grid[2048] = {
     0x010101010000ff00ULL, 0x01010101000000ffULL, 0x0101010100000001ULL, 0x0101010101ffffffULL,
     0x0101010101ffff01ULL, 0x0101010101ff01ffULL, 0x0101010101ff0101ULL, 0x0101010101000000ULL,
     0x010101010101ffffULL, 0x010101010101ff01ULL, 0x01010101010101ffULL, 0x0101010101010101ULL,
-};
+NINFER_GGML_TABLE_END()
 
-} // namespace ninfer::test::ggml
+} // namespace ninfer::ggml_tables

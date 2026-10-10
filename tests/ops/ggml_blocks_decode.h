@@ -11,7 +11,7 @@
 
 #include "core/weight.h"
 #include "core/weight_view.h"
-#include "ops/ggml_tables.h"
+#include "ggml-common-tables.h"
 
 #include <algorithm>
 #include <bit>
@@ -24,6 +24,8 @@
 namespace ninfer::test::ggml {
 
 namespace detail {
+
+using namespace ::ninfer::ggml_tables;
 
 [[nodiscard]] inline std::uint8_t u8(const std::byte* block, std::size_t offset) {
     return std::to_integer<std::uint8_t>(block[offset]);

@@ -106,7 +106,7 @@ int run() {
         const auto blocks = golden(format, name);
         paged_rows_decode_like_blocks(format, blocks);
     }
-    std::cout << "GGML exact decoder matches ggml " << ggml::kRelease << '\n';
+    std::cout << "GGML exact decoder matches ggml " << ninfer::ggml_tables::kRelease << '\n';
     return 0;
 }
 

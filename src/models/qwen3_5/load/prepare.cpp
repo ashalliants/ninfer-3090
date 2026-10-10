@@ -24,6 +24,11 @@ WeightId Bindings::parameter(std::string name, artifact::Shape shape,
     }
     PendingWeight pending;
     pending.reference = binder.parameter(name, std::move(shape), residency, exact_format);
+    [[maybe_unused]] bool ggml_block_parameter = !pending.reference.binding.parts.empty();
+    for (const auto& part : pending.reference.binding.parts) {
+        ggml_block_parameter =
+            ggml_block_parameter && is_ggml_block(binder.reader().geometry(part.object).format);
+    }
     for (const auto& input : inputs) {
         const auto& use = binder.use(name, input);
         if (!use.activation_policy) {
@@ -45,8 +50,10 @@ WeightId Bindings::parameter(std::string name, artifact::Shape shape,
 #if defined(NINFER_SM8X_COMPAT)
         // sm_86/sm_89 have no FP8 or FP4 tensor cores. A stored permission for A8/A4 activations
         // is an upper bound, not a requirement, so FP8 and NVFP4 weights run their A16 routes,
-        // which dequantize the stored codes before the matmul.
-        result.policy = ops::LinearPolicy::A16Only;
+        // which dequantize the stored codes before the matmul. GGML block formats are the
+        // exception: their only route is the Q8_1 dp4a/s8 path, which sm_86 has, so they keep the
+        // stored permission instead of being downgraded into a route they do not register.
+        if (!ggml_block_parameter) { result.policy = ops::LinearPolicy::A16Only; }
 #endif
         for (const auto& [role, binding] : use.auxiliaries) {
             if (role != "activation_input_divisor") {

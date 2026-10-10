@@ -206,9 +206,11 @@ and is not a runtime input.
 ## Linear Op benchmark
 
 `ninfer_linear_bench` measures only the public pure `linear()` contract. It supports Q4, Q5, Q6,
-Q8, registered BF16 weights, the registered NVFP4 problems, and the registered FP8 problems.
-Existing formats use `--policy a16`; NVFP4 additionally supports `--policy a4`, and
-FP8 supports `--policy a8`. Each permission lets the production resolver select the qualified
+Q8, registered BF16 weights, the registered NVFP4 problems, the registered FP8 problems, and the
+registered GGML block-format problems (`--qtype ggml_iq4_xs|ggml_iq3_s|ggml_q6_k|ggml_iq4_nl|
+ggml_q8_0|ggml_q2_0`, random valid blocks; `--suite qwen3_8_flash_next` runs all of them).
+Existing formats use `--policy a16`; NVFP4 additionally supports `--policy a4`,
+FP8 supports `--policy a8`, and the GGML formats require `--policy a8` (their only profile). Each permission lets the production resolver select the qualified
 route for the exact geometry and T. LinearAdd, LinearSwiGLU,
 LinearPair, Attention/GDN projections, and sparse MoE remain separate semantic Ops and are not
 benchmark modes here.
