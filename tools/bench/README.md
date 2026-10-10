@@ -72,6 +72,89 @@ python3 tools/bench/run_agent_rotation.py --agents 4 --target-tokens 200000 \
     --out profiles/bench/agent-rotation/run.jsonl
 ```
 
+## Copy-heavy agent replay
+
+`agent_replay/` is the copy-drafting workload: deterministic multi-turn coding-agent sessions whose
+tool results are real files of this repository, so a large share of the model's output reproduces
+text already in its prompt. `run_agent_rotation.py` above never copies (its turns are random words)
+and cannot show copy-drafting gains. The replay is stdlib-only and drives an already-running
+`ninfer-serve` through streaming `/v1/chat/completions` with five tools (`Read`, `Write`, `Edit`,
+`Grep`, `Bash`), greedy and thinking off.
+
+Each session starts from a seeded file of the pinned `--commit` (default `HEAD`, recorded as a
+hash) and grows turn by turn until its prompt reaches a seeded target in
+`[--min-context, --max-context]`. Every turn stages a scripted tool call and its result, then the
+model generates the assistant turn. Turns come in shuffled blocks of eight, half of them copies:
+
+| category | observation | the model is asked to |
+|---|---|---|
+| `explore` | `cat -n` Read slice, plain `sed -n` slice, Grep rows, or a `git show` diff | continue (no instruction) |
+| `explain` | `cat -n` Read slice | explain an identifier in prose, no code |
+| `rewrite_file` | whole file as a `cat -n` Read | Write the whole file with one identifier renamed |
+| `apply_change` | whole file as plain `cat` | return the whole file with one comment added |
+| `edit_function` | `cat -n` Read around a 20-60 line block | Edit: old_string and new_string both reproduce the block |
+| `diff_revert` | `git show <sha> -- <path>` | write each hunk's pre-change lines |
+
+Tool results, file choices and instructions depend only on the seed and the corpus commit; the
+assistant turns are free-running, so the number of turns before a session reaches its target can
+differ between builds. Compare decode tok/s over committed tokens and wall time, matched by
+`(session, turn)`, not output hashes. Model tool calls are answered with a short acknowledgement
+before the next scripted observation.
+
+```bash
+# start the server with a request log, then
+python -m tools.bench.agent_replay run --port 18120 --sessions 4 --concurrency 1 \
+    --min-context 30000 --max-context 120000 \
+    --request-log profiles/bench/agent-replay/request_log.jsonl --out profiles/bench/agent-replay/run1
+```
+
+`--request-log` names the server's `--request-log-jsonl` file. The runner reads the records written
+during its run and joins them to its turns by response id, which adds the request's `speculative`
+counters, the server's TTFT/total seconds and the committed output token IDs. Without it the
+runner takes decode time from the usage chunk's `timings` (`predicted_ms`; `prompt_ms` is kept as
+`prompt_s`, it is not TTFT) and TTFT from client-side stream timing.
+
+Outputs in `--out`:
+
+- `turns.jsonl`: one sample per turn: category, prompt/cached/output tokens, finish reason, TTFT,
+  decode seconds and `decode_tps` (output tokens / (total - TTFT)), the timing source, the copy
+  overlap, and `counters`, every numeric leaf of the request log's `speculative` object and of
+  the usage `timings` under dotted names. New server counters, such as `ngram_*`, are picked up
+  without changes here.
+- `summary.json`: per category, `copy`, `non_copy` and `all`: token-weighted decode tok/s, its
+  median and minimum per turn, TTFT median/mean/max, token sums, length-capped turns,
+  `short_turns` (under 128 output tokens: a copy turn this short called a tool instead), summed
+  counters, DFlash/MTP acceptance and tokens per round, and the share of output from any
+  `*ngram*accepted_tokens` counter.
+- `transcripts.jsonl`: the full message list of each session and the message count at each turn.
+- `output_token_ids.jsonl` (with `--request-log`): committed output token IDs per turn.
+
+**Copy overlap** is the fraction of the turn's output (content plus tool-call argument values) in
+8-unit windows that also occur in the session's prompt so far. Units are identifiers, numbers or
+single punctuation characters, whitespace is ignored, and `cat -n` prefixes are removed from both
+sides. It shows that copy turns actually copy and bounds what a copy proposer can harvest; it is a
+text proxy, not the proposer's token-level match.
+
+`export` writes the prompt and output token sequence of every turn for an offline proposer
+simulation (the copy-length distribution of the n-gram copy-drafting plan). The server logs output
+IDs but not prompt IDs and has no tokenize endpoint, so each prompt is re-rendered from
+`transcripts.jsonl` with the served artifact's own `chat_template.jinja` and `tokenizer.json`
+resources, with tool definitions shaped as the server passes them to the template and message text
+that spells a special token (a source file quoting `<|video_pad|>`) encoded as plain text, as the
+server does. Each prompt's length is checked against the server's `prompt_tokens`. This one step
+needs `jinja2` and `tokenizers`:
+
+```bash
+python -m tools.bench.agent_replay export --run profiles/bench/agent-replay/run1 \
+    --artifact models/qwen3_8_27b.ninfer
+```
+
+It writes `token_streams.jsonl` (`prompt_ids`, `output_ids`, `output_source`) and prints how many
+rendered prompts match the server's length exactly. Output IDs come from the request log; without
+one they are re-tokenized from the recorded text and marked `retokenized_text`.
+`--tokenizer-dir` takes a directory holding `tokenizer.json`, `tokenizer_config.json` and
+`chat_template.jinja` instead of an artifact.
+
 ## Corpus baker
 
 `ninfer_bench` benchmarks prefill at an exact length by slicing the first `P` token ids of a
