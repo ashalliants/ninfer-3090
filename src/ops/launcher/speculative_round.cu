@@ -47,6 +47,21 @@ void speculative_prepare_verify_ids_launch(const Tensor& anchors, const Tensor& 
     CUDA_CHECK(cudaGetLastError());
 }
 
+void speculative_overlay_copy_proposals_launch(const Tensor& copy_rows, const Tensor& copy_drafts,
+                                               Tensor& drafts, Tensor& candidates,
+                                               Tensor& proposal_q, std::int32_t token_domain,
+                                               cudaStream_t stream) {
+    constexpr int kBlock = 128;
+    const int k          = drafts.ne[0];
+    const int batch      = drafts.ne[1];
+    speculative_overlay_copy_proposals_kernel<<<batch, kBlock, 0, stream>>>(
+        static_cast<const std::int32_t*>(copy_rows.data),
+        static_cast<const std::int32_t*>(copy_drafts.data),
+        static_cast<std::int32_t*>(drafts.data), static_cast<std::int32_t*>(candidates.data),
+        static_cast<float*>(proposal_q.data), k, token_domain);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const Tensor& logits,
                                              const Tensor& drafts, const Tensor& current_extents,
                                              Tensor& lengths, Tensor& anchors,
