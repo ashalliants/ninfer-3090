@@ -8,6 +8,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -36,6 +37,28 @@ void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCa
 // Client-executed types stay rejected. Dropping one of those would leave the caller waiting for a
 // call that can never arrive, which is worse than a clear error.
 [[nodiscard]] bool is_hosted_openai_tool_type(std::string_view type) noexcept;
+
+// Free-form `custom` tools (Chat Completions and Responses). The model sees a strict function under
+// the tool's own name with one required string parameter, `input`. Strict lowering makes the
+// constrained decoder carry that parameter as a raw string, byte for byte, and guarantees it is the
+// only argument, so a call maps back onto a custom tool call without guessing.
+inline constexpr const char* kCustomToolInputParameter = "input";
+
+// A declared lark or regex grammar. It is described to the model in the `input` parameter and is
+// not enforced.
+struct CustomToolGrammar {
+    std::string syntax;
+    std::string definition;
+};
+
+// The strict input schema of a lowered custom tool.
+[[nodiscard]] std::string
+custom_tool_input_schema_json(const std::optional<CustomToolGrammar>& grammar);
+// Engine-side arguments carrying a custom tool's free-form input (assistant history).
+[[nodiscard]] std::string custom_tool_arguments_json(const std::string& input);
+// A custom tool's free-form input from its Engine-side call. Anything other than exactly one string
+// `input` argument is an internal contract violation (std::logic_error), not output to pass on.
+[[nodiscard]] std::string custom_tool_input(const ninfer::GeneratedToolCall& call);
 
 // What /v1/models advertises about the one resident model.
 struct ModelDescription {

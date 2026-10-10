@@ -10,6 +10,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -530,9 +531,9 @@ int test_tools() {
             Json::parse(
                 prompt(parse(body).generation).options.tool_jsons[0])["function"]["strict"] == true,
         "strict survives prompt and request translation");
-    body["tools"] = Json::array({Json{{"type", "custom"}, {"name", "shell"}}});
+    body["tools"] = Json::array({Json{{"type", "code_runner"}, {"name", "shell"}}});
     failures += check(api_error([&] { (void)parse(body); }).code == "tool_type_not_supported",
-                      "custom tools rejected");
+                      "unknown client-executed tool types rejected");
 
     // A hosted tool is the server's to run. NInfer has no executor, and the caller is not waiting
     // on one either, so the declaration is dropped instead of failing a request the client cannot
@@ -603,6 +604,149 @@ int test_tools() {
             ordered_prompt.options.tool_jsons.front() ==
                 R"({"type":"function","function":{"name":"probe","parameters":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"integer"}}},"strict":false}})",
         "OpenAI Chat changed tool-schema member order before PromptInput");
+    return failures;
+}
+
+// Free-form `custom` tools (OpenAI Chat Completions ChatCompletionCustomToolParam). A custom tool
+// is lowered exactly like on Responses: a strict function with one required string parameter,
+// `input`, whose grammar is described, not enforced. Its calls are answered as
+// `{type:"custom", custom:{name, input}}`, and history in that shape lowers back to `{"input"}`.
+Json custom_tool(std::string name = "apply_patch") {
+    return Json{{"type", "custom"},
+                {"custom", Json{{"name", std::move(name)},
+                                {"description", "Edit files with a patch."},
+                                {"format", Json{{"type", "grammar"},
+                                                {"grammar", Json{{"syntax", "lark"},
+                                                                 {"definition", "start: LF"}}}}}}}};
+}
+
+int test_custom_tools() {
+    int failures                    = 0;
+    Json body                       = base_request();
+    body["tools"]                   = Json::array({custom_tool(), function_tool("shell")});
+    const OpenAIChatRequest request = parse(body);
+    const ToolDefinition& tool      = request.generation.tools.at(0);
+    const Json expected_schema      = {
+        {"type", "object"},
+        {"properties",
+              Json{{"input",
+                    Json{{"type", "string"},
+                         {"description",
+                          "The tool's complete free-form input, passed to it exactly as written (not "
+                               "JSON). It must match this lark grammar:\nstart: LF"}}}}},
+        {"required", Json::array({"input"})},
+        {"additionalProperties", false}};
+    failures +=
+        check(tool.name == "apply_patch" && tool.description == "Edit files with a patch." &&
+                  tool.strict && Json::parse(tool.input_schema_json) == expected_schema &&
+                  !request.generation.tools.at(1).strict &&
+                  request.custom_tools == std::unordered_set<std::string>{"apply_patch"},
+              "a Chat custom tool is a strict function with one required string input");
+    const Json rendered = Json::parse(prompt(request.generation).options.tool_jsons.at(0));
+    failures += check(rendered.at("type") == "function" &&
+                          rendered.at("function").at("name") == "apply_patch" &&
+                          rendered.at("function").at("strict") == true &&
+                          rendered.at("function").at("parameters") == expected_schema,
+                      "a Chat custom tool renders as a strict function");
+
+    body["tool_constraints"] = "auto";
+    failures += check(parse(body).generation.constrains_tools(),
+                      "a custom tool stays constrained under tool_constraints auto");
+    body.erase("tool_constraints");
+    body["stop"] = Json::array({"</done>"});
+    failures += check(api_error([&] { (void)parse(body); }).param == "stop",
+                      "a custom tool's strict lowering refuses custom stop strings");
+    body.erase("stop");
+
+    Json text_format                            = body;
+    text_format["tools"][0]["custom"]["format"] = Json{{"type", "text"}};
+    Json no_format                              = body;
+    no_format["tools"][0]["custom"].erase("format");
+    const std::string plain_description =
+        "The tool's complete free-form input, passed to it exactly as written (not JSON).";
+    failures += check(
+        Json::parse(parse(text_format).generation.tools[0].input_schema_json)["properties"]["input"]
+                                                                             ["description"] ==
+                plain_description &&
+            Json::parse(
+                parse(no_format).generation.tools[0].input_schema_json)["properties"]["input"]
+                                                                       ["description"] ==
+                plain_description,
+        "a text or absent format describes unconstrained free-form input");
+
+    // Forced choice and allowed_tools, in OpenAI's nested and the flat compatibility shape.
+    body["tool_choice"] = Json{{"type", "custom"}, {"custom", Json{{"name", "apply_patch"}}}};
+    const GenerationRequest forced = parse(body).generation;
+    failures +=
+        check(forced.tool_choice.mode == ToolChoiceMode::Required &&
+                  forced.tool_choice.allowed_names == std::vector<std::string>{"apply_patch"} &&
+                  !forced.tool_choice.parallel,
+              "a named custom tool_choice forces exactly one call of that tool");
+    body["tool_choice"] = Json{
+        {"type", "allowed_tools"},
+        {"allowed_tools",
+         Json{{"mode", "required"},
+              {"tools",
+               Json::array({Json{{"type", "custom"}, {"custom", Json{{"name", "apply_patch"}}}},
+                            Json{{"type", "function"}, {"function", Json{{"name", "shell"}}}}})}}}};
+    const GenerationRequest allowed = parse(body).generation;
+    failures += check(allowed.tool_choice.mode == ToolChoiceMode::Required &&
+                          allowed.tool_choice.allowed_names ==
+                              std::vector<std::string>{"apply_patch", "shell"},
+                      "allowed_tools selects custom and function tools in OpenAI's nested shape");
+    body["tool_choice"]["allowed_tools"]["tools"] =
+        Json::array({Json{{"type", "custom"}, {"name", "apply_patch"}}});
+    failures += check(parse(body).generation.tool_choice.allowed_names ==
+                          std::vector<std::string>{"apply_patch"},
+                      "allowed_tools accepts a flat custom entry");
+
+    // Rejections: malformed definitions and references that mix a tool's kind.
+    auto rejected = [&](Json invalid, const std::string& param, const std::string& code,
+                        const std::string& label) {
+        const ApiError error = api_error([&] { (void)parse(std::move(invalid)); });
+        failures += check(
+            error.status == 400 && error.param == param && (code.empty() || error.code == code),
+            label + " (got " + error.param + "/" + error.code + ": " + error.message + ")");
+    };
+    Json invalid     = base_request();
+    invalid["tools"] = Json::array({Json{{"type", "custom"}, {"name", "apply_patch"}}});
+    rejected(invalid, "tools", "", "a custom tool without a custom object");
+    invalid["tools"]                        = Json::array({custom_tool()});
+    invalid["tools"][0]["custom"]["format"] = Json{{"type", "regex"}};
+    rejected(invalid, "tools", "", "an unknown custom format type");
+    invalid["tools"][0]["custom"]["format"] = Json{{"type", "grammar"}};
+    rejected(invalid, "tools", "", "a grammar format without a grammar object");
+    invalid["tools"][0]["custom"]["format"] =
+        Json{{"type", "grammar"}, {"grammar", Json{{"syntax", "ebnf"}, {"definition", "x"}}}};
+    rejected(invalid, "tools", "", "a grammar syntax other than lark or regex");
+    invalid["tools"][0]["custom"]["format"] =
+        Json{{"type", "grammar"}, {"grammar", Json{{"syntax", "regex"}}}};
+    rejected(invalid, "tools", "", "a grammar without a definition");
+    invalid["tools"]                             = Json::array({custom_tool()});
+    invalid["tools"][0]["custom"]["description"] = 5;
+    rejected(invalid, "tools", "", "a non-string custom description");
+    invalid["tools"] = Json::array({custom_tool("dup"), function_tool("dup")});
+    rejected(invalid, "tools", "duplicate_tool_name", "a name declared as custom and function");
+    invalid["tools"] = Json::array({function_tool("dup"), custom_tool("dup")});
+    rejected(invalid, "tools", "duplicate_tool_name", "a name declared as function and custom");
+    invalid = body;
+    invalid["tool_choice"] =
+        Json{{"type", "function"}, {"function", Json{{"name", "apply_patch"}}}};
+    rejected(invalid, "tool_choice", "invalid_tool_choice",
+             "a function tool_choice naming a custom tool");
+    invalid["tool_choice"] = Json{{"type", "custom"}, {"custom", Json{{"name", "shell"}}}};
+    rejected(invalid, "tool_choice", "invalid_tool_choice",
+             "a custom tool_choice naming a function tool");
+    invalid["tool_choice"] = Json{{"type", "custom"}, {"custom", Json{{"name", "missing"}}}};
+    rejected(invalid, "tool_choice", "", "a custom tool_choice naming an undeclared tool");
+    invalid["tool_choice"] = Json{{"type", "custom"}, {"name", "apply_patch"}};
+    rejected(invalid, "tool_choice", "", "a custom tool_choice without its custom object");
+    invalid["tool_choice"] =
+        Json{{"type", "allowed_tools"},
+             {"mode", "auto"},
+             {"tools", Json::array({Json{{"type", "function"}, {"name", "apply_patch"}}})}};
+    rejected(invalid, "tool_choice", "invalid_tool_choice",
+             "allowed_tools selecting a custom tool as a function");
     return failures;
 }
 
@@ -1052,6 +1196,141 @@ int test_stream_response() {
     return failures;
 }
 
+GenerationOutcome custom_call_outcome(const std::string& patch) {
+    GenerationOutcome outcome;
+    outcome.finish_reason = ninfer::FinishReason::StopToken;
+    outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
+        .name = "apply_patch", .arguments_json = custom_tool_arguments_json(patch)});
+    outcome.tool_calls.push_back(
+        ninfer::GeneratedToolCall{.name = "shell", .arguments_json = R"({"cmd":"ls"})"});
+    return outcome;
+}
+
+int test_custom_tool_responses() {
+    int failures = 0;
+    // A Codex-style patch: leading spaces, blank lines, quotes and the *** markers survive.
+    const std::string patch = "*** Begin Patch\n*** Update File: a.py\n@@ def f():\n"
+                              "-    x = \"1\"\n+    x = \"2\"\n \n+\n     return x\n*** End Patch";
+    const std::unordered_set<std::string> custom_tools{"apply_patch"};
+    const GenerationOutcome outcome = custom_call_outcome(patch);
+
+    const Json aggregate =
+        Json::parse(make_chat_completion_response(identity(), outcome, custom_tools));
+    const Json& message = aggregate["choices"][0]["message"];
+    const Json& custom  = message["tool_calls"][0];
+    failures += check(
+        aggregate["choices"][0]["finish_reason"] == "tool_calls" && custom.size() == 3 &&
+            custom["type"] == "custom" && custom["id"].get<std::string>().starts_with("call_") &&
+            custom["custom"].size() == 2 && custom["custom"]["name"] == "apply_patch" &&
+            custom["custom"]["input"].get<std::string>() == patch && !custom.contains("function"),
+        "an aggregate custom call is {id, type:custom, custom:{name, input}}");
+    failures += check(message["tool_calls"][1]["type"] == "function" &&
+                          message["tool_calls"][1]["function"]["arguments"] == R"({"cmd":"ls"})",
+                      "a function call beside a custom call keeps the function shape");
+    failures += check(Json::parse(make_chat_completion_response(
+                          identity(), outcome))["choices"][0]["message"]["tool_calls"][0]["type"] ==
+                          "function",
+                      "without declared custom tools every call is a function call");
+
+    OpenAIChatStream stream(identity(), false, false, false, custom_tools);
+    (void)stream.start();
+    const std::vector<std::string> events = stream.finish(outcome);
+    std::string streamed_input;
+    Json first_custom_delta;
+    for (const std::string& event : events) {
+        if (event == "data: [DONE]\n\n") { continue; }
+        const Json payload = parse_sse(event);
+        const Json& delta  = payload["choices"][0]["delta"];
+        if (!delta.contains("tool_calls")) { continue; }
+        for (const Json& call : delta["tool_calls"]) {
+            if (call["index"] != 0) { continue; }
+            if (first_custom_delta.is_null()) { first_custom_delta = call; }
+            streamed_input += call["custom"]["input"].get<std::string>();
+        }
+    }
+    failures +=
+        check(first_custom_delta["index"] == 0 && first_custom_delta["type"] == "custom" &&
+                  first_custom_delta["id"].get<std::string>().starts_with("call_") &&
+                  first_custom_delta["custom"]["name"] == "apply_patch" &&
+                  !first_custom_delta.contains("function"),
+              "a streamed custom call delta is {index, id, type:custom, custom:{name, input}}");
+    failures += check(streamed_input == patch &&
+                          streamed_input == custom["custom"]["input"].get<std::string>(),
+                      "streamed custom inputs concatenate to the aggregate input byte for byte");
+    failures +=
+        check(parse_sse(events[events.size() - 2])["choices"][0]["finish_reason"] == "tool_calls",
+              "a streamed custom call finishes with tool_calls");
+
+    // History round trip: the aggregate answer, sent back as assistant history, lowers to the
+    // exact Engine call that produced it.
+    Json history     = base_request();
+    history["tools"] = Json::array({custom_tool(), function_tool("shell")});
+    Json assistant   = message;
+    assistant.erase("reasoning_content");
+    history["messages"] =
+        Json::array({Json{{"role", "user"}, {"content", "fix it"}}, assistant,
+                     Json{{"role", "tool"}, {"tool_call_id", custom["id"]}, {"content", "Done!"}},
+                     Json{{"role", "tool"},
+                          {"tool_call_id", message["tool_calls"][1]["id"]},
+                          {"content", "a"}}});
+    const GenerationRequest replayed = parse(history).generation;
+    const auto& calls                = replayed.messages.at(1).tool_calls;
+    failures += check(calls.size() == 2 && calls[0].name == "apply_patch" &&
+                          calls[0].id == custom["id"].get<std::string>() &&
+                          calls[0].arguments_json == outcome.tool_calls[0].arguments_json &&
+                          calls[1].arguments_json == outcome.tool_calls[1].arguments_json &&
+                          replayed.has_tool_history(),
+                      "custom call history lowers back to the Engine call it came from");
+    const ninfer::PromptInput replayed_prompt = prompt(replayed);
+    failures += check(replayed_prompt.messages.size() == 4 &&
+                          replayed_prompt.messages[1].tool_calls.size() == 2 &&
+                          replayed_prompt.messages[1].tool_calls[0].arguments_json ==
+                              outcome.tool_calls[0].arguments_json,
+                      "custom call history reaches PromptInput as the Engine call");
+
+    auto history_error = [&](Json call) {
+        Json invalid                         = history;
+        invalid["messages"][1]["tool_calls"] = Json::array({std::move(call)});
+        invalid["messages"].erase(3);
+        return api_error([&] { (void)parse(invalid); });
+    };
+    ApiError error = history_error(
+        Json{{"id", "c1"}, {"type", "custom"}, {"custom", Json{{"name", "apply_patch"}}}});
+    failures += check(error.param == "messages", "a custom history call without input");
+    error =
+        history_error(Json{{"id", "c1"},
+                           {"type", "custom"},
+                           {"custom", Json{{"name", "apply_patch"}, {"input", Json::object()}}}});
+    failures += check(error.param == "messages", "a custom history call with non-string input");
+    error = history_error(Json{
+        {"id", "c1"}, {"type", "custom"}, {"custom", Json{{"name", "shell"}, {"input", "ls"}}}});
+    failures += check(error.code == "invalid_tool_history",
+                      "a custom history call naming a declared function");
+    error = history_error(Json{{"id", "c1"},
+                               {"type", "function"},
+                               {"function", Json{{"name", "apply_patch"}, {"arguments", "{}"}}}});
+    failures += check(error.code == "invalid_tool_history",
+                      "a function history call naming a declared custom tool");
+    error = history_error(Json{{"id", "c1"}, {"type", "mcp"}});
+    failures += check(error.code == "tool_type_not_supported",
+                      "a history call of another type stays rejected");
+
+    // Strict lowering guarantees exactly one string `input`; anything else is a server bug and
+    // must not reach the client as a patch.
+    GenerationOutcome broken            = outcome;
+    broken.tool_calls[0].arguments_json = R"({"input":"x","extra":1})";
+    failures +=
+        check(throws_logic(
+                  [&] { (void)make_chat_completion_response(identity(), broken, custom_tools); }),
+              "an aggregate custom call without exactly one string input is an internal error");
+    OpenAIChatStream broken_stream(identity(), false, false, false, custom_tools);
+    (void)broken_stream.start();
+    failures +=
+        check(throws_logic([&] { (void)broken_stream.finish(broken); }),
+              "a streamed custom call without exactly one string input is an internal error");
+    return failures;
+}
+
 int test_stream_observations() {
     int failures = 0;
     OpenAIChatStream stream(identity(), true, true, true);
@@ -1192,11 +1471,13 @@ int main() {
     failures += test_prompt_cache_boundaries();
     failures += test_constrained_decoding_extensions();
     failures += test_tools();
+    failures += test_custom_tools();
     failures += test_messages_and_media();
     failures += test_reasoning_and_extensions();
     failures += test_stops_and_ranges();
     failures += test_aggregate_response();
     failures += test_stream_response();
+    failures += test_custom_tool_responses();
     failures += test_stream_observations();
     failures += test_common_objects();
     if (failures == 0) { std::cout << "OpenAI Chat protocol tests passed\n"; }

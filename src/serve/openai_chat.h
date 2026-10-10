@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace ninfer::serve {
@@ -27,6 +28,9 @@ struct OpenAIChatRequest {
     // timings_per_token controls only cumulative timing snapshots on streamed output chunks.
     bool timings_per_token = false;
     bool return_progress   = false;
+    // Engine names of declared free-form `custom` tools. Their calls are answered as
+    // `{type:"custom", custom:{name, input}}` instead of function calls.
+    std::unordered_set<std::string> custom_tools;
 };
 
 OpenAIChatRequest parse_chat_completion_request(const RequestJson& body,
@@ -40,12 +44,14 @@ struct OpenAIChatResponseIdentity {
 
 OpenAIChatResponseIdentity make_openai_chat_response_identity(std::string model);
 std::string make_chat_completion_response(const OpenAIChatResponseIdentity& identity,
-                                          const GenerationOutcome& outcome);
+                                          const GenerationOutcome& outcome,
+                                          const std::unordered_set<std::string>& custom_tools = {});
 
 class OpenAIChatStream {
 public:
     OpenAIChatStream(OpenAIChatResponseIdentity identity, bool include_usage,
-                     bool timings_per_token = false, bool return_progress = false);
+                     bool timings_per_token = false, bool return_progress = false,
+                     std::unordered_set<std::string> custom_tools = {});
 
     std::string start();
     void note_start(const ninfer::GenerationStart& start);
@@ -60,6 +66,7 @@ private:
     nlohmann::json live_timings_json() const;
 
     OpenAIChatResponseIdentity identity_;
+    std::unordered_set<std::string> custom_tools_;
     std::string reasoning_;
     std::string content_;
     std::optional<ninfer::GenerationTimingObservation> live_timing_;

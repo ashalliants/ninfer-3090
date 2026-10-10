@@ -501,6 +501,8 @@ The endpoint supports:
 - function tools, optional `strict:true` argument schemas, `tool_choice` `auto`/`none`/`required`,
   named selection, `allowed_tools`, and `parallel_tool_calls`; assistant tool-call history,
   tool-result messages, and legacy function-call history;
+- free-form [`custom` tools](#chat-custom-tools) in definitions, named selection,
+  `allowed_tools` and assistant history;
 - the top-level `reasoning_effort` field;
 - `enable_thinking` and `preserve_thinking`, either at top level or in
   `chat_template_kwargs`;
@@ -635,7 +637,7 @@ The three protocols share one constrained tool implementation:
 | `auto` | Text or calls; zero to many |
 | `none` | No tool calls; declarations remain in the prompt |
 | OpenAI `required` / Anthropic `any` | One or more calls |
-| OpenAI named function | Exactly one call to that function |
+| OpenAI named function or custom tool | Exactly one call to that tool |
 | Anthropic named `tool` | One or more calls to that tool |
 | OpenAI `parallel_tool_calls:false` / Anthropic `disable_parallel_tool_use:true` | At most one call; exactly one when a call is required |
 
@@ -771,6 +773,51 @@ finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a
 and reasoning-token details; choices carry `logprobs: null` when log probabilities were not
 requested, and aggregate assistant messages carry `refusal: null` because refusal output is not
 supported.
+
+### Chat custom tools
+
+Chat Completions accepts free-form `custom` tools in the OpenAI Chat shape:
+
+```json
+{
+  "type": "custom",
+  "custom": {
+    "name": "apply_patch",
+    "description": "Edit files with a patch.",
+    "format": {"type": "grammar", "grammar": {"syntax": "lark", "definition": "start: ..."}}
+  }
+}
+```
+
+`format` is omitted, `{"type":"text"}`, or a `grammar` with `syntax` `lark` or `regex` and a string
+`definition`. A custom tool is lowered exactly as on [Responses](#custom-tools): the model sees a
+strict function under the tool's name with one required string parameter, `input`, whose
+description carries the grammar. The grammar is **advisory** (shown, not enforced); the strict
+lowering is enforced, so `input` is the call's only argument and its text is returned byte for byte,
+except that it cannot contain a line break directly followed by `</parameter>`. Like any strict tool,
+a request declaring a custom tool is constrained even with `tool_constraints:"auto"`, so it cannot
+use custom `stop` strings or `ignore_eos` (HTTP 400 on `stop`/`ignore_eos`).
+
+A generated call is answered in the OpenAI Chat custom tool call shape, in `message.tool_calls`:
+
+```json
+{"id": "call_...", "type": "custom", "custom": {"name": "apply_patch", "input": "*** Begin Patch
+..."}}
+```
+
+Streaming sends the same object with its `index` in one `delta.tool_calls` entry
+(`{"index":0,"id":"call_...","type":"custom","custom":{"name":"apply_patch","input":"..."}}`); as for
+function calls, the complete input is sent once generation finishes, so the streamed `input`
+pieces concatenate to the aggregate value. `finish_reason` is `tool_calls`.
+
+Custom tools may be forced with `tool_choice: {"type":"custom","custom":{"name":...}}` and listed in
+`allowed_tools` as `{"type":"custom","custom":{"name":...}}` (the flat `{"type":"custom","name":...}`
+is also accepted there, as it is for function entries). An assistant history entry
+`{"id":...,"type":"custom","custom":{"name":...,"input":"..."}}` is replayed as the same Engine call
+(`{"input": "..."}` arguments); its result is an ordinary `tool` message. Referring to a declared
+custom tool as a function, or the reverse, fails with HTTP 400: `duplicate_tool_name` when both are
+declared in `tools`, `invalid_tool_choice` in `tool_choice`, and `invalid_tool_history` in
+`messages`. Calls of undeclared tools in history are accepted, as for functions.
 
 ### Multimodal request
 
@@ -1036,8 +1083,8 @@ carrying the input, `response.custom_tool_call_input.done` with the complete inp
 The client returns its result as a `custom_tool_call_output` Item. Custom tools may be named by
 `tool_choice: {"type":"custom","name":...}` and listed as `custom` entries in `allowed_tools`.
 Referring to a custom tool as a function, or the reverse, fails (`duplicate_tool_name` in `tools`,
-`invalid_tool_choice` in `tool_choice`, `invalid_tool_history` in `input`). Custom tools are
-accepted only on the Responses endpoint; Chat Completions still rejects them.
+`invalid_tool_choice` in `tool_choice`, `invalid_tool_history` in `input`). Chat Completions
+accepts custom tools in its own wire shape; see [Chat custom tools](#chat-custom-tools).
 
 Hosted tools, remote MCP tools, deferred loading, output schemas, and caller restrictions that
 exclude direct invocation remain unsupported.

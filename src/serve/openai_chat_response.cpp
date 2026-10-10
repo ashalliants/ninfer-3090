@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 
 namespace ninfer::serve {
@@ -138,25 +139,22 @@ const char* finish_reason(const GenerationOutcome& outcome) {
                                                        : finish_reason(outcome.finish_reason);
 }
 
-std::vector<ToolCall>
-materialize_tool_calls(const std::vector<ninfer::GeneratedToolCall>& generated) {
-    std::vector<ToolCall> calls;
-    calls.reserve(generated.size());
-    for (const ninfer::GeneratedToolCall& call : generated) {
-        calls.push_back(ToolCall{.id             = new_openai_chat_tool_call_id(),
-                                 .name           = call.name,
-                                 .arguments_json = call.arguments_json});
-    }
-    return calls;
-}
-
-Json tool_calls_json(const std::vector<ToolCall>& calls, bool include_index) {
+// The message's tool_calls, or with `include_index` the stream delta's: a function call carries its
+// JSON arguments, a custom tool call its free-form input. A stream sends every call whole in one
+// delta, so the delta and the aggregate entry carry the same text.
+Json tool_calls_json(const std::vector<ninfer::GeneratedToolCall>& calls,
+                     const std::unordered_set<std::string>& custom_tools, bool include_index) {
     Json output = Json::array();
     for (std::size_t index = 0; index < calls.size(); ++index) {
-        const ToolCall& call = calls[index];
-        Json value           = {{"id", call.id},
-                                {"type", "function"},
-                                {"function", Json{{"name", call.name}, {"arguments", call.arguments_json}}}};
+        const ninfer::GeneratedToolCall& call = calls[index];
+        Json value =
+            custom_tools.contains(call.name)
+                ? Json{{"id", new_openai_chat_tool_call_id()},
+                       {"type", "custom"},
+                       {"custom", Json{{"name", call.name}, {"input", custom_tool_input(call)}}}}
+                : Json{{"id", new_openai_chat_tool_call_id()},
+                       {"type", "function"},
+                       {"function", Json{{"name", call.name}, {"arguments", call.arguments_json}}}};
         if (include_index) { value["index"] = static_cast<int>(index); }
         output.push_back(std::move(value));
     }
@@ -236,15 +234,15 @@ OpenAIChatResponseIdentity make_openai_chat_response_identity(std::string model)
 }
 
 std::string make_chat_completion_response(const OpenAIChatResponseIdentity& identity,
-                                          const GenerationOutcome& outcome) {
+                                          const GenerationOutcome& outcome,
+                                          const std::unordered_set<std::string>& custom_tools) {
     Json message = {{"role", "assistant"}, {"content", outcome.text}, {"refusal", nullptr}};
     const bool has_tool_calls = !outcome.tool_calls.empty();
     // vLLM/SGLang-compatible reasoning_content preserves the Engine's Reasoning/Content split.
     if (!outcome.reasoning.empty()) { message["reasoning_content"] = outcome.reasoning; }
     if (has_tool_calls) {
-        const std::vector<ToolCall> calls = materialize_tool_calls(outcome.tool_calls);
         message["content"]    = outcome.text.empty() ? Json(nullptr) : Json(outcome.text);
-        message["tool_calls"] = tool_calls_json(calls, false);
+        message["tool_calls"] = tool_calls_json(outcome.tool_calls, custom_tools, false);
     }
 
     Json payload       = base_payload(identity, "chat.completion");
@@ -260,9 +258,11 @@ std::string make_chat_completion_response(const OpenAIChatResponseIdentity& iden
 }
 
 OpenAIChatStream::OpenAIChatStream(OpenAIChatResponseIdentity identity, bool include_usage,
-                                   bool timings_per_token, bool return_progress)
-    : identity_(std::move(identity)), include_usage_(include_usage),
-      timings_per_token_(timings_per_token), return_progress_(return_progress) {}
+                                   bool timings_per_token, bool return_progress,
+                                   std::unordered_set<std::string> custom_tools)
+    : identity_(std::move(identity)), custom_tools_(std::move(custom_tools)),
+      include_usage_(include_usage), timings_per_token_(timings_per_token),
+      return_progress_(return_progress) {}
 
 std::string OpenAIChatStream::start() {
     if (started_ || finished_) { throw std::logic_error("OpenAI Chat stream already started"); }
@@ -381,9 +381,10 @@ std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outco
     }
 
     if (!outcome.tool_calls.empty()) {
-        const std::vector<ToolCall> calls = materialize_tool_calls(outcome.tool_calls);
-        events.push_back(chunk(identity_, Json{{"tool_calls", tool_calls_json(calls, true)}},
-                               nullptr, include_usage_, output_timings));
+        events.push_back(
+            chunk(identity_,
+                  Json{{"tool_calls", tool_calls_json(outcome.tool_calls, custom_tools_, true)}},
+                  nullptr, include_usage_, output_timings));
         events.push_back(chunk(identity_, Json::object(), finish_reason(outcome), include_usage_,
                                include_usage_ ? Json(nullptr) : final_timings,
                                include_usage_ ? Json(nullptr) : constraint));
