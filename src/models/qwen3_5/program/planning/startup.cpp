@@ -855,6 +855,14 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("max_concurrency must be in [1,8]");
     }
+    // Decode and verify rounds run the target's projections with the same Linear policies as
+    // prefill, one call over every lane's verify columns. The cuBLAS prefill route has to stay out
+    // of them -- it would put a weight-sized scratch into every round workspace and change decode
+    // numerics -- so the widest round must sit below its width gate. Every speculative backend caps
+    // its window at 15.
+    static_assert(kMaximumConcurrency * (kMtpDecodeMaximumDrafts + 1) <
+                      static_cast<std::uint32_t>(ops::kCublasPrefillMinTokens),
+                  "the widest decode/verify round must stay below the cuBLAS prefill width gate");
     if (parameters.text.rank_count != device.size() ||
         parameters.text.rank_count != std::max<std::size_t>(options.devices.size(), 1)) {
         throw std::invalid_argument("the model is split into " +

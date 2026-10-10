@@ -238,7 +238,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             throw std::invalid_argument(
                 "linear_add: Q5 requires 16-byte x/residual/code/high/scale alignment");
         }
-        // About 1.9x the integer route at 4096 tokens; below the width gate it loses, because the
+        // About 1.9x the integer route at 4096 tokens; below the width gate it can lose, because the
         // dequantise pass costs the same whatever the token count. The shape was checked above and
         // the route takes any token count, so unlike the integer route below it is not gated on a
         // 128-token tile -- an unaligned final chunk is where it is furthest ahead.
