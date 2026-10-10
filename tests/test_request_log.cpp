@@ -540,6 +540,8 @@ int main() {
                   done.at("result").at("tool_call_parse").at("structured_call_count") == 0 &&
                   done.at("result").at("tool_call_parse").at("empty_arguments_omitted") == 0 &&
                   done.at("result").at("tool_call_parse").at("schema_mismatch_arguments") == 0 &&
+                  done.at("result").at("tool_call_parse").at("duplicate_parameters_repaired") ==
+                      0 &&
                   done.at("result").at("tool_call_parse").at("fallback_reason") == "none",
               "default tool-call parse diagnostics missing");
     failures += check(done.at("timings_seconds").at("decode").get<double>() ==
@@ -703,8 +705,9 @@ int main() {
         .marker_seen               = true,
         .structured_call_count     = 1,
         .empty_arguments_omitted   = 1,
-        .schema_mismatch_arguments = 2,
-        .fallback_reason           = ninfer::ToolCallParseFallbackReason::None,
+        .schema_mismatch_arguments     = 2,
+        .duplicate_parameters_repaired = 3,
+        .fallback_reason               = ninfer::ToolCallParseFallbackReason::None,
     };
     const Json normalized_tool_done =
         Json::parse(format_request_done_json("serve-test", 3002, context, normalized_tool_outcome));
@@ -717,6 +720,9 @@ int main() {
             normalized_tool_done.at("result")
                     .at("tool_call_parse")
                     .at("schema_mismatch_arguments") == 2 &&
+            normalized_tool_done.at("result")
+                    .at("tool_call_parse")
+                    .at("duplicate_parameters_repaired") == 3 &&
             normalized_tool_done.at("result").at("tool_call_parse").at("fallback_reason") ==
                 "none" &&
             !render_tool_call_fallback(context, normalized_tool_outcome),
@@ -728,19 +734,19 @@ int main() {
           .structured_call_count     = 0,
           .empty_arguments_omitted   = 0,
           .schema_mismatch_arguments = 0,
-          .fallback_reason           = ninfer::ToolCallParseFallbackReason::DuplicateParameter,
+          .fallback_reason           = ninfer::ToolCallParseFallbackReason::UndeclaredTool,
     };
     const Json fallback_done =
         Json::parse(format_request_done_json("serve-test", 3003, context, fallback_outcome));
     failures += check(fallback_done.at("result").at("tool_call_parse").at("marker_seen") &&
                           fallback_done.at("result").at("tool_call_parse").at("fallback_reason") ==
-                              "duplicate_parameter",
+                              "undeclared_tool",
                       "tool-call text fallback diagnostics missing from JSONL");
     const std::optional<OperationalRecord> fallback_warning =
         render_tool_call_fallback(context, fallback_outcome);
     failures += check(
         fallback_warning && fallback_warning->severity == OperationalSeverity::Warning &&
-            fallback_warning->message == "req#7 tool markup returned as text | duplicate parameter",
+            fallback_warning->message == "req#7 tool markup returned as text | undeclared tool",
         "tool-call text fallback warning is absent or exposes raw content");
 
     const Json error =
