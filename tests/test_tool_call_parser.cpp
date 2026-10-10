@@ -1402,6 +1402,33 @@ int test_tolerant_keeps_complete_calls() {
                           clean.diagnostics.fallback_reason == Reason::None,
                       "a well-formed call was reported as a tolerant repair");
 
+    // A cut or malformed call followed by a later `<tool_call>` is no end of the turn: the earlier
+    // call may be an example, so the later real call is the turn, at the top level and inside a
+    // `<function_calls>` wrapper.
+    const std::string cut_head  = "<tool_call>\n<function=configure>\n<parameter=value>\ny";
+    const std::string real_call = tool_call("configure", {{"value", "real"}});
+    const std::string closed_x  = "<function=configure>\n<parameter=value>\nx\n</parameter>\n"
+                                  "</function>\n";
+    const auto real = std::vector<std::pair<std::string, std::string>>{
+        {"configure", R"({"value":"real"})"}};
+    const std::string after_cut = "Setting it.\n" + call + "\n" + cut_head + "\n" + real_call;
+    const std::string wrapped =
+        "Setting it.\n<function_calls>\n" + closed_x + cut_head + "\n" + real_call;
+    for (const FinishReason reason : kAllFinishReasons) {
+        // The later call parses cleanly, so the turn is not reported as a repair.
+        const TolerantTurn top = tolerant_turn(contract, after_cut, reason, failures);
+        failures += check(top.content == "Setting it.\n" + call + "\n" + cut_head &&
+                              top.calls == real && top.diagnostics.fallback_reason == Reason::None,
+                          "a later call after a cut call was ignored at " + reason_label(reason));
+        const TolerantTurn inner = tolerant_turn(contract, wrapped, reason, failures);
+        failures += check(inner.content ==
+                                  "Setting it.\n<function_calls>\n" + closed_x + cut_head &&
+                              inner.calls == real &&
+                              inner.diagnostics.fallback_reason == Reason::None,
+                          "a later call after a cut wrapped call was ignored at " +
+                              reason_label(reason));
+    }
+
     // A suffix that holds another marker makes the earlier call a quoted example: the later
     // region is the turn, never the example.
     const std::string example = "Write it as " + call + " like that. So:";
@@ -1461,6 +1488,17 @@ int test_tolerant_unclosed_final_call() {
         failures += check(repaired_to(tolerant_turn(contract, both, reason, failures), "",
                                       {{"delete_file", R"({"filePath":"/tmp/a"})"}}),
                           "an unclosed final call was kept at " + reason_label(reason));
+    }
+
+    // A parameter closer followed by prose is quoted value text, not a closed parameter, so the
+    // value is cut and the call is never kept: the missing `</function>` is recovered only at the
+    // end of the output, where the closer is unambiguous.
+    for (const std::string& text : {head + "That should do it.",
+                                    head + "</tool_call>\nThat should do it."}) {
+        failures += check(kept_as_text(tolerant_turn(contract, text, FinishReason::StopToken,
+                                                     failures),
+                                       text),
+                          "a parameter closer followed by prose was read as closed");
     }
 
     // A call cut before any parameter closed carries no arguments and is never kept.

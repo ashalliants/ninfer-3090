@@ -443,10 +443,12 @@ public:
                         return FallbackReason::MalformedStructure;
                     }
                     RawToolCall call;
+                    const std::size_t call_begin       = pos;
                     const std::uint32_t repairs_before = duplicate_parameters_repaired_;
                     const FallbackReason failure       = parse_function(pos, call);
                     if (failure != FallbackReason::None) {
-                        return end_at_failed_call(calls, std::move(call), failure, repairs_before);
+                        return end_at_failed_call(calls, std::move(call), failure, call_begin,
+                                                  repairs_before);
                     }
                     calls.push_back(std::move(call));
                     had_calls = true;
@@ -455,12 +457,14 @@ public:
             } else if (starts_with_at(text_, pos, kToolOpen) ||
                        function_open_header_begin(text_, pos) != 0) {
                 RawToolCall call;
+                const std::size_t call_begin       = pos;
                 const std::uint32_t repairs_before = duplicate_parameters_repaired_;
                 const FallbackReason failure       = starts_with_at(text_, pos, kToolOpen)
                                                          ? parse_tool_call(pos, call)
                                                          : parse_function(pos, call);
                 if (failure != FallbackReason::None) {
-                    return end_at_failed_call(calls, std::move(call), failure, repairs_before);
+                    return end_at_failed_call(calls, std::move(call), failure, call_begin,
+                                              repairs_before);
                 }
                 calls.push_back(std::move(call));
             } else {
@@ -489,16 +493,20 @@ private:
 
     // A call failed to parse. Repair keeps a final call that is only missing its closing tags
     // when the model ended the turn itself, and otherwise ends the region after the complete
-    // calls before it; the strict parser fails the region.
+    // calls before it; the strict parser fails the region. A later `<tool_call>` wrapper makes the
+    // calls before the failure possibly a quoted example, so the region fails and the caller
+    // retries from that wrapper, as it does for a suffix holding another marker.
     FallbackReason end_at_failed_call(std::vector<RawToolCall>& calls, RawToolCall call,
-                                      FallbackReason failure, std::uint32_t repairs_before) {
+                                      FallbackReason failure, std::size_t call_begin,
+                                      std::uint32_t repairs_before) {
         if (unclosed_ && repair_ == ToolCallRepair::UnclosedFinalCall &&
             !call.parameters.empty()) {
             calls.push_back(std::move(call));
             repaired_ = true;
             return FallbackReason::None;
         }
-        if (repairing() && !calls.empty()) {
+        if (repairing() && !calls.empty() &&
+            text_.find(kToolOpen, call_begin + 1) == std::string_view::npos) {
             // The discarded call's repeated parameters are not part of the published turn.
             duplicate_parameters_repaired_ = repairs_before;
             repaired_                      = true;
