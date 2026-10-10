@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from math import prod
 from pathlib import Path
 
-from tools.convert.qwen4_exp import head_tables, layer_multipliers
+import numpy as np
+
+from tools.convert.qwen4_exp import NARROWED, head_tables, layer_multipliers
 
 from .gguf_writer import tensor_bytes, write_gguf
 
@@ -151,9 +154,21 @@ def tensors(drop=(), extra=()) -> list[tuple[str, int, tuple[int, ...], bytes]]:
             ]
     specs = [spec for spec in specs if spec[0] not in drop] + list(extra)
     return [
-        (name, kind, ne, tensor_bytes(kind, ne, seed=index))
+        (name, kind, ne, _bytes(name, kind, ne, index))
         for index, (name, kind, ne) in enumerate(specs)
     ]
+
+
+def _bytes(name: str, kind: int, ne: tuple[int, ...], seed: int) -> bytes:
+    """Random tensor bytes; the narrowed F32 tensors hold values with exact BF16 forms, as the
+    real GGUF's do: BF16 words, or ``fl32(1 + gamma)`` of a BF16 gamma for the q/k norms."""
+    rule = NARROWED.get(name.split(".", 2)[-1]) if name.startswith("blk.") else None
+    if rule is None or kind != F32:
+        return tensor_bytes(kind, ne, seed=seed)
+    rng = np.random.default_rng(seed)
+    words = rng.uniform(-0.5, 0.5, prod(ne)).astype(np.float32)
+    words = ((words.view(np.uint32) >> 16) << 16).view(np.float32)
+    return (np.float32(1.0) + words if rule == "gamma" else words).astype("<f4").tobytes()
 
 
 def write(path: Path, *, metadata_changes=None, drop=(), extra=()) -> Path:

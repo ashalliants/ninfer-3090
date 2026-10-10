@@ -5,6 +5,7 @@ import os
 import shutil
 
 import pytest
+import torch
 
 from tools.artifact import ngram_volume
 from tools.convert import qwen4_exp
@@ -116,7 +117,23 @@ def test_name_map_covers_every_tensor_once(gguf_path):
     assert banks == [qwen4_exp.expert_bank(layer) for layer in range(4)]
     # Three expert tensors become one bank per layer; the PLE table is the n-gram volume.
     assert len(model.parameters) == len(gguf.tensors) - 3 * 4 + 4 - 1
-    assert not model.packing_groups and "text/ple/table" not in model.parameters
+    # Each mixer's down and inject rows form one parent (the final mixer has no inject), as do
+    # the GDN a and b projections and the PLE key and value projections.
+    groups = [tuple(name.split("/", 3)[3] for name in g) for g in model.packing_groups]
+    assert groups == [
+        ("attn_hc/down", "attn_hc/inject"), ("mlp_hc/down", "mlp_hc/inject"),
+        ("gdn/a_projection", "gdn/b_projection"),
+        ("attn_hc/down", "attn_hc/inject"), ("mlp_hc/down", "mlp_hc/inject"),
+        ("gdn/a_projection", "gdn/b_projection"), ("ple/key", "ple/value"),
+        ("attn_hc/down", "attn_hc/inject"), ("mlp_hc/down", "mlp_hc/inject"),
+        ("gdn/a_projection", "gdn/b_projection"),
+        ("attn_hc/down", "attn_hc/inject"), ("mlp_hc/down", "mlp_hc/inject"),
+    ]
+    assert "text/ple/table" not in model.parameters
+    assert model.parameters["text/layers/3/attention/query_norm"].direct_format == "bf16"
+    conv = model.parameters["text/layers/0/gdn/convolution"]
+    assert conv.direct_format == "bf16" and conv.shape == (4, 128)  # [K, C], the GGUF transposed
+    assert model.parameters["text/layers/0/attn_hc/norm"].direct_format == "fp32"
     bank = model.parameters["text/layers/0/moe/experts"]
     assert bank.shape == (fixture.E, fixture.H, fixture.F)
     assert bank.inputs == ("text/layers/0/ffn_input",)
@@ -153,6 +170,18 @@ def test_name_map_rejects_missing_misplaced_and_unknown_tensors(tmp_path, drop, 
     path = fixture.write(tmp_path / "bad.gguf", drop=drop, extra=extra)
     with GgufModel(path) as gguf, pytest.raises(GgufError, match=message):
         qwen4_exp.build_model(gguf)
+
+
+def test_narrowing_is_exact_or_refused():
+    gamma = torch.tensor([0.5, -0.25, 0.0078125, -0.4375], dtype=torch.bfloat16).float()
+    stored = (torch.tensor(1.0) + gamma).float()
+    assert torch.equal(qwen4_exp.narrow_exactly("n", stored, "gamma").float(), gamma)
+    assert torch.equal(qwen4_exp.narrow_exactly("n", gamma, "words").float(), gamma)
+    # fl32(1.1) - 1 needs 21 significant bits: no BF16 gamma reproduces it.
+    with pytest.raises(GgufError, match="no exact BF16 gamma"):
+        qwen4_exp.narrow_exactly("n", torch.tensor([1.1]), "gamma")
+    with pytest.raises(GgufError, match="no exact BF16 words"):
+        qwen4_exp.narrow_exactly("n", torch.tensor([0.1]), "words")
 
 
 @pytest.mark.parametrize(
@@ -192,7 +221,13 @@ def test_conversion_stores_gguf_bytes_exactly(tmp_path):
     with GgufModel(path) as gguf:
         report = _convert(gguf, out)
         summary = verify(out, gguf, volume=str(out) + ".ngram")
-    assert summary["records"] == 4 and summary["widened"] == 1
+    # Narrowed: ssm_norm and ssm_conv1d of three GDN layers, four q/k norms of the QSA layer.
+    assert summary["records"] == 4 and summary["widened"] == 1 and summary["narrowed"] == 10
+    hc = [m for m in report["methods"] if "text/layers/0/attn_hc/down" in m["parameters"]]
+    assert [tuple(m["parameters"]) for m in hc] == [
+        ("text/layers/0/attn_hc/down", "text/layers/0/attn_hc/inject")
+    ]
+    assert tuple(hc[0]["shape"]) == (fixture.LOW + fixture.HC, fixture.HC * fixture.H)
     assert summary["volume_rows"] == fixture.PLE_ROWS
     assert summary["objects"] == len(report["methods"])
     banks = {
