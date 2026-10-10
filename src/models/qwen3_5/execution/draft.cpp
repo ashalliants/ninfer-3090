@@ -580,12 +580,17 @@ void spread_proposal_plane(WorkspaceArena& work, const void* from, void* to, std
 
 // The draft model's block of `state.neural_drafts` for every row, laid out as the `k`-draft round
 // `frame` reads it: row r's proposal in its leading columns, the rest unread (each row's extent
-// bounds verification).
+// bounds verification). At equal width the proposal is written straight into the frame.
 void propose_beside_copies(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& frame,
                            std::int32_t batch_size, std::uint32_t k, DFlashEnvelopes envelopes) {
     const std::uint32_t neural = state.neural_drafts;
-    if (neural == 0 || neural >= k) {
-        throw std::logic_error("a batched copy round needs a narrower neural block");
+    if (neural == 0 || neural > k) {
+        throw std::logic_error("a batched copy round needs a neural block within its width");
+    }
+    if (neural == k) {
+        // A copy family as wide as the neural window: the proposal already fills the frame.
+        propose_batch_impl(state, frame, batch_size, k, envelopes);
+        return;
     }
     qwen3_5::DFlashDecodeState proposal = state.frame.narrowed(neural);
     propose_batch_impl(state, proposal, batch_size, neural, envelopes);

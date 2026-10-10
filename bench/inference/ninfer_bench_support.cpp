@@ -435,7 +435,7 @@ BenchOptions parse_args(int argc, char** argv) {
             options.speculative.draft_tokens = parse_u32(value("--draft-tokens"), "draft-tokens");
         } else if (arg == "--ngram-draft-tokens") {
             options.speculative.ngram_draft_tokens =
-                parse_u32(value("--ngram-draft-tokens"), "ngram-draft-tokens");
+                parse_u32(value("--ngram-draft-tokens"), "ngram-draft-tokens", true);
         } else if (arg == "--ngram-min-match") {
             options.speculative.ngram_min_match =
                 parse_u32(value("--ngram-min-match"), "ngram-min-match");
