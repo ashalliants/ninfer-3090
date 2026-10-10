@@ -56,6 +56,10 @@ struct CustomToolGrammar {
 custom_tool_input_schema_json(const std::optional<CustomToolGrammar>& grammar);
 // Engine-side arguments carrying a custom tool's free-form input (assistant history).
 [[nodiscard]] std::string custom_tool_arguments_json(const std::string& input);
+// Rejects (invalid_tool_history, on `param`) replayed custom-tool input containing the Qwen
+// parameter delimiter "\n</parameter>": the prompt renderer emits the value raw, so it would end
+// the parameter early and change what the model sees. Every other byte is accepted unchanged.
+void require_representable_custom_tool_input(const std::string& input, const std::string& param);
 // A custom tool's free-form input from its Engine-side call. Anything other than exactly one string
 // `input` argument is an internal contract violation (std::logic_error), not output to pass on.
 [[nodiscard]] std::string custom_tool_input(const ninfer::GeneratedToolCall& call);

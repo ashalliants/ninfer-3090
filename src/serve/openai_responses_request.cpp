@@ -479,7 +479,8 @@ ToolCall parse_custom_tool_call_item(
         bad_request("custom_tool_call input must be a string", "input");
     }
     const std::string input = item.at("input").get<std::string>();
-    call.arguments_json     = custom_tool_arguments_json(input);
+    require_representable_custom_tool_input(input, "input");
+    call.arguments_json = custom_tool_arguments_json(input);
     if (item.contains("status") && !item.at("status").is_null() &&
         (!item.at("status").is_string() || item.at("status").get<std::string>() != "completed")) {
         bad_request("partial custom_tool_call Items cannot be represented in model history",

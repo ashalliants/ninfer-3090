@@ -375,10 +375,11 @@ std::vector<ToolCall> parse_assistant_tool_calls(const Json& message, std::size_
             }
             std::string name = require_function_name(custom, "messages");
             require_tool_kind(request, name, true, "messages", "invalid_tool_history");
+            const std::string& input = custom.at("input").get_ref<const std::string&>();
+            require_representable_custom_tool_input(input, "messages");
             calls.push_back(ToolCall{.id             = value.at("id").get<std::string>(),
                                      .name           = std::move(name),
-                                     .arguments_json = custom_tool_arguments_json(
-                                         custom.at("input").get<std::string>())});
+                                     .arguments_json = custom_tool_arguments_json(input)});
             continue;
         }
         if (type != "function") {

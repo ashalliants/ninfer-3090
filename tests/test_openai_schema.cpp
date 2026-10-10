@@ -1311,6 +1311,19 @@ int test_custom_tool_responses() {
                                {"function", Json{{"name", "apply_patch"}, {"arguments", "{}"}}}});
     failures += check(error.code == "invalid_tool_history",
                       "a function history call naming a declared custom tool");
+    error = history_error(Json{{"id", "c1"},
+                               {"type", "custom"},
+                               {"custom", Json{{"name", "apply_patch"}, {"input", "a\n</parameter>\nb"}}}});
+    failures += check(error.code == "invalid_tool_history" && error.param == "messages",
+                      "a custom history call whose input would close the parameter early");
+    const std::string awkward = "a</parameter>\n\n<parameter=input>\n  x\n";
+    Json awkward_history      = history;
+    awkward_history["messages"][1]["tool_calls"] = Json::array({Json{
+        {"id", "c1"}, {"type", "custom"}, {"custom", Json{{"name", "apply_patch"}, {"input", awkward}}}}});
+    awkward_history["messages"].erase(3);
+    failures += check(parse(awkward_history).generation.messages.at(1).tool_calls.at(0).arguments_json ==
+                          custom_tool_arguments_json(awkward),
+                      "other delimiter-like custom input bytes are preserved");
     error = history_error(Json{{"id", "c1"}, {"type", "mcp"}});
     failures += check(error.code == "tool_type_not_supported",
                       "a history call of another type stays rejected");

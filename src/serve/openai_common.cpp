@@ -76,6 +76,14 @@ std::string custom_tool_arguments_json(const std::string& input) {
     return RequestJson{{kCustomToolInputParameter, input}}.dump();
 }
 
+void require_representable_custom_tool_input(const std::string& input, const std::string& param) {
+    if (input.find("\n</parameter>") != std::string::npos) {
+        bad_request("custom tool call input cannot contain a line break followed by </parameter>, "
+                    "which is the tool format's value delimiter",
+                    param, "invalid_tool_history");
+    }
+}
+
 std::string custom_tool_input(const ninfer::GeneratedToolCall& call) {
     const Json arguments = Json::parse(call.arguments_json, nullptr, false);
     if (arguments.is_object() && arguments.size() == 1) {
