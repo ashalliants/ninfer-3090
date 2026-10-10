@@ -86,11 +86,13 @@ Q81 cast_q81(const std::vector<std::uint16_t>& x, std::int32_t k, std::int32_t t
     for (std::size_t g = 0; g < out.d.size(); ++g) {
         float amax = 0.0F;
         for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(bf16_to_f32(x[32 * g + i])));
-        const float inverse = amax == 0.0F ? 0.0F : 127.0F / amax;
+        // Pre-scaled by a power of two when 127 / amax would overflow (BF16 subnormals).
+        const float scale   = amax < 0x1p-100F ? 0x1p+100F : 1.0F;
+        const float inverse = amax == 0.0F ? 0.0F : 127.0F / (amax * scale);
         for (int i = 0; i < 32; ++i) {
             // Default rounding mode: nearest, ties to even.
-            out.q[32 * g + i] =
-                static_cast<std::int8_t>(std::nearbyint(bf16_to_f32(x[32 * g + i]) * inverse));
+            out.q[32 * g + i] = static_cast<std::int8_t>(
+                std::nearbyint((bf16_to_f32(x[32 * g + i]) * scale) * inverse));
         }
         out.d[g] = amax / 127.0F;
     }
@@ -265,10 +267,11 @@ std::vector<std::uint16_t> make_cast_activation(std::int32_t k, std::int32_t t) 
                             -21.5F};
     for (std::int32_t col = 0; col < t; ++col) {
         for (int i = 0; i < 32; ++i) x[static_cast<std::size_t>(col) * k + 32 + i] = f32_to_bf16(ties[i]);
-        // A group whose maximum is subnormal-adjacent and one far above 1.
+        // A group of true BF16 subnormals (multiples of 2^-133, where 127 / amax overflows FP32)
+        // and one far above 1.
         for (int i = 0; i < 32; ++i) {
             x[static_cast<std::size_t>(col) * k + 64 + i] =
-                f32_to_bf16(std::ldexp(static_cast<float>(i - 16), -120));
+                f32_to_bf16(std::ldexp(static_cast<float>(i - 16), -133));
             x[static_cast<std::size_t>(col) * k + 96 + i] =
                 f32_to_bf16(std::ldexp(static_cast<float>(3 * i - 47), 90));
         }

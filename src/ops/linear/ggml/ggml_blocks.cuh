@@ -271,7 +271,8 @@ __device__ __forceinline__ void load_tables(Tables& tables, std::uint32_t* grid_
 }
 
 // The Q8_1 activation cast of one 32-value group (linear.h), the only implementation both routes
-// use: a = max|x|, d = a / 127, q = rint(x * (127 / a)) with ties to even, q = 0 when a = 0. Both
+// use: a = max|x|, d = a / 127, q = rint(x * (127 / a)) with ties to even, q = 0 when a = 0
+// (tiny a is pre-scaled by a power of two so 127 / a stays finite). Both
 // divisions are IEEE FP32 round-to-nearest (this target builds without fast-math). `x` is 16-byte
 // aligned; q lands in `words` (values 4w..4w+3 in word w) and d is returned.
 __device__ __forceinline__ float quantize_q8_1_group(const __nv_bfloat16* x, int (&words)[8]) {
@@ -292,13 +293,17 @@ __device__ __forceinline__ float quantize_q8_1_group(const __nv_bfloat16* x, int
         value[2 * i + 1] = __uint_as_float(bits[i] & 0xFFFF0000U);
         amax             = fmaxf(amax, fmaxf(fabsf(value[2 * i]), fabsf(value[2 * i + 1])));
     }
-    const float inverse = amax == 0.0F ? 0.0F : 127.0F / amax;
+    // A tiny finite group (BF16 subnormals reach 9e-41) would overflow 127 / a to infinity. Both
+    // a and x are scaled by the same power of two first, which is exact and leaves x * (127 / a)
+    // unchanged; the scale is 1 for every group with a >= 2^-100, so those bits are untouched.
+    const float scale   = amax < 0x1p-100F ? 0x1p+100F : 1.0F;
+    const float inverse = amax == 0.0F ? 0.0F : 127.0F / (amax * scale);
 #pragma unroll
     for (int w = 0; w < 8; ++w) {
         std::uint32_t word = 0;
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            const int q = __float2int_rn(value[4 * w + j] * inverse);
+            const int q = __float2int_rn((value[4 * w + j] * scale) * inverse);
             word |= (static_cast<std::uint32_t>(q) & 0xFFU) << (8 * j);
         }
         words[w] = static_cast<int>(word);
