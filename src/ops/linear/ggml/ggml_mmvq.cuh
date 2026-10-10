@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace ninfer::ops::ggml {
 
@@ -39,10 +40,12 @@ constexpr std::size_t mmvq_shared_bytes() {
 // x is BF16 [K,T] (column t at x + t K); out is BF16 [N,T]. The cast stores sub-block s of column
 // t as two 16-byte halves at t K + 16 s and t K + K / 2 + 16 s, so the lanes of a row, which read
 // consecutive sub-blocks, hit distinct banks.
-template <QType F, int K, int T, bool Residual>
+// Out is BF16 (Linear, LinearAdd) or FP32 (projection_fp32's GGML head); Residual needs BF16.
+template <QType F, int K, int T, bool Residual, class Out = __nv_bfloat16>
 __global__ void __launch_bounds__(kMmvqThreads)
     ggml_mmvq_kernel(const std::uint8_t* __restrict__ w, const __nv_bfloat16* __restrict__ x,
-                     __nv_bfloat16* __restrict__ out, int n) {
+                     Out* __restrict__ out, int n) {
+    static_assert(std::is_same_v<Out, __nv_bfloat16> || (std::is_same_v<Out, float> && !Residual));
     using Fmt                 = Format<F>;
     constexpr int kSubs       = K / kSubValues;
     constexpr int kLanes      = mmvq_lanes_per_row(kSubs);
@@ -134,8 +137,12 @@ __global__ void __launch_bounds__(kMmvqThreads)
             if (sub_lane == t % kLanes) {
                 const std::size_t o = static_cast<std::size_t>(t) * n + row;
                 float y             = acc[t];
-                if constexpr (Residual) y += __bfloat162float(out[o]);
-                out[o] = __float2bfloat16_rn(y);
+                if constexpr (std::is_same_v<Out, float>) {
+                    out[o] = y;
+                } else {
+                    if constexpr (Residual) y += __bfloat162float(out[o]);
+                    out[o] = __float2bfloat16_rn(y);
+                }
             }
         }
     }
@@ -149,14 +156,14 @@ inline void mmvq_check(cudaError_t error, const char* what) {
 }
 
 // Grid of persistent CTAs: as many as fit at once, never more than there are row groups.
-template <QType F, int K, int T, bool Residual>
-void launch_mmvq_instance(const std::uint8_t* w, const __nv_bfloat16* x, __nv_bfloat16* out, int n,
+template <QType F, int K, int T, bool Residual, class Out = __nv_bfloat16>
+void launch_mmvq_instance(const std::uint8_t* w, const __nv_bfloat16* x, Out* out, int n,
                           cudaStream_t stream) {
     constexpr std::size_t kShared = mmvq_shared_bytes<F, K, T>();
     constexpr int kRowsCta =
         kMmvqWarps * (32 / mmvq_lanes_per_row(K / kSubValues));
     static const int resident = [] {
-        auto kernel = ggml_mmvq_kernel<F, K, T, Residual>;
+        auto kernel = ggml_mmvq_kernel<F, K, T, Residual, Out>;
         if (kShared > 48 * 1024) {
             mmvq_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                             static_cast<int>(kShared)),
@@ -174,22 +181,22 @@ void launch_mmvq_instance(const std::uint8_t* w, const __nv_bfloat16* x, __nv_bf
     }();
     const int ctas_needed = (n + kRowsCta - 1) / kRowsCta;
     const int grid        = ctas_needed < resident ? ctas_needed : resident;
-    ggml_mmvq_kernel<F, K, T, Residual><<<grid, kMmvqThreads, kShared, stream>>>(w, x, out, n);
+    ggml_mmvq_kernel<F, K, T, Residual, Out><<<grid, kMmvqThreads, kShared, stream>>>(w, x, out, n);
     mmvq_check(cudaGetLastError(), "launch");
 }
 
-template <QType F, int K, bool Residual>
-void launch_mmvq_k(const std::uint8_t* w, const __nv_bfloat16* x, __nv_bfloat16* out, int n, int t,
+template <QType F, int K, bool Residual, class Out = __nv_bfloat16>
+void launch_mmvq_k(const std::uint8_t* w, const __nv_bfloat16* x, Out* out, int n, int t,
                    cudaStream_t stream) {
     switch (t) {
-    case 1: return launch_mmvq_instance<F, K, 1, Residual>(w, x, out, n, stream);
-    case 2: return launch_mmvq_instance<F, K, 2, Residual>(w, x, out, n, stream);
-    case 3: return launch_mmvq_instance<F, K, 3, Residual>(w, x, out, n, stream);
-    case 4: return launch_mmvq_instance<F, K, 4, Residual>(w, x, out, n, stream);
-    case 5: return launch_mmvq_instance<F, K, 5, Residual>(w, x, out, n, stream);
-    case 6: return launch_mmvq_instance<F, K, 6, Residual>(w, x, out, n, stream);
-    case 7: return launch_mmvq_instance<F, K, 7, Residual>(w, x, out, n, stream);
-    case 8: return launch_mmvq_instance<F, K, 8, Residual>(w, x, out, n, stream);
+    case 1: return launch_mmvq_instance<F, K, 1, Residual, Out>(w, x, out, n, stream);
+    case 2: return launch_mmvq_instance<F, K, 2, Residual, Out>(w, x, out, n, stream);
+    case 3: return launch_mmvq_instance<F, K, 3, Residual, Out>(w, x, out, n, stream);
+    case 4: return launch_mmvq_instance<F, K, 4, Residual, Out>(w, x, out, n, stream);
+    case 5: return launch_mmvq_instance<F, K, 5, Residual, Out>(w, x, out, n, stream);
+    case 6: return launch_mmvq_instance<F, K, 6, Residual, Out>(w, x, out, n, stream);
+    case 7: return launch_mmvq_instance<F, K, 7, Residual, Out>(w, x, out, n, stream);
+    case 8: return launch_mmvq_instance<F, K, 8, Residual, Out>(w, x, out, n, stream);
     default: break;
     }
     throw std::invalid_argument("ggml mmvq: T must be in [1, 8]");

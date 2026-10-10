@@ -307,9 +307,15 @@ values. To preserve existing compatible encoded words, also provide `read_encode
 ## Convert a GGUF
 
 A `--model` path ending in `.gguf` selects the GGUF route. It supports Qwen3.8-Flash-Next
-(GGUF architecture `qwen4exp`) with the `qwen4_exp_gguf` recipe, which stores every tensor exactly
-as the GGUF holds it: block tensors keep their GGML blocks, BF16 and FP32 keep their words, and the
-one F16 tensor widens exactly to FP32. Each layer's routed experts become one expert bank in
+(GGUF architecture `qwen4exp`) with the `qwen4_exp_gguf` recipe, which stores every value exactly:
+block tensors keep their GGML blocks, BF16 and FP32 keep their words, and the one F16 tensor widens
+exactly to FP32. A few direct tensors take the representation their Op reads, still without
+rounding: the attention and indexer q/k norms are stored as the BF16 `gamma` of the GGUF's
+`1 + gamma` (the converter forms `v - 1` exactly and refuses any value without an exact BF16 gamma
+that reproduces `v`), `ssm_norm` and `ssm_conv1d` (F32 words that are BF16 words) as BF16, and
+`ssm_conv1d` transposed to `[K, C]`; BF16 projections over one input are packed into one parent
+(each hyper-connection mixer's down and inject rows, the GDN a and b rows, the PLE key and value
+rows). Each layer's routed experts become one expert bank in
 `ggml_expert_record_v1`: one record per expert holding its gate, up and down blocks, the unit the
 expert cache moves. Name the first file of a split GGUF; the reader finds the others by their
 `-0000N-of-0000M` names and checks the split metadata.
@@ -333,8 +339,10 @@ The text config uses Infernix's Qwen4Exp keys. The GGUF stores the n-gram hash t
 1234, prime base 20,000,000, padding to 128 rows), and the converter refuses a GGUF whose literal
 tables differ from that derivation.
 
-The NInfer runtime cannot load the result yet: the C++ side materializes the GGML block and expert
-record formats but has no `qwen4exp` architecture or n-gram volume reader. `--subset dev` writes a
+The full conversion writes a 39.2 GB artifact (two files) and a 29.1 GB volume; on this fork's
+host it took 802 s plus 346 s for the volume, at a peak working set of 0.62 GiB. The model runs from
+it through `ninfer_qwen4_exp_forward_real_test` (M0, see `docs/maintainer/qwen4-exp-model.md`); the
+Engine, CLI and server do not load it yet. `--subset dev` writes a
 2.9 GB development subset instead: one real tensor of each GGML type, the direct tensors of layers
 0, 1 and 3, the expert banks of layers 0, 1 and 8 (one of each record format) and a volume of the
 first 4,500 n-gram rows. The reader ([`sources/gguf.py`](../tools/convert/sources/gguf.py)) admits

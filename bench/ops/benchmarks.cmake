@@ -32,10 +32,15 @@ ninfer_add_op_bench(ninfer_cast_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/cast_be
 ninfer_add_op_bench(ninfer_argmax_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/argmax_bench.cu")
 ninfer_add_op_bench(ninfer_causal_conv1d_silu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/causal_conv1d_silu_bench.cu")
 ninfer_add_op_bench(ninfer_linear_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_bench.cu")
+ninfer_add_op_bench(ninfer_hyper_connection_bench
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/hyper_connection_bench.cu")
+ninfer_add_op_bench(ninfer_projection_fp32_bench
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/projection_fp32_bench.cu")
 ninfer_add_op_bench(ninfer_linear_schedule_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_schedule_bench.cu")
 ninfer_add_op_bench(ninfer_linear_topk_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_topk_bench.cu")
 ninfer_add_op_bench(ninfer_offloaded_moe_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/offloaded_moe_bench.cu")
+ninfer_add_op_bench(ninfer_qsa_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/qsa_bench.cu")
 ninfer_add_op_bench(ninfer_candidate_selector_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/candidate_selector_bench.cu")
 ninfer_add_op_bench(ninfer_gdn_input_proj_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/gdn_input_proj_bench.cu")
 ninfer_add_op_bench(ninfer_gdn_input_proj_conv_snapshot_bench

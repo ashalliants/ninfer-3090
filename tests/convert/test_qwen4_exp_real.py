@@ -73,7 +73,8 @@ def test_whole_model_maps_every_tensor(gguf):
     assert {m.gguf for m in qwen4_exp.name_map(gguf, model.config)} == set(gguf.tensors)
     # One expert bank per layer for its three expert tensors; the PLE table is the volume.
     assert len(model.parameters) == 1224 - 3 * 48 + 48 - 1
-    assert not model.packing_groups
+    # Two mixers per layer, a|b of the 36 GDN layers, key|value of the PLE layer.
+    assert len(model.packing_groups) == 2 * 48 + 36 + 1
     assert model.token_count == 248_077
     banks = [p for name, p in model.parameters.items() if name.endswith("/moe/experts")]
     total = sum(
@@ -125,8 +126,9 @@ def test_dev_subset_stores_the_gguf_bytes(gguf, tmp_path):
         qwen4_exp.write_ngram_volume(gguf, model, str(path) + ".ngram")
     volume = str(path) + ".ngram"
     summary = verify(path, gguf, subset, volume=volume)
-    assert summary["records"] == 3 and summary["widened"] == 1
-    assert summary["volume_rows"] == 4500 and summary["objects"] == 68
+    assert summary["records"] == 3 and summary["widened"] == 1 and summary["narrowed"] == 8
+    # 68 objects before the six mixers' down|inject, two GDN a|b and the PLE key|value were joined.
+    assert summary["volume_rows"] == 4500 and summary["objects"] == 59
     # The 512-row reuse check accepts the volume for the same table and subset.
     from tools.artifact.reader import Artifact
 

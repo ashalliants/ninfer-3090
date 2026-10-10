@@ -115,6 +115,11 @@ The variable-width DFlash2 target-attention subset can be run with
 cache codecs, W=2..16, B=1..8, request-local prefixes, cache effects, and Graph metadata/input
 updates. The default executable also runs the existing attention geometries and prefill tests.
 
+`ninfer_qsa_test` qualifies the four QSA Ops (index query, pooled keys, block selection, attention
+over selected blocks) against their FP64 and exact oracles. `--small` runs the quick subset used
+under compute-sanitizer:
+`compute-sanitizer --tool memcheck build/tests/ninfer_tests ninfer_qsa_test --small`.
+
 Linear tests are independently runnable by weight and activation-compute profile:
 
 ```bash
@@ -204,6 +209,14 @@ at 1 and 6 workers (T in {1, 2, 7, 8, 16}), and the whole layer, with a shared e
 GGML linears and the combine, against FP64. With `NINFER_TEST_ARTIFACT` it repeats the placements on
 32 real experts of every expert bank of the artifact. `--small` runs a reduced set for
 compute-sanitizer.
+The Qwen3.8-Flash-Next Ops ported from Infernix have their own suites, each a few seconds:
+`ninfer_hyper_connection_test` (the mixer against its FP64 formula on both arithmetic profiles,
+fused T ≤ 16 and composed above, column invariance, graph equal to eager; inject and expand exact),
+`ninfer_ple_test` (the IQ4_NL row decode exact against the host decoder; the gate and the stateful
+convolution against FP64, states bit for bit, split calls equal to one call, commit equal to the
+in-place update), `ninfer_projection_fp32_test` (BF16 router segments and the IQ4_XS head against
+FP64 within the FP32 accumulation bound, column invariance) and `ninfer_rows_test` (exact splits and
+gathers with guard bytes).
 
 The real loading test accepts an explicit artifact path and optional component selection:
 

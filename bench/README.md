@@ -203,6 +203,16 @@ entry retains the preceding numerical layer. After real-scenario acceptance, a m
 promote quantized values into the C++ table. The detailed `--json` report is diagnostic provenance
 and is not a runtime input.
 
+## Hyper-connection and FP32 projection benchmarks
+
+`ninfer_hyper_connection_bench [--tokens T,...] [--chain N]` times `hyper_connection_mix` at
+Qwen3.8-Flash-Next's geometry (S = 4, H = 2560, rank 320, BF16 weights) with and without injection
+rows, from graph replays after an L2 flush: one call per graph (`single`, which includes the graph's
+launch latency) and `N` calls per graph on distinct weight copies (`chained`, the per-call cost
+inside a decode graph). `ninfer_projection_fp32_bench [--tokens T,...]` times `projection_fp32` on
+the BF16 router plus shared-expert gate [513, 2560] and the IQ4_XS LM head [248320, 2560]. Both
+call only the public Ops.
+
 ## Linear Op benchmark
 
 `ninfer_linear_bench` measures only the public pure `linear()` contract. It supports Q4, Q5, Q6,
@@ -342,6 +352,24 @@ with finite scales; medians of `--reps` (default 30).
 ```bash
 ./build/bench/ninfer_benches ninfer_offloaded_moe_bench
 ./build/bench/ninfer_benches ninfer_offloaded_moe_bench --mode cpu --reps 50
+```
+
+## QSA Op benchmark
+
+`ninfer_qsa_bench` measures the four public QSA Ops of `include/ninfer/ops/qsa.h` at the registered
+geometry (4 x 128 indexer, R=4, budget 2048, D256/Q24/KV2 Int8Group64 cache): `index_query`,
+`pool_keys`, `select` and `attention` for one call of `T` columns ending at the last position of a
+context `L`, each captured alone, and `all` (the four in one graph). Pooled keys, queries and cache
+codes are random, so the selection picks scattered blocks; the page table is shuffled. The
+attention stage reads the selection the select stage produced. Each sample replays a CUDA Graph,
+after a 256 MiB L2 eviction read by default (`--cache warm` skips it). Defaults: `T=1,2048`,
+`L=8192,32768,131072`, 5 warmups, 30 samples. Output is CSV
+`stage,T,context,cache,median_us,min_us,p95_us,graph_nodes`. These are Op measurements.
+
+```bash
+cmake --build build -j --target ninfer_benches
+./build/bench/ninfer_benches ninfer_qsa_bench
+./build/bench/ninfer_benches ninfer_qsa_bench --tokens 1 --contexts 32768 --repeat 100
 ```
 
 ## CandidateSelectorPath Op benchmark

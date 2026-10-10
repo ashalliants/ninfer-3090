@@ -14,11 +14,22 @@ The GGUF stores the PLE hash tables literally (multipliers, head sizes, head off
 holds Infernix's derivation parameters instead (seed, prime base, padding), and the converter
 refuses a GGUF whose literal tables differ from that derivation, so both describe one hash.
 
-Export conventions of the GGUF, bound as stored (evidence in docs/maintainer/flash-next-plan.md):
+Export conventions of the GGUF (evidence in docs/maintainer/flash-next-plan.md):
 
-- Every norm vector except ``gdn/norm`` (GGUF ``ssm_norm``) is stored as ``1 + gamma``; the
-  model multiplies by the stored vector. ``gdn/norm`` is a plain multiplier. The converter does
-  not subtract 1, which would round.
+- Every norm vector except ``gdn/norm`` (GGUF ``ssm_norm``) is stored as ``fl32(1 + gamma)``
+  with ``gamma`` a BF16 word. The hyper-connection and PLE norms keep the stored F32 multiplier
+  (their Ops take it). The attention and indexer q/k norms are stored as ``gamma`` in BF16, the
+  unit-offset form the attention Ops take: ``v - 1`` is formed exactly and the converter refuses
+  the tensor unless every ``v - 1`` is a BF16 word with ``fl32(1 + (v - 1)) == v``, so the model's
+  FP32 gain ``1 + gamma`` is the stored ``v`` bit for bit. ``gdn/norm`` (a plain multiplier) and
+  ``gdn/convolution`` are F32 words that are all BF16 words; they are stored as BF16 after the
+  same refusal check. Nothing is rounded.
+- ``gdn/convolution`` is stored ``[K, C]`` (tap-major), the GDN convolution Op's operand and
+  Qwen3.5's logical shape; the GGUF holds ``[C, K]``. The transpose moves words, not values.
+- BF16 projections over one input are packed into one parent (``PACKED``): each hyper-connection
+  mixer's ``down`` and ``inject`` (``rank + S`` rows, the operand the mixer Op reads), the GDN
+  ``a`` and ``b`` projections, and the PLE ``key`` and ``value`` projections. The bytes are the
+  GGUF tensors concatenated.
 - GDN value heads are in llama.cpp's tiled order (value head h pairs with key head h % 16) in
   ``gdn/qkv`` (value rows), ``gdn/z``, ``gdn/a_projection``, ``gdn/b_projection``, ``gdn/a``,
   ``gdn/dt_bias``, ``gdn/convolution`` and the K axis of ``gdn/output``. Block formats cannot
@@ -47,6 +58,7 @@ from .methods import PrepareRequest, PreparedMethod
 from .model import Model, Parameter
 from .resources import token_domain
 from .sources.gguf import GgufError, GgufModel, tensor_source
+from .sources.logical import array_source
 
 ARCHITECTURE = "qwen4exp"
 _KEY = ARCHITECTURE + "."
@@ -298,14 +310,14 @@ def text_config(metadata: Mapping) -> dict:
 
 # GGUF per-layer suffix -> (logical role, mathematical inputs relative to the layer prefix).
 _LAYER_ROLES = {
-    "hc_attn_down.weight": ("hc_mixer/down", ("hc_mixer/stream",)),
-    "hc_attn_up.weight": ("hc_mixer/up", ("hc_mixer/low_rank",)),
-    "hc_attn_inject.weight": ("hc_mixer/inject", ("hc_mixer/stream",)),
-    "hc_attn_norm.weight": ("hc_mixer/norm", ()),
-    "hc_ffn_down.weight": ("hc_ffn/down", ("hc_ffn/stream",)),
-    "hc_ffn_up.weight": ("hc_ffn/up", ("hc_ffn/low_rank",)),
-    "hc_ffn_inject.weight": ("hc_ffn/inject", ("hc_ffn/stream",)),
-    "hc_ffn_norm.weight": ("hc_ffn/norm", ()),
+    "hc_attn_down.weight": ("attn_hc/down", ("attn_hc/input",)),
+    "hc_attn_up.weight": ("attn_hc/up", ("attn_hc/mix_activation",)),
+    "hc_attn_inject.weight": ("attn_hc/inject", ("attn_hc/input",)),
+    "hc_attn_norm.weight": ("attn_hc/norm", ()),
+    "hc_ffn_down.weight": ("mlp_hc/down", ("mlp_hc/input",)),
+    "hc_ffn_up.weight": ("mlp_hc/up", ("mlp_hc/mix_activation",)),
+    "hc_ffn_inject.weight": ("mlp_hc/inject", ("mlp_hc/input",)),
+    "hc_ffn_norm.weight": ("mlp_hc/norm", ()),
     "attn_qkv.weight": ("gdn/qkv", ("mixer_input",)),
     "attn_gate.weight": ("gdn/z", ("mixer_input",)),
     "ssm_alpha.weight": ("gdn/a_projection", ("mixer_input",)),
@@ -359,10 +371,53 @@ _LAYER_COMMON = {key for key in _LAYER_ROLES if key.startswith(_COMMON)} | set(_
 _GLOBAL_ROLES = {
     "token_embd.weight": ("text/token_embedding", ()),
     "output.weight": ("text/output_head", ("text/final_hidden",)),
-    "output_hc_down.weight": ("text/output_hc/down", ("text/output_hc/stream",)),
-    "output_hc_up.weight": ("text/output_hc/up", ("text/output_hc/low_rank",)),
-    "output_hc_norm.weight": ("text/output_hc/norm", ()),
+    "output_hc_down.weight": ("text/final_mixer/down", ("text/final_mixer/input",)),
+    "output_hc_up.weight": ("text/final_mixer/up", ("text/final_mixer/mix_activation",)),
+    "output_hc_norm.weight": ("text/final_mixer/norm", ()),
 }
+# Direct F32 tensors stored as BF16 without rounding (see the module docstring). "gamma": the
+# stored v is fl32(1 + gamma) and gamma is kept; "words": v is itself a BF16 word.
+NARROWED = {
+    "attn_q_norm.weight": "gamma",
+    "attn_k_norm.weight": "gamma",
+    "indexer.q_norm.weight": "gamma",
+    "indexer.k_norm.weight": "gamma",
+    "ssm_norm.weight": "words",
+    "ssm_conv1d.weight": "words",
+}
+# Direct tensors whose logical shape is the GGUF matrix transposed (see the module docstring).
+TRANSPOSED = {"ssm_conv1d.weight"}
+# Per-layer BF16 projections over one input that share one parent, rows in this order (the
+# operands the model's Ops and registered Linear shapes take): each mixer's down then inject rows,
+# the GDN a then b rows, and the PLE key then value rows.
+PACKED = (
+    ("attn_hc/down", "attn_hc/inject"),
+    ("mlp_hc/down", "mlp_hc/inject"),
+    ("gdn/a_projection", "gdn/b_projection"),
+    ("ple/key", "ple/value"),
+)
+
+
+def narrow_exactly(name: str, values: torch.Tensor, rule: str) -> torch.Tensor:
+    """The BF16 tensor a NARROWED rule stores for F32 *values*; refuses any rounding."""
+    v = values.to(torch.float32).reshape(-1).numpy()
+    if rule == "gamma":
+        stored = v.astype(np.float64) - 1.0  # exact in binary64
+        narrow = stored.astype(np.float32)
+        exact = narrow.astype(np.float64) == stored
+        exact &= (np.float32(1.0) + narrow) == v
+    elif rule == "words":
+        narrow = v
+        exact = np.isfinite(v)
+    else:
+        raise ValueError(f"unknown narrowing rule {rule!r}")
+    exact &= (narrow.view(np.uint32) & 0xFFFF) == 0
+    if not exact.all():
+        bad = int(np.flatnonzero(~exact)[0])
+        raise GgufError(
+            f"{name}: value {bad} ({v[bad]!r}) has no exact BF16 {rule} representation"
+        )
+    return torch.from_numpy(narrow.copy()).to(torch.bfloat16).reshape(values.shape)
 # The PLE n-gram table: written to the n-gram volume, not to the artifact.
 PLE_TABLE = "per_layer_token_embd.weight"
 
@@ -413,6 +468,11 @@ SUBSETS = {
         ple_rows=4500,
     ),
 }
+
+
+def layer_suffix(name: str) -> str:
+    """A tensor name without its ``blk.N.`` prefix."""
+    return _split_layer(name)[1]
 
 
 def _split_layer(name: str) -> tuple[int | None, str]:
@@ -482,6 +542,8 @@ def name_map(gguf: GgufModel, config: dict) -> list[TensorMapping]:
         shape = tensor.shape
         if suffix == "ffn_gate_inp_shexp.weight":
             shape = (1, *shape)
+        if suffix in TRANSPOSED:
+            shape = shape[::-1]
         result.append(
             TensorMapping(name, prefix + role, shape, tuple(prefix + i for i in inputs))
         )
@@ -772,16 +834,31 @@ def build_model(
             banks.setdefault(item.parameter, {})[item.part] = item
             continue
         tensor = gguf.tensor(item.gguf)
+        transposed = layer_suffix(item.gguf) in TRANSPOSED
+        source = tensor_source(gguf, item.gguf, shape=item.shape[::-1] if transposed else item.shape)
+        # Unassigned block tensors fall back to their exact FP32 decode, never a rounding.
+        direct_format = tensor.type.format if tensor.type.dtype is not None else "fp32"
+        rule = NARROWED.get(layer_suffix(item.gguf))
+        if rule is not None:
+            values = source.values().reshape(source.shape)
+            narrowed = narrow_exactly(item.gguf, values.T.contiguous() if transposed else values, rule)
+            source, direct_format = array_source(narrowed, item.gguf), "bf16"
+        elif transposed:
+            raise GgufError(f"{item.gguf}: a transposed tensor must be narrowed")
         model.add(
             Parameter(
                 item.parameter,
                 item.shape,
-                tensor_source(gguf, item.gguf, shape=item.shape),
+                source,
                 inputs=item.inputs,
-                # Unassigned block tensors fall back to their exact FP32 decode, never a rounding.
-                direct_format=tensor.type.format if tensor.type.dtype is not None else "fp32",
+                direct_format=direct_format,
             )
         )
+    for layer in range(config["num_hidden_layers"]):
+        for packed in PACKED:
+            group = tuple(f"text/layers/{layer}/{name}" for name in packed)
+            if all(name in model.parameters for name in group):
+                model.packing_groups.append(group)
     for name, parts in banks.items():
         gate, up, down = parts["gate"], parts["up"], parts["down"]
         experts, intermediate, hidden = gate.shape

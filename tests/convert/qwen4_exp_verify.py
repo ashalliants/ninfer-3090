@@ -70,8 +70,9 @@ def verify(path, gguf: GgufModel, subset: qwen4_exp.Subset | None = None, volume
 
     Plain objects are compared by SHA-256 over the GGUF bytes of their bound parameters in
     binding order. Layout transforms are inverted exactly: expert records are unpacked to each
-    expert's gate, up and down rows, and F16 widened to FP32 must narrow back to the original
-    words. With *volume*, the n-gram volume is checked against the GGUF table too.
+    expert's gate, up and down rows, F16 widened to FP32 must narrow back to the original words,
+    and a narrowed BF16 tensor must widen back to the GGUF's F32 words (``1 + gamma`` for the
+    unit-offset norms). With *volume*, the n-gram volume is checked against the GGUF table too.
     """
     config = qwen4_exp.text_config(gguf.metadata)
     mappings = defaultdict(list)
@@ -99,7 +100,19 @@ def verify(path, gguf: GgufModel, subset: qwen4_exp.Subset | None = None, volume
                 summary["records"] += 1
             else:
                 tensors = [gguf.tensor(mappings[name][0].gguf) for _, _, name in bound]
-                if obj.format == "fp32" and tensors[0].type.name == "F16":
+                rule = qwen4_exp.NARROWED.get(qwen4_exp.layer_suffix(tensors[0].name))
+                if rule is not None:
+                    (tensor,) = tensors
+                    words = np.frombuffer(artifact.read_object(obj.id), dtype="<u2")
+                    stored = (words.astype(np.uint32) << 16).view(np.float32)
+                    if rule == "gamma":
+                        stored = np.float32(1.0) + stored
+                    if qwen4_exp.layer_suffix(tensor.name) in qwen4_exp.TRANSPOSED:
+                        stored = stored.reshape(obj.shape).T.copy()
+                    source = gguf.read_range(tensor, 0, tensor.bytes)
+                    assert obj.format == "bf16" and stored.tobytes() == source, obj.id
+                    summary["narrowed"] += 1
+                elif obj.format == "fp32" and tensors[0].type.name == "F16":
                     (tensor,) = tensors
                     source = gguf.read_range(tensor, 0, tensor.bytes)
                     widened = np.frombuffer(artifact.read_object(obj.id), dtype="<f4")
