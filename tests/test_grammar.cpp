@@ -220,6 +220,9 @@ int main() {
 
         auto thinking = compile(compiler, "root ::= \" answer\"", "\n</think>\n\n", {});
         consume(*thinking, "reason\n<other>\n");
+        // EOS stays masked until the canonical close: a constrained turn cannot end inside its
+        // thinking.
+        require(!allows(mask(*thinking), 256), "EOS admitted inside open thinking");
         require(allows(mask(*thinking), 258), "cross-boundary token not admitted");
         thinking->accept(258);
         thinking->confirm();

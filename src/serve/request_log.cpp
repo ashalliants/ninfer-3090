@@ -104,7 +104,8 @@ Json tool_call_parse_json(const ninfer::ToolCallParseDiagnostics& diagnostics) {
                 {"schema_mismatch_arguments", diagnostics.schema_mismatch_arguments},
                 {"duplicate_parameters_repaired", diagnostics.duplicate_parameters_repaired},
                 {"fallback_reason",
-                 ninfer::tool_call_parse_fallback_reason_name(diagnostics.fallback_reason)}};
+                 ninfer::tool_call_parse_fallback_reason_name(diagnostics.fallback_reason)},
+                {"recovered_from_reasoning", diagnostics.recovered_from_reasoning}};
 }
 
 std::string tool_choice_name(const ToolChoice& choice) {

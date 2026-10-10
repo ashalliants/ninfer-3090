@@ -814,11 +814,19 @@ bool MarkdownCodeTracker::in_code() const noexcept {
                1;
 }
 
-ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
-                                                 std::size_t max_tool_name_length,
-                                                 const ToolCallOutputContract& contract,
-                                                 MarkdownCodeTracker code) {
-    const std::string_view source(text);
+namespace {
+
+// The tool-call region a free terminal parse accepts. `begin` is npos when none parses; then
+// `first_failure` is the first candidate's failure, or None when no candidate marker was found.
+struct AcceptedRegion {
+    std::size_t begin = std::string_view::npos;
+    std::vector<RawToolCall> calls;
+    std::uint32_t duplicate_repairs = 0;
+    std::optional<FallbackReason> first_failure;
+};
+
+AcceptedRegion find_accepted_region(std::string_view source, std::size_t max_tool_name_length,
+                                    const Contract& contract, MarkdownCodeTracker code) {
     // A marker of free output inside Markdown code is a quoted example, never a call. Candidates
     // only move forward, so the tracker reads each byte once.
     std::size_t tracked = 0;
@@ -830,54 +838,87 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     };
     const auto next_marker = [&](std::size_t from) {
         const std::size_t found = find_first_tool_marker(source.substr(from));
-        return found == std::string_view::npos ? std::string::npos : from + found;
+        return found == std::string_view::npos ? std::string_view::npos : from + found;
     };
     std::size_t candidate = next_marker(0);
-    while (candidate != std::string::npos && quoted(candidate)) {
+    while (candidate != std::string_view::npos && quoted(candidate)) {
         candidate = next_marker(candidate + 1);
     }
-    if (candidate == std::string::npos) { return fallback(text); }
-
-    ParsedToolCallOutput out;
-    out.diagnostics.marker_seen = true;
 
     // Generated prose can quote a tool-call marker before the real turn. Try the first marker,
     // then each later `<tool_call>` wrapper, and accept the first region that parses to the end of
-    // the output; the text before it stays ordinary content.
-    std::vector<RawToolCall> raw_calls;
-    std::size_t accepted            = std::string::npos;
-    std::uint32_t duplicate_repairs = 0;
-    std::optional<FallbackReason> first_failure;
-    while (candidate != std::string::npos) {
+    // the text.
+    AcceptedRegion region;
+    while (candidate != std::string_view::npos) {
         std::vector<RawToolCall> calls;
         QwenToolRegionParser parser(source.substr(candidate), max_tool_name_length, contract);
         const FallbackReason failure = parser.parse(calls);
         if (failure == FallbackReason::None) {
-            accepted          = candidate;
-            duplicate_repairs = parser.duplicate_parameters_repaired();
-            raw_calls         = std::move(calls);
-            break;
+            region.begin             = candidate;
+            region.duplicate_repairs = parser.duplicate_parameters_repaired();
+            region.calls             = std::move(calls);
+            return region;
         }
-        if (!first_failure) { first_failure = failure; }
+        if (!region.first_failure) { region.first_failure = failure; }
         // Retries move only to a later `<tool_call>` wrapper: the markup nested inside a failed
         // region (its `<function=...>` or `<invoke>`) must not re-read a broken call.
         do {
-            candidate = text.find(kToolOpen, candidate + 1);
-        } while (candidate != std::string::npos && quoted(candidate));
+            candidate = source.find(kToolOpen, candidate + 1);
+        } while (candidate != std::string_view::npos && quoted(candidate));
     }
-    if (accepted == std::string::npos) {
-        out.diagnostics.fallback_reason = *first_failure;
-        return fallback(text, out.diagnostics);
-    }
+    return region;
+}
 
-    out.content = rtrim_format_whitespace(source.substr(0, accepted));
-    out.tool_calls.reserve(raw_calls.size());
-    for (const RawToolCall& raw : raw_calls) {
+// Normalizes an accepted region's calls into a structured turn.
+void publish_structured_calls(ParsedToolCallOutput& out, const AcceptedRegion& region,
+                              const Contract& contract) {
+    out.tool_calls.reserve(region.calls.size());
+    for (const RawToolCall& raw : region.calls) {
         out.tool_calls.push_back(normalize_raw_tool_call(raw, contract, out.diagnostics));
     }
-    out.diagnostics.duplicate_parameters_repaired = duplicate_repairs;
+    out.diagnostics.marker_seen                   = true;
+    out.diagnostics.duplicate_parameters_repaired = region.duplicate_repairs;
     out.diagnostics.structured_call_count = static_cast<std::uint32_t>(out.tool_calls.size());
     out.is_tool_call_response             = true;
+}
+
+// A turn that ended inside its thinking can hold the calls it meant to make. The same region
+// search as the answer applies: the first marker outside Markdown code, or a later `<tool_call>`
+// wrapper, from which the rest of the thinking is nothing but complete, declared calls parsed
+// strictly. Prose after a call, a quoted marker or a cut call leaves the thinking as reasoning,
+// and the thinking before the accepted region is never returned.
+ParsedToolCallOutput parse_open_reasoning_calls(std::string_view reasoning,
+                                                std::size_t max_tool_name_length,
+                                                const Contract& contract) {
+    const AcceptedRegion region =
+        find_accepted_region(reasoning, max_tool_name_length, contract, {});
+    ParsedToolCallOutput out;
+    if (region.begin == std::string_view::npos) { return out; }
+    publish_structured_calls(out, region, contract);
+    out.diagnostics.recovered_from_reasoning = true;
+    return out;
+}
+
+} // namespace
+
+ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
+                                                 std::size_t max_tool_name_length,
+                                                 const ToolCallOutputContract& contract,
+                                                 MarkdownCodeTracker code) {
+    AcceptedRegion region =
+        find_accepted_region(text, max_tool_name_length, contract, std::move(code));
+    if (region.begin == std::string_view::npos) {
+        if (!region.first_failure) { return fallback(text); }
+        ToolCallParseDiagnostics diagnostics;
+        diagnostics.marker_seen     = true;
+        diagnostics.fallback_reason = *region.first_failure;
+        return fallback(text, diagnostics);
+    }
+
+    // The text before the accepted region stays ordinary content.
+    ParsedToolCallOutput out;
+    out.content = rtrim_format_whitespace(std::string_view(text).substr(0, region.begin));
+    publish_structured_calls(out, region, contract);
     return out;
 }
 
@@ -889,6 +930,7 @@ std::string ToolCallOutputDecoder::feed(std::string_view text) {
     if (finished_) { throw std::logic_error("tool-call output decoder is already finished"); }
     if (text.empty()) { return {}; }
     if (!contract_) { return std::string(text); }
+    fed_content_ = true;
     if (saw_tool_marker_) {
         tool_region_.append(text);
         return {};
@@ -974,10 +1016,27 @@ void ToolCallOutputDecoder::initialize_continuation(std::string_view prefix) {
         trailing_whitespace_.size() + pending_tag_.size() + tool_region_.size();
 }
 
-ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish(FinishReason reason) {
+ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish(FinishReason reason,
+                                                              std::string_view open_reasoning) {
     if (finished_) { throw std::logic_error("tool-call output decoder is already finished"); }
     finished_ = true;
     if (!contract_) { return {}; }
+
+    // Only a turn the model ended itself recovers calls from its open thinking: an output,
+    // context or cancellation cut leaves a call it was still deliberating over unexecuted, and a
+    // stop string is the client's own end. Constrained output cannot end inside thinking (the
+    // grammar admits EOS only after the canonical close), and the free parser would bypass what
+    // its grammar enforces, so recovery is limited to free tool output.
+    if (!contract_->constrained && reason == FinishReason::StopToken && !open_reasoning.empty() &&
+        !fed_content_) {
+        ParsedToolCallOutput recovered =
+            parse_open_reasoning_calls(open_reasoning, max_tool_name_length_, *contract_);
+        if (recovered.is_tool_call_response) {
+            return Terminal{.content     = {},
+                            .tool_calls  = std::move(recovered.tool_calls),
+                            .diagnostics = recovered.diagnostics};
+        }
+    }
 
     if (contract_->constrained && saw_tool_marker_) {
         Terminal result;

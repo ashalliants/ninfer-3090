@@ -657,6 +657,19 @@ and complete responses agree. A marker after a closed fence, or after a sentence
 still opens a call. Inline code is tracked per paragraph, so an unpaired backtick earlier in the
 same paragraph also makes a later marker text.
 
+A model sometimes writes its tool calls inside its thinking and ends the turn with its stop token
+without ever closing the thinking, so no call reaches the answer. On the unconstrained route such a
+call is **executed**: when, from a marker (found by the same rules as in the answer) to the end of
+that thinking, there is nothing but complete calls to declared tools, those calls become the
+structured turn, and the operational log notes the recovery at Info severity. This means a call the
+model wrote while still thinking is returned for execution when the model ended its own turn right
+after complete, declared calls. The thinking stays reasoning, including the calls' text, and none
+of it is published as content. Nothing is recovered when the thinking was closed, when the turn
+published any content, when it ended at the output limit, context capacity, a stop string or a
+cancellation, or when prose, a quoted marker or a cut call follows the last call. Constrained tool
+output cannot end inside thinking: its grammar admits the stop token only after the canonical
+thinking close, so this recovery does not apply there.
+
 ### Tool constraints
 
 The three protocols share one constrained tool implementation:
@@ -1509,7 +1522,9 @@ unspecified. `enable_thinking` records whether the response starts in thinking m
 call count, empty non-string arguments omitted during normalization, schema-mismatched arguments
 preserved for consumer validation, repeated parameter names resolved to their last value
 (`duplicate_parameters_repaired`), and a stable text-fallback reason. Fallback reasons are `none`,
-`malformed_structure`, `invalid_tool_name`, `undeclared_tool`, and `trailing_content`. These counters contain no tool arguments or generated text.
+`malformed_structure`, `invalid_tool_name`, `undeclared_tool`, and `trailing_content`.
+`recovered_from_reasoning` is true when the structured calls came from a turn that ended inside
+its unclosed thinking. These counters contain no tool arguments or generated text.
 
 `request_done.constraint` carries the same constraint observation as the HTTP terminal result,
 or `null` for unconstrained requests. Preparation failures and execution errors use the existing

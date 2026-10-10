@@ -356,6 +356,8 @@ public:
           thinking_control_tokens(std::move(thinking_control_tokens_)),
           preserve_special(output.raw || output.preserve_special_tokens),
           split_reasoning(starts_in_reasoning && !output.raw),
+          collect_open_reasoning(split_reasoning && tool_call_output_ != nullptr &&
+                                 !tool_call_output_->constrained && grammar_ == nullptr),
           tool_call_output(output.raw ? nullptr : std::move(tool_call_output_),
                            output.tool_name_max_length),
           grammar(std::move(grammar_)), combined(combined_) {
@@ -422,6 +424,10 @@ public:
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
     bool preserve_special = false;
     bool split_reasoning  = false;
+    // Free tool output keeps the open thinking so a turn that ends inside it can still return the
+    // calls stranded there; the text is dropped once the thinking closes.
+    bool collect_open_reasoning = false;
+    std::string open_reasoning;
     bool early_close_available = true;
     std::optional<std::uint32_t> requested_budget;
     DecoderState state;
@@ -438,6 +444,9 @@ public:
     ToolCallParseDiagnostics tool_call_parse;
     bool preview_ready                 = false;
     FinishReason preview_finish_reason = FinishReason::None;
+    // Whether the previewed stop token is one of the checkpoint's own end-of-turn tokens, as
+    // opposed to a caller-supplied stop id merged into the same policy.
+    bool preview_stop_is_model_default = false;
     std::unique_ptr<text::GrammarSession> grammar;
     bool combined                 = false;
     bool saw_content              = false;
@@ -552,6 +561,7 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
     impl_->preview_prefix_execution = impl_->prefix_execution;
     impl_->preview_execution_split_after.reset();
     impl_->preview_output.clear();
+    impl_->preview_stop_is_model_default = false;
 
     const auto complete = [&](std::uint32_t count, FinishReason reason,
                               runtime::ContinuationAction continuation =
@@ -620,6 +630,10 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         }
 
         if (stop_token) {
+            const auto& defaults = impl_->tokenizer->default_stop_token_ids();
+            impl_->preview_stop_is_model_default =
+                std::find(defaults.begin(), defaults.end(), static_cast<int>(token)) !=
+                defaults.end();
             if (!impl_->policy.publish_stop_token) {
                 impl_->preview_state  = std::move(before_state);
                 impl_->preview_output = std::move(before_output);
@@ -785,12 +799,26 @@ PublishedOutput OutputSession::commit_preview() {
                                                           : ConstraintOutputBranch::Content;
             if (!impl_->combined || impl_->branch == ConstraintOutputBranch::Tools)
                 delta.text = impl_->tool_call_output.feed(delta.text);
+        } else if (delta.channel == OutputChannel::Reasoning && impl_->collect_open_reasoning) {
+            impl_->open_reasoning.append(delta.text);
         }
+    }
+    if (impl_->collect_open_reasoning && !impl_->state.in_reasoning) {
+        impl_->collect_open_reasoning = false;
+        impl_->open_reasoning         = {};
     }
     if (impl_->state.terminal &&
         (!impl_->combined || impl_->branch == ConstraintOutputBranch::Tools)) {
+        // The reasoning channel is still open only when the model ended the turn without closing
+        // its thinking. A caller-supplied stop id is the client's own end, not the model's, so it
+        // does not recover calls from that thinking.
+        const bool model_ended = impl_->preview_finish_reason != FinishReason::StopToken ||
+                                 impl_->preview_stop_is_model_default;
+        const std::string_view open_reasoning =
+            impl_->state.in_reasoning && model_ended ? std::string_view(impl_->open_reasoning)
+                                                     : std::string_view{};
         fi::ToolCallOutputDecoder::Terminal terminal =
-            impl_->tool_call_output.finish(impl_->preview_finish_reason);
+            impl_->tool_call_output.finish(impl_->preview_finish_reason, open_reasoning);
         impl_->tool_calls      = std::move(terminal.tool_calls);
         impl_->tool_call_parse = terminal.diagnostics;
         if (!terminal.content.empty()) {
