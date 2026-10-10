@@ -317,11 +317,16 @@ admission actually resumes from it. On the 27B on an RTX 3090, a 7.8k-token conv
 856 MB image) read back from a warm file cache in about 1.5 s gave a first token after 1.6 s, against
 5.1 s for prefilling it and 0.1 s when it had stayed resident.
 
-The store works with every speculative backend, including the launchers' default DFlash2. A stored
-recovery point carries the draft's own context with the target's: DFlash2's local K/V rings (40 MiB
-per recovery point on the 27B) inside each recurrent state, and DFlash's draft KV pages. A restored
+The store works with MTP and DFlash2, including the launchers' default DFlash2, and with no
+speculation. A stored recovery point carries the draft's own context with the target's: DFlash2's
+local K/V rings (40 MiB per recovery point on the 27B) inside each recurrent state. A restored
 conversation therefore drafts exactly as if it had never left the GPU: the real tests require the
 same output and the same speculative rounds and accepted drafts as the uninterrupted conversation.
+`--spec dflash` (the 35B-A3B DFlash v1 backend, not a launcher profile) is accepted but is not
+fully verified: after a restart a short conversation was restored at start-up yet its continuation
+reused no tokens, so it falls back to a cold prefill (a deep conversation restores and matches
+exactly), and its hydration, crash and recovery paths were not exercised. Treat the store as
+unsupported there.
 N-gram copy drafting (`--ngram-draft-tokens`) needs nothing stored; a restored request builds its
 copy index from its own prompt like any other. A store is bound to the speculative backend, draft
 count and proposal head it was written with (and to the model, KV format and `--gdn-state-fp16`), so
