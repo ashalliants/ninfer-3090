@@ -6,6 +6,7 @@
 #include <iostream>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -1084,8 +1085,11 @@ int test_markdown_quoted_calls() {
     // (arguments of every call, content) of one output.
     using Outcome = std::pair<std::vector<std::string>, std::string>;
     int failures  = 0;
+    // Tolerant repair changes nothing about what counts as quoted.
+    bool tolerant      = false;
     const auto outcome = [&](const std::string& text) {
-        const auto whole = fi::parse_qwen_tool_call_output(text, 64, *contract);
+        const auto whole = fi::parse_qwen_tool_call_output(
+            text, 64, *contract, {}, fi::tool_call_repair(tolerant, ninfer::FinishReason::StopToken));
         Outcome reference({}, whole.content);
         for (const auto& parsed_call : whole.tool_calls) {
             reference.first.push_back(parsed_call.arguments_json);
@@ -1093,7 +1097,7 @@ int test_markdown_quoted_calls() {
         for (const std::size_t width : {std::size_t{1}, std::size_t{2}, std::size_t{3},
                                         std::size_t{5}, std::size_t{7}, std::size_t{64},
                                         text.size()}) {
-            fi::ToolCallOutputDecoder decoder(contract, 64);
+            fi::ToolCallOutputDecoder decoder(contract, 64, tolerant);
             Outcome streamed;
             for (std::size_t at = 0; at < text.size(); at += width) {
                 streamed.second += decoder.feed(std::string_view(text).substr(at, width));
@@ -1116,11 +1120,6 @@ int test_markdown_quoted_calls() {
         "Text\n\n```python\nx = 1\n```\n```\n" + call,
         // A line that starts with the fence character but carries info text does not close it.
         "~~~\n~~~shell\n" + call, "```\n```cpp\n" + call, "~~~\n~~~~x\n" + call};
-    for (const std::string& body : quoted) {
-        failures += check(outcome(body) == Outcome({}, body),
-                          "a call quoted in Markdown code became a call or lost bytes: " +
-                              body.substr(0, 30));
-    }
     // (output, content before the call)
     const std::vector<std::pair<std::string, std::string>> real{
         {call, ""},
@@ -1131,17 +1130,25 @@ int test_markdown_quoted_calls() {
         {"~~~\nx\n~~~\n\n" + call, "~~~\nx\n~~~"},
         // A closing fence may be longer than the opener's three and carry trailing whitespace.
         {"~~~\nx\n~~~~  \n" + call, "~~~\nx\n~~~~"}};
-    for (const auto& [body, content] : real) {
-        failures += check(outcome(body) == Outcome({args}, content),
-                          "a top-level call after closed Markdown code did not fire exactly: " +
-                              body.substr(0, 30));
-    }
-    failures += check(outcome(call + "\n" + call) == Outcome({args, args}, ""),
-                      "two top-level calls did not both fire");
-    // A quoted example before the real call stays text; the call still fires.
     const std::string example = "Example:\n```\n" + call + "\n```\nNow for real.";
-    failures += check(outcome(example + "\n\n" + call) == Outcome({args}, example),
-                      "a quoted example before a real call was not kept as text");
+    for (const bool mode : {false, true}) {
+        tolerant = mode;
+        for (const std::string& body : quoted) {
+            failures += check(outcome(body) == Outcome({}, body),
+                              "a call quoted in Markdown code became a call or lost bytes: " +
+                                  body.substr(0, 30));
+        }
+        for (const auto& [body, content] : real) {
+            failures += check(outcome(body) == Outcome({args}, content),
+                              "a top-level call after closed Markdown code did not fire exactly: " +
+                                  body.substr(0, 30));
+        }
+        failures += check(outcome(call + "\n" + call) == Outcome({args, args}, ""),
+                          "two top-level calls did not both fire");
+        // A quoted example before the real call stays text; the call still fires.
+        failures += check(outcome(example + "\n\n" + call) == Outcome({args}, example),
+                          "a quoted example before a real call was not kept as text");
+    }
     return failures;
 }
 
@@ -1257,6 +1264,424 @@ int test_open_reasoning_recovery() {
                               .tool_calls.empty(),
                           "constrained tool output recovered a call from open thinking");
     }
+    {
+        // Tolerant repair never applies to thinking: a call missing its wrapper close stays there.
+        fi::ToolCallOutputDecoder decoder(contract, 64, /*tolerant*/ true);
+        const auto terminal = decoder.finish(
+            ninfer::FinishReason::StopToken,
+            planning + "<tool_call>\n<function=delete_file>\n<parameter=filePath>\n/tmp/stale.cfg\n"
+                       "</parameter>\n</function>\n");
+        failures += check(terminal.tool_calls.empty() && terminal.content.empty() &&
+                              !terminal.diagnostics.recovered_from_reasoning &&
+                              !terminal.diagnostics.tolerant_recovered,
+                          "tolerant repair recovered a malformed call from open thinking");
+    }
+    return failures;
+}
+
+// --tolerant-tool-calls. Every case is a whole-output parse at the repair level of its finish
+// reason, checked against every streamed chunking of the tolerant decoder.
+using Reason = ninfer::ToolCallParseFallbackReason;
+using ninfer::FinishReason;
+
+constexpr FinishReason kAllFinishReasons[] = {FinishReason::StopToken, FinishReason::OutputLimit,
+                                              FinishReason::ContextCapacity,
+                                              FinishReason::Cancelled, FinishReason::StopString};
+// Turns the model did not end itself.
+constexpr FinishReason kCutFinishReasons[] = {FinishReason::OutputLimit,
+                                              FinishReason::ContextCapacity,
+                                              FinishReason::Cancelled, FinishReason::StopString};
+
+std::string reason_label(FinishReason reason) {
+    switch (reason) {
+    case FinishReason::StopToken:
+        return "stop token";
+    case FinishReason::OutputLimit:
+        return "output limit";
+    case FinishReason::ContextCapacity:
+        return "context capacity";
+    case FinishReason::Cancelled:
+        return "cancellation";
+    case FinishReason::StopString:
+        return "stop string";
+    default:
+        return "none";
+    }
+}
+
+struct TolerantTurn {
+    std::string content;
+    std::vector<std::pair<std::string, std::string>> calls; // (name, arguments)
+    ninfer::ToolCallParseDiagnostics diagnostics;
+
+    bool operator==(const TolerantTurn&) const = default;
+};
+
+TolerantTurn tolerant_turn(const std::shared_ptr<const fi::ToolCallOutputContract>& contract,
+                           const std::string& text, FinishReason reason, int& failures,
+                           bool tolerant = true) {
+    const auto whole = fi::parse_qwen_tool_call_output(text, 64, *contract, {},
+                                                       fi::tool_call_repair(tolerant, reason));
+    TolerantTurn reference{.content = whole.content, .calls = {}, .diagnostics = whole.diagnostics};
+    for (const auto& call : whole.tool_calls) {
+        reference.calls.emplace_back(call.name, call.arguments_json);
+    }
+    for (const std::size_t width : {std::size_t{1}, std::size_t{2}, std::size_t{3}, std::size_t{5},
+                                    std::size_t{7}, std::size_t{64}, text.size()}) {
+        fi::ToolCallOutputDecoder decoder(contract, 64, tolerant);
+        TolerantTurn streamed;
+        for (std::size_t at = 0; at < text.size(); at += width) {
+            streamed.content += decoder.feed(std::string_view(text).substr(at, width));
+        }
+        auto terminal = decoder.finish(reason);
+        streamed.content += terminal.content;
+        for (const auto& call : terminal.tool_calls) {
+            streamed.calls.emplace_back(call.name, call.arguments_json);
+        }
+        streamed.diagnostics = terminal.diagnostics;
+        if (streamed != reference) {
+            failures += fail("a tolerant streamed chunking of width " + std::to_string(width) +
+                             " at " + reason_label(reason) +
+                             " disagrees with the whole output: " + text.substr(0, 48));
+        }
+    }
+    return reference;
+}
+
+// The repaired turn: the content before the region and exactly these calls, flagged as repaired.
+bool repaired_to(const TolerantTurn& turn, std::string_view content,
+                 const std::vector<std::pair<std::string, std::string>>& calls) {
+    return turn.content == content && turn.calls == calls && turn.diagnostics.marker_seen &&
+           turn.diagnostics.tolerant_recovered &&
+           turn.diagnostics.structured_call_count == calls.size() &&
+           turn.diagnostics.fallback_reason == Reason::None;
+}
+
+// The whole output returned as text, with no call and no repair reported.
+bool kept_as_text(const TolerantTurn& turn, std::string_view text) {
+    return turn.content == text && turn.calls.empty() && !turn.diagnostics.tolerant_recovered &&
+           turn.diagnostics.structured_call_count == 0 &&
+           turn.diagnostics.fallback_reason != Reason::None;
+}
+
+// Complete calls survive a suffix or a malformed later call; the discarded markup is dropped.
+int test_tolerant_keeps_complete_calls() {
+    const auto contract  = output_contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    const auto call      = tool_call("configure", {{"value", "x"}});
+    const auto expected  = std::vector<std::pair<std::string, std::string>>{
+        {"configure", R"({"value":"x"})"}};
+    int failures = 0;
+
+    const std::string suffixed = "Setting it.\n" + call + "\nI'll wait for the result.";
+    const std::string later_cut =
+        "Setting it.\n" + call + "\n<tool_call>\n<function=configure>\n<parameter=value>\ny";
+    const std::string later_malformed = "Setting it.\n" + call +
+                                        "\n<tool_call>\n<function=configure>\n<parameter=value>\n"
+                                        "a\n</parameter>\n<parameter=value>\nb\n</parameter>\n<oops>";
+    for (const FinishReason reason : kAllFinishReasons) {
+        const std::string at = " at " + reason_label(reason);
+        failures += check(repaired_to(tolerant_turn(contract, suffixed, reason, failures),
+                                      "Setting it.", expected),
+                          "a suffix after a complete call was not discarded" + at);
+        failures += check(repaired_to(tolerant_turn(contract, later_cut, reason, failures),
+                                      "Setting it.", expected),
+                          "a cut call after a complete call was not discarded" + at);
+        const TolerantTurn malformed = tolerant_turn(contract, later_malformed, reason, failures);
+        failures += check(repaired_to(malformed, "Setting it.", expected) &&
+                              malformed.diagnostics.duplicate_parameters_repaired == 0,
+                          "a malformed call after a complete call was not discarded whole" + at);
+    }
+    failures += check(
+        kept_as_text(tolerant_turn(contract, suffixed, FinishReason::StopToken, failures, false),
+                     suffixed),
+        "strict parsing kept a call with a suffix");
+    failures += check(
+        kept_as_text(tolerant_turn(contract, later_cut, FinishReason::StopToken, failures, false),
+                     later_cut),
+        "strict parsing kept a call before a cut call");
+
+    // A well-formed turn is not reported as repaired.
+    const TolerantTurn clean = tolerant_turn(contract, call, FinishReason::StopToken, failures);
+    failures += check(clean.calls == expected && !clean.diagnostics.tolerant_recovered &&
+                          clean.diagnostics.fallback_reason == Reason::None,
+                      "a well-formed call was reported as a tolerant repair");
+
+    // A cut or malformed call followed by a later `<tool_call>` is no end of the turn: the earlier
+    // call may be an example, so the later real call is the turn, at the top level and inside a
+    // `<function_calls>` wrapper.
+    const std::string cut_head  = "<tool_call>\n<function=configure>\n<parameter=value>\ny";
+    const std::string real_call = tool_call("configure", {{"value", "real"}});
+    const std::string closed_x  = "<function=configure>\n<parameter=value>\nx\n</parameter>\n"
+                                  "</function>\n";
+    const auto real = std::vector<std::pair<std::string, std::string>>{
+        {"configure", R"({"value":"real"})"}};
+    const std::string after_cut = "Setting it.\n" + call + "\n" + cut_head + "\n" + real_call;
+    const std::string wrapped =
+        "Setting it.\n<function_calls>\n" + closed_x + cut_head + "\n" + real_call;
+    for (const FinishReason reason : kAllFinishReasons) {
+        // The later call parses cleanly, so the turn is not reported as a repair.
+        const TolerantTurn top = tolerant_turn(contract, after_cut, reason, failures);
+        failures += check(top.content == "Setting it.\n" + call + "\n" + cut_head &&
+                              top.calls == real && top.diagnostics.fallback_reason == Reason::None,
+                          "a later call after a cut call was ignored at " + reason_label(reason));
+        const TolerantTurn inner = tolerant_turn(contract, wrapped, reason, failures);
+        failures += check(inner.content ==
+                                  "Setting it.\n<function_calls>\n" + closed_x + cut_head &&
+                              inner.calls == real &&
+                              inner.diagnostics.fallback_reason == Reason::None,
+                          "a later call after a cut wrapped call was ignored at " +
+                              reason_label(reason));
+    }
+
+    // A suffix that holds another marker makes the earlier call a quoted example: the later
+    // region is the turn, never the example.
+    const std::string example = "Write it as " + call + " like that. So:";
+    const std::string quoted  = example + "\n" + tool_call("configure", {{"value", "real"}}) +
+                               "\nDone.";
+    for (const FinishReason reason : kAllFinishReasons) {
+        failures += check(repaired_to(tolerant_turn(contract, quoted, reason, failures), example,
+                                      {{"configure", R"({"value":"real"})"}}),
+                          "a quoted example call won over the real call at " +
+                              reason_label(reason));
+    }
+    return failures;
+}
+
+// A final call whose closing tags are missing after a closed parameter is kept only when the model
+// ended the turn itself; any other end may have cut it between parameters.
+int test_tolerant_unclosed_final_call() {
+    const auto contract =
+        output_contract_for("delete_file", Json{{"filePath", Json{{"type", "string"}}}});
+    const std::string lead = "Now let me clean up.";
+    const std::string head = lead +
+                             "\n<tool_call>\n<function=delete_file>\n<parameter=filePath>\n"
+                             "/tmp/out.js\n</parameter>\n";
+    const auto expected = std::vector<std::pair<std::string, std::string>>{
+        {"delete_file", R"({"filePath":"/tmp/out.js"})"}};
+    int failures = 0;
+
+    const std::vector<std::pair<std::string, std::string>> unclosed = {
+        {head + "</function>", "a missing tool close"},
+        {head + "</function>\nThat should do it.", "a missing tool close before a suffix"},
+        {head, "missing function and tool closes"},
+    };
+    for (const auto& [text, label] : unclosed) {
+        failures += check(repaired_to(tolerant_turn(contract, text, FinishReason::StopToken, failures),
+                                      lead, expected),
+                          "a call with " + label + " was not kept at the model's stop token");
+        for (const FinishReason reason : kCutFinishReasons) {
+            failures += check(kept_as_text(tolerant_turn(contract, text, reason, failures), text),
+                              "a call with " + label + " was kept at " + reason_label(reason));
+        }
+        failures += check(
+            kept_as_text(tolerant_turn(contract, text, FinishReason::StopToken, failures, false),
+                         text),
+            "strict parsing kept a call with " + label);
+    }
+
+    // After complete calls, the unclosed one joins them only at the stop token.
+    const std::string first = tool_call("delete_file", {{"filePath", "/tmp/a"}});
+    const std::string both  = first +
+                             "\n<tool_call>\n<function=delete_file>\n<parameter=filePath>\n"
+                             "/tmp/b\n</parameter>\n";
+    failures += check(repaired_to(tolerant_turn(contract, both, FinishReason::StopToken, failures),
+                                  "", {{"delete_file", R"({"filePath":"/tmp/a"})"},
+                                       {"delete_file", R"({"filePath":"/tmp/b"})"}}),
+                      "an unclosed final call after a complete one was not kept at the stop token");
+    for (const FinishReason reason : kCutFinishReasons) {
+        failures += check(repaired_to(tolerant_turn(contract, both, reason, failures), "",
+                                      {{"delete_file", R"({"filePath":"/tmp/a"})"}}),
+                          "an unclosed final call was kept at " + reason_label(reason));
+    }
+
+    // A parameter closer followed by prose is quoted value text, not a closed parameter, so the
+    // value is cut and the call is never kept: the missing `</function>` is recovered only at the
+    // end of the output, where the closer is unambiguous.
+    for (const std::string& text : {head + "That should do it.",
+                                    head + "</tool_call>\nThat should do it."}) {
+        failures += check(kept_as_text(tolerant_turn(contract, text, FinishReason::StopToken,
+                                                     failures),
+                                       text),
+                          "a parameter closer followed by prose was read as closed");
+    }
+
+    // A call cut before any parameter closed carries no arguments and is never kept.
+    for (const std::string& text : {std::string("<tool_call>\n<function=delete_file>\n"),
+                                    std::string("<tool_call>\n<function=delete_file>")}) {
+        for (const FinishReason reason : kAllFinishReasons) {
+            failures += check(kept_as_text(tolerant_turn(contract, text, reason, failures), text),
+                              "a call with no closed parameter was kept at " +
+                                  reason_label(reason));
+        }
+    }
+    return failures;
+}
+
+// A parameter value without its closing tag was cut: whatever ended the turn, the call is never
+// published with a truncated path, command or patch. (Infernix kept `/tmp/out` from a cut
+// `/tmp/out.js`; this asserts the opposite.)
+int test_tolerant_never_keeps_cut_value() {
+    const auto contract =
+        output_contract_for("delete_file", Json{{"filePath", Json{{"type", "string"}}}});
+    const auto bash     = output_contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    const std::string open = "Now\n<tool_call>\n<function=delete_file>\n<parameter=filePath>\n";
+    int failures           = 0;
+
+    const std::vector<std::pair<std::string, std::string>> cut = {
+        {open + "/tmp/out", "a value cut mid-path"},
+        {open + "/tmp/out.js\n</param", "a value cut inside its closer"},
+        {open + "/tmp/out.js\n</parameter", "a value cut before its closer's `>`"},
+    };
+    for (const auto& [text, label] : cut) {
+        for (const FinishReason reason : kAllFinishReasons) {
+            failures += check(kept_as_text(tolerant_turn(contract, text, reason, failures), text),
+                              label + " was kept at " + reason_label(reason));
+        }
+    }
+    // A closer the value quotes does not close it, so the value is still cut.
+    const std::string quoted_closer =
+        "<tool_call>\n<function=bash>\n<parameter=command>\necho '</parameter>' more";
+    for (const FinishReason reason : kAllFinishReasons) {
+        failures += check(
+            kept_as_text(tolerant_turn(bash, quoted_closer, reason, failures), quoted_closer),
+            "a cut value quoting a closer was kept at " + reason_label(reason));
+    }
+    // After a complete call, only the complete call is published.
+    const std::string after = tool_call("delete_file", {{"filePath", "/tmp/a"}}) + "\n" +
+                              "<tool_call>\n<function=delete_file>\n<parameter=filePath>\n/tmp/ou";
+    for (const FinishReason reason : kAllFinishReasons) {
+        failures += check(repaired_to(tolerant_turn(contract, after, reason, failures), "",
+                                      {{"delete_file", R"({"filePath":"/tmp/a"})"}}),
+                          "a cut value after a complete call was kept at " +
+                              reason_label(reason));
+    }
+    return failures;
+}
+
+// Opener repairs and the missing `>` after the name keep an otherwise complete call.
+int test_tolerant_opener_repairs() {
+    const auto contract = output_contract_for(
+        "memory", Json{{"command", Json{{"type", "string"}}}, {"path", Json{{"type", "string"}}}});
+    const std::string body =
+        "<parameter=command>\nstr_replace\n</parameter>\n<parameter=path>\n/memories/notes.md\n"
+        "</parameter>\n</function>\n</tool_call>";
+    const auto expected = std::vector<std::pair<std::string, std::string>>{
+        {"memory", R"({"command":"str_replace","path":"/memories/notes.md"})"}};
+    int failures = 0;
+
+    const std::vector<std::pair<std::string, std::string>> openers = {
+        {"<function=memory\n", "a missing `>` after the name"},
+        {"<|im_start|>function=memory>\n", "a leaked <|im_start|>"},
+        {"<|im_start|><function=memory>\n", "a leaked <|im_start|> before the opener"},
+        {"function=memory>\n", "a dropped `<`"},
+        {"<<function=memory>\n", "a doubled `<`"},
+        {"<=memory>\n", "a dropped `function` keyword"},
+    };
+    for (const auto& [opener, label] : openers) {
+        const std::string text = "Checking notes.\n<tool_call>\n" + opener + body;
+        for (const FinishReason reason : {FinishReason::StopToken, FinishReason::OutputLimit}) {
+            failures += check(
+                repaired_to(tolerant_turn(contract, text, reason, failures), "Checking notes.",
+                            expected),
+                label + " was not repaired at " + reason_label(reason));
+        }
+        failures += check(
+            kept_as_text(tolerant_turn(contract, text, FinishReason::StopToken, failures, false),
+                         text),
+            "strict parsing repaired " + label);
+    }
+
+    // Prose after a marker yields no valid name, so it is never a call.
+    for (const std::string& text :
+         {std::string("<tool_call> is the tag I would use, but no tool is needed."),
+          std::string("<tool_call>\nfunction calls are not needed here."),
+          std::string("<tool_call>\n<function=memory and then some prose.")}) {
+        failures += check(
+            kept_as_text(tolerant_turn(contract, text, FinishReason::StopToken, failures), text),
+            "tolerant repair turned prose into a call: " + text.substr(0, 30));
+    }
+    return failures;
+}
+
+// Behind the flag only, a complete call to a name the request did not declare stays structured
+// for the client to judge; strict parsing returns it as text.
+int test_tolerant_undeclared_name() {
+    const auto contract =
+        output_contract_for("delete_file", Json{{"filePath", Json{{"type", "string"}}}});
+    const std::string text = tool_call("not_a_declared_tool", {{"filePath", "/tmp/out.js"}});
+    int failures           = 0;
+    for (const FinishReason reason : kAllFinishReasons) {
+        failures += check(repaired_to(tolerant_turn(contract, text, reason, failures), "",
+                                      {{"not_a_declared_tool", R"({"filePath":"/tmp/out.js"})"}}),
+                          "an undeclared-name call was not kept at " + reason_label(reason));
+    }
+    const TolerantTurn strict =
+        tolerant_turn(contract, text, FinishReason::StopToken, failures, false);
+    failures += check(kept_as_text(strict, text) &&
+                          strict.diagnostics.fallback_reason == Reason::UndeclaredTool,
+                      "strict parsing kept an undeclared-name call");
+    return failures;
+}
+
+// An unclosed `<function_calls>` wrapper after complete calls keeps them: each call has its own
+// closing tags, so this holds whatever ended the turn.
+int test_tolerant_unclosed_function_calls_wrapper() {
+    const auto contract =
+        output_contract_for("TaskCreate", Json{{"description", Json{{"type", "string"}}}});
+    const std::string text = "<function_calls>\n<invoke name=\"TaskCreate\">\n"
+                             "<parameter name=\"description\">\nx\n</parameter>\n</invoke>\n";
+    int failures           = 0;
+    for (const FinishReason reason : kAllFinishReasons) {
+        failures += check(repaired_to(tolerant_turn(contract, text, reason, failures), "",
+                                      {{"TaskCreate", R"({"description":"x"})"}}),
+                          "an unclosed function_calls wrapper lost its complete call at " +
+                              reason_label(reason));
+    }
+    failures += check(
+        kept_as_text(tolerant_turn(contract, text, FinishReason::StopToken, failures, false), text),
+        "strict parsing accepted an unclosed function_calls wrapper");
+    const std::string empty = "<function_calls>\n";
+    failures += check(
+        kept_as_text(tolerant_turn(contract, empty, FinishReason::StopToken, failures), empty),
+        "an empty unclosed function_calls wrapper became a turn");
+    return failures;
+}
+
+// Constrained contracts never consult the flag: the grammar already admits only exact calls.
+int test_tolerant_ignored_by_constrained_contracts() {
+    const std::vector<std::string> definitions = {
+        tool_definition("delete_file", Json{{"filePath", Json{{"type", "string"}}}})};
+    const auto constrained =
+        fi::select_tool_call_contract(contract_from_definitions(definitions), ninfer::ToolChoice{});
+    int failures = check(constrained->constrained, "the default tool choice is not constrained");
+    const std::string complete = tool_call("delete_file", {{"filePath", "/tmp/a"}});
+    const std::string cut      = complete +
+                            "\n<tool_call>\n<function=delete_file>\n<parameter=filePath>\n/tmp/ou";
+    const auto run = [&](const std::string& text, bool tolerant, FinishReason reason) {
+        fi::ToolCallOutputDecoder decoder(constrained, 64, tolerant);
+        std::string content = decoder.feed(text);
+        auto terminal       = decoder.finish(reason);
+        terminal.content    = content + terminal.content;
+        return terminal;
+    };
+    for (const FinishReason reason : {FinishReason::OutputLimit, FinishReason::ContextCapacity,
+                                      FinishReason::Cancelled}) {
+        const auto tolerant = run(cut, true, reason);
+        const auto strict   = run(cut, false, reason);
+        failures += check(tolerant.tool_calls.size() == 1 && strict.tool_calls.size() == 1 &&
+                              tolerant.content == strict.content &&
+                              tolerant.diagnostics == strict.diagnostics &&
+                              !tolerant.diagnostics.tolerant_recovered,
+                          "the flag changed a constrained interrupted turn at " +
+                              reason_label(reason));
+    }
+    // An undeclared name stays a grammar/decoder disagreement, not a kept call.
+    bool rejected = false;
+    try {
+        (void)run(tool_call("not_declared", {{"filePath", "/tmp/a"}}), true,
+                  FinishReason::StopToken);
+    } catch (const std::logic_error&) { rejected = true; }
+    failures += check(rejected, "the flag let a constrained contract keep an undeclared name");
     return failures;
 }
 
@@ -1351,6 +1776,13 @@ int main() {
     failures += test_claude_code_plan_and_task_create_exact_repro();
     failures += test_markdown_quoted_calls();
     failures += test_open_reasoning_recovery();
+    failures += test_tolerant_keeps_complete_calls();
+    failures += test_tolerant_unclosed_final_call();
+    failures += test_tolerant_never_keeps_cut_value();
+    failures += test_tolerant_opener_repairs();
+    failures += test_tolerant_undeclared_name();
+    failures += test_tolerant_unclosed_function_calls_wrapper();
+    failures += test_tolerant_ignored_by_constrained_contracts();
     failures += test_bare_marker_boundaries();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

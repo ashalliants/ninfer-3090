@@ -359,7 +359,7 @@ public:
           collect_open_reasoning(split_reasoning && tool_call_output_ != nullptr &&
                                  !tool_call_output_->constrained && grammar_ == nullptr),
           tool_call_output(output.raw ? nullptr : std::move(tool_call_output_),
-                           output.tool_name_max_length),
+                           output.tool_name_max_length, output.tolerant_tool_calls),
           grammar(std::move(grammar_)), combined(combined_) {
         if (thinking.budget && *thinking.budget == 0) {
             throw std::invalid_argument("thinking budget must be positive");

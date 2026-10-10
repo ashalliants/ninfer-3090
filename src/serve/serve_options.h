@@ -89,6 +89,9 @@ struct ServeOptions {
     bool exit_on_engine_failure = true;
     std::optional<bool> enable_thinking;
     std::optional<bool> preserve_thinking;
+    // --tolerant-tool-calls: repair free (`tool_constraints:"auto"`) tool-call markup the strict
+    // parser returns as text. Off keeps the strict all-or-nothing parse.
+    bool tolerant_tool_calls = false;
     // --graft NAME=PATH, repeatable: phantom-kv grafts a request may select with "graft": NAME.
     std::vector<GraftSource> grafts;
     // --default-graft NAME: graft applied to a request that states none ("graft": "" opts out).
