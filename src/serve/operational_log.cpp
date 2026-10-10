@@ -280,6 +280,14 @@ OperationalRecord render_request_done(const RequestLogContext& context,
             << '/' << product::format_pretty_count(metrics.speculative_draft_tokens) << " ("
             << product::format_pretty_percent(acceptance) << ')';
     }
+    if (metrics.speculative_ngram_drafted_tokens != 0) {
+        const double acceptance = static_cast<double>(metrics.speculative_ngram_accepted_tokens) /
+                                  static_cast<double>(metrics.speculative_ngram_drafted_tokens);
+        out << " | copies accepted "
+            << product::format_pretty_count(metrics.speculative_ngram_accepted_tokens) << '/'
+            << product::format_pretty_count(metrics.speculative_ngram_drafted_tokens) << " ("
+            << product::format_pretty_percent(acceptance) << ')';
+    }
     if (outcome.thinking.requested_budget) {
         out << " | thinking "
             << product::format_pretty_count(outcome.thinking.model_thinking_tokens) << '/'

@@ -389,6 +389,9 @@ public:
     const std::uint32_t draft_window;
     // The widest round family's verify_drafts; per-round buffers are allocated at it.
     const std::uint32_t max_verify_drafts;
+    // N-gram copy drafting: the copy family's window (0 when off) and the tail match a copy needs.
+    const std::uint32_t ngram_draft_tokens;
+    const std::uint32_t ngram_min_match;
     const SpeculativeBackend speculative_backend;
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;

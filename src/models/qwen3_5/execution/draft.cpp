@@ -577,9 +577,12 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         qwen3_5::DFlashDecodeState frame = state.frame.narrowed(k);
         const std::int32_t width         = static_cast<std::int32_t>(k) + 1;
         if (phase == SpeculativePhase::Forward) {
-            CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
-                                       sizeof(qwen3_5::DFlashDecodeIngress), cudaMemcpyHostToDevice,
-                                       state.execution.device.stream));
+            // Only a copy round transfers the copy fields at the ingress tail.
+            const std::size_t ingress_bytes = state.copy_round
+                                                  ? sizeof(qwen3_5::DFlashDecodeIngress)
+                                                  : qwen3_5::kDFlashDecodeIngressNeuralBytes;
+            CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress, ingress_bytes,
+                                       cudaMemcpyHostToDevice, state.execution.device.stream));
         }
 
         Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
@@ -619,7 +622,26 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             append_context_impl(state, compact_features, append_positions, append_counts,
                                 state_destinations, dflash_rows, envelopes.append);
 
-            propose_batch_impl(state, frame, batch_size, k, envelopes);
+            if (state.copy_round) {
+                // A batch-one copy round verifies the copy instead of a proposal, so the draft
+                // model does not run; DFlash2's sparse verifier reads it as a one-hot law.
+                if (batch_size != 1) {
+                    throw std::logic_error("a batched n-gram copy round is not built");
+                }
+                Tensor copy_rows   = frame.copy_rows.slice(0, 0, batch_size);
+                Tensor copy_drafts = frame.copy_drafts.slice(1, 0, batch_size);
+                Tensor candidates  = frame.candidate_ids.data
+                                         ? frame.candidate_ids.slice(2, 0, batch_size)
+                                         : Tensor{};
+                Tensor proposal_q =
+                    frame.proposal_q.data ? frame.proposal_q.slice(2, 0, batch_size) : Tensor{};
+                ops::speculative_overlay_copy_proposals(
+                    copy_rows, copy_drafts, drafts, candidates, proposal_q,
+                    dimension(state.execution.parameters.model.resources().public_token_count),
+                    state.execution.device.stream);
+            } else {
+                propose_batch_impl(state, frame, batch_size, k, envelopes);
+            }
             const auto draft_count = static_cast<std::size_t>(k) * batch_size;
             if (state.host_drafts.size() < draft_count) {
                 throw std::logic_error("DFlash host draft buffer is too small");

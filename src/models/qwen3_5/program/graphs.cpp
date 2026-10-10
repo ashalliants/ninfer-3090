@@ -200,9 +200,10 @@ void ProgramImpl::prepare_graphs() {
             }
             cache.page_pool().zero_pages(pages, compute_streams);
         };
-    // `verify_drafts` is the captured DFlash round family's; ordinary and MTP rounds ignore it.
+    // `verify_drafts` and `copy_round` describe the captured DFlash round family; ordinary and MTP
+    // rounds ignore them. A copy family's representative rows all carry a copy.
     const auto prepare_representative = [&](std::uint32_t frontier, std::uint32_t batch_size,
-                                            std::uint32_t verify_drafts) {
+                                            std::uint32_t verify_drafts, bool copy_round) {
         if (batch_size == 0 || batch_size > max_concurrency) {
             throw std::logic_error("CUDA Graph representative batch is invalid");
         }
@@ -258,6 +259,7 @@ void ProgramImpl::prepare_graphs() {
                 dflash_host_ingress->state_source_slots[row]      = capture_state_slot(row);
                 dflash_host_ingress->state_destination_slots[row] = capture_state_slot(row);
                 dflash_host_ingress->sampling[row]                = {};
+                dflash_host_ingress->copy_rows[row]               = copy_round ? 1 : 0;
             }
         }
         if (io.mtp_decode) {
@@ -328,7 +330,7 @@ void ProgramImpl::prepare_graphs() {
             *io.ordinary,          *ordinary_host_ingress,
             *ordinary_host_egress, state_images->continuation_hidden_store()};
         const GraphExecutionProfile code_warm = ordinary_profiles.front();
-        prepare_representative(code_warm.min, 1, 0);
+        prepare_representative(code_warm.min, 1, 0, false);
         device.synchronize();
         execution::ordinary_decode_batch(ordinary_state, 1, {code_warm.min + 1, code_warm.max + 1},
                                          nullptr);
@@ -357,7 +359,7 @@ void ProgramImpl::prepare_graphs() {
         instantiate_graph_family(ordinary_graphs, "ordinary", device);
         for (auto& topology : ordinary_graphs.topologies) {
             const auto& profile = ordinary_graphs.profiles[*topology.installed_profile];
-            prepare_representative(profile.min_execution_frontier, profile.batch_size, 0);
+            prepare_representative(profile.min_execution_frontier, profile.batch_size, 0, false);
             device.synchronize();
             topology.executable.launch(device.stream);
             device.synchronize();
@@ -371,8 +373,9 @@ void ProgramImpl::prepare_graphs() {
         const bool mtp = speculative_backend == SpeculativeBackend::Mtp;
         // An MTP round verifies its own proposal, so its only family is at the draft window.
         const std::uint32_t verify_drafts = round.shape.verify_drafts;
-        if (mtp && verify_drafts != draft_window) {
-            throw std::logic_error("MTP round family must verify at the draft window");
+        const bool copy_round             = round.shape.kind == SpeculativeRoundKind::Copy;
+        if (mtp && (verify_drafts != draft_window || copy_round)) {
+            throw std::logic_error("MTP runs only its neural family at the draft window");
         }
         // sm_86 topology classes: MTP breaks on the target's attention routes; DFlash breaks per
         // exact B, because its verify attention route changes with the batch's query width.
@@ -416,7 +419,8 @@ void ProgramImpl::prepare_graphs() {
                                                  *dflash_host_egress,
                                                  state_images->continuation_hidden_store(),
                                                  dflash_draft_handoff->tokens(),
-                                                 dflash_draft_handoff->ready};
+                                                 dflash_draft_handoff->ready,
+                                                 copy_round};
         };
         const auto target_envelope = [&](std::uint32_t frontier) {
             return ops::CausalAttentionExecutionEnvelope{
@@ -456,7 +460,7 @@ void ProgramImpl::prepare_graphs() {
         };
 
         const auto code_warm = forward_profiles.front();
-        prepare_representative(code_warm.min, 1, verify_drafts);
+        prepare_representative(code_warm.min, 1, verify_drafts, copy_round);
         device.synchronize();
         run(SpeculativePhase::Forward, 1, code_warm.max, nullptr);
         run(SpeculativePhase::Finish, 1, code_warm.max, nullptr);
@@ -492,7 +496,7 @@ void ProgramImpl::prepare_graphs() {
             auto& finish  = round.finish.select(forward.batch_size, forward.min_execution_frontier);
             auto& finish_exec = round.finish.install(finish);
             prepare_representative(forward.min_execution_frontier, forward.batch_size,
-                                   verify_drafts);
+                                   verify_drafts, copy_round);
             device.synchronize();
             topology.executable.launch(device.stream);
             finish_exec.launch(device.stream);

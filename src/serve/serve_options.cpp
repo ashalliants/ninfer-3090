@@ -145,6 +145,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4] "
            "[--spec mtp|dflash|dflash2 --draft-tokens N] "
+           "[--ngram-draft-tokens 0|15] [--ngram-min-match N] "
            "[--default-max-tokens N] [--max-output-tokens N] [--default-thinking-budget N] "
            "[--vision] [--vision-residency resident|overlay] [--vision-max-merged N] "
            "[--no-cuda-graph] [--no-prefix-reuse] [--devices N,M,...] [--stage-layers A,B,...] "
@@ -184,6 +185,13 @@ std::string serve_usage_text(const char* argv0) {
            "small perplexity cost (docs/performance.md), off by default, and it wants a larger "
            "--prefill-chunk to pay; --no-prefill-cublas-projections keeps the attention and GDN "
            "input projections off that route\n"
+           "       --ngram-draft-tokens 15 adds n-gram copy drafting beside --spec dflash2: when the "
+           "text being written already appeared in the request (a tool result, the prompt or the "
+           "output so far), a round verifies up to 15 copied tokens instead of the draft model's "
+           "proposal; verification licenses every token, so a wrong copy costs speed, never "
+           "output. 0 (the default) disables it. It needs --max-concurrency 1 for now. "
+           "--ngram-min-match N (4..64, default 12) is how many tokens must match before a copy "
+           "is proposed\n"
            "       --no-prefix-reuse disables cross-request history; request pause/replay "
            "resources remain available\n"
            "       --context-store DIR keeps retained sessions on disk so a restart or crash does "
@@ -448,6 +456,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
+        } else if (arg == "--ngram-draft-tokens") {
+            options.speculative.ngram_draft_tokens = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--ngram-draft-tokens"), "ngram-draft-tokens"));
+        } else if (arg == "--ngram-min-match") {
+            options.speculative.ngram_min_match = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--ngram-min-match"), "ngram-min-match"));
         } else if (arg == "--max-output-tokens") {
             options.max_output_tokens =
                 parse_nonnegative_int(require_value("--max-output-tokens"), "max-output-tokens");
@@ -703,6 +717,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     product::apply_speculative_defaults(options.speculative);
     product::validate_speculative_cli_options(options.speculative);
+    if (options.speculative.ngram_draft_tokens != 0 && options.max_concurrency != 1) {
+        throw std::invalid_argument(
+            "--ngram-draft-tokens needs --max-concurrency 1; copies above one lane are not "
+            "built yet");
+    }
     if (options.vision_residency == VisionResidency::Overlay && !options.enable_vision) {
         throw std::invalid_argument("--vision-residency overlay requires --vision");
     }

@@ -102,7 +102,16 @@ struct DFlashDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
     std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
+    // N-gram copy rounds only; the other rounds transfer the fields above and stop here. Rows
+    // flagged in copy_rows verify copy_drafts, laid out [k, B] at the round's k, instead of a
+    // draft model proposal.
+    std::array<std::int32_t, kMaximumConcurrency> copy_rows{};
+    std::array<TokenId, kMaximumConcurrency * kDFlashDecodeMaximumDrafts> copy_drafts{};
 };
+
+// The leading bytes of DFlashDecodeIngress a round without copies transfers.
+inline constexpr std::size_t kDFlashDecodeIngressNeuralBytes =
+    offsetof(DFlashDecodeIngress, copy_rows);
 
 struct DFlashDecodeEgress {
     std::array<TokenId, kMaximumConcurrency * kDFlashDecodeMaximumWidth> licensed_tokens{};
@@ -290,6 +299,8 @@ struct DFlashDecodeState {
     Tensor state_source_slots;
     Tensor state_destination_slots;
     const ops::SamplingConfig* sampling = nullptr;
+    Tensor copy_rows;
+    Tensor copy_drafts;
     Tensor licensed_tokens;
     Tensor licensed_counts;
     Tensor accepted_drafts;

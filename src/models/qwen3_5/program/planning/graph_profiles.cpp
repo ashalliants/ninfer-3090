@@ -117,9 +117,14 @@ void collect_shape_changes(std::uint32_t lo, std::uint32_t hi, const Shapes& sha
 } // namespace
 
 std::vector<SpeculativeRoundShape> speculative_round_shapes(SpeculativeBackend backend,
-                                                            std::uint32_t draft_window) {
+                                                            std::uint32_t draft_window,
+                                                            std::uint32_t ngram_draft_tokens) {
     if (backend == SpeculativeBackend::None) { return {}; }
-    return {{SpeculativeRoundKind::Neural, draft_window}};
+    std::vector<SpeculativeRoundShape> shapes{{SpeculativeRoundKind::Neural, draft_window}};
+    if (ngram_draft_tokens != 0) {
+        shapes.push_back({SpeculativeRoundKind::Copy, ngram_draft_tokens});
+    }
+    return shapes;
 }
 
 std::uint32_t max_verify_drafts(std::span<const SpeculativeRoundShape> shapes) noexcept {

@@ -95,6 +95,15 @@ struct SpeculativeOptions {
     // Startup-fixed K: 1..15 for MTP, DFlash and DFlash2 (query width K+1).
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
+    // N-gram copy drafting beside DFlash2: when the committed text's tail already occurred in the
+    // request (its prompt, a tool result or its own output), a round verifies what followed it,
+    // up to this many drafts, instead of the draft model's proposal. Verification licenses every
+    // token, so a wrong copy costs throughput and never changes output. 0 disables it. The product
+    // flags accept only 15; the Engine accepts 1..15 above draft_tokens so benchmarks can measure
+    // other verify widths. Requires DFlash2 and, for now, max_concurrency 1.
+    std::uint32_t ngram_draft_tokens = 0;
+    // Tail tokens a copy must match before it is proposed, 4..64.
+    std::uint32_t ngram_min_match = 12;
 };
 
 enum class StartupPhase : std::uint8_t {
@@ -1023,7 +1032,15 @@ struct SpeculativeStats {
     std::uint64_t drafted_tokens  = 0;
     std::uint64_t accepted_tokens = 0;
     std::uint64_t fallback_steps  = 0;
+    // Draft-model rounds only: how often draft position i was accepted. Copy rounds are counted
+    // by the n-gram fields instead.
     std::vector<std::uint64_t> accepted_per_position;
+    // N-gram copy drafting: the configured window (0 when off) and the copy rounds, which are a
+    // subset of `rounds`, `drafted_tokens` and `accepted_tokens`.
+    std::uint32_t ngram_draft_tokens    = 0;
+    std::uint64_t ngram_rounds          = 0;
+    std::uint64_t ngram_drafted_tokens  = 0;
+    std::uint64_t ngram_accepted_tokens = 0;
 };
 
 struct ThinkingBudgetStats {
@@ -1207,6 +1224,10 @@ struct RuntimeStats {
     std::uint64_t speculative_draft_tokens    = 0;
     std::uint64_t speculative_accepted_tokens = 0;
     std::uint64_t speculative_fallback_steps  = 0;
+    // N-gram copy rounds, a subset of the speculative counters above.
+    std::uint64_t speculative_ngram_rounds          = 0;
+    std::uint64_t speculative_ngram_draft_tokens    = 0;
+    std::uint64_t speculative_ngram_accepted_tokens = 0;
     // Initial prompt tokens evaluated by prefill. Reused checkpoint-prefix tokens and replay
     // recomputation are excluded; replayed_tokens separately counts that additional model work.
     std::uint64_t computed_prefill_tokens = 0;

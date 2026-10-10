@@ -246,13 +246,13 @@ UnitDemand ProgramImpl::next_unit(const SequenceState& sequence, const RequestCo
         if (request.lifecycle != Lifecycle::Active || tokens == 0 || frontier >= capacity) {
             throw std::logic_error("decode demand requires an active token and output budget");
         }
-        const auto available    = std::min(tokens - 1U, capacity - frontier - 1U);
-        const auto extent       = speculative_backend == SpeculativeBackend::None
-                                      ? 0U
-                                      : std::min({available, draft_window,
-                                            speculative_backend == SpeculativeBackend::Mtp
-                                                      ? sequence.mtp_draft_count
-                                                      : draft_window});
+        const auto available = std::min(tokens - 1U, capacity - frontier - 1U);
+        // A masked-draft round may verify an n-gram copy at the widest family's window, so it
+        // reserves that window; without copies it is the draft window.
+        const auto extent = speculative_backend == SpeculativeBackend::None ? 0U
+                            : speculative_backend == SpeculativeBackend::Mtp
+                                ? std::min({available, draft_window, sequence.mtp_draft_count})
+                                : std::min(available, max_verify_drafts);
         demand.main_frontier    = frontier + extent + 1U;
         demand.backend_frontier = speculative_backend == SpeculativeBackend::Mtp
                                       ? std::min(capacity, frontier + extent + draft_window)

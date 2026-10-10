@@ -332,8 +332,11 @@ Speculative unit 使用 Forward、Finish 两段 Graph，CPU 在两段之间准�
 forward 重叠；两段共享同一个资源预留和提交边界。
 每个 speculative round family（proposal kind 与 `verify_drafts`）各自捕获 Forward/Finish Graph；
 round frame、ReplaySSM records、grammar mask staging 和 DFlash pending features 按最宽 family
-分配，每轮以自身宽度的 dense view 使用，提交按该轮记录的 `verify_drafts` 索引 egress。目前只有
-draft window 宽度的 neural family。
+分配，每轮以自身宽度的 dense view 使用，提交按该轮记录的 `verify_drafts` 索引 egress。DFlash2 有
+draft window 宽度的 neural family，`--ngram-draft-tokens` 时再加一个 copy family：batch 1 的 copy
+round 不运行 drafter（仍做 context catch-up），由 `speculative_overlay_copy_proposals` 把请求自身的
+n-gram copy 写成 one-hot sparse law 交给同一个 sparse verifier。是否走 copy round 只取决于已提交
+ledger，与输出预算无关，所以预算截断的末轮与不截断时算术相同。
 长度档位限制资源范围；Program 不复制 Attention Op 私有 kernel 的分派边界。
 
 本 fork 的多 GPU layer pipeline（`--devices A,B,...`，Linux；每个 stage 整层拥有权重、KV plane、GDN

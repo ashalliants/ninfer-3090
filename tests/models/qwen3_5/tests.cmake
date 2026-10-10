@@ -80,6 +80,12 @@ ninfer_add_test(ninfer_qwen3_5_dflash2_real_test
   LIBRARIES ninfer_engine
   TEST_ARGS 7 1 1 2 int8 0 1)
 
+# N-gram copy rounds beside DFlash2: copy exactness against non-speculative greedy, lifecycle,
+# context-store restore and a constrained copy.
+ninfer_add_test(ninfer_qwen3_5_ngram_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_ngram_real.cpp"
+  LIBRARIES ninfer_engine ninfer::json)
+
 ninfer_add_test(ninfer_qwen3_5_dflash_prefill_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dflash_prefill_real.cpp"
   LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_core)
@@ -133,6 +139,7 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_vision_workspace_test
   ninfer_qwen3_5_vision_overlay_real_test
   ninfer_qwen3_5_dflash2_real_test
+  ninfer_qwen3_5_ngram_real_test
   ninfer_qwen3_5_dflash_prefill_real_test
   ninfer_qwen3_5_moe_real_test
   ninfer_qwen3_5_dflash_real_test

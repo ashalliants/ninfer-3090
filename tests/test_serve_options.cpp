@@ -154,6 +154,39 @@ int main() {
         failures += check(kv_help.find(flag) != std::string::npos,
                           "serve help omits an accepted prefill control");
     }
+    // N-gram copy drafting: 0 or 15 beside DFlash2 at one lane, carried into the Engine options.
+    const ServeOptions ngram =
+        parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "7",
+               "--ngram-draft-tokens", "15", "--ngram-min-match", "16"});
+    const ninfer::EngineOptions ngram_engine = make_engine_options(ngram);
+    failures += check(ngram_engine.speculative.ngram_draft_tokens == 15 &&
+                          ngram_engine.speculative.ngram_min_match == 16 &&
+                          default_engine.speculative.ngram_draft_tokens == 0 &&
+                          default_engine.speculative.ngram_min_match == 12,
+                      "the n-gram copy controls did not reach the Engine options");
+    failures += check(kv_help.find("--ngram-draft-tokens") != std::string::npos &&
+                          kv_help.find("--ngram-min-match") != std::string::npos,
+                      "serve help omits the n-gram copy controls");
+    const auto serve_rejects = [&](std::vector<std::string> arguments, const char* fragment) {
+        try {
+            (void)parse(std::move(arguments));
+        } catch (const std::invalid_argument& error) {
+            return std::string(error.what()).find(fragment) != std::string::npos;
+        }
+        return false;
+    };
+    failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--spec", "dflash2",
+                                     "--draft-tokens", "7", "--ngram-draft-tokens", "31"},
+                                    "31, 63"),
+                      "serve accepted a copy window other than 15, or did not name the wider ones");
+    failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--ngram-draft-tokens", "15"},
+                                    "--spec dflash2"),
+                      "serve accepted n-gram copy drafting without DFlash2");
+    failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--spec", "dflash2",
+                                     "--draft-tokens", "7", "--ngram-draft-tokens", "15",
+                                     "--max-concurrency", "2"},
+                                    "--max-concurrency 1"),
+                      "serve accepted n-gram copy drafting above one lane");
     // The MTP-only context lookup was removed with no alias; n-gram copy drafting replaces it.
     bool lookup_rejected = false;
     try {
