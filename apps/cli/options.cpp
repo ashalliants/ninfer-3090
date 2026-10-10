@@ -250,7 +250,7 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
         } else if (arg == "--ngram-draft-tokens") {
-            options.speculative.ngram_draft_tokens = parse_u32(value(arg), "ngram-draft-tokens");
+            options.speculative.ngram_draft_tokens = parse_u32(value(arg), "ngram-draft-tokens", true);
         } else if (arg == "--ngram-min-match") {
             options.speculative.ngram_min_match = parse_u32(value(arg), "ngram-min-match");
         } else if (arg == "--lm-head-draft") {
