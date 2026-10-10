@@ -48,11 +48,16 @@ struct WeightGeometry {
     std::uint64_t scale_offset        = 0;
     std::uint64_t scale_bytes         = 0;
     std::uint64_t divisor_offset      = 0;
+    // GgmlRowsPage4K only: whole rows per 4096-byte page.
+    std::uint64_t rows_per_page = 0;
 };
 
 [[nodiscard]] WeightGeometry weight_geometry(QType format, QuantLayout layout,
                                              std::span<const std::uint64_t> shape);
 [[nodiscard]] std::uint64_t weight_element_count(std::span<const std::uint64_t> shape);
+// Payload offset of row `row` (C order over the leading axes) of a GGML block parent. Rows of
+// GgmlBlocks are consecutive; GgmlRowsPage4K places them page by page, never across a page.
+[[nodiscard]] std::uint64_t ggml_row_offset(const WeightGeometry& geometry, std::uint64_t row);
 
 // RowSplitPanel is a permutation of RowSplit's bytes, so every byte-counting question about the
 // two has the same answer. Ask this rather than comparing against RowSplit, or the panel layout
@@ -105,7 +110,9 @@ struct WeightRowPlanes {
 [[nodiscard]] WeightRowPlanes weight_row_planes(const WeightRegion& region);
 [[nodiscard]] Tensor weight_tensor(const WeightView& view,
                                    std::initializer_list<std::int32_t> internal_shape);
-// Existing Weight ABI: complete quantized parents, direct regions, and RowSplit row views.
+// Existing Weight ABI: complete quantized parents, direct regions, and RowSplit or GgmlBlocks row
+// views (a GgmlBlocks Weight has codes only: its scales live inside each block). GgmlRowsPage4K
+// has no native Weight; its rows are read one at a time.
 // Arbitrary FP8/NVFP4 regions use their explicit planes until a native consumer supports them.
 [[nodiscard]] Weight native_weight(const WeightView& view, float input_divisor = 0.0F);
 

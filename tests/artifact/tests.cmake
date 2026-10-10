@@ -33,12 +33,26 @@ else()
     "LINKER:--wrap=cudaStreamSynchronize")
 endif()
 
+# It decodes GGML blocks with the exact host decoder (tests/ops/ggml_blocks_decode.h).
+ninfer_op_oracle_options(ninfer_artifact_materialization_test)
+
 add_test(NAME ninfer_artifact_writer_interop_test
   COMMAND ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/writer_interop.py"
     $<TARGET_FILE:ninfer_artifact_materialization_test>)
 
 set_tests_properties(
   ninfer_artifact_writer_interop_test
+  PROPERTIES SKIP_RETURN_CODE 77)
+
+# A real GGML artifact (NINFER_TEST_ARTIFACT, e.g. the qwen4exp `--subset dev` conversion) loaded
+# through every residency and decoded against the Python decoders. Skips without the variable, or
+# when that artifact holds no GGML block tensor.
+add_test(NAME ninfer_artifact_ggml_real_test
+  COMMAND ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/ggml_artifact_real.py"
+    $<TARGET_FILE:ninfer_artifact_materialization_test>)
+
+set_tests_properties(
+  ninfer_artifact_ggml_real_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
 set_tests_properties(

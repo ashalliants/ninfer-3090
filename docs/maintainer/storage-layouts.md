@@ -20,8 +20,7 @@ The storage registry contains exactly these identities:
 | `raw_bytes_v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
 
 These format/layout pairs define the current codec support. Native consumer requirements are
-covered separately in Section 10. The two GGML layouts are tooling-only for now, like their
-formats: the C++ layout registry does not accept them yet.
+covered separately in Section 10.
 
 Object alignment applies to the object's payload-relative `offset` in the `.ninfer` JSON. Internal
 plane offsets and padding belong to the selected layout. Inter-object padding belongs to the
@@ -361,7 +360,8 @@ offset(row n) = (n / rows_per_page) * 4096 + (n % rows_per_page) * row_bytes
 
 Page `p` holds rows `p * rows_per_page` onward, each row's bytes unchanged and in order. The bytes
 from `rows_per_page * row_bytes` to the end of every page, and the slots of the missing rows in the
-last page, are zero; a reader rejects other contents. No row crosses a page boundary. The object
+last page, are zero; a decoder rejects other contents. The loader does not scan the payload: it
+places the object's bytes unchanged. No row crosses a page boundary. The object
 alignment of 4096 bytes, with the container's 4096-byte payload alignment, puts every page on a
 4096-byte boundary of its file.
 
@@ -411,6 +411,12 @@ matrix dimensions. Materialization uploads each required parent once and binds n
 [`weight_view.cpp`](../../src/core/weight_view.cpp) provides plane addressing and the bridge to
 native operands. Direct tensors can use a contiguous element range. Grouped integer matrices can
 use consecutive complete rows with unchanged K, using independent code, high-bit and scale pointers.
+
+GGML block matrices in `ggml_blocks_v1` use consecutive complete rows the same way, with one code
+pointer and no scale plane: each block carries its scales. `ggml_rows_page4k_v1` rows are not one
+contiguous range, so that layout has no native `Weight`; a consumer addresses each row with
+`ggml_row_offset`. Geometry and offsets are 64-bit throughout; the native `Weight` is 32-bit per
+axis and refuses a dimension beyond `INT32_MAX` rather than truncating it.
 
 The current native `Weight` bridge requires a complete parent for FP8 and NVFP4. Their consumers
 use the complete matrix geometry for plane addressing; a row slice cannot be passed as though its
