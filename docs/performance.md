@@ -535,8 +535,9 @@ nearly free, so 11 to 15 is up to 1.85x faster than three. For a coding assistan
 writes new code, seven is about 10% faster than three. The former MTP-only context lookup added
 nothing on top of MTP there: the head already copies (K=15 with and without `--lookup-ngram 8`:
 262.4 and 262.6 tok/s, the same tokens per round). It verified at the same width as the head, so
-it could never widen a round; it has been removed, and n-gram copy drafting, which verifies a copy
-wider than the neural window, is being built to replace it. For comparison, DFlash2 at its default seven is still faster at one
+it could never widen a round; it has been removed in favour of
+[n-gram copy drafting](#n-gram-copy-drafting-rtx-3090-qwen38-27b), which verifies a copy wider than
+the neural window. For comparison, DFlash2 at its default seven is still faster at one
 stream on the same runs (268.5 tok/s editing code, 115.7 explaining); MTP is the backend that fits
 the full context and a second lane. Draft counts of eight and above add a second CUDA Graph
 topology class on the 27B (its wide verify moves between the prompt and chunked attention routes),
@@ -546,6 +547,59 @@ DFlash2 accepts every draft count from 1 through 15. Seven is the checkpoint rec
 best mean on this card; the sweep behind it is in
 [Choosing a speculative backend by concurrency](#choosing-a-speculative-backend-by-concurrency-rtx-3090-qwen38-27b).
 DFlash2's `--lm-head-draft` is within noise of unset at every count and can be left off.
+
+### N-gram copy drafting (RTX 3090, Qwen3.8-27B)
+
+`--ngram-draft-tokens 15` beside DFlash2 K=7 (draft head, `rk4v4`, one lane). A copy round verifies
+16 columns and skips the drafter, so it pays only if a 16-column verify costs well under twice an
+8-column DFlash2 round. Measured with the round bench's teacher-forced copy mode (every timed copy
+round accepts all of its drafts; GPU time per round, median of 30, corpus prompt):
+
+| context | DFlash2 round, 8 columns | copy round, 8 | 12 | 16 | 16 / DFlash2 |
+|---|---:|---:|---:|---:|---:|
+| 2,048 | 28.8 ms | 26.1 | 32.0 | 35.4 | 1.23 |
+| 32,768 | 31.3 ms | 28.4 | 36.8 | 39.6 | 1.27 |
+| 131,072 | 39.2 ms | 36.1 | 50.3 | 55.2 | 1.41 |
+
+A full copy round yields 16 tokens for 1.2-1.4 DFlash2 rounds, which yield about 7.4. Wider windows
+need the verification Ops extended past 16 columns; a final-prefill-chunk proxy for them (same route
+resolver, prefill GDN instead of the record path, so only indicative) costs 1.9-7.1x an 8-token
+chunk at 32 tokens and 4.9-8.2x at 64, against 1.3-1.5x at 16, because those widths fall to the
+prompt attention route. Windows of 31 and 63 are not worth building on this card on that evidence.
+
+**Agent replay** (`tools/bench/agent_replay`: 4 sessions, 112-113 turns of Read/Edit/explain traffic
+growing to 39-115K tokens, greedy; two runs per arm, alternating; decode tok/s over committed
+tokens, both runs agree within 0.3%):
+
+| category | off | `--ngram-draft-tokens 15` | change | share of output copied |
+|---|---:|---:|---:|---:|
+| rewrite a file | 187.5 | 332.5 | +77% | 88% |
+| apply a change | 198.4 | 341.0 | +72% | 90% |
+| edit a function | 230.3 | 352.2 | +53% | 86% |
+| revert a diff | 212.6 | 204.9 | **-3.6%** | 24% |
+| explore | 163.1 | 193.9 | +19% | 51% |
+| explain | 74.8 | 72.2 | **-3.5%** | 2% |
+| all turns | 174.6 | 240.4 | +38% | 73% |
+
+Whole replay wall time drops from 789 s to 676 s. Copies were accepted 92% of the time (58,147 of
+63,393 copied tokens). Two categories got slower. Reverting a diff proposes copies that are often
+wrong (46% accepted), and each costs a 16-column round. Explaining copies almost nothing, so it
+pays the small fixed cost below; its outputs also differ between arms (6,924 against 6,837 tokens),
+so that row is not a like-for-like pair. The offline simulation of this replay predicted 1.36x
+overall at a 16-column cost of 1.1x; the measured cost is 1.23-1.41x and the measured gain 1.38x.
+
+**Without copies** (`ninfer_bench -n 512` on the bench corpus, two alternating rounds against the
+build before this feature): with the flag off DFlash2 decodes 64.00 and 63.88 tok/s against 64.72
+and 63.84 (the first run of a session is the high one in every row, as plain and MTP decode show
+too). With it on, DFlash2 decodes 63.49 and 63.43, 0.8% and 0.7% below the flag-off runs of the
+same rounds, with identical rounds and acceptance: the corpus never copies.
+That is the price of rounds sized for 16 columns (the context catch-up and buffers run at the
+widest family); it is not yet attributed more precisely.
+
+**Memory.** The copy family's CUDA Graphs add 24 MiB at 8K context and 79 MiB at 172K; the planner
+reserves 170 MiB more at the Windows DFlash2 launcher profile (188,416 tokens). The launcher keeps
+its default: the profile started with 0.79 GB of runtime headroom left on the day it was measured,
+so the flag fits without stepping the context down, but it is not on in the launchers yet.
 
 ### Choosing a KV format (RTX 3090, Qwen3.8-27B)
 

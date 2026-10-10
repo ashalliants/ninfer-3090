@@ -327,7 +327,10 @@ so far. When they occurred before, the round verifies the 15 tokens that followe
 pays when the answer repeats its input -- returning a file, applying an edit, quoting a tool result.
 As with any draft, every token is licensed by the target's own verification, and a copy that is
 wrong, or that a grammar forbids, is rejected. It runs with one lane (`--max-concurrency 1`) for
-now; the counters are in the request log and `/metrics` (see [serving](serving.md)).
+now; the counters are in the request log and `/metrics` (see [serving](serving.md)). On an agent
+replay it decoded 38% faster overall and up to 77% faster on turns that return a file, at 0.7-0.8%
+on output that never copies; see
+[performance](performance.md#n-gram-copy-drafting-rtx-3090-qwen38-27b).
 
 ## CUDA synchronization
 
