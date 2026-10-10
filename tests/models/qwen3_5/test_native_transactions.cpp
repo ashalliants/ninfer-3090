@@ -1707,6 +1707,9 @@ public:
         std::size_t payload = 0;
         for (const auto& region : from_device.regions) { payload += region.length; }
         require(payload > from_device.bytes.size() / 2, "image regions miss its payload");
+        // One point names one StateImage, the last region.
+        std::cout << "checkpoint image: " << from_device.bytes.size() << " bytes for " << frontier
+                  << " tokens, StateImage " << from_device.regions.back().length << " bytes\n";
 
         demote_to_host(original);
         const auto from_host = program_.export_checkpoints(originals, std::nullopt, kBinding);
@@ -1732,6 +1735,25 @@ public:
             (void)program_.import_checkpoints(damaged, kBinding);
         } catch (const std::invalid_argument&) { rejected = true; }
         require(rejected, "a damaged image was imported");
+        // Another format version, or a configuration this Program does not have (here the
+        // speculative backend, the second configuration field after the magic, version and
+        // binding), is refused for that reason, before the checksum is consulted.
+        const auto rejection = [&](std::size_t offset) {
+            auto altered = keyed.bytes;
+            altered[offset] ^= 0x01;
+            try {
+                (void)program_.import_checkpoints(altered, kBinding);
+            } catch (const std::invalid_argument& error) { return std::string(error.what()); }
+            return std::string();
+        };
+        constexpr std::size_t kVersionOffset = 8;
+        const std::size_t config_offset =
+            kVersionOffset + 2 * sizeof(std::uint32_t) + kBinding.size();
+        require(rejection(kVersionOffset).find("version") != std::string::npos,
+                "an image of another format version was not refused as such");
+        require(rejection(config_offset + sizeof(std::uint32_t)).find("configuration") !=
+                    std::string::npos,
+                "an image of another speculative configuration was not refused as such");
         expect_empty("rejected imports changed typed resources");
 
         const auto needed = program_.checkpoint_image_host_bytes(keyed.bytes, kBinding);
@@ -2117,7 +2139,11 @@ int main(int argc, char** argv) {
         DeviceContext device;
         models::LoadOptions selected;
         selected.speculative = backend;
-        auto model           = qwen::load_model(artifact, selected, device);
+        // The masked-draft backends propose through the optimized head, as the launchers run them.
+        const bool masked_draft =
+            backend == SpeculativeBackend::DFlash || backend == SpeculativeBackend::DFlash2;
+        if (masked_draft) { selected.proposal_head = ProposalHead::Optimized; }
+        auto model = qwen::load_model(artifact, selected, device);
         qwen::execution::Parameters parameters(*model);
         auto frontend = qwen::make_frontend(model->resources(),
                                             {.vision_enabled = false, .max_context = kCapacity});
@@ -2130,6 +2156,7 @@ int main(int argc, char** argv) {
         options.use_cuda_graph           = false;
         options.speculative.backend      = backend;
         options.speculative.draft_tokens = backend == SpeculativeBackend::None ? 0U : 3U;
+        if (masked_draft) { options.speculative.proposal_head = ProposalHead::Optimized; }
         options.context_cache.device_state_slots  = 2;
         options.context_cache.host_capacity_bytes = 512ULL * 1024 * 1024;
         auto planner = qwen::make_sequence_planner(parameters, device, options);

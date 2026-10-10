@@ -1350,7 +1350,11 @@ struct RuntimeStats {
     std::uint64_t context_store_corrupt        = 0; // removed because they could not be read
     std::uint64_t context_store_restored       = 0; // sessions restored into the cache at start-up
     std::uint64_t context_store_restored_bytes = 0;
-    double context_store_restore_seconds       = 0.0;
+    // Sessions found at start-up that were written under another model, configuration (KV,
+    // recurrent state, speculative backend or draft window) or image format: never read, they age
+    // out of the store.
+    std::uint64_t context_store_foreign  = 0;
+    double context_store_restore_seconds = 0.0;
     // Stored sessions brought back into the cache for a request that would otherwise have been
     // prefilled from further back, and the prompt tokens that bought.
     std::uint64_t context_store_hydrations         = 0;

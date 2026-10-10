@@ -72,6 +72,7 @@
 #   NINFER_MAX_OUTPUT_TOKENS            --max-output-tokens N          cap every request's output budget
 #   NINFER_MLP_A8_DECODE=on             --mlp-a8-decode                INT8-activation MLP decode
 #   NINFER_CONTEXT_STORE                --context-store DIR            keep the context cache across restarts
+#                                                                      and crashes, under every NINFER_SPEC
 #     NINFER_CONTEXT_STORE_MAX_GIB      --context-store-max-gib N      disk budget for the store
 #
 # Each spec's defaults (context, lanes, chunk)

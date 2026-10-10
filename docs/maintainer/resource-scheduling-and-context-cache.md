@@ -165,6 +165,17 @@ ledger[execution_frontier] = 已提交、下一次待输入的 token
 精确命中可以使用保存的 tail hidden 进入采样。MTP 的 frontier−1 bridge、DFlash context
 append 和 speculative accepted-prefix fold 由 Native 完成。尚未提交的 suffix 不成为恢复点。
 
+持久 context store（`--context-store`）保存的 checkpoint image 就是这些点的完整 Host 表示：
+各 KV 页（Main 与 backend KV，DFlash 的 draft full-attention KV 属于后者）、每个 StateImage
+（GDN/conv、continuation hidden，DFlash/DFlash2 的 draft local K/V ring）和精确身份，逐字节等同
+Host demotion 的内容，因此三种 speculative backend 都可写入与恢复。DFlash pending target
+features 与 n-gram copy index 是 round/request 状态，不属于检查点，binding 时重建。image 绑定
+Program 配置（KV 存储、backend、proposal head、draft window、页与 StateImage 几何，含 GDN state
+dtype 与 ring 形状）和 Engine binding（模型、artifact、KV、GDN state 精度、backend、draft
+window、vision、grafts、image 格式版本）；任何不符都是 miss，不做只恢复 target 的部分恢复，
+因为 draft context 只能靠重新 prefill 整段历史重建。n-gram copy 宽度不进 binding。格式版本或
+binding 不符的旧 image 在启动摘要中计数（`context_store_foreign`），随 TTL/LRU 淘汰。
+
 前缀索引的 digest 用于缩小候选范围，采用前还要校验 token、位置、媒体与执行身份。独立重算得到
 的 state 与 KV 不能因为 token 相同就拼接；共享页和跨介质副本沿用其真实内容身份。
 
