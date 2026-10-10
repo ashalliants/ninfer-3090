@@ -32,9 +32,19 @@
 // points would hold, so importing an image yields Host-resident checkpoints indistinguishable from
 // demoted ones: a later binding restores them through the ordinary Host-to-Device path.
 //
+// A StateImage is the whole continuation state: GDN conv and recurrent state, the continuation
+// hidden and, for DFlash and DFlash2, the draft's local K/V rings. DFlash's full-attention draft
+// context is the backend KV. Nothing else a checkpoint resumes from lives outside the image: the
+// DFlash pending target features and the n-gram copy index are per-round and per-request state that
+// a binding rebuilds.
+//
 // Byte order is the host's. An image binds to the Program configuration (KV storage, speculative
-// layout, page and StateImage geometry) and to the caller's model binding; import rejects any
-// mismatch instead of reinterpreting bytes. A trailing checksum covers the whole image.
+// layout, page geometry and the StateImage's own geometry: GDN shapes and storage types, the DFlash
+// ring shape) and to the caller's model binding; import rejects any mismatch instead of
+// reinterpreting bytes. A trailing checksum covers the whole image.
+//
+// Version 2 added the StateImage geometry to the configuration; version 1 matched only its total
+// size, which a different ring shape or state type of equal size would have passed.
 //
 // KV pages are listed in the order the histories first reach them, so successive images of one
 // conversation share the bytes of their common prefix page for page: a content-addressed store keeps
@@ -44,7 +54,7 @@ namespace ninfer::models::qwen3_5::detail {
 namespace {
 
 constexpr char kImageMagic[8]                   = {'N', 'I', 'N', 'F', 'C', 'K', 'P', 'T'};
-constexpr std::uint32_t kImageVersion           = 1;
+constexpr std::uint32_t kImageVersion           = 2;
 constexpr std::size_t kMaximumModelBindingBytes = 4096;
 constexpr std::uint32_t kMaximumImagePoints     = 64;
 
@@ -161,6 +171,21 @@ struct ImageConfig {
     std::uint64_t text_page_stride    = 0;
     std::uint32_t backend_plane_count = 0;
     std::uint64_t backend_page_stride = 0;
+    // The StateImage geometry (its slot count is a Program choice, not part of an image).
+    std::uint32_t state_hidden           = 0;
+    std::uint32_t linear_layers          = 0;
+    std::uint32_t linear_conv_channels   = 0;
+    std::uint32_t linear_conv_width      = 0;
+    std::uint32_t linear_value_heads     = 0;
+    std::uint32_t linear_value_head_dim  = 0;
+    std::uint32_t linear_key_head_dim    = 0;
+    std::uint32_t linear_conv_dtype      = 0;
+    std::uint32_t linear_recurrent_dtype = 0;
+    // DFlash local rings; all zero when the StateImage has none.
+    std::uint32_t dflash_local_layers   = 0;
+    std::uint32_t dflash_local_capacity = 0;
+    std::uint32_t dflash_local_kv_heads = 0;
+    std::uint32_t dflash_local_head_dim = 0;
 
     friend bool operator==(const ImageConfig&, const ImageConfig&) noexcept = default;
 };
@@ -176,20 +201,46 @@ void write_config(ImageWriter& writer, const ImageConfig& config) {
     writer.pod(config.text_page_stride);
     writer.pod(config.backend_plane_count);
     writer.pod(config.backend_page_stride);
+    writer.pod(config.state_hidden);
+    writer.pod(config.linear_layers);
+    writer.pod(config.linear_conv_channels);
+    writer.pod(config.linear_conv_width);
+    writer.pod(config.linear_value_heads);
+    writer.pod(config.linear_value_head_dim);
+    writer.pod(config.linear_key_head_dim);
+    writer.pod(config.linear_conv_dtype);
+    writer.pod(config.linear_recurrent_dtype);
+    writer.pod(config.dflash_local_layers);
+    writer.pod(config.dflash_local_capacity);
+    writer.pod(config.dflash_local_kv_heads);
+    writer.pod(config.dflash_local_head_dim);
 }
 
 ImageConfig read_config(ImageReader& reader) {
     ImageConfig config;
-    config.kv_storage          = reader.pod<std::uint32_t>();
-    config.speculative_backend = reader.pod<std::uint32_t>();
-    config.proposal_head       = reader.pod<std::uint32_t>();
-    config.draft_window        = reader.pod<std::uint32_t>();
-    config.page_tokens         = reader.pod<std::uint32_t>();
-    config.state_image_bytes   = reader.pod<std::uint64_t>();
-    config.text_plane_count    = reader.pod<std::uint32_t>();
-    config.text_page_stride    = reader.pod<std::uint64_t>();
-    config.backend_plane_count = reader.pod<std::uint32_t>();
-    config.backend_page_stride = reader.pod<std::uint64_t>();
+    config.kv_storage             = reader.pod<std::uint32_t>();
+    config.speculative_backend    = reader.pod<std::uint32_t>();
+    config.proposal_head          = reader.pod<std::uint32_t>();
+    config.draft_window           = reader.pod<std::uint32_t>();
+    config.page_tokens            = reader.pod<std::uint32_t>();
+    config.state_image_bytes      = reader.pod<std::uint64_t>();
+    config.text_plane_count       = reader.pod<std::uint32_t>();
+    config.text_page_stride       = reader.pod<std::uint64_t>();
+    config.backend_plane_count    = reader.pod<std::uint32_t>();
+    config.backend_page_stride    = reader.pod<std::uint64_t>();
+    config.state_hidden           = reader.pod<std::uint32_t>();
+    config.linear_layers          = reader.pod<std::uint32_t>();
+    config.linear_conv_channels   = reader.pod<std::uint32_t>();
+    config.linear_conv_width      = reader.pod<std::uint32_t>();
+    config.linear_value_heads     = reader.pod<std::uint32_t>();
+    config.linear_value_head_dim  = reader.pod<std::uint32_t>();
+    config.linear_key_head_dim    = reader.pod<std::uint32_t>();
+    config.linear_conv_dtype      = reader.pod<std::uint32_t>();
+    config.linear_recurrent_dtype = reader.pod<std::uint32_t>();
+    config.dflash_local_layers    = reader.pod<std::uint32_t>();
+    config.dflash_local_capacity  = reader.pod<std::uint32_t>();
+    config.dflash_local_kv_heads  = reader.pod<std::uint32_t>();
+    config.dflash_local_head_dim  = reader.pod<std::uint32_t>();
     return config;
 }
 
@@ -298,7 +349,24 @@ ImageConfig program_config(const ProgramImpl& program) {
     config.proposal_head       = static_cast<std::uint32_t>(program.proposal_head);
     config.draft_window        = program.draft_window;
     config.page_tokens         = static_cast<std::uint32_t>(kPagedKVPageSize);
-    config.state_image_bytes   = program.state_images->host_layout().image_bytes;
+    const StateImageHostLayout& state = program.state_images->host_layout();
+    config.state_image_bytes          = state.image_bytes;
+    const auto& linear                = state.spec.linear;
+    config.state_hidden               = static_cast<std::uint32_t>(state.spec.hidden);
+    config.linear_layers              = linear.layers;
+    config.linear_conv_channels       = static_cast<std::uint32_t>(linear.conv_channels);
+    config.linear_conv_width          = static_cast<std::uint32_t>(linear.conv_width);
+    config.linear_value_heads         = static_cast<std::uint32_t>(linear.value_heads);
+    config.linear_value_head_dim      = static_cast<std::uint32_t>(linear.value_head_dim);
+    config.linear_key_head_dim        = static_cast<std::uint32_t>(linear.key_head_dim);
+    config.linear_conv_dtype          = static_cast<std::uint32_t>(linear.conv_dtype);
+    config.linear_recurrent_dtype     = static_cast<std::uint32_t>(linear.recurrent_dtype);
+    if (state.spec.dflash_local) {
+        config.dflash_local_layers   = state.spec.dflash_local->layers;
+        config.dflash_local_capacity = state.spec.dflash_local->capacity;
+        config.dflash_local_kv_heads = static_cast<std::uint32_t>(state.spec.dflash_local->kv_heads);
+        config.dflash_local_head_dim = static_cast<std::uint32_t>(state.spec.dflash_local->head_dim);
+    }
     const HostKVPageLayout text =
         plan_host_kv_page_layout(program.text_kv_pages->physical_pool().geometry());
     config.text_plane_count = static_cast<std::uint32_t>(text.planes.size());

@@ -510,6 +510,11 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                       stats.context_store_restored,
                       product::format_pretty_bytes(stats.context_store_restored_bytes),
                       stats.context_store_restore_seconds);
+        if (stats.context_store_foreign != 0) {
+            logger_->info("context store | {} sessions were written under another model, "
+                          "configuration or store format and are not used; they age out",
+                          stats.context_store_foreign);
+        }
     }
 
     if (service.options().enable_vision) {
