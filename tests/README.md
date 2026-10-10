@@ -182,6 +182,14 @@ variables extend the Python GGML and GGUF checks:
 
 `python -m tools.artifact.gen_ggml_fixtures --dll PATH` regenerates the fixtures.
 
+`ninfer_linear_ggml_test` qualifies Linear and LinearAdd over the six GGML formats they register,
+at every registered problem and T in {1..8, 9, 63, 64, 65, 300}: the weight is decoded by that host
+oracle, the activation passes through an independent host copy of the contract's Q8_1 cast, and
+the output is compared with the FP64 product. It also checks the cast exactly, byte for byte against
+the wide route's cast kernel and through the public Op on both routes, and the admission rules.
+`--format NAME` and `--shape N K` select problems; the full run takes about a minute, most of it the
+host oracle.
+
 The real loading test accepts an explicit artifact path and optional component selection:
 
 ```bash
