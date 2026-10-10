@@ -141,6 +141,63 @@ void check(std::uint32_t capacity, std::uint32_t draft_window, const MtpGraphAtt
     }
 }
 
+// The same contract for a DFlash round's target verify (T=K+1 over E+K+1 keys, batch B): every
+// profile replays one launch shape over its whole frontier range, and a class never mixes node
+// counts.
+void check_dflash(std::uint32_t capacity, std::uint32_t draft_window, std::uint32_t batch_size,
+                  const MtpGraphAttention& attention) {
+    const auto profiles = ninfer::models::qwen3_5::detail::dflash_graph_profiles(
+        ninfer::SpeculativeBackend::DFlash, capacity, draft_window, batch_size, attention);
+    const auto label = [&] {
+        return "dflash capacity=" + std::to_string(capacity) + " k=" + std::to_string(draft_window) +
+               " b=" + std::to_string(batch_size) +
+               " heads=" + std::to_string(attention.geometry.query_heads) +
+               " kv=" + std::to_string(static_cast<int>(attention.storage));
+    };
+    const auto shape = [&](std::uint32_t frontier) {
+        const auto visible = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+            capacity, static_cast<std::uint64_t>(frontier) + draft_window + 1ULL));
+        return ninfer::ops::causal_softmax_attention_launch_shape(
+            attention.geometry, attention.storage, CausalAttentionExecutionEnvelope{1U, visible},
+            static_cast<std::int32_t>(batch_size), static_cast<std::int32_t>(draft_window) + 1,
+            {nullptr, attention.multiprocessor_count});
+    };
+    std::uint32_t expected_min = 0;
+    std::map<std::uint32_t, std::uint32_t> nodes_of_class;
+    for (const auto& profile : profiles) {
+        if (profile.min != expected_min || profile.max < profile.min) {
+            std::cerr << label() << ": frontier coverage has a hole at [" << profile.min << ","
+                      << profile.max << "]\n";
+            ++failures;
+        }
+        expected_min = profile.max + 1;
+        // Every frontier at the smallest capacity, which spans every small-T key tier; the ends
+        // otherwise (the planner relies on shapes changing monotonically in the key count).
+        bool spans_change = !(shape(profile.min) == shape(profile.max));
+        for (std::uint32_t frontier = profile.min; capacity <= 16384U && !spans_change &&
+                                                   frontier < profile.max;
+             ++frontier) {
+            spans_change = !(shape(frontier) == shape(profile.max));
+        }
+        if (spans_change) {
+            std::cerr << label() << ": profile [" << profile.min << "," << profile.max
+                      << "] spans a verify launch-shape change\n";
+            ++failures;
+        }
+        const auto nodes          = shape(profile.max).kernel_nodes;
+        const auto [it, inserted] = nodes_of_class.emplace(profile.topology_class, nodes);
+        if (!inserted && it->second != nodes) {
+            std::cerr << label() << ": class " << profile.topology_class << " carries "
+                      << it->second << " and " << nodes << " verify kernel nodes\n";
+            ++failures;
+        }
+    }
+    if (profiles.empty() || profiles.back().max != capacity - 1) {
+        std::cerr << label() << ": coverage does not reach the capacity\n";
+        ++failures;
+    }
+}
+
 } // namespace
 
 int main() {
@@ -154,17 +211,23 @@ int main() {
                  ++draft_window) {
                 for (const KvCacheStorage storage : kStorages) {
                     // 82 SMs: the RTX 3090 the sm_86 route tables were measured on.
-                    check(capacity, draft_window,
-                          {.geometry = geometry, .storage = storage, .multiprocessor_count = 82});
+                    const MtpGraphAttention attention{
+                        .geometry = geometry, .storage = storage, .multiprocessor_count = 82};
+                    check(capacity, draft_window, attention);
+                    if (draft_window <= 15) {
+                        for (const std::uint32_t batch_size : {1U, 2U, 4U}) {
+                            check_dflash(capacity, draft_window, batch_size, attention);
+                        }
+                    }
                 }
             }
         }
     }
     if (failures != 0) {
-        std::cerr << failures << " MTP graph-profile contract violation(s)\n";
+        std::cerr << failures << " MTP/DFlash graph-profile contract violation(s)\n";
         return 1;
     }
-    std::cout << "MTP graph profiles keep one attention route per profile and one node structure "
-                 "per class\n";
+    std::cout << "MTP and DFlash graph profiles keep one attention route per profile and one node "
+                 "structure per class\n";
     return 0;
 }

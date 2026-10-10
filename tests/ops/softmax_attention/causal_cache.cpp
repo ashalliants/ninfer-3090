@@ -3642,8 +3642,8 @@ int run_int8_prompt_cases(KvCacheStorage storage) {
         failures += a1({200, 33000, 33200, seed++, false, true}, MappingPattern::Fragmented);
         failures += a1({100, 400, 500, seed++, false, true}, MappingPattern::Fragmented, false);
         // Launches of one to four key tiles: a whole first chunk of one tile, the 9- and
-        // 16-column verify widths (the H24 prompt route below 257 visible keys), with graph
-        // replay, and a 17-column launch at either side of four tiles.
+        // 16-column verify widths (prompt-routed over this few keys), with graph replay, and a
+        // 17-column launch at either side of four tiles.
         failures += a1({9, 0, 9, seed++}, MappingPattern::Identity, false);
         failures += a1({16, 47, 63, seed++, false, true}, MappingPattern::Fragmented, false);
         failures += a1({16, 240, 256, seed++, false, true}, MappingPattern::Fragmented, false);
@@ -3688,6 +3688,51 @@ int run_int8_prompt_cases(KvCacheStorage storage) {
                       << " exercised no split launch\n";
             ++failures;
         }
+    }
+    return failures;
+}
+
+// The single-row verify-width route table of the INT8 family (W 6-16): where a launch moves between
+// the prompt kernel, one small-T launch and chunked small-T, and where the chunk width changes with
+// the key tier. Every change up to past the last small-T tier (8198 keys) is found through the
+// public launch shape, so the table can move without the cases losing their boundaries, and is
+// qualified at b-1, b and b+1 visible keys against the FP64 oracle.
+int run_int8_verify_route_boundary_cases(KvCacheStorage storage) {
+    std::cout << "  " << cache_name(storage) << " verify-width route boundaries:\n";
+    int failures       = 0;
+    int boundaries     = 0;
+    std::uint32_t seed = 2400u;
+    for (const Geometry& geometry : kGeometries) {
+        for (std::int32_t width = 6; width <= 16; ++width) {
+            const auto shape = [&](std::uint32_t keys) {
+                return ops::causal_softmax_attention_launch_shape(
+                    op_geometry(geometry), storage, {1, keys}, 1, width, test_execution());
+            };
+            for (auto keys = static_cast<std::uint32_t>(width) + 1; keys <= 8300; ++keys) {
+                const auto before = shape(keys - 1);
+                const auto after  = shape(keys);
+                if (before == after) { continue; }
+                // A route change is qualified at every width. A change of chunk width or key tier
+                // alone runs the same small-T kernels on both sides, split differently, so it is
+                // qualified at the narrowest chunked width and at 16 columns, which keeps this
+                // suite's FP64 oracle work (cases up to 8.2K keys) bounded.
+                const bool route_change = (before.route & 0xffU) != (after.route & 0xffU);
+                const std::int32_t narrowest = geometry.q_heads == 16 ? 7 : 9;
+                if (!route_change && width != narrowest && width != 16) { continue; }
+                ++boundaries;
+                for (const std::uint32_t k : {keys - 1, keys, keys + 1}) {
+                    if (k < static_cast<std::uint32_t>(width)) { continue; }
+                    failures += run_a1_case(
+                        geometry, storage,
+                        {width, static_cast<std::int32_t>(k) - width, k, seed++},
+                        MappingPattern::Fragmented);
+                }
+            }
+        }
+    }
+    if (boundaries == 0) {
+        std::cerr << cache_name(storage) << " verify-width route table has no boundary\n";
+        ++failures;
     }
     return failures;
 }
@@ -3992,6 +4037,7 @@ int run_softmax_attention_int8_prompt_tests() {
     }
     for (const KvCacheStorage storage : kInt8FamilyStorages) {
         failures += run_int8_prompt_cases(storage);
+        failures += run_int8_verify_route_boundary_cases(storage);
     }
     std::cout << (failures == 0 ? "PASS" : "FAIL")
               << " causal_softmax_attention int8-family prompt route\n";

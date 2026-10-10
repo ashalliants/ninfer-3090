@@ -366,17 +366,17 @@ void ProgramImpl::prepare_graphs() {
         const bool mtp = speculative_backend == SpeculativeBackend::Mtp;
         // sm_86 topology classes: MTP breaks on the target's attention routes; DFlash breaks per
         // exact B, because its verify attention route changes with the batch's query width.
-        const auto& attention         = *parameters.model.config().text.attention;
+        const auto& attention = *parameters.model.config().text.attention;
+        const MtpGraphAttention target_attention{
+            .geometry             = {dimension(attention.head_dim),
+                                     dimension(attention.num_attention_heads),
+                                     dimension(attention.num_key_value_heads)},
+            .storage              = kv_storage,
+            .multiprocessor_count = device.multiprocessor_count()};
         const auto forward_profiles_for = [&](std::uint32_t batch) {
-            auto profiles =
-                mtp ? mtp_graph_profiles(capacity, draft_window,
-                                         {.geometry = {dimension(attention.head_dim),
-                                                       dimension(attention.num_attention_heads),
-                                                       dimension(attention.num_key_value_heads)},
-                                          .storage  = kv_storage,
-                                          .multiprocessor_count =
-                                              device.multiprocessor_count()})
-                    : dflash_graph_profiles(speculative_backend, capacity, draft_window, batch);
+            auto profiles = mtp ? mtp_graph_profiles(capacity, draft_window, target_attention)
+                                : dflash_graph_profiles(speculative_backend, capacity,
+                                                        draft_window, batch, target_attention);
             validate_graph_profiles(profiles, capacity - 1, "speculative forward");
             return profiles;
         };
