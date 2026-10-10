@@ -49,9 +49,11 @@ void require_positions(const Tensor& positions, std::int32_t tokens) {
 }
 
 void require_rope_positions(const Tensor& rope_positions, std::int32_t tokens) {
+    // Axis-major planes (word a * T + t): exactly ne = {T, 3, 1, 1}; a [T, 1, 3] tensor is
+    // interleaved (3 t + a) and would be read incorrectly by the kernels.
     require(contiguous(rope_positions, DType::I32) && rope_positions.ne[0] == tokens &&
-                rope_positions.numel() == 3 * static_cast<std::int64_t>(tokens),
-            "rope_positions must be contiguous I32 [T, 3]");
+                rope_positions.ne[1] == 3 && rope_positions.ne[2] == 1 && rope_positions.ne[3] == 1,
+            "rope_positions must be contiguous I32 [T, 3] (ne = {T, 3, 1, 1})");
 }
 
 void require_norm_weight(const Tensor& weight) {

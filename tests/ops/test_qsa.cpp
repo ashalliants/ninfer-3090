@@ -981,6 +981,21 @@ void test_rejections() {
         (void)ops::qsa_select_blocks_workspace_capacity_bytes(geometry(true), {262145}, 1, 1, exec);
     } catch (const std::invalid_argument&) { threw = true; }
     expect(threw, "an envelope beyond 262144 keys is rejected");
+
+    // rope_positions must be exactly [T, 3] (axis-major); a same-numel [T, 1, 3] is interleaved.
+    {
+        const std::vector<std::int32_t> rope(6, 0);
+        const std::vector<std::uint16_t> q(static_cast<std::size_t>(kDi) * kIndexHeads * 2, 0);
+        const std::vector<std::uint16_t> weight(kDi, 0);
+        DeviceBuffer dr = upload(rope), dq = upload(q), dw = upload(weight);
+        Tensor tq(dq.p, DType::BF16, {kDi, kIndexHeads, 2});
+        threw = false;
+        try {
+            ops::qsa_index_query(Tensor(dr.p, DType::I32, {2, 1, 3}), Tensor(dw.p, DType::BF16, {kDi}),
+                                 geometry(true), tq, nullptr);
+        } catch (const std::invalid_argument&) { threw = true; }
+        expect(threw, "rope_positions shaped [T, 1, 3] is rejected");
+    }
 }
 
 int run(bool small) {
