@@ -1256,6 +1256,10 @@ int test_open_reasoning_recovery() {
         failures += check(decoder.finish(ninfer::FinishReason::StopToken, planning + remove)
                               .tool_calls.empty(),
                           "constrained tool output recovered a call from open thinking");
+    }
+    return failures;
+}
+
 // The marker scan must accept every opener the parser accepts and no opener it cannot parse.
 int test_bare_marker_boundaries() {
     const std::vector<std::string> definitions = {

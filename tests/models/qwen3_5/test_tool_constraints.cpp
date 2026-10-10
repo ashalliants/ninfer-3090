@@ -247,6 +247,8 @@ void thinking_cannot_end_with_eos(ninfer::text::GrammarCompiler& compiled) {
         }
         require(eos_allowed(), "tool grammar did not admit EOS after a call in the answer");
     }
+}
+
 // The serve layer lowers a free-form `custom` tool (Codex's apply_patch) to this strict schema.
 // Its top-level pure-string parameter must come back byte for byte, so a patch keeps its leading
 // spaces, blank lines and markers, and the grammar must make `input` the only, required argument.
