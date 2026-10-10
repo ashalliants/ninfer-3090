@@ -220,6 +220,8 @@ expect_exit 2 'unknown NINFER_SPEC' clear_env "${serve_env[@]}" NINFER_SPEC=bogu
 expect_exit 2 'unknown NINFER_NGRAM' clear_env "${serve_env[@]}" NINFER_NGRAM=yes "$root/run.sh" qwen38-27b
 expect_exit 2 'NINFER_NGRAM=on without DFlash2' clear_env "${serve_env[@]}" NINFER_SPEC=mtp NINFER_NGRAM=on \
   "$root/run.sh" qwen38-27b
+expect_exit 2 'NINFER_NGRAM=on on the 35B' clear_env "${serve_env[@]}" NINFER_NGRAM=on "$root/run.sh" qwen36-35b-a3b
+expect_exit 2 'unknown NINFER_NGRAM on the 35B' clear_env "${serve_env[@]}" NINFER_NGRAM=yes "$root/run.sh" qwen36-35b-a3b
 expect_exit 0 '--help' clear_env "${serve_env[@]}" "$root/run.sh" --help
 
 # Step-down ladder. A desktop holding VRAM can leave too little for the default context, and the

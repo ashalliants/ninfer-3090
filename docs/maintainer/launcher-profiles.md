@@ -51,7 +51,7 @@ a file the conversation has read. Output that never copies is 0.7% slower, and i
 runtime memory: the Windows 188,416-token start still had 991 MiB free. With
 `NINFER_CONCURRENCY=2` it stays off unless `NINFER_NGRAM=on`. There, aggregate throughput rises 15%,
 but a request sharing rounds with a copying one decodes up to 19% slower. `NINFER_NGRAM=on` with
-`mtp` or `none` is refused, because copy rounds ride on DFlash2. Tables are in
+`mtp` or `none`, or on the 35B-A3B profile (which has no DFlash2), is refused, because copy rounds ride on DFlash2. Tables are in
 [performance](../performance.md#n-gram-copy-drafting-rtx-3090-qwen38-27b).
 
 MTP DRAFT COUNT, 2026-09-28. MTP now accepts `NINFER_DRAFT_TOKENS` up to 15 (it was capped at

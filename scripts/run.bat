@@ -269,6 +269,16 @@ set "CONTEXT=212992"
 set "CONCURRENCY=2"
 set "PREFILL_CHUNK=4096"
 set "DRAFT_TOKENS=3"
+rem DFlash2 is 27B-only and n-gram copy rounds ride on it, so refuse rather than ignore the flag.
+if "%NINFER_NGRAM%"=="" goto :ngram35_done
+if /i "%NINFER_NGRAM%"=="off" goto :ngram35_done
+if /i "%NINFER_NGRAM%"=="on" (
+  echo NINFER_NGRAM=on needs NINFER_SPEC=dflash2, which only qwen38-27b has 1>&2
+  exit /b 2
+)
+echo NINFER_NGRAM must be on or off, got %NINFER_NGRAM% 1>&2
+exit /b 2
+:ngram35_done
 if /i "%SPEC%"=="mtp" goto :spec35_mtp
 if /i "%SPEC%"=="none" goto :spec35_none
 echo NINFER_SPEC must be mtp or none, got %SPEC% 1>&2

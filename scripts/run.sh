@@ -190,6 +190,12 @@ case "$model_key/$profile" in
       none) spec_args=(); spec_label='no speculation' ;;
       *) printf 'NINFER_SPEC must be mtp or none, got %s\n' "$SPEC" >&2; exit 2 ;;
     esac
+    # DFlash2 is 27B-only and n-gram copy rounds ride on it, so refuse rather than ignore the flag.
+    case "${NINFER_NGRAM:-off}" in
+      off) ;;
+      on) printf 'NINFER_NGRAM=on needs NINFER_SPEC=dflash2, which only qwen38-27b has\n' >&2; exit 2 ;;
+      *) printf 'NINFER_NGRAM must be on or off, got %s\n' "$NINFER_NGRAM" >&2; exit 2 ;;
+    esac
     # rk4v4 fits three lanes at the full context even beside a desktop (2026-09-24; four fall 48 MB
     # short there, so a headless card may take NINFER_CONCURRENCY=4). Lanes share the one
     # --kv-capacity pool: any request may use all of it, but not every lane at once.
