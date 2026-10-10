@@ -501,7 +501,9 @@ PrefillSuiteResult measure_prefill(const ArtifactProfile& artifact,
     engine_options.max_concurrency       = 1;
     engine_options.max_pending_requests  = 1;
     engine_options.prefill_chunk         = options.prefill_chunk;
-    engine_options.kv_cache              = KvCacheStorage::BFloat16;
+    engine_options.kv_cache              = options.kv_cache;
+    engine_options.prefill_cublas        = options.prefill_cublas;
+    engine_options.gdn_state_fp16        = options.gdn_state_fp16;
     engine_options.speculative.backend   = SpeculativeBackend::None;
     engine_options.enable_vision         = true;
     engine_options.use_cuda_graph        = true;

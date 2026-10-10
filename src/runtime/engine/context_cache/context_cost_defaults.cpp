@@ -21,23 +21,28 @@ constexpr ContextPrefillCost kNvfp4Fp8Prefill{
     .vision_patch_ns_q32   = 23'832'529'381'413,
 };
 
-// RTX 3090 (sm_86) fits, measured 2026-09-14 on the fork host (Windows 11, CUDA 12.8, 315 W cap)
-// with ninfer_context_cost_bench at --max-context 65536 for each groupwise-int artifact. The
-// generic prefill model predicted 26.0 s for a 55,000-token Qwen3.8-27B prefill that took 57 s on
-// this card; this fit predicts 58.1 s.
+// RTX 3090 (sm_86) fits, measured 2026-10-10 on the fork host (Windows 11, CUDA 12.8, 315 W cap)
+// with ninfer_context_cost_bench --suite prefill under the launcher's prefill configuration
+// (--kv-dtype rk4v4 --prefill-cublas --gdn-state-fp16 --prefill-chunk 4096 --max-context 32768),
+// i.e. the FA2 INT8-family prompt kernel with its key splits. Each coefficient is the median of
+// three independent calibrations (spread: chunk and token 2 %, attention pair 4 % on the 27B and
+// 8 % on the 35B, Vision patch 1 %, Vision item 19 % and 7 %); every calibration passed the tool's
+// acceptance with held-out p95 error under 5 %. Against ninfer_bench prefills outside the fitted
+// range (up to 26.6K tokens), the 27B fit predicts 32K/64K/128K-token prompts at +0.0/+1.0/+2.5 %
+// and the 35B fit at +2.2/+3.4/+4.8 %.
 constexpr ContextPrefillCost kGroupwise27bPrefillSm86{
-    .chunk_ns              = 42'827'781,
-    .token_ns_q32          = 3'084'986'452'624'619,
-    .attention_pair_ns_q32 = 46'293'818'703,
-    .vision_item_ns        = 6'744'019,
-    .vision_patch_ns_q32   = 109'358'098'255'328,
+    .chunk_ns              = 107'758'083,
+    .token_ns_q32          = 1'221'872'677'006'676,
+    .attention_pair_ns_q32 = 19'498'990'504,
+    .vision_item_ns        = 3'827'710,
+    .vision_patch_ns_q32   = 119'690'866'131'660,
 };
 constexpr ContextPrefillCost kGroupwise35bA3bPrefillSm86{
-    .chunk_ns              = 32'306'259,
-    .token_ns_q32          = 671'808'709'554'317,
-    .attention_pair_ns_q32 = 17'853'060'462,
-    .vision_item_ns        = 6'937'447,
-    .vision_patch_ns_q32   = 106'078'200'821'712,
+    .chunk_ns              = 44'854'298,
+    .token_ns_q32          = 447'515'582'721'849,
+    .attention_pair_ns_q32 = 8'648'045'621,
+    .vision_item_ns        = 3'410'151,
+    .vision_patch_ns_q32   = 115'787'286'593'791,
 };
 constexpr const char* kGroupwise35bA3bSignatureText   = "ec5569f8250032ddd23568d599e4abf7e369d7a84971b2de3bd7fedfb9714dd1";
 constexpr const char* kGroupwise35bA3bSignatureVision = "f4a7fddf7c517236401d5d7f085879d7735de10d49e19d125c496139f47f6533";
@@ -98,10 +103,8 @@ const std::vector<ContextCostMachinePreset>& compiled_context_cost_defaults() {
         },
         ContextCostMachinePreset{
             .hardware_class = "nvidia-geforce-rtx-3090-sm86",
-            // Measured 2026-09-14 on the fork host (Windows 11, CUDA 12.8, 315 W cap) with
-            // ninfer_context_cost_bench, prefill at --max-context 65536 for each groupwise-int
-            // artifact. The generic prefill model predicted 26.0 s for a 55,000-token Qwen3.8-27B
-            // prefill that took 57 s on this card; this fit predicts 58.1 s.
+            // Transfer measured 2026-09-14 on the fork host (Windows 11, CUDA 12.8, 315 W cap) with
+            // ninfer_context_cost_bench --suite transfer; prefill fits as described above.
             .transfer =
                 std::array{
                     ContextTransferCost{
@@ -111,12 +114,17 @@ const std::vector<ContextCostMachinePreset>& compiled_context_cost_defaults() {
                     ContextTransferCost{
                         .batch_ns = 338, .operation_ns = 6'742, .ns_per_byte_q32 = 10'830'495},
                 },
-            // Keys are v3 prefill signatures (see models/qwen3_5/measurement.cpp); Qwen3.6-27B and
-            // Qwen3.8-27B groupwise-int share one binding signature, and their two measured fits
-            // differ by under 1%, so the Qwen3.8 fit serves both. Each pair is Vision
-            // disabled/enabled.
+            // Keys are v3 prefill signatures (see models/qwen3_5/measurement.cpp); each pair is
+            // Vision disabled/enabled. The 27B fit was measured on the Qwen3.8-27B DFlash2 bundle
+            // that download-model fetches (its first pair); the earlier Qwen3.6/3.8-27B
+            // groupwise-int bindings below have the same geometry and take the same fit, not
+            // re-measured.
             .prefill =
                 {
+                    {"34e6977811057a534eb4c60bb56e9e9c0520ff0ecadf4852cbb176756c104c02",
+                     kGroupwise27bPrefillSm86},
+                    {"55d6cf832e5d519bcd43097cf00ba696ca5182ae8ec2570f05baf6cae1fc0c7b",
+                     kGroupwise27bPrefillSm86},
                     {"200f57efee7b0fe1172dfd4a06b1e6e0b2dbc36dfcd6a242fea35338bb5ff0d2",
                      kGroupwise27bPrefillSm86},
                     {"badf2271162e72c8c51a91da02cbb4343d4b7574d037a014ca6862ff2862638b",
