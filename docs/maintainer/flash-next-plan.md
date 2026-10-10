@@ -16,14 +16,13 @@ references, `engine-architecture.md`).
 | 3 | Dense GGML linears: `linear`/`linear_add` for IQ4_XS, IQ3_S, Q6_K, IQ4_NL, Q8_0, Q2_0 at the model's 19 dense problems, Q8_1 activation profile | done (perf gates below) |
 | 4-6 | Hyper-connections and FP32 head, QSA, PLE | not started |
 | 7a | `offloaded_sparse_moe` contract, routing, dispatch, combine, canonical A8 arithmetic, CPU expert engine (scalar, AVX2, worker team) | done |
-| 7b | `offloaded_sparse_moe` GPU narrow route (device frames, staging, zero-copy), CPU miss channel and service | not started |
+| 7b | `offloaded_sparse_moe` GPU narrow route (device frames, staging, zero-copy), CPU miss channel and service | done (perf gate missed, see below) |
 | 8-9 | Model skeleton, Program and Engine integration | not started |
 | 10 | Whole model at 32K, quality gate against Strata | not started |
 | 11-14 | Residency policy and miss split, 128K, MTP, vision | not started |
 
 The C++ loader reads and places every `ggml_*` and `ggml_rec_*` object. Linear and LinearAdd execute
-the six dense formats (PR 3); offloaded_sparse_moe's CPU expert engine executes the three expert
-record formats (PR 7a); its GPU route follows (PR 7b).
+the six dense formats (PR 3); offloaded_sparse_moe executes the three expert record formats (PR 7).
 
 ## PR 3 measurements
 
@@ -38,6 +37,28 @@ cast plus int8 MMA with dequantize-to-FP16 plus cuBLAS (`cublasGemmEx`, FP32 com
 | Wide, T = 512 / 4096, ours over dequant + cuBLAS | 1.02-2.02x for five formats; Q6_K 0.96x / 0.77x |
 
 The 80% decode gate is not met; see the PR 3 description for the tuning that was tried.
+
+## PR 7 measurements
+
+RTX 3090, CUDA 12.8, 5950X with DDR4-2133; random records with finite scales (record bytes are
+fixed per format); 10 experts each routed every column; cold L2; medians. Bit-exactness (CPU scalar
+= AVX2 = team at 1-16 workers = GPU in device frames, staged and zero-copy, and CPU-served) holds on
+synthetic and on the subset artifact's real IQ2_S, IQ2_XXS and IQ1_M banks.
+
+| Workload | IQ2_S | IQ2_XXS | IQ1_M | Gate |
+|---|---|---|---|---|
+| Narrow route T = 1, resident, graph replay | 53.2 us, 284 GB/s (30%) | 46.1 us, 283 GB/s (30%) | 45.1 us, 261 GB/s (28%) | >= 70% of 936 GB/s: **missed** |
+| Same, kernels (nsys median): gate/up + down | 35.4 + 16.9 us | 33.4 + 16.9 us | 28.8 + 16.9 us | |
+| Plain read of the same bytes | 22.5 us (670 GB/s) | 19.5 us | 17.4 us | |
+| Strata native grouped kernels, same records (quantize + grouped) | 61.4 us | 53.2 us | 52.2 us | |
+| Canonical / native, T = 1, 2, 4, 8 | 0.90, 0.99, 0.88, 0.90 | 0.92, 1.02, 0.89, 0.76 | 0.90, 0.93, 0.81, 0.71 | K7: within 5% of native, **not triggered** |
+| Staged misses T = 1 (10 misses), effective PCIe | 24.2 GB/s | 24.2 GB/s | 15.8-23.8 GB/s (one outlier run) | >= 18 GB/s: met (IQ1_M once below) |
+| One cold CPU expert T = 1, 16 workers (sweep 1-16 in the PR) | 72.6 us, 20.8 GB/s | 88.9 us, 14.7 GB/s | 122.5 us, 9.6 GB/s | recorded |
+
+The narrow route stays at the speed of Strata's native MMVQ grouped kernels on the same records:
+both run two dependent kernels (gate/up, then down) over 15 MB, and neither reaches the read
+roofline at T = 1. A sweep of CTA geometry and grids in shared memory moved T = 1 by at most ~15%;
+reaching 70% needs a different structure (one persistent two-phase kernel), left open.
 
 ## Artifact decisions
 
@@ -91,10 +112,11 @@ Infernix is Apache-2.0; each adapted file carries the notice the spec's licensin
 |---|---|---|
 | `tools/artifact/ngram_volume.py` | `tools/convert/qwen4_exp.py` (`ngram_geometry`, `read_ngram_volume_id`, `write_ngram_volume`) | Version 2 header with a row-format field; streams GGML rows from any source |
 | `tools/convert/qwen4_exp.py` (config keys, `layer_multipliers`, `head_tables`, expert bank parameter, volume binding) | `src/models/qwen4_exp/config.cpp`, `tools/flash_next/ngram.py`, `tools/convert/qwen4_exp.py` (`ExpertBankSource`, `import_expert_bank`), `tools/convert/__main__.py` | Sourced from GGUF metadata; GGML expert records instead of NVFP4 banks |
-| `include/ninfer/ops/offloaded_sparse_moe.h` | `include/infernix/ops/offloaded_sparse_moe.h` | GGML record formats, no per-expert scales; routing, dispatch, combine and the CPU engine (the GPU expert route follows) |
+| `include/ninfer/ops/offloaded_sparse_moe.h` | `include/infernix/ops/offloaded_sparse_moe.h` | GGML record formats, no per-expert scales; SSD tier, fetch channel, landing, streamed records, overlap/fork streams, L2 warming and wide route not carried |
 | `src/ops/common/canonical_math.h` | `src/ops/common/canonical_math.h` (`0cf68068`) | IEEE helpers, BF16, exp and SiLU only |
 | `src/ops/offloaded_sparse_moe/cpu/expert_team.cpp` | `src/ops/offloaded_sparse_moe/cpu/expert_team.{h,cpp}` | GGML jobs; units of 32 intermediates; no A16, AVX-VNNI or AVX-512 |
-| `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu` | `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu` | Route, dispatch and combine |
+| `src/ops/offloaded_sparse_moe/cpu/miss_service.cpp` | `src/ops/offloaded_sparse_moe/cpu/miss_service.{h,cpp}` | No tiered requests; fixes a startup race (the first request could be taken as already answered) |
+| `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu` | `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu` (`398cf2cc`) | Route, dispatch, staging, CPU plan/wait and combine kept; narrow kernels rewritten for GGML sub-blocks |
 
 ## Export conventions of this GGUF
 

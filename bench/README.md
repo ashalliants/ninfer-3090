@@ -328,6 +328,22 @@ cmake --build build -j --target ninfer_benches
 ./build/bench/ninfer_benches ninfer_linear_topk_bench --profile q4-optimized --columns 129 --repeat 60
 ```
 
+## Offloaded sparse-MoE Op benchmark
+
+`ninfer_offloaded_moe_bench` measures the public offloaded_sparse_moe experts over GGML expert
+records (IQ2_S, IQ2_XXS and IQ1_M gate/up with Q2_0 down). `--mode gpu` times `moe_experts` with
+`--experts` experts (default 10, the model's top-k) each routed every column, at T in {1, 2, 4, 8}
+with the records resident in device frames, and at T = 1 staged from the pinned host bank or read
+zero-copy; a 256 MiB L2 eviction read precedes every sample and CUDA events bracket the call, both
+replayed from a CUDA graph (the reported rate) and launched eagerly. The rate counts each record once. `--mode cpu` times one cold expert at T = 1 on the CPU worker team
+over 1-16 workers, rotating through 96 records so none is cache-resident. Records are random blocks
+with finite scales; medians of `--reps` (default 30).
+
+```bash
+./build/bench/ninfer_benches ninfer_offloaded_moe_bench
+./build/bench/ninfer_benches ninfer_offloaded_moe_bench --mode cpu --reps 50
+```
+
 ## CandidateSelectorPath Op benchmark
 
 `ninfer_candidate_selector_bench` measures the complete public conditional selector for
