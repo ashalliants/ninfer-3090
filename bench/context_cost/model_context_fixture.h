@@ -28,6 +28,11 @@ struct MeasurementOptions {
     int device                  = 0;
     std::uint32_t max_context   = 8192;
     std::uint32_t prefill_chunk = 1024;
+    // The prefill configuration being priced. The runtime keys a price by hardware class and
+    // prefill signature only, so a calibration measures the configuration the machine serves with.
+    KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
+    bool prefill_cublas         = false;
+    bool gdn_state_fp16         = false;
     int transfer_warmup         = 2;
     int transfer_repetitions    = 9;
     int prefill_repetitions     = 5;
