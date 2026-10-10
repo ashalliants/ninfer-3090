@@ -10,6 +10,8 @@
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "ninfer/ops/attn_input_proj.h"
+#include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer_bench_common.h"
@@ -228,6 +230,113 @@ int main(int argc, char** argv) {
                         a8_us, cublas_us, a8_us > 0 ? tops(profile, t, a8_us) : 0.0,
                         tops(profile, t, cublas_us),
                         a8_us > 0 && cublas_us > 0 ? a8_us / cublas_us : 0.0, rel);
+        }
+    }
+
+    // The split input projections: two parents over one activation, scattered into the destinations
+    // the model reads. The integer arm goes through the public Op, so below the A8 tile it is A16.
+    struct Split {
+        const char* name;
+        std::int32_t first_rows;  // Q4 parent
+        std::int32_t second_rows; // Q5 parent
+        bool gdn;
+    };
+    constexpr Split kSplits[] = {{"gdn_in", 4096, 12288, true}, {"attn_in", 7168, 7168, false}};
+    constexpr std::int32_t kHidden = 5120;
+    for (const Split& split : kSplits) {
+        ninfer::bench::PackedQuantizedWeight first = ninfer::bench::make_row_split_weight(
+            QType::Q4_G64_FP16, split.first_rows, kHidden, kHidden, 0x53U);
+        ninfer::bench::PackedQuantizedWeight second = ninfer::bench::make_row_split_weight(
+            QType::Q5_G64_FP16, split.second_rows, kHidden, kHidden, 0x54U);
+        const std::size_t out_rows =
+            static_cast<std::size_t>(split.first_rows) + split.second_rows;
+        ninfer::DeviceBuffer input(static_cast<std::size_t>(kHidden) * max_tokens * 2);
+        ninfer::DeviceBuffer output(out_rows * max_tokens * 2);
+        {
+            const std::size_t count = static_cast<std::size_t>(kHidden) * max_tokens;
+            fill_activations<<<static_cast<unsigned>((count + 255) / 256), 256>>>(
+                static_cast<__nv_bfloat16*>(input.p), count, 0x9e3779b9u);
+            cudaDeviceSynchronize();
+        }
+        const double flops_per_token = 2.0 * static_cast<double>(out_rows) * kHidden;
+
+        for (const std::int32_t t : tokens) {
+            Tensor x(input.p, DType::BF16, {kHidden, t});
+            auto* base = static_cast<char*>(output.p);
+            const auto slice = [&](std::size_t row_offset) {
+                return base + row_offset * static_cast<std::size_t>(t) * 2;
+            };
+            // gdn: qkv [4096 + 6144, t] and z [6144, t]. attn: q, gate [6144, t] and k, v [1024, t].
+            Tensor qkv(slice(0), DType::BF16, {10240, t});
+            Tensor z(slice(10240), DType::BF16, {6144, t});
+            Tensor q(slice(0), DType::BF16, {6144, t});
+            Tensor gate(slice(6144), DType::BF16, {6144, t});
+            Tensor k(slice(12288), DType::BF16, {1024, t});
+            Tensor v(slice(13312), DType::BF16, {1024, t});
+
+            using ninfer::ops::detail::CublasProjection;
+            using ninfer::ops::detail::CublasProjectionDestination;
+            const CublasProjectionDestination gdn_first[]   = {{qkv.data, 0, 4096, 10240, 0}};
+            const CublasProjectionDestination gdn_second[]  = {{qkv.data, 0, 6144, 10240, 4096},
+                                                               {z.data, 6144, 6144, 6144, 0}};
+            const CublasProjectionDestination attn_first[]  = {{q.data, 0, 6144, 6144, 0},
+                                                               {k.data, 6144, 1024, 1024, 0}};
+            const CublasProjectionDestination attn_second[] = {{gate.data, 0, 6144, 6144, 0},
+                                                               {v.data, 6144, 1024, 1024, 0}};
+            const CublasProjection parents[] = {
+                {&first.weight, split.gdn ? gdn_first : attn_first, split.gdn ? 1 : 2},
+                {&second.weight, split.gdn ? gdn_second : attn_second, 2}};
+
+            double a8_us = 0.0;
+            try {
+                const auto capacity =
+                    split.gdn ? ninfer::ops::gdn_input_proj_split_workspace_capacity_bytes(
+                                    QType::Q4_G64_FP16, split.first_rows, QType::Q5_G64_FP16,
+                                    split.second_rows, kHidden,
+                                    ninfer::ops::LinearPolicy::AllowA8Int, t, t)
+                              : ninfer::ops::attn_input_proj_split_workspace_capacity_bytes(
+                                    QType::Q4_G64_FP16, split.first_rows, QType::Q5_G64_FP16,
+                                    split.second_rows, kHidden,
+                                    ninfer::ops::LinearPolicy::AllowA8Int, t, t);
+                ninfer::WorkspaceArena ws(std::max<std::size_t>(capacity, 1));
+                const auto invoke = [&](cudaStream_t s) {
+                    if (split.gdn) {
+                        ninfer::ops::gdn_input_proj(x, first.weight, second.weight, qkv, z,
+                                                    ninfer::ops::LinearPolicy::AllowA8Int, ws, s);
+                    } else {
+                        ninfer::ops::attn_input_proj(x, first.weight, second.weight, q, gate, k,
+                                                     v, ninfer::ops::LinearPolicy::AllowA8Int, ws,
+                                                     s);
+                    }
+                };
+                a8_us = ninfer::bench::measure_cold_launch(invoke, flush, stream, warmup, repeat)
+                            .median_us;
+            } catch (const std::exception&) {
+                cudaGetLastError();
+            }
+
+            double cublas_us = 0.0;
+            try {
+                ninfer::WorkspaceArena ws(
+                    ninfer::ops::detail::w4_cublas_projection_workspace_capacity_bytes(
+                        std::max(split.first_rows, split.second_rows), kHidden, t, t));
+                const auto invoke = [&](cudaStream_t s) {
+                    ninfer::ops::detail::w4_cublas_projection_launch(x, parents, 2, ws, s);
+                };
+                cublas_us = ninfer::bench::measure_cold_launch(invoke, flush, stream, warmup, repeat)
+                                .median_us;
+            } catch (const std::exception& error) {
+                cudaGetLastError();
+                std::printf("%-12s %6d  cublas route unavailable: %s\n", split.name, t,
+                            error.what());
+                continue;
+            }
+            const auto split_tops = [&](double us) {
+                return flops_per_token * t / (us * 1.0e-6) / 1.0e12;
+            };
+            std::printf("%-12s %6d %12.1f %12.1f %10.1f %10.1f %7.2fx %10s\n", split.name, t, a8_us,
+                        cublas_us, a8_us > 0 ? split_tops(a8_us) : 0.0, split_tops(cublas_us),
+                        a8_us > 0 && cublas_us > 0 ? a8_us / cublas_us : 0.0, "-");
         }
     }
     return 0;
