@@ -40,6 +40,7 @@ ninfer_add_op_bench(ninfer_linear_schedule_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_schedule_bench.cu")
 ninfer_add_op_bench(ninfer_linear_topk_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_topk_bench.cu")
 ninfer_add_op_bench(ninfer_offloaded_moe_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/offloaded_moe_bench.cu")
+ninfer_add_op_bench(ninfer_qsa_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/qsa_bench.cu")
 ninfer_add_op_bench(ninfer_candidate_selector_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/candidate_selector_bench.cu")
 ninfer_add_op_bench(ninfer_gdn_input_proj_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/gdn_input_proj_bench.cu")
 ninfer_add_op_bench(ninfer_gdn_input_proj_conv_snapshot_bench

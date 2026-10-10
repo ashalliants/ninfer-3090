@@ -133,13 +133,13 @@ Infernix is Apache-2.0; each adapted file carries the notice the spec's licensin
 | `src/ops/offloaded_sparse_moe/cpu/expert_team.cpp` | `src/ops/offloaded_sparse_moe/cpu/expert_team.{h,cpp}` | GGML jobs; units of 32 intermediates; no A16, AVX-VNNI or AVX-512 |
 | `src/ops/offloaded_sparse_moe/cpu/miss_service.cpp` | `src/ops/offloaded_sparse_moe/cpu/miss_service.{h,cpp}` | No tiered requests; fixes a startup race (the first request could be taken as already answered) |
 | `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu` | `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu` (`398cf2cc`) | Route, dispatch, staging, CPU plan/wait and combine kept; narrow kernels rewritten for GGML sub-blocks |
-| `include/ninfer/ops/hyper_connection.h` | `include/infernix/ops/hyper_connection.h` | see PR 6 |
-| `src/ops/hyper_connection/hyper_connection.cu` | `src/ops/hyper_connection/hyper_connection.cu` | see PR 6 |
-| `src/ops/hyper_connection/hyper_connection_mix_fused.{h,cu}` | `src/ops/hyper_connection/hyper_connection_mix_fused.{h,cu}` | see PR 6 |
-| `include/ninfer/ops/ple.h`, `src/ops/ple/ple.cu` | `include/infernix/ops/ple.h`, `src/ops/ple/ple.cu` | see PR 6 |
-| `include/ninfer/ops/projection_fp32.h`, `src/ops/projection_fp32/projection_fp32.cu` | `include/infernix/ops/projection_fp32.h`, `src/ops/projection_fp32/projection_fp32.cu` | see PR 6 |
-| `include/ninfer/ops/rows.h`, `src/ops/rows/rows.cu` | `include/infernix/ops/rows.h`, `src/ops/rows/rows.cu` | see PR 6 |
-| `tests/ops/test_hyper_connection.cpp`, `test_projection_fp32.cpp`, `test_rows.cpp` | `tests/ops/test_hyper_connection.cpp`, `tests/ops/linear/test_projection_fp32.cpp`, `tests/ops/test_rows.cpp` | see PR 6 |
+| `include/ninfer/ops/hyper_connection.h` | `include/infernix/ops/hyper_connection.h` | FP32 multiplier norm weight; no Q8 weight form |
+| `src/ops/hyper_connection/hyper_connection.cu` | `src/ops/hyper_connection/hyper_connection.cu` | BF16 weights only |
+| `src/ops/hyper_connection/hyper_connection_mix_fused.{h,cu}` | `src/ops/hyper_connection/hyper_connection_mix_fused.{h,cu}` | Grids re-fitted to 82 SMs |
+| `include/ninfer/ops/ple.h`, `src/ops/ple/ple.cu` | `include/infernix/ops/ple.h`, `src/ops/ple/ple.cu` | IQ4_NL `ple_embed`; FP32 multiplier norms; FP16 `[K, C]` conv weight |
+| `include/ninfer/ops/projection_fp32.h`, `src/ops/projection_fp32/projection_fp32.cu` | `include/infernix/ops/projection_fp32.h`, `src/ops/projection_fp32/projection_fp32.cu` | BF16 segment form plus a GGML IQ4_XS head |
+| `include/ninfer/ops/rows.h`, `src/ops/rows/rows.cu` | `include/infernix/ops/rows.h`, `src/ops/rows/rows.cu` | Verbatim |
+| `tests/ops/test_hyper_connection.cpp`, `test_projection_fp32.cpp`, `test_rows.cpp` | `tests/ops/test_hyper_connection.cpp`, `tests/ops/linear/test_projection_fp32.cpp`, `tests/ops/test_rows.cpp` | Ported with their Ops |
 
 ## Export conventions of this GGUF
 

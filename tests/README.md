@@ -115,6 +115,11 @@ The variable-width DFlash2 target-attention subset can be run with
 cache codecs, W=2..16, B=1..8, request-local prefixes, cache effects, and Graph metadata/input
 updates. The default executable also runs the existing attention geometries and prefill tests.
 
+`ninfer_qsa_test` qualifies the four QSA Ops (index query, pooled keys, block selection, attention
+over selected blocks) against their FP64 and exact oracles. `--small` runs the quick subset used
+under compute-sanitizer:
+`compute-sanitizer --tool memcheck build/tests/ninfer_tests ninfer_qsa_test --small`.
+
 Linear tests are independently runnable by weight and activation-compute profile:
 
 ```bash
