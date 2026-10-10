@@ -3,7 +3,7 @@
 // Adapted from Infernix a3edb450 include/infernix/ops/ple.h (Apache-2.0).
 // Modified for NInfer-3090: n-gram rows are GGML IQ4_NL blocks (Infernix: FP8 E4M3 with one
 // per-tensor scale), the three norm weights are stored FP32 multipliers instead of BF16 unit-offset
-// weights, the convolution weight is FP16 with each channel's taps contiguous, and the contract
+// weights, the convolution weight is FP32 with each channel's taps contiguous, and the contract
 // follows op-development §3.
 
 #include "core/tensor.h"
@@ -92,7 +92,7 @@ void ple_gate(const Tensor& key, const Tensor& value, const Tensor& residual,
  *   h'[c, k] = src(W - span + k) for k < span (the trailing span columns of history || normalized).
  *
  * Logical shapes:
- *   gated, normalized, residual BF16 [C, T]; weight FP16 [K, C] (tap j of channel c at c*K + j);
+ *   gated, normalized, residual BF16 [C, T]; weight FP32 [K, C] (tap j of channel c at c*K + j);
  *   states BF16 [C, span, slots]; source_slots, destination_slots I32 [sequences]. K >= 2,
  *   dilation >= 1, T a multiple of sequences.
  *

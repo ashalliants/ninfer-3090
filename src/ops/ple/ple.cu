@@ -1,7 +1,8 @@
 // Adapted from Infernix a3edb450 src/ops/ple/ple.cu (Apache-2.0).
 // Modified for NInfer-3090: ple_embed decodes GGML IQ4_NL rows (Infernix: FP8 E4M3 rows times one
-// scale), the norm weights are stored FP32 multipliers, the convolution weight is FP16 [K, C]
-// (each channel's taps contiguous), and the namespaces and includes are NInfer's.
+// scale), the norm weights are stored FP32 multipliers, the convolution weight is FP32 [K, C]
+// (each channel's taps contiguous; the GGUF's F16 taps widened exactly), and the namespaces and
+// includes are NInfer's.
 
 #include "ninfer/ops/ple.h"
 
@@ -122,7 +123,7 @@ __global__ void __launch_bounds__(kThreads)
 
 // One thread per (channel, column): reads the pre-update history.
 __global__ void conv_kernel(const bf16* __restrict__ gated, const bf16* __restrict__ normalized,
-                            const __half* __restrict__ weight, int taps, int dilation, int span,
+                            const float* __restrict__ weight, int taps, int dilation, int span,
                             int channels, int width, const bf16* __restrict__ states,
                             const std::int32_t* __restrict__ source_slots, int columns,
                             bf16* __restrict__ residual) {
@@ -142,7 +143,7 @@ __global__ void conv_kernel(const bf16* __restrict__ gated, const bf16* __restri
             x = __bfloat162float(
                 states[(static_cast<std::size_t>(slot) * span + (span + source)) * channels + c]);
         }
-        acc += __half2float(weight[static_cast<std::size_t>(c) * taps + j]) * x;
+        acc += weight[static_cast<std::size_t>(c) * taps + j] * x;
     }
     const std::size_t i = static_cast<std::size_t>(t) * channels + c;
     const float out     = __bfloat162float(gated[i]) + acc * sigmoidf(acc);
@@ -245,7 +246,7 @@ void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor
                      std::int32_t dilation, Tensor& states, const Tensor& source_slots,
                      const Tensor& destination_slots, Tensor& residual, cudaStream_t stream) {
     require(contiguous(gated, DType::BF16) && contiguous(normalized, DType::BF16) &&
-                contiguous(weight, DType::FP16) && contiguous(states, DType::BF16) &&
+                contiguous(weight, DType::FP32) && contiguous(states, DType::BF16) &&
                 contiguous(residual, DType::BF16) && contiguous(source_slots, DType::I32) &&
                 (destination_slots.data == nullptr || contiguous(destination_slots, DType::I32)),
             "conv requires contiguous tensors");
@@ -263,7 +264,7 @@ void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor
     const int width = columns / sequences;
     conv_kernel<<<dim3((channels + kThreads - 1) / kThreads, columns), kThreads, 0, stream>>>(
         static_cast<const bf16*>(gated.data), static_cast<const bf16*>(normalized.data),
-        static_cast<const __half*>(weight.data), taps, dilation, span, channels, width,
+        static_cast<const float*>(weight.data), taps, dilation, span, channels, width,
         static_cast<const bf16*>(states.data), static_cast<const std::int32_t*>(source_slots.data),
         columns, static_cast<bf16*>(residual.data));
     check_launch("conv");

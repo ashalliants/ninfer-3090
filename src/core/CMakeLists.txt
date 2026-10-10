@@ -17,6 +17,11 @@ add_library(ninfer_core STATIC
   evictable_kv_pool.cu
   evictable_weight_pool.cu
 )
+if(WIN32)
+  target_sources(ninfer_core PRIVATE read_only_file_win32.cpp)
+else()
+  target_sources(ninfer_core PRIVATE read_only_file_posix.cpp)
+endif()
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
 target_link_libraries(ninfer_core PUBLIC ${NINFER_CUDART_TARGET} CUDA::nvtx3 Threads::Threads CUDA::cuda_driver)

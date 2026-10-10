@@ -8,8 +8,9 @@
 
 namespace ninfer::ops::detail {
 
+// z selects the gated forms: SiLU(z), or sigmoid(z) when sigmoid_gate.
 void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
-                    const Tensor* z, Tensor& out, std::int32_t multiprocessor_count,
-                    cudaStream_t stream);
+                    const Tensor* z, bool sigmoid_gate, Tensor& out,
+                    std::int32_t multiprocessor_count, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

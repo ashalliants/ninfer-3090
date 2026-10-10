@@ -12,8 +12,11 @@
 
 namespace ninfer::ops {
 
+// Decay = false: rate[h] holds A_log and the decay is -exp(A_log). Decay = true: rate[h] is the
+// decay itself (GGUF ssm_a = -exp(A_log)).
+template <bool Decay>
 __global__ void gdn_gating_kernel(const __nv_bfloat16* a, const __nv_bfloat16* b,
-                                  const float* A_log, const float* dt_bias, float* g, float* beta,
+                                  const float* rate, const float* dt_bias, float* g, float* beta,
                                   std::int64_t n) {
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
@@ -22,7 +25,11 @@ __global__ void gdn_gating_kernel(const __nv_bfloat16* a, const __nv_bfloat16* b
         const float av = __bfloat162float(a[i]);
         const float bv = __bfloat162float(b[i]);
         const float sp = softplus(av + dt_bias[h]);
-        g[i]           = -expf(A_log[h]) * sp;
+        if constexpr (Decay) {
+            g[i] = rate[h] * sp;
+        } else {
+            g[i] = -expf(rate[h]) * sp;
+        }
         beta[i]        = sigmoid(bv);
     }
 }

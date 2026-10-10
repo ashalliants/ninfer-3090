@@ -1,5 +1,6 @@
 #include "core/weight.h"
 #include "ninfer/ops/embedding.h"
+#include "ops/ggml_blocks_decode.h"
 #include "ops/op_tester.h"
 #include "core/device.h"
 #include "core/decode_graph.h"
@@ -11,6 +12,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -874,6 +876,71 @@ int test_dense() {
     return failures;
 }
 
+// GGML IQ4_XS ggml_blocks_v1 table (the Qwen3.8-Flash-Next token embedding, D = 2560): every
+// output is exactly the BF16 rounding of the host decoder's value (ggml b11316's
+// dequantize_row_iq4_xs, qualified bit for bit against ggml in ninfer_ggml_blocks_decode_test).
+int test_ggml_iq4_xs() {
+    constexpr std::int32_t kVocab = 1000, kD = 2560, kBlock = 136;
+    const std::size_t row_bytes = static_cast<std::size_t>(kD / 256) * kBlock;
+    std::vector<std::byte> blocks(static_cast<std::size_t>(kVocab) * row_bytes);
+    std::uint32_t state = 0x1234567U;
+    const auto next = [&] {
+        state = state * 1664525U + 1013904223U;
+        return state >> 8;
+    };
+    for (auto& b : blocks) { b = static_cast<std::byte>(next() & 0xFF); }
+    // Finite FP16 scales of either sign, normal and subnormal (exponent field below 31).
+    for (std::size_t block = 0; block < blocks.size() / kBlock; ++block) {
+        auto* d = blocks.data() + block * kBlock;
+        const std::uint16_t bits = static_cast<std::uint16_t>((next() & 0x83FF) | ((next() % 31) << 10));
+        d[0] = static_cast<std::byte>(bits & 0xFF);
+        d[1] = static_cast<std::byte>(bits >> 8);
+    }
+    const std::vector<std::int32_t> ids = {0, kVocab - 1, 17, 17, 523, 2, 999, 400, 401};
+    std::vector<std::uint16_t> expected(static_cast<std::size_t>(kD) * ids.size());
+    for (std::size_t t = 0; t < ids.size(); ++t) {
+        const auto row = std::span<const std::byte>(blocks).subspan(
+            static_cast<std::size_t>(ids[t]) * row_bytes, row_bytes);
+        const std::vector<float> values = ninfer::test::ggml::decode_blocks(QType::GGML_IQ4_XS, row);
+        for (std::int32_t v = 0; v < kD; ++v) { expected[t * kD + v] = f32_to_bf16(values[v]); }
+    }
+
+    std::vector<std::uint8_t> table_bytes(blocks.size());
+    std::memcpy(table_bytes.data(), blocks.data(), blocks.size());
+    GuardedDeviceBuffer device_table(table_bytes.size());
+    device_table.copy_from_host(table_bytes.data(), table_bytes.size());
+    GuardedDeviceBuffer device_ids(ids.size() * sizeof(std::int32_t));
+    device_ids.copy_from_host(ids.data(), ids.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer output(expected.size() * sizeof(std::uint16_t));
+    output.fill(0xff);
+
+    Weight weight{};
+    weight.qtype         = QType::GGML_IQ4_XS;
+    weight.layout        = QuantLayout::GgmlBlocks;
+    weight.ndim          = 2;
+    weight.shape[0]      = kVocab;
+    weight.shape[1]      = kD;
+    weight.payload       = device_table.data();
+    weight.qdata         = device_table.data();
+    weight.payload_bytes = table_bytes.size();
+    weight.n             = kVocab;
+    weight.k             = kD;
+    weight.group         = 256;
+
+    Tensor input(device_ids.data(), DType::I32, {static_cast<std::int32_t>(ids.size())});
+    Tensor result(output.data(), DType::BF16, {kD, static_cast<std::int32_t>(ids.size())});
+    ops::embedding(input, weight, result, nullptr);
+    cuda_synchronize();
+
+    int failures = verify_exact("embedding GGML IQ4_XS [1000,2560]",
+                                guarded_to_host<std::uint16_t>(output, expected.size()), expected);
+    failures += output.verify_guards("embedding GGML IQ4_XS output");
+    failures += device_table.verify_guards("embedding GGML IQ4_XS table");
+    failures += verify_exact("embedding GGML IQ4_XS table unchanged",
+                             guarded_to_host<std::uint8_t>(device_table, table_bytes.size()), table_bytes);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -889,6 +956,7 @@ int main() {
         failures += test_q6();
         failures += test_q8();
         failures += test_fp8();
+        failures += test_ggml_iq4_xs();
     } catch (const std::exception& error) {
         std::cerr << "embedding test exception: " << error.what() << '\n';
         return 1;

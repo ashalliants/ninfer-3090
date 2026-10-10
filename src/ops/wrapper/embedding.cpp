@@ -268,6 +268,22 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
         require_non_empty_tensors(ids, out);
         detail::embed_gather_q8_launch(ids, table, out, stream);
         break;
+    case QType::GGML_IQ4_XS: {
+        // A ggml_blocks_v1 table: rows of D/256 blocks, codes only (scales live in the blocks).
+        require_weight_2d(table);
+        if (table.layout != QuantLayout::GgmlBlocks || table.shape[1] != out.ne[0] ||
+            out.ne[0] % 256 != 0 || table.qdata == nullptr) {
+            throw std::invalid_argument("embedding: GGML IQ4_XS table must be ggml_blocks_v1 [vocab,d], d % 256 == 0");
+        }
+        const std::uint64_t expected = checked_mul_u64(static_cast<std::uint64_t>(table.shape[0]),
+                                                       static_cast<std::uint64_t>(out.ne[0]) / 256 * 136);
+        if (table.payload_bytes != 0 && table.payload_bytes < expected) {
+            throw std::invalid_argument("embedding: GGML IQ4_XS payload is too small");
+        }
+        if (is_empty_T(ids, out)) { return; }
+        require_non_empty_tensors(ids, out);
+        detail::embed_gather_ggml_iq4_xs_launch(ids, table, out, stream);
+    } break;
     case QType::FP8_E4M3FN_ROW_BF16:
         require_fp8_metadata(table, out);
         if (is_empty_T(ids, out)) { return; }

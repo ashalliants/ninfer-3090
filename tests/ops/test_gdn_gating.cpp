@@ -40,8 +40,9 @@ std::vector<double> read_fp32(const void* device, std::size_t elements) {
     return {values.begin(), values.end()};
 }
 
+// decay: `a_log` holds the decay rate itself (gdn_gating_decay).
 void gating_oracle(const std::vector<float>& a, const std::vector<float>& b,
-                   const std::vector<float>& a_log, const std::vector<float>& dt_bias,
+                   const std::vector<float>& a_log, const std::vector<float>& dt_bias, bool decay,
                    std::vector<double>& g, std::vector<double>& beta) {
     g.resize(a.size());
     beta.resize(b.size());
@@ -50,18 +51,23 @@ void gating_oracle(const std::vector<float>& a, const std::vector<float>& b,
         const double av        = static_cast<double>(a[i]);
         const double bv        = static_cast<double>(b[i]);
         const double bias      = static_cast<double>(dt_bias[head]);
-        const double scale     = std::exp(static_cast<double>(a_log[head]));
-        g[i]                   = -scale * softplus(av + bias);
+        const double rate      = static_cast<double>(a_log[head]);
+        g[i]                   = (decay ? rate : -std::exp(rate)) * softplus(av + bias);
         beta[i]                = sigmoid(bv);
     }
 }
 
-int run_case(std::int32_t tokens, std::uint32_t seed, bool stress_transcendentals) {
+int run_case(std::int32_t tokens, std::uint32_t seed, bool stress_transcendentals,
+             bool decay = false) {
     const std::size_t elements = static_cast<std::size_t>(kHeads) * tokens;
     std::vector<float> a(elements), b(elements), a_log(kHeads), dt_bias(kHeads);
     fill_uniform(a, seed, -8.0F, 8.0F);
     fill_uniform(b, seed + 1u, -8.0F, 8.0F);
     fill_uniform(a_log, seed + 2u, -2.0F, 1.0F);
+    if (decay) {
+        // A stored decay -exp(A_log) as the GGUF holds it: negative, any FP32 word.
+        for (float& v : a_log) { v = -std::exp(v); }
+    }
     fill_uniform(dt_bias, seed + 3u, -1.0F, 1.0F);
     if (stress_transcendentals) {
         constexpr float values[] = {-30.0F, -15.0F, 0.0F, 15.0F, 30.0F};
@@ -74,7 +80,7 @@ int run_case(std::int32_t tokens, std::uint32_t seed, bool stress_transcendental
     round_to_bf16(b);
 
     std::vector<double> reference_g, reference_beta;
-    gating_oracle(a, b, a_log, dt_bias, reference_g, reference_beta);
+    gating_oracle(a, b, a_log, dt_bias, decay, reference_g, reference_beta);
 
     const std::vector<std::uint16_t> a_bits = bf16_bits(a);
     const std::vector<std::uint16_t> b_bits = bf16_bits(b);
@@ -94,12 +100,18 @@ int run_case(std::int32_t tokens, std::uint32_t seed, bool stress_transcendental
     Tensor tensor_g(device_g.data(), DType::FP32, {kHeads, tokens});
     Tensor tensor_beta(device_beta.data(), DType::FP32, {kHeads, tokens});
 
-    ops::gdn_gating(tensor_a, tensor_b, tensor_a_log, tensor_dt_bias, tensor_g, tensor_beta,
-                    nullptr);
+    if (decay) {
+        ops::gdn_gating_decay(tensor_a, tensor_b, tensor_a_log, tensor_dt_bias, tensor_g,
+                              tensor_beta, nullptr);
+    } else {
+        ops::gdn_gating(tensor_a, tensor_b, tensor_a_log, tensor_dt_bias, tensor_g, tensor_beta,
+                        nullptr);
+    }
     cuda_synchronize();
 
     const std::string label = std::string("gdn_gating T=") + std::to_string(tokens) +
-                              (stress_transcendentals ? " transcendental-range" : "");
+                              (stress_transcendentals ? " transcendental-range" : "") +
+                              (decay ? " decay" : "");
     int failures = 0;
     failures += verify_pointwise((label + " g").c_str(), read_fp32(device_g.data(), elements),
                                  reference_g, kGdnGatingFp32);
@@ -132,6 +144,9 @@ int main() {
     failures += run_case(128, 0x303u, false);
     failures += run_case(4096, 0x404u, false);
     failures += run_case(17, 0x505u, true);
+    failures += run_case(1, 0x606u, false, true);
+    failures += run_case(256, 0x707u, false, true);
+    failures += run_case(17, 0x808u, true, true);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_gating correctness\n";
     return failures == 0 ? 0 : 1;

@@ -27,5 +27,8 @@ void embed_gather_fp8_launch(const Tensor& ids, const Weight& table, Tensor& out
                              cudaStream_t stream);
 void embed_gather_q8_2048_launch(const Tensor& ids, const Weight& table, Tensor& out,
                                  Q8EmbedRoute route, cudaStream_t stream);
+// GGML IQ4_XS rows (ggml_blocks_v1): ggml's dequantize_row_iq4_xs of each row, rounded to BF16.
+void embed_gather_ggml_iq4_xs_launch(const Tensor& ids, const Weight& table, Tensor& out,
+                                     cudaStream_t stream);
 
 } // namespace ninfer::ops::detail
