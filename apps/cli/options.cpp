@@ -1,4 +1,5 @@
 #include "options.h"
+#include "product/reasoning_loop_options.h"
 #include "product/speculative_options.h"
 
 #include <cerrno>
@@ -139,7 +140,6 @@ std::string usage_text(const char* argv0) {
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N] [--devices N,M,...] [--stage-layers A,B,...]\n"
            "       [--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N]\n"
-           "       [--lookup-ngram N]\n"
            "       [--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4]\n"
            "       [--gdn-state-fp16] [--mlp-a8-decode] [--no-prefill-a8]\n"
            "       [--prefill-cublas [--no-prefill-cublas-projections]]\n"
@@ -150,6 +150,7 @@ std::string usage_text(const char* argv0) {
            "       [--grammar-file FILE | --json-object | --json-schema-file FILE |\n"
            "        --regex PATTERN | --choice TEXT ...]\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
+           "       [--reasoning-loop off|stop|conclude]\n"
            "       [--reasoning-effort none|minimal|low|medium|high|xhigh|max] [--vision]\n"
            "       [--vision-residency resident|overlay] [--vision-max-merged N]\n"
            "       [--no-cuda-graph]\n"
@@ -163,6 +164,9 @@ std::string usage_text(const char* argv0) {
            "memory per image; --vision-max-merged bounds one item's merged tokens (default 16384).\n"
            "--thinking-budget caps model-origin thinking tokens; inserted control tokens count "
            "toward --max-new.\n"
+           "--reasoning-loop off (default) | stop | conclude: when the open thinking keeps repeating "
+           "whole passages (checked every 512 thinking tokens), end the reply (stop) or close the "
+           "thinking and let the model answer (conclude).\n"
            "--devices N,M,... splits the model's layers into one pipeline stage per GPU, each owning "
            "its layers' weights, KV cache and state; the first GPU also holds the embedding, head "
            "and round state. --stage-layers A,B,... sets the layers per stage (default: chosen "
@@ -179,9 +183,6 @@ std::string usage_text(const char* argv0) {
            "perplexity cost (docs/performance.md), off by default, and it wants a larger "
            "--prefill-chunk to pay. --no-prefill-cublas-projections keeps the attention and GDN "
            "input projections off that route.\n"
-           "--lookup-ngram N adds context-lookup drafting alongside --spec: the last N tokens are "
-           "matched against the sequence so far and what followed is proposed. It is exact, and 0 "
-           "(the default) disables it.\n"
            "--kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom.\n"
@@ -264,8 +265,6 @@ Options parse_options(int argc, char** argv) {
             options.mlp_a8_decode = true;
         } else if (arg == "--no-prefill-a8") {
             options.prefill_a8 = false;
-        } else if (arg == "--lookup-ngram") {
-            options.speculative.lookup_ngram = parse_u32(value("--lookup-ngram"), "lookup-ngram");
         } else if (arg == "--prefill-cublas") {
             options.prefill_cublas = true;
         } else if (arg == "--no-prefill-cublas-projections") {
@@ -278,6 +277,8 @@ Options parse_options(int argc, char** argv) {
             options.enable_thinking = false;
         } else if (arg == "--thinking-budget") {
             options.thinking_budget = parse_u32(value(arg), "thinking-budget");
+        } else if (arg == "--reasoning-loop") {
+            options.reasoning_loop = ninfer::product::parse_reasoning_loop_action(value(arg));
         } else if (arg == "--reasoning-effort") {
             options.reasoning_effort = parse_reasoning_effort(value(arg));
         } else if (arg == "--vision") {
@@ -380,6 +381,10 @@ Options parse_options(int argc, char** argv) {
     if (options.reasoning_effort == ReasoningEffort::None) options.enable_thinking = false;
     if (options.enable_thinking == false && options.thinking_budget) {
         throw std::invalid_argument("--thinking-budget cannot be combined with --no-thinking");
+    }
+    if (options.enable_thinking == false &&
+        options.reasoning_loop != ninfer::ReasoningLoopAction::Off) {
+        throw std::invalid_argument("--reasoning-loop cannot be combined with --no-thinking");
     }
     if (options.greedy) { options.sampling.temperature = 0.0F; }
     return options;
