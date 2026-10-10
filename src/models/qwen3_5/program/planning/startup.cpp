@@ -965,18 +965,20 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         // Definitions remain per execution profile, but only one executable is instantiated for
         // each reachable node-topology class. These bounds cover the largest profile installed in
         // each class and the driver/module state materialized while qualifying all definitions.
+        // Speculative classes break on the target's attention routes.
+        const auto& attention = *impl->parameters->model.config().text.attention;
+        const MtpGraphAttention target_attention{
+            .geometry             = {dimension(attention.head_dim),
+                                     dimension(attention.num_attention_heads),
+                                     dimension(attention.num_key_value_heads)},
+            .storage              = impl->kv_storage,
+            .multiprocessor_count = impl->multiprocessor_count};
         if (impl->speculative_backend == SpeculativeBackend::None) {
             impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
                                                       "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
-            const auto& attention = *impl->parameters->model.config().text.attention;
-            const auto profiles   = mtp_graph_profiles(
-                impl->capacity, impl->draft_window,
-                {.geometry = {dimension(attention.head_dim),
-                              dimension(attention.num_attention_heads),
-                              dimension(attention.num_key_value_heads)},
-                 .storage              = impl->kv_storage,
-                 .multiprocessor_count = impl->multiprocessor_count});
+            const auto profiles =
+                mtp_graph_profiles(impl->capacity, impl->draft_window, target_attention);
             const std::size_t per_batch_allowance = graph_topology_allowance(
                 profiles,
                 [&](GraphExecutionProfile profile) {
@@ -1000,8 +1002,9 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                                       "MTP exact-b graph allowance");
         } else {
             const auto class_allowance = [&](std::uint32_t batch_size) {
-                const auto profiles = dflash_graph_profiles(
-                    impl->speculative_backend, impl->capacity, impl->draft_window, batch_size);
+                const auto profiles =
+                    dflash_graph_profiles(impl->speculative_backend, impl->capacity,
+                                          impl->draft_window, batch_size, target_attention);
                 return graph_topology_allowance(
                     profiles,
                     [&](GraphExecutionProfile profile) {

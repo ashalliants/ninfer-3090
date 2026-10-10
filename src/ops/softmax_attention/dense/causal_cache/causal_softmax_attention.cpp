@@ -25,6 +25,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -277,18 +278,101 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
 }
 
 #if defined(NINFER_SM8X_COMPAT)
+// The FP8, NVFP4 and K8V4 prompt kernels keep their H16 verify cutoffs.
 constexpr std::uint32_t kTwoChunkPromptVisibleKeys   = 512;
 constexpr std::uint32_t kThreeChunkPromptVisibleKeys = 1024;
+
+bool int8_family_storage(KvCacheStorage storage) {
+    return storage == KvCacheStorage::Int8Group64 ||
+           storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
+           storage == KvCacheStorage::RotatedLloyd4KeyInt4Value;
+}
+
+// A single-row INT8-family verify-width launch (W 6-16) takes the FA2 prompt kernel while its
+// visible-key maximum is at most this, and small-T above it. Indexed by W - 6; rk4v4 has its own
+// row, INT8-G64 and rk8v4 share one. Measured on the RTX 3090 (2026-10-10, ninfer_causal_softmax_
+// attention_bench, eager, cold, fragmented, three passes, cell pass-to-pass median 1.3 %) by forcing
+// the prompt route, small-T and every chunk width at W 6-32 over 0-4K cached keys, both
+// geometries and all three codings: each limit is the last key count from which the prompt kernel
+// stays at least as fast as the fastest small-T alternative. rk4v4's Lloyd-Max key expansion makes
+// its prompt launch dearer, so it hands over sooner. On the 35B, 13-16 columns win on the prompt
+// kernel again over about 1.4K-2K keys, where small-T's six-column launches need two waves; the
+// limit stays at the first crossover so the route changes once. Widths of 17 and more always
+// prompt (they were fastest on the prompt kernel in every swept cell); widths of at most 5 never
+// do.
+constexpr std::array<std::uint32_t, 11> kH24PromptKeysRk4v4{0,   128, 128, 288, 320, 448,
+                                                            448, 512, 576, 704, 704};
+constexpr std::array<std::uint32_t, 11> kH24PromptKeysInt8{96,  160, 160, 512, 512, 576,
+                                                           576, 704, 768, 832, 832};
+constexpr std::array<std::uint32_t, 11> kH16PromptKeysRk4v4{0,   288, 288, 352, 416,  512,
+                                                            576, 832, 832, 1024, 1024};
+constexpr std::array<std::uint32_t, 11> kH16PromptKeysInt8{128, 512,  512,  512,  512, 640,
+                                                           704, 1056, 1056, 1056, 1056};
+
+std::uint32_t int8_family_prompt_keys(std::int32_t q_heads, std::int32_t width,
+                                      KvCacheStorage storage) {
+    if (width < 6 || width > kMaximumVerifyTokens) { return 0; }
+    const bool rk4v4 = storage == KvCacheStorage::RotatedLloyd4KeyInt4Value;
+    const auto& limits =
+        q_heads == 24 ? (rk4v4 ? kH24PromptKeysRk4v4 : kH24PromptKeysInt8)
+                      : (rk4v4 ? kH16PromptKeysRk4v4 : kH16PromptKeysInt8);
+    return limits[static_cast<std::size_t>(width - 6)];
+}
+
+// Key tiers of single-row INT8-family chunked small-T launches. Small-T sizes its grid at one split
+// per 64 / SmallTSplitScale keys up to 4096 keys, so past the first tier a one-CTA-per-SM small-T
+// launch (6-8 columns on the 27B and 5-6 on the 35B, up to 8198 keys; see small_t.cu) needs a second
+// wave on the 3090's 82 SMs, while its two-CTA-per-SM launches of fewer columns still fit one. The
+// 35B's five-column launch runs one CTA per SM up to 4096 keys, and its six-column launch fits one
+// wave again over (5000, 5248] (small_t.cu's T >= 6 grid above 5000 keys; the 5248 edge was measured
+// between 5208 and 5258). The tier index only grows with the key count, and the launch shape
+// carries it, so a graph planner that bisects on launch shapes cannot step over a chunk-width change
+// whose neighbouring tiers happen to agree.
+constexpr std::array<std::uint32_t, 2> kH24ChunkTierKeys{82 / 4 * 64, 8198};                 // 1280
+constexpr std::array<std::uint32_t, 5> kH16ChunkTierKeys{82 / 2 * 64 / 2, 4096, 5000, 5248, // 1312
+                                                         8198};
+
+std::uint32_t int8_family_chunk_tier(std::int32_t q_heads, std::uint32_t keys) {
+    const auto count = [keys](const auto& edges) {
+        return static_cast<std::uint32_t>(
+            std::count_if(edges.begin(), edges.end(), [keys](std::uint32_t edge) {
+                return keys > edge;
+            }));
+    };
+    return q_heads == 16 ? count(kH16ChunkTierKeys) : count(kH24ChunkTierKeys);
+}
+
+// Chunk widths by key tier and W (27B: W 9-16; 35B: W 7-16), from the route sweep above plus
+// 1.1K-1.8K, 4.2K-8.1K and 6K-128K keys: per width and tier the fastest chunk width that keeps the
+// old chunk count (two on the 27B; two up to 12 columns and three above on the 35B), kept at the
+// old width where the difference was under about 3 % or changed sign between codings. A width's
+// chunk count is its graph node count, so holding it keeps every MTP and DFlash topology class (and
+// its reserved graph memory) as it was. Splits into more chunks measured another 10-35 % in the
+// middle tiers; they are not taken because they would add a topology class.
+constexpr std::array<std::array<std::int8_t, 8>, 3> kH24ChunkTokens{{
+    {8, 8, 6, 6, 8, 8, 8, 8}, // <= 1280 keys
+    {5, 5, 6, 7, 8, 8, 8, 8}, // (1280, 8198]
+    {8, 8, 6, 7, 8, 8, 8, 8}, // > 8198 (INT8-G64 keeps 5 at W 9-10, below)
+}};
+constexpr std::array<std::array<std::int8_t, 10>, 6> kH16ChunkTokens{{
+    {5, 6, 5, 5, 6, 6, 6, 6, 6, 6}, // <= 1312 keys
+    {4, 4, 5, 6, 6, 6, 5, 5, 6, 6}, // (1312, 4096]
+    {5, 4, 5, 5, 6, 6, 5, 5, 5, 6}, // (4096, 5000]
+    {6, 6, 6, 6, 6, 6, 6, 6, 6, 6}, // (5000, 5248]
+    {5, 4, 5, 5, 6, 6, 5, 5, 5, 6}, // (5248, 8198]
+    {6, 6, 6, 6, 6, 6, 6, 6, 6, 6}, // > 8198
+}};
 
 std::int32_t causal_attention_chunk_tokens(std::int32_t q_heads, std::int32_t width,
                                            std::int32_t batch_size, KvCacheStorage storage,
                                            CausalAttentionExecutionEnvelope envelope) {
-    if (q_heads == 16) return 6;
-    // INT8 benefits from 5+4/5 at long contexts.
-    if (batch_size == 1 && storage == KvCacheStorage::Int8Group64 && width >= 9 && width <= 10 &&
-        envelope.max_visible_keys > 4096)
-        return (width + 1) / 2;
-    return 8;
+    if (batch_size != 1 || !int8_family_storage(storage)) { return q_heads == 16 ? 6 : 8; }
+    const std::uint32_t tier = int8_family_chunk_tier(q_heads, envelope.max_visible_keys);
+    if (q_heads == 16) { return kH16ChunkTokens[tier][static_cast<std::size_t>(width - 7)]; }
+    // INT8-G64 keeps 5 + 4/5 at W 9-10 above 8198 keys too, as it did; there rk8v4 measured 2-3 %
+    // slower at 128K and rk4v4 within 1 %, so both keep 8.
+    if (tier == 2 && storage == KvCacheStorage::Int8Group64 && width <= 10) { return 5; }
+    return kH24ChunkTokens[tier][static_cast<std::size_t>(width - 9)];
 }
 
 struct SmallTWorkspace {
@@ -375,8 +459,13 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::i
                                                     std::int32_t batch_size, KvCacheStorage storage,
                                                     CausalAttentionExecutionEnvelope envelope) {
     if (storage == KvCacheStorage::BFloat16) return CausalAttentionRoute::Bf16;
+    const bool int8_family = int8_family_storage(storage);
+    if (int8_family && batch_size == 1 &&
+        envelope.max_visible_keys <= int8_family_prompt_keys(q_heads, width, storage)) {
+        return CausalAttentionRoute::Prompt;
+    }
     if (q_heads == 24 && width <= kMaximumVerifyTokens) {
-        if (batch_size == 1) {
+        if (batch_size == 1 && !int8_family) {
             std::uint32_t prompt_limit = 0;
             switch (storage) {
             case KvCacheStorage::BFloat16:
@@ -384,14 +473,7 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::i
             case KvCacheStorage::Int8Group64:
             case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
             case KvCacheStorage::RotatedLloyd4KeyInt4Value:
-                // The INT8 family shares one prompt and one small-T kernel, so the three codings
-                // share INT8's cutoff; rk8v4 and rk4v4 used to fall through to small-T. On the 27B
-                // (2026-09-24) that made 9-16 columns over 64-224 keys 1.1-1.9x faster, except
-                // rk8v4 at 9 columns over 224 keys (12% slower), the same trade INT8 makes there.
-                // That was measured on the tiled prompt kernel; the FA2-style kernel that replaced
-                // it takes 0.73-0.95x its time on these launches (2026-10-10).
-                prompt_limit = width <= 8 ? 0 : 256;
-                break;
+                throw std::logic_error("INT8-family verify widths are routed above");
             case KvCacheStorage::Fp8E4M3Row256:
                 prompt_limit = width <= 4 ? 0 : width <= 8 ? 128 : 320;
                 break;
@@ -408,6 +490,8 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::i
     }
     if (width <= 6) return CausalAttentionRoute::SmallT;
     if (batch_size > 1) return CausalAttentionRoute::ChunkedSmallT;
+    if (int8_family && q_heads == 16 && width <= kMaximumVerifyTokens)
+        return CausalAttentionRoute::ChunkedSmallT;
     const std::uint32_t prompt_visible_keys =
         width <= 12 ? kTwoChunkPromptVisibleKeys : kThreeChunkPromptVisibleKeys;
     if (q_heads == 16 && width <= kMaximumVerifyTokens &&
@@ -457,9 +541,7 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     // RTX 3090 (see geometry.cuh); the INT8-family prompt route plans its key splits from the
     // device SM count at the envelope's maximum, which bounds every launch inside the envelope
     // (prompt_i8_fa2_plan.h).
-    const bool int8_family = cache_storage == KvCacheStorage::Int8Group64 ||
-                             cache_storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
-                             cache_storage == KvCacheStorage::RotatedLloyd4KeyInt4Value;
+    const bool int8_family     = int8_family_storage(cache_storage);
     const auto prompt_capacity = [&](std::int32_t width) {
         if (!int8_family) { return std::size_t{0}; }
         const detail::CausalPromptFa2Plan plan = detail::causal_prompt_fa2_plan(
@@ -552,10 +634,7 @@ CausalAttentionLaunchShape causal_softmax_attention_launch_shape(
     // An INT8-family prompt launch's CTA shape and split choice are distinct kernel instantiations
     // and part of the route, and a launch that splits its keys adds the merge kernel.
     CausalAttentionLaunchShape shape{.route = static_cast<std::uint32_t>(route), .kernel_nodes = 2U};
-    if (route == detail::CausalAttentionRoute::Prompt &&
-        (cache_storage == KvCacheStorage::Int8Group64 ||
-         cache_storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
-         cache_storage == KvCacheStorage::RotatedLloyd4KeyInt4Value)) {
+    if (route == detail::CausalAttentionRoute::Prompt && int8_family_storage(cache_storage)) {
         const detail::CausalPromptFa2Plan plan = detail::causal_prompt_fa2_plan(
             geometry.query_heads, tokens, envelope.max_visible_keys,
             execution.multiprocessor_count);
@@ -570,6 +649,12 @@ CausalAttentionLaunchShape causal_softmax_attention_launch_shape(
             geometry.query_heads, tokens, batch_size, cache_storage, envelope));
         shape.route |= chunk << 8U;
         shape.kernel_nodes = 2U * ((static_cast<std::uint32_t>(tokens) + chunk - 1U) / chunk);
+        // The chunk width is not monotone in the key count; its key tier is.
+        if (batch_size == 1 && int8_family_storage(cache_storage)) {
+            shape.route |= int8_family_chunk_tier(geometry.query_heads,
+                                                  envelope.max_visible_keys)
+                           << 20U;
+        }
     }
     return shape;
 #else
