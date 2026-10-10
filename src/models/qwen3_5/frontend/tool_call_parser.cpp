@@ -25,10 +25,12 @@ constexpr std::string_view kToolClose = "</tool_call>";
 // Free output also accepts the XML forms agent harnesses (Claude Code and others) prompt models
 // with: a `<function_calls>` wrapper, bare `<function ...>`/`<invoke ...>` calls, quoted `name`
 // attributes and `<param>` parameters. A constrained grammar emits only `<tool_call>`, the first
-// entry.
+// entry. The other markers are the openers `function_open_header_begin()` accepts with a name
+// after the keyword (`=` or format whitespace). A bare `<function>` or `<invoke>` has no name, so
+// it is prose and must not shadow a later real call.
 constexpr std::string_view kToolMarkers[] = {
-    "<tool_call>", "<function_calls>", "<function=", "<function ", "<function>", "<function=\"",
-    "<function='", "<invoke=",         "<invoke ",   "<invoke>",   "<invoke=\"", "<invoke='",
+    "<tool_call>", "<function_calls>", "<function=",  "<function ",  "<function\t", "<function\r",
+    "<function\n", "<invoke=",         "<invoke ",    "<invoke\t",   "<invoke\r",   "<invoke\n",
 };
 
 struct RawParameter {
@@ -634,7 +636,8 @@ public:
             if (!tool) return Status::Invalid;
             position_ = end + 1;
             if (!take("\n")) return status_;
-            std::ptrdiff_t previous = -1;
+            std::ptrdiff_t previous       = -1;
+            std::uint32_t call_duplicates = 0;
             while (!input_.substr(position_).starts_with("</function>")) {
                 if (std::string_view("</function>").starts_with(input_.substr(position_)))
                     return Status::Incomplete;
@@ -674,10 +677,12 @@ public:
                     raw.parameters.push_back({name, value});
                 } else {
                     existing->value = value;
-                    ++diagnostics.duplicate_parameters_repaired;
+                    ++call_duplicates;
                 }
             }
             if (!take("</function>\n</tool_call>")) return status_;
+            // Repairs are published with their call; an unfinished call reports none.
+            diagnostics.duplicate_parameters_repaired += call_duplicates;
             if (!contract_.parallel && !calls.empty()) return Status::Invalid;
             std::string arguments = "{";
             bool first            = true;
@@ -783,7 +788,14 @@ void MarkdownCodeTracker::end_line() {
         return text.size() >= 3 && text[0] == fence && text[1] == fence && text[2] == fence;
     };
     if (fence_ != '\0') {
-        if (run_of_three(line, fence_)) { fence_ = '\0'; }
+        // A closing fence is a run of the opener's character followed only by whitespace, so a
+        // content line such as `~~~shell` stays inside the block.
+        const std::size_t run = line.find_first_not_of(fence_);
+        if (run_of_three(line, fence_) &&
+            (run == std::string_view::npos ||
+             line.find_first_not_of(" \t\r\f\v", run) == std::string_view::npos)) {
+            fence_ = '\0';
+        }
     } else if (!line.empty() && (line[0] == '`' || line[0] == '~') && run_of_three(line, line[0]) &&
                line.substr(3).find(std::string(3, line[0])) == std::string_view::npos) {
         // A ``` or ~~~ opener whose run is not closed on the same line (that is inline code).

@@ -114,6 +114,21 @@ void basic_contracts(ninfer::text::GrammarCompiler& compiled) {
     require(single.finish().diagnostics.duplicate_parameters_repaired == 0,
             "a call without repeats counted a duplicate repair");
 
+    // A repeat inside a call that never completes is discarded with that call, so it is not
+    // counted; the repeats of the calls that did complete still are.
+    const std::string unfinished = "<tool_call>\n<function=call>\n<parameter=x>\n1\n</parameter>\n"
+                                   "<parameter=x>\n2\n</parameter>\n";
+    frontend::ToolCallOutputDecoder cut_alone(integer, 64);
+    (void)cut_alone.feed(unfinished);
+    const auto alone = cut_alone.finish(ninfer::FinishReason::OutputLimit);
+    require(alone.tool_calls.empty() && alone.diagnostics.duplicate_parameters_repaired == 0,
+            "an unfinished call's duplicate repair was counted without a published call");
+    frontend::ToolCallOutputDecoder cut_after(integer, 64);
+    (void)cut_after.feed(repeated + "\n" + unfinished);
+    const auto after = cut_after.finish(ninfer::FinishReason::OutputLimit);
+    require(after.tool_calls.size() == 1 && after.diagnostics.duplicate_parameters_repaired == 1,
+            "a completed call's duplicate repair was lost or inflated by an unfinished one");
+
     // These requests share the same compiled envelope but have different value normalization.
     const auto string = contract(schema({{"type", "string"}}), false);
     for (const auto& bound : {integer, string}) {
