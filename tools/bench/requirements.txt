@@ -1,4 +1,6 @@
 # Corpus-baker dependencies (tools/bench/make_bench_corpus.py). Loads a local Hugging Face
 # tokenizer only: run with --tokenizer-path or NINFER_TOKENIZER_PATH; never downloads from the network.
+# `agent_replay export` uses tokenizers and jinja2; the replay itself is stdlib-only.
 transformers>=4.40
 tokenizers>=0.19
+jinja2>=3.1
