@@ -1117,7 +1117,9 @@ int test_markdown_quoted_calls() {
     const std::vector<std::string> quoted{
         "Format:\n```xml\n" + call + "\n```\nDone.", "Format:\n~~~\n" + call + "\n~~~\nDone.",
         "Use `" + call + "` like this.", "Use `x`, then `\n" + call + "`", "```\n" + call,
-        "Text\n\n```python\nx = 1\n```\n```\n" + call};
+        "Text\n\n```python\nx = 1\n```\n```\n" + call,
+        // A line that starts with the fence character but carries info text does not close it.
+        "~~~\n~~~shell\n" + call, "```\n```cpp\n" + call, "~~~\n~~~~x\n" + call};
     // (output, content before the call)
     const std::vector<std::pair<std::string, std::string>> real{
         {call, ""},
@@ -1125,7 +1127,9 @@ int test_markdown_quoted_calls() {
         {"Let me do it. " + call, "Let me do it."},
         {"```\ncode\n```\n" + call, "```\ncode\n```"},
         {"`a` and `b` " + call, "`a` and `b`"},
-        {"~~~\nx\n~~~\n\n" + call, "~~~\nx\n~~~"}};
+        {"~~~\nx\n~~~\n\n" + call, "~~~\nx\n~~~"},
+        // A closing fence may be longer than the opener's three and carry trailing whitespace.
+        {"~~~\nx\n~~~~  \n" + call, "~~~\nx\n~~~~"}};
     const std::string example = "Example:\n```\n" + call + "\n```\nNow for real.";
     for (const bool mode : {false, true}) {
         tolerant = mode;
@@ -1681,6 +1685,61 @@ int test_tolerant_ignored_by_constrained_contracts() {
     return failures;
 }
 
+// The marker scan must accept every opener the parser accepts and no opener it cannot parse.
+int test_bare_marker_boundaries() {
+    const std::vector<std::string> definitions = {
+        tool_definition("write", Json{{"path", Json{{"type", "string"}}}})};
+    const auto contract = contract_from_definitions(definitions);
+    const std::string args = R"({"path":"/a"})";
+    int failures           = 0;
+    const auto parse_both = [&](const std::string& text, const std::string& label) {
+        const auto whole = fi::parse_qwen_tool_call_output(text, 64, *contract);
+        for (const std::size_t width : {std::size_t{1}, std::size_t{4}, text.size()}) {
+            fi::ToolCallOutputDecoder decoder(contract, 64);
+            std::string content;
+            for (std::size_t at = 0; at < text.size(); at += width) {
+                content += decoder.feed(std::string_view(text).substr(at, width));
+            }
+            auto terminal = decoder.finish();
+            content += terminal.content;
+            failures += check(content == whole.content &&
+                                  terminal.tool_calls.size() == whole.tool_calls.size(),
+                              "streamed width " + std::to_string(width) +
+                                  " disagrees with the whole output: " + label);
+        }
+        return whole;
+    };
+
+    // Tab, newline and carriage return after the keyword are accepted by the parser, so the scan
+    // must find them.
+    for (const char* separator : {"\t", "\n", "\r"}) {
+        for (const std::string keyword : {"function", "invoke"}) {
+            const std::string close = "</" + keyword + ">";
+            const std::string text  = "Calling.\n<" + keyword + separator +
+                                     "name=\"write\"><parameter name=\"path\">/a</parameter>" +
+                                     close;
+            const auto parsed = parse_both(text, keyword + " with separator");
+            failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                                  parsed.tool_calls.front().arguments_json == args &&
+                                  parsed.content == "Calling.",
+                              "a bare <" + keyword + "> header with a tab or newline after the "
+                              "keyword was returned as text");
+        }
+    }
+
+    // An unnamed `<function>` / `<invoke>` is prose; it must not shadow a later real bare call.
+    for (const std::string prose : {"<function>", "<invoke>"}) {
+        const std::string text = "Wrap it in " + prose + " tags.\n<invoke name=\"write\">"
+                                 "<parameter name=\"path\">/a</parameter></invoke>";
+        const auto parsed = parse_both(text, prose);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                              parsed.tool_calls.front().arguments_json == args &&
+                              parsed.content == "Wrap it in " + prose + " tags.",
+                          "an unnamed " + prose + " in prose blocked a later real call");
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -1724,6 +1783,7 @@ int main() {
     failures += test_tolerant_undeclared_name();
     failures += test_tolerant_unclosed_function_calls_wrapper();
     failures += test_tolerant_ignored_by_constrained_contracts();
+    failures += test_bare_marker_boundaries();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

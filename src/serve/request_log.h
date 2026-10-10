@@ -23,8 +23,9 @@ namespace ninfer::serve {
 // 22 was the fork on top of upstream 21; upstream 23 is the preemption engine; 24 was the fork
 // (structured output, thinking clamp, overlay, waiting/cancel counters) on top of upstream 23.
 // Upstream 24 adds the request_scheduling event; 25 was the fork on top of upstream 24. Upstream
-// 25 adds constraint observations and admission stats; 26 is the fork on top of upstream 25.
-inline constexpr int kRequestLogSchemaVersion        = 26;
+// 25 adds constraint observations and admission stats; 26 is the fork on top of upstream 25;
+// 27 adds the reasoning-loop fields; 28 adds tool_call_parse.duplicate_parameters_repaired.
+inline constexpr int kRequestLogSchemaVersion        = 28;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct ServerLogEnvironment {

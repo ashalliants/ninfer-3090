@@ -50,10 +50,9 @@ requests are not guaranteed.
 > your desktop's GPU? Plans start with a day pass, and every verified account gets a few free
 > requests a day. Thank you to NeverMetered for supporting this project.
 
-**New in v0.14.2:** long prompts no longer have to block short ones. `--max-prefill-lanes N` reads
-several prompts in at once (default 2 with three or more `--max-concurrency` lanes; a short request behind a 3,000-token prompt: 2.5 s to 1.5 s to first word),
-`GET /slots` reports each retained conversation's reuse, and `--host-cache-max-mib` caps the
-RAM cache on shared machines. The rest are opt-in. See the [v0.14.2 release notes](RELEASE_NOTES_0.14.2.md).
+**v0.14.2:** `--host-cache-max-mib` caps the RAM cache on shared machines. This release also
+added `--max-prefill-lanes` and `GET /slots`, which the current engine no longer provides
+(see [docs/serving.md](docs/serving.md)). See the [v0.14.2 release notes](RELEASE_NOTES_0.14.2.md).
 
 **v0.14.1:** a stability fix for `ninfer-serve`. A large or unplannable request no longer fails
 every running request (`internal error generation`) or clears the context cache; only that request
@@ -146,7 +145,7 @@ now pins all of it too (earlier releases clamped it there to about 4.6 GiB).
 `NINFER_CHAT_TEMPLATE` for every profile, plus `NINFER_CONTEXT`, `NINFER_CONCURRENCY`,
 `NINFER_KV_CAPACITY`, `NINFER_KV_DTYPE`, `NINFER_SPEC`, `NINFER_DRAFT_TOKENS`, `NINFER_PREFILL_CHUNK`,
 `NINFER_VISION`, `NINFER_HOST_CONTEXT_MIB` (8192), `NINFER_MIN_P` (0.03) and `NINFER_PRESENCE_PENALTY` (0.5) for the
-default ones; the last two are the loop guard, and `default` leaves the registered sampling preset in force. Other serving flags are opt-in overrides too: `NINFER_AUTO_HOST_CACHE=on`, `NINFER_MAX_OUTPUT_TOKENS`, `NINFER_LOOKUP_NGRAM`, `NINFER_MLP_A8_DECODE=on` and `NINFER_CONTEXT_STORE` (listed with their caps at the top of `run.sh` / `run.bat`). The launchers bind `127.0.0.1`;
+default ones; the last two are the loop guard, and `default` leaves the registered sampling preset in force. Other serving flags are opt-in overrides too: `NINFER_AUTO_HOST_CACHE=on`, `NINFER_MAX_OUTPUT_TOKENS`, `NINFER_MLP_A8_DECODE=on` and `NINFER_CONTEXT_STORE` (listed with their caps at the top of `run.sh` / `run.bat`). The launchers bind `127.0.0.1`;
 `NINFER_HOST=0.0.0.0` exposes the server to the LAN, **unauthenticated**. On Windows,
 `set NINFER_SPEC=mtp && run.bat qwen38-27b`; on Linux, `NINFER_SPEC=mtp ./run.sh qwen38-27b`.
 
