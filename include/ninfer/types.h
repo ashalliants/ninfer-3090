@@ -430,6 +430,10 @@ struct OutputOptions {
     // Presentation constraint supplied by the protocol adapter. It bounds only Qwen's emitted
     // function-name grammar; it does not require the name to match a currently declared tool.
     std::uint32_t tool_name_max_length = 128;
+    // Repair Qwen tool-call markup the strict free parser rejects (`--tolerant-tool-calls`). Only
+    // free tool output consults it; constrained tool contracts already admit only exact calls.
+    // A call whose parameter value was cut is never kept.
+    bool tolerant_tool_calls = false;
 };
 
 enum class OutputConstraintKind : std::uint8_t { Grammar, JsonObject, JsonSchema, Choice, Regex };
@@ -553,6 +557,10 @@ struct ToolCallParseDiagnostics {
     ToolCallParseFallbackReason fallback_reason = ToolCallParseFallbackReason::None;
     // The structured calls came from free tool output whose turn ended inside unclosed thinking.
     bool recovered_from_reasoning = false;
+    // Tolerant tool-call parsing repaired markup the strict parser rejects to produce the
+    // structured calls: a discarded suffix or malformed later call, a repaired opener, a kept
+    // undeclared name, or closing tags missing at the end of a turn the model ended itself.
+    bool tolerant_recovered = false;
 
     [[nodiscard]] friend constexpr bool
     operator==(const ToolCallParseDiagnostics&, const ToolCallParseDiagnostics&) noexcept = default;

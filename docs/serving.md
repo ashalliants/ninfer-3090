@@ -657,6 +657,39 @@ cancellation, or when prose, a quoted marker or a cut call follows the last call
 output cannot end inside thinking: its grammar admits the stop token only after the canonical
 thinking close, so this recovery does not apply there.
 
+#### Tolerant tool calls
+
+By default a tool-call region the parser cannot read exactly is returned as ordinary content, so an
+agent client shows raw `<tool_call>` text where a tool should have run. `--tolerant-tool-calls`
+(off by default) repairs the common ways a model breaks that markup and returns the calls
+structurally instead. It applies only to free tool output, that is requests sent with
+`tool_constraints:"auto"` that fall back to free generation as described under
+[Tool constraints](#tool-constraints). Constrained output, the default, already admits only exact
+calls and never consults the flag.
+
+With the flag, these calls are kept whatever ended the turn:
+
+- complete calls followed by prose or by a malformed or cut call: the calls are kept and what follows
+  them is dropped. Prose that itself contains another call marker is not dropped: the calls before it
+  may be an example the answer quotes, so the later region is tried instead;
+- complete calls inside a `<function_calls>` wrapper that never closes;
+- a call whose opener the model mangled inside `<tool_call>`: a dropped or doubled `<`, a leaked
+  `<|im_start|>`, a dropped `function` keyword (`<=name>`), or a missing `>` after the function name
+  when the next tag follows on the next line;
+- a complete call to a tool name the request did not declare. It is returned for the client to
+  reject, since leaking it as text would hide the call; strict parsing returns it as text.
+
+A final call whose parameters all closed but whose `</function>` or `</tool_call>` is missing is
+kept only when the model ended the turn itself with its stop token. If the turn ended at the output
+limit, context capacity, a stop string or a cancellation, the call may have been cut between
+parameters, so only the calls before it are kept, as on the constrained route.
+
+The flag **never** keeps a call whose parameter value was cut off before its closing tag: a cut path,
+command or patch would run as something the model did not write. Such a call is dropped (or, when
+it is the only one, the output stays text). The flag also never applies to calls recovered from
+unclosed thinking, which must parse exactly. A repaired turn reports `tolerant_recovered` in the
+[structured request log](#structured-request-log) and logs one Info line.
+
 ### Tool constraints
 
 The three protocols share one constrained tool implementation:
@@ -1379,6 +1412,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-exit-on-engine-failure` | stay alive (answering 503) when the engine latches unavailable, instead of logging FATAL and exiting with status 3 after 5 s | exit |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
+| `--tolerant-tool-calls` | repair broken tool-call markup on `tool_constraints:"auto"` requests instead of returning it as text; never keeps a call whose argument was cut. See [Tolerant tool calls](#tolerant-tool-calls) | off |
 | `--graft NAME=PATH` | load a [prompt graft](#prompt-grafts) a request may select by name; repeatable | none |
 | `--default-graft NAME` | apply a loaded graft to requests that state none; `"graft": ""` opts out | none |
 | `--reasoning-effort minimal\|low\|medium\|high\|xhigh\|max` | effort for thinking-enabled requests that state none | template default |
@@ -1446,7 +1480,11 @@ preserved for consumer validation, repeated parameter names resolved to their la
 (`duplicate_parameters_repaired`), and a stable text-fallback reason. Fallback reasons are `none`,
 `malformed_structure`, `invalid_tool_name`, `undeclared_tool`, and `trailing_content`.
 `recovered_from_reasoning` is true when the structured calls came from a turn that ended inside
-its unclosed thinking. These counters contain no tool arguments or generated text.
+its unclosed thinking. `tolerant_recovered` is true when `--tolerant-tool-calls` repaired markup
+the strict parser returns as text to produce the structured calls (see
+[Tolerant tool calls](#tolerant-tool-calls)); the fallback reason is then `none`. These counters
+contain no tool arguments or generated text. `server_start.server.tolerant_tool_calls` records the
+flag.
 
 `request_done.constraint` carries the same constraint observation as the HTTP terminal result,
 or `null` for unconstrained requests. Preparation failures and execution errors use the existing

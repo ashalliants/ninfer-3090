@@ -308,6 +308,14 @@ std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogConte
                        std::to_string(outcome.tool_call_parse.structured_call_count),
         };
     }
+    if (outcome.tool_call_parse.tolerant_recovered) {
+        return OperationalRecord{
+            .severity = OperationalSeverity::Info,
+            .message  = "req#" + std::to_string(context.id) +
+                       " tool markup repaired by --tolerant-tool-calls | calls=" +
+                       std::to_string(outcome.tool_call_parse.structured_call_count),
+        };
+    }
     if (!outcome.tool_call_parse.marker_seen ||
         reason == ninfer::ToolCallParseFallbackReason::None) {
         return std::nullopt;

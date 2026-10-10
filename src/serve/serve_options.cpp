@@ -153,7 +153,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--gdn-state-fp16] "
            "[--mlp-a8-decode] [--no-prefill-a8] "
            "[--prefill-cublas [--no-prefill-cublas-projections]] [--lookup-ngram N] "
-           "[--no-thinking] [--preserve-thinking] [--graft NAME=PATH]... [--default-graft NAME] "
+           "[--no-thinking] [--preserve-thinking] [--tolerant-tool-calls] "
+           "[--graft NAME=PATH]... [--default-graft NAME] "
            "[--reasoning-effort minimal|low|medium|high|xhigh|max] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -227,6 +228,14 @@ std::string serve_usage_text(const char* argv0) {
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
+           "       --tolerant-tool-calls repairs tool calls the model wrote with broken markup "
+           "instead of returning them as plain text. Turn it on when an agent shows raw "
+           "<tool_call> text where a tool should have run. It affects only requests sent with "
+           "\"tool_constraints\": \"auto\"; the default constrained tool calls are always exact. "
+           "It keeps the complete calls and drops what follows them, repairs a mangled call "
+           "opener, and passes on a call to an undeclared tool name for the client to reject. "
+           "It never runs a call whose argument was cut off, and keeps a call missing its "
+           "closing tags only when the model ended its turn itself. Off by default\n"
            "       --graft NAME=PATH loads a phantom-kv prefill graft (a safetensors container with a "
            ".json sidecar beside it); a request selecting it with \"graft\": \"NAME\" runs as if the "
            "graft's hidden turn preceded its own messages. Repeatable\n"
@@ -560,6 +569,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_thinking = false;
         } else if (arg == "--preserve-thinking") {
             options.preserve_thinking = true;
+        } else if (arg == "--tolerant-tool-calls") {
+            options.tolerant_tool_calls = true;
         } else if (arg == "--graft") {
             const std::string_view spec = require_value("--graft");
             const std::size_t equals    = spec.find('=');

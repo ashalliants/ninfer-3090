@@ -2321,6 +2321,68 @@ int test_open_reasoning_tool_recovery() {
     return failures;
 }
 
+// OutputOptions::tolerant_tool_calls reaches the session's free tool output, and the session's
+// finish reason sets what it may repair: a call missing its closing tags is kept only when the
+// model ended the turn with its stop token.
+int test_tolerant_tool_calls_session() {
+    const Frontend frontend = make_frontend(resources());
+    ninfer::PromptInput input;
+    input.messages.push_back({.role  = ninfer::ChatRole::User,
+                              .parts = {{.kind = ninfer::MessagePartKind::Text, .text = "x"}}});
+    input.options.enable_thinking = false;
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}}}}})");
+    const auto prompt = frontend.prepare(std::move(input));
+    ninfer::ToolChoice free_calls;
+    free_calls.constraints = ninfer::ToolConstraintMode::Automatic;
+    const ninfer::TokenId eos = frontend.default_stop_policy().token_ids.front();
+
+    struct Turn {
+        std::string content;
+        std::vector<ninfer::GeneratedToolCall> calls;
+        ninfer::ToolCallParseDiagnostics diagnostics;
+    };
+    const auto run = [&](const std::string& generated, bool tolerant, bool end_with_eos) {
+        auto session = frontend.make_output_session(
+            prompt, {},
+            ninfer::OutputOptions{.tool_name_max_length = 64, .tolerant_tool_calls = tolerant}, {},
+            {}, free_calls);
+        std::vector<ninfer::TokenId> tokens = fixture_tokenizer().encode(generated);
+        if (end_with_eos) { tokens.push_back(eos); }
+        const auto budget = static_cast<std::uint32_t>(tokens.size() + (end_with_eos ? 8U : 0U));
+        (void)session.preview_model(tokens, budget, ninfer::FinishReason::OutputLimit);
+        Turn turn;
+        turn.content     = channel_text(session.commit_preview(), ninfer::OutputChannel::Content);
+        turn.calls       = session.take_tool_calls();
+        turn.diagnostics = session.tool_call_parse_diagnostics();
+        return turn;
+    };
+    const auto kept = [](const Turn& turn) {
+        return turn.content == "Running it." && turn.calls.size() == 1 &&
+               turn.calls[0].name == "bash" &&
+               turn.calls[0].arguments_json == R"({"command":"ls"})" &&
+               turn.diagnostics.tolerant_recovered;
+    };
+
+    const std::string head =
+        "Running it.\n<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n";
+    const std::string suffixed = head + "</function>\n</tool_call>\nI'll wait for the output.";
+    int failures               = 0;
+    failures += check(kept(run(suffixed, true, true)) && kept(run(suffixed, true, false)),
+                      "the session did not keep a call before a suffix with tolerant tool calls");
+    const Turn strict = run(suffixed, false, true);
+    failures += check(strict.calls.empty() && strict.content == suffixed &&
+                          !strict.diagnostics.tolerant_recovered,
+                      "the session repaired a call without tolerant tool calls");
+    failures += check(kept(run(head, true, true)),
+                      "the session did not keep an unclosed final call at its stop token");
+    const Turn cut = run(head, true, false);
+    failures += check(cut.calls.empty() && cut.content == head &&
+                          !cut.diagnostics.tolerant_recovered,
+                      "the session kept an unclosed call the output budget cut");
+    return failures;
+}
+
 int test_reasoning_split(const Frontend& frontend) {
     ninfer::ChatMessage message;
     message.role = ninfer::ChatRole::User;
@@ -3092,6 +3154,7 @@ int main() {
     failures += test_structured_tool_output();
     failures += test_tools_and_json_output();
     failures += test_open_reasoning_tool_recovery();
+    failures += test_tolerant_tool_calls_session();
     failures += test_constraint_refuses_caller_stops(frontend);
     failures += test_reasoning_split(frontend);
     failures += test_thinking_budget_control(frontend);

@@ -104,7 +104,8 @@ Json tool_call_parse_json(const ninfer::ToolCallParseDiagnostics& diagnostics) {
                 {"duplicate_parameters_repaired", diagnostics.duplicate_parameters_repaired},
                 {"fallback_reason",
                  ninfer::tool_call_parse_fallback_reason_name(diagnostics.fallback_reason)},
-                {"recovered_from_reasoning", diagnostics.recovered_from_reasoning}};
+                {"recovered_from_reasoning", diagnostics.recovered_from_reasoning},
+                {"tolerant_recovered", diagnostics.tolerant_recovered}};
 }
 
 std::string tool_choice_name(const ToolChoice& choice) {
@@ -754,6 +755,7 @@ std::string format_server_start_json(
                   : Json(nullptr)},
              {"default_preserve_thinking",
               options.preserve_thinking ? Json(*options.preserve_thinking) : Json(nullptr)},
+             {"tolerant_tool_calls", options.tolerant_tool_calls},
              {"default_graft",
               options.default_graft.empty() ? Json(nullptr) : Json(options.default_graft)}};
     record["artifact"]                             = Json{{"path", options.artifact_path},
