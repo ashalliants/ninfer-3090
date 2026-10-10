@@ -118,6 +118,20 @@ ninfer_add_test(ninfer_qwen3_5_visual_scatter_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_visual_scatter.cpp"
   LIBRARIES ninfer_engine ninfer_core)
 
+# The context store under the launchers' DFlash2 profile (K=7, draft head, rk4v4, FP16 GDN state),
+# without and with n-gram copy drafting: the stored StateImages carry the draft's local rings, and
+# every restored continuation must match the warm control's output and speculation exactly.
+ninfer_bundle_command(ninfer_qwen3_5_context_store_real_command ninfer_tests
+  ninfer_qwen3_5_context_store_real_test)
+add_test(NAME ninfer_qwen3_5_context_store_dflash2_real_test
+  COMMAND ${ninfer_qwen3_5_context_store_real_command})
+set_tests_properties(ninfer_qwen3_5_context_store_dflash2_real_test PROPERTIES
+  ENVIRONMENT "NINFER_STORE_REAL_SPEC=dflash2")
+add_test(NAME ninfer_qwen3_5_context_store_ngram_real_test
+  COMMAND ${ninfer_qwen3_5_context_store_real_command})
+set_tests_properties(ninfer_qwen3_5_context_store_ngram_real_test PROPERTIES
+  ENVIRONMENT "NINFER_STORE_REAL_SPEC=dflash2-ngram")
+
 ninfer_bundle_command(ninfer_qwen3_5_prefix_real_command ninfer_tests
   ninfer_qwen3_5_prefix_real_test)
 add_test(NAME ninfer_qwen3_5_agent_continuation_real_test
@@ -132,6 +146,8 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_prefix_real_test
   ninfer_qwen3_5_agent_continuation_real_test
   ninfer_qwen3_5_context_store_real_test
+  ninfer_qwen3_5_context_store_dflash2_real_test
+  ninfer_qwen3_5_context_store_ngram_real_test
   ninfer_qwen3_5_preemption_real_test
   ninfer_qwen3_5_recovery_real_test
   ninfer_qwen3_5_grammar_real_test

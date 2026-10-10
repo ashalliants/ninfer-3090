@@ -8,7 +8,8 @@
 //               cancellation mid-copy each leave a prefix of that output; the Engine then
 //               reproduces it whole
 //   restore     a follow-up turn bound from its retained session copies again and matches the same
-//               turn prefilled from scratch (the context store does not take DFlash backends)
+//               turn prefilled from scratch, and so does one restored from the context store after
+//               an Engine restart
 //   constrained a JSON-schema answer copying a JSON blob from a tool result validates, copies were
 //               verified, and the blob's number, which the schema makes a string, never leaks
 //   lanes       two lanes, one copying the file while the other writes free text: the copying lane
@@ -32,6 +33,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <iostream>
 #include <optional>
 #include <sstream>
@@ -262,9 +264,8 @@ ninfer::PromptInput follow_up(const std::string& reply) {
     return input;
 }
 
-// The context store does not take the DFlash backends, so a restored session here is one the
-// context cache retained from the previous turn: the follow-up turn binds from that checkpoint
-// instead of prefilling, and its copies come from the prompt's index all the same.
+// A session the context cache retained from the previous turn: the follow-up turn binds from that
+// checkpoint instead of prefilling, and its copies come from the prompt's index all the same.
 void check_restore(ninfer::Engine& engine, std::uint32_t budget) {
     ninfer::PromptInput first = copy_prompt(false);
     first.context_cache.allow_engine_automatic_shared_prefixes = false;
@@ -278,6 +279,47 @@ void check_restore(ninfer::Engine& engine, std::uint32_t budget) {
     require_same(restored, fresh.generated_token_ids, "restored copy");
     std::cout << "restore: reused " << restored.reused_prompt_tokens << " tokens, copies accepted "
               << restored.speculative.ngram_accepted_tokens << '\n';
+}
+
+// The same follow-up after an Engine restart: the first Engine writes the session to the context
+// store at shutdown and a second restores it at start-up. The restored request builds its copy index
+// from its own prompt as any other does, copies again and matches the turn prefilled from scratch.
+void check_store_restore(const char* artifact, ninfer::KvCacheStorage kv, std::uint32_t budget) {
+    const std::filesystem::path directory =
+        std::filesystem::temp_directory_path() / "ninfer-ngram-store-real";
+    std::filesystem::remove_all(directory);
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() {
+            std::error_code ignored;
+            std::filesystem::remove_all(path, ignored);
+        }
+    } const cleanup{directory};
+    auto options = engine_options(artifact, kv, true, true);
+    options.context_cache.host_capacity_bytes = std::size_t{1} << 30U;
+    options.context_store.directory           = directory;
+    options.context_store.idle_persist        = std::chrono::seconds(0);
+    ninfer::PromptInput first = copy_prompt(false);
+    first.context_cache.allow_engine_automatic_shared_prefixes = false;
+    std::string reply;
+    {
+        ninfer::Engine engine(options);
+        reply = engine.generate(engine.prepare(first), greedy(budget, true)).content;
+    }
+    ninfer::Engine engine(options);
+    require(engine.runtime_stats().context_store_restored == 1,
+            "the restarted Engine did not restore the stored session");
+    const auto restored = engine.generate(engine.prepare(follow_up(reply)), greedy(budget, true));
+    require(restored.reused_prompt_tokens > 0, "the follow-up turn did not use the stored session");
+    require(restored.speculative.ngram_accepted_tokens > 0,
+            "the turn restored from the store accepted no copies");
+    const auto fresh = engine.generate(engine.prepare(follow_up(reply)), greedy(budget));
+    require(fresh.reused_prompt_tokens == 0, "the control turn reused a session");
+    require_same(restored, fresh.generated_token_ids, "store-restored copy");
+    std::cout << "store restore: reused " << restored.reused_prompt_tokens
+              << " tokens after a restart, copies accepted "
+              << restored.speculative.ngram_accepted_tokens << '/'
+              << restored.speculative.ngram_drafted_tokens << '\n';
 }
 
 void check_constrained(ninfer::Engine& engine) {
@@ -453,6 +495,7 @@ int main(int argc, char** argv) {
                 check_restore(engine, kBudget);
             }
         }
+        check_store_restore(artifact, kv, kBudget);
         check_lanes(artifact, kv, reference, kBudget);
         check_preemption(artifact, kv, reference, true);
         check_preemption(artifact, kv, reference, false);

@@ -35,12 +35,41 @@
 //   stages     a session written by a two-stage Engine restores on one device, and the reverse
 //   recovery   after a worker failure clears the cache, the next turn reads the session back
 //   damaged    a store whose chunk was damaged is not trusted
+//   foreign    a store written under another speculative configuration is not restored
+//
+// NINFER_STORE_REAL_SPEC selects the speculative configuration every Engine here runs:
+//   mtp (default)  MTP K=3 with the draft head, BF16 KV
+//   dflash2        the launchers' DFlash2 profile: K=7 with the draft head, rk4v4 KV, FP16 GDN state
+//   dflash2-ngram  the same with n-gram copy drafting (15)
+//   dflash         DFlash K=7 with the draft head, for a 35B-A3B artifact (not registered with ctest,
+//                  whose NINFER_TEST_ARTIFACT is the 27B)
+// Under DFlash2 the stored StateImages carry the draft's local K/V rings. Greedy output alone cannot
+// show they came back intact, since verification licenses every token whatever the draft proposed;
+// so each continuation must also reproduce the control's speculative rounds and accepted drafts
+// exactly, over a longer continuation.
 namespace {
 
 namespace fs = std::filesystem;
 using Clock  = std::chrono::steady_clock;
 
 constexpr std::string_view kCrashChild = "--crash-child";
+
+enum class Spec { Mtp, DFlash2, DFlash2Ngram, DFlash };
+
+Spec selected_spec() {
+    const char* value = std::getenv("NINFER_STORE_REAL_SPEC");
+    const std::string_view name = value ? value : "mtp";
+    if (name == "mtp") { return Spec::Mtp; }
+    if (name == "dflash2") { return Spec::DFlash2; }
+    if (name == "dflash2-ngram") { return Spec::DFlash2Ngram; }
+    if (name == "dflash") { return Spec::DFlash; }
+    throw std::invalid_argument(
+        "NINFER_STORE_REAL_SPEC must be mtp, dflash2, dflash2-ngram or dflash");
+}
+
+const Spec kSpec = selected_spec();
+
+bool draft_model_spec() { return kSpec != Spec::Mtp; }
 
 ninfer::EngineOptions store_engine_options(const char* artifact) {
     ninfer::EngineOptions options;
@@ -57,8 +86,24 @@ ninfer::EngineOptions store_engine_options(const char* artifact) {
     // Room for one deep session (its KV and two StateImages, about 0.85 GB) and not two: later
     // sessions must push the first one out of the Host tier as well.
     options.context_cache.host_capacity_bytes = std::size_t{1280} << 20U;
+    if (kSpec == Spec::DFlash) {
+        options.speculative.backend      = ninfer::SpeculativeBackend::DFlash;
+        options.speculative.draft_tokens = 7;
+    } else if (draft_model_spec()) {
+        options.speculative.backend      = ninfer::SpeculativeBackend::DFlash2;
+        options.speculative.draft_tokens = 7;
+        options.kv_cache                 = ninfer::KvCacheStorage::RotatedLloyd4KeyInt4Value;
+        options.gdn_state_fp16           = true;
+        if (kSpec == Spec::DFlash2Ngram) { options.speculative.ngram_draft_tokens = 15; }
+        // rk4v4 KV is about a quarter of BF16 and the FP16 GDN state half, while each StateImage
+        // gains the draft rings: one deep session is about 0.5 GB here.
+        options.context_cache.host_capacity_bytes = std::size_t{768} << 20U;
+    }
     return options;
 }
+
+// Continuations under a draft model run long enough to compare acceptance.
+std::uint32_t continuation_tokens() { return draft_model_spec() ? 512U : 12U; }
 
 ninfer::EngineOptions with_store(ninfer::EngineOptions options, const fs::path& directory,
                                  std::chrono::seconds idle) {
@@ -131,6 +176,7 @@ struct Control {
     std::vector<ninfer::TokenId> tokens;
     std::uint32_t reused = 0;
     double first_token_seconds = 0.0;
+    ninfer::SpeculativeStats speculative;
 };
 
 // A conversation whose session never leaves the device.
@@ -138,11 +184,13 @@ Control control_turns(ninfer::Engine& engine, const std::vector<std::string>& fi
                       std::string_view question) {
     Control control;
     control.reply = engine.generate(engine.prepare(conversation(first)), greedy()).content;
-    const auto next = engine.generate(
-        engine.prepare(conversation(next_turn(first, control.reply, question))), greedy());
+    const auto next =
+        engine.generate(engine.prepare(conversation(next_turn(first, control.reply, question))),
+                        greedy(continuation_tokens()));
     control.tokens              = next.generated_token_ids;
     control.reused              = next.reused_prompt_tokens;
     control.first_token_seconds = next.timings.first_token_seconds;
+    control.speculative         = next.speculative;
     return control;
 }
 
@@ -156,6 +204,28 @@ int check_continuation(const ninfer::GenerationResult& next, const Control& cont
     if (next.generated_token_ids != control.tokens) {
         std::cerr << label << ": output differs from the warm control\n";
         return 1;
+    }
+    // The draft proposes from the restored rings: the same rounds and accepted drafts as the warm
+    // control show they came back exactly (output identity alone would not).
+    const auto& got  = next.speculative;
+    const auto& want = control.speculative;
+    if (got.rounds != want.rounds || got.drafted_tokens != want.drafted_tokens ||
+        got.accepted_tokens != want.accepted_tokens ||
+        got.ngram_rounds != want.ngram_rounds ||
+        got.ngram_accepted_tokens != want.ngram_accepted_tokens) {
+        std::cerr << label << ": speculation differs from the warm control: rounds " << got.rounds
+                  << " vs " << want.rounds << ", accepted " << got.accepted_tokens << '/'
+                  << got.drafted_tokens << " vs " << want.accepted_tokens << '/'
+                  << want.drafted_tokens << ", copies accepted " << got.ngram_accepted_tokens
+                  << " vs " << want.ngram_accepted_tokens << '\n';
+        return 1;
+    }
+    if (draft_model_spec()) {
+        std::cout << label << ": " << next.generated_token_ids.size() << " tokens in "
+                  << got.rounds << " rounds, accepted " << got.accepted_tokens << '/'
+                  << got.drafted_tokens << " (copy rounds " << got.ngram_rounds
+                  << ", copies accepted " << got.ngram_accepted_tokens
+                  << "), identical to the warm control\n";
     }
     return 0;
 }
@@ -220,7 +290,7 @@ int exercise_restart(const char* artifact, const fs::path& root, const Control& 
     }
     const auto next = engine.generate(
         engine.prepare(conversation(next_turn(kShortFirst, control.reply, kShortQuestion))),
-        greedy());
+        greedy(continuation_tokens()));
     if (check_continuation(next, control, "restart") != 0) { return 1; }
     std::cout << "restart: restored " << stats.context_store_restored_bytes << " bytes in "
               << stats.context_store_restore_seconds << " s; continuation reused "
@@ -248,7 +318,8 @@ int exercise_deep_restart(const char* artifact, const fs::path& root, const Cont
         return 1;
     }
     const auto next = engine.generate(
-        engine.prepare(conversation(next_turn(first, control.reply, kDeepQuestion))), greedy());
+        engine.prepare(conversation(next_turn(first, control.reply, kDeepQuestion))),
+        greedy(continuation_tokens()));
     if (check_continuation(next, control, "deep restart") != 0) { return 1; }
     std::cout << "deep restart: restored " << stats.context_store_restored_bytes << " bytes ("
               << stats.context_store_used_bytes << " on disk) in "
@@ -283,7 +354,7 @@ int exercise_crash(const char* artifact, const char* program, const fs::path& ro
     }
     const auto next = engine.generate(
         engine.prepare(conversation(next_turn(kShortFirst, control.reply, kShortQuestion))),
-        greedy());
+        greedy(continuation_tokens()));
     if (check_continuation(next, control, "crash") != 0) { return 1; }
     std::cout << "crash: restored " << stats.context_store_restored_bytes << " bytes in "
               << stats.context_store_restore_seconds << " s\n";
@@ -317,7 +388,7 @@ int exercise_hydration(const char* artifact, const fs::path& root, const Control
               << before.host_context_occupied_bytes << " bytes occupied\n";
     const auto next =
         engine.generate(engine.prepare(conversation(next_turn(first, reply.content, kDeepQuestion))),
-                        greedy());
+                        greedy(continuation_tokens()));
     const auto stats = engine.runtime_stats();
     const auto hydrations = stats.context_store_hydrations - before.context_store_hydrations;
     const auto tokens = stats.context_store_hydrated_tokens - before.context_store_hydrated_tokens;
@@ -342,6 +413,11 @@ int exercise_hydration(const char* artifact, const fs::path& root, const Control
 // two-stage Engine (both stages on device 0) is restored by a single-device one, and the reverse,
 // and each continues exactly as the single-device control.
 int exercise_stages(const char* artifact, const fs::path& root, const Control& control) {
+    if (kSpec == Spec::DFlash2Ngram) {
+        // Copy rounds widen a round past the drafter's width, which pipeline stages do not run.
+        std::cout << "stages: skipped (n-gram copy drafting does not run in pipeline stages)\n";
+        return 0;
+    }
     auto split    = store_engine_options(artifact);
     split.devices = {0, 0};
     const auto single = store_engine_options(artifact);
@@ -372,7 +448,7 @@ int exercise_stages(const char* artifact, const fs::path& root, const Control& c
         }
         const auto next = engine.generate(
             engine.prepare(conversation(next_turn(kShortFirst, control.reply, kShortQuestion))),
-            greedy());
+            greedy(continuation_tokens()));
         if (check_continuation(next, control, leg.label) != 0) { return 1; }
         std::cout << leg.label << ": restored and continued, reused " << next.reused_prompt_tokens
                   << " tokens\n";
@@ -412,7 +488,7 @@ int exercise_recovery(const char* artifact, const fs::path& root, const Control&
     const auto before = engine.runtime_stats();
     const auto next =
         engine.generate(engine.prepare(conversation(next_turn(first, reply.content, kDeepQuestion))),
-                        greedy());
+                        greedy(continuation_tokens()));
     const auto stats      = engine.runtime_stats();
     const auto hydrations = stats.context_store_hydrations - before.context_store_hydrations;
     if (hydrations != 1 || stats.context_store_hydration_failures != 0 ||
@@ -474,12 +550,40 @@ int exercise_bucket(const char* artifact, const fs::path& root, const Control& c
     }
     const auto next = engine.generate(
         engine.prepare(conversation(next_turn(kShortFirst, control.reply, kShortQuestion))),
-        greedy());
+        greedy(continuation_tokens()));
     if (check_continuation(next, control, "bucket") != 0) { return 1; }
     std::cout << "bucket: restored " << stats.context_store_restored_bytes << " bytes ("
               << stats.context_store_remote_download_bytes << " downloaded) in "
               << stats.context_store_restore_seconds << " s; writer uploads before shutdown "
               << uploaded << '\n';
+    return 0;
+}
+
+// The restart store, opened by an Engine of the other speculative family (MTP for a DFlash2 store
+// and the reverse): its sessions hold another draft's state, so none is restored, and start-up
+// reports them as written under another configuration.
+int exercise_foreign(const char* artifact, const fs::path& root) {
+    auto options = store_engine_options(artifact);
+    if (draft_model_spec()) {
+        options.speculative.backend            = ninfer::SpeculativeBackend::Mtp;
+        options.speculative.draft_tokens       = 3;
+        options.speculative.ngram_draft_tokens = 0;
+    } else {
+        options.speculative.backend      = ninfer::SpeculativeBackend::DFlash2;
+        options.speculative.draft_tokens = 7;
+    }
+    ninfer::Engine engine(with_store(options, root / "restart", std::chrono::seconds(0)));
+    const auto stats = engine.runtime_stats();
+    if (stats.context_store_restored != 0 || stats.context_store_foreign == 0 ||
+        stats.context_store_foreign != stats.context_store_images) {
+        std::cerr << "foreign: a store of another speculative configuration was not set aside: "
+                     "restored="
+                  << stats.context_store_restored << " foreign=" << stats.context_store_foreign
+                  << " images=" << stats.context_store_images << '\n';
+        return 1;
+    }
+    std::cout << "foreign: " << stats.context_store_foreign
+              << " sessions of the other speculative configuration set aside\n";
     return 0;
 }
 
@@ -579,6 +683,7 @@ int main(int argc, char** argv) {
         if (scenario == "all" || scenario == "bucket") {
             if (exercise_bucket(artifact, root, short_control) != 0) { return 1; }
         }
+        if (scenario == "all" && exercise_foreign(artifact, root) != 0) { return 1; }
         if (scenario == "all" && exercise_damaged(artifact, root) != 0) { return 1; }
         std::cout << "ok\n";
         return 0;
