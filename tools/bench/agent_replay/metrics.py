@@ -46,8 +46,12 @@ class SourceIndex:
 def percentile(values: list[float], fraction: float) -> float | None:
     if not values:
         return None
+    # Linear interpolation between order statistics (numpy's default); 0.5 is the median.
     ordered = sorted(values)
-    return ordered[min(len(ordered) - 1, int(round(fraction * (len(ordered) - 1))))]
+    position = fraction * (len(ordered) - 1)
+    low = int(position)
+    high = min(low + 1, len(ordered) - 1)
+    return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
 
 
 def flatten_counters(prefix: str, value: Any, out: dict[str, Any]) -> None:

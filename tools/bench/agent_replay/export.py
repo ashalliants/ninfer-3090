@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any, Callable
 
@@ -77,8 +78,16 @@ def _compile_template(source: str) -> Any:
     def raise_exception(message: str) -> None:
         raise jinja2.exceptions.TemplateError(message)
 
-    def tojson(value: Any, indent: int | None = None) -> str:
-        return json.dumps(value, ensure_ascii=False, indent=indent)
+    def tojson(value: Any, ensure_ascii: bool = False, indent: int | None = None,
+               separators: Any = None, sort_keys: bool = False) -> str:
+        """The server's filter (third_party/llama-jinja value.cpp): positional order is
+        ensure_ascii, indent, separators, sort_keys; UTF-8 and ", "/": " unless told otherwise."""
+        if separators is not None:
+            separators = tuple(separators)
+            if len(separators) == 1:
+                separators += (": ",)
+        return json.dumps(value, ensure_ascii=bool(ensure_ascii), indent=indent,
+                          separators=separators, sort_keys=bool(sort_keys))
 
     env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
                                         extensions=["jinja2.ext.loopcontrols"])
@@ -196,6 +205,8 @@ def export(run_dir: Path, artifact: Path | None, tokenizer_dir: Path | None,
 
     turns = matched = logged = 0
     worst = 0
+    unverified: list[str] = []  # prompt length missing or different from the server's
+    unlogged: list[str] = []  # outputs retokenized although a request log was supplied
     with out_path.open("w", encoding="utf-8") as out:
         for line in (run_dir / "transcripts.jsonl").read_text(encoding="utf-8").splitlines():
             transcript = json.loads(line)
@@ -208,10 +219,13 @@ def export(run_dir: Path, artifact: Path | None, tokenizer_dir: Path | None,
                 prompt = template.render(messages=messages[:count], tools=tools, **template_tokens,
                                          add_generation_prompt=True, enable_thinking=False)
                 prompt_ids = encoder.encode(prompt)
+                failed = sample.get("error") is not None
                 if key in output_ids:
                     ids, source = output_ids[key], "request_log"
                     logged += 1
                 elif count < len(transcript["messages"]):
+                    if ids_path.exists():
+                        unlogged.append(f"session {key[0]} turn {key[1]}")
                     text = _output_text(transcript["messages"][count])
                     ids, source = encoder.encode_text(text), "retokenized_text"
                 else:
@@ -220,6 +234,10 @@ def export(run_dir: Path, artifact: Path | None, tokenizer_dir: Path | None,
                 turns += 1
                 if server == len(prompt_ids):
                     matched += 1
+                elif not failed:
+                    unverified.append(f"session {key[0]} turn {key[1]}: server "
+                                      f"{server if server else 'missing'} != rendered "
+                                      f"{len(prompt_ids)}")
                 if server:
                     worst = max(worst, abs(server - len(prompt_ids)))
                 out.write(json.dumps({
@@ -231,4 +249,13 @@ def export(run_dir: Path, artifact: Path | None, tokenizer_dir: Path | None,
               "max_prompt_length_difference": worst, "output_ids_from_request_log": logged,
               "out": str(out_path)}
     print(json.dumps(report, indent=2))
+    problems = [f"prompt length not reproduced ({len(unverified)}): " + "; ".join(unverified[:5])
+                if unverified else "",
+                f"output not in the request log ({len(unlogged)}): " + "; ".join(unlogged[:5])
+                if unlogged else ""]
+    if any(problems):
+        out_path.unlink(missing_ok=True)  # an inexact stream must not pass for an exact one
+        for problem in filter(None, problems):
+            print(f"error: {problem}; stream file removed", file=sys.stderr)
+        return 1
     return 0 if turns else 1

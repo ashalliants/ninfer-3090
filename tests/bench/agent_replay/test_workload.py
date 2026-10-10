@@ -109,6 +109,34 @@ def test_usage_prompt_ms_is_not_reported_as_ttft():
     assert sample["ttft_s"] == 0.5 and sample["timing_source"] == "request_log"
 
 
+def test_percentile_is_interpolated_and_p50_is_the_median():
+    from tools.bench.agent_replay.metrics import percentile
+
+    assert percentile([4.0, 1.0, 3.0, 2.0], 0.5) == 2.5
+    assert percentile([1.0, 2.0, 3.0], 0.5) == 2.0
+    assert percentile([5.0], 0.5) == 5.0
+    assert percentile([0.0, 10.0], 0.95) == 9.5
+    assert percentile([], 0.5) is None
+
+
+def test_timing_counters_keep_counts_and_durations_not_rates():
+    from tools.bench.agent_replay.run import timing_counters
+
+    counters = timing_counters({"prompt_n": 10, "prompt_ms": 12.5, "predicted_per_second": 40.0,
+                                "predicted_per_token_ms": 25.0, "note": "x"})
+    assert counters == {"timings.prompt_n": 10, "timings.prompt_ms": 12.5}
+
+
+def test_requested_request_log_must_cover_every_measured_turn():
+    from tools.bench.agent_replay.run import unjoined_turns
+
+    samples = [{"session": 0, "turn": 0, "response_id": "a", "error": None},
+               {"session": 0, "turn": 1, "response_id": "b", "error": None},
+               {"session": 0, "turn": 2, "response_id": None, "error": "timeout"}]
+    assert unjoined_turns(samples, {"a": {}, "b": {}}) == []
+    assert unjoined_turns(samples, {"a": {}}) == ["b"]
+
+
 def test_run_rejects_settings_that_measure_nothing(tmp_path):
     from tools.bench.agent_replay.run import RunConfig, run
 

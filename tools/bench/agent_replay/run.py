@@ -221,9 +221,7 @@ class SessionRunner:
     def _sample(self, plan: TurnPlan, reply: Reply) -> dict[str, Any]:
         covered, total = self.sources.overlap(output_text(reply)) if reply.error is None else (0, 0)
         details = reply.usage.get("prompt_tokens_details") or {}
-        counters: dict[str, Any] = {}
-        flatten_counters("timings", {k: v for k, v in reply.timings.items()
-                                     if isinstance(v, int)}, counters)
+        counters = timing_counters(reply.timings)
         self.turn_index.append({"turn": plan.turn, "message_count": len(self.messages),
                                 "response_id": reply.response_id, "category": plan.category})
         sample = {
@@ -253,6 +251,24 @@ class SessionRunner:
         }
         apply_timing(sample, None)
         return sample
+
+
+def timing_counters(timings: dict[str, Any]) -> dict[str, Any]:
+    """Summable usage timings: counts and durations, not the per-second/per-token rates.
+
+    Counters are summed over turns, where a rate is meaningless; the raw values stay in
+    `server_timings`.
+    """
+    counters: dict[str, Any] = {}
+    flatten_counters("timings", {k: v for k, v in timings.items() if "_per_" not in k}, counters)
+    return counters
+
+
+def unjoined_turns(samples: list[dict[str, Any]], done: dict[str, Any]) -> list[str]:
+    """Response ids (or session/turn when none) of measured turns the request log lacks."""
+    return sorted(s["response_id"] or f"session {s['session']} turn {s['turn']}"
+                  for s in samples
+                  if s["error"] is None and (s.get("response_id") or "") not in done)
 
 
 def apply_timing(sample: dict[str, Any], done: dict[str, Any] | None) -> None:
@@ -360,9 +376,11 @@ def run(config: RunConfig) -> int:
     wall = time.time() - started
 
     merged = None
+    missing: list[str] = []
     if config.request_log is not None:
         done = read_request_log(config.request_log, log_offset)
         merged = merge_request_log(samples, done, config.out / "output_token_ids.jsonl")
+        missing = unjoined_turns(samples, done)
 
     samples.sort(key=lambda s: (s["session"], s["turn"]))
     with (config.out / "turns.jsonl").open("w", encoding="utf-8") as out:
@@ -387,6 +405,7 @@ def run(config: RunConfig) -> int:
         },
         "wall_seconds": wall,
         "request_log_merged": merged,
+        "request_log_missing": missing,
         "sessions": [
             {"session": r.index, "target_context": r.target, "turns": len(r.turn_index),
              "stop_reason": r.stop_reason,
@@ -401,6 +420,11 @@ def run(config: RunConfig) -> int:
     print(json.dumps({k: summary[k] for k in ("sessions", "request_log_merged", "wall_seconds")},
                      indent=2))
     print_table(summary)
+    if missing:
+        print(f"error: --request-log did not contain {len(missing)} measured turn(s): "
+              + ", ".join(missing[:10]) + (" ..." if len(missing) > 10 else "")
+              + "; output_token_ids.jsonl is partial", file=sys.stderr)
+        return 1
     if not samples:
         print("error: no turn was measured (every session stopped before its first request; "
               "raise --max-context or check --min-context)", file=sys.stderr)
