@@ -1,8 +1,9 @@
 """Regenerate the GGML lookup tables from ggml's ggml-common.h.
 
-Writes tools/artifact/codecs/ggml_tables.py for the Python decoders and tests/ops/ggml_tables.h for
-the C++ exact decoder (tests/ops/ggml_blocks_decode.h). Both come from one parse, so they cannot
-disagree.
+Writes tools/artifact/codecs/ggml_tables.py for the Python decoders and
+third_party/ggml/ggml-common-tables.h for C++: the exact host decoder (tests/ops/ggml_blocks_decode.h)
+and the device kernels of the GGML Ops (src/ops/linear/ggml) include that one header. Both outputs
+come from one parse, so they cannot disagree.
 
 Usage: python -m tools.artifact.gen_ggml_tables PATH/TO/ggml/src/ggml-common.h [--release b11316]
 
@@ -27,7 +28,9 @@ TABLES = {
     "iq1s_grid": ("uint64_t", 2048),
 }
 OUTPUT = Path(__file__).with_name("codecs") / "ggml_tables.py"
-CPP_OUTPUT = Path(__file__).resolve().parents[2] / "tests" / "ops" / "ggml_tables.h"
+CPP_OUTPUT = (
+    Path(__file__).resolve().parents[2] / "third_party" / "ggml" / "ggml-common-tables.h"
+)
 
 HEADER = '''"""Lookup tables of ggml's IQ block formats, copied verbatim from ggml-common.h.
 
@@ -82,11 +85,25 @@ CPP_HEADER = """// Lookup tables of ggml's IQ block formats, copied verbatim fro
 //
 // Copyright (c) 2023-2026 The ggml authors. Distributed under the MIT License; the full notice is
 // in third_party/ggml/LICENSE.
+//
+// One header serves host and device code, as ggml-common.h does with GGML_TABLE_BEGIN. By default
+// every table is an `inline constexpr` host array. A CUDA translation unit that reads a table in
+// device code defines both macros before including this header, for example
+//
+//   #define NINFER_GGML_TABLE_BEGIN(type, name, size) static __device__ const type name[size] = {{
+//   #define NINFER_GGML_TABLE_END() }};
+//
+// and includes it no other way.
 #pragma once
 
 #include <cstdint>
 
-namespace ninfer::test::ggml {{
+#ifndef NINFER_GGML_TABLE_BEGIN
+#define NINFER_GGML_TABLE_BEGIN(type, name, size) inline constexpr type name[size] = {{
+#define NINFER_GGML_TABLE_END() }};
+#endif
+
+namespace ninfer::ggml_tables {{
 
 inline constexpr char kRelease[] = "{release}";
 """
@@ -103,11 +120,11 @@ def render_cpp(source: str, release: str) -> str:
             words = [str(value) for value in values]
         else:
             words = [f"0x{value:0{width - 2}x}{suffix}" for value in values]
-        lines.append(f"\ninline constexpr std::{ctype} {name}[{count}] = {{\n")
+        lines.append(f"\nNINFER_GGML_TABLE_BEGIN(std::{ctype}, {name}, {count})\n")
         for begin in range(0, count, per_line):
             lines.append("    " + ", ".join(words[begin : begin + per_line]) + ",\n")
-        lines.append("};\n")
-    lines.append("\n} // namespace ninfer::test::ggml\n")
+        lines.append("NINFER_GGML_TABLE_END()\n")
+    lines.append("\n} // namespace ninfer::ggml_tables\n")
     return "".join(lines)
 
 

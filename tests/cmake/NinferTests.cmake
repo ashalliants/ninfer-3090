@@ -10,7 +10,10 @@ include(${PROJECT_SOURCE_DIR}/cmake/NinferBundles.cmake)
 
 function(ninfer_test_includes target)
   ninfer_internal_includes(${target})
-  target_include_directories(${target} PRIVATE ${PROJECT_SOURCE_DIR}/tests)
+  # third_party/ggml: the GGML lookup tables the exact host decoder (ops/ggml_blocks_decode.h) and
+  # the GGML kernels share.
+  target_include_directories(${target} PRIVATE ${PROJECT_SOURCE_DIR}/tests
+    ${PROJECT_SOURCE_DIR}/third_party/ggml)
 endfunction()
 
 function(ninfer_add_test name)

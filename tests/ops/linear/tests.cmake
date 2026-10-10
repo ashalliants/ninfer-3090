@@ -39,3 +39,9 @@ ninfer_add_op_test(ninfer_linear_fp8_a8_test
 ninfer_add_op_test(ninfer_linear_bf16_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_bf16_a16.cpp"
   LIBRARIES ninfer_linear_test_support)
+
+# GGML block-format Linear and LinearAdd (Q8_1 activation profile) against the exact host decoder
+# and an FP64 oracle; also the Q8_1 cast exactly. `--format NAME --shape N K` selects one problem.
+ninfer_add_op_test(ninfer_linear_ggml_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml.cpp"
+  LIBRARIES ninfer_ops)
