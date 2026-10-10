@@ -317,8 +317,17 @@ admission actually resumes from it. On the 27B on an RTX 3090, a 7.8k-token conv
 856 MB image) read back from a warm file cache in about 1.5 s gave a first token after 1.6 s, against
 5.1 s for prefilling it and 0.1 s when it had stayed resident.
 
-The store does not support the DFlash speculative backends (their draft-side state has not been
-verified through a stored image); the Engine refuses to start with both.
+The store works with every speculative backend, including the launchers' default DFlash2. A stored
+recovery point carries the draft's own context with the target's: DFlash2's local K/V rings (40 MiB
+per recovery point on the 27B) inside each recurrent state, and DFlash's draft KV pages. A restored
+conversation therefore drafts exactly as if it had never left the GPU: the real tests require the
+same output and the same speculative rounds and accepted drafts as the uninterrupted conversation.
+N-gram copy drafting (`--ngram-draft-tokens`) needs nothing stored; a restored request builds its
+copy index from its own prompt like any other. A store is bound to the speculative backend, draft
+count and proposal head it was written with (and to the model, KV format and `--gdn-state-fp16`), so
+a server restarted with another `--spec` or `--draft-tokens` restores nothing from it and prefills
+instead; the start-up log counts those sessions as written under another configuration, and they
+age out. `--ngram-draft-tokens` may change freely.
 
 An image does not depend on `--devices`/`--stage-layers`: a conversation stored by a server split
 into pipeline stages restores on one GPU and the reverse. A worker failure that clears the context
@@ -328,7 +337,8 @@ any other, and changing the configured grafts (their names or files) makes the e
 misses, as a different model would.
 
 A session image is several GB for a deep context (about 18 KB per token with `--kv-dtype rk4v4`,
-plus about 150 MB of recurrent state per recovery point), and consecutive images of one conversation
+plus about 150 MB of recurrent state per recovery point, about 80 MB with `--gdn-state-fp16`, and
+40 MiB more under DFlash2), and consecutive images of one conversation
 share almost all of it. The store therefore splits an image into fixed 32 MiB chunks named by a hash
 of their content and writes only chunks it does not already hold: keeping a long conversation current
 costs the newest pages and the endpoint state, not the whole session. Older images of a conversation
@@ -339,7 +349,9 @@ simply re-prefilled by the next request; a damaged store costs cache hits, never
 The store keeps at most `--context-store-max-gib` (default: half the free space of the volume when
 the server starts), removing the least recently used sessions first, and removes sessions unused for
 `--context-store-ttl-hours` (default 168). A store written by a different model, quantization, KV
-configuration or set of prompt grafts is ignored and ages out. The `ninfer_context_store_*` series (see
+or recurrent-state configuration, speculative configuration, set of prompt grafts or an older
+engine's image format is ignored and ages out; the start-up log line `context store | N sessions
+were written under another model, configuration or store format` says so. The `ninfer_context_store_*` series (see
 [Metrics](#metrics)) report size, writes, bytes reused, what was restored at start-up and how long it
 took. A background write is skipped while any request is waiting, binding, prefilling or replaying,
 and the write queue holds at most two images, so a slow disk does not hold up requests. Taking the

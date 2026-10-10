@@ -68,6 +68,7 @@ rem     NINFER_HOST_CACHE_MAX_MIB         --host-cache-max-mib N         hard ca
 rem   NINFER_MAX_OUTPUT_TOKENS            --max-output-tokens N          cap every request's output budget
 rem   NINFER_MLP_A8_DECODE=on             --mlp-a8-decode                INT8-activation MLP decode
 rem   NINFER_CONTEXT_STORE                --context-store DIR            keep the context cache across restarts
+rem                                                                      and crashes, under every NINFER_SPEC
 rem     NINFER_CONTEXT_STORE_MAX_GIB      --context-store-max-gib N      disk budget for the store
 rem
 rem Each spec's defaults
