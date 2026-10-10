@@ -71,14 +71,16 @@ DFlashFeatureSink prefill_feature_sink_impl(PrefillContext& state,
     }
 }
 
-DFlashFeatureSink batch_feature_sink_impl(DFlashBatchContext& state, const Tensor& lanes,
-                                          const Tensor& valid_columns, std::int32_t width,
-                                          std::int32_t batch_size) {
+// `features` is the [D, width, lanes] logical view of the widest pending-feature buffer (slice
+// dimension 1; it keeps the allocated lane and column strides).
+DFlashFeatureSink batch_feature_sink_impl(DFlashBatchContext& state, Tensor& features,
+                                          const Tensor& lanes, const Tensor& valid_columns,
+                                          std::int32_t width, std::int32_t batch_size) {
     {
         const auto& target = state.execution.parameters.model.config().text;
         const auto& config = *state.execution.parameters.model.config().draft;
         return DFlashFeatureSink{
-            .batch_features      = &dflash_state(state).pending_features,
+            .batch_features      = &features,
             .batch_lanes         = &lanes,
             .batch_valid_columns = &valid_columns,
             .batch_width         = width,
@@ -663,8 +665,11 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache);
         card.set_stage_runtime(state.execution.stages);
-        DFlashFeatureSink sink =
-            batch_feature_sink_impl(state, active_lanes, valid_columns, width, batch_size);
+        // pending_features stays allocated at the widest round (catch-up reads it at that width);
+        // a narrower round captures into the leading `width` columns of each lane.
+        Tensor pending_features = dflash_state(state).pending_features.slice(1, 0, width);
+        DFlashFeatureSink sink  = batch_feature_sink_impl(state, pending_features, active_lanes,
+                                                          valid_columns, width, batch_size);
         {
             nvtx::ScopedRange target_range(nvtx::Name::DecodeDFlashTarget, nvtx::Category::DFlash,
                                            static_cast<std::uint64_t>(width) * batch_size);
