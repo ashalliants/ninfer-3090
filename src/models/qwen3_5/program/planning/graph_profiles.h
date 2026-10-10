@@ -11,7 +11,7 @@ namespace ninfer::models::qwen3_5::detail {
 
 // How a speculative round proposes the drafts it verifies. A neural round verifies the draft
 // model's (MTP or DFlash) own proposal; a copy round verifies an n-gram copy from the request's own
-// text and, at batch one, does not run the draft model.
+// text for the rows that have one and, at batch one, does not run the draft model.
 enum class SpeculativeRoundKind : std::uint8_t { Neural, Copy };
 
 // One speculative round family: its proposal kind and the drafts it verifies (verify_drafts + 1
@@ -35,6 +35,21 @@ speculative_round_shapes(SpeculativeBackend backend, std::uint32_t draft_window,
 [[nodiscard]] std::uint32_t
 max_verify_drafts(std::span<const SpeculativeRoundShape> shapes) noexcept;
 
+// A copy round verifies every row of its batch at the copy width, so one copying row widens all of
+// them. Measured on the RTX 3090 (27B, DFlash2 K=7, 16-column copy rounds against 8-column neural
+// rounds, docs/performance.md): a batch-one copy round costs 1.22-1.26x a neural round, a batch-two
+// round in which one row copies 1.44-1.49x, and a batch-four one 2.36x, more than four rows of
+// whole copies return. Copy rounds therefore run at batch one and two only, and their families
+// capture no larger batch.
+inline constexpr std::uint32_t kMaximumCopyRoundBatch = 2;
+// The largest batch a family captures and runs.
+[[nodiscard]] std::uint32_t round_family_batch_limit(const SpeculativeRoundShape& shape,
+                                                     std::uint32_t max_concurrency) noexcept;
+// The longest copy a batch of `batch` rows needs before its round becomes a copy round: any copy
+// the proposer offers at batch one; at batch two one that, accepted, pays for the wider round
+// beside a neural partner; none above that.
+[[nodiscard]] std::uint32_t copy_round_minimum_drafts(std::uint32_t batch) noexcept;
+
 [[nodiscard]] std::vector<GraphExecutionProfile> ordinary_graph_profiles(std::uint32_t capacity);
 // The target's full-attention geometry and KV storage, which select the attention routes an MTP
 // round records and therefore where its graph topology classes break.
@@ -54,8 +69,8 @@ struct MtpGraphAttention {
 
 [[nodiscard]] execution::MtpCausalAttentionEnvelopes
 mtp_causal_attention_envelopes(std::uint32_t max_frontier, std::uint32_t k, std::uint32_t capacity);
-// `append_drafts` is the widest family's: a round's context catch-up appends the target features
-// of the previous round's verified columns, whichever family that round ran.
+// `append_drafts` is the round family's own: its context catch-up appends at most that many plus
+// one columns, and a wider previous round is caught up before a narrower one starts.
 [[nodiscard]] execution::DFlashEnvelopes dflash_envelopes(std::uint32_t max_frontier,
                                                           std::uint32_t append_drafts);
 

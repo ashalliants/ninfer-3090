@@ -634,21 +634,22 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         submit_range.emplace(nvtx::Name::DecodeDFlashSubmit, nvtx::Category::DFlash,
                              static_cast<std::uint64_t>(lanes.size()));
         // N-gram copies: a row whose committed tail already occurred in its request proposes what
-        // followed it there. A round with a copy verifies it at the copy family's width without
-        // running the draft model (batch one only); otherwise the round is the neural family's.
-        // A copy is sized by its window and the context room, never by the output budget, so a
-        // budget-limited round runs the same family, and therefore the same arithmetic, as an
-        // unlimited one (Infernix 53489da2).
+        // followed it there. A round with a copy verifies at the copy family's width; at batch one
+        // the draft model does not run, above it the draft model proposes for the rows without a
+        // copy. Otherwise the round is the neural family's. A copy is sized by its window and the
+        // context room, never by the output budget, so a budget-limited round runs the same family,
+        // and therefore the same arithmetic, as an unlimited one (Infernix 53489da2).
         std::array<NgramMatch, kMaximumConcurrency> copies{};
         bool copy_round = false;
-        if (ngram_draft_tokens != 0) {
+        if (ngram_draft_tokens != 0 && lanes.size() <= kMaximumCopyRoundBatch) {
             const TokenId domain = dimension(parameters.model.resources().public_token_count);
+            std::uint32_t longest = 0;
             for (std::size_t row = 0; row < lanes.size(); ++row) {
                 RequestControl& request = requests[lanes[row]];
                 if (!request.ngram) { continue; }
                 copies[row] = request.ngram->propose_for_round(
                     active_sequence(lanes[row]).ledger, ngram_draft_tokens, draft_window,
-                    ngram_min_match);
+                    request.ngram_backoff.required_match(ngram_min_match));
                 // Sources are tokenized text, so a copy stays in the public token domain; one that
                 // leaves it ends there.
                 std::vector<TokenId>& tokens = copies[row].tokens;
@@ -657,11 +658,10 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                                               return token < 0 || token >= domain;
                                           }),
                              tokens.end());
-                copy_round = copy_round || !tokens.empty();
+                longest = std::max(longest, static_cast<std::uint32_t>(tokens.size()));
             }
-            if (copy_round && lanes.size() != 1) {
-                throw std::logic_error("a batched n-gram copy round is not built");
-            }
+            copy_round =
+                longest >= copy_round_minimum_drafts(static_cast<std::uint32_t>(lanes.size()));
         }
         // Every row of a round verifies at its family's width; the frame, egress and ReplaySSM
         // records are viewed at it.
@@ -670,11 +670,16 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                        : round_family(SpeculativeRoundKind::Neural, draft_window);
         const std::uint32_t verify_drafts = family.shape.verify_drafts;
         const std::uint32_t width         = verify_drafts + 1U;
-        const auto row_extent             = [&](std::size_t row) {
+        // In a copy round a row without a copy verifies the draft model's neural window.
+        const auto copies_row = [&](std::size_t row) {
+            return copy_round && !copies[row].tokens.empty();
+        };
+        const auto row_extent = [&](std::size_t row) {
             const std::uint32_t remaining     = budgets[row].generated_tokens_remaining;
             const std::uint32_t max_by_budget = remaining > 1 ? remaining - 1U : 0U;
             const std::uint32_t proposed =
-                copy_round ? static_cast<std::uint32_t>(copies[row].tokens.size()) : verify_drafts;
+                copies_row(row) ? static_cast<std::uint32_t>(copies[row].tokens.size())
+                                : std::min(verify_drafts, draft_window);
             return std::min({proposed, max_by_budget,
                              capacity - active_sequence(lanes[row]).execution_frontier - 1U});
         };
@@ -684,6 +689,37 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                 std::max(maximum_target_tokens,
                          active_sequence(lanes[row]).execution_frontier + row_extent(row) + 1U);
         }
+        // A round catches its rows' draft context up at its own width. A row whose previous round
+        // verified more columns than that (a copy round before a neural one) is caught up first,
+        // so a round that never follows a copy pays no copy-width work.
+        {
+            std::array<std::uint32_t, kMaximumConcurrency> behind_lanes{};
+            std::array<std::uint32_t, kMaximumConcurrency> behind_starts{};
+            std::array<std::uint32_t, kMaximumConcurrency> behind_counts{};
+            std::size_t behind = 0;
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                const SequenceState& sequence = active_sequence(lanes[row]);
+                const std::uint32_t gap =
+                    sequence.execution_frontier - sequence.dflash_context_frontier;
+                if (gap > width) {
+                    behind_lanes[behind]  = lanes[row];
+                    behind_starts[behind] = sequence.dflash_context_frontier;
+                    behind_counts[behind] = gap;
+                    ++behind;
+                }
+            }
+            if (behind != 0) {
+                enqueue_dflash_context_append(std::span(behind_lanes.data(), behind),
+                                              std::span(behind_starts.data(), behind),
+                                              std::span(behind_counts.data(), behind));
+                // The append's ingress transfer reads the pinned host ingress this round rewrites.
+                device.synchronize();
+                for (std::size_t row = 0; row < behind; ++row) {
+                    SequenceState& sequence          = active_sequence(behind_lanes[row]);
+                    sequence.dflash_context_frontier = sequence.execution_frontier;
+                }
+            }
+        }
         bool constrained = false;
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             grammar_dead_positions[row] = 0;
@@ -691,8 +727,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         }
         DecodeGraphExecutable* forward       = nullptr;
         DecodeGraphExecutable* finish        = nullptr;
-        execution::DFlashEnvelopes envelopes =
-            dflash_envelopes(maximum_frontier, max_verify_drafts);
+        execution::DFlashEnvelopes envelopes = dflash_envelopes(maximum_frontier, verify_drafts);
         ops::CausalAttentionExecutionEnvelope target_envelope{1, maximum_target_tokens};
         if (use_cuda_graph) {
             const auto batch = static_cast<std::uint32_t>(lanes.size());
@@ -700,7 +735,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             auto& completion = family.finish.select(batch, maximum_frontier);
             forward          = &family.forward.install(profile);
             finish           = &family.finish.install(completion);
-            envelopes       = dflash_envelopes(profile.max_execution_frontier, max_verify_drafts);
+            envelopes        = dflash_envelopes(profile.max_execution_frontier, verify_drafts);
             target_envelope = {
                 1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
                        capacity, static_cast<std::uint64_t>(profile.max_execution_frontier) +
@@ -717,7 +752,9 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                 checked_i32(frontier, "DFlash batch frontier");
             dflash_host_ingress->context_frontiers[row] =
                 checked_i32(sequence.dflash_context_frontier, "DFlash context frontier");
-            dflash_host_ingress->proposal_valid_columns[row] = static_cast<std::int32_t>(width);
+            // The draft model always proposes its own block, also beside copies.
+            dflash_host_ingress->proposal_valid_columns[row] =
+                static_cast<std::int32_t>(draft_window + 1U);
             dflash_host_ingress->proposal_extents[row]       = static_cast<std::int32_t>(extent);
             dflash_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1U);
             for (std::uint32_t column = 0; column < width; ++column) {
@@ -739,7 +776,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                 // The copy at the round's [k, B] layout; columns past it hold the anchor, which
                 // verification never reads.
                 const std::vector<TokenId>& copy    = copies[row].tokens;
-                dflash_host_ingress->copy_rows[row] = copy.empty() ? 0 : 1;
+                dflash_host_ingress->copy_rows[row] = copies_row(row) ? 1 : 0;
                 for (std::uint32_t step = 0; step < verify_drafts; ++step) {
                     dflash_host_ingress->copy_drafts[row * verify_drafts + step] =
                         step < copy.size() ? copy[step] : sequence.ledger.back();
@@ -760,7 +797,8 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             state_images->continuation_hidden_store(),
             dflash_draft_handoff->tokens(),
             dflash_draft_handoff->ready,
-            copy_round};
+            copy_round,
+            draft_window};
 
         mark_workspace_usage(workspace_plan.dflash_round);
         const auto batch = static_cast<std::int32_t>(lanes.size());
@@ -820,11 +858,12 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                 request.speculative_stats.rounds += 1;
                 request.speculative_stats.drafted_tokens += extent;
                 request.speculative_stats.accepted_tokens += static_cast<std::uint32_t>(accepted_i);
-                if (copy_round) {
+                if (copies_row(row)) {
                     request.speculative_stats.ngram_rounds += 1;
                     request.speculative_stats.ngram_drafted_tokens += extent;
                     request.speculative_stats.ngram_accepted_tokens +=
                         static_cast<std::uint32_t>(accepted_i);
+                    request.ngram_backoff.record(extent, static_cast<std::uint32_t>(accepted_i));
                 } else {
                     for (std::int32_t i = 0; i < accepted_i; ++i) {
                         request.speculative_stats

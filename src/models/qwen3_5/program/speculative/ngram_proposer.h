@@ -268,6 +268,42 @@ private:
     }
 };
 
+// A request whose copies keep missing asks for longer matches before it copies again. A copy round
+// that commits fewer than kNgramMissAcceptedTokens of its copied tokens (or of all of them, when
+// fewer were verified) is a miss and raises the request's level by one, up to kNgramMaxBackoff; any
+// other copy round lowers it by one. A copy then needs `minimum_match * (1 + level)` matched
+// tokens, at most the match history. Only committed rounds move the level, never the output budget,
+// so a request's copy decisions are a function of its committed history.
+//
+// Chosen offline on the agent replay (docs/performance.md): a wrong copy costs a 16-column round,
+// which mostly happens where the request copies from several near-identical places (reverting a
+// diff), and a longer match there picks the right one or none.
+inline constexpr std::uint32_t kNgramMissAcceptedTokens = 4;
+inline constexpr std::uint32_t kNgramMaxBackoff         = 2;
+
+class NgramCopyBackoff {
+public:
+    [[nodiscard]] std::uint32_t required_match(std::uint32_t minimum_match) const noexcept {
+        const std::uint64_t required = static_cast<std::uint64_t>(minimum_match) * (1U + level_);
+        return static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(required, kNgramMatchHistoryTokens));
+    }
+
+    // One verified copy round of `drafted` copied tokens, `accepted` of which were committed.
+    void record(std::uint32_t drafted, std::uint32_t accepted) noexcept {
+        if (accepted < std::min(drafted, kNgramMissAcceptedTokens)) {
+            level_ = std::min(level_ + 1U, kNgramMaxBackoff);
+        } else if (level_ != 0) {
+            --level_;
+        }
+    }
+
+    [[nodiscard]] std::uint32_t level() const noexcept { return level_; }
+
+private:
+    std::uint32_t level_ = 0;
+};
+
 struct NgramIndexCapacity {
     std::size_t tokens  = 0;
     std::size_t buckets = 0;

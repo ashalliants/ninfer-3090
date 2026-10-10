@@ -482,9 +482,6 @@ BenchOptions parse_args(int argc, char** argv) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
     product::validate_speculative_cli_options(options.speculative);
-    if (options.speculative.ngram_draft_tokens != 0 && options.concurrency > 1) {
-        throw std::invalid_argument("--ngram-draft-tokens needs --concurrency 1 for now");
-    }
     return options;
 }
 

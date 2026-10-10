@@ -28,11 +28,16 @@
 // Steady masked-draft round cost on a real artifact. Three modes:
 //   default        complete DFlash/DFlash2 neural rounds: context append, proposal, target
 //                  verification/acceptance and host publication
-//   --copy-width W teacher-forced n-gram copy rounds (DFlash2, batch one): the bench first records
-//                  the request's own greedy continuation, then gives a second identical request that
-//                  continuation as an n-gram proposal source, so every copy round can verify a full
-//                  W-1 drafts. Only rounds that accept all of them are timed, which gives the cost
-//                  of a W-column copy round t(W). The source is a bench input, not a product flag.
+//   --copy-width W teacher-forced n-gram copy rounds (DFlash2): the bench first records the
+//                  request's own greedy continuation, then gives identical requests in the first
+//                  --copy-lanes lanes (default: all) that continuation as an n-gram proposal
+//                  source, so every copy round can verify a full W-1 drafts; the other lanes run
+//                  the same prompt without copies, which the draft model proposes for beside them.
+//                  Only rounds in which every copying lane accepts all of its drafts are timed,
+//                  which gives the cost of a W-column copy round t(W). The source is a bench input,
+//                  not a product flag.
+//   --ngram-idle W default neural rounds with W-column copy rounds configured but no request
+//                  holding a copy index, the cost n-gram drafting adds to rounds that never copy
 //   --prefill-tail N  the cost of a final N-token prefill chunk at the context depth, a proxy for
 //                  verify widths the round Ops do not reach
 namespace {
@@ -50,6 +55,8 @@ struct Options {
     std::uint32_t draft_tokens         = 15;
     std::uint32_t batch_size           = 1;
     std::uint32_t copy_width           = 0;
+    std::uint32_t copy_lanes           = 0;
+    std::uint32_t ngram_idle_width     = 0;
     std::uint32_t prefill_tail         = 0;
     std::uint32_t prefill_chunk        = 128;
     ninfer::SpeculativeBackend backend = ninfer::SpeculativeBackend::DFlash;
@@ -64,7 +71,7 @@ void print_usage(const char* executable) {
                  " [--warmup <n>] [--reps <n>] [--draft-tokens <1..15>]"
                  " [--batch <1..8>] [--spec dflash|dflash2] [--kv-dtype bf16|int8|rk4v4]"
                  " [--corpus <ids file>] [--prefill-chunk <tokens>]"
-                 " [--copy-width <W> | --prefill-tail <N>]"
+                 " [--copy-width <W> [--copy-lanes <n>] | --ngram-idle <W> | --prefill-tail <N>]"
                  " [--proposal-head full|optimized] [--no-cuda-graph]\n";
 }
 
@@ -112,6 +119,10 @@ Options parse_options(int argc, char** argv) {
             options.batch_size = parse_u32(value("--batch"), "batch");
         } else if (argument == "--copy-width") {
             options.copy_width = parse_u32(value("--copy-width"), "copy-width");
+        } else if (argument == "--copy-lanes") {
+            options.copy_lanes = parse_u32(value("--copy-lanes"), "copy-lanes");
+        } else if (argument == "--ngram-idle") {
+            options.ngram_idle_width = parse_u32(value("--ngram-idle"), "ngram-idle");
         } else if (argument == "--prefill-tail") {
             options.prefill_tail = parse_u32(value("--prefill-tail"), "prefill-tail");
         } else if (argument == "--prefill-chunk") {
@@ -162,19 +173,27 @@ Options parse_options(int argc, char** argv) {
     if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }
-    if (options.copy_width != 0) {
-        if (options.copy_width < options.draft_tokens + 1 || options.copy_width > 16 ||
-            options.backend != ninfer::SpeculativeBackend::DFlash2 || options.batch_size != 1) {
-            throw std::invalid_argument(
-                "--copy-width needs DFlash2, batch 1 and a width in [draft-tokens+1,16]");
-        }
+    if (options.copy_width != 0 && options.ngram_idle_width != 0) {
+        throw std::invalid_argument("--copy-width and --ngram-idle are exclusive");
+    }
+    const std::uint32_t copy_window = std::max(options.copy_width, options.ngram_idle_width);
+    if (copy_window != 0 && (copy_window < options.draft_tokens + 1 || copy_window > 16 ||
+                             options.backend != ninfer::SpeculativeBackend::DFlash2)) {
+        throw std::invalid_argument(
+            "--copy-width and --ngram-idle need DFlash2 and a width in [draft-tokens+1,16]");
+    }
+    if (options.copy_lanes == 0) { options.copy_lanes = options.batch_size; }
+    if (options.copy_lanes > options.batch_size ||
+        (options.copy_width == 0 && options.copy_lanes != options.batch_size)) {
+        throw std::invalid_argument("--copy-lanes needs --copy-width and at most --batch lanes");
     }
     if (options.prefill_tail != 0) {
-        if (options.copy_width != 0 || options.prefill_tail >= options.prefill_chunk ||
+        if (options.copy_width != 0 || options.ngram_idle_width != 0 ||
+            options.prefill_tail >= options.prefill_chunk ||
             options.context_tokens % options.prefill_chunk != 0 || options.batch_size != 1) {
             throw std::invalid_argument(
                 "--prefill-tail needs batch 1, a tail below --prefill-chunk and a context that "
-                "is a multiple of it, and excludes --copy-width");
+                "is a multiple of it, and excludes --copy-width and --ngram-idle");
         }
     }
     return options;
@@ -300,8 +319,8 @@ public:
         engine.speculative.backend            = options.backend;
         engine.speculative.draft_tokens       = options.draft_tokens;
         engine.speculative.proposal_head      = options.proposal;
-        engine.speculative.ngram_draft_tokens =
-            options.copy_width == 0 ? 0 : options.copy_width - 1U;
+        const std::uint32_t copy_window = std::max(options.copy_width, options.ngram_idle_width);
+        engine.speculative.ngram_draft_tokens = copy_window == 0 ? 0 : copy_window - 1U;
         engine.use_cuda_graph  = options.use_cuda_graph;
         engine.max_concurrency = options.batch_size;
         engine       = ninfer::runtime::normalize_engine_options(std::move(engine));
@@ -315,12 +334,14 @@ public:
     qwen::Program& program() { return *constructed_.instance->program; }
 
     // Prefills `prompt` into `lane` and commits its first token. With a source, the request's
-    // n-gram index also holds it as a proposal-only source.
+    // n-gram index also holds it as a proposal-only source; without one the request has no index,
+    // so it never copies.
     StartedSequence start(std::uint32_t lane, std::vector<ninfer::TokenId> prompt,
                           const std::vector<ninfer::TokenId>* source = nullptr) {
         auto& frontend = constructed_.instance->frontend;
         auto& program  = constructed_.instance->program;
         auto prepared  = frontend.prepare_tokens(std::move(prompt), false);
+        qwen::FrontendTestAccess::edit(prepared).ngram_index.index.reset();
         if (source != nullptr) {
             auto& data         = qwen::FrontendTestAccess::edit(prepared);
             data.ngram_sources = {*source};
@@ -390,7 +411,7 @@ private:
 };
 
 void print_header(const Options& options, const ninfer::DeviceContext& device, const char* mode) {
-    std::cout << "format,ninfer_qwen3_5_dflash_round_bench_v4\n";
+    std::cout << "format,ninfer_qwen3_5_dflash_round_bench_v5\n";
     std::cout << "mode," << mode << '\n';
     std::cout << "artifact," << options.artifact.string() << '\n';
     std::cout << "device," << device.props.name << '\n';
@@ -400,6 +421,7 @@ void print_header(const Options& options, const ninfer::DeviceContext& device, c
     std::cout << "context_tokens," << options.context_tokens << '\n';
     std::cout << "draft_tokens," << options.draft_tokens << '\n';
     std::cout << "batch_size," << options.batch_size << '\n';
+    std::cout << "ngram_idle_width," << options.ngram_idle_width << '\n';
     std::cout << "proposal_head,"
               << (options.proposal == ninfer::ProposalHead::Optimized ? "optimized" : "full")
               << '\n';
@@ -440,18 +462,23 @@ int run_prefill_tail(const Options& options, const std::vector<ninfer::TokenId>&
     return 0;
 }
 
-// Teacher-forced copy rounds at `copy_width` columns.
+// Teacher-forced copy rounds at `copy_width` columns in the first `copy_lanes` lanes; the other
+// lanes decode the same prompt without copies.
 int run_copy(const Options& options, const std::vector<ninfer::TokenId>& corpus) {
     const std::uint32_t width    = options.copy_width;
+    const std::uint32_t batch    = options.batch_size;
+    const std::uint32_t copying  = options.copy_lanes;
     const std::uint32_t measured = static_cast<std::uint32_t>(options.warmup + options.repetitions);
     // The recorded continuation covers every measured round at full width, plus room to resync.
     const std::uint32_t recorded_target = measured * width + 64U;
     const std::uint32_t outputs         = 2U * recorded_target + 2U * width + 1U;
     const std::uint64_t max_context     = options.context_tokens + outputs + 2ULL * width;
-    if (max_context > 262144) {
+    const std::uint64_t capacity =
+        batch == 1 ? max_context : ((max_context + 63ULL) & ~63ULL) * batch;
+    if (max_context > 262144 || capacity > std::numeric_limits<std::uint32_t>::max()) {
         throw std::invalid_argument("context and measured rounds exceed native capacity");
     }
-    Harness harness(options, static_cast<std::uint32_t>(max_context), max_context, outputs);
+    Harness harness(options, static_cast<std::uint32_t>(max_context), capacity, outputs);
     auto& program            = harness.program();
     const auto prompt        = prompt_tokens(options.context_tokens, corpus);
 
@@ -475,26 +502,49 @@ int run_copy(const Options& options, const std::vector<ninfer::TokenId>& corpus)
         prompt.end() - static_cast<std::ptrdiff_t>(std::min<std::size_t>(prompt.size(), 64)),
         prompt.end());
     source.insert(source.end(), continuation.begin(), continuation.end());
-    const auto teacher = harness.start(0, prompt, &source);
-    if (teacher.first_token != recording.first_token) {
-        throw std::runtime_error("the teacher request's first token differs from the recording");
+    std::array<qwen::SequenceHandle, ninfer::kMaximumConcurrency> lanes{};
+    for (std::uint32_t lane = 0; lane < batch; ++lane) {
+        const auto started = harness.start(lane, prompt, lane < copying ? &source : nullptr);
+        if (started.first_token != recording.first_token) {
+            throw std::runtime_error("a request's first token differs from the recording");
+        }
+        lanes[lane] = started.sequence;
     }
-    const auto sequence = std::span<const qwen::SequenceHandle>(&teacher.sequence, 1);
-    ninfer::SpeculativeStats before{};
+    const auto sequences = std::span<const qwen::SequenceHandle>(lanes.data(), batch);
+    std::array<ninfer::SpeculativeStats, ninfer::kMaximumConcurrency> before{};
     std::vector<float> full_gpu_ms;
     std::vector<float> partial_gpu_ms;
     std::vector<float> neural_gpu_ms;
-    std::uint64_t full_wall_count = 0;
-    double full_wall_ms           = 0.0;
+    std::uint64_t full_wall_count  = 0;
+    double full_wall_ms            = 0.0;
+    std::uint64_t free_tokens      = 0;
+    std::uint64_t free_lane_rounds = 0;
     for (std::uint32_t round = 0; round < measured; ++round) {
         const RoundMeasurement measurement =
-            measure_round(program, harness.device(), sequence, 1, width);
-        const ninfer::SpeculativeStats& after = measurement.stats[0];
-        const bool copy     = after.ngram_rounds != before.ngram_rounds;
-        const bool full     = copy && after.ngram_accepted_tokens - before.ngram_accepted_tokens ==
-                                      static_cast<std::uint64_t>(width - 1U);
-        before              = after;
-        if (round < static_cast<std::uint32_t>(options.warmup)) { continue; }
+            measure_round(program, harness.device(), sequences, batch, width);
+        bool copy = false;
+        bool full = true;
+        for (std::uint32_t lane = 0; lane < copying; ++lane) {
+            const ninfer::SpeculativeStats& after = measurement.stats[lane];
+            const bool copied                     = after.ngram_rounds != before[lane].ngram_rounds;
+            copy                                  = copy || copied;
+            full                                  = full && copied &&
+                   after.ngram_accepted_tokens - before[lane].ngram_accepted_tokens ==
+                       static_cast<std::uint64_t>(width - 1U);
+        }
+        const bool timed = round >= static_cast<std::uint32_t>(options.warmup);
+        for (std::uint32_t lane = copying; lane < batch; ++lane) {
+            const ninfer::SpeculativeStats& after = measurement.stats[lane];
+            if (timed && full) {
+                free_tokens += (after.accepted_tokens - before[lane].accepted_tokens) +
+                               (after.rounds - before[lane].rounds);
+                free_lane_rounds += after.rounds - before[lane].rounds;
+            }
+        }
+        for (std::uint32_t lane = 0; lane < batch; ++lane) {
+            before[lane] = measurement.stats[lane];
+        }
+        if (!timed) { continue; }
         if (full) {
             full_gpu_ms.push_back(measurement.gpu_ms);
             full_wall_ms += measurement.wall_ms;
@@ -505,10 +555,17 @@ int run_copy(const Options& options, const std::vector<ninfer::TokenId>& corpus)
             neural_gpu_ms.push_back(measurement.gpu_ms);
         }
     }
-    harness.abort(teacher.sequence);
+    for (std::uint32_t lane = 0; lane < batch; ++lane) { harness.abort(lanes[lane]); }
 
     print_header(options, harness.device(), "teacher_copy");
     std::cout << "copy_width," << width << '\n';
+    std::cout << "copy_lanes," << copying << '\n';
+    if (free_lane_rounds != 0) {
+        // The lanes beside the copies: their own tokens per round in the timed copy rounds.
+        std::cout << "free_lane_tokens_per_round,"
+                  << static_cast<double>(free_tokens) / static_cast<double>(free_lane_rounds)
+                  << '\n';
+    }
     std::cout << "recorded_tokens," << continuation.size() << '\n';
     std::cout << "recording_rounds," << recording_rounds << '\n';
     print_gpu("full_copy_round", full_gpu_ms);

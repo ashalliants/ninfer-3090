@@ -91,9 +91,12 @@ struct DFlashBatchContext {
     Tensor& continuation_hidden_store;
     std::span<TokenId> host_drafts;
     CudaCompletionEvent& drafts_ready;
-    // An n-gram copy round: the draft model does not run, and the rows flagged in the ingress
-    // verify their copies as one-hot proposals. Context catch-up still runs.
-    bool copy_round = false;
+    // An n-gram copy round: the rows flagged in the ingress verify their copies as one-hot
+    // proposals. At batch one the draft model does not run; above it the draft model proposes its
+    // own `neural_drafts` for every row and a flagged row's copy replaces them. Context catch-up
+    // always runs.
+    bool copy_round             = false;
+    std::uint32_t neural_drafts = 0;
 };
 
 struct DFlashAppendContext {

@@ -324,8 +324,8 @@ struct DFlashDecodeState {
 
     // The same storage viewed densely as a round of `k` drafts: every per-column tensor becomes
     // [k+1 or k, batch_capacity] over its leading elements, matching host ingress/egress indexed
-    // at row * (k + 1). Append positions keep the allocated width, since a round's context
-    // catch-up covers the previous round, which may have run a wider family.
+    // at row * (k + 1). Append positions too: a round's context catch-up runs at its own width,
+    // so a wider previous round is caught up before a narrower one (see decode_dflash_batch).
     [[nodiscard]] DFlashDecodeState narrowed(std::uint32_t k) const;
 };
 

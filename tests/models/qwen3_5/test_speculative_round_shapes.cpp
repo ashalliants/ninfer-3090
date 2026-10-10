@@ -3,10 +3,10 @@
 // A Program captures one Forward/Finish graph family per SpeculativeRoundShape. Without n-gram
 // drafting the set must stay exactly one neural family at the configured draft window, so the
 // captured executables, graph allowance and round buffers match a single-width Program. N-gram
-// copy drafting adds exactly one copy family at its window. Round
-// storage is allocated at the widest family and viewed densely at each round's width: the views
-// must alias the allocated storage, keep the batch capacity and leave the catch-up append width
-// alone, because host ingress/egress index every row at row * (k + 1).
+// copy drafting adds exactly one copy family at its window, which runs at batch one and two only.
+// Round storage is allocated at the widest family and viewed densely at each round's width, the
+// catch-up append positions included: the views must alias the allocated storage and keep the
+// batch capacity, because host ingress/egress index every row at row * (k + 1).
 
 #include "core/gdn_replay_records.h"
 #include "core/layout.h"
@@ -14,6 +14,7 @@
 #include "models/qwen3_5/program/round_buffers.h"
 #include "ninfer/types.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -91,6 +92,24 @@ void check_round_shapes() {
     const std::vector<SpeculativeRoundShape> mixed{{SpeculativeRoundKind::Neural, 7},
                                                    {SpeculativeRoundKind::Neural, 15}};
     expect(qwen::detail::max_verify_drafts(mixed) == 15, "widest of several families");
+
+    // A copy round widens every row of its batch, so the copy family stops at batch two, and a
+    // batch of two needs a long copy before it pays for its neural partner.
+    const SpeculativeRoundShape neural{SpeculativeRoundKind::Neural, 7};
+    const SpeculativeRoundShape copy{SpeculativeRoundKind::Copy, 15};
+    for (const std::uint32_t lanes : {1U, 2U, 3U, 8U}) {
+        expect(qwen::detail::round_family_batch_limit(neural, lanes) == lanes,
+               "the neural family captures every batch up to " + std::to_string(lanes));
+        expect(qwen::detail::round_family_batch_limit(copy, lanes) == std::min(lanes, 2U),
+               "the copy family captures batches up to two of " + std::to_string(lanes));
+    }
+    expect(qwen::detail::copy_round_minimum_drafts(1) == 1,
+           "at batch one any offered copy takes the round");
+    expect(qwen::detail::copy_round_minimum_drafts(2) == 12,
+           "at batch two a copy of at least 12 drafts takes the round");
+    expect(qwen::detail::copy_round_minimum_drafts(3) > 15 &&
+               qwen::detail::copy_round_minimum_drafts(8) > 15,
+           "above batch two no copy takes the round");
 }
 
 void check_dflash_frame_views() {
@@ -153,8 +172,9 @@ void check_dflash_frame_views() {
                same_shape(narrow.proposal_q, {16, 7, kBatch}),
            "sparse proposal planes are dense [16,7,C] views");
     expect(narrow.append_positions.data == frame.append_positions.data &&
-               same_shape(narrow.append_positions, {16, kBatch}),
-           "catch-up append positions keep the allocated width");
+               same_shape(narrow.append_positions, {8, kBatch}) &&
+               same_shape(native.append_positions, {16, kBatch}),
+           "catch-up append positions are a dense view at the round width");
     expect(narrow.ingress.data == frame.ingress.data && narrow.egress.data == frame.egress.data,
            "ingress and egress are shared");
 
