@@ -13,7 +13,8 @@ references, `engine-architecture.md`).
 | 1 | GGUF reader, nine exact GGML block formats, `ggml_blocks_v1` / `ggml_rows_page4k_v1`, `qwen4_exp` name map, tokenizer synthesis, `--subset dev` | done (Python only) |
 | 2 | C++ registration and materialization of the GGML formats and layouts; host exact decoder | done |
 | 3 | Dense GGML linears: `linear`/`linear_add` for IQ4_XS, IQ3_S, Q6_K, IQ4_NL, Q8_0, Q2_0 at the model's 19 dense problems, Q8_1 activation profile | done (perf gates below) |
-| 4-9 | Hyper-connections and FP32 head, QSA, PLE frontend and stream residency, model skeleton, MoE on GPU, MoE on CPU | not started |
+| 6 | Ops from Infernix: `hyper_connection` (mix, inject, expand), `ple` (IQ4_NL `ple_embed`, gate, stateful convolution, commit), `projection_fp32` (BF16 router; IQ4_XS head on PR 3's decode route), `rows` | done (HC perf gate missed, below) |
+| 4-9 | QSA, PLE frontend and stream residency, model skeleton, MoE on GPU, MoE on CPU | not started |
 | 10 | Whole model at 32K, quality gate against Strata | not started |
 | 11-14 | Residency policy and miss split, 128K, MTP, vision | not started |
 
@@ -33,6 +34,36 @@ cast plus int8 MMA with dequantize-to-FP16 plus cuBLAS (`cublasGemmEx`, FP32 com
 | Wide, T = 512 / 4096, ours over dequant + cuBLAS | 1.02-2.02x for five formats; Q6_K 0.96x / 0.77x |
 
 The 80% decode gate is not met; see the PR 3 description for the tuning that was tried.
+
+## PR 6 measurements
+
+RTX 3090, CUDA 12.8, L2 flushed before each graph replay. "Chained" is 8 calls per graph on
+distinct weight copies (the per-call cost inside a decode graph).
+
+| Workload | Result |
+|---|---|
+| `hyper_connection_mix`, T = 1, 13.2 MB BF16 (block mixer / final mixer) | chained 28.2 / 26.8 us = 50% / 52% of 936 GB/s; single call 30.7 / 28.7 us |
+| Same bytes, loads only (a probe of a rejected one-kernel variant, chained) | 17.3 us = 81% |
+| `hyper_connection_mix`, fused route T = 2 / 4 / 8 / 16; composed route T = 17 / 64 | 35 / 49 / 76 / 122 us; 34 / 66 us |
+| `projection_fp32` IQ4_XS head [248320, 2560], T = 1 / 2 / 8 | 392 / 396-400 / 583 us = 92% / 91% / 63% |
+| `projection_fp32` BF16 router + shared gate [513, 2560], T = 1 / 8 / 9 | 10.2 / 14.3 / 26.6 us |
+
+The 80% HC gate is not met: the fused mixer is latency-bound on sm_86, and above T = 2 it is
+slower than the composed route. See the PR 6 description.
+
+## Files ported from Infernix
+
+Infernix (Apache-2.0) at commit `a3edb450`. Each file carries its own adaptation notice.
+
+| Ours | Infernix |
+|---|---|
+| `include/ninfer/ops/hyper_connection.h` | `include/infernix/ops/hyper_connection.h` |
+| `src/ops/hyper_connection/hyper_connection.cu` | `src/ops/hyper_connection/hyper_connection.cu` |
+| `src/ops/hyper_connection/hyper_connection_mix_fused.{h,cu}` | `src/ops/hyper_connection/hyper_connection_mix_fused.{h,cu}` |
+| `include/ninfer/ops/ple.h`, `src/ops/ple/ple.cu` | `include/infernix/ops/ple.h`, `src/ops/ple/ple.cu` |
+| `include/ninfer/ops/projection_fp32.h`, `src/ops/projection_fp32/projection_fp32.cu` | `include/infernix/ops/projection_fp32.h`, `src/ops/projection_fp32/projection_fp32.cu` |
+| `include/ninfer/ops/rows.h`, `src/ops/rows/rows.cu` | `include/infernix/ops/rows.h`, `src/ops/rows/rows.cu` |
+| `tests/ops/test_hyper_connection.cpp`, `test_projection_fp32.cpp`, `test_rows.cpp` | `tests/ops/test_hyper_connection.cpp`, `tests/ops/linear/test_projection_fp32.cpp`, `tests/ops/test_rows.cpp` |
 
 ## Artifact decisions taken in PR 1
 

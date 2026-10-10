@@ -42,6 +42,19 @@ ninfer_add_op_test(ninfer_linear_topk_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"
   LIBRARIES ninfer_ops)
 
+# Qwen3.8-Flash-Next (qwen4exp) Ops ported from Infernix: hyper-connection mixers, the PLE
+# injection (with its IQ4_NL row decode), FP32 projections (BF16 router, IQ4_XS head) and row
+# splits / column gathers.
+ninfer_add_op_test(ninfer_hyper_connection_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_hyper_connection.cpp"
+  LIBRARIES ninfer_linear_test_support)
+
+foreach(op IN ITEMS ple projection_fp32 rows)
+  ninfer_add_op_test(ninfer_${op}_test
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_${op}.cpp"
+    LIBRARIES ninfer_ops)
+endforeach()
+
 ninfer_add_op_test(ninfer_candidate_selector_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_candidate_selector.cpp"
   LIBRARIES ninfer_ops)
