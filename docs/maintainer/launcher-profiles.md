@@ -29,7 +29,7 @@ carries the context, lane count and prefill chunk that fit it:
 
 | `NINFER_SPEC` | flags | context (Linux / Windows) | lanes (Linux / Windows) |
 |---|---|---|---|
-| `dflash2` (default) | `--spec dflash2 --draft-tokens 7 --lm-head-draft --prefill-cublas --prefill-chunk 4096 --kv-dtype rk4v4 --gdn-state-fp16 --vision --vision-residency overlay` | 262,144 / 188,416 | 1 / 1 |
+| `dflash2` (default) | `--spec dflash2 --draft-tokens 7 --lm-head-draft --ngram-draft-tokens 15 --prefill-cublas --prefill-chunk 4096 --kv-dtype rk4v4 --gdn-state-fp16 --vision --vision-residency overlay` | 262,144 / 188,416 | 1 / 1 |
 | `mtp` | `--spec mtp --draft-tokens 3 --lm-head-draft --prefill-cublas --prefill-chunk 2048 --kv-dtype rk4v4 --gdn-state-fp16 --vision --vision-residency overlay` | 262,144 / 262,144 | 2 / 2 |
 | `none` | the `mtp` set without speculation | 262,144 / 262,144 | 2 / 2 |
 
@@ -43,6 +43,16 @@ The first is the fastest at one stream (prefill about 1.7x and decode about 1.39
 defaults) and the second is the full context with a second lane, still fast. The Qwen3.6-35B-A3B
 `tuned` profile runs MTP3 + draft head at 262,144 tokens with three lanes on Linux and two on
 Windows.
+
+N-GRAM COPIES, 2026-10-10. The `dflash2` variant passes `--ngram-draft-tokens 15` when it runs one
+lane, which is its default; `NINFER_NGRAM=off` drops it. On the agent replay
+(`tools/bench/agent_replay`) it decodes 42% faster overall and 53-76% faster on turns that write back
+a file the conversation has read. Output that never copies is 0.7% slower, and it plans 170 MiB more
+runtime memory: the Windows 188,416-token start still had 991 MiB free. With
+`NINFER_CONCURRENCY=2` it stays off unless `NINFER_NGRAM=on`. There, aggregate throughput rises 15%,
+but a request sharing rounds with a copying one decodes up to 19% slower. `NINFER_NGRAM=on` with
+`mtp` or `none` is refused, because copy rounds ride on DFlash2. Tables are in
+[performance](../performance.md#n-gram-copy-drafting-rtx-3090-qwen38-27b).
 
 MTP DRAFT COUNT, 2026-09-28. MTP now accepts `NINFER_DRAFT_TOKENS` up to 15 (it was capped at
 five). The `mtp` profiles keep three: it is best or within 2% on prose, while 7, 9 and 15 lose 12%,
