@@ -7,8 +7,9 @@ them against ggml-base.dll from that release. NInfer has no encoder for these fo
 converter only imports existing blocks.
 
 ``ggml_blocks_v1`` stores the blocks unchanged: a row is K / block_elems consecutive blocks and
-rows are row-major. ``ggml_rows_page4k_v1`` packs whole rows into 4096-byte pages with a zero
-tail, so a row never crosses a page; ``page_rows`` and ``unpage_rows`` are exact inverses.
+rows are row-major. ``ggml_expert_record_v1`` stores one routed expert per record: its gate, up
+and down rows, each part unchanged; ``pack_expert_records`` and ``unpack_expert_records`` are
+exact inverses.
 """
 
 from __future__ import annotations
@@ -17,13 +18,8 @@ from typing import Sequence
 
 import numpy as np
 
-from ..formats import GgmlBlockFormat
-from ..layouts import (
-    ROW_PAGE_BYTES,
-    _format,
-    ggml_blocks_geometry,
-    ggml_row_page_geometry,
-)
+from ..formats import GgmlBlockFormat, GgmlExpertRecordFormat
+from ..layouts import _format, ggml_blocks_geometry, ggml_expert_record_geometry
 from . import ggml_tables as tables
 
 _F32 = np.float32
@@ -257,54 +253,56 @@ def decode_ggml_blocks(
     return decode_blocks(format, raw).reshape(tuple(shape))
 
 
-def page_rows(
-    rows: np.ndarray, format: str | GgmlBlockFormat, shape: Sequence[int], row_begin: int
-) -> tuple[int, np.ndarray]:
-    """Place encoded rows ``[row_begin, row_begin+len(rows))`` into whole pages.
-
-    *rows* is uint8 ``[count, row_bytes]``. The rows must start a page and either fill whole
-    pages or end the tensor, so every returned page is complete. Returns the payload offset and
-    the page bytes ``[pages, 4096]``.
-    """
-    geometry = ggml_row_page_geometry(format, shape)
-    count = rows.shape[0]
-    if rows.dtype != np.uint8 or rows.ndim != 2 or rows.shape[1] != geometry.row_bytes:
-        raise TypeError(f"rows must be uint8 [count, {geometry.row_bytes}]")
-    end = row_begin + count
-    if count <= 0 or row_begin % geometry.rows_per_page or end > geometry.rows:
-        raise ValueError("paged rows must start a page and stay inside the tensor")
-    if count % geometry.rows_per_page and end != geometry.rows:
-        raise ValueError("paged rows must fill whole pages unless they end the tensor")
-    pages = -(-count // geometry.rows_per_page)
-    out = np.zeros((pages, ROW_PAGE_BYTES), dtype=np.uint8)
-    used = geometry.rows_per_page * geometry.row_bytes
-    padded = np.zeros((pages * geometry.rows_per_page, geometry.row_bytes), np.uint8)
-    padded[:count] = rows
-    out[:, :used] = padded.reshape(pages, used)
-    return row_begin // geometry.rows_per_page * ROW_PAGE_BYTES, out
-
-
-def unpage_rows(
-    payload: bytes | bytearray | memoryview | np.ndarray,
-    format: str | GgmlBlockFormat,
+def pack_expert_records(
+    format: str | GgmlExpertRecordFormat,
     shape: Sequence[int],
+    gate: np.ndarray,
+    up: np.ndarray,
+    down: np.ndarray,
 ) -> np.ndarray:
-    """Recover the ``[rows, row_bytes]`` block rows of a ``ggml_rows_page4k_v1`` payload.
+    """Pack experts' exact block rows into ``ggml_expert_record_v1`` records.
 
-    Rejects a payload whose page tails are not zero, so paging round-trips exactly.
+    *gate* and *up* are uint8 ``[count, intermediate, gate_up_row_bytes]``, *down* is uint8
+    ``[count, hidden, down_row_bytes]``; *shape* is the whole bank ``[experts, hidden,
+    intermediate]``. Returns uint8 ``[count, record_stride]`` with zero gaps.
     """
-    geometry = ggml_row_page_geometry(format, shape)
+    g = ggml_expert_record_geometry(format, shape)
+    count = gate.shape[0]
+    for name, part, rows, row_bytes in (
+        ("gate", gate, g.intermediate, g.gate_up_row_bytes),
+        ("up", up, g.intermediate, g.gate_up_row_bytes),
+        ("down", down, g.hidden, g.down_row_bytes),
+    ):
+        if part.dtype != np.uint8 or part.shape != (count, rows, row_bytes):
+            raise TypeError(f"{name} rows must be uint8 [{count}, {rows}, {row_bytes}]")
+    out = np.zeros((count, g.record_stride), dtype=np.uint8)
+    out[:, : g.gate_bytes] = gate.reshape(count, -1)
+    out[:, g.up_offset : g.up_offset + g.gate_bytes] = up.reshape(count, -1)
+    out[:, g.down_offset : g.down_offset + g.down_bytes] = down.reshape(count, -1)
+    return out
+
+
+def unpack_expert_records(
+    payload: bytes | bytearray | memoryview | np.ndarray,
+    format: str | GgmlExpertRecordFormat,
+    shape: Sequence[int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The exact inverse of :func:`pack_expert_records` over a complete bank payload.
+
+    Returns gate, up and down block rows; rejects a payload whose gaps are not zero.
+    """
+    g = ggml_expert_record_geometry(format, shape)
     raw = _bytes(payload)
-    if raw.size != geometry.payload_bytes:
+    if raw.size != g.payload_bytes:
         raise ValueError(
-            f"ggml_rows_page4k_v1 payload has {raw.size} bytes, "
-            f"expected {geometry.payload_bytes}"
+            f"ggml_expert_record_v1 payload has {raw.size} bytes, expected {g.payload_bytes}"
         )
-    pages = raw.reshape(geometry.pages, ROW_PAGE_BYTES)
-    used = geometry.rows_per_page * geometry.row_bytes
-    if pages[:, used:].any():
-        raise ValueError("ggml_rows_page4k_v1 page tails must be zero")
-    rows = pages[:, :used].reshape(-1, geometry.row_bytes)
-    if rows[geometry.rows :].any():
-        raise ValueError("ggml_rows_page4k_v1 unused rows of the last page must be zero")
-    return rows[: geometry.rows]
+    records = raw.reshape(g.experts, g.record_stride)
+    used = np.zeros(g.record_stride, dtype=bool)
+    parts = []
+    for _, offset, rows, row_bytes in g.parts():
+        used[offset : offset + rows * row_bytes] = True
+        parts.append(records[:, offset : offset + rows * row_bytes].reshape(-1, rows, row_bytes))
+    if records[:, ~used].any():
+        raise ValueError("ggml_expert_record_v1 gaps between parts must be zero")
+    return parts[0], parts[1], parts[2]

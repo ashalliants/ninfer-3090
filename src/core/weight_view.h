@@ -48,16 +48,32 @@ struct WeightGeometry {
     std::uint64_t scale_offset        = 0;
     std::uint64_t scale_bytes         = 0;
     std::uint64_t divisor_offset      = 0;
-    // GgmlRowsPage4K only: whole rows per 4096-byte page.
-    std::uint64_t rows_per_page = 0;
+    // GgmlExpertRecord only: expert e's record is at e * record_stride; inside it gate starts at
+    // 0, up at record_up_offset and down at record_down_offset.
+    std::uint64_t record_bytes       = 0;
+    std::uint64_t record_stride      = 0;
+    std::uint64_t record_up_offset   = 0;
+    std::uint64_t record_down_offset = 0;
 };
 
 [[nodiscard]] WeightGeometry weight_geometry(QType format, QuantLayout layout,
                                              std::span<const std::uint64_t> shape);
 [[nodiscard]] std::uint64_t weight_element_count(std::span<const std::uint64_t> shape);
-// Payload offset of row `row` (C order over the leading axes) of a GGML block parent. Rows of
-// GgmlBlocks are consecutive; GgmlRowsPage4K places them page by page, never across a page.
+// Payload offset of row `row` (C order over the leading axes) of a GgmlBlocks parent.
 [[nodiscard]] std::uint64_t ggml_row_offset(const WeightGeometry& geometry, std::uint64_t row);
+
+// One part of one expert's record in a GgmlExpertRecord parent: `rows` rows of `k` values in the
+// GGML block format `format`, `row_bytes` each, starting at payload offset `offset`.
+enum class ExpertPart : std::uint8_t { Gate = 0, Up = 1, Down = 2 };
+struct GgmlRecordPart {
+    QType format            = QType::BF16;
+    std::uint64_t offset    = 0;
+    std::uint64_t rows      = 0;
+    std::uint64_t k         = 0;
+    std::uint64_t row_bytes = 0;
+};
+[[nodiscard]] GgmlRecordPart ggml_record_part(const WeightGeometry& geometry, std::uint64_t expert,
+                                              ExpertPart part);
 
 // RowSplitPanel is a permutation of RowSplit's bytes, so every byte-counting question about the
 // two has the same answer. Ask this rather than comparing against RowSplit, or the panel layout
@@ -111,8 +127,8 @@ struct WeightRowPlanes {
 [[nodiscard]] Tensor weight_tensor(const WeightView& view,
                                    std::initializer_list<std::int32_t> internal_shape);
 // Existing Weight ABI: complete quantized parents, direct regions, and RowSplit or GgmlBlocks row
-// views (a GgmlBlocks Weight has codes only: its scales live inside each block). GgmlRowsPage4K
-// has no native Weight; its rows are read one at a time.
+// views (a GgmlBlocks Weight has codes only: its scales live inside each block). A
+// GgmlExpertRecord bank has no native Weight; its consumers address records by ggml_record_part.
 // Arbitrary FP8/NVFP4 regions use their explicit planes until a native consumer supports them.
 [[nodiscard]] Weight native_weight(const WeightView& view, float input_divisor = 0.0F);
 

@@ -40,12 +40,14 @@ def _records(data: bytes):
         (id_bytes,) = struct.unpack("<I", take(4))
         object_id = take(id_bytes).decode()
         (residency,) = struct.unpack("<I", take(4))
-        (block,) = struct.unpack("<Q", take(8))
+        (offset,) = struct.unpack("<Q", take(8))
+        (name_bytes,) = struct.unpack("<I", take(4))
+        format = take(name_bytes).decode()
         (block_bytes,) = struct.unpack("<I", take(4))
         encoded = take(block_bytes)
         (count,) = struct.unpack("<I", take(4))
         values = take(4 * count)
-        yield object_id, residency, block, encoded, values
+        yield object_id, residency, offset, format, encoded, values
 
 
 def main() -> int:
@@ -59,9 +61,27 @@ def main() -> int:
         print("numpy is not available to the test interpreter; skipped")
         return SKIP
     from tools.artifact.codecs.ggml_blocks import decode_blocks
-    from tools.artifact.formats import get_format
-    from tools.artifact.layouts import ggml_blocks_geometry, ggml_row_page_geometry
+    from tools.artifact.formats import GgmlExpertRecordFormat, get_format
+    from tools.artifact.layouts import ggml_blocks_geometry, ggml_expert_record_geometry
     from tools.artifact.reader import Artifact
+
+    def block_format(item, offset: int) -> str:
+        """The GGML block format the Python geometry places at payload *offset* of *item*."""
+        spec = get_format(item.format)
+        if not isinstance(spec, GgmlExpertRecordFormat):
+            geometry = ggml_blocks_geometry(spec, item.shape)
+            if offset % spec.block_bytes or offset >= geometry.payload_bytes:
+                raise ValueError(f"{item.id}: offset {offset} is not a block")
+            return spec.name
+        g = ggml_expert_record_geometry(spec, item.shape)
+        within = offset % g.record_stride
+        for role, start, rows, row_bytes in g.parts():
+            part = spec.down if role == "down" else spec.gate_up
+            if start <= within < start + rows * row_bytes:
+                if (within - start) % part.block_bytes:
+                    break
+                return part.name
+        raise ValueError(f"{item.id}: offset {offset} is not a block of a record part")
 
     with tempfile.TemporaryDirectory(prefix="ninfer-ggml-real-") as temporary:
         samples = Path(temporary) / "samples.bin"
@@ -73,30 +93,26 @@ def main() -> int:
     checked: dict[str, int] = {}
     residencies: set[int] = set()
     with Artifact.open(path) as artifact:
-        for object_id, residency, block, encoded, values in _records(data):
+        for object_id, residency, offset, format, encoded, values in _records(data):
             item = artifact.object(object_id)
-            spec = get_format(item.format)
-            if item.layout == "ggml_rows_page4k_v1":
-                geometry = ggml_row_page_geometry(spec, item.shape)
-                row, column = divmod(block, geometry.row_bytes // spec.block_bytes)
-                offset = geometry.row_offset(row) + column * spec.block_bytes
-            else:
-                geometry = ggml_blocks_geometry(spec, item.shape)
-                offset = block * spec.block_bytes
+            if block_format(item, offset) != format:
+                print(f"{object_id} at {offset}: C++ decoded {format}, the geometry says otherwise")
+                return 1
+            spec = get_format(format)
             stored = artifact.read_range(item.offset + offset, spec.block_bytes)
             if stored != encoded:
-                print(f"{object_id} block {block}: C++ addressed different bytes than the file")
+                print(f"{object_id} at {offset}: C++ addressed different bytes than the file")
                 return 1
             expected = decode_blocks(spec, np.frombuffer(stored, np.uint8)).view(np.uint32)
             actual = np.frombuffer(values, "<u4")
             if not np.array_equal(expected, actual):
                 first = int(np.argmax(expected != actual))
                 print(
-                    f"{object_id} block {block} value {first}: C++ 0x{actual[first]:08x}, "
+                    f"{object_id} at {offset} value {first}: C++ 0x{actual[first]:08x}, "
                     f"Python 0x{expected[first]:08x}"
                 )
                 return 1
-            checked[item.format] = checked.get(item.format, 0) + 1
+            checked[format] = checked.get(format, 0) + 1
             residencies.add(residency)
     for name, count in sorted(checked.items()):
         print(f"{name}: {count} sampled blocks bit-exact")

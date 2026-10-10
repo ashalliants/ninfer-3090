@@ -164,6 +164,7 @@ The converter currently writes these formats:
 | `fp8_e4m3fn_row_bf16` | `fp8_row_maxabs` | `import_encoded` |
 | `nvfp4` | Supply a custom quantizer | `import_encoded` |
 | `ggml_q8_0`, `ggml_q6_k`, `ggml_iq2_xxs`, `ggml_iq4_nl`, `ggml_iq3_s`, `ggml_iq2_s`, `ggml_iq4_xs`, `ggml_iq1_m`, `ggml_q2_0` | None | `import_encoded` from a GGUF |
+| `ggml_rec_iq2_s_q2_0`, `ggml_rec_iq2_xxs_q2_0`, `ggml_rec_iq1_m_q2_0` | None | `import_expert_records` from a GGUF expert layer |
 
 `grouped_absmax` stores one FP16 scale per group and signed integer codes. `grouped_search` stores
 the same words but chooses each group's scale by minimizing rounding error weighted by an activation
@@ -308,8 +309,10 @@ values. To preserve existing compatible encoded words, also provide `read_encode
 A `--model` path ending in `.gguf` selects the GGUF route. It supports Qwen3.8-Flash-Next
 (GGUF architecture `qwen4exp`) with the `qwen4_exp_gguf` recipe, which stores every tensor exactly
 as the GGUF holds it: block tensors keep their GGML blocks, BF16 and FP32 keep their words, and the
-one F16 tensor widens exactly to FP32. Name the first file of a split GGUF; the reader finds the
-others by their `-0000N-of-0000M` names and checks the split metadata.
+one F16 tensor widens exactly to FP32. Each layer's routed experts become one expert bank in
+`ggml_expert_record_v1`: one record per expert holding its gate, up and down blocks, the unit the
+expert cache moves. Name the first file of a split GGUF; the reader finds the others by their
+`-0000N-of-0000M` names and checks the split metadata.
 
 ```bash
 python -m tools.convert \
@@ -317,13 +320,27 @@ python -m tools.convert \
   --recipe qwen4_exp_gguf --device cpu --out out/qwen4exp.ninfer
 ```
 
-The NInfer runtime cannot load the result yet: the C++ side does not accept the GGML block formats
-or the `qwen4exp` architecture. `--subset dev` writes a 2.9 GB development subset instead: one real
-tensor of each GGML type, the direct tensors of layers 0, 1 and 3, three expert banks and the first
-4,500 n-gram embedding rows. The reader ([`sources/gguf.py`](../tools/convert/sources/gguf.py))
-admits only F32, F16, BF16 and the registered GGML block types, and reads with bounded positional
-reads; the measured peak working set stayed under 0.7 GiB for the subset and for a full pass over
-the 28.8 GB n-gram table.
+The PLE n-gram table is not stored in the artifact. The converter writes it after the artifact as
+a separate n-gram volume (storage layouts Section 11), by default `OUT.ngram`; `--ngram-out PATH`
+places it elsewhere, for example on another NVMe drive, and refuses to replace an existing file.
+The artifact records the volume's geometry and a random 16-byte volume id in its text config
+(`ngram_table`). To convert again without rewriting the 29 GB volume, pass `--ngram-reuse PATH`:
+the converter adopts that volume's id only if its header matches this table's geometry and 512
+rows spread over the table (the first and last included) equal the GGUF's rows byte for byte.
+
+The text config uses Infernix's Qwen4Exp keys. The GGUF stores the n-gram hash tables literally
+(multipliers, head sizes and offsets); the config records Infernix's derivation parameters (seed
+1234, prime base 20,000,000, padding to 128 rows), and the converter refuses a GGUF whose literal
+tables differ from that derivation.
+
+The NInfer runtime cannot load the result yet: the C++ side materializes the GGML block and expert
+record formats but has no `qwen4exp` architecture or n-gram volume reader. `--subset dev` writes a
+2.9 GB development subset instead: one real tensor of each GGML type, the direct tensors of layers
+0, 1 and 3, the expert banks of layers 0, 1 and 8 (one of each record format) and a volume of the
+first 4,500 n-gram rows. The reader ([`sources/gguf.py`](../tools/convert/sources/gguf.py)) admits
+only F32, F16, BF16 and the registered GGML block types, and reads with bounded positional reads;
+the measured peak working set was 0.62 GiB for the subset conversion and 0.60 GiB for a pass of the
+whole 29.1 GB n-gram volume through the writer.
 
 The tokenizer resources are synthesized from the GGUF vocabulary and merges. A GGUF cannot record
 that a `<|...|>` added token is not special (llama.cpp's converter marks those as control tokens), so

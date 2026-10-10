@@ -22,11 +22,7 @@ from tools.artifact.formats import (
     get_format,
     valid_positive_fp32_word,
 )
-from tools.artifact.layouts import (
-    GGML_ROWS_PAGE4K_V1,
-    ggml_blocks_geometry,
-    ggml_row_page_geometry,
-)
+from tools.artifact.layouts import ggml_blocks_geometry
 from tools.artifact.schema import TensorSpec
 from tools.artifact.tensor_output import TensorOutput
 
@@ -337,15 +333,9 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
                     )
     n = request.target.shape[0]
     if ggml:
-        # Byte-sized reads, independent of the quantizers' rows_per_chunk; a paged layout
-        # writes whole pages, so its chunks hold whole pages of rows.
+        # Byte-sized reads, independent of the quantizers' rows_per_chunk.
         row_bytes = ggml_blocks_geometry(request.target.format, request.target.shape).row_bytes
         chunk = max(1, GGML_CHUNK_BYTES // row_bytes)
-        if request.target.layout == GGML_ROWS_PAGE4K_V1.name:
-            per_page = ggml_row_page_geometry(
-                request.target.format, request.target.shape
-            ).rows_per_page
-            chunk = max(per_page, chunk // per_page * per_page)
     elif request.target.format == "nvfp4":
         chunk = max(128, request.rows_per_chunk // 128 * 128)
     else:

@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from .methods import cast_direct, fp8_row_maxabs, grouped_absmax, import_encoded
-from .qwen4_exp import encoded_format
+from .qwen4_exp import (
+    bound_volume_id,
+    encoded_format,
+    expert_record_source,
+    import_expert_records,
+)
 
 Q4 = "q4_g64_fp16"
 Q5 = "q5_g64_fp16"
@@ -211,21 +216,34 @@ def qwen3_8_27b_nvfp4(model, recipe, sources):
 def qwen4_exp_gguf(model, recipe, sources):
     """Qwen3.8-Flash-Next from its GGUF, with every tensor stored exactly as in the GGUF.
 
-    Block tensors keep their GGML blocks through ``import_encoded`` (no requantization), the
-    PLE table is paged into 4 KiB pages, and direct tensors keep their words (F16 widens to
-    FP32). GGML-format projections permit A8 activations (ggml's Q8_1 activation path).
+    Block tensors keep their GGML blocks through ``import_encoded`` (no requantization), each
+    layer's routed experts become one ``ggml_expert_record_v1`` bank of per-expert records, and
+    direct tensors keep their words (F16 widens to FP32). The PLE table is not an artifact
+    object: it is the n-gram volume the model is bound to. GGML-format projections permit A8
+    activations (ggml's Q8_1 activation path).
     """
 
     if model.config.get("model_type") != "qwen4_exp_text":
         raise ValueError("this official recipe requires the qwen4exp GGUF model")
+    bound_volume_id(model)
     for name, parameter in model.parameters.items():
+        bank = expert_record_source(parameter)
+        if bank is not None:
+            recipe.assign(
+                name,
+                format=bank.format,
+                layout="ggml_expert_record_v1",
+                method=import_expert_records,
+                activation_policy="AllowA8",
+            )
+            recipe.group(name, shape=parameter.shape)
+            continue
         format = encoded_format(parameter)
         if format is None:
             continue
         recipe.assign(
             name,
             format=format,
-            layout="ggml_rows_page4k_v1" if name == "text/ple/table" else None,
             method=import_encoded,
             activation_policy="AllowA8" if parameter.projection else None,
         )

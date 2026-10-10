@@ -1,4 +1,4 @@
-"""GGML block formats: exact decoders against ggml b11316, and the two block layouts."""
+"""GGML block formats: exact decoders against ggml b11316, and the two GGML layouts."""
 
 from __future__ import annotations
 
@@ -11,14 +11,14 @@ import pytest
 from tools.artifact.codecs.ggml_blocks import (
     decode_blocks,
     decode_ggml_blocks,
-    page_rows,
-    unpage_rows,
+    pack_expert_records,
+    unpack_expert_records,
 )
-from tools.artifact.formats import GGML_BLOCK_FORMATS, get_format
+from tools.artifact.formats import GGML_BLOCK_FORMATS, GGML_RECORD_FORMATS, get_format
 from tools.artifact.layouts import (
     encoded_size,
     ggml_blocks_geometry,
-    ggml_row_page_geometry,
+    ggml_expert_record_geometry,
 )
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "ggml"
@@ -139,34 +139,67 @@ def test_block_geometry_and_rejections():
         decode_ggml_blocks(bytes(34), "ggml_q2_0", (2, 64))
 
 
-def test_row_pages_hold_whole_rows_and_invert_exactly():
-    # The PLE table: IQ4_NL rows of 160 values are 90 bytes, 45 per 4096-byte page.
-    geometry = ggml_row_page_geometry("ggml_iq4_nl", (320_001_536, 160))
-    assert (geometry.row_bytes, geometry.rows_per_page) == (90, 45)
-    assert geometry.pages == 7_111_146 and geometry.payload_bytes == 29_127_254_016
-    assert geometry.row_offset(0) == 0 and geometry.row_offset(44) == 44 * 90
-    assert geometry.row_offset(45) == 4096 and geometry.row_offset(1000) == 22 * 4096 + 10 * 90
+def test_expert_record_geometry_at_the_real_shapes():
+    # Qwen3.8-Flash-Next banks [512 experts, hidden 2560, intermediate 640]: parts of 256 B
+    # multiples, so the records are back to back (spec section 2.1 byte counts per expert).
+    shape = (512, 2560, 640)
+    expected = {
+        "ggml_rec_iq2_s_q2_0": (524_800, 1_510_400),
+        "ggml_rec_iq2_xxs_q2_0": (422_400, 1_305_600),
+        "ggml_rec_iq1_m_q2_0": (358_400, 1_177_600),
+    }
+    assert set(expected) == set(GGML_RECORD_FORMATS)
+    for name, (gate_bytes, record_bytes) in expected.items():
+        g = ggml_expert_record_geometry(name, shape)
+        assert (g.gate_bytes, g.up_offset, g.down_offset) == (
+            gate_bytes, gate_bytes, 2 * gate_bytes
+        )
+        assert (g.down_bytes, g.down_row_bytes) == (460_800, 180)
+        assert g.record_bytes == g.record_stride == record_bytes
+        assert encoded_size("ggml_expert_record_v1", name, shape) == 512 * record_bytes
+    # 34 IQ2_S, 11 IQ2_XXS and 3 IQ1_M layers hold exactly the GGUF's routed-expert bytes: its
+    # IQ2_S, IQ2_XXS, IQ1_M and Q2_0 totals less five 2560 x 640 Q2_0 shared-expert downs.
+    total = 512 * (34 * 1_510_400 + 11 * 1_305_600 + 3 * 1_177_600)
+    assert total == 35_454_976_000
+    assert total == 18_271_436_800 + 4_757_913_600 + 1_101_004_800 + 11_326_924_800 - 5 * 460_800
+    for shape, message in (
+        ((512, 640), "rank 3"),
+        ((4, 2560, 96), "intermediate by 64"),
+        ((4, 640, 640), "hidden divisible by 256"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            ggml_expert_record_geometry("ggml_rec_iq2_s_q2_0", shape)
+    with pytest.raises(ValueError, match="does not accept"):
+        encoded_size("ggml_blocks_v1", "ggml_rec_iq2_s_q2_0", (4, 2560, 640))
+    with pytest.raises(ValueError, match="does not accept"):
+        encoded_size("ggml_expert_record_v1", "ggml_iq2_s", (4, 2560, 640))
 
-    shape = (100, 160)
-    rows = np.random.default_rng(3).integers(0, 256, size=(100, 90), dtype=np.uint8)
-    payload = bytearray(ggml_row_page_geometry("ggml_iq4_nl", shape).payload_bytes)
-    for begin in (0, 45, 90):  # whole pages, then the final partial page
-        end = min(begin + 45, 100)
-        offset, pages = page_rows(rows[begin:end], "ggml_iq4_nl", shape, begin)
-        payload[offset : offset + pages.size] = pages.tobytes()
-    assert len(payload) == 3 * 4096
-    for row in (0, 44, 45, 99):
-        at = ggml_row_page_geometry("ggml_iq4_nl", shape).row_offset(row)
-        assert bytes(payload[at : at + 90]) == rows[row].tobytes()
-    assert np.array_equal(unpage_rows(bytes(payload), "ggml_iq4_nl", shape), rows)
 
-    with pytest.raises(ValueError, match="start a page"):
-        page_rows(rows[1:46], "ggml_iq4_nl", shape, 1)
-    with pytest.raises(ValueError, match="whole pages"):
-        page_rows(rows[:10], "ggml_iq4_nl", shape, 0)
-    dirty = bytearray(payload)
-    dirty[4095] = 1
-    with pytest.raises(ValueError, match="tails must be zero"):
-        unpage_rows(bytes(dirty), "ggml_iq4_nl", shape)
-    with pytest.raises(ValueError, match="at most 4096"):
-        ggml_row_page_geometry("ggml_q8_0", (4, 32 * 121))
+def test_expert_records_invert_exactly_with_zero_gaps():
+    # IQ2_XXS rows of 66 B: 64 gate rows are 4224 B, so up starts at 4352 and down at 8704,
+    # and the record (8704 + 256 rows of one 18 B Q2_0 block) is padded to 13,312 B.
+    name, shape = "ggml_rec_iq2_xxs_q2_0", (3, 256, 64)
+    g = ggml_expert_record_geometry(name, shape)
+    assert (g.gate_bytes, g.up_offset, g.down_offset) == (4224, 4352, 8704)
+    assert (g.record_bytes, g.record_stride) == (8704 + 256 * 18, 13_312)
+    rng = np.random.default_rng(5)
+    gate = rng.integers(0, 256, size=(3, 64, 66), dtype=np.uint8)
+    up = rng.integers(0, 256, size=(3, 64, 66), dtype=np.uint8)
+    down = rng.integers(0, 256, size=(3, 256, 18), dtype=np.uint8)
+    records = pack_expert_records(name, shape, gate, up, down)
+    assert records.shape == (3, g.record_stride)
+    assert records[1, : g.gate_bytes].tobytes() == gate[1].tobytes()
+    assert records[2, g.up_offset : g.up_offset + g.gate_bytes].tobytes() == up[2].tobytes()
+    assert records[0, g.down_offset :].tobytes() == down[0].tobytes()
+    assert not records[:, g.gate_bytes : g.up_offset].any()
+    unpacked = unpack_expert_records(records.tobytes(), name, shape)
+    for a, b in zip(unpacked, (gate, up, down)):
+        assert np.array_equal(a, b)
+    dirty = records.copy()
+    dirty[2, g.up_offset - 1] = 1
+    with pytest.raises(ValueError, match="gaps between parts must be zero"):
+        unpack_expert_records(dirty.tobytes(), name, shape)
+    with pytest.raises(TypeError, match="down rows"):
+        pack_expert_records(name, shape, gate, up, down[:, :-1])
+    with pytest.raises(ValueError, match="expected"):
+        unpack_expert_records(records.tobytes()[:-1], name, shape)

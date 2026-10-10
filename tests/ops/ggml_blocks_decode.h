@@ -263,31 +263,17 @@ inline void decode_blocks(QType format, std::span<const std::byte> blocks, std::
     return out;
 }
 
-// The encoded bytes of row `row` of a complete GGML parent payload. For the paged layout it also
-// checks that the page's unused tail is zero, as storage-layouts.md Section 7 requires of a reader.
+// The encoded bytes of row `row` of a complete GgmlBlocks parent payload.
 [[nodiscard]] inline std::span<const std::byte> row_bytes(const WeightGeometry& geometry,
                                                           std::span<const std::byte> payload,
                                                           std::uint64_t row) {
     if (payload.size() != geometry.bytes) {
         throw std::invalid_argument("GGML payload size differs from its geometry");
     }
-    const auto offset = ggml_row_offset(geometry, row);
-    if (geometry.layout == QuantLayout::GgmlRowsPage4K) {
-        const auto page  = offset / kGgmlRowPageBytes * kGgmlRowPageBytes;
-        const auto rows  = geometry.elements / geometry.padded_columns;
-        const auto first = page / kGgmlRowPageBytes * geometry.rows_per_page;
-        const auto used  = std::min(geometry.rows_per_page, rows - first);
-        for (auto i = page + used * geometry.code_bytes_per_row; i < page + kGgmlRowPageBytes;
-             ++i) {
-            if (payload[i] != std::byte{0}) {
-                throw std::invalid_argument("ggml_rows_page4k_v1 page tail is not zero");
-            }
-        }
-    }
-    return payload.subspan(offset, geometry.code_bytes_per_row);
+    return payload.subspan(ggml_row_offset(geometry, row), geometry.code_bytes_per_row);
 }
 
-// Every value of a complete GGML parent, in logical C order.
+// Every value of a complete GgmlBlocks parent, in logical C order.
 [[nodiscard]] inline std::vector<float> decode_parent(const WeightGeometry& geometry,
                                                       std::span<const std::byte> payload) {
     const auto rows = geometry.elements / geometry.padded_columns;
@@ -297,6 +283,40 @@ inline void decode_blocks(QType format, std::span<const std::byte> blocks, std::
                       std::span(out).subspan(row * geometry.padded_columns,
                                              geometry.padded_columns));
     }
+    return out;
+}
+
+// The encoded bytes of one part of one expert's record in a complete GgmlExpertRecord payload.
+// It also checks that the gap after the part (to the next part or the next record) is zero, as
+// storage-layouts.md Section 7 requires of a reader.
+[[nodiscard]] inline std::span<const std::byte> record_part_bytes(
+    const WeightGeometry& geometry, std::span<const std::byte> payload, std::uint64_t expert,
+    ExpertPart part) {
+    if (payload.size() != geometry.bytes) {
+        throw std::invalid_argument("GGML record payload size differs from its geometry");
+    }
+    const auto p     = ggml_record_part(geometry, expert, part);
+    const auto bytes = p.rows * p.row_bytes;
+    const auto next  = part == ExpertPart::Gate ? expert * geometry.record_stride +
+                                                     geometry.record_up_offset
+                       : part == ExpertPart::Up ? expert * geometry.record_stride +
+                                                     geometry.record_down_offset
+                                                : (expert + 1) * geometry.record_stride;
+    for (auto i = p.offset + bytes; i < next; ++i) {
+        if (payload[i] != std::byte{0}) {
+            throw std::invalid_argument("ggml_expert_record_v1 gap is not zero");
+        }
+    }
+    return payload.subspan(p.offset, bytes);
+}
+
+// Every value of one part of one expert, as its [rows, k] matrix in C order.
+[[nodiscard]] inline std::vector<float> decode_record_part(const WeightGeometry& geometry,
+                                                           std::span<const std::byte> payload,
+                                                           std::uint64_t expert, ExpertPart part) {
+    const auto p = ggml_record_part(geometry, expert, part);
+    std::vector<float> out(p.rows * p.k);
+    decode_blocks(p.format, record_part_bytes(geometry, payload, expert, part), out);
     return out;
 }
 

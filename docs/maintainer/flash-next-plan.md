@@ -12,32 +12,66 @@ references, `engine-architecture.md`).
 | 0 | Strata baselines: decode, MTP, prefill, teacher-forced log-probs on frozen token ids | not started |
 | 1 | GGUF reader, nine exact GGML block formats, `ggml_blocks_v1` / `ggml_rows_page4k_v1`, `qwen4_exp` name map, tokenizer synthesis, `--subset dev` | done (Python only) |
 | 2 | C++ registration and materialization of the GGML formats and layouts; host exact decoder | done |
+| 2b | Infernix-aligned artifact: `ggml_expert_record_v1` expert banks and three record formats (Python and C++), the n-gram table as an Infernix-format volume with IQ4_NL rows, Infernix's text config keys; replaces PR 1's two-object banks and `ggml_rows_page4k_v1` | done |
 | 3-9 | Dense GGML linears, hyper-connections and FP32 head, QSA, PLE frontend and stream residency, model skeleton, MoE on GPU, MoE on CPU | not started |
 | 10 | Whole model at 32K, quality gate against Strata | not started |
 | 11-14 | Residency policy and miss split, 128K, MTP, vision | not started |
 
-The C++ loader reads and places every `ggml_*` object; nothing executes them until PR 3.
+The C++ loader reads and places every `ggml_*` and `ggml_rec_*` object; nothing executes them
+until PR 3 (dense) and PR 7 (experts).
 
-## Artifact decisions taken in PR 1
+## Artifact decisions
+
+Taken in PR 1 and revised in PR 2b, which aligned the artifact with Infernix (the model code and
+expert cache are lifted from it in PRs 7-9).
 
 - Logical parameters mirror the GGUF tensors one to one, named under `text/`; shapes are the
-  reversed GGUF dimensions, so every object holds the GGUF bytes unchanged. The exceptions: routed
-  experts are split into per-expert `moe/experts/E/{gate,up,down}` parameters, and
-  `ffn_gate_inp_shexp` becomes `moe/shared_score` of shape `[1, 2560]`. The map is the table in
+  reversed GGUF dimensions, so every object holds the GGUF bytes unchanged. The exceptions: a
+  layer's three routed-expert tensors are one expert bank, and `ffn_gate_inp_shexp` becomes
+  `moe/shared_score` of shape `[1, 2560]`. The map is the table in
   [`tools/convert/qwen4_exp.py`](../../tools/convert/qwen4_exp.py); unknown, missing or misplaced
   GGUF tensors are errors.
-- Each layer's routed experts are two objects: `gate|up` of shape `[512 * 1280, 2560]` with expert
-  `e`'s 640 gate rows then its 640 up rows, and `down` of shape `[512 * 2560, 640]`. These are the
-  `[512, 1280, 2560]` and `[512, 2560, 640]` banks with identical bytes; the 2-D form is what the
-  existing packing groups and per-expert bindings produce, as for Qwen3.5 MoE.
-- The n-gram embedding table (`text/ple/table`) uses `ggml_rows_page4k_v1`: 7,111,146 pages,
-  29,127,254,016 bytes. It is written in 16 MiB chunks of whole pages.
-- GGML-format projections record `AllowA8` (ggml's Q8_1 activation path); BF16 projections keep
-  `A16Only`.
+- **Expert banks (PR 2b).** Each layer's routed experts are one parameter
+  `text/layers/L/moe/experts` of shape `[512, 2560, 640]` in `ggml_expert_record_v1`: one record
+  per expert holding its gate, up and down blocks, in one of three record formats
+  (`ggml_rec_iq2_s_q2_0`, `ggml_rec_iq2_xxs_q2_0`, `ggml_rec_iq1_m_q2_0`). Infernix's frame pool,
+  residency table, staging and CPU jobs treat an expert as one opaque record with one
+  `record_stride`; packing records on the host at load would be runtime repacking, so the converter
+  writes them. Records are 1,510,400 / 1,305,600 / 1,177,600 bytes, back to back: the stride is
+  rounded to 256 bytes, not Infernix's 4 KiB, because only the deferred SSD expert tier reads
+  records in place with direct I/O, and 4 KiB rounding would cost 1.5% (0.5 GiB) of host RAM. This
+  replaces PR 1's two objects per layer (gate|up interleaved, and down).
+- **n-gram volume (PR 2b).** The PLE n-gram table is not an artifact object. It is Infernix's
+  `NINFERNG` volume, version 2 with a row-format field (`ggml_iq4_nl`): 45 rows of 90 bytes per
+  4 KiB block, exactly PR 1's page geometry, after a 4 KiB header; 29,127,258,112 bytes. The
+  artifact's `ngram_table` records the geometry and the volume id; `--ngram-out` and
+  `--ngram-reuse` follow Infernix, including its 512-row reuse check. This replaces
+  `ggml_rows_page4k_v1`, which no longer exists.
+- **Text config (PR 2b).** The keys are exactly Infernix `parse_config`'s (`hc_lowrank`,
+  `indexer_n_heads`, `indexer_budget`, one-based `ple_layer_ids`, `ple_embed_dim` = 16 heads x 160,
+  `eos_token_id` = the PLE EOS 248044, and so on). The GGUF's literal hash tables are replaced by
+  Infernix's derivation parameters (seed 1234, base 20,000,000, padding 128), which the converter
+  proves equal to the literals; a GGUF with other literals is refused. Facts the GGUF does not
+  record are fixed by the architecture: `output_gate_type` sigmoid (llama.cpp's and Strata's GDN
+  both apply a sigmoid gate), `norm_topk_prob` true, one indexer key head (checked against
+  `indexer.k_proj`), and `split_ngram_parts` 1 (the GGUF holds the table as one tensor; Infernix
+  parses the key and does not use it). The GGUF's `ple.image_token_id` is not carried: Infernix has
+  no such key and vision is PR 14.
+- GGML-format projections and the expert banks record `AllowA8` (ggml's Q8_1 activation path);
+  BF16 projections keep `A16Only`.
 - The development subset is a builder option (`--subset dev`), not a second recipe, because a
-  recipe cannot drop parameters or shorten the n-gram table. It is 2,930,421,760 bytes, not the
-  ~1.2 GB first estimated: the token embedding and output head alone are 675 MB and the three
-  expert banks 2.04 GB.
+  recipe cannot drop parameters or shorten the n-gram table. It is 2,928,979,712 bytes plus a
+  413,696-byte volume of 4,500 rows: the token embedding and output head alone are 675 MB and the
+  three expert banks 2.04 GB.
+
+## Code adapted from Infernix
+
+Infernix is Apache-2.0; each adapted file carries the notice the spec's licensing rule fixes.
+
+| NInfer file | Infernix source (`a3edb450`) | Adaptation |
+|---|---|---|
+| `tools/artifact/ngram_volume.py` | `tools/convert/qwen4_exp.py` (`ngram_geometry`, `read_ngram_volume_id`, `write_ngram_volume`) | Version 2 header with a row-format field; streams GGML rows from any source |
+| `tools/convert/qwen4_exp.py` (config keys, `layer_multipliers`, `head_tables`, expert bank parameter, volume binding) | `src/models/qwen4_exp/config.cpp`, `tools/flash_next/ngram.py`, `tools/convert/qwen4_exp.py` (`ExpertBankSource`, `import_expert_bank`), `tools/convert/__main__.py` | Sourced from GGUF metadata; GGML expert records instead of NVFP4 banks |
 
 ## Export conventions of this GGUF
 
@@ -73,7 +107,7 @@ say. `--resource tokenizer.json=PATH` keeps the Hugging Face flags after checkin
 the GGUF. Whether Flash-Next's own Hugging Face tokenizer equals Qwen3.8-27B's is assumed, not
 checked. The GGUF's chat template is used as is; it differs from the NInfer Qwen3.8-27B template.
 
-## PR 1 measurements
+## Measurements
 
 Host: Ryzen 9 5950X, Samsung 980 PRO (C:), Python 3.12.7, numpy 2.5.3, torch 2.11 (CPU).
 
@@ -82,5 +116,12 @@ Host: Ryzen 9 5950X, Samsung 980 PRO (C:), Python 3.12.7, numpy 2.5.3, torch 2.1
 | `--subset dev` conversion, GGUF on C: to C: | 2.93 GB in 20 s on the first run, 11 s with the GGUF ranges cached; peak working set 0.69 GiB (0.48 GiB of it is the interpreter with torch loaded) |
 | Full n-gram table paging, output discarded | 28.80 GB read in 43 s (0.67 GB/s, CPU-bound in Python); peak working set 0.57 GiB |
 | GGUF header parse (73 keys, 248,320-token vocabulary, 1,224 tensors) | 0.7 s |
+
+PR 2b, same host, GGUF on C: to C:, peak working set from `psutil` after the run:
+
+| Workload | Result |
+|---|---|
+| `--subset dev` conversion with its 4,500-row volume | 2.93 GB artifact and 0.41 MB volume in 20.0 s; peak working set 0.62 GiB |
+| Whole n-gram volume through the writer, output discarded | 320,001,536 rows, 7,111,146 blocks, 29,127,258,112 bytes in 51.4 s (0.56 GB/s read); peak working set 0.60 GiB |
 
 The full-model conversion has not been run; it needs ~68.4 GB free on C: (see the spec's disk plan).

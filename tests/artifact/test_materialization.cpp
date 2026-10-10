@@ -1,5 +1,6 @@
 #include "artifact/binder.h"
 #include "artifact/fixture.h"
+#include "artifact/formats.h"
 #include "artifact/views.h"
 #include "core/device.h"
 #include "core/evictable_weight_pool.h"
@@ -16,6 +17,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace ninfer::test {
@@ -251,17 +253,20 @@ void file_roundtrip(DeviceContext& device, const std::filesystem::path& path, bo
     std::cout << path.filename().string() << ": all bound parent bytes and logical views passed\n";
 }
 
-// Expected bytes of writer_interop.py's GGML objects: row r of K/values blocks is the same byte
-// sequence as unpaged row r of `(i * 37 + 11) % 251`, in either GGML layout.
+// Expected bytes of writer_interop.py's GGML objects, a byte sequence `(i * 37 + 11) % 251`: row
+// r of a GgmlBlocks object holds bytes [r * row_bytes, (r + 1) * row_bytes) of it, and the parts
+// of an expert record object, in order (expert 0 gate, up, down, expert 1 gate, ...), hold its
+// consecutive runs, with zero gaps between them.
 std::byte interop_byte(std::uint64_t index) { return std::byte((index * 37 + 11) % 251); }
+
+constexpr std::array kExpertParts = {ExpertPart::Gate, ExpertPart::Up, ExpertPart::Down};
 
 std::vector<ObjectHandle> ggml_objects(const Reader& reader) {
     std::vector<ObjectHandle> out;
     for (std::size_t i = 0; i < reader.directory().objects.size(); ++i) {
-        if (std::holds_alternative<TensorObject>(reader.directory().objects[i]) &&
-            is_ggml_block(reader.geometry({i}).format)) {
-            out.push_back({i});
-        }
+        if (!std::holds_alternative<TensorObject>(reader.directory().objects[i])) { continue; }
+        const auto format = reader.geometry({i}).format;
+        if (is_ggml_block(format) || is_ggml_record(format)) { out.push_back({i}); }
     }
     return out;
 }
@@ -277,12 +282,13 @@ std::vector<std::byte> parent_bytes(const WeightParent& parent, bool device) {
     return out;
 }
 
-// The writer's GGML objects survive Pinned and Host residency byte for byte, and every row
-// decodes; Device residency is covered by file_roundtrip.
+// The writer's GGML objects survive Pinned and Host residency byte for byte, every row and
+// record part sits where the Python writer put it, and every one decodes; Device residency is
+// covered by file_roundtrip.
 void ggml_writer_residencies(DeviceContext& device, const std::filesystem::path& path) {
     Reader reader(path);
     const auto objects = ggml_objects(reader);
-    require(objects.size() == 10, "writer fixture lost a GGML format or layout");
+    require(objects.size() == 12, "writer fixture lost a GGML format or layout");
     for (const auto residency : {Residency::Pinned, Residency::Host}) {
         Binder binder(reader);
         for (const auto object : objects) {
@@ -302,6 +308,21 @@ void ggml_writer_residencies(DeviceContext& device, const std::filesystem::path&
             if (residency == Residency::Pinned) {
                 require((parent.data - backing.pinned_block().data()) % g.alignment == 0,
                         "pinned GGML parent lost its layout alignment");
+            }
+            if (g.layout == QuantLayout::GgmlExpertRecord) {
+                std::uint64_t cursor = 0;
+                for (std::uint64_t expert = 0; expert < g.shape[0]; ++expert) {
+                    for (const auto part : kExpertParts) {
+                        const auto encoded = test::ggml::record_part_bytes(g, bytes, expert, part);
+                        for (std::size_t i = 0; i < encoded.size(); ++i) {
+                            require(encoded[i] == interop_byte(cursor + i),
+                                    "C++ record addressing differs from the Python writer's parts");
+                        }
+                        cursor += encoded.size();
+                        (void)test::ggml::decode_record_part(g, bytes, expert, part);
+                    }
+                }
+                continue;
             }
             const auto rows = g.elements / g.padded_columns;
             for (std::uint64_t row = 0; row < rows; ++row) {
@@ -338,9 +359,50 @@ private:
     std::ofstream file_;
 };
 
+// One sampled GGML block of a parent: its payload offset and block format.
+struct BlockSite {
+    std::uint64_t offset = 0;
+    QType format         = QType::BF16;
+};
+
+// Block `index` of a parent, counting a GgmlBlocks parent's blocks in row order and an expert
+// bank's blocks record by record (gate, up, down).
+BlockSite block_site(const WeightGeometry& g, std::uint64_t index) {
+    if (g.layout == QuantLayout::GgmlBlocks) {
+        const auto block          = ggml_block(g.format);
+        const auto blocks_per_row = g.padded_columns / block.values;
+        return {ggml_row_offset(g, index / blocks_per_row) + index % blocks_per_row * block.bytes,
+                g.format};
+    }
+    std::uint64_t per_record = 0;
+    for (const auto part : kExpertParts) {
+        const auto p = ggml_record_part(g, 0, part);
+        per_record += p.rows * p.k / ggml_block(p.format).values;
+    }
+    auto rest = index % per_record;
+    for (const auto part : kExpertParts) {
+        const auto p      = ggml_record_part(g, index / per_record, part);
+        const auto blocks = p.rows * p.k / ggml_block(p.format).values;
+        if (rest < blocks) { return {p.offset + rest * ggml_block(p.format).bytes, p.format}; }
+        rest -= blocks;
+    }
+    throw std::logic_error("block index outside its record");
+}
+
+std::uint64_t block_count(const WeightGeometry& g) {
+    if (g.layout == QuantLayout::GgmlBlocks) { return g.elements / ggml_block(g.format).values; }
+    std::uint64_t per_record = 0;
+    for (const auto part : kExpertParts) {
+        const auto p = ggml_record_part(g, 0, part);
+        per_record += p.rows * p.k / ggml_block(p.format).values;
+    }
+    return g.shape[0] * per_record;
+}
+
 // Real-artifact check (tests/artifact/ggml_artifact_real.py drives it): every GGML object is
 // materialized, rotating Device, Pinned and Host residency, compared whole against the file, and
 // sampled blocks are decoded here and written out for the Python decoder to compare exactly.
+// Every expert record part is also addressed once, which checks the gaps between parts are zero.
 int ggml_samples(DeviceContext& device, const std::filesystem::path& path,
                  const std::filesystem::path& out) {
     Reader reader(path);
@@ -367,7 +429,7 @@ int ggml_samples(DeviceContext& device, const std::filesystem::path& path,
     }
     const auto backing = materialize(reader, std::move(binder).finish(), device);
     SampleWriter samples(out);
-    std::uint64_t compared = 0;
+    std::uint64_t compared   = 0;
     std::size_t sample_count = 0;
     for (std::size_t i = 0; i < objects.size(); ++i) {
         const auto object    = objects[i];
@@ -379,33 +441,34 @@ int ggml_samples(DeviceContext& device, const std::filesystem::path& path,
         const auto bytes     = parent_bytes(parent, residency == Residency::Device);
         require(bytes == reader.read_object(object), "materialized GGML object differs from file");
         compared += bytes.size();
-        const auto block           = ggml_block(g.format);
-        const auto blocks_per_row  = g.padded_columns / block.values;
-        const auto block_count     = g.elements / block.values;
+        if (g.layout == QuantLayout::GgmlExpertRecord) {
+            for (std::uint64_t expert = 0; expert < g.shape[0]; ++expert) {
+                for (const auto part : kExpertParts) {
+                    (void)test::ggml::record_part_bytes(g, bytes, expert, part);
+                }
+            }
+        }
         // First, last and 30 spread pseudo-random blocks per object.
-        std::vector<std::uint64_t> picks{0, block_count - 1};
+        const auto count = block_count(g);
+        std::vector<std::uint64_t> picks{0, count - 1};
         std::uint64_t state = 0x9E3779B97F4A7C15ULL ^ i;
         for (int n = 0; n < 30; ++n) {
             state = state * 6364136223846793005ULL + 1442695040888963407ULL;
-            picks.push_back((state >> 11) % block_count);
-        }
-        if (g.layout == QuantLayout::GgmlRowsPage4K) {
-            // Every page tail of the paged table must be zero; row_bytes checks it.
-            for (std::uint64_t row = 0; row < g.elements / g.padded_columns; ++row) {
-                (void)test::ggml::row_bytes(g, bytes, row);
-            }
+            picks.push_back((state >> 11) % count);
         }
         const auto& id = reader.directory().tensor(object).id;
         for (const auto pick : picks) {
-            const auto offset = ggml_row_offset(g, pick / blocks_per_row) +
-                                pick % blocks_per_row * block.bytes;
-            const auto encoded =
-                std::span<const std::byte>(bytes).subspan(offset, block.bytes);
-            const auto values = test::ggml::decode_blocks(g.format, encoded);
+            const auto site    = block_site(g, pick);
+            const auto block   = ggml_block(site.format);
+            const auto encoded = std::span<const std::byte>(bytes).subspan(site.offset, block.bytes);
+            const auto values  = test::ggml::decode_blocks(site.format, encoded);
+            const auto name    = format_name(site.format);
             samples.word(id.size(), 4);
             samples.raw(std::as_bytes(std::span(id)));
             samples.word(static_cast<std::uint64_t>(residency), 4);
-            samples.word(pick, 8);
+            samples.word(site.offset, 8);
+            samples.word(name.size(), 4);
+            samples.raw(std::as_bytes(std::span(name)));
             samples.word(block.bytes, 4);
             samples.raw(encoded);
             samples.word(values.size(), 4);

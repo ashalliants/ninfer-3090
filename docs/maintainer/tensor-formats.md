@@ -8,7 +8,7 @@ separately.
 
 ## 1. Registered formats
 
-NInfer has exactly eighteen persistent numeric tensor formats in five categories.
+NInfer has exactly twenty-one persistent numeric tensor formats in six categories.
 
 Direct scalar formats preserve one logical scalar word per tensor element:
 
@@ -53,8 +53,17 @@ The GGML block formats store blocks of ggml's quantization types unchanged (Sect
 | `ggml_iq1_m` | `IQ1_M` (29) | 256 | 56 | 1.75 |
 | `ggml_q2_0` | `Q2_0` (42) | 64 | 18 | 2.25 |
 
-The C++ registry accepts the GGML block formats and materializes them to Device, Host or Pinned
-memory unchanged. No Op consumes them yet; an Op that does declares its own support.
+The GGML expert record formats store one routed expert as one record of GGML blocks in two block
+formats (Section 3.6):
+
+| Canonical name | Gate and up | Down |
+|---|---|---|
+| `ggml_rec_iq2_s_q2_0` | `ggml_iq2_s` | `ggml_q2_0` |
+| `ggml_rec_iq2_xxs_q2_0` | `ggml_iq2_xxs` | `ggml_q2_0` |
+| `ggml_rec_iq1_m_q2_0` | `ggml_iq1_m` | `ggml_q2_0` |
+
+The C++ registry accepts the GGML block and expert record formats and materializes them to Device,
+Host or Pinned memory unchanged. No Op consumes them yet; an Op that does declares its own support.
 
 Each name fixes a code and scale contract. The format registry is implemented in
 [`tools/artifact/formats.py`](../../tools/artifact/formats.py) and
@@ -70,8 +79,8 @@ The registry keeps the following concerns separate.
 
 A **persistent numeric format** defines the logical words needed to recover a numeric tensor from
 an artifact. The closed registry contains direct scalar formats, grouped signed-integer formats,
-the block-scaled `nvfp4` format, the row-scaled `fp8_e4m3fn_row_bf16` format, and the GGML block
-formats. It does not
+the block-scaled `nvfp4` format, the row-scaled `fp8_e4m3fn_row_bf16` format, the GGML block
+formats and the GGML expert record formats. It does not
 identify a tensor's model role, physical byte layout, or supported consumer.
 
 ### 2.2 Direct scalar format
@@ -94,8 +103,9 @@ A **quantization scheme** defines only the persistent logical representation of 
 - the validity rules for codes and scales;
 - the mathematical reconstruction of each represented weight.
 
-The fifteen quantized names above identify schemes in this sense; a GGML block format's scheme is
-its ggml block type. Their meanings are immutable: a
+The eighteen quantized names above identify schemes in this sense; a GGML block format's scheme
+is its ggml block type, and an expert record format's are its two parts' block types. Their
+meanings are immutable: a
 consumer must not infer a different zero point, scale geometry, code range, or reconstruction rule
 from context.
 
@@ -109,8 +119,9 @@ The built-in `grouped_absmax` method implements the reference encoder in Section
 grouped integer formats. `fp8_row_maxabs` rounds source values to BF16 and quantizes each row to
 E4M3FN codes with a BF16 multiplier. `import_encoded` preserves compatible FP8 or NVFP4 codes,
 scales, and, for NVFP4, the matrix weight divisor; for a GGML block format it copies whole source
-blocks. NInfer currently provides no built-in floating-point-to-NVFP4 quantizer and no GGML block
-encoder.
+blocks. The qwen4exp converter's `import_expert_records` copies a GGUF layer's expert blocks into
+expert records. NInfer currently provides no built-in floating-point-to-NVFP4 quantizer and no
+GGML block encoder.
 
 A recipe can supply a Python callable as its method. Different methods can produce different
 valid codes and scales for the same format; they share the format's decoding contract. Method
@@ -140,7 +151,8 @@ One format may have more than one deliberately supported layout, but every layou
 exactly the same direct words or logical codes and scales. The currently registered layouts are
 `contiguous_le_v1` for direct words, `row_split_k128_v1` for grouped signed-integer formats, and
 `block_scale_k16_m128x4_v1` for `nvfp4`, `row_scale_v1` for `fp8_e4m3fn_row_bf16`, and
-`ggml_blocks_v1` and `ggml_rows_page4k_v1` for the GGML block formats. Their byte order, plane
+`ggml_blocks_v1` for the GGML block formats, and `ggml_expert_record_v1` for the GGML expert
+record formats. Their byte order, plane
 packing, padding, swizzle, divisor placement, and alignment rules belong to the layout registry,
 not to these numeric formats.
 
@@ -347,6 +359,20 @@ exact host decoder that GGML Ops are qualified against is
 `tools/artifact/gen_ggml_tables.py` copies from ggml in one pass, with ggml's MIT notice in
 [`third_party/ggml/LICENSE`](../../third_party/ggml/LICENSE). NInfer has no encoder for these
 formats: a converter imports blocks from a source already in the same format.
+
+### 3.6 GGML expert record formats
+
+An expert record format describes a routed-expert bank of logical shape `[E, H, I]` (experts, hidden
+size, intermediate size) as one record per expert, the unit Infernix's expert cache moves and
+holds. A record contains the expert's three matrices, each in a GGML block format of Section 3.5:
+
+- gate `[I, H]` and up `[I, H]` in the record's gate/up block format, K = H;
+- down `[H, I]` in its down block format, K = I.
+
+The represented values of each matrix are those of its blocks under Section 3.5; the record adds
+no scale, offset or field of its own. The three registered formats are exactly the gate/up and down
+type pairs of the Qwen3.8-Flash-Next GGUF. Their only layout is `ggml_expert_record_v1`
+([storage layouts](storage-layouts.md) Section 7), which fixes where each part lies in a record.
 
 ## 4. Grouped signed-integer tensor model
 

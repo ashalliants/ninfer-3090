@@ -1,9 +1,18 @@
+# The config keys, the n-gram hash derivation, the expert-bank parameter and the n-gram volume
+# binding are adapted from Infernix a3edb450 src/models/qwen4_exp/config.cpp,
+# tools/flash_next/ngram.py and tools/convert/qwen4_exp.py (Apache-2.0).
+# Modified for NInfer-3090: sourced from a GGUF; GGML expert records and IQ4_NL volume rows.
 """Qwen3.8-Flash-Next (GGUF architecture ``qwen4exp``) from a llama.cpp-style GGUF.
 
-Maps GGUF metadata to the text config, every GGUF tensor to exactly one logical parameter (or,
-for the routed experts, one per expert), and synthesizes the frontend resources from the GGUF
-vocabulary. Values are never re-derived: block tensors keep their GGML blocks and direct tensors
-their words. Logical shapes are the reversed GGUF dimensions, which keeps the bytes identical.
+Maps GGUF metadata to Infernix's text config keys, every GGUF tensor to one logical parameter
+(the three routed-expert tensors of a layer to one expert bank, the PLE table to the separate
+n-gram volume), and synthesizes the frontend resources from the GGUF vocabulary. Values are never
+re-derived: block tensors keep their GGML blocks and direct tensors their words. Logical shapes
+are the reversed GGUF dimensions, which keeps the bytes identical.
+
+The GGUF stores the PLE hash tables literally (multipliers, head sizes, head offsets). The config
+holds Infernix's derivation parameters instead (seed, prime base, padding), and the converter
+refuses a GGUF whose literal tables differ from that derivation, so both describe one hash.
 
 Export conventions of the GGUF, bound as stored (evidence in docs/maintainer/flash-next-plan.md):
 
@@ -22,11 +31,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 from pathlib import Path
-from typing import Mapping
+from typing import Iterator, Mapping
 
 import numpy as np
+import torch
 
+from tools.artifact import ngram_volume
+from tools.artifact.codecs.ggml_blocks import pack_expert_records
+from tools.artifact.formats import ggml_record_format
+from tools.artifact.layouts import GGML_EXPERT_RECORD_V1, ggml_expert_record_geometry
+
+from .methods import PrepareRequest, PreparedMethod
 from .model import Model, Parameter
 from .resources import token_domain
 from .sources.gguf import GgufError, GgufModel, tensor_source
@@ -71,13 +88,115 @@ def _f32_text(value: float) -> float:
     return float(str(np.float32(value)))
 
 
+# Infernix's published n-gram hash parameters (tools/flash_next/ngram.py). The GGUF's literal
+# tables must equal their derivation; the prime base is the one value the tables pin down only up
+# to a prime gap, so the smallest base consistent with the first head size is recorded.
+NGRAM_SEED = 1234
+NGRAM_DIVISIBLE_BY = 128
+_MASK64 = (1 << 64) - 1
+_GAMMA = 0x9E3779B97F4A7C15
+_LAYER_PRIME = 10007
+
+
+def _splitmix64(x: int) -> int:
+    x = (x + _GAMMA) & _MASK64
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _MASK64
+    return x ^ (x >> 31)
+
+
+def layer_multipliers(vocab_size: int, ngram_size: int, seed: int, layer: int) -> list[int]:
+    """Infernix's per-layer hash multipliers: odd values from splitmix64 of the layer seed."""
+    half_bound = max(1, ((1 << 63) - 1) // max(vocab_size, 1) // 2)
+    base = seed + _LAYER_PRIME * layer
+    return [
+        2 * (_splitmix64((base + _GAMMA * (i + 1)) & _MASK64) % half_bound) + 1
+        for i in range(ngram_size)
+    ]
+
+
+def _is_prime(value: int) -> bool:
+    if value < 2:
+        return False
+    if value % 2 == 0:
+        return value == 2
+    return all(value % d for d in range(3, math.isqrt(value) + 1, 2))
+
+
+def head_tables(
+    vocab_size_base: int, heads: int, divisible_by: int, layer: int
+) -> tuple[list[int], list[int], int]:
+    """Per-head prime modulus and row offset of PLE layer *layer*, and its padded row count.
+
+    The head sizes are consecutive primes from ``vocab_size_base``, continued across layers.
+    """
+    prime, sizes, offsets, total = vocab_size_base - 1, [], [], 0
+    for i in range((layer + 1) * heads):
+        prime += 1
+        while not _is_prime(prime):
+            prime += 1
+        if i >= layer * heads:
+            sizes.append(prime)
+            offsets.append(total)
+            total += prime
+    return sizes, offsets, -(-total // divisible_by) * divisible_by
+
+
+def ngram_table_rows(config: Mapping) -> int:
+    """Rows of the n-gram table the config's hash addresses (Infernix's ``table_rows()``)."""
+    heads = (config["ngram_size"] - 1) * config["heads_per_ngram"]
+    return head_tables(
+        config["ngram_vocab_size_base"], heads, config["make_ngram_vocab_size_divisible_by"], 0
+    )[2]
+
+
+def _ngram_parameters(m: Mapping, vocab_size: int, ngram: int, heads: int) -> dict:
+    """Infernix's hash parameters, proven equal to the GGUF's literal tables."""
+    offsets = _ints(m, _KEY + "ple.head_offsets", heads)
+    sizes = _ints(m, _KEY + "ple.head_vocab_sizes", heads)
+    multipliers = _ints(m, _KEY + "ple.layer_multipliers", ngram)
+    if not _is_prime(sizes[0]):
+        raise GgufError("ple.head_vocab_sizes must start with a prime")
+    base = sizes[0] - 1
+    while not _is_prime(base) and base > 1:
+        base -= 1
+    base += 1
+    derived_sizes, derived_offsets, _ = head_tables(base, heads, NGRAM_DIVISIBLE_BY, 0)
+    if (sizes, offsets) != (derived_sizes, derived_offsets):
+        raise GgufError(
+            "ple.head_vocab_sizes and ple.head_offsets are not consecutive primes and their "
+            "running sum (Infernix's n-gram head tables)"
+        )
+    if multipliers != layer_multipliers(vocab_size, ngram, NGRAM_SEED, 0):
+        raise GgufError(
+            "ple.layer_multipliers differ from Infernix's splitmix64 derivation with seed "
+            f"{NGRAM_SEED}"
+        )
+    return {
+        "ngram_vocab_size_base": base,
+        "make_ngram_vocab_size_divisible_by": NGRAM_DIVISIBLE_BY,
+        "seed": NGRAM_SEED,
+    }
+
+
 def text_config(metadata: Mapping) -> dict:
+    """Infernix's Qwen4Exp text config (its ``parse_config`` keys) from GGUF metadata.
+
+    ``ngram_table`` is added by :func:`build_model` and its ``volume_id`` when the n-gram volume
+    is bound. Facts the GGUF does not record are the architecture's: the GDN output gate is a
+    sigmoid, top-k weights are renormalized, the QSA indexer has one key head (checked against its
+    projection in :func:`name_map`), and the GGUF holds the n-gram table as one part.
+    """
     if metadata.get("general.architecture") != ARCHITECTURE:
         raise GgufError(
             f"general.architecture is {metadata.get('general.architecture')!r}, "
             f"expected {ARCHITECTURE!r}"
         )
     m = metadata
+    tokens = m.get("tokenizer.ggml.tokens")
+    if not isinstance(tokens, list) or not tokens:
+        raise GgufError("tokenizer.ggml.tokens is required")
+    vocab_size = len(tokens)
     layers = _int(m, _KEY + "block_count")
     interval = _int(m, _KEY + "full_attention_interval")
     layer_types = [
@@ -93,6 +212,10 @@ def text_config(metadata: Mapping) -> dict:
     head_dim = _int(m, _KEY + "attention.key_length")
     if _int(m, _KEY + "attention.value_length") != head_dim:
         raise GgufError("attention key and value lengths differ")
+    heads = _int(m, _KEY + "attention.head_count")
+    kv_heads = _int(m, _KEY + "attention.head_count_kv")
+    if heads % kv_heads:
+        raise GgufError("attention heads must be divisible by KV heads")
     rotary = _int(m, _KEY + "rope.dimension_count")
     sections = _ints(m, _KEY + "rope.dimension_sections", 4)
     if sections[3] != 0 or sum(sections) * 2 != rotary or rotary > head_dim:
@@ -102,65 +225,74 @@ def text_config(metadata: Mapping) -> dict:
     key_heads = _int(m, _KEY + "ssm.group_count")
     if inner % value_heads or value_heads % key_heads:
         raise GgufError("GDN head counts do not divide the inner size")
-    ple_layers = _ints(m, _KEY + "ple.layers")
-    offsets = _ints(m, _KEY + "ple.head_offsets")
-    sizes = _ints(m, _KEY + "ple.head_vocab_sizes", len(offsets))
-    ngram = _int(m, _KEY + "ple.ngram_size")
-    heads_per_ngram = _int(m, _KEY + "ple.heads_per_ngram")
-    if len(offsets) != (ngram - 1) * heads_per_ngram:
-        raise GgufError("PLE head tables do not match ngram_size and heads_per_ngram")
-    if any(offsets[i] + sizes[i] != offsets[i + 1] for i in range(len(offsets) - 1)):
-        raise GgufError("PLE head offsets are not the running sum of the head sizes")
-    if any(not 0 <= layer < layers for layer in ple_layers):
-        raise GgufError(f"PLE layers {ple_layers} are outside the model")
     experts, used = _int(m, _KEY + "expert_count"), _int(m, _KEY + "expert_used_count")
     if used > experts:
         raise GgufError("expert_used_count exceeds expert_count")
+    hc_count = _int(m, _KEY + "hyper_connection.count")
+    if hc_count < 2:
+        raise GgufError("hyper_connection.count must exceed 1")
+    budget = _int(m, _KEY + "attention.indexer.top_k")
+    index_dim = _int(m, _KEY + "attention.indexer.key_length")
+    if budget % compress[0] or rotary > index_dim:
+        raise GgufError("invalid QSA indexer geometry")
+    ple_layers = _ints(m, _KEY + "ple.layers")
+    if len(ple_layers) != 1:
+        raise GgufError(f"Qwen4Exp implements exactly one PLE layer, got {ple_layers}")
+    (ple_layer,) = ple_layers  # zero-based in the GGUF, one-based in the config
+    if not 0 <= ple_layer < layers or layer_types[ple_layer] != "linear_attention":
+        raise GgufError(f"PLE layer {ple_layer} is not a linear-attention layer of the model")
+    ngram = _int(m, _KEY + "ple.ngram_size")
+    heads_per_ngram = _int(m, _KEY + "ple.heads_per_ngram")
+    if ngram < 2:
+        raise GgufError("ple.ngram_size must be at least 2")
+    ple_heads = (ngram - 1) * heads_per_ngram
+    eos = _int(m, _KEY + "ple.eos_token_id")
+    if eos >= vocab_size:
+        raise GgufError("ple.eos_token_id exceeds the vocabulary")
     return {
         "architectures": ["Qwen4ExpForCausalLM"],
         "model_type": "qwen4_exp_text",
         "hidden_size": _int(m, _KEY + "embedding_length"),
+        "vocab_size": vocab_size,
         "num_hidden_layers": layers,
         "max_position_embeddings": _int(m, _KEY + "context_length"),
         "tie_word_embeddings": False,
         "rms_norm_eps": _real(m, _KEY + "attention.layer_norm_rms_epsilon"),
         "layer_types": layer_types,
-        "num_attention_heads": _int(m, _KEY + "attention.head_count"),
-        "num_key_value_heads": _int(m, _KEY + "attention.head_count_kv"),
+        "num_attention_heads": heads,
+        "num_key_value_heads": kv_heads,
         "head_dim": head_dim,
         "rope_parameters": {
             "rope_theta": _real(m, _KEY + "rope.freq_base"),
             "partial_rotary_factor": rotary / head_dim,
             "mrope_section": sections[:3],
-            "mrope_interleaved": True,
         },
         "linear_num_key_heads": key_heads,
         "linear_key_head_dim": _int(m, _KEY + "ssm.state_size"),
         "linear_num_value_heads": value_heads,
         "linear_value_head_dim": inner // value_heads,
         "linear_conv_kernel_dim": _int(m, _KEY + "ssm.conv_kernel"),
+        "output_gate_type": "sigmoid",
         "num_experts": experts,
         "num_experts_per_tok": used,
         "moe_intermediate_size": _int(m, _KEY + "expert_feed_forward_length"),
-        "shared_expert_intermediate_size": _int(
-            m, _KEY + "expert_shared_feed_forward_length"
-        ),
-        "hc_count": _int(m, _KEY + "hyper_connection.count"),
-        "hc_low_rank": _int(m, _KEY + "hyper_connection.low_rank"),
-        "indexer_num_heads": _int(m, _KEY + "attention.indexer.head_count"),
-        "indexer_head_dim": _int(m, _KEY + "attention.indexer.key_length"),
-        "indexer_top_k": _int(m, _KEY + "attention.indexer.top_k"),
+        "shared_expert_intermediate_size": _int(m, _KEY + "expert_shared_feed_forward_length"),
+        "norm_topk_prob": True,
+        "hc_count": hc_count,
+        "hc_lowrank": _int(m, _KEY + "hyper_connection.low_rank"),
+        "indexer_n_heads": _int(m, _KEY + "attention.indexer.head_count"),
+        "indexer_kv_heads": 1,
+        "indexer_head_dim": index_dim,
+        "indexer_budget": budget,
         "indexer_compress_ratio": compress[0],
-        "ple_layers": ple_layers,
-        "ple_ngram_size": ngram,
-        "ple_heads_per_ngram": heads_per_ngram,
-        "ple_conv_kernel": _int(m, _KEY + "ple.conv_kernel"),
-        "ple_embedding_dim": _int(m, _KEY + "embedding_length_per_layer_input"),
-        "ple_eos_token_id": _int(m, _KEY + "ple.eos_token_id"),
-        "ple_image_token_id": _int(m, _KEY + "ple.image_token_id"),
-        "ple_layer_multipliers": _ints(m, _KEY + "ple.layer_multipliers", ngram),
-        "ple_head_offsets": offsets,
-        "ple_head_vocab_sizes": sizes,
+        "ple_layer_ids": [ple_layer + 1],
+        "ple_embed_dim": _int(m, _KEY + "embedding_length_per_layer_input") * ple_heads,
+        "ple_conv_kernel_size": _int(m, _KEY + "ple.conv_kernel"),
+        "ngram_size": ngram,
+        "heads_per_ngram": heads_per_ngram,
+        **_ngram_parameters(m, vocab_size, ngram, ple_heads),
+        "split_ngram_parts": 1,
+        "eos_token_id": eos,
     }
 
 
@@ -230,8 +362,8 @@ _GLOBAL_ROLES = {
     "output_hc_down.weight": ("text/output_hc/down", ("text/output_hc/stream",)),
     "output_hc_up.weight": ("text/output_hc/up", ("text/output_hc/low_rank",)),
     "output_hc_norm.weight": ("text/output_hc/norm", ()),
-    "per_layer_token_embd.weight": ("text/ple/table", ()),
 }
+# The PLE n-gram table: written to the n-gram volume, not to the artifact.
 PLE_TABLE = "per_layer_token_embd.weight"
 
 
@@ -239,7 +371,8 @@ PLE_TABLE = "per_layer_token_embd.weight"
 class Subset:
     """A development subset: chosen tensors, whole expert banks, and the first PLE rows.
 
-    Such an artifact is not a loadable model; later PRs use it as a real-weight fixture.
+    Such an artifact (and its n-gram volume of ``ple_rows`` rows) is not a loadable model; later
+    PRs use it as a real-weight fixture.
     """
 
     tensors: frozenset[str]
@@ -248,7 +381,7 @@ class Subset:
     ple_rows: int
 
     def keeps(self, gguf: GgufModel, name: str) -> bool:
-        if name in self.tensors or name == PLE_TABLE:
+        if name in self.tensors:
             return True
         layer, suffix = _split_layer(name)
         if layer is None:
@@ -260,8 +393,8 @@ class Subset:
 
 SUBSETS = {
     # One real tensor of every stored GGML type, the direct tensors of a GDN layer, the PLE
-    # layer and a QSA layer, three expert banks (IQ2_S, IQ2_XXS and IQ1_M with Q2_0 down) and
-    # the first 100 PLE pages.
+    # layer and a QSA layer, the three expert record formats (IQ2_S, IQ2_XXS and IQ1_M gate/up
+    # with Q2_0 down) and the first 100 volume blocks of the n-gram table.
     "dev": Subset(
         tensors=frozenset(
             {
@@ -293,64 +426,66 @@ def _split_layer(name: str) -> tuple[int | None, str]:
 
 @dataclass(frozen=True, slots=True)
 class TensorMapping:
-    """One logical parameter of a GGUF tensor: its row range, logical shape and inputs."""
+    """The logical destination of one GGUF tensor: its parameter, logical shape and inputs.
+
+    A layer's three routed-expert tensors share one parameter, its expert bank, and ``part``
+    names the record part (gate, up or down) the tensor supplies. The PLE table has no parameter:
+    it is the n-gram volume.
+    """
 
     gguf: str
-    parameter: str
-    rows: tuple[int, int] | None
+    parameter: str | None
     shape: tuple[int, ...]
     inputs: tuple[str, ...]
+    part: str | None = None
+
+
+def expert_bank(layer: int) -> str:
+    return f"text/layers/{layer}/moe/experts"
 
 
 def name_map(gguf: GgufModel, config: dict) -> list[TensorMapping]:
     """Map every GGUF tensor; reject unknown, missing or misplaced tensors."""
     layers = config["num_hidden_layers"]
     expected: dict[int, set[str]] = {}
+    ple_layers = {layer - 1 for layer in config["ple_layer_ids"]}
     for layer, kind in enumerate(config["layer_types"]):
         expected[layer] = _LAYER_COMMON | _MIXER_SUFFIXES[kind]
-        if layer in config["ple_layers"]:
+        if layer in ple_layers:
             expected[layer] |= _PLE_SUFFIXES
     found: dict[int, set[str]] = {layer: set() for layer in range(layers)}
     result = []
-    experts = config["num_experts"]
     for name, tensor in gguf.tensors.items():
         layer, suffix = _split_layer(name)
         if layer is None:
+            if name == PLE_TABLE:
+                result.append(TensorMapping(name, None, tensor.shape, ()))
+                continue
             if name not in _GLOBAL_ROLES:
                 raise GgufError(f"unknown GGUF tensor {name!r}")
             parameter, inputs = _GLOBAL_ROLES[name]
-            result.append(TensorMapping(name, parameter, None, tensor.shape, inputs))
+            result.append(TensorMapping(name, parameter, tensor.shape, inputs))
             continue
         if layer >= layers or suffix not in expected[layer]:
             raise GgufError(f"unexpected GGUF tensor {name!r} for this layer")
         found[layer].add(suffix)
         prefix = f"text/layers/{layer}/"
         if suffix in _EXPERT_ROLES:
-            if len(tensor.shape) != 3 or tensor.shape[0] != experts:
-                raise GgufError(f"{name}: expected [{experts}, N, K], got {tensor.shape}")
-            role = _EXPERT_ROLES[suffix]
-            per = tensor.shape[1]
-            for expert in range(experts):
-                expert_prefix = f"{prefix}moe/experts/{expert}/"
-                use = expert_prefix + "product" if role == "down" else prefix + "ffn_input"
-                result.append(
-                    TensorMapping(
-                        name,
-                        expert_prefix + role,
-                        (expert * per, (expert + 1) * per),
-                        tensor.shape[1:],
-                        (use,),
-                    )
+            result.append(
+                TensorMapping(
+                    name, expert_bank(layer), tensor.shape, (prefix + "ffn_input",),
+                    _EXPERT_ROLES[suffix],
                 )
+            )
             continue
         role, inputs = _LAYER_ROLES[suffix]
         shape = tensor.shape
         if suffix == "ffn_gate_inp_shexp.weight":
             shape = (1, *shape)
         result.append(
-            TensorMapping(name, prefix + role, None, shape, tuple(prefix + i for i in inputs))
+            TensorMapping(name, prefix + role, shape, tuple(prefix + i for i in inputs))
         )
-    for name in _GLOBAL_ROLES:
+    for name in (*_GLOBAL_ROLES, PLE_TABLE):
         if name not in gguf.tensors:
             raise GgufError(f"GGUF tensor {name!r} is missing")
     for layer in range(layers):
@@ -362,25 +497,22 @@ def name_map(gguf: GgufModel, config: dict) -> list[TensorMapping]:
 
 
 def _check_shapes(gguf: GgufModel, config: dict) -> None:
-    h, vocab = config["hidden_size"], gguf.tensor("token_embd.weight").shape[0]
+    h, vocab = config["hidden_size"], config["vocab_size"]
+    e, i = config["num_experts"], config["moe_intermediate_size"]
     qkv = 2 * config["linear_num_key_heads"] * config["linear_key_head_dim"]
     vg = config["linear_num_value_heads"] * config["linear_value_head_dim"]
+    ple_heads = (config["ngram_size"] - 1) * config["heads_per_ngram"]
+    hc_width = config["hc_count"] * h
     checks = {
         "token_embd.weight": (vocab, h),
         "output.weight": (vocab, h),
-        PLE_TABLE: (
-            gguf.tensor(PLE_TABLE).shape[0],
-            config["ple_embedding_dim"],
-        ),
+        PLE_TABLE: (ngram_table_rows(config), config["ple_embed_dim"] // ple_heads),
     }
     for layer, kind in enumerate(config["layer_types"]):
         p = f"blk.{layer}."
-        checks[p + "ffn_gate_exps.weight"] = (
-            config["num_experts"], config["moe_intermediate_size"], h
-        )
-        checks[p + "ffn_down_exps.weight"] = (
-            config["num_experts"], h, config["moe_intermediate_size"]
-        )
+        checks[p + "ffn_gate_exps.weight"] = (e, i, h)
+        checks[p + "ffn_up_exps.weight"] = (e, i, h)
+        checks[p + "ffn_down_exps.weight"] = (e, h, i)
         if kind == "linear_attention":
             checks[p + "attn_qkv.weight"] = (qkv + vg, h)
             checks[p + "ssm_out.weight"] = (h, vg)
@@ -388,12 +520,32 @@ def _check_shapes(gguf: GgufModel, config: dict) -> None:
             heads, d = config["num_attention_heads"], config["head_dim"]
             checks[p + "attn_q.weight"] = (2 * heads * d, h)
             checks[p + "attn_output.weight"] = (h, heads * d)
+            index = config["indexer_head_dim"]
+            checks[p + "indexer.q_proj.weight"] = (config["indexer_n_heads"] * index, h)
+            checks[p + "indexer.k_proj.weight"] = (config["indexer_kv_heads"] * index, h)
+        if layer + 1 in config["ple_layer_ids"]:
+            checks[p + "ple_key.weight"] = (hc_width, config["ple_embed_dim"])
+            checks[p + "ple_value.weight"] = (h, config["ple_embed_dim"])
     for name, shape in checks.items():
         if gguf.tensor(name).shape != tuple(shape):
             raise GgufError(f"{name}: shape {gguf.tensor(name).shape}, expected {shape}")
-    rows = gguf.tensor(PLE_TABLE).shape[0]
-    if config["ple_head_offsets"][-1] + config["ple_head_vocab_sizes"][-1] > rows:
-        raise GgufError("PLE head ranges exceed the table rows")
+    for layer in range(config["num_hidden_layers"]):
+        _record_format(gguf, layer)
+
+
+def _record_format(gguf: GgufModel, layer: int) -> str:
+    """The expert record format of a layer: gate and up share one GGML type, down has its own."""
+    p = f"blk.{layer}."
+    gate, up, down = (
+        gguf.tensor(p + suffix).type.format
+        for suffix in ("ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight")
+    )
+    if gate != up:
+        raise GgufError(f"layer {layer}: gate experts are {gate} but up experts {up}")
+    try:
+        return ggml_record_format(gate, down).name
+    except ValueError as error:
+        raise GgufError(f"layer {layer}: {error}") from None
 
 
 def tokenizer_resources(metadata: Mapping, config: dict) -> dict[str, bytes]:
@@ -502,7 +654,7 @@ def tokenizer_resources(metadata: Mapping, config: dict) -> dict[str, bytes]:
         "tokenizer_class": "Qwen2Tokenizer",
         "unk_token": None,
     }
-    eos = [metadata["tokenizer.ggml.eos_token_id"], config["ple_eos_token_id"]]
+    eos = [metadata["tokenizer.ggml.eos_token_id"], config["eos_token_id"]]
     generation = {
         "bos_token_id": metadata.get("tokenizer.ggml.bos_token_id"),
         "do_sample": True,
@@ -578,6 +730,7 @@ def build_model(
     subset: Subset | None = None,
     resource_overrides: Mapping[str, str | Path] | None = None,
 ) -> Model:
+    """The logical model of a qwen4exp GGUF; bind its n-gram volume before converting it."""
     config = text_config(gguf.metadata)
     mappings = name_map(gguf, config)
     resources = tokenizer_resources(gguf.metadata, config)
@@ -596,13 +749,14 @@ def build_model(
                 )
                 resources["tokenizer_config.json"] = _json_bytes(settings)
         resources[role] = data
-    vocab = gguf.tensor("token_embd.weight").shape[0]
-    config["vocab_size"] = vocab
     count, special = token_domain(
         json.loads(resources["tokenizer.json"]),
         json.loads(resources["tokenizer_config.json"]),
-        vocab,
+        config["vocab_size"],
     )
+    # The volume id is unknown until the volume is written or reused (bind_ngram_volume).
+    table = ngram_geometry(gguf, subset)
+    config["ngram_table"] = {**table.config(bytes(ngram_volume.VOLUME_ID_BYTES)), "volume_id": None}
     references = {role: f"resource/text/{role}" for role in resources}
     model = Model(
         {"text": {"config": config, "resources": references}},
@@ -610,36 +764,38 @@ def build_model(
         token_count=count,
         special_token_ids=special,
     )
-    groups: dict[tuple[int, str], list[str]] = {}
+    banks: dict[str, dict[str, TensorMapping]] = {}
     for item in mappings:
-        if subset is not None and not subset.keeps(gguf, item.gguf):
+        if item.parameter is None or (subset is not None and not subset.keeps(gguf, item.gguf)):
+            continue
+        if item.part is not None:
+            banks.setdefault(item.parameter, {})[item.part] = item
             continue
         tensor = gguf.tensor(item.gguf)
-        rows, shape = item.rows, item.shape
-        if item.gguf == PLE_TABLE and subset is not None:
-            rows, shape = (0, subset.ple_rows), (subset.ple_rows, shape[1])
-        source = tensor_source(gguf, item.gguf, rows=rows, shape=shape)
         model.add(
             Parameter(
                 item.parameter,
-                shape,
-                source,
+                item.shape,
+                tensor_source(gguf, item.gguf, shape=item.shape),
                 inputs=item.inputs,
                 # Unassigned block tensors fall back to their exact FP32 decode, never a rounding.
                 direct_format=tensor.type.format if tensor.type.dtype is not None else "fp32",
             )
         )
-        if item.rows is not None:
-            layer = int(item.parameter.split("/")[2])
-            bank = "down" if item.parameter.endswith("/down") else "gate_up"
-            groups.setdefault((layer, bank), []).append(item.parameter)
-    for (layer, bank), names in sorted(groups.items()):
-        if bank == "gate_up":
-            # Expert e is gate_e's rows then up_e's rows: two contiguous byte ranges per expert.
-            names = sorted(names, key=lambda name: (int(name.split("/")[5]), name.endswith("/up")))
-        else:
-            names = sorted(names, key=lambda name: int(name.split("/")[5]))
-        model.packing_groups.append(tuple(names))
+    for name, parts in banks.items():
+        gate, up, down = parts["gate"], parts["up"], parts["down"]
+        experts, intermediate, hidden = gate.shape
+        layer = int(name.split("/")[2])
+        source = ExpertRecordSource(
+            (experts, hidden, intermediate),
+            f"{gate.gguf}|{up.gguf}|{down.gguf}",
+            gguf,
+            (gate.gguf, up.gguf, down.gguf),
+            _record_format(gguf, layer),
+        )
+        model.add(
+            Parameter(name, source.shape, source, inputs=gate.inputs, direct_format=source.format)
+        )
     return model
 
 
@@ -648,3 +804,146 @@ def encoded_format(parameter: Parameter) -> str | None:
     if parameter.source.read_encoded is None:
         return None
     return parameter.source.read_encoded(0, 1).format
+
+
+# ---------------------------------------------------------------------------- routed experts
+
+
+@dataclass(frozen=True, slots=True)
+class ExpertRecordSource:
+    """One layer's routed experts ``[experts, hidden, intermediate]`` in the GGUF.
+
+    Only :func:`import_expert_records` reads it: the bank is stored exactly, never as values.
+    ``tensors`` names the GGUF gate, up and down tensors; ``format`` is the record format.
+    """
+
+    shape: tuple[int, int, int]
+    label: str
+    gguf: GgufModel
+    tensors: tuple[str, str, str]
+    format: str
+    read_encoded: object = None
+    weight_divisor: object = None
+    input_divisor: object = None
+
+    def values(self, begin: int = 0, end: int | None = None) -> torch.Tensor:
+        raise ValueError(f"{self.label}: an expert bank is imported exactly, never as values")
+
+
+def expert_record_source(parameter: Parameter) -> ExpertRecordSource | None:
+    source = parameter.source
+    return source if isinstance(source, ExpertRecordSource) else None
+
+
+_RECORD_CHUNK = 16  # experts per read and write: 24 MiB of IQ2_S records
+
+
+def import_expert_records(request: PrepareRequest) -> PreparedMethod:
+    """Write one layer's experts as ``ggml_expert_record_v1`` records of their GGUF blocks.
+
+    Expert e's gate rows are GGUF rows ``[e*I, (e+1)*I)`` of the gate tensor, likewise up, and
+    its down rows ``[e*H, (e+1)*H)`` of the down tensor; every block is copied unchanged.
+    """
+    target = request.target
+    if target.layout != GGML_EXPERT_RECORD_V1.name:
+        raise ValueError("import_expert_records writes ggml_expert_record_v1")
+    if request.parameters:
+        raise ValueError("import_expert_records accepts no numerical parameters")
+    if len(request.inputs) != 1 or not isinstance(request.inputs[0].source, ExpertRecordSource):
+        raise ValueError("import_expert_records requires exactly one expert bank source")
+    source = request.inputs[0].source
+    if tuple(target.shape) != source.shape or target.format != source.format:
+        raise ValueError(
+            f"expert bank target {target.format} {target.shape} differs from its source "
+            f"{source.format} {source.shape}"
+        )
+    g = ggml_expert_record_geometry(target.format, target.shape)
+    parts = [
+        (source.gguf.tensor(name), rows, row_bytes)
+        for name, (_, _, rows, row_bytes) in zip(source.tensors, g.parts())
+    ]
+    for tensor, rows, row_bytes in parts:
+        if tensor.rows != g.experts * rows or tensor.row_bytes != row_bytes:
+            raise ValueError(f"{tensor.name}: rows of {tensor.row_bytes} B differ from the record")
+
+    def produce(output):
+        for first in range(0, g.experts, _RECORD_CHUNK):
+            count = min(_RECORD_CHUNK, g.experts - first)
+            gate, up, down = (
+                source.gguf.read_rows(tensor, first * rows, (first + count) * rows).reshape(
+                    count, rows, row_bytes
+                )
+                for tensor, rows, row_bytes in parts
+            )
+            records = pack_expert_records(target.format, target.shape, gate, up, down)
+            output.write_bytes(first * g.record_stride, records.reshape(-1).data)
+
+    return request.job(produce=produce)
+
+
+# ---------------------------------------------------------------------------- n-gram volume
+
+_NGRAM_CHUNK_BYTES = 16 * 1024 * 1024
+
+
+def ngram_geometry(gguf: GgufModel, subset: Subset | None = None) -> ngram_volume.VolumeGeometry:
+    """The n-gram volume of the GGUF's PLE table, or of a subset's first rows."""
+    table = gguf.tensor(PLE_TABLE)
+    rows = table.rows if subset is None else subset.ple_rows
+    if not 0 < rows <= table.rows:
+        raise GgufError(f"the n-gram volume takes 1 to {table.rows} rows, not {rows}")
+    return ngram_volume.geometry(table.type.format, rows, table.row_elems)
+
+
+def _volume_geometry(gguf: GgufModel, model: Model) -> ngram_volume.VolumeGeometry:
+    record = model.config["ngram_table"]
+    table = gguf.tensor(PLE_TABLE)
+    g = ngram_volume.geometry(record["format"], record["rows"], table.row_elems)
+    if {**g.config(bytes(16)), "volume_id": None} != {**record, "volume_id": None}:
+        raise ValueError("the model's ngram_table differs from the GGUF table")
+    return g
+
+
+def ngram_rows(gguf: GgufModel, rows: int) -> Iterator[np.ndarray]:
+    """The table's first *rows* GGUF rows, exactly, in chunks of about 16 MiB."""
+    table = gguf.tensor(PLE_TABLE)
+    step = max(1, _NGRAM_CHUNK_BYTES // table.row_bytes)
+    for begin in range(0, rows, step):
+        yield gguf.read_rows(table, begin, min(rows, begin + step))
+
+
+def bind_ngram_volume(model: Model, volume_id: bytes) -> None:
+    """Record the id of the n-gram volume this artifact reads."""
+    record = model.config["ngram_table"]
+    if len(volume_id) != ngram_volume.VOLUME_ID_BYTES:
+        raise ValueError("the n-gram volume id is 16 bytes")
+    record["volume_id"] = volume_id.hex()
+
+
+def bound_volume_id(model: Model) -> bytes:
+    value = model.config["ngram_table"].get("volume_id")
+    if not isinstance(value, str) or len(value) != 2 * ngram_volume.VOLUME_ID_BYTES:
+        raise ValueError("bind the n-gram volume (write or reuse one) before converting")
+    return bytes.fromhex(value)
+
+
+def write_ngram_volume(
+    gguf: GgufModel, model: Model, path: str | Path, *, progress=None
+) -> ngram_volume.VolumeGeometry:
+    """Write the model's n-gram volume, with the volume id the model is bound to."""
+    g = _volume_geometry(gguf, model)
+    ngram_volume.write_volume(
+        path, g, bound_volume_id(model), ngram_rows(gguf, g.rows), progress=progress
+    )
+    return g
+
+
+def read_ngram_volume_id(gguf: GgufModel, model: Model, path: str | Path) -> bytes:
+    """The id of an existing volume written from this GGUF's table (Infernix's reuse check)."""
+    g = _volume_geometry(gguf, model)
+    table = gguf.tensor(PLE_TABLE)
+
+    def source_row(row: int) -> bytes:
+        return gguf.read_range(table, row * table.row_bytes, (row + 1) * table.row_bytes)
+
+    return ngram_volume.check_reuse(path, g, source_row)

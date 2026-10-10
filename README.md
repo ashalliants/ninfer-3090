@@ -681,6 +681,10 @@ you can [support upstream on Ko-fi](https://ko-fi.com/neroued). Support is entir
 not a purchase or investment and does not come with financial returns, promised services or
 features, or a role in project decisions.
 
+The Qwen3.8-Flash-Next work adapts code from [Infernix](https://github.com/wallawalla47/infernix)
+by [wallawalla47](https://github.com/wallawalla47) (Apache-2.0), itself a fork of NInfer: so far the n-gram volume format and the
+model's config keys and n-gram hash derivation. Each adapted file says so in its header.
+
 ## Contributors
 
 See [CONTRIBUTORS.md](CONTRIBUTORS.md) for the complete, maintained credit list.

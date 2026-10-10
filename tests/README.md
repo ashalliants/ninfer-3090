@@ -169,15 +169,17 @@ The GGML block decoders, Python (`tests/artifact/test_ggml_codecs.py`) and C++
 checked against committed golden fixtures from ggml's reference `dequantize_row_*`
 (`tests/fixtures/ggml/<format>.blocks` and `.f32`). `ninfer_artifact_ggml_real_test` loads a real
 GGML artifact named by `NINFER_TEST_ARTIFACT` (such as `--subset dev` below) through Device, Pinned
-and Host residency and requires the C++ and Python decoders to agree bit for bit on sampled blocks;
-it skips without the variable or when that artifact has no GGML tensor. Optional environment
-variables extend the Python GGML and GGUF checks:
+and Host residency and requires the C++ and Python decoders to agree bit for bit on sampled blocks,
+including blocks of every part of the expert records; it skips without the variable or when that
+artifact has no GGML tensor. `tests/artifact/test_ngram_volume.py` covers the n-gram volume file
+(header fields, block geometry at the real table, exact row placement, the 512-row reuse check).
+Optional environment variables extend the Python GGML and GGUF checks:
 
 | Variable | Adds |
 |---|---|
 | `NINFER_GGML_BASE_DLL` | the live oracle: ggml-base (`.dll` or `.so`) of llama.cpp b11316 decodes 100,000 random blocks per format, and 1,000 real blocks per format with `NINFER_TEST_GGUF` |
-| `NINFER_TEST_GGUF` | the real Qwen3.8-Flash-Next GGUF (first split file): tensor inventory, whole-model name map, export conventions, and a `--subset dev` conversion compared byte for byte (~2.9 GB in the test's temporary directory) |
-| `NINFER_TEST_QWEN4EXP_SUBSET` | verify that existing `--subset dev` artifact instead of converting one |
+| `NINFER_TEST_GGUF` | the real Qwen3.8-Flash-Next GGUF (first split file): tensor inventory, whole-model name map and expert record bytes, export conventions and hash parameters, and a `--subset dev` conversion and its n-gram volume compared byte for byte against the GGUF, expert records through their exact inverse (~2.9 GB in the test's temporary directory) |
+| `NINFER_TEST_QWEN4EXP_SUBSET` | verify that existing `--subset dev` artifact, and the volume beside it as `<artifact>.ngram`, instead of converting one |
 | `NINFER_TEST_QWEN38_ARTIFACT` | a Qwen3.8 `.ninfer` whose tokenizer the GGUF vocabulary must equal |
 
 `python -m tools.artifact.gen_ggml_fixtures --dll PATH` regenerates the fixtures.

@@ -7,18 +7,32 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from tools.artifact.formats import GGML_BLOCK_FORMATS
-from tools.artifact.layouts import ROW_PAGE_BYTES, ggml_row_page_geometry
+from tools.artifact.formats import GGML_BLOCK_FORMATS, GGML_RECORD_FORMATS
+from tools.artifact.layouts import ggml_expert_record_geometry
 from tools.artifact.schema import TensorSpec
 from tools.artifact.writer import ArtifactWriter
 
-# The C++ side expects every GGML object's unpaged row bytes to be this sequence.
+
+# The C++ side expects every GGML object's rows, and every expert record's parts in record
+# order, to be consecutive runs of this sequence (gaps between record parts are zero).
 def _pattern(count: int) -> bytes:
     return bytes((index * 37 + 11) % 251 for index in range(count))
 
 
+def _records(name: str, shape: tuple[int, int, int]) -> bytes:
+    g = ggml_expert_record_geometry(name, shape)
+    payload, cursor = bytearray(g.payload_bytes), 0
+    for expert in range(g.experts):
+        for _, offset, rows, row_bytes in g.parts():
+            size = rows * row_bytes
+            start = expert * g.record_stride + offset
+            payload[start : start + size] = _pattern(cursor + size)[cursor:]
+            cursor += size
+    return bytes(payload)
+
+
 def _ggml_objects() -> tuple[list[TensorSpec], dict[str, bytes], dict[str, dict]]:
-    """Three rows of two blocks per GGML format, plus one paged table with a partial last page."""
+    """Three rows of two blocks per GGML format, and two experts of each record format."""
     specs, data, bindings = [], {}, {}
     for name, spec in sorted(GGML_BLOCK_FORMATS.items()):
         shape = (3, 2 * spec.block_elems)
@@ -28,18 +42,12 @@ def _ggml_objects() -> tuple[list[TensorSpec], dict[str, bytes], dict[str, dict]
     # Rows 1..2 of one parent: a partial region of a GGML block parent.
     k = 2 * GGML_BLOCK_FORMATS["ggml_q6_k"].block_elems
     bindings["ggml_q6_k_rows"] = {"parts": [{"object": "ggml_q6_k", "range": [k, 3 * k]}]}
-    shape = (50, 160)  # 45 rows in page 0, five in page 1
-    geometry = ggml_row_page_geometry("ggml_iq4_nl", shape)
-    rows = _pattern(shape[0] * geometry.row_bytes)
-    paged = bytearray(geometry.payload_bytes)
-    for row in range(shape[0]):
-        paged[geometry.row_offset(row) : geometry.row_offset(row) + geometry.row_bytes] = rows[
-            row * geometry.row_bytes : (row + 1) * geometry.row_bytes
-        ]
-    assert len(paged) == 2 * ROW_PAGE_BYTES
-    specs.append(TensorSpec("ple_paged", shape, "ggml_iq4_nl", "ggml_rows_page4k_v1"))
-    data["ple_paged"] = bytes(paged)
-    bindings["ple_paged"] = {"object": "ple_paged"}
+    # [2 experts, hidden 256, intermediate 64]: IQ2_S and IQ2_XXS gate parts leave a gap.
+    for name in sorted(GGML_RECORD_FORMATS):
+        shape = (2, 256, 64)
+        specs.append(TensorSpec(name, shape, name, "ggml_expert_record_v1"))
+        data[name] = _records(name, shape)
+        bindings[name] = {"object": name}
     return specs, data, bindings
 
 

@@ -16,9 +16,11 @@ from typing import Sequence
 
 from .formats import (
     GGML_BLOCK_FORMATS,
+    GGML_RECORD_FORMATS,
     DirectFormat,
     Fp8RowFormat,
     GgmlBlockFormat,
+    GgmlExpertRecordFormat,
     Nvfp4Format,
     NumericFormat,
     QuantFormat,
@@ -27,7 +29,6 @@ from .formats import (
 
 PLANE_ALIGNMENT = 256
 K_ALIGNMENT = 128
-ROW_PAGE_BYTES = 4096
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,20 +91,34 @@ class GgmlBlocksGeometry:
 
 
 @dataclass(frozen=True, slots=True)
-class GgmlRowPageGeometry:
-    rows: int
-    k: int
-    row_bytes: int
-    rows_per_page: int
-    pages: int
+class GgmlExpertRecordGeometry:
+    """``ggml_expert_record_v1``: expert e's record starts at ``e * record_stride``.
+
+    Inside a record, gate (``intermediate`` rows of K = hidden) starts at 0, up at ``up_offset``
+    and down (``hidden`` rows of K = intermediate) at ``down_offset``; each part starts on a
+    256-byte boundary and the gaps are zero.
+    """
+
+    experts: int
+    hidden: int
+    intermediate: int
+    gate_up_row_bytes: int
+    down_row_bytes: int
+    gate_bytes: int
+    up_offset: int
+    down_offset: int
+    down_bytes: int
+    record_bytes: int
+    record_stride: int
     payload_bytes: int
 
-    def row_offset(self, row: int) -> int:
-        """Payload offset of logical row *row*; no row crosses a page."""
-        if not 0 <= row < self.rows:
-            raise ValueError(f"row {row} is outside [0,{self.rows})")
-        page, slot = divmod(row, self.rows_per_page)
-        return page * ROW_PAGE_BYTES + slot * self.row_bytes
+    def parts(self) -> tuple[tuple[str, int, int, int], ...]:
+        """``(role, offset, rows, row_bytes)`` of the gate, up and down parts of one record."""
+        return (
+            ("gate", 0, self.intermediate, self.gate_up_row_bytes),
+            ("up", self.up_offset, self.intermediate, self.gate_up_row_bytes),
+            ("down", self.down_offset, self.hidden, self.down_row_bytes),
+        )
 
 
 CONTIGUOUS_LE_V1 = Layout("contiguous_le_v1", 256, frozenset(("bf16", "fp32", "int32")))
@@ -123,8 +138,8 @@ ROW_SCALE_V1 = Layout(
     frozenset(("fp8_e4m3fn_row_bf16",)),
 )
 GGML_BLOCKS_V1 = Layout("ggml_blocks_v1", 256, frozenset(GGML_BLOCK_FORMATS))
-GGML_ROWS_PAGE4K_V1 = Layout(
-    "ggml_rows_page4k_v1", ROW_PAGE_BYTES, frozenset(GGML_BLOCK_FORMATS)
+GGML_EXPERT_RECORD_V1 = Layout(
+    "ggml_expert_record_v1", PLANE_ALIGNMENT, frozenset(GGML_RECORD_FORMATS)
 )
 
 LAYOUTS = MappingProxyType(
@@ -136,7 +151,7 @@ LAYOUTS = MappingProxyType(
             BLOCK_SCALE_K16_M128X4_V1,
             ROW_SCALE_V1,
             GGML_BLOCKS_V1,
-            GGML_ROWS_PAGE4K_V1,
+            GGML_EXPERT_RECORD_V1,
         )
     }
 )
@@ -308,21 +323,46 @@ def ggml_blocks_geometry(
     return GgmlBlocksGeometry(rows, k, blocks_per_row, row_bytes, rows * row_bytes)
 
 
-def ggml_row_page_geometry(
-    format: str | GgmlBlockFormat, shape: Sequence[int]
-) -> GgmlRowPageGeometry:
-    """Whole rows packed into 4096-byte pages; the unused page tail is zero."""
-    spec, rows, k = _ggml_rows(format, shape, rank=2)
-    row_bytes = k // spec.block_elems * spec.block_bytes
-    if row_bytes > ROW_PAGE_BYTES:
+def ggml_expert_record_geometry(
+    format: str | GgmlExpertRecordFormat, shape: Sequence[int]
+) -> GgmlExpertRecordGeometry:
+    """One record per expert of a routed bank ``[experts, hidden, intermediate]``.
+
+    The record is the expert's gate matrix ``[intermediate, hidden]``, its up matrix of the same
+    shape (both in ``format.gate_up``) and its down matrix ``[hidden, intermediate]`` (in
+    ``format.down``), each starting on a 256-byte boundary. The stride is the record rounded
+    up to 256 bytes, so records stay back to back when every part is a multiple of 256 bytes.
+    """
+    spec = _format(format)
+    if not isinstance(spec, GgmlExpertRecordFormat):
+        raise ValueError("ggml_expert_record_v1 requires a GGML expert record format")
+    experts, hidden, intermediate = _shape(shape, rank=3)
+    if hidden % spec.gate_up.block_elems or intermediate % spec.down.block_elems:
         raise ValueError(
-            f"ggml_rows_page4k_v1 requires rows of at most {ROW_PAGE_BYTES} bytes, "
-            f"got {row_bytes}"
+            f"{spec.name} requires hidden divisible by {spec.gate_up.block_elems} and "
+            f"intermediate by {spec.down.block_elems}, got {hidden} and {intermediate}"
         )
-    rows_per_page = ROW_PAGE_BYTES // row_bytes
-    pages = -(-rows // rows_per_page)
-    return GgmlRowPageGeometry(
-        rows, k, row_bytes, rows_per_page, pages, pages * ROW_PAGE_BYTES
+    gate_up_row_bytes = hidden // spec.gate_up.block_elems * spec.gate_up.block_bytes
+    down_row_bytes = intermediate // spec.down.block_elems * spec.down.block_bytes
+    gate_bytes = intermediate * gate_up_row_bytes
+    up_offset = align_up(gate_bytes, PLANE_ALIGNMENT)
+    down_offset = align_up(up_offset + gate_bytes, PLANE_ALIGNMENT)
+    down_bytes = hidden * down_row_bytes
+    record_bytes = down_offset + down_bytes
+    record_stride = align_up(record_bytes, PLANE_ALIGNMENT)
+    return GgmlExpertRecordGeometry(
+        experts=experts,
+        hidden=hidden,
+        intermediate=intermediate,
+        gate_up_row_bytes=gate_up_row_bytes,
+        down_row_bytes=down_row_bytes,
+        gate_bytes=gate_bytes,
+        up_offset=up_offset,
+        down_offset=down_offset,
+        down_bytes=down_bytes,
+        record_bytes=record_bytes,
+        record_stride=record_stride,
+        payload_bytes=experts * record_stride,
     )
 
 
@@ -358,6 +398,6 @@ def encoded_size(
         return row_scale_geometry(numeric_spec, shape).payload_bytes
     if layout_spec is GGML_BLOCKS_V1:
         return ggml_blocks_geometry(numeric_spec, shape).payload_bytes
-    if layout_spec is GGML_ROWS_PAGE4K_V1:
-        return ggml_row_page_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is GGML_EXPERT_RECORD_V1:
+        return ggml_expert_record_geometry(numeric_spec, shape).payload_bytes
     raise ValueError(f"unsupported tensor layout: {layout_spec.name!r}")

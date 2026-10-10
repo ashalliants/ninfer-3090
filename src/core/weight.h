@@ -26,6 +26,11 @@ enum class QType : std::uint16_t {
     GGML_IQ4_XS  = 15,
     GGML_IQ1_M   = 16,
     GGML_Q2_0    = 17,
+    // One routed expert per record: gate and up rows in the first GGML type, down rows in Q2_0
+    // (tensor-formats.md Section 3.6). Only the GgmlExpertRecord layout holds them.
+    GGML_REC_IQ2_S_Q2_0   = 18,
+    GGML_REC_IQ2_XXS_Q2_0 = 19,
+    GGML_REC_IQ1_M_Q2_0   = 20,
 };
 
 // One GGML block: `values` consecutive K values encoded in `bytes` bytes, scales included.
@@ -64,6 +69,30 @@ struct GgmlBlock {
     return ggml_block(format).values != 0;
 }
 
+// The GGML block formats of an expert record's parts: gate and up share `gate_up`.
+struct GgmlRecordParts {
+    QType gate_up = QType::BF16;
+    QType down    = QType::BF16;
+};
+
+// {BF16, BF16} for a format that is not a GGML expert record format.
+[[nodiscard]] constexpr GgmlRecordParts ggml_record_parts(QType format) noexcept {
+    switch (format) {
+    case QType::GGML_REC_IQ2_S_Q2_0:
+        return {QType::GGML_IQ2_S, QType::GGML_Q2_0};
+    case QType::GGML_REC_IQ2_XXS_Q2_0:
+        return {QType::GGML_IQ2_XXS, QType::GGML_Q2_0};
+    case QType::GGML_REC_IQ1_M_Q2_0:
+        return {QType::GGML_IQ1_M, QType::GGML_Q2_0};
+    default:
+        return {};
+    }
+}
+
+[[nodiscard]] constexpr bool is_ggml_record(QType format) noexcept {
+    return is_ggml_block(ggml_record_parts(format).gate_up);
+}
+
 enum class QuantLayout : std::uint16_t {
     RowSplit            = 0,
     Contiguous          = 1,
@@ -77,16 +106,10 @@ enum class QuantLayout : std::uint16_t {
     // A GGML block format's rows of K / values_per_block consecutive blocks, rows in C order, no
     // padding: a GGUF tensor's bytes unchanged (storage-layouts.md Section 6).
     GgmlBlocks = 5,
-    // Whole GGML block rows packed into 4096-byte pages with a zero tail, so one row is one direct
-    // 4 KiB read (storage-layouts.md Section 7). Rank two only.
-    GgmlRowsPage4K = 6,
+    // A routed-expert bank [experts, hidden, intermediate] of one GGML expert record per expert:
+    // gate, up and down rows, each part on a 256-byte boundary (storage-layouts.md Section 7).
+    GgmlExpertRecord = 6,
 };
-
-inline constexpr std::uint64_t kGgmlRowPageBytes = 4096;
-
-[[nodiscard]] constexpr bool is_ggml_layout(QuantLayout layout) {
-    return layout == QuantLayout::GgmlBlocks || layout == QuantLayout::GgmlRowsPage4K;
-}
 
 // Rows per stored panel. Four 32-byte records is exactly one 128-byte line, which is all the
 // prefill kernels need (measured flat from 2 to 64 in tools/w4a8_marlin_probe.cu), and it is the

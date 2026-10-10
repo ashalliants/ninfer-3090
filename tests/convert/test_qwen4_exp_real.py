@@ -2,8 +2,9 @@
 
 NINFER_TEST_GGUF                 first file of the GGUF (…-00001-of-00002.gguf); required
 NINFER_GGML_BASE_DLL             ggml-base of llama.cpp b11316, for the sampled-block oracle
-NINFER_TEST_QWEN4EXP_SUBSET      an existing ``--subset dev`` artifact to verify instead of
-                                 converting one into the test's temporary directory (~2.9 GB)
+NINFER_TEST_QWEN4EXP_SUBSET      an existing ``--subset dev`` artifact (its n-gram volume beside
+                                 it as ``<artifact>.ngram``) to verify instead of converting one
+                                 into the test's temporary directory (~2.9 GB)
 NINFER_TEST_QWEN38_ARTIFACT      a Qwen3.8 .ninfer whose tokenizer the GGUF vocabulary must equal
 """
 
@@ -19,6 +20,7 @@ import pytest
 
 from tools.artifact.codecs.ggml_blocks import decode_blocks
 from tools.artifact.formats import GGML_BLOCK_FORMATS
+from tools.artifact.layouts import ggml_expert_record_geometry
 from tools.convert import qwen4_exp
 from tools.convert.sources.gguf import GgufModel
 
@@ -69,9 +71,20 @@ def test_tensor_inventory_matches_the_scan(gguf):
 def test_whole_model_maps_every_tensor(gguf):
     model = qwen4_exp.build_model(gguf)
     assert {m.gguf for m in qwen4_exp.name_map(gguf, model.config)} == set(gguf.tensors)
-    assert len(model.parameters) == 1224 - 3 * 48 + 3 * 48 * 512
-    assert len(model.packing_groups) == 2 * 48
+    # One expert bank per layer for its three expert tensors; the PLE table is the volume.
+    assert len(model.parameters) == 1224 - 3 * 48 + 48 - 1
+    assert not model.packing_groups
     assert model.token_count == 248_077
+    banks = [p for name, p in model.parameters.items() if name.endswith("/moe/experts")]
+    total = sum(
+        ggml_expert_record_geometry(qwen4_exp.expert_record_source(p).format, p.shape).payload_bytes
+        for p in banks
+    )
+    assert total == 35_454_976_000  # Strata's native_experts.txt total; no padding added
+    table = model.config["ngram_table"]
+    assert (table["rows"], table["row_bytes"], table["rows_per_block"], table["blocks"]) == (
+        320_001_536, 90, 45, 7_111_146
+    )
 
 
 @pytest.mark.skipif(
@@ -105,12 +118,23 @@ def test_dev_subset_stores_the_gguf_bytes(gguf, tmp_path):
 
         path = tmp_path / "qwen4exp-subset.ninfer"
         model = qwen4_exp.build_model(gguf, subset=subset)
+        qwen4_exp.bind_ngram_volume(model, os.urandom(16))
         recipe = Recipe(model)
         qwen4_exp_gguf(model, recipe, {"base": gguf})
         convert(model, recipe, path, device="cpu")
-    summary = verify(path, gguf, subset)
-    assert summary["interleaved"] == 3 and summary["paged"] == 1 and summary["widened"] == 1
-    assert summary["objects"] == 72
+        qwen4_exp.write_ngram_volume(gguf, model, str(path) + ".ngram")
+    volume = str(path) + ".ngram"
+    summary = verify(path, gguf, subset, volume=volume)
+    assert summary["records"] == 3 and summary["widened"] == 1
+    assert summary["volume_rows"] == 4500 and summary["objects"] == 68
+    # The 512-row reuse check accepts the volume for the same table and subset.
+    from tools.artifact.reader import Artifact
+
+    model = qwen4_exp.build_model(gguf, subset=subset)
+    stored = qwen4_exp.read_ngram_volume_id(gguf, model, volume)
+    with Artifact(path) as artifact:
+        table = artifact.directory.components["text"]["config"]["ngram_table"]
+    assert table["volume_id"] == stored.hex()
 
 
 def _bf16_exact(values: np.ndarray) -> np.ndarray:
@@ -149,32 +173,18 @@ def test_gdn_decay_and_ple_hash_constants(gguf):
             tensor = gguf.tensor(name)
             values = np.frombuffer(gguf.read_range(tensor, 0, tensor.bytes), "<f4")
             assert (values < 0).all(), name  # -exp(A_log)
+    # text_config proves the literal multipliers, head sizes and offsets equal Infernix's
+    # derivation; these are the parameters it records, Infernix's published defaults.
     config = qwen4_exp.text_config(gguf.metadata)
-    mask, gamma = (1 << 64) - 1, 0x9E3779B97F4A7C15
-
-    def splitmix(x):
-        x = (x + gamma) & mask
-        x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & mask
-        x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & mask
-        return x ^ (x >> 31)
-
-    # Seed 1234 and the first PLE layer's index 0, over the 248,320-row embedding vocabulary.
-    half = ((1 << 63) - 1) // 248_320 // 2
-    derived = [2 * (splitmix((1234 + gamma * (i + 1)) & mask) % half) + 1 for i in range(3)]
-    assert config["ple_layer_multipliers"] == derived
-    sizes = config["ple_head_vocab_sizes"]
-
-    def is_prime(v):
-        return v > 1 and all(v % d for d in range(2, int(v**0.5) + 1))
-
-    candidate = 20_000_000
-    for size in sizes:  # consecutive primes from 20,000,000
-        while not is_prime(candidate):
-            candidate += 1
-        assert size == candidate
-        candidate += 1
-    rows = gguf.tensor(qwen4_exp.PLE_TABLE).shape[0]
-    assert rows == -(-sum(sizes) // 128) * 128
+    assert (
+        config["ngram_vocab_size_base"],
+        config["make_ngram_vocab_size_divisible_by"],
+        config["seed"],
+        config["ple_layer_ids"],
+        config["ple_embed_dim"],
+        config["eos_token_id"],
+    ) == (20_000_000, 128, 1234, [2], 2560, 248_044)
+    assert qwen4_exp.ngram_table_rows(config) == gguf.tensor(qwen4_exp.PLE_TABLE).rows
 
 
 @pytest.mark.skipif(

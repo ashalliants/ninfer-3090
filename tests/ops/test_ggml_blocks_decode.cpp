@@ -76,35 +76,79 @@ std::vector<std::byte> golden(QType format, const char* name) {
     return blocks;
 }
 
-// The paged layout decodes to the same values as the unpaged rows, and a non-zero tail is refused.
-void paged_rows_decode_like_blocks(QType format, const std::vector<std::byte>& blocks) {
-    const auto block = ggml_block(format);
-    const std::uint64_t k    = block.values * 2;
-    const std::uint64_t rows = blocks.size() / (2 * block.bytes);
-    const std::array<std::uint64_t, 2> shape{rows, k};
-    const auto flat  = weight_geometry(format, QuantLayout::GgmlBlocks, shape);
-    const auto paged = weight_geometry(format, QuantLayout::GgmlRowsPage4K, shape);
-    std::vector<std::byte> payload(paged.bytes);
-    for (std::uint64_t row = 0; row < rows; ++row) {
-        std::memcpy(payload.data() + ggml_row_offset(paged, row),
-                    blocks.data() + ggml_row_offset(flat, row), flat.code_bytes_per_row);
+/// Each record part decodes to its own golden blocks' values (ggml's FP32 outputs, checked by
+// golden()), at the addresses the record geometry gives, and a non-zero gap is refused. Two
+// experts of [hidden 256, intermediate 64]: gate and up are 64 rows of one gate/up block, down
+// 256 rows of one Q2_0 block. Expert 1's parts take the fixture blocks in reverse order.
+void record_parts_decode_like_blocks(QType record, const std::vector<std::byte>& gate_up,
+                                     const std::vector<std::byte>& down) {
+    const auto parts = ggml_record_parts(record);
+    const auto g     = weight_geometry(record, QuantLayout::GgmlExpertRecord,
+                                       std::array<std::uint64_t, 3>{2, 256, 64});
+    const auto gu = ggml_block(parts.gate_up), d = ggml_block(parts.down);
+    require(g.record_up_offset == (64 * gu.bytes + 255) / 256 * 256 &&
+                g.record_down_offset == (g.record_up_offset + 64 * gu.bytes + 255) / 256 * 256 &&
+                g.record_bytes == g.record_down_offset + 256 * d.bytes &&
+                g.record_stride == (g.record_bytes + 255) / 256 * 256 &&
+                g.bytes == 2 * g.record_stride,
+            "expert record geometry differs from 256-byte aligned parts");
+    std::vector<std::byte> payload(g.bytes);
+    const auto blocks_of = [&](const std::vector<std::byte>& source, GgmlBlock block,
+                               std::uint64_t count, bool reverse) {
+        std::vector<std::byte> out(count * block.bytes);
+        for (std::uint64_t i = 0; i < count; ++i) {
+            const auto from = reverse ? count - 1 - i : i;
+            std::memcpy(out.data() + i * block.bytes, source.data() + from * block.bytes,
+                        block.bytes);
+        }
+        return out;
+    };
+    const std::array kParts = {ExpertPart::Gate, ExpertPart::Up, ExpertPart::Down};
+    std::vector<std::vector<std::byte>> expected;
+    for (std::uint64_t expert = 0; expert < 2; ++expert) {
+        for (const auto part : kParts) {
+            const bool is_down = part == ExpertPart::Down;
+            auto bytes = blocks_of(is_down ? down : gate_up, is_down ? d : gu, is_down ? 256 : 64,
+                                   expert == 1 || part == ExpertPart::Up);
+            const auto at = ggml_record_part(g, expert, part).offset;
+            std::memcpy(payload.data() + at, bytes.data(), bytes.size());
+            expected.push_back(std::move(bytes));
+        }
     }
-    const auto expected = ggml::decode_parent(flat, std::span(blocks).first(flat.bytes));
-    const auto actual   = ggml::decode_parent(paged, payload);
-    require(std::memcmp(expected.data(), actual.data(), expected.size() * 4) == 0,
-            "paged rows decode differently from the same rows unpaged");
-    payload.back() = std::byte{1};
-    bool refused   = false;
+    std::size_t index = 0;
+    for (std::uint64_t expert = 0; expert < 2; ++expert) {
+        for (const auto part : kParts) {
+            const auto p        = ggml_record_part(g, expert, part);
+            const auto actual   = ggml::decode_record_part(g, payload, expert, part);
+            const auto reference = ggml::decode_blocks(p.format, expected[index++]);
+            require(actual.size() == p.rows * p.k &&
+                        std::memcmp(actual.data(), reference.data(), actual.size() * 4) == 0,
+                    "an expert record part decodes differently from its blocks");
+        }
+    }
+    payload[g.record_stride + g.record_up_offset - 1] = std::byte{1};
+    bool refused = g.record_up_offset == 64 * gu.bytes; // no gap to dirty when parts align
     try {
-        (void)ggml::decode_parent(paged, payload);
+        (void)ggml::decode_record_part(g, payload, 1, ExpertPart::Gate);
     } catch (const std::invalid_argument&) { refused = true; }
-    require(refused, "a non-zero page tail was accepted");
+    require(refused, "a non-zero gap between record parts was accepted");
 }
 
 int run() {
-    for (const auto& [format, name] : kFormats) {
-        const auto blocks = golden(format, name);
-        paged_rows_decode_like_blocks(format, blocks);
+    std::vector<std::vector<std::byte>> blocks;
+    for (const auto& [format, name] : kFormats) { blocks.push_back(golden(format, name)); }
+    const auto of = [&](QType format) -> const std::vector<std::byte>& {
+        for (std::size_t i = 0; i < kFormats.size(); ++i) {
+            if (kFormats[i].first == format) { return blocks[i]; }
+        }
+        throw std::logic_error("no fixture");
+    };
+    for (const auto record :
+         {QType::GGML_REC_IQ2_S_Q2_0, QType::GGML_REC_IQ2_XXS_Q2_0, QType::GGML_REC_IQ1_M_Q2_0}) {
+        const auto parts = ggml_record_parts(record);
+        require(of(QType::GGML_Q2_0).size() >= 256 * ggml_block(QType::GGML_Q2_0).bytes,
+                "the Q2_0 fixture has fewer than 256 blocks");
+        record_parts_decode_like_blocks(record, of(parts.gate_up), of(parts.down));
     }
     std::cout << "GGML exact decoder matches ggml " << ggml::kRelease << '\n';
     return 0;

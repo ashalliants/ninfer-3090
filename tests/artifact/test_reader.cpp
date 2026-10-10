@@ -9,6 +9,7 @@
 #include <array>
 #include <bit>
 #include <iostream>
+#include <string>
 
 namespace {
 
@@ -115,29 +116,30 @@ void geometry_and_views() {
             "per-use native parameters changed the parent");
 }
 
-// GGML block geometry, at the real shapes it must hold: the expert banks and the 51.2 G-value paged
-// n-gram table, whose element count and byte offsets overflow 32 bits.
+/// GGML block geometry, at the real shapes it must hold: the dense matrices, the 51.2 G-value
+// n-gram table (whose element count and byte offsets overflow 32 bits) and the expert records.
 void ggml_geometry() {
     constexpr std::array names = {"ggml_q8_0",  "ggml_q6_k",   "ggml_iq2_xxs",
                                   "ggml_iq4_nl", "ggml_iq3_s", "ggml_iq2_s",
                                   "ggml_iq4_xs", "ggml_iq1_m", "ggml_q2_0"};
     for (const auto* name : names) {
         const auto format = parse_format(name);
-        require(is_ggml_block(format) && format_name(format) == name,
+        require(is_ggml_block(format) && !is_ggml_record(format) && format_name(format) == name,
                 "GGML format name does not round-trip");
     }
     require(parse_layout("ggml_blocks_v1") == QuantLayout::GgmlBlocks &&
-                parse_layout("ggml_rows_page4k_v1") == QuantLayout::GgmlRowsPage4K &&
-                layout_name(QuantLayout::GgmlRowsPage4K) == "ggml_rows_page4k_v1",
+                layout_name(QuantLayout::GgmlBlocks) == "ggml_blocks_v1",
             "GGML layout name does not round-trip");
+    rejects([] { (void)parse_layout("ggml_rows_page4k_v1"); },
+            "the superseded paged layout is still accepted");
 
-    // qwen4exp gate|up bank of one layer: 512 experts x 1280 rows of 2560 IQ2_S values.
+    // A GGML block matrix: 512 x 1280 rows of 2560 IQ2_S values.
     const auto bank = weight_geometry(QType::GGML_IQ2_S, QuantLayout::GgmlBlocks,
                                       std::array<std::uint64_t, 2>{512 * 1280, 2560});
     require(bank.bytes == 537395200 && bank.code_bytes_per_row == 820 &&
                 ggml_row_offset(bank, 1280) == 1049600 && bank.alignment == 256 &&
                 bank.group_size == 256 && bank.scale_bytes == 0,
-            "expert bank geometry differs from 1280 rows x 820 B per expert");
+            "GGML block geometry differs from 820 B rows");
     require(weight_geometry(QType::GGML_IQ2_S, QuantLayout::GgmlBlocks,
                             std::array<std::uint64_t, 3>{512, 1280, 2560})
                     .bytes == bank.bytes &&
@@ -146,21 +148,14 @@ void ggml_geometry() {
                         .bytes == 210,
             "GGML block geometry depends on how the leading axes are split");
 
-    // The n-gram (PLE) table: 320,001,536 rows of 160 IQ4_NL values = 51,200,245,760 values.
+    // The n-gram (PLE) table as one matrix: 320,001,536 rows of 160 IQ4_NL values.
     const std::array<std::uint64_t, 2> ple{320001536, 160};
-    const auto paged = weight_geometry(QType::GGML_IQ4_NL, QuantLayout::GgmlRowsPage4K, ple);
-    require(paged.elements == 51200245760ULL && paged.code_bytes_per_row == 90 &&
-                paged.rows_per_page == 45 && paged.bytes == 29127254016ULL &&
-                paged.alignment == 4096,
-            "paged PLE geometry differs from 7,111,146 pages of 45 rows");
-    require(ggml_row_offset(paged, 44) == 3960 && ggml_row_offset(paged, 45) == 4096 &&
-                ggml_row_offset(paged, 320001535) == 29127250820ULL,
-            "paged row offsets are not page-major");
-    rejects<std::invalid_argument>([&] { (void)ggml_row_offset(paged, 320001536); },
-                                   "a row past the table was addressed");
     const auto flat = weight_geometry(QType::GGML_IQ4_NL, QuantLayout::GgmlBlocks, ple);
-    require(flat.bytes == 28800138240ULL && ggml_row_offset(flat, 320001535) == 28800138150ULL,
-            "unpaged PLE geometry overflowed");
+    require(flat.elements == 51200245760ULL && flat.bytes == 28800138240ULL &&
+                ggml_row_offset(flat, 320001535) == 28800138150ULL,
+            "PLE geometry overflowed");
+    rejects<std::invalid_argument>([&] { (void)ggml_row_offset(flat, 320001536); },
+                                   "a row past the table was addressed");
 
     // The native Weight ABI is int32 per axis: the whole table still fits, a 2^31-row matrix
     // is refused rather than truncated.
@@ -177,33 +172,98 @@ void ggml_geometry() {
     rejects<std::invalid_argument>(
         [&] { (void)native_weight(WeightView{{1ULL << 31, 32}, {{&wide, 0, 1ULL << 36}}}); },
         "a row count beyond int32 reached the native Weight");
-    const WeightParent paged_parent{paged, row.data()};
-    rejects<std::invalid_argument>(
-        [&] { (void)weight_row_planes({&paged_parent, 0, 160}); },
-        "paged rows were treated as one contiguous plane");
     rejects<std::invalid_argument>([&] { (void)weight_scale_offset(flat, 0, 0); },
                                    "a GGML parent reported a separate scale plane");
+
+    // Expert records of one qwen4exp layer: [512 experts, hidden 2560, intermediate 640]. Every
+    // part is a multiple of 256 B, so records are back to back (spec section 2.1 byte counts).
+    struct RecordCase {
+        const char* name;
+        QType format;
+        QType gate_up;
+        std::uint64_t gate_bytes;
+        std::uint64_t record_bytes;
+    };
+    constexpr std::array records = {
+        RecordCase{"ggml_rec_iq2_s_q2_0", QType::GGML_REC_IQ2_S_Q2_0, QType::GGML_IQ2_S, 524800,
+                   1510400},
+        RecordCase{"ggml_rec_iq2_xxs_q2_0", QType::GGML_REC_IQ2_XXS_Q2_0, QType::GGML_IQ2_XXS,
+                   422400, 1305600},
+        RecordCase{"ggml_rec_iq1_m_q2_0", QType::GGML_REC_IQ1_M_Q2_0, QType::GGML_IQ1_M, 358400,
+                   1177600},
+    };
+    require(parse_layout("ggml_expert_record_v1") == QuantLayout::GgmlExpertRecord &&
+                layout_name(QuantLayout::GgmlExpertRecord) == "ggml_expert_record_v1",
+            "expert record layout name does not round-trip");
+    const std::array<std::uint64_t, 3> layer{512, 2560, 640};
+    std::uint64_t model_bytes = 0;
+    for (const auto& item : records) {
+        require(parse_format(item.name) == item.format && format_name(item.format) == item.name &&
+                    is_ggml_record(item.format) && !is_ggml_block(item.format) &&
+                    ggml_record_parts(item.format).gate_up == item.gate_up &&
+                    ggml_record_parts(item.format).down == QType::GGML_Q2_0,
+                "expert record format does not round-trip");
+        const auto g = weight_geometry(item.format, QuantLayout::GgmlExpertRecord, layer);
+        require(g.record_up_offset == item.gate_bytes &&
+                    g.record_down_offset == 2 * item.gate_bytes &&
+                    g.record_bytes == item.record_bytes && g.record_stride == item.record_bytes &&
+                    g.bytes == 512 * item.record_bytes && g.alignment == 256 &&
+                    g.elements == 512ULL * 2560 * 640,
+                (std::string(item.name) + ": record geometry differs from the GGUF").c_str());
+        const auto down = ggml_record_part(g, 511, ExpertPart::Down);
+        require(down.format == QType::GGML_Q2_0 && down.rows == 2560 && down.k == 640 &&
+                    down.row_bytes == 180 &&
+                    down.offset == 511 * item.record_bytes + 2 * item.gate_bytes &&
+                    down.offset + down.rows * down.row_bytes == g.bytes,
+                "the last expert's down part is not the end of the bank");
+        const auto up = ggml_record_part(g, 3, ExpertPart::Up);
+        require(up.format == item.gate_up && up.rows == 640 && up.k == 2560 &&
+                    up.row_bytes * 640 == item.gate_bytes &&
+                    up.offset == 3 * item.record_bytes + item.gate_bytes,
+                "the up part is not after the gate part");
+        rejects<std::invalid_argument>([&] { (void)ggml_record_part(g, 512, ExpertPart::Gate); },
+                                       "an expert past the bank was addressed");
+        rejects<std::invalid_argument>([&] { (void)weight_scale_offset(g, 0, 0); },
+                                       "an expert record reported a separate scale plane");
+        const WeightParent parent{g, row.data()};
+        rejects<std::invalid_argument>(
+            [&] { (void)native_weight(WeightView{{512, 2560, 640}, {{&parent, 0, g.elements}}}); },
+            "an expert bank reached the native Weight");
+        model_bytes += (item.format == QType::GGML_REC_IQ2_S_Q2_0     ? 34
+                        : item.format == QType::GGML_REC_IQ2_XXS_Q2_0 ? 11
+                                                                       : 3) *
+                       g.bytes;
+    }
+    require(model_bytes == 35454976000ULL, "the 48 banks differ from the GGUF's expert bytes");
+    // Parts that are not 256 B multiples are padded: 64 IQ2_XXS rows of 66 B are 4224 B.
+    const auto padded = weight_geometry(QType::GGML_REC_IQ2_XXS_Q2_0, QuantLayout::GgmlExpertRecord,
+                                        std::array<std::uint64_t, 3>{3, 256, 64});
+    require(padded.record_up_offset == 4352 && padded.record_down_offset == 8704 &&
+                padded.record_bytes == 8704 + 256 * 18 && padded.record_stride == 13312 &&
+                padded.bytes == 3 * 13312,
+            "record parts are not on 256-byte boundaries");
 
     const auto invalid = [](QType format, QuantLayout layout, std::vector<std::uint64_t> shape) {
         rejects<std::invalid_argument>([&] { (void)weight_geometry(format, layout, shape); },
                                        "invalid GGML geometry accepted");
     };
-    invalid(QType::GGML_Q6_K, QuantLayout::GgmlBlocks, {4, 128});        // K % 256
-    invalid(QType::GGML_IQ4_NL, QuantLayout::GgmlRowsPage4K, {2, 2, 32}); // paged is rank 2
-    invalid(QType::GGML_IQ4_XS, QuantLayout::GgmlRowsPage4K, {2, 256 * 31}); // 4216 B row
+    invalid(QType::GGML_Q6_K, QuantLayout::GgmlBlocks, {4, 128}); // K % 256
     invalid(QType::GGML_Q8_0, QuantLayout::RowSplit, {2, 128});
     invalid(QType::GGML_Q8_0, QuantLayout::Contiguous, {2, 32});
     invalid(QType::BF16, QuantLayout::GgmlBlocks, {2, 32});
-    invalid(QType::Q8_G32_FP16, QuantLayout::GgmlRowsPage4K, {2, 32});
+    invalid(QType::GGML_REC_IQ2_S_Q2_0, QuantLayout::GgmlBlocks, {2, 256, 64});
+    invalid(QType::GGML_IQ2_S, QuantLayout::GgmlExpertRecord, {2, 256, 64});
+    invalid(QType::GGML_REC_IQ2_S_Q2_0, QuantLayout::GgmlExpertRecord, {512, 2560});   // rank 3
+    invalid(QType::GGML_REC_IQ2_S_Q2_0, QuantLayout::GgmlExpertRecord, {2, 640, 640});  // H % 256
+    invalid(QType::GGML_REC_IQ1_M_Q2_0, QuantLayout::GgmlExpertRecord, {2, 2560, 96}); // I % 64
+    invalid(QType::GGML_REC_IQ1_M_Q2_0, QuantLayout::RowSplit, {2, 2560});
 
-    // The object record must carry the layout's size and its 4096-byte alignment.
-    TensorObject object{"ple", {90, 160}, "ggml_iq4_nl", "ggml_rows_page4k_v1", 8192, 8192};
-    require(describe_tensor(object).rows_per_page == 45, "paged object was not described");
-    object.offset = 4352;
-    rejects([&] { (void)describe_tensor(object); }, "paged object off a page boundary accepted");
-    object.offset = 8192;
-    object.bytes  = 8100;
-    rejects([&] { (void)describe_tensor(object); }, "paged object without its page tails accepted");
+    // The object record must carry the layout's size.
+    TensorObject object{"bank", {2, 256, 64}, "ggml_rec_iq2_xxs_q2_0", "ggml_expert_record_v1",
+                        512, 2 * 13312};
+    require(describe_tensor(object).record_stride == 13312, "record object was not described");
+    object.bytes = 2 * 13312 - 256;
+    rejects([&] { (void)describe_tensor(object); }, "a bank without its last record's tail accepted");
 }
 
 void invalid_directories() {

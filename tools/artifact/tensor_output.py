@@ -10,7 +10,6 @@ import torch
 
 from .codecs.direct import encode_direct
 from .codecs.fp8_row import encode_fp8_row_scaled
-from .codecs.ggml_blocks import page_rows
 from .codecs.nvfp4 import encode_nvfp4
 from .codecs.row_split import encode_row_split, split_row_planes
 from .formats import (
@@ -22,7 +21,6 @@ from .formats import (
     get_format,
 )
 from .layouts import (
-    GGML_ROWS_PAGE4K_V1,
     block_scale_geometry,
     ggml_blocks_geometry,
     row_scale_geometry,
@@ -135,10 +133,6 @@ class TensorOutput:
             if codes.dtype != torch.uint8 or tuple(codes.shape) != (rows, row_bytes):
                 raise TypeError(f"{obj.id}: GGML rows must be uint8 [{rows}, {row_bytes}]")
             block = codes.detach().contiguous().cpu().numpy()
-            if obj.layout == GGML_ROWS_PAGE4K_V1.name:
-                offset, pages = page_rows(block, self.format, obj.shape, row_begin)
-                self.write_bytes(offset, pages.reshape(-1).data)
-            else:
-                self.write_bytes(row_begin * row_bytes, block.reshape(-1).data)
+            self.write_bytes(row_begin * row_bytes, block.reshape(-1).data)
         else:
             raise TypeError(f"{obj.id}: direct format does not accept quantized codes")

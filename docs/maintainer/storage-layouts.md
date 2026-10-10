@@ -16,7 +16,7 @@ The storage registry contains exactly these identities:
 | `block_scale_k16_m128x4_v1` | tensor layout | `nvfp4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `row_scale_v1` | tensor layout | `fp8_e4m3fn_row_bf16` | rank 2 `[N,K]` | 256 bytes |
 | `ggml_blocks_v1` | tensor layout | the nine `ggml_*` block formats | rank `1..16`, `K % values_per_block == 0` | 256 bytes |
-| `ggml_rows_page4k_v1` | tensor layout | the nine `ggml_*` block formats | rank 2 `[N,K]`, `K % values_per_block == 0`, row ≤ 4096 bytes | 4096 bytes |
+| `ggml_expert_record_v1` | tensor layout | the three `ggml_rec_*` expert record formats | rank 3 `[E,H,I]`, `H` and `I` whole blocks of their parts | 256 bytes |
 | `raw_bytes_v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
 
 These format/layout pairs define the current codec support. Native consumer requirements are
@@ -340,34 +340,37 @@ C order of the leading coordinates. Logical element `[r, k]` of the `[rows, K]` 
 
 A GGUF tensor with dimensions `(ne0 = K, ne1, ne2, ...)` therefore has the logical shape
 `[..., ne2, ne1, K]` and identical bytes. Consecutive complete rows form one contiguous byte range,
-so a row slice, an expert of an expert bank, or a group of parameters packed by concatenating
-complete rows needs no repacking. A converter that interleaves parameters (for example each
-expert's gate rows followed by its up rows) does so by the order of the rows it writes; the layout
-itself is unchanged.
+so a row slice or a group of parameters packed by concatenating complete rows needs no repacking.
 
-## 7. `ggml_rows_page4k_v1`
+## 7. `ggml_expert_record_v1`
 
-`ggml_rows_page4k_v1` stores a rank-two GGML block matrix `[N,K]` whose rows are read one at a time
-by direct 4 KiB I/O, such as Qwen3.8-Flash-Next's n-gram embedding table. With `row_bytes` as in
-Section 6, which must be at most 4096:
+`ggml_expert_record_v1` stores a routed-expert bank of logical shape `[E, H, I]` (experts, hidden
+size, intermediate size) in one of the `ggml_rec_*` formats, one record per expert, so an expert
+moves as one byte range. The record format names two GGML block formats: `gate_up` with block
+`(B1, S1)` and `down` with block `(B2, S2)`, as in Section 6. `H % B1 == 0` and `I % B2 == 0`.
 
 ```text
-rows_per_page = floor(4096 / row_bytes)
-pages         = ceil(N / rows_per_page)
-payload_bytes = pages * 4096
-offset(row n) = (n / rows_per_page) * 4096 + (n % rows_per_page) * row_bytes
+gate_up_row_bytes = (H / B1) * S1          # a gate or up row: K = H
+down_row_bytes    = (I / B2) * S2          # a down row: K = I
+gate_bytes        = I * gate_up_row_bytes
+up_offset         = align_up(gate_bytes, 256)
+down_offset       = align_up(up_offset + gate_bytes, 256)
+record_bytes      = down_offset + H * down_row_bytes
+record_stride     = align_up(record_bytes, 256)
+payload_bytes     = E * record_stride
 ```
 
-Page `p` holds rows `p * rows_per_page` onward, each row's bytes unchanged and in order. The bytes
-from `rows_per_page * row_bytes` to the end of every page, and the slots of the missing rows in the
-last page, are zero; a decoder rejects other contents. The loader does not scan the payload: it
-places the object's bytes unchanged. No row crosses a page boundary. The object
-alignment of 4096 bytes, with the container's 4096-byte payload alignment, puts every page on a
-4096-byte boundary of its file.
+Record `e` starts at `e * record_stride`. Inside it, the expert's gate matrix `[I, H]` starts at 0,
+its up matrix `[I, H]` at `up_offset` and its down matrix `[H, I]` at `down_offset`; each part is
+`ggml_blocks_v1` rows (Section 6), its blocks unchanged. The bytes between parts and after the
+last part up to the stride are zero; a decoder rejects other contents. The loader places the
+object's bytes unchanged.
 
-For the 90-byte IQ4_NL rows of a 160-wide table, 45 rows fill 4050 bytes of each page and 46 bytes
-are zero; 320,001,536 rows take 7,111,146 pages (29,127,254,016 bytes, 1.1% more than the unpaged
-rows).
+For a GGUF expert bank, expert `e`'s gate rows are rows `[e*I, (e+1)*I)` of `ffn_gate_exps`, its up
+rows those of `ffn_up_exps`, and its down rows rows `[e*H, (e+1)*H)` of `ffn_down_exps`, so the
+inverse of the packing recovers each GGUF tensor's bytes exactly. At Qwen3.8-Flash-Next's
+`[512, 2560, 640]` every part is a multiple of 256 bytes, the records carry no padding, and
+`record_stride` is 1,510,400 (IQ2_S), 1,305,600 (IQ2_XXS) or 1,177,600 (IQ1_M) bytes.
 
 ## 8. `raw_bytes_v1`
 
@@ -395,7 +398,8 @@ Layout decoding yields only persistent logical words:
   matrix-level FP32 weight divisor;
 - `row_scale_v1` yields the natural row-major E4M3FN code words and one BF16 multiplier per logical
   row;
-- `ggml_blocks_v1` and `ggml_rows_page4k_v1` yield each row's GGML blocks unchanged;
+- `ggml_blocks_v1` yields each row's GGML blocks unchanged, and `ggml_expert_record_v1` each
+  expert's gate, up and down rows of GGML blocks unchanged;
 - `raw_bytes_v1` yields the enclosing resource bytes.
 
 Dequantized values follow the reconstruction rule in `tensor-formats.md`. This document does
@@ -413,10 +417,12 @@ native operands. Direct tensors can use a contiguous element range. Grouped inte
 use consecutive complete rows with unchanged K, using independent code, high-bit and scale pointers.
 
 GGML block matrices in `ggml_blocks_v1` use consecutive complete rows the same way, with one code
-pointer and no scale plane: each block carries its scales. `ggml_rows_page4k_v1` rows are not one
-contiguous range, so that layout has no native `Weight`; a consumer addresses each row with
-`ggml_row_offset`. Geometry and offsets are 64-bit throughout; the native `Weight` is 32-bit per
-axis and refuses a dimension beyond `INT32_MAX` rather than truncating it.
+pointer and no scale plane: each block carries its scales. An `ggml_expert_record_v1` bank has no
+native `Weight`; its consumer addresses each expert's parts with `ggml_record_part` (format,
+offset, rows, K and row bytes of one part of one record), and a record is one
+`record_stride`-byte range for staging and residency. Geometry and offsets are 64-bit throughout;
+the native `Weight` is 32-bit per axis and refuses a dimension beyond `INT32_MAX` rather than
+truncating it.
 
 The current native `Weight` bridge requires a complete parent for FP8 and NVFP4. Their consumers
 use the complete matrix geometry for plane addressing; a row slice cannot be passed as though its
@@ -427,3 +433,40 @@ parent as one native weight.
 Offline codecs can produce a standalone slice with its own plane offsets. The loader does not
 perform that transformation. An execution implementation that accepts additional view forms must
 consume the original parent geometry correctly.
+
+## 11. The n-gram volume (outside the artifact)
+
+Qwen3.8-Flash-Next's PLE n-gram table (320,001,536 rows) is read a few rows per token and never
+materialized, so it is not a `.ninfer` object: the converter writes it as a separate n-gram
+volume file, Infernix's `NINFERNG` format with a row-format field added
+([`ngram_volume.py`](../../tools/artifact/ngram_volume.py)). The artifact's text config records
+the volume's geometry and 16-byte id in `ngram_table`; the runtime opens the volume by path and
+checks both.
+
+```text
+offset size field
+0      8    magic "NINFERNG"
+8      4    version, 2 (Infernix's version 1 holds FP8 rows and has no row format)
+12     4    header_bytes, 4096
+16     8    rows
+24     4    row_bytes
+28     4    rows_per_block = floor(4096 / row_bytes)
+32     4    block_bytes, 4096
+36     8    blocks = ceil(rows / rows_per_block)
+44     16   volume id
+60     32   row format: a NUL-padded ggml_* block format name
+```
+
+All integers are little-endian and the rest of the 4096-byte header block is zero. Block `b` is
+at `4096 * (1 + b)` and holds rows `b * rows_per_block` onward, each row's GGML blocks unchanged
+(a row is `ggml_blocks_v1`, Section 6); the bytes after `rows_per_block * row_bytes`, and the slots
+of the missing rows in the last block, are zero. No row crosses a block, so a row is one direct
+4 KiB read at:
+
+```text
+offset(row r) = 4096 + (r / rows_per_block) * 4096 + (r % rows_per_block) * row_bytes
+file_bytes    = 4096 * (1 + blocks)
+```
+
+For the 90-byte IQ4_NL rows of the 160-wide table, 45 rows fill 4050 bytes of each block and 46 are
+zero: 7,111,146 blocks, 29,127,258,112 bytes with the header (1.1% more than the unpaged rows).

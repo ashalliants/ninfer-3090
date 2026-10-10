@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from contextlib import ExitStack
 import importlib.util
+import os
 from pathlib import Path
 import sys
 from collections.abc import Mapping
@@ -137,6 +138,16 @@ def main(argv=None):
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--rows-per-chunk", type=int, default=512)
     parser.add_argument("--max-file-bytes", type=int, default=32_000_000_000)
+    parser.add_argument(
+        "--ngram-out",
+        type=Path,
+        help="GGUF: where to write the n-gram volume (default OUT + '.ngram'); any drive",
+    )
+    parser.add_argument(
+        "--ngram-reuse",
+        type=Path,
+        help="GGUF: bind the artifact to this existing n-gram volume of the same table",
+    )
     args = parser.parse_args(argv)
     components = tuple(args.components.split(","))
     if len(components) != len(set(components)):
@@ -150,6 +161,11 @@ def main(argv=None):
         raise ValueError("--subset applies to a GGUF model")
     if gguf and (components != ("text",) or paths or args.proposal):
         raise ValueError("a GGUF model supplies only the text component and takes no --source")
+    if not gguf and (args.ngram_out or args.ngram_reuse):
+        raise ValueError("--ngram-out and --ngram-reuse apply to a GGUF model")
+    if args.ngram_out and args.ngram_reuse:
+        raise ValueError("--ngram-reuse and --ngram-out are exclusive")
+    ngram_out = None
     with ExitStack() as stack:
         if gguf:
             base = stack.enter_context(GgufModel(args.model))
@@ -159,6 +175,15 @@ def main(argv=None):
                 subset=qwen4_exp.SUBSETS[args.subset] if args.subset else None,
                 resource_overrides=overrides,
             )
+            # The volume id ties the separately placed n-gram volume to this artifact.
+            if args.ngram_reuse is not None:
+                volume_id = qwen4_exp.read_ngram_volume_id(base, model, args.ngram_reuse)
+            else:
+                ngram_out = args.ngram_out or Path(str(args.out) + ".ngram")
+                if ngram_out.exists():
+                    raise FileExistsError(f"n-gram volume already exists: {ngram_out}")
+                volume_id = os.urandom(16)
+            qwen4_exp.bind_ngram_volume(model, volume_id)
         else:
             base = stack.enter_context(SafetensorsSource(args.model))
             sources = SourceInputs(base, paths, stack)
@@ -217,6 +242,11 @@ def main(argv=None):
             f"wrote {args.out}: {report['objects']} objects, {len(report['files'])} files, {report['seconds']:.1f}s",
             flush=True,
         )
+        if ngram_out is not None:
+            geometry = qwen4_exp.write_ngram_volume(base, model, ngram_out)
+            print(f"wrote {ngram_out}: {geometry.blocks} blocks of {geometry.rows} rows", flush=True)
+        elif gguf:
+            print(f"bound {args.out} to the n-gram volume {args.ngram_reuse}", flush=True)
 
 
 if __name__ == "__main__":

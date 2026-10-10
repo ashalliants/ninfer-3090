@@ -57,8 +57,25 @@ class GgmlBlockFormat:
     block_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class GgmlExpertRecordFormat:
+    """One routed expert as one record: gate rows, up rows, then down rows, each part exact GGML
+    blocks of its own type. ``gate_up`` encodes gate and up (K = hidden), ``down`` the down
+    matrix (K = intermediate); the record carries no scale outside its blocks.
+    """
+
+    name: str
+    gate_up: GgmlBlockFormat
+    down: GgmlBlockFormat
+
+
 NumericFormat: TypeAlias = (
-    DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat | GgmlBlockFormat
+    DirectFormat
+    | QuantFormat
+    | Nvfp4Format
+    | Fp8RowFormat
+    | GgmlBlockFormat
+    | GgmlExpertRecordFormat
 )
 
 
@@ -83,6 +100,13 @@ GGML_IQ4_XS = GgmlBlockFormat("ggml_iq4_xs", 23, 256, 136)
 GGML_IQ1_M = GgmlBlockFormat("ggml_iq1_m", 29, 256, 56)
 GGML_Q2_0 = GgmlBlockFormat("ggml_q2_0", 42, 64, 18)
 
+# The closed set of expert records: every gate/up type of the qwen4exp GGUF with its Q2_0 down.
+GGML_REC_IQ2_S_Q2_0 = GgmlExpertRecordFormat("ggml_rec_iq2_s_q2_0", GGML_IQ2_S, GGML_Q2_0)
+GGML_REC_IQ2_XXS_Q2_0 = GgmlExpertRecordFormat(
+    "ggml_rec_iq2_xxs_q2_0", GGML_IQ2_XXS, GGML_Q2_0
+)
+GGML_REC_IQ1_M_Q2_0 = GgmlExpertRecordFormat("ggml_rec_iq1_m_q2_0", GGML_IQ1_M, GGML_Q2_0)
+
 
 DIRECT_FORMATS = MappingProxyType({item.name: item for item in (BF16, FP32, INT32)})
 QUANT_FORMATS = MappingProxyType(
@@ -106,6 +130,12 @@ GGML_BLOCK_FORMATS = MappingProxyType(
         )
     }
 )
+GGML_RECORD_FORMATS = MappingProxyType(
+    {
+        item.name: item
+        for item in (GGML_REC_IQ2_S_Q2_0, GGML_REC_IQ2_XXS_Q2_0, GGML_REC_IQ1_M_Q2_0)
+    }
+)
 NUMERIC_FORMATS = MappingProxyType(
     {
         **DIRECT_FORMATS,
@@ -113,8 +143,18 @@ NUMERIC_FORMATS = MappingProxyType(
         **NVFP4_FORMATS,
         **FP8_ROW_FORMATS,
         **GGML_BLOCK_FORMATS,
+        **GGML_RECORD_FORMATS,
     }
 )
+
+
+def ggml_record_format(gate_up: str, down: str) -> GgmlExpertRecordFormat:
+    """The record format of an expert whose gate/up and down matrices use these GGML formats."""
+
+    for item in GGML_RECORD_FORMATS.values():
+        if (item.gate_up.name, item.down.name) == (gate_up, down):
+            return item
+    raise ValueError(f"no expert record format holds {gate_up} gate/up with {down} down")
 
 
 _E2M1_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
@@ -204,19 +244,25 @@ __all__ = [
     "GGML_IQ4_XS",
     "GGML_IQ1_M",
     "GGML_Q2_0",
+    "GGML_REC_IQ2_S_Q2_0",
+    "GGML_REC_IQ2_XXS_Q2_0",
+    "GGML_REC_IQ1_M_Q2_0",
     "DIRECT_FORMATS",
     "QUANT_FORMATS",
     "NVFP4_FORMATS",
     "FP8_ROW_FORMATS",
     "GGML_BLOCK_FORMATS",
+    "GGML_RECORD_FORMATS",
     "NUMERIC_FORMATS",
     "DirectFormat",
     "QuantFormat",
     "Nvfp4Format",
     "Fp8RowFormat",
     "GgmlBlockFormat",
+    "GgmlExpertRecordFormat",
     "NumericFormat",
     "get_format",
+    "ggml_record_format",
     "decode_e2m1_word",
     "decode_e4m3fn_word",
     "valid_fp8_row_scale_word",
