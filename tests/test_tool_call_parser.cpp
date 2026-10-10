@@ -1003,6 +1003,33 @@ int test_mismatched_closing_tags_rejected() {
         "Value\n</parameter>\n</function>\n</tool_call>",
         contract, Reason::MalformedStructure,
         "param opening with parameter closing tag was accepted");
+    failures += check_rejected(
+        "<tool_call>\n<functionX name=\"TaskCreate\">\n<parameter name=\"description\">\n"
+        "Value\n</parameter>\n</function>\n</tool_call>",
+        contract, Reason::MalformedStructure,
+        "function opener without a token boundary was accepted");
+    failures += check_rejected(
+        "<tool_call>\n<invokeX name=\"TaskCreate\">\n<parameter name=\"description\">\n"
+        "Value\n</parameter>\n</invoke>\n</tool_call>",
+        contract, Reason::MalformedStructure,
+        "invoke opener without a token boundary was accepted");
+    {
+        // A value quoting a balanced pair of the other parameter tag family stays one value.
+        const std::string quoted_short = "run <param name=\"x\">v</param> done";
+        const auto long_outer = fi::parse_qwen_tool_call_output(
+            "<tool_call>\n<function name=\"TaskCreate\">\n<parameter name=\"description\">\n" +
+                quoted_short + "\n</parameter>\n</function>\n</tool_call>",
+            64, contract);
+        failures += check(long_outer.is_tool_call_response && long_outer.tool_calls.size() == 1,
+                          "param pair quoted inside a parameter value was rejected");
+        const std::string quoted_long = "run <parameter name=\"x\">v</parameter> done";
+        const auto short_outer = fi::parse_qwen_tool_call_output(
+            "<tool_call>\n<function name=\"TaskCreate\">\n<param name=\"description\">\n" +
+                quoted_long + "\n</param>\n</function>\n</tool_call>",
+            64, contract);
+        failures += check(short_outer.is_tool_call_response && short_outer.tool_calls.size() == 1,
+                          "parameter pair quoted inside a param value was rejected");
+    }
     return failures;
 }
 
