@@ -189,6 +189,25 @@ bool is_param_open_at(std::string_view text, std::size_t pos, std::size_t& tag_e
     return true;
 }
 
+// `<function` or `<invoke` followed by `=`, whitespace or `>`, so `<functionX ...>` is not an
+// opener. Returns the offset just past the keyword, or 0 when `pos` is not a function opener.
+std::size_t function_open_header_begin(std::string_view text, std::size_t pos) {
+    std::size_t header_begin = 0;
+    if (starts_with_at(text, pos, "<function")) {
+        header_begin = pos + 9;
+    } else if (starts_with_at(text, pos, "<invoke")) {
+        header_begin = pos + 7;
+    } else {
+        return 0;
+    }
+    if (header_begin >= text.size() ||
+        (text[header_begin] != '=' && text[header_begin] != '>' &&
+         !is_format_whitespace(text[header_begin]))) {
+        return 0;
+    }
+    return header_begin;
+}
+
 bool valid_function_name(std::string_view name, std::size_t max_name_length) {
     if (name.empty() || name.size() > max_name_length) { return false; }
     return std::all_of(name.begin(), name.end(), [](char byte) {
@@ -434,8 +453,7 @@ public:
                 }
                 if (!had_calls) { return FallbackReason::MalformedStructure; }
             } else if (starts_with_at(text_, pos, kToolOpen) ||
-                       starts_with_at(text_, pos, "<function") ||
-                       starts_with_at(text_, pos, "<invoke")) {
+                       function_open_header_begin(text_, pos) != 0) {
                 RawToolCall call;
                 const std::uint32_t repairs_before = duplicate_parameters_repaired_;
                 const FallbackReason failure       = starts_with_at(text_, pos, kToolOpen)
@@ -538,18 +556,15 @@ private:
     // `<function=name>`, `<function name="name">` or `<invoke name="name">`, closed by the
     // matching `</function>` or `</invoke>`.
     FallbackReason parse_function(std::size_t& pos, RawToolCall& call) {
-        std::size_t header_begin = 0;
-        std::string_view function_close;
-        if (starts_with_at(text_, pos, "<function")) {
-            header_begin   = pos + 9;
-            function_close = "</function>";
-        } else if (starts_with_at(text_, pos, "<invoke")) {
-            header_begin   = pos + 7;
-            function_close = "</invoke>";
-        } else if (repairing() && repair_function_opener(pos, header_begin, function_close)) {
-            repaired_ = true;
-        } else {
-            return FallbackReason::MalformedStructure;
+        std::size_t header_begin = function_open_header_begin(text_, pos);
+        std::string_view function_close =
+            starts_with_at(text_, pos, "<function") ? "</function>" : "</invoke>";
+        if (header_begin == 0) {
+            if (repairing() && repair_function_opener(pos, header_begin, function_close)) {
+                repaired_ = true;
+            } else {
+                return FallbackReason::MalformedStructure;
+            }
         }
         std::size_t tag_end = text_.find('>', header_begin);
         std::size_t body    = tag_end + 1;
@@ -663,7 +678,10 @@ private:
             }
             std::size_t open_tag_end = 0;
             if (is_param_open_at(text_, scan, open_tag_end)) {
-                ++depth;
+                // Only openers of the outer parameter's own tag family pair with its closer; a
+                // quoted balanced pair of the other family is plain value text.
+                const bool open_is_long = starts_with_at(text_, scan, "<parameter");
+                if (open_is_long == (param_close == "</parameter>")) { ++depth; }
                 scan = open_tag_end + 1;
                 continue;
             }
