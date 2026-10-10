@@ -66,7 +66,7 @@ def main() -> int:
     source.add_argument("--artifact", type=Path,
                         help="the served .ninfer; its tokenizer and chat template are used")
     source.add_argument("--tokenizer-dir", type=Path,
-                        help="directory with tokenizer.json and chat_template.jinja instead")
+                        help="directory with tokenizer.json, tokenizer_config.json and chat_template.jinja instead")
     exporter.add_argument("--out", type=Path, help="default: RUN/token_streams.jsonl")
 
     args = parser.parse_args()

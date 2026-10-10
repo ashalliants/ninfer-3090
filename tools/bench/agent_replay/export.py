@@ -17,18 +17,57 @@ from typing import Any, Callable
 
 TOKENIZER_RESOURCE = "resource/text/tokenizer.json"
 TEMPLATE_RESOURCE = "resource/text/chat_template.jinja"
+CONFIG_RESOURCE = "resource/text/tokenizer_config.json"
+# Template globals the server derives from tokenizer_config.json (frontend.cpp).
+_TEMPLATE_TOKEN_KEYS = ("bos_token", "eos_token", "pad_token", "unk_token", "sep_token",
+                        "cls_token", "mask_token")
 
 
-def _load_resources(artifact: Path | None, tokenizer_dir: Path | None) -> tuple[str, str]:
+def _load_resources(artifact: Path | None,
+                    tokenizer_dir: Path | None) -> tuple[str, str, dict[str, Any]]:
+    """tokenizer.json (with tokenizer_config.json's added tokens merged), template, template tokens."""
     if artifact is not None:
         from tools.artifact.reader import Artifact
 
         with Artifact(artifact) as model:
-            return (model.read_object(TOKENIZER_RESOURCE).decode("utf-8"),
-                    model.read_object(TEMPLATE_RESOURCE).decode("utf-8"))
-    assert tokenizer_dir is not None
-    return ((tokenizer_dir / "tokenizer.json").read_text(encoding="utf-8"),
-            (tokenizer_dir / "chat_template.jinja").read_text(encoding="utf-8"))
+            tokenizer, template, config = (model.read_object(name).decode("utf-8") for name in
+                                           (TOKENIZER_RESOURCE, TEMPLATE_RESOURCE, CONFIG_RESOURCE))
+    else:
+        assert tokenizer_dir is not None
+        tokenizer, template, config = ((tokenizer_dir / name).read_text(encoding="utf-8") for name in
+                                       ("tokenizer.json", "chat_template.jinja",
+                                        "tokenizer_config.json"))
+    config = json.loads(config)
+    return _merge_added_tokens(tokenizer, config), template, _template_tokens(config)
+
+
+def _merge_added_tokens(tokenizer_json: str, config: dict[str, Any]) -> str:
+    """Add `added_tokens_decoder` entries missing from tokenizer.json, as server startup does."""
+    root = json.loads(tokenizer_json)
+    added = root.setdefault("added_tokens", [])
+    known = {token["id"] for token in added}
+    for key, entry in (config.get("added_tokens_decoder") or {}).items():
+        if int(key) not in known:
+            added.append({"id": int(key), "content": entry["content"],
+                          "single_word": entry.get("single_word", False),
+                          "lstrip": entry.get("lstrip", False),
+                          "rstrip": entry.get("rstrip", False),
+                          "normalized": entry.get("normalized", False),
+                          "special": entry.get("special", False)})
+    return json.dumps(root, ensure_ascii=False)
+
+
+def _template_tokens(config: dict[str, Any]) -> dict[str, Any]:
+    tokens: dict[str, Any] = {}
+    for key in _TEMPLATE_TOKEN_KEYS:
+        value = config.get(key)
+        if isinstance(value, dict):
+            value = value.get("content")
+        if isinstance(value, str):
+            tokens[key] = value
+    if "additional_special_tokens" in config:
+        tokens["additional_special_tokens"] = config["additional_special_tokens"]
+    return tokens
 
 
 def _compile_template(source: str) -> Any:
@@ -74,7 +113,7 @@ class _PromptEncoder:
 
         self._control = Tokenizer.from_str(tokenizer_json)
         self._plain = Tokenizer.from_str(tokenizer_json)
-        self._plain.encode_special_tokens = True
+        self._plain.encode_special_tokens = True  # i.e. special-token strings are plain text
         specials = sorted((t["content"] for t in json.loads(tokenizer_json).get("added_tokens", [])
                            if t.get("special")), key=len, reverse=True)
         self._special = re.compile("|".join(map(re.escape, specials))) if specials else None
@@ -143,7 +182,7 @@ def _output_text(message: dict[str, Any]) -> str:
 
 def export(run_dir: Path, artifact: Path | None, tokenizer_dir: Path | None,
            out_path: Path) -> int:
-    tokenizer_json, template_source = _load_resources(artifact, tokenizer_dir)
+    tokenizer_json, template_source, template_tokens = _load_resources(artifact, tokenizer_dir)
     encoder = _PromptEncoder(tokenizer_json)
     template = _compile_template(template_source)
     samples = {(s["session"], s["turn"]): s for s in
@@ -166,7 +205,7 @@ def export(run_dir: Path, artifact: Path | None, tokenizer_dir: Path | None,
                 key = (transcript["session"], entry["turn"])
                 sample = samples.get(key) or {}
                 count = entry["message_count"]
-                prompt = template.render(messages=messages[:count], tools=tools,
+                prompt = template.render(messages=messages[:count], tools=tools, **template_tokens,
                                          add_generation_prompt=True, enable_thinking=False)
                 prompt_ids = encoder.encode(prompt)
                 if key in output_ids:

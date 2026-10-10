@@ -111,8 +111,8 @@ python -m tools.bench.agent_replay run --port 18120 --sessions 4 --concurrency 1
 `--request-log` names the server's `--request-log-jsonl` file. The runner reads the records written
 during its run and joins them to its turns by response id, which adds the request's `speculative`
 counters, the server's TTFT/total seconds and the committed output token IDs. Without it the
-runner falls back to the usage chunk's `timings` (`prompt_ms`, `predicted_ms`, `draft_n`,
-`draft_n_accepted`), then to client-side stream timing.
+runner takes decode time from the usage chunk's `timings` (`predicted_ms`; `prompt_ms` is kept as
+`prompt_s`, it is not TTFT) and TTFT from client-side stream timing.
 
 Outputs in `--out`:
 
@@ -152,7 +152,8 @@ python -m tools.bench.agent_replay export --run profiles/bench/agent-replay/run1
 It writes `token_streams.jsonl` (`prompt_ids`, `output_ids`, `output_source`) and prints how many
 rendered prompts match the server's length exactly. Output IDs come from the request log; without
 one they are re-tokenized from the recorded text and marked `retokenized_text`.
-`--tokenizer-dir` takes a directory holding the two files instead of an artifact.
+`--tokenizer-dir` takes a directory holding `tokenizer.json`, `tokenizer_config.json` and
+`chat_template.jinja` instead of an artifact.
 
 ## Corpus baker
 

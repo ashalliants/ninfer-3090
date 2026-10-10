@@ -266,8 +266,13 @@ def apply_timing(sample: dict[str, Any], done: dict[str, Any] | None) -> None:
             decode = total - ttft
     if source is None and sample["server_timings"].get("predicted_ms") is not None:
         timings = sample["server_timings"]
-        ttft = (timings.get("prompt_ms") or 0.0) / 1000.0
+        # `prompt_ms` is prompt wall time from the initial binding attempt, so it omits
+        # queue/preparation; TTFT stays the client's first-output latency and `prompt_ms` is
+        # reported separately.
+        ttft = sample["client_ttft_s"]
         decode = timings["predicted_ms"] / 1000.0
+        if timings.get("prompt_ms") is not None:
+            sample["prompt_s"] = timings["prompt_ms"] / 1000.0
         source = "usage_timings"
     if source is None and sample["client_ttft_s"] is not None:
         ttft = sample["client_ttft_s"]
@@ -326,6 +331,10 @@ def merge_request_log(samples: list[dict[str, Any]], done: dict[str, dict[str, A
 
 
 def run(config: RunConfig) -> int:
+    for name in ("sessions", "max_turns", "concurrency"):
+        if getattr(config, name) < 1:
+            print(f"error: --{name.replace('_', '-')} must be at least 1", file=sys.stderr)
+            return 2
     corpus = Corpus(config.repo, config.commit)
     probe = NInferServeClient(config.base_url, config.timeout_seconds, config.api_key)
     model = probe.discover_model()
@@ -392,6 +401,10 @@ def run(config: RunConfig) -> int:
     print(json.dumps({k: summary[k] for k in ("sessions", "request_log_merged", "wall_seconds")},
                      indent=2))
     print_table(summary)
+    if not samples:
+        print("error: no turn was measured (every session stopped before its first request; "
+              "raise --max-context or check --min-context)", file=sys.stderr)
+        return 1
     return 0 if all(s["error"] is None for s in samples) else 1
 
 

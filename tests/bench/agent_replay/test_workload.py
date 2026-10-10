@@ -90,3 +90,31 @@ def test_summary_counts_generic_counters_and_acceptance():
     assert group["counters"]["speculative.accepted_per_position"] == [11, 7, 3]
     assert group["speculative.ngram_accepted_tokens.share_of_output"] == 30 / 400
     assert group["length_capped_turns"] == 1
+
+
+def _timing_sample(**timings):
+    return {"server_timings": timings, "client_ttft_s": 0.9, "client_total_s": 2.0,
+            "output_tokens": 100}
+
+
+def test_usage_prompt_ms_is_not_reported_as_ttft():
+    from tools.bench.agent_replay.run import apply_timing
+
+    sample = _timing_sample(prompt_ms=300.0, predicted_ms=1000.0)
+    apply_timing(sample, None)
+    assert sample["ttft_s"] == 0.9
+    assert sample["prompt_s"] == 0.3
+    assert sample["decode_s"] == 1.0
+    apply_timing(sample, {"timings_seconds": {"ttft": 0.5, "total": 1.5}})
+    assert sample["ttft_s"] == 0.5 and sample["timing_source"] == "request_log"
+
+
+def test_run_rejects_settings_that_measure_nothing(tmp_path):
+    from tools.bench.agent_replay.run import RunConfig, run
+
+    base = dict(base_url="http://127.0.0.1:1", api_key=None, repo=REPO, commit="HEAD", seed=0,
+                sessions=1, concurrency=1, min_context=1, max_context=2, obs_tokens=(1, 2),
+                max_copy_tokens=1, max_turns=1, timeout_seconds=1.0, request_log=None,
+                out=tmp_path)
+    for bad in ({"sessions": 0}, {"max_turns": 0}):
+        assert run(RunConfig(**{**base, **bad})) == 2
