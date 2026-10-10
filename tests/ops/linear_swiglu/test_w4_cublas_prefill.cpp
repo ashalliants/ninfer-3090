@@ -199,9 +199,13 @@ int run_gate_up(std::int32_t tokens) {
     failures += expect_route(label, workspace, static_cast<std::size_t>(kRows) * kCols, tokens);
     const std::vector<double> got = read_bf16(output, out_elements);
     Samples s;
+    // Twelve rows per token rather than three. SwiGLU multiplies two quantised products, so this
+    // family sits nearest its allowance (0.031-0.034 relative L2 on a fixed set of tokens, flat from
+    // 129 to 4133 tokens), and with three rows a narrow call's ~45 samples scattered 0.032-0.045 by
+    // which outputs happened to be drawn rather than by anything the route did.
     for (const std::int32_t token : sample_tokens(tokens, 3U)) {
         const std::vector<float> input = token_column(activation, kCols, token);
-        for (std::uint32_t r = 0; r < 3; ++r) {
+        for (std::uint32_t r = 0; r < 12; ++r) {
             const std::int32_t row = pick_row(r, token, kOut);
             const double gate      = qw::dot_fp64(w.host, row, input.data(), kCols);
             const double up        = qw::dot_fp64(w.host, kOut + row, input.data(), kCols);
@@ -412,10 +416,11 @@ int run_attn_input(std::int32_t tokens) {
 int main() {
     try {
         int failures = 0;
-        // 128 is below the width gate, so the policy must resolve to a route that still answers
-        // correctly; 512 is the gate; 1000 and 1921 are unaligned, and 1921 puts one token in a
-        // second gate_up tile.
-        for (const std::int32_t tokens : {128, 512, 1000, 1921}) {
+        // Either side of the width gate: one below must resolve to a route that still answers
+        // correctly, the gate itself and one past it to the route. 1000 and 1921 are unaligned, and
+        // 1921 puts one token in a second gate_up tile.
+        constexpr std::int32_t gate = ops::kCublasPrefillMinTokens;
+        for (const std::int32_t tokens : {gate - 1, gate, gate + 1, 1000, 1921}) {
             failures += run_gate_up(tokens);
             failures += run_down(tokens, 17408);
             failures += run_down(tokens, 6144);
@@ -424,7 +429,7 @@ int main() {
         // tokens to tile, so they get their own.
         failures += run_gate_up(4133);
         failures += run_down(13057, 6144);
-        for (const std::int32_t tokens : {128, 512, 1000, 5377}) {
+        for (const std::int32_t tokens : {gate - 1, gate, gate + 1, 1000, 5377}) {
             failures += run_gdn_input(tokens);
             failures += run_attn_input(tokens);
         }

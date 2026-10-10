@@ -66,9 +66,18 @@ enum class LinearPolicy : std::uint8_t {
     return policy == LinearPolicy::AllowPrefillCublas;
 }
 
-/// Below this width the route loses to the integer mainloop it replaces: the dequantise pass costs
-/// the same whatever the token count, so a narrow call pays for it without the GEMM to amortise it.
-inline constexpr std::int32_t kCublasPrefillMinTokens = 512;
+/// Below this width the route can lose to the route it replaces: the dequantise pass costs the same
+/// whatever the token count, so a narrow call pays for it without the GEMM to amortise it. Measured
+/// on the 27B shapes (RTX 3090, ninfer_w4_cublas_prefill_bench), the route it replaces below 512 is
+/// the A8 integer mainloop only at multiples of 128 and the A16 mainloop everywhere else. Against
+/// that, the cuBLAS route wins on every shape from 72 unaligned tokens (1.1-1.9x), and from 129 to
+/// 511 by 1.4-2.8x unaligned and 0.99-1.9x at the aligned 256 and 384. The one real loss above 64
+/// is an aligned 128, where it runs gate_up at 0.74x of the A8 route.
+///
+/// 129 is also the floor this gate may not go below: a decode or verify round runs up to
+/// kMaximumConcurrency lanes of draft window + 1 tokens, 8 x 16 = 128 columns, through these same
+/// Ops and policies, and those widths must stay off the route (startup.cpp asserts it).
+inline constexpr std::int32_t kCublasPrefillMinTokens = 129;
 
 /**
  * Returns the caller-owned transient capacity required by Linear for every T in the inclusive

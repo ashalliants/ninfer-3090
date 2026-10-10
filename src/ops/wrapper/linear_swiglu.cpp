@@ -170,8 +170,8 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     }
 
     // The cuBLAS route first, where it is admitted and wide enough to pay: about 2x the integer
-    // mainloop at 4096 tokens, 1.83x at 1024, and a loss below that -- hence the width gate rather
-    // than an unconditional preference. Everything narrower falls through to the routes below.
+    // mainloop at 4096 tokens, 1.83x at 1024, and a loss at narrow widths -- hence the width gate
+    // rather than an unconditional preference. Everything narrower falls through to the routes below.
     if (allows_cublas_prefill(policy) && t >= kCublasPrefillMinTokens && q4_weight &&
         detail::w4_cublas_prefill_supported(gate_up_weight, t)) {
         detail::w4_cublas_swiglu_launch(x, gate_up_weight, out, ws, stream);

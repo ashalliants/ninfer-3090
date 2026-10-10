@@ -105,8 +105,8 @@ Qwen3.8-27B groupwise-int, `--kv-dtype int8`, both arms on the same build and ca
 | **`--prefill-cublas --prefill-chunk 4096`** | **2,379.8** | **2,988.7** | **2,609.0** | **1,904.1** |
 | change | +42.8% | +82.9% | +73.5% | +53.5% |
 
-Decode is untouched (45.1 against 45.7 tok/s, the route is gated to wide token counts), and the
-workspace grows from 155.6 MiB to 661.2 MiB.
+Decode is untouched (45.1 against 45.7 tok/s, the route is gated to calls of at least 129 tokens,
+above the widest 128-column verify round), and the workspace grows from 155.6 MiB to 661.2 MiB.
 
 **It is off by default because it is a quality trade, not a free win.** cuBLAS reduces over the
 whole of K, so it cannot see a scale per 64 columns: the weight carries one scale per row and the
