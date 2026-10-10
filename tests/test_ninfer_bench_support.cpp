@@ -143,13 +143,12 @@ int test_cli_contract() {
     failures += expect(ngram.speculative.ngram_draft_tokens == 15 &&
                            ngram.speculative.ngram_min_match == 8,
                        "benchmark n-gram copy controls");
-    failures += expect_throws<std::invalid_argument>(
-        [] {
-            (void)parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--spec", "dflash2",
-                                  "--draft-tokens", "7", "--ngram-draft-tokens", "15",
-                                  "--concurrency", "2"});
-        },
-        "n-gram copy drafting above one lane");
+    const auto ngram_lanes =
+        parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--spec", "dflash2",
+                        "--draft-tokens", "7", "--ngram-draft-tokens", "15", "--concurrency", "2"});
+    failures +=
+        expect(ngram_lanes.speculative.ngram_draft_tokens == 15 && ngram_lanes.concurrency == 2,
+               "n-gram copy drafting above one lane");
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--spec", "dflash2",

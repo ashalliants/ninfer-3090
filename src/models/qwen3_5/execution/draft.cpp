@@ -562,6 +562,46 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
     }
 }
 
+// Copies `rows` rows of `from_steps` dense steps of `step_bytes` each to the leading steps of rows
+// of `to_steps`. Both views share the frame's storage, so the rows pass through a workspace copy.
+void spread_proposal_plane(WorkspaceArena& work, const void* from, void* to, std::size_t step_bytes,
+                           std::uint32_t from_steps, std::uint32_t to_steps, std::int32_t rows,
+                           cudaStream_t stream) {
+    const std::size_t from_row = step_bytes * from_steps;
+    const std::size_t to_row   = step_bytes * to_steps;
+    const DeviceSpan staging   = work.alloc_bytes(from_row * static_cast<std::size_t>(rows));
+    CUDA_CHECK(
+        cudaMemcpyAsync(staging.data, from, staging.bytes, cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpy2DAsync(to, to_row, staging.data, from_row, from_row,
+                                 static_cast<std::size_t>(rows), cudaMemcpyDeviceToDevice, stream));
+}
+
+// The draft model's block of `state.neural_drafts` for every row, laid out as the `k`-draft round
+// `frame` reads it: row r's proposal in its leading columns, the rest unread (each row's extent
+// bounds verification).
+void propose_beside_copies(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& frame,
+                           std::int32_t batch_size, std::uint32_t k, DFlashEnvelopes envelopes) {
+    const std::uint32_t neural = state.neural_drafts;
+    if (neural == 0 || neural >= k) {
+        throw std::logic_error("a batched copy round needs a narrower neural block");
+    }
+    qwen3_5::DFlashDecodeState proposal = state.frame.narrowed(neural);
+    propose_batch_impl(state, proposal, batch_size, neural, envelopes);
+    auto& work                = state.execution.work;
+    const cudaStream_t stream = state.execution.device.stream;
+    work.reset();
+    spread_proposal_plane(work, proposal.draft_tokens.data, frame.draft_tokens.data,
+                          sizeof(TokenId), neural, k, batch_size, stream);
+    if (frame.candidate_ids.data) {
+        const auto candidates = static_cast<std::size_t>(frame.candidate_ids.ne[0]);
+        spread_proposal_plane(work, proposal.candidate_ids.data, frame.candidate_ids.data,
+                              candidates * sizeof(TokenId), neural, k, batch_size, stream);
+        spread_proposal_plane(work, proposal.proposal_q.data, frame.proposal_q.data,
+                              candidates * sizeof(float), neural, k, batch_size, stream);
+    }
+    work.reset();
+}
+
 auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                               DFlashEnvelopes envelopes,
                               ops::CausalAttentionExecutionEnvelope target_envelope,
@@ -611,22 +651,28 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
 
         if (phase == SpeculativePhase::Forward) {
             state.execution.work.reset();
-            // Catch-up appends the previous round's columns, at the frame's allocated width.
-            Tensor compact_features = state.execution.work.alloc(
+            // Catch-up appends the previous round's columns at this round's width; a wider previous
+            // round was caught up before this one started.
+            const std::int32_t append_width = frame.append_positions.ne[0];
+            Tensor compact_features         = state.execution.work.alloc(
                 DType::BF16,
                 {dimension(state.execution.parameters.draft->feature_projection.weight.k),
-                 frame.append_positions.ne[0], batch_size});
+                         append_width, batch_size});
             ops::prepare_ragged_prefix(
-                dflash_state(state).pending_features, active_lanes, context_starts, frontiers,
-                compact_features, append_positions, append_counts, state.execution.device.stream);
+                dflash_state(state).pending_features.slice(1, 0, append_width), active_lanes,
+                context_starts, frontiers, compact_features, append_positions, append_counts,
+                state.execution.device.stream);
             append_context_impl(state, compact_features, append_positions, append_counts,
                                 state_destinations, dflash_rows, envelopes.append);
 
             if (state.copy_round) {
-                // A batch-one copy round verifies the copy instead of a proposal, so the draft
-                // model does not run; DFlash2's sparse verifier reads it as a one-hot law.
-                if (batch_size != 1) {
-                    throw std::logic_error("a batched n-gram copy round is not built");
+                // A copy round verifies each flagged row's copy instead of a proposal; DFlash2's
+                // sparse verifier reads it as a one-hot law. At batch one the draft model does
+                // not run. Above it the draft model proposes its own block for every row
+                // (Infernix 760d09b0), which is spread into the leading columns of the wider
+                // frame, and the copies then replace the flagged rows.
+                if (batch_size > 1) {
+                    propose_beside_copies(state, frame, batch_size, k, envelopes);
                 }
                 Tensor copy_rows   = frame.copy_rows.slice(0, 0, batch_size);
                 Tensor copy_drafts = frame.copy_drafts.slice(1, 0, batch_size);

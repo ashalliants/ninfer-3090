@@ -135,6 +135,23 @@ std::uint32_t max_verify_drafts(std::span<const SpeculativeRoundShape> shapes) n
     return widest;
 }
 
+std::uint32_t round_family_batch_limit(const SpeculativeRoundShape& shape,
+                                       std::uint32_t max_concurrency) noexcept {
+    return shape.kind == SpeculativeRoundKind::Copy
+               ? std::min(max_concurrency, kMaximumCopyRoundBatch)
+               : max_concurrency;
+}
+
+std::uint32_t copy_round_minimum_drafts(std::uint32_t batch) noexcept {
+    // Batch two: a copy of L accepted drafts beside a neural partner yields L + 1 + p tokens in a
+    // round costing r = 1.44-1.49x the neural round's c + p, where the copying row's own neural
+    // round yields c = 7.4 on copyable text and a free partner p = 2-3 (bench corpus and agent
+    // replay prose). L + 1 >= r (c + p) - p holds from L = 12.
+    if (batch <= 1) { return 1; }
+    if (batch <= kMaximumCopyRoundBatch) { return 12; }
+    return std::numeric_limits<std::uint32_t>::max();
+}
+
 std::vector<GraphExecutionProfile> ordinary_graph_profiles(std::uint32_t capacity) {
     // E+1 is the one-token visible window; all tiers share one topology per exact B.
     return causal_resource_profiles(capacity, 1);

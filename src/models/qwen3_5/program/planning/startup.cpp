@@ -935,20 +935,15 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         throw std::invalid_argument("n-gram minimum match must be in [4,64]");
     }
     if (options.speculative.ngram_draft_tokens != 0) {
-        // A copy round runs without the drafter beside DFlash2's sparse verifier. Its window is
-        // bounded by the 16-column verification domain and must exceed the drafter's own window
-        // to have a family of its own. A batched copy round is not built yet.
+        // A copy round verifies a copy beside DFlash2's sparse verifier. Its window is bounded by
+        // the 16-column verification domain and must exceed the drafter's own window to have a
+        // family of its own.
         if (options.speculative.backend != SpeculativeBackend::DFlash2) {
             throw std::invalid_argument("n-gram copy drafting requires the DFlash2 backend");
         }
         if (options.speculative.ngram_draft_tokens > kDFlashDecodeMaximumDrafts ||
             options.speculative.ngram_draft_tokens < options.speculative.draft_tokens) {
             throw std::invalid_argument("n-gram copy window must be in [draft_tokens,15]");
-        }
-        if (options.max_concurrency != 1) {
-            throw std::invalid_argument(
-                "n-gram copy drafting needs max_concurrency 1; copies above one lane are not "
-                "built yet");
         }
     }
     if (device.compute_capability() != 80 && device.compute_capability() != 86 &&
@@ -1063,7 +1058,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             // topology classes; finish has one small executable per exact B, independently of
             // context length.
             for (const SpeculativeRoundShape& shape : impl->round_shapes) {
-                for (std::uint32_t batch_size = 1; batch_size <= impl->max_concurrency;
+                for (std::uint32_t batch_size = 1;
+                     batch_size <= round_family_batch_limit(shape, impl->max_concurrency);
                      ++batch_size) {
                     impl->graph_allowance_bytes =
                         checked_add(impl->graph_allowance_bytes,

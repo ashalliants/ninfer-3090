@@ -201,7 +201,7 @@ void ProgramImpl::prepare_graphs() {
             cache.page_pool().zero_pages(pages, compute_streams);
         };
     // `verify_drafts` and `copy_round` describe the captured DFlash round family; ordinary and MTP
-    // rounds ignore them. A copy family's representative rows all carry a copy.
+    // rounds ignore them.
     const auto prepare_representative = [&](std::uint32_t frontier, std::uint32_t batch_size,
                                             std::uint32_t verify_drafts, bool copy_round) {
         if (batch_size == 0 || batch_size > max_concurrency) {
@@ -236,15 +236,20 @@ void ProgramImpl::prepare_graphs() {
         if (io.dflash_decode) {
             *dflash_host_ingress       = {};
             *dflash_host_egress        = {};
-            const std::uint32_t extent = std::min(verify_drafts, capacity - frontier - 1U);
             const std::uint32_t width  = verify_drafts + 1U;
             for (std::uint32_t row = 0; row < batch_size; ++row) {
+                // A batched copy family's representative mixes one copying row with neural rows,
+                // which verify the draft model's own window.
+                const bool copies          = copy_round && row == 0;
+                const std::uint32_t extent = std::min(
+                    copy_round && !copies ? draft_window : verify_drafts, capacity - frontier - 1U);
                 dflash_host_ingress->anchors[row] = 0;
                 dflash_host_ingress->execution_frontiers[row] =
                     checked_i32(frontier, "graph representative DFlash frontier");
                 dflash_host_ingress->context_frontiers[row] =
                     checked_i32(frontier, "graph representative DFlash context frontier");
-                dflash_host_ingress->proposal_valid_columns[row] = static_cast<std::int32_t>(width);
+                dflash_host_ingress->proposal_valid_columns[row] =
+                    static_cast<std::int32_t>(draft_window + 1U);
                 dflash_host_ingress->proposal_extents[row] = static_cast<std::int32_t>(extent);
                 dflash_host_ingress->target_valid_columns[row] =
                     static_cast<std::int32_t>(extent + 1U);
@@ -259,7 +264,7 @@ void ProgramImpl::prepare_graphs() {
                 dflash_host_ingress->state_source_slots[row]      = capture_state_slot(row);
                 dflash_host_ingress->state_destination_slots[row] = capture_state_slot(row);
                 dflash_host_ingress->sampling[row]                = {};
-                dflash_host_ingress->copy_rows[row]               = copy_round ? 1 : 0;
+                dflash_host_ingress->copy_rows[row]               = copies ? 1 : 0;
             }
         }
         if (io.mtp_decode) {
@@ -420,7 +425,8 @@ void ProgramImpl::prepare_graphs() {
                                                  state_images->continuation_hidden_store(),
                                                  dflash_draft_handoff->tokens(),
                                                  dflash_draft_handoff->ready,
-                                                 copy_round};
+                                                 copy_round,
+                                                 draft_window};
         };
         const auto target_envelope = [&](std::uint32_t frontier) {
             return ops::CausalAttentionExecutionEnvelope{
@@ -438,7 +444,7 @@ void ProgramImpl::prepare_graphs() {
             } else {
                 auto state = dflash_context();
                 execution::dflash_decode_batch(state, batch, verify_drafts,
-                                               dflash_envelopes(frontier, max_verify_drafts),
+                                               dflash_envelopes(frontier, verify_drafts),
                                                target_envelope(frontier), executable, phase);
             }
         };
@@ -454,7 +460,7 @@ void ProgramImpl::prepare_graphs() {
             } else {
                 auto state = dflash_context();
                 execution::capture_dflash_decode_batch(
-                    state, batch, verify_drafts, dflash_envelopes(frontier, max_verify_drafts),
+                    state, batch, verify_drafts, dflash_envelopes(frontier, verify_drafts),
                     target_envelope(frontier), profile.definition, phase);
             }
         };
@@ -471,7 +477,8 @@ void ProgramImpl::prepare_graphs() {
             auto& family       = forward ? round.forward : round.finish;
             family.profiles.reserve((forward ? forward_profiles : finish_profiles).size() *
                                     max_concurrency);
-            for (std::uint32_t batch = 1; batch <= max_concurrency; ++batch) {
+            for (std::uint32_t batch = 1;
+                 batch <= round_family_batch_limit(round.shape, max_concurrency); ++batch) {
                 const auto planned_profiles =
                     !forward ? finish_profiles
                     : (mtp || batch == 1) ? forward_profiles

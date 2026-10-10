@@ -397,9 +397,10 @@ DFlashDecodeState DFlashDecodeState::narrowed(std::uint32_t k) const {
     const auto drafts        = static_cast<std::int32_t>(k);
     const auto width         = drafts + 1;
     const auto rows          = draft_tokens.ne[1];
-    for (Tensor* tensor : {&result.target_rope_positions, &result.licensed_tokens,
-                           &result.proposal_ids, &result.proposal_positions,
-                           &result.verify_positions, &result.verify_ids, &result.target_argmax}) {
+    for (Tensor* tensor :
+         {&result.target_rope_positions, &result.licensed_tokens, &result.proposal_ids,
+          &result.proposal_positions, &result.verify_positions, &result.verify_ids,
+          &result.target_argmax, &result.append_positions}) {
         *tensor = Tensor(tensor->data, tensor->dtype, {width, rows});
     }
     for (Tensor* tensor : {&result.draft_tokens, &result.copy_drafts}) {

@@ -182,11 +182,12 @@ int main() {
     failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--ngram-draft-tokens", "15"},
                                     "--spec dflash2"),
                       "serve accepted n-gram copy drafting without DFlash2");
-    failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--spec", "dflash2",
-                                     "--draft-tokens", "7", "--ngram-draft-tokens", "15",
-                                     "--max-concurrency", "2"},
-                                    "--max-concurrency 1"),
-                      "serve accepted n-gram copy drafting above one lane");
+    const auto ngram_lanes =
+        parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "7",
+               "--ngram-draft-tokens", "15", "--max-concurrency", "2"});
+    failures +=
+        check(ngram_lanes.speculative.ngram_draft_tokens == 15 && ngram_lanes.max_concurrency == 2,
+              "serve rejected n-gram copy drafting above one lane");
     // The MTP-only context lookup was removed with no alias; n-gram copy drafting replaces it.
     bool lookup_rejected = false;
     try {

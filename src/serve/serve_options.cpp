@@ -189,7 +189,7 @@ std::string serve_usage_text(const char* argv0) {
            "text being written already appeared in the request (a tool result, the prompt or the "
            "output so far), a round verifies up to 15 copied tokens instead of the draft model's "
            "proposal; verification licenses every token, so a wrong copy costs speed, never "
-           "output. 0 (the default) disables it. It needs --max-concurrency 1 for now. "
+           "output. 0 (the default) disables it. "
            "--ngram-min-match N (4..64, default 12) is how many tokens must match before a copy "
            "is proposed\n"
            "       --no-prefix-reuse disables cross-request history; request pause/replay "
@@ -717,11 +717,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     product::apply_speculative_defaults(options.speculative);
     product::validate_speculative_cli_options(options.speculative);
-    if (options.speculative.ngram_draft_tokens != 0 && options.max_concurrency != 1) {
-        throw std::invalid_argument(
-            "--ngram-draft-tokens needs --max-concurrency 1; copies above one lane are not "
-            "built yet");
-    }
     if (options.vision_residency == VisionResidency::Overlay && !options.enable_vision) {
         throw std::invalid_argument("--vision-residency overlay requires --vision");
     }

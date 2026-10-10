@@ -1,4 +1,4 @@
-// N-gram copy rounds beside DFlash2 on the real artifact (step 3, PR 3.3).
+// N-gram copy rounds beside DFlash2 on the real artifact (step 3, PRs 3.3 and 3.4).
 //
 //   copy        "return this file exactly": with the file in the prompt, and only as a `cat -n`
 //               numbered tool result (so only its de-numbered source can match), the output equals
@@ -11,24 +11,33 @@
 //               turn prefilled from scratch (the context store does not take DFlash backends)
 //   constrained a JSON-schema answer copying a JSON blob from a tool result validates, copies were
 //               verified, and the blob's number, which the schema makes a string, never leaks
+//   lanes       two lanes, one copying the file while the other writes free text: the copying lane
+//               equals non-speculative greedy output (its copies verified beside the other lane's
+//               draft-model proposal, at the copy width), and the other lane is a valid, varied
+//               answer of its own (cross-lane identity with one lane is not required)
+//   preemption  two copying lanes in a KV capacity that cannot hold both to the end: a lane is
+//               paused while copying and resumed from its snapshot, and again without Host memory
+//               by replay, and both outputs still equal non-speculative greedy output
 //
-// Arguments: [kv-dtype (default rk4v4)]. Preemption of a copying lane needs two lanes, which n-gram
-// copies do not run yet; it is covered when they do.
+// Arguments: [kv-dtype (default rk4v4)].
 #include "ninfer/engine.h"
 #include "kv_cache_storage.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <iostream>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -105,13 +114,14 @@ ninfer::RequestOptions greedy(std::uint32_t tokens, bool reuse = false) {
 }
 
 ninfer::EngineOptions engine_options(const char* artifact, ninfer::KvCacheStorage kv, bool ngram,
-                                     bool graph) {
+                                     bool graph, std::uint32_t lanes = 1,
+                                     std::uint32_t capacity = 8192) {
     ninfer::EngineOptions options;
     options.artifact_path   = artifact;
-    options.max_context     = 8192;
-    options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(8192);
+    options.max_context     = std::min<std::uint32_t>(capacity, 8192);
+    options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(capacity);
     options.prefill_chunk   = 2048;
-    options.max_concurrency = 1;
+    options.max_concurrency = lanes;
     options.kv_cache        = kv;
     options.use_cuda_graph  = graph;
     if (ngram) {
@@ -312,6 +322,114 @@ void check_constrained(ninfer::Engine& engine) {
               << parsed.at("pressure").dump() << '\n';
 }
 
+// Free text with little to copy, long enough to share every round with the copying lane.
+ninfer::PromptInput free_prompt() {
+    ninfer::PromptInput input;
+    input.options.enable_thinking = false;
+    input.messages.push_back(message(
+        ninfer::ChatRole::User,
+        "Write a long, original story about a lighthouse keeper who finds a stranded whale. "
+        "Use plain prose with no lists and no headings."));
+    return input;
+}
+
+// Runs two prepared requests at once and returns their results in order.
+std::array<ninfer::GenerationResult, 2> run_pair(ninfer::Engine& engine, ninfer::PromptInput first,
+                                                 ninfer::PromptInput second,
+                                                 std::array<std::uint32_t, 2> budgets) {
+    auto first_handle  = engine.submit(engine.prepare(std::move(first)), greedy(budgets[0]));
+    auto second_handle = engine.submit(engine.prepare(std::move(second)), greedy(budgets[1]));
+    std::array<ninfer::GenerationResult, 2> results;
+    std::exception_ptr error;
+    std::thread waiter([&] {
+        try {
+            results[1] = second_handle.wait();
+        } catch (...) { error = std::current_exception(); }
+    });
+    results[0] = first_handle.wait();
+    waiter.join();
+    if (error) { std::rethrow_exception(error); }
+    return results;
+}
+
+// A degenerate answer repeats a few tokens; a varied one uses many distinct ones.
+bool varied(const std::vector<ninfer::TokenId>& tokens) {
+    std::vector<ninfer::TokenId> distinct = tokens;
+    std::sort(distinct.begin(), distinct.end());
+    distinct.erase(std::unique(distinct.begin(), distinct.end()), distinct.end());
+    return tokens.size() >= 200 && distinct.size() * 4 >= tokens.size();
+}
+
+void check_lanes(const char* artifact, ninfer::KvCacheStorage kv, const Reference& reference,
+                 std::uint32_t budget) {
+    ninfer::Engine engine(engine_options(artifact, kv, true, true, 2));
+    const auto before  = engine.runtime_stats();
+    const auto results = run_pair(engine, copy_prompt(false), free_prompt(), {budget, budget});
+    const auto after   = engine.runtime_stats();
+    const auto& copy   = results[0];
+    const auto& prose  = results[1];
+    require_same(copy, reference.plain, "copying lane beside a drafting lane");
+    require(copy.speculative.ngram_accepted_tokens > 0, "the copying lane accepted no copies");
+    require(prose.speculative.rounds > 0 && prose.speculative.ngram_rounds == 0 &&
+                varied(prose.generated_token_ids),
+            "the free lane copied, did not draft, or degenerated beside the copying lane");
+    // Both lanes decoded in the same rounds for most of the copy.
+    require(after.decode_row_rounds - before.decode_row_rounds >
+                after.decode_rounds - before.decode_rounds + copy.speculative.ngram_rounds / 2,
+            "the two lanes rarely shared a round");
+    std::cout << "lanes: copy " << copy.generated_token_ids.size() << " tokens, copy rounds "
+              << copy.speculative.ngram_rounds << ", copies accepted "
+              << copy.speculative.ngram_accepted_tokens << '/'
+              << copy.speculative.ngram_drafted_tokens << "; free lane "
+              << prose.generated_token_ids.size() << " tokens in " << prose.speculative.rounds
+              << " rounds; shared row-rounds " << after.decode_row_rounds - before.decode_row_rounds
+              << " of " << after.decode_rounds - before.decode_rounds << " rounds\n";
+}
+
+// Each copy request needs its prompt (about 600 and 900 tokens) plus about 700 output tokens; this
+// capacity holds both prompts and their first rounds, not both complete requests, so growth pauses
+// one of them while it copies. With Host memory the paused lane resumes from its snapshot; without
+// it, by replaying its prompt and committed output.
+void check_preemption(const char* artifact, ninfer::KvCacheStorage kv, const Reference& reference,
+                      bool snapshot) {
+    constexpr std::uint32_t kCapacity = 2560;
+    constexpr std::uint32_t kBudget   = 1024;
+    require(reference.plain.size() < kBudget && reference.numbered.size() < kBudget,
+            "the reference copies do not fit the preemption budget");
+    auto options = engine_options(artifact, kv, true, true, 2, kCapacity);
+    if (!snapshot) {
+        options.context_cache.enabled             = false;
+        options.context_cache.device_state_slots  = 0;
+        options.context_cache.host_capacity_bytes = 0;
+    }
+    ninfer::Engine engine(options);
+    const auto results =
+        run_pair(engine, copy_prompt(false), copy_prompt(true), {kBudget, kBudget});
+    const std::string label = snapshot ? "snapshot preemption" : "replay preemption";
+    require_same(results[0], reference.plain, label + " plain");
+    require_same(results[1], reference.numbered, label + " numbered");
+    std::uint64_t preemptions = 0;
+    std::uint64_t restores    = 0;
+    std::uint64_t replays     = 0;
+    for (const auto& result : results) {
+        preemptions += result.scheduling.preemptions;
+        restores += result.scheduling.snapshot_restores + result.scheduling.replay_restores;
+        replays += result.scheduling.replay_restores;
+        require(result.speculative.ngram_accepted_tokens > 0,
+                "a preempted lane accepted no copies");
+    }
+    require(preemptions != 0 && restores == preemptions && (snapshot || replays == preemptions),
+            label +
+                ": growth pressure never paused a copying lane, or it was not restored that way");
+    std::cout << label << ": " << preemptions << " preemptions, "
+              << results[0].scheduling.snapshot_restores + results[1].scheduling.snapshot_restores
+              << " snapshot and "
+              << results[0].scheduling.replay_restores + results[1].scheduling.replay_restores
+              << " replay restores; copies accepted "
+              << results[0].speculative.ngram_accepted_tokens << " and "
+              << results[1].speculative.ngram_accepted_tokens << '\n';
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -335,6 +453,9 @@ int main(int argc, char** argv) {
                 check_restore(engine, kBudget);
             }
         }
+        check_lanes(artifact, kv, reference, kBudget);
+        check_preemption(artifact, kv, reference, true);
+        check_preemption(artifact, kv, reference, false);
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;
