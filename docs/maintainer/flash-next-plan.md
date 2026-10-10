@@ -11,12 +11,12 @@ references, `engine-architecture.md`).
 |---|---|---|
 | 0 | Strata baselines: decode, MTP, prefill, teacher-forced log-probs on frozen token ids | not started |
 | 1 | GGUF reader, nine exact GGML block formats, `ggml_blocks_v1` / `ggml_rows_page4k_v1`, `qwen4_exp` name map, tokenizer synthesis, `--subset dev` | done (Python only) |
-| 2 | C++ registration and materialization of the GGML formats and layouts; host exact decoder | next |
+| 2 | C++ registration and materialization of the GGML formats and layouts; host exact decoder | done |
 | 3-9 | Dense GGML linears, hyper-connections and FP32 head, QSA, PLE frontend and stream residency, model skeleton, MoE on GPU, MoE on CPU | not started |
 | 10 | Whole model at 32K, quality gate against Strata | not started |
 | 11-14 | Residency policy and miss split, 128K, MTP, vision | not started |
 
-Until PR 2 the C++ reader rejects every artifact that uses a `ggml_*` format.
+The C++ loader reads and places every `ggml_*` object; nothing executes them until PR 3.
 
 ## Artifact decisions taken in PR 1
 

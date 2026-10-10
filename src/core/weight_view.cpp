@@ -64,7 +64,52 @@ void validate_region(const WeightRegion& region) {
     }
 }
 
+// Every count here is u64: the paged n-gram table alone is 320 M rows x 160 = 51.2 G values.
+WeightGeometry ggml_geometry(WeightGeometry out) {
+    const auto block = ggml_block(out.format);
+    if (!block.values) {
+        throw std::invalid_argument("GGML block layouts require a GGML block format");
+    }
+    if (out.shape.empty()) { throw std::invalid_argument("GGML block layouts require rank >= 1"); }
+    const auto k = out.shape.back();
+    if (k % block.values) {
+        throw std::invalid_argument("GGML block K must be a multiple of the block's value count");
+    }
+    const auto rows        = out.elements / k;
+    out.padded_columns     = k;
+    out.group_size         = block.values;
+    out.code_bytes_per_row = mul(k / block.values, block.bytes);
+    if (out.layout == QuantLayout::GgmlBlocks) {
+        out.code_bytes = mul(rows, out.code_bytes_per_row);
+    } else {
+        if (out.shape.size() != 2) {
+            throw std::invalid_argument("ggml_rows_page4k_v1 requires a matrix");
+        }
+        if (out.code_bytes_per_row > kGgmlRowPageBytes) {
+            throw std::invalid_argument("ggml_rows_page4k_v1 rows must fit one 4096-byte page");
+        }
+        out.rows_per_page = kGgmlRowPageBytes / out.code_bytes_per_row;
+        out.code_bytes    = mul(add(rows, out.rows_per_page - 1) / out.rows_per_page,
+                                kGgmlRowPageBytes);
+        out.alignment     = kGgmlRowPageBytes;
+    }
+    out.bytes = out.code_bytes;
+    return out;
+}
+
 } // namespace
+
+std::uint64_t ggml_row_offset(const WeightGeometry& geometry, std::uint64_t row) {
+    if (!is_ggml_layout(geometry.layout) || !geometry.code_bytes_per_row ||
+        row >= geometry.elements / geometry.padded_columns) {
+        throw std::invalid_argument("GGML row coordinate exceeds its parent");
+    }
+    if (geometry.layout == QuantLayout::GgmlBlocks) {
+        return row * geometry.code_bytes_per_row;
+    }
+    return row / geometry.rows_per_page * kGgmlRowPageBytes +
+           row % geometry.rows_per_page * geometry.code_bytes_per_row;
+}
 
 std::uint64_t weight_element_count(std::span<const std::uint64_t> shape) {
     if (shape.size() > 16) { throw std::invalid_argument("weight rank exceeds 16"); }
@@ -91,6 +136,7 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         }
         return out;
     }
+    if (is_ggml_layout(layout)) { return ggml_geometry(std::move(out)); }
     if (shape.size() != 2) { throw std::invalid_argument("quantized weight must be a matrix"); }
     const auto n       = shape[0];
     const auto k       = shape[1];
@@ -186,6 +232,9 @@ bool is_complete_weight(const WeightView& view) {
 
 std::uint64_t weight_scale_offset(const WeightGeometry& geometry, std::uint64_t row,
                                   std::uint64_t group) {
+    if (is_ggml_layout(geometry.layout)) {
+        throw std::invalid_argument("GGML blocks carry their scales inside each block");
+    }
     if (geometry.shape.size() != 2 || !geometry.group_size || row >= geometry.shape[0] ||
         group >= geometry.padded_columns / geometry.group_size) {
         throw std::invalid_argument("weight scale coordinate exceeds its parent");
@@ -205,6 +254,10 @@ WeightRowPlanes weight_row_planes(const WeightRegion& region) {
     if (!parent.data || g.shape.size() != 2 || region.begin % g.shape[1] ||
         region.end % g.shape[1]) {
         throw std::invalid_argument("row view requires resident complete logical rows");
+    }
+    // Paged rows are not one contiguous range; their reader addresses each row by ggml_row_offset.
+    if (g.layout == QuantLayout::GgmlRowsPage4K) {
+        throw std::invalid_argument("paged GGML rows have no contiguous row planes");
     }
     WeightRowPlanes out;
     out.row_begin       = region.begin / g.shape[1];

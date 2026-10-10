@@ -3,9 +3,10 @@
 Usage: python -m tools.artifact.gen_ggml_fixtures [--dll PATH] [--out tests/fixtures/ggml]
 
 The oracle is ``dequantize_row_<type>`` exported by ggml-base.dll (or libggml-base.so) of llama.cpp
-release b11316; the path comes from ``--dll`` or ``NINFER_GGML_BASE_DLL``. Each fixture
-``<format>.npz`` holds ``blocks`` (uint8 [n, block_bytes]) and ``expected`` (the oracle's FP32 bit
-patterns as uint32 [n, block_elems]). Blocks are random bytes with structured fields overwritten so
+release b11316; the path comes from ``--dll`` or ``NINFER_GGML_BASE_DLL``. Each fixture is a
+pair of raw files that the Python and C++ tests both read: ``<format>.blocks`` holds n whole
+blocks, and ``<format>.f32`` the oracle's n * block_elems FP32 results as little-endian bit
+patterns. Blocks are random bytes with structured fields overwritten so
 that every grid index, sign pattern and scale field of the format occurs, and the binary16 scales
 include zeros of both signs, subnormals, the largest finite values, infinities and NaNs.
 """
@@ -170,9 +171,10 @@ def main(argv=None) -> None:
             raise SystemExit(f"{spec.name}: oracle geometry {oracle.geometry(spec)} differs")
         count = 256 if spec.block_elems <= 64 else 64
         blocks = structured_blocks(spec, count)
-        path = args.out / f"{spec.name}.npz"
-        np.savez_compressed(path, blocks=blocks, expected=oracle.decode(spec, blocks))
-        print(f"{path}: {count} blocks, {path.stat().st_size} bytes")
+        stem = args.out / spec.name
+        blocks.astype(np.uint8).tofile(stem.with_suffix(".blocks"))
+        oracle.decode(spec, blocks).astype("<u4").tofile(stem.with_suffix(".f32"))
+        print(f"{stem}.blocks/.f32: {count} blocks")
 
 
 if __name__ == "__main__":

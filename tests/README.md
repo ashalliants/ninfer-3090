@@ -164,8 +164,14 @@ The Python suites exercise conversion, encoded output and measurement tools with
 The maintained environment uses Python 3.11 with the dependencies for those suites. C++ binding and Engine tests
 cover consumption of their resulting representation.
 
-The GGML block decoders are checked against committed golden fixtures from ggml's reference
-`dequantize_row_*`. Optional environment variables extend the GGML and GGUF checks:
+The GGML block decoders, Python (`tests/artifact/test_ggml_codecs.py`) and C++
+(`ninfer_ggml_blocks_decode_test`, for the host oracle `tests/ops/ggml_blocks_decode.h`), are
+checked against committed golden fixtures from ggml's reference `dequantize_row_*`
+(`tests/fixtures/ggml/<format>.blocks` and `.f32`). `ninfer_artifact_ggml_real_test` loads a real
+GGML artifact named by `NINFER_TEST_ARTIFACT` (such as `--subset dev` below) through Device, Pinned
+and Host residency and requires the C++ and Python decoders to agree bit for bit on sampled blocks;
+it skips without the variable or when that artifact has no GGML tensor. Optional environment
+variables extend the Python GGML and GGUF checks:
 
 | Variable | Adds |
 |---|---|

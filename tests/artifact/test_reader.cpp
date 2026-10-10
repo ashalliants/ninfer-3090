@@ -1,6 +1,8 @@
 #include "artifact/binder.h"
 #include "artifact/reader.h"
 #include "artifact/fixture.h"
+#include "artifact/formats.h"
+#include "artifact/layouts.h"
 #include "core/weight_view.h"
 
 #include <algorithm>
@@ -113,6 +115,97 @@ void geometry_and_views() {
             "per-use native parameters changed the parent");
 }
 
+// GGML block geometry, at the real shapes it must hold: the expert banks and the 51.2 G-value paged
+// n-gram table, whose element count and byte offsets overflow 32 bits.
+void ggml_geometry() {
+    constexpr std::array names = {"ggml_q8_0",  "ggml_q6_k",   "ggml_iq2_xxs",
+                                  "ggml_iq4_nl", "ggml_iq3_s", "ggml_iq2_s",
+                                  "ggml_iq4_xs", "ggml_iq1_m", "ggml_q2_0"};
+    for (const auto* name : names) {
+        const auto format = parse_format(name);
+        require(is_ggml_block(format) && format_name(format) == name,
+                "GGML format name does not round-trip");
+    }
+    require(parse_layout("ggml_blocks_v1") == QuantLayout::GgmlBlocks &&
+                parse_layout("ggml_rows_page4k_v1") == QuantLayout::GgmlRowsPage4K &&
+                layout_name(QuantLayout::GgmlRowsPage4K) == "ggml_rows_page4k_v1",
+            "GGML layout name does not round-trip");
+
+    // qwen4exp gate|up bank of one layer: 512 experts x 1280 rows of 2560 IQ2_S values.
+    const auto bank = weight_geometry(QType::GGML_IQ2_S, QuantLayout::GgmlBlocks,
+                                      std::array<std::uint64_t, 2>{512 * 1280, 2560});
+    require(bank.bytes == 537395200 && bank.code_bytes_per_row == 820 &&
+                ggml_row_offset(bank, 1280) == 1049600 && bank.alignment == 256 &&
+                bank.group_size == 256 && bank.scale_bytes == 0,
+            "expert bank geometry differs from 1280 rows x 820 B per expert");
+    require(weight_geometry(QType::GGML_IQ2_S, QuantLayout::GgmlBlocks,
+                            std::array<std::uint64_t, 3>{512, 1280, 2560})
+                    .bytes == bank.bytes &&
+                weight_geometry(QType::GGML_Q6_K, QuantLayout::GgmlBlocks,
+                                std::array<std::uint64_t, 1>{256})
+                        .bytes == 210,
+            "GGML block geometry depends on how the leading axes are split");
+
+    // The n-gram (PLE) table: 320,001,536 rows of 160 IQ4_NL values = 51,200,245,760 values.
+    const std::array<std::uint64_t, 2> ple{320001536, 160};
+    const auto paged = weight_geometry(QType::GGML_IQ4_NL, QuantLayout::GgmlRowsPage4K, ple);
+    require(paged.elements == 51200245760ULL && paged.code_bytes_per_row == 90 &&
+                paged.rows_per_page == 45 && paged.bytes == 29127254016ULL &&
+                paged.alignment == 4096,
+            "paged PLE geometry differs from 7,111,146 pages of 45 rows");
+    require(ggml_row_offset(paged, 44) == 3960 && ggml_row_offset(paged, 45) == 4096 &&
+                ggml_row_offset(paged, 320001535) == 29127250820ULL,
+            "paged row offsets are not page-major");
+    rejects<std::invalid_argument>([&] { (void)ggml_row_offset(paged, 320001536); },
+                                   "a row past the table was addressed");
+    const auto flat = weight_geometry(QType::GGML_IQ4_NL, QuantLayout::GgmlBlocks, ple);
+    require(flat.bytes == 28800138240ULL && ggml_row_offset(flat, 320001535) == 28800138150ULL,
+            "unpaged PLE geometry overflowed");
+
+    // The native Weight ABI is int32 per axis: the whole table still fits, a 2^31-row matrix
+    // is refused rather than truncated.
+    std::array<std::byte, 90> row{};
+    const WeightParent table{flat, row.data()};
+    const auto native = native_weight(WeightView{{320001536, 160}, {{&table, 0, flat.elements}}});
+    require(native.n == 320001536 && native.k == 160 && native.qdata == row.data() &&
+                native.scales == nullptr && native.group == 32 &&
+                native.qtype == QType::GGML_IQ4_NL && native.layout == QuantLayout::GgmlBlocks,
+            "GGML native Weight lost its rows or block size");
+    const WeightParent wide{weight_geometry(QType::GGML_Q8_0, QuantLayout::GgmlBlocks,
+                                            std::array<std::uint64_t, 2>{1ULL << 31, 32}),
+                            row.data()};
+    rejects<std::invalid_argument>(
+        [&] { (void)native_weight(WeightView{{1ULL << 31, 32}, {{&wide, 0, 1ULL << 36}}}); },
+        "a row count beyond int32 reached the native Weight");
+    const WeightParent paged_parent{paged, row.data()};
+    rejects<std::invalid_argument>(
+        [&] { (void)weight_row_planes({&paged_parent, 0, 160}); },
+        "paged rows were treated as one contiguous plane");
+    rejects<std::invalid_argument>([&] { (void)weight_scale_offset(flat, 0, 0); },
+                                   "a GGML parent reported a separate scale plane");
+
+    const auto invalid = [](QType format, QuantLayout layout, std::vector<std::uint64_t> shape) {
+        rejects<std::invalid_argument>([&] { (void)weight_geometry(format, layout, shape); },
+                                       "invalid GGML geometry accepted");
+    };
+    invalid(QType::GGML_Q6_K, QuantLayout::GgmlBlocks, {4, 128});        // K % 256
+    invalid(QType::GGML_IQ4_NL, QuantLayout::GgmlRowsPage4K, {2, 2, 32}); // paged is rank 2
+    invalid(QType::GGML_IQ4_XS, QuantLayout::GgmlRowsPage4K, {2, 256 * 31}); // 4216 B row
+    invalid(QType::GGML_Q8_0, QuantLayout::RowSplit, {2, 128});
+    invalid(QType::GGML_Q8_0, QuantLayout::Contiguous, {2, 32});
+    invalid(QType::BF16, QuantLayout::GgmlBlocks, {2, 32});
+    invalid(QType::Q8_G32_FP16, QuantLayout::GgmlRowsPage4K, {2, 32});
+
+    // The object record must carry the layout's size and its 4096-byte alignment.
+    TensorObject object{"ple", {90, 160}, "ggml_iq4_nl", "ggml_rows_page4k_v1", 8192, 8192};
+    require(describe_tensor(object).rows_per_page == 45, "paged object was not described");
+    object.offset = 4352;
+    rejects([&] { (void)describe_tensor(object); }, "paged object off a page boundary accepted");
+    object.offset = 8192;
+    object.bytes  = 8100;
+    rejects([&] { (void)describe_tensor(object); }, "paged object without its page tails accepted");
+}
+
 void invalid_directories() {
     Fixture fixture;
     const auto bad = [&](auto mutate) {
@@ -158,6 +251,7 @@ int main(int argc, char** argv) {
     try {
         file_set_and_bindings();
         geometry_and_views();
+        ggml_geometry();
         invalid_directories();
         // Optional production-writer fixture or explicitly selected real artifact.
         if (argc == 2) {

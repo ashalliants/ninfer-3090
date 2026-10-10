@@ -27,8 +27,12 @@ ORACLE = os.environ.get("NINFER_GGML_BASE_DLL")
 
 
 def _fixture(name: str):
-    with np.load(FIXTURES / f"{name}.npz", allow_pickle=False) as data:
-        return data["blocks"], data["expected"]
+    spec = get_format(name)
+    blocks = np.fromfile(FIXTURES / f"{name}.blocks", dtype=np.uint8)
+    expected = np.fromfile(FIXTURES / f"{name}.f32", dtype="<u4")
+    count = blocks.size // spec.block_bytes
+    assert blocks.size == count * spec.block_bytes and expected.size == count * spec.block_elems
+    return blocks.reshape(count, spec.block_bytes), expected.reshape(count, spec.block_elems)
 
 
 @pytest.mark.parametrize("name", FORMATS)
@@ -43,7 +47,8 @@ def test_decoder_matches_ggml_reference_bit_for_bit(name):
 
 @pytest.mark.parametrize("name", FORMATS)
 def test_fixture_stays_small_and_covers_special_scales(name):
-    assert (FIXTURES / f"{name}.npz").stat().st_size < 64_000
+    stem = FIXTURES / name
+    assert stem.with_suffix(".blocks").stat().st_size + stem.with_suffix(".f32").stat().st_size <= 80_000
     _, expected = _fixture(name)
     values = expected.view(np.float32)
     # Signed zeros, infinities and NaNs from the special binary16 scales reach the output.

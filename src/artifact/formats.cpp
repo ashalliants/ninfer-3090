@@ -17,12 +17,23 @@ constexpr std::array kFormats = {
     std::pair{QType::Q8_G32_FP16, std::string_view{"q8_g32_fp16"}},
     std::pair{QType::NVFP4, std::string_view{"nvfp4"}},
     std::pair{QType::FP8_E4M3FN_ROW_BF16, std::string_view{"fp8_e4m3fn_row_bf16"}},
+    std::pair{QType::GGML_Q8_0, std::string_view{"ggml_q8_0"}},
+    std::pair{QType::GGML_Q6_K, std::string_view{"ggml_q6_k"}},
+    std::pair{QType::GGML_IQ2_XXS, std::string_view{"ggml_iq2_xxs"}},
+    std::pair{QType::GGML_IQ4_NL, std::string_view{"ggml_iq4_nl"}},
+    std::pair{QType::GGML_IQ3_S, std::string_view{"ggml_iq3_s"}},
+    std::pair{QType::GGML_IQ2_S, std::string_view{"ggml_iq2_s"}},
+    std::pair{QType::GGML_IQ4_XS, std::string_view{"ggml_iq4_xs"}},
+    std::pair{QType::GGML_IQ1_M, std::string_view{"ggml_iq1_m"}},
+    std::pair{QType::GGML_Q2_0, std::string_view{"ggml_q2_0"}},
 };
 constexpr std::array kLayouts = {
     std::pair{QuantLayout::Contiguous, std::string_view{"contiguous_le_v1"}},
     std::pair{QuantLayout::RowSplit, std::string_view{"row_split_k128_v1"}},
     std::pair{QuantLayout::RowScale, std::string_view{"row_scale_v1"}},
     std::pair{QuantLayout::BlockScaleK16M128x4, std::string_view{"block_scale_k16_m128x4_v1"}},
+    std::pair{QuantLayout::GgmlBlocks, std::string_view{"ggml_blocks_v1"}},
+    std::pair{QuantLayout::GgmlRowsPage4K, std::string_view{"ggml_rows_page4k_v1"}},
 };
 
 // Layouts a device may hold but an artifact may never declare. They are produced by a load-time

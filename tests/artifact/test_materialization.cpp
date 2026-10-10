@@ -3,11 +3,13 @@
 #include "artifact/views.h"
 #include "core/device.h"
 #include "core/evictable_weight_pool.h"
+#include "ops/ggml_blocks_decode.h"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstring>
 #include <iostream>
 #include <map>
@@ -249,6 +251,174 @@ void file_roundtrip(DeviceContext& device, const std::filesystem::path& path, bo
     std::cout << path.filename().string() << ": all bound parent bytes and logical views passed\n";
 }
 
+// Expected bytes of writer_interop.py's GGML objects: row r of K/values blocks is the same byte
+// sequence as unpaged row r of `(i * 37 + 11) % 251`, in either GGML layout.
+std::byte interop_byte(std::uint64_t index) { return std::byte((index * 37 + 11) % 251); }
+
+std::vector<ObjectHandle> ggml_objects(const Reader& reader) {
+    std::vector<ObjectHandle> out;
+    for (std::size_t i = 0; i < reader.directory().objects.size(); ++i) {
+        if (std::holds_alternative<TensorObject>(reader.directory().objects[i]) &&
+            is_ggml_block(reader.geometry({i}).format)) {
+            out.push_back({i});
+        }
+    }
+    return out;
+}
+
+// Copies a materialized parent's bytes back to the host, whichever residency holds it.
+std::vector<std::byte> parent_bytes(const WeightParent& parent, bool device) {
+    std::vector<std::byte> out(static_cast<std::size_t>(parent.geometry.bytes));
+    if (device) {
+        CUDA_CHECK(cudaMemcpy(out.data(), parent.data, out.size(), cudaMemcpyDeviceToHost));
+    } else {
+        std::memcpy(out.data(), parent.data, out.size());
+    }
+    return out;
+}
+
+// The writer's GGML objects survive Pinned and Host residency byte for byte, and every row
+// decodes; Device residency is covered by file_roundtrip.
+void ggml_writer_residencies(DeviceContext& device, const std::filesystem::path& path) {
+    Reader reader(path);
+    const auto objects = ggml_objects(reader);
+    require(objects.size() == 10, "writer fixture lost a GGML format or layout");
+    for (const auto residency : {Residency::Pinned, Residency::Host}) {
+        Binder binder(reader);
+        for (const auto object : objects) {
+            if (residency == Residency::Pinned) {
+                binder.require_pinned(object);
+            } else {
+                (void)binder.host_object(object);
+            }
+        }
+        const auto backing = materialize(reader, std::move(binder).finish(), device);
+        for (const auto object : objects) {
+            const auto& parent = residency == Residency::Pinned ? backing.pinned_parent(object)
+                                                                : backing.host_parent(object);
+            const auto& g      = parent.geometry;
+            const auto bytes   = parent_bytes(parent, false);
+            require(bytes == reader.read_object(object), "GGML parent bytes changed in residency");
+            if (residency == Residency::Pinned) {
+                require((parent.data - backing.pinned_block().data()) % g.alignment == 0,
+                        "pinned GGML parent lost its layout alignment");
+            }
+            const auto rows = g.elements / g.padded_columns;
+            for (std::uint64_t row = 0; row < rows; ++row) {
+                const auto encoded = test::ggml::row_bytes(g, bytes, row);
+                for (std::size_t i = 0; i < encoded.size(); ++i) {
+                    require(encoded[i] == interop_byte(row * g.code_bytes_per_row + i),
+                            "C++ GGML row addressing differs from the Python writer's rows");
+                }
+            }
+            (void)test::ggml::decode_parent(g, bytes);
+        }
+    }
+    std::cout << path.filename().string() << ": GGML objects passed Pinned and Host residency\n";
+}
+
+// Little-endian record writer for --ggml-samples.
+class SampleWriter {
+public:
+    explicit SampleWriter(const std::filesystem::path& path)
+        : file_(path, std::ios::binary | std::ios::trunc) {
+        file_.exceptions(std::ios::badbit | std::ios::failbit);
+    }
+
+    void word(std::uint64_t value, unsigned bytes) {
+        for (unsigned i = 0; i < bytes; ++i) { file_.put(static_cast<char>(value >> (8 * i))); }
+    }
+
+    void raw(std::span<const std::byte> bytes) {
+        file_.write(reinterpret_cast<const char*>(bytes.data()),
+                    static_cast<std::streamsize>(bytes.size()));
+    }
+
+private:
+    std::ofstream file_;
+};
+
+// Real-artifact check (tests/artifact/ggml_artifact_real.py drives it): every GGML object is
+// materialized, rotating Device, Pinned and Host residency, compared whole against the file, and
+// sampled blocks are decoded here and written out for the Python decoder to compare exactly.
+int ggml_samples(DeviceContext& device, const std::filesystem::path& path,
+                 const std::filesystem::path& out) {
+    Reader reader(path);
+    const auto objects = ggml_objects(reader);
+    if (objects.empty()) {
+        std::cout << path.filename().string() << " has no GGML block tensors; skipped\n";
+        return 77;
+    }
+    const auto residency_of = [](std::size_t i) {
+        return std::array{Residency::Device, Residency::Pinned, Residency::Host}[i % 3];
+    };
+    Binder binder(reader);
+    for (std::size_t i = 0; i < objects.size(); ++i) {
+        switch (residency_of(i)) {
+        case Residency::Device:
+            binder.require_device(objects[i]);
+            break;
+        case Residency::Pinned:
+            binder.require_pinned(objects[i]);
+            break;
+        default:
+            (void)binder.host_object(objects[i]);
+        }
+    }
+    const auto backing = materialize(reader, std::move(binder).finish(), device);
+    SampleWriter samples(out);
+    std::uint64_t compared = 0;
+    std::size_t sample_count = 0;
+    for (std::size_t i = 0; i < objects.size(); ++i) {
+        const auto object    = objects[i];
+        const auto residency = residency_of(i);
+        const auto& parent   = residency == Residency::Device   ? backing.device_parent(object)
+                               : residency == Residency::Pinned ? backing.pinned_parent(object)
+                                                                : backing.host_parent(object);
+        const auto& g        = parent.geometry;
+        const auto bytes     = parent_bytes(parent, residency == Residency::Device);
+        require(bytes == reader.read_object(object), "materialized GGML object differs from file");
+        compared += bytes.size();
+        const auto block           = ggml_block(g.format);
+        const auto blocks_per_row  = g.padded_columns / block.values;
+        const auto block_count     = g.elements / block.values;
+        // First, last and 30 spread pseudo-random blocks per object.
+        std::vector<std::uint64_t> picks{0, block_count - 1};
+        std::uint64_t state = 0x9E3779B97F4A7C15ULL ^ i;
+        for (int n = 0; n < 30; ++n) {
+            state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+            picks.push_back((state >> 11) % block_count);
+        }
+        if (g.layout == QuantLayout::GgmlRowsPage4K) {
+            // Every page tail of the paged table must be zero; row_bytes checks it.
+            for (std::uint64_t row = 0; row < g.elements / g.padded_columns; ++row) {
+                (void)test::ggml::row_bytes(g, bytes, row);
+            }
+        }
+        const auto& id = reader.directory().tensor(object).id;
+        for (const auto pick : picks) {
+            const auto offset = ggml_row_offset(g, pick / blocks_per_row) +
+                                pick % blocks_per_row * block.bytes;
+            const auto encoded =
+                std::span<const std::byte>(bytes).subspan(offset, block.bytes);
+            const auto values = test::ggml::decode_blocks(g.format, encoded);
+            samples.word(id.size(), 4);
+            samples.raw(std::as_bytes(std::span(id)));
+            samples.word(static_cast<std::uint64_t>(residency), 4);
+            samples.word(pick, 8);
+            samples.word(block.bytes, 4);
+            samples.raw(encoded);
+            samples.word(values.size(), 4);
+            for (const float value : values) { samples.word(std::bit_cast<std::uint32_t>(value), 4); }
+            ++sample_count;
+        }
+    }
+    std::cout << path.filename().string() << ": " << objects.size() << " GGML objects ("
+              << compared << " B) materialized and compared, " << sample_count
+              << " blocks decoded\n";
+    return 0;
+}
+
 void staging_reuse(DeviceContext& device) {
     // More than one full staging ring, with distinct pages and a partial final block.
     constexpr std::size_t bytes = 5ULL * 64 * 1024 * 1024 + 1024;
@@ -391,11 +561,17 @@ int main(int argc, char** argv) {
         DeviceContext device;
         if (argc == 3 && (std::string_view(argv[1]) == "--artifact" ||
                           std::string_view(argv[1]) == "--writer-fixture")) {
-            file_roundtrip(device, argv[2], std::string_view(argv[1]) == "--writer-fixture");
+            const bool writer_fixture = std::string_view(argv[1]) == "--writer-fixture";
+            file_roundtrip(device, argv[2], writer_fixture);
+            if (writer_fixture) { ggml_writer_residencies(device, argv[2]); }
             return 0;
         }
+        if (argc == 4 && std::string_view(argv[1]) == "--ggml-samples") {
+            return ggml_samples(device, argv[2], argv[3]);
+        }
         if (argc != 1) {
-            throw std::invalid_argument("expected [--artifact|--writer-fixture PATH]");
+            throw std::invalid_argument(
+                "expected [--artifact|--writer-fixture PATH] or [--ggml-samples PATH OUT]");
         }
         materialization(device);
         failure_and_host_only(device);
