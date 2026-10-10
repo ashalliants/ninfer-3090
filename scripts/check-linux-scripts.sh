@@ -131,12 +131,19 @@ expect_exit() { # expect_exit <status> <label> <command...>: the command exits w
 # Qwen3.8-27B `tuned`: the two measured flag sets and the speculation-free variant.
 recorded="$(record dflash2 -- qwen38-27b)"
 expect_flags '27B default' "$recorded" \
-  '--spec dflash2 --draft-tokens 7 --lm-head-draft' \
+  '--spec dflash2 --draft-tokens 7 --lm-head-draft --ngram-draft-tokens 15' \
   '--prefill-cublas --prefill-chunk 4096' \
   '--kv-dtype rk4v4' '--gdn-state-fp16' \
   '--vision --vision-residency overlay' '--max-context 262144' '--max-concurrency 1'
 refuse_flag '27B default' "$recorded" '--lm-head-q6'
 refuse_flag '27B default' "$recorded" '--embedding-q4'
+
+# N-gram copies: on with DFlash2 at one lane, off at two unless asked for, never without DFlash2.
+refuse_flag '27B NINFER_NGRAM=off' "$(record ngram_off NINFER_NGRAM=off -- qwen38-27b)" '--ngram-draft-tokens'
+refuse_flag '27B DFlash2 two lanes' "$(record ngram_c2 NINFER_CONCURRENCY=2 -- qwen38-27b)" '--ngram-draft-tokens'
+expect_flags '27B DFlash2 two lanes, NINFER_NGRAM=on' \
+  "$(record ngram_c2_on NINFER_CONCURRENCY=2 NINFER_NGRAM=on -- qwen38-27b)" '--ngram-draft-tokens 15'
+refuse_flag '27B NINFER_SPEC=mtp' "$(record ngram_mtp NINFER_SPEC=mtp -- qwen38-27b)" '--ngram-draft-tokens'
 
 recorded="$(record mtp NINFER_SPEC=mtp -- qwen38-27b tuned)"
 expect_flags '27B NINFER_SPEC=mtp' "$recorded" \
@@ -210,6 +217,11 @@ expect_exit 2 'unknown model' clear_env "${serve_env[@]}" "$root/run.sh" gpt
 expect_exit 2 'profile the model lacks' clear_env "${serve_env[@]}" "$root/run.sh" qwen36-35b-a3b c8
 expect_exit 2 'unknown profile' clear_env "${serve_env[@]}" "$root/run.sh" qwen38-27b fastest
 expect_exit 2 'unknown NINFER_SPEC' clear_env "${serve_env[@]}" NINFER_SPEC=bogus "$root/run.sh" qwen38-27b
+expect_exit 2 'unknown NINFER_NGRAM' clear_env "${serve_env[@]}" NINFER_NGRAM=yes "$root/run.sh" qwen38-27b
+expect_exit 2 'NINFER_NGRAM=on without DFlash2' clear_env "${serve_env[@]}" NINFER_SPEC=mtp NINFER_NGRAM=on \
+  "$root/run.sh" qwen38-27b
+expect_exit 2 'NINFER_NGRAM=on on the 35B' clear_env "${serve_env[@]}" NINFER_NGRAM=on "$root/run.sh" qwen36-35b-a3b
+expect_exit 2 'unknown NINFER_NGRAM on the 35B' clear_env "${serve_env[@]}" NINFER_NGRAM=yes "$root/run.sh" qwen36-35b-a3b
 expect_exit 0 '--help' clear_env "${serve_env[@]}" "$root/run.sh" --help
 
 # Step-down ladder. A desktop holding VRAM can leave too little for the default context, and the

@@ -650,7 +650,8 @@ alternating pairs) when the catch-up ran at the copy width, and costs 43.50 now.
 170 MiB more with the flag on (5,616,887,552 against 5,438,487,040 bytes, the same as the one-lane
 build), and it starts with 991 MiB of device memory free. At two lanes (65,536 tokens) it reserves
 340 MiB more, of which about 100 MiB is actually used after startup (2.61 against 2.71 GiB free).
-The launchers keep the flag off.
+The `tuned` launchers pass the flag with DFlash2 at one lane, their default, and keep it off at two
+lanes unless `NINFER_NGRAM=on` (see [launcher profiles](maintainer/launcher-profiles.md)).
 
 ### Choosing a KV format (RTX 3090, Qwen3.8-27B)
 

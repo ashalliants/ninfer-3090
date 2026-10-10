@@ -85,12 +85,12 @@ the idea is obvious and the obstacle is not.
   one acceptance threshold. The curve is flat in the middle, so two points take most of the spread
   for one extra graph and one bit of per-sequence state.
 
-**2. Copy drafting on the DFlash2 path -- done at one and two lanes; launcher default open.**
+**2. Copy drafting on the DFlash2 path -- done at one and two lanes; on in the one-lane launchers.**
 `--ngram-draft-tokens 15` verifies n-gram copies in 16-column rounds beside DFlash2: +42% decode
 on the agent replay at one lane, up to +76% on turns that return a file; a copy-miss backoff fixed
 reverting a diff (-3.7% to -0.1%). Two lanes copy only for copies of 12+ tokens (the other lane pays
 the 16 columns, about a third slower in those rounds); three or more never copy (2.4x round cost).
-Open: whether the launchers turn it on by default (one lane: +170 MiB planned, fits 188,416 tokens);
+The `tuned` DFlash2 launchers pass it at one lane (+170 MiB planned, fits 188,416 tokens). Open:
 the -0.7% at one lane on output that never copies, which an nsys trace puts in the same kernels each
 running about 1% slower (not attributed; the round bench does not reproduce it); explaining turns
 read -4.8% on the replay but their answers differ between arms (round cost +0.4%). At two lanes the

@@ -21,7 +21,7 @@
 #
 #   NINFER_SPEC=dflash2 (default): fastest at one stream, the full 262,144-token context headless
 #
-#     --spec dflash2 --draft-tokens 7 --lm-head-draft \
+#     --spec dflash2 --draft-tokens 7 --lm-head-draft --ngram-draft-tokens 15 \
 #     --prefill-cublas --prefill-chunk 4096 \
 #     --kv-dtype rk4v4 --gdn-state-fp16 \
 #     --vision --vision-residency overlay
@@ -59,7 +59,7 @@
 # straight to --chat-template; overrides the artifact's built-in template). `tuned` also:
 # NINFER_CONTEXT, NINFER_CONCURRENCY,
 # NINFER_KV_CAPACITY, NINFER_KV_DTYPE, NINFER_SPEC, NINFER_DRAFT_TOKENS, NINFER_PREFILL_CHUNK,
-# NINFER_VISION (on|off), NINFER_VISION_RESIDENCY, NINFER_HOST_CONTEXT_MIB (8192), NINFER_MIN_P (0.03) and
+# NINFER_NGRAM (on|off; n-gram copy drafting, on with DFlash2 at one lane), NINFER_VISION (on|off), NINFER_VISION_RESIDENCY, NINFER_HOST_CONTEXT_MIB (8192), NINFER_MIN_P (0.03) and
 # NINFER_PRESENCE_PENALTY (0.5), the loop guard ("default" keeps the registered preset).
 #
 # SERVING KNOBS, `tuned` only. Each is passed to ninfer-serve only when set, so leaving them all
@@ -155,6 +155,20 @@ case "$model_key/$profile" in
     KV_CAPACITY="${NINFER_KV_CAPACITY:-$CONTEXT}"
     KV_DTYPE="${NINFER_KV_DTYPE:-rk4v4}"
     PREFILL_CHUNK="${NINFER_PREFILL_CHUNK:-$default_chunk}"
+    # N-gram copy drafting rides on DFlash2. At one lane it is on: +42% decode on agent traffic that
+    # writes back files it has read, -0.7% on output that never copies, 170 MiB of VRAM. At two
+    # lanes a copying request slows the other one by up to 19%, so it stays off unless NINFER_NGRAM=on.
+    default_ngram=off
+    [[ "$SPEC" != 'dflash2' || "$CONCURRENCY" != '1' ]] || default_ngram=on
+    NGRAM="${NINFER_NGRAM:-$default_ngram}"
+    case "$NGRAM" in
+      on)
+        [[ "$SPEC" == 'dflash2' ]] || { printf 'NINFER_NGRAM=on needs NINFER_SPEC=dflash2\n' >&2; exit 2; }
+        spec_args+=(--ngram-draft-tokens 15)
+        spec_label="$spec_label + n-gram copies" ;;
+      off) ;;
+      *) printf 'NINFER_NGRAM must be on or off, got %s\n' "$NGRAM" >&2; exit 2 ;;
+    esac
     profile_args=(
       --max-concurrency "$CONCURRENCY" --max-context "$CONTEXT" --kv-capacity "$KV_CAPACITY"
       --kv-dtype "$KV_DTYPE"
@@ -175,6 +189,12 @@ case "$model_key/$profile" in
             spec_label="MTP${NINFER_DRAFT_TOKENS:-3} + draft head" ;;
       none) spec_args=(); spec_label='no speculation' ;;
       *) printf 'NINFER_SPEC must be mtp or none, got %s\n' "$SPEC" >&2; exit 2 ;;
+    esac
+    # DFlash2 is 27B-only and n-gram copy rounds ride on it, so refuse rather than ignore the flag.
+    case "${NINFER_NGRAM:-off}" in
+      off) ;;
+      on) printf 'NINFER_NGRAM=on needs NINFER_SPEC=dflash2, which only qwen38-27b has\n' >&2; exit 2 ;;
+      *) printf 'NINFER_NGRAM must be on or off, got %s\n' "$NINFER_NGRAM" >&2; exit 2 ;;
     esac
     # rk4v4 fits three lanes at the full context even beside a desktop (2026-09-24; four fall 48 MB
     # short there, so a headless card may take NINFER_CONCURRENCY=4). Lanes share the one
