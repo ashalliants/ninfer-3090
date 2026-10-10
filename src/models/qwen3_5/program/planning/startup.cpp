@@ -936,8 +936,8 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     }
     if (options.speculative.ngram_draft_tokens != 0) {
         // A copy round verifies a copy beside DFlash2's sparse verifier. Its window is bounded by
-        // the 16-column verification domain and must exceed the drafter's own window to have a
-        // family of its own.
+        // the 16-column verification domain and may equal the drafter's own window (a copy family
+        // of its own, keyed by kind; batched rounds then propose straight into the frame).
         if (options.speculative.backend != SpeculativeBackend::DFlash2) {
             throw std::invalid_argument("n-gram copy drafting requires the DFlash2 backend");
         }
