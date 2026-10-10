@@ -21,4 +21,16 @@ namespace ninfer::ops {
 void gdn_gating(const Tensor& a, const Tensor& b, const Tensor& A_log, const Tensor& dt_bias,
                 Tensor& g, Tensor& beta, cudaStream_t stream);
 
+/**
+ * The same gates from the decay rate itself, as GGUF exports store it (ssm_a = -exp(A_log)):
+ *
+ *   g[h,t]    = decay[h] * softplus(a[h,t] + dt_bias[h])
+ *   beta[h,t] = sigmoid(b[h,t]).
+ *
+ * `decay` is contiguous FP32 [48]; every other operand, the oracle and the effects are those of
+ * gdn_gating. The decay is applied as stored: no logarithm or exponential of it is formed.
+ */
+void gdn_gating_decay(const Tensor& a, const Tensor& b, const Tensor& decay, const Tensor& dt_bias,
+                      Tensor& g, Tensor& beta, cudaStream_t stream);
+
 } // namespace ninfer::ops

@@ -3,7 +3,15 @@
 #include "core/device.h"
 #include "core/tensor.h"
 
+#include <cstdint>
+
 namespace ninfer::ops {
+
+/// The gate activation of gated_rmsnorm.
+enum class RmsGate : std::uint8_t {
+    Silu,    ///< SiLU(z) = z * sigmoid(z) (Qwen3.5 GDN)
+    Sigmoid, ///< sigmoid(z)
+};
 
 /**
  * Applies RMS normalization over ne[0] and an elementwise SiLU gate. For each logical row r:
@@ -22,5 +30,12 @@ namespace ninfer::ops {
  */
 void gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, float eps, Tensor& out,
                    DeviceExecutionView execution);
+
+/**
+ * The same contract with the gate chosen by `gate`: ideal[d,r] = x[d,r] * inv_r * weight[d] *
+ * act(z[d,r]) with act = SiLU (the form above) or sigmoid. Oracle and criterion are the same.
+ */
+void gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, RmsGate gate, float eps,
+                   Tensor& out, DeviceExecutionView execution);
 
 } // namespace ninfer::ops

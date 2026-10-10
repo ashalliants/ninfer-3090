@@ -6,6 +6,8 @@
 #include "ops/kernel/embed_gather.cuh"
 #include "core/device.h" // CUDA_CHECK
 
+#include <cuda_fp16.h>
+
 #include <algorithm>
 #include <cstdint>
 
@@ -157,6 +159,46 @@ void embed_gather_q8_launch(const Tensor& ids, const Weight& table, Tensor& out,
     embed_gather_q8_kernel<<<grid_for(n), kBlock, 0, stream>>>(
         static_cast<const std::int32_t*>(ids.data), codes, scales,
         static_cast<__nv_bfloat16*>(out.data), d, T, table.padded_shape[1]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+namespace {
+
+// ggml's kvalues_iq4nl (ggml-common.h, llama.cpp b11316).
+__constant__ std::int8_t kIq4nlValues[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
+                                             1,    13,   25,  38,  53,  69,  89,  113};
+
+// IQ4_XS: {fp16 d; u16 scales_h; u8 scales_l[4]; u8 qs[128]} per 256 values. One thread per output
+// value, in ggml's operation order: dl = d * (ls - 32), then y = dl * kvalue, both FP32.
+constexpr int kIq4XsBlockBytes = 136;
+__global__ void embed_gather_iq4_xs_kernel(const std::int32_t* __restrict__ ids,
+                                           const std::uint8_t* __restrict__ table,
+                                           std::int64_t row_bytes, int d,
+                                           __nv_bfloat16* __restrict__ out) {
+    const int v = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+    if (v >= d) { return; }
+    const std::uint8_t* block = table + static_cast<std::int64_t>(ids[t]) * row_bytes +
+                                static_cast<std::int64_t>(v / 256) * kIq4XsBlockBytes;
+    const int ib = (v % 256) / 32, j = v % 32;
+    const auto d_bits = static_cast<unsigned short>(block[0] | (static_cast<unsigned>(block[1]) << 8));
+    const unsigned scales_h = block[2] | (static_cast<unsigned>(block[3]) << 8);
+    const int ls = ((block[4 + ib / 2] >> (4 * (ib % 2))) & 0xF) | (((scales_h >> (2 * ib)) & 3) << 4);
+    const float dl = __half2float(__ushort_as_half(d_bits)) * static_cast<float>(ls - 32);
+    const std::uint8_t q = block[8 + 16 * ib + (j & 15)];
+    const int code       = j < 16 ? (q & 0xF) : (q >> 4);
+    out[static_cast<std::size_t>(t) * d + v] = __float2bfloat16_rn(dl * static_cast<float>(kIq4nlValues[code]));
+}
+
+} // namespace
+
+void embed_gather_ggml_iq4_xs_launch(const Tensor& ids, const Weight& table, Tensor& out,
+                                     cudaStream_t stream) {
+    const int d = out.ne[0];
+    const std::int64_t row_bytes = static_cast<std::int64_t>(d / 256) * kIq4XsBlockBytes;
+    embed_gather_iq4_xs_kernel<<<dim3((d + 255) / 256, ids.ne[0]), 256, 0, stream>>>(
+        static_cast<const std::int32_t*>(ids.data), static_cast<const std::uint8_t*>(table.qdata),
+        row_bytes, d, static_cast<__nv_bfloat16*>(out.data));
     CUDA_CHECK(cudaGetLastError());
 }
 
