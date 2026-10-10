@@ -760,7 +760,32 @@ because C falls in B < C < B + R; Engine resolves it as follows:
 
 Logs report the requested budget, and the effective budget when it differs. A request that cannot
 enforce its budget reports the requested value only. The server does not promise that the model will
-emit nonempty content or a tool call after the marker.
+emit nonempty content or a tool call after the marker. `model_thinking_tokens` in the request log
+counts the model's thinking tokens for every thinking request, with or without a budget.
+
+`--reasoning-loop off|stop|conclude` (default `off`) guards thinking-enabled requests against a
+model that keeps rewriting the same passages in its thinking, which token penalties do not catch
+because every pass varies a little.
+
+- **Check.** Every 512 model-origin thinking tokens, at the end of a decode round, the thinking is
+  split into words (letters, digits and non-ASCII bytes; ASCII case folded) and punctuation marks.
+  The guard fires when at least 25 % of the last 2,000 words lie inside a 12-word passage that
+  occurs at least three times in the last 30,000 words. A passage repeated twice (a recap) does not
+  count. The measure and thresholds are those of Strata's `reasoning_loop_recovery` (measured on
+  other models; NInfer has not re-tuned them).
+- **`stop`** ends the reply there with `finish_reason` `length` (Anthropic `max_tokens`).
+- **`conclude`** commits the same control span a reached thinking budget does (Qwen's early-close
+  guidance plus `</think>`), so the model answers from the thinking it has; no prompt is read again.
+  When the remaining output budget cannot hold the span and one more token, or the request's
+  thinking budget could not be enforced (early close unavailable, above), it stops instead.
+- It applies to constrained requests too (tool constraints, `response_format`): the control span
+  goes through the same grammar-checked path as a thinking budget, so a constrained request can
+  still answer or call a tool after `conclude`. With `stop`, a constrained request ends as an
+  interrupted one (completed calls only).
+- The console line and the request log (`reasoning_loop_detected`,
+  `reasoning_loop_thinking_tokens`, `reasoning_loop_coverage`) record each firing; `server_start`
+  records the mode as `reasoning_loop`. It can mistake a long, deliberately repeated checklist for a
+  loop; keep it off where the thinking legitimately repeats whole passages.
 
 For Chat Completions, `reasoning_effort: "none"` requests disabled thinking. The other standard
 values (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`) reach the template on its three rungs:
@@ -916,8 +941,8 @@ wire response contains typed `output` Items.
 | `graft` | NInfer extension: name of a [prompt graft](#prompt-grafts), or `null`; also accepted by input token count |
 | `thinking_budget` | NInfer extension: positive per-request [thinking cap](#openai-chat-completions), or `null`; rejected by input token count, which does not generate |
 | `text.format` | `text` (default), `json_object`, or `json_schema`; see [Output constraints](#output-constraints) |
-| `tools` | direct function definitions or namespace groups containing function definitions; see below |
-| `tool_choice` | `auto`, `none`, `required`, a named function, or function-only `allowed_tools` with mode `auto`/`required`; namespaced selection carries both `namespace` and `name` |
+| `tools` | direct function and free-form `custom` definitions, or namespace groups containing them; see below |
+| `tool_choice` | `auto`, `none`, `required`, a named function or `custom` tool, or `allowed_tools` of function and custom entries with mode `auto`/`required`; namespaced selection carries both `namespace` and `name` |
 | `parallel_tool_calls` | `true` by default; `false` enforces at most one call |
 | `max_tool_calls` | non-negative integer accepted as a hosted-tool no-op; NInfer does not execute hosted tools |
 | `truncation` | omitted or `disabled`; overlong input fails instead of silently dropping Items |
@@ -946,11 +971,14 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 | `reasoning` | raw replay Item with `reasoning_text` content; summary/encrypted metadata may accompany raw text but cannot replace it |
 | `function_call` | completed assistant call with optional `id` and namespace, plus required `call_id`, `name`, and JSON-object string `arguments` |
 | `function_call_output` | completed result with required `call_id` and optional matching name/namespace assertion; `output` may be a string or a non-empty array of `input_text`/`input_image` parts |
+| `custom_tool_call` | completed assistant call of a [custom tool](#custom-tools) with optional `id` and namespace, plus required `call_id`, `name`, and string `input` |
+| `custom_tool_call_output` | as `function_call_output`, for a custom tool's call |
 
 Contiguous assistant-owned Items form one assistant history turn in the representable order
-`reasoning` -> assistant message content -> `function_call`. Multiple message Items append their
-content parts, multiple calls retain declaration order, and a reasoning-only turn is retained. A
-user, system, developer, or `function_call_output` Item ends the group; an order that would require
+`reasoning` -> assistant message content -> `function_call`/`custom_tool_call`. Multiple message
+Items append their content parts, multiple calls retain declaration order, and a reasoning-only turn
+is retained. A user, system, developer, `function_call_output`, or `custom_tool_call_output` Item
+ends the group; an order that would require
 rearranging assistant content fails with `invalid_assistant_history`. Results are validated by
 `call_id` and reordered to call declaration order before prompt rendering; unknown, duplicate, or
 unrepresentable partial result sets fail with `invalid_tool_history`. Canonical input Items retain
@@ -1013,8 +1041,44 @@ NInfer renders these definitions in the Qwen prompt and parses model output into
 `call_id` (`call_...`). The client executes the function and sends a `function_call_output` Item in
 a later request. Selection and strict argument enforcement follow the common tool contract above.
 
-Hosted tools, remote MCP tools, custom free-form tools, deferred loading, output schemas, and
-caller restrictions that exclude direct invocation remain unsupported.
+### Custom tools
+
+Free-form `custom` tools take raw text instead of JSON arguments. Codex declares `apply_patch` this
+way:
+
+```json
+{
+  "type": "custom",
+  "name": "apply_patch",
+  "description": "Use the `apply_patch` tool to edit files.",
+  "format": {"type": "grammar", "syntax": "lark", "definition": "start: begin_patch hunk+ end_patch\n..."}
+}
+```
+
+The model sees a strict function under the tool's own name with one required string parameter,
+`input`; the function keeps the tool's description, and the parameter's description says the input
+is passed exactly as written and, for a `grammar` format, includes its `syntax` and `definition`.
+The declared format is **advisory**: it is shown to the model, but neither a lark nor a regex
+grammar is enforced on the generated text. What is enforced is the strict lowering: tool framing is
+constrained, `input` is the call's only and required argument, and its text is returned byte for
+byte (leading spaces, blank lines and all), except that it cannot contain a line break directly
+followed by `</parameter>`, which is the Qwen tool format's value delimiter. Like any strict tool,
+a request declaring a custom tool is constrained even with `tool_constraints:"auto"`, so it cannot
+use custom `stop` strings.
+
+A generated call returns as a `custom_tool_call` Item (`ctc_...`) with a `call_id` (`call_...`),
+`name` (and `namespace` when declared in one) and the raw `input`. Streaming emits
+`response.output_item.added` (with empty `input`), one `response.custom_tool_call_input.delta`
+carrying the input, `response.custom_tool_call_input.done` with the complete input, then
+`response.output_item.done`; as for function calls, these events are sent once generation finishes.
+The client returns its result as a `custom_tool_call_output` Item. Custom tools may be named by
+`tool_choice: {"type":"custom","name":...}` and listed as `custom` entries in `allowed_tools`.
+Referring to a custom tool as a function, or the reverse, fails (`duplicate_tool_name` in `tools`,
+`invalid_tool_choice` in `tool_choice`, `invalid_tool_history` in `input`). Custom tools are
+accepted only on the Responses endpoint; Chat Completions still rejects them.
+
+Hosted tools, remote MCP tools, deferred loading, output schemas, and caller restrictions that
+exclude direct invocation remain unsupported.
 
 ### Response object and usage
 
@@ -1023,7 +1087,7 @@ A terminal wire response has `object: "response"`, one of `completed`, `incomple
 
 - a `reasoning` Item containing raw `reasoning_text` and an empty summary;
 - an assistant `message` containing an `output_text` part;
-- one or more `function_call` Items.
+- one or more `function_call` or [`custom_tool_call`](#custom-tools) Items.
 
 Ordinary model/string stops produce `completed`. Output-token or context-capacity exhaustion
 produces `incomplete` with `incomplete_details.reason: "max_output_tokens"`. Errors accepted after
@@ -1068,7 +1132,8 @@ The normal lifecycle is:
 4. matching `*.done`, `response.content_part.done`, and `response.output_item.done` events;
 5. exactly one `response.completed`, `response.incomplete`, or `response.failed` terminal event.
 
-Function arguments use `response.function_call_arguments.delta` and `.done`. IDs, output indices,
+Function arguments use `response.function_call_arguments.delta` and `.done`; a custom tool's input
+uses `response.custom_tool_call_input.delta` and `.done`. IDs, output indices,
 and content indices remain stable, and concatenated deltas equal the terminal Item. Responses SSE
 does not emit the Chat Completions `[DONE]` sentinel. With tools enabled, ordinary answer text still
 streams immediately; only an ambiguous `<tool_call>` suffix or the structured tool region is held.
@@ -1116,8 +1181,8 @@ stored.
 ### Responses input token count
 
 `POST /v1/responses/input_tokens` uses the same prompt path as Create and does not run generation.
-It accepts `model`, `input`, `instructions`, `previous_response_id`, reasoning, function tools and
-tool choice, supported text/truncation values, and the `preserve_thinking` extension. Parent lookup,
+It accepts `model`, `input`, `instructions`, `previous_response_id`, reasoning, function and custom
+tools and tool choice, supported text/truncation values, and the `preserve_thinking` extension. Parent lookup,
 call-ID normalization, template rendering, and media expansion are therefore identical to the
 corresponding Create request:
 
@@ -1133,7 +1198,7 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 
 Unsupported Create fields include Conversations, prompt templates, context management, hosted
 moderation, non-empty `include`, background execution, compaction,
-files/audio, and OpenAI-hosted/MCP/custom tools. These are compatibility boundaries, not silently
+files/audio, and OpenAI-hosted/MCP tools. These are compatibility boundaries, not silently
 accepted placeholders.
 
 ## Anthropic Messages
@@ -1328,12 +1393,12 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 | unset |
 | `--lm-head-draft` | optimized proposal head; implied by `--spec`, accepted for compatibility | on with `--spec` |
-| `--lookup-ngram N` | context-lookup drafting alongside `--spec`: the last `N` tokens are matched against the sequence so far and what followed is proposed; exact, since verification rejects a wrong guess | `0` (off) |
 | `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [performance](performance.md)) | off |
 | `--no-prefill-cublas-projections` | with `--prefill-cublas`, keep the attention and GDN input projections off that route | projections on |
 | `--default-max-tokens N` | output limit when omitted by a request; see [default output limit](#default-output-limit) | the remaining context |
 | `--max-output-tokens N` | upper bound on every request's output budget, stated or derived; see [default output limit](#default-output-limit) | none |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
+| `--reasoning-loop off\|stop\|conclude` | reasoning-loop guard for thinking-enabled requests: end the reply or close the thinking when it keeps repeating whole passages (details under [OpenAI Chat Completions](#openai-chat-completions)) | `off` |
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--vision-residency resident\|overlay` | `overlay` keeps the Vision tower in pinned host memory and encodes each image inside a window borrowed from free KV pages, or from the evict-ranked text weight tail when those fall short, so `--vision` no longer reserves device memory and `--kv-capacity auto` resolves the no-vision capacity; requires `--vision` and CUDA virtual memory management | `resident` |
 | `--vision-max-merged N` | merged-token budget of one media item, `[64, 16384]`; larger images and video frame pairs are downscaled at preprocessing instead of being rejected, and the overlay window is sized for it | 16384 |
@@ -1398,7 +1463,7 @@ in append mode and flushes every event, so successive model or MTP blocks may sh
 file. The parent directory must already exist. Failure to open the file aborts startup; the log path
 is also rejected if it resolves to the model artifact.
 
-Every line is one `ninfer_serve_request_log` schema-v26 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v27 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
@@ -1409,7 +1474,7 @@ they do not infer request behavior from process-global counter deltas.
 | `server_start` | build version, artifact path, architecture, public name, actual formats and prefill signature; resolved Engine and context-cache capacities, thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, unified Host context capacity and occupancy, KV sizing ledger, CUDA Graph allowance, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, requested reasoning effort, actual initial thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, requested reasoning effort, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
-| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, preemption/recovery counters, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, preemption/recovery counters, thinking-budget application counters, model thinking tokens, reasoning-loop guard firing, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters |
 | `request_scheduling` | request identity, pause/restore/recovery transitions, Snapshot revocation, Engine observation time and cumulative global/request work counters |
 | `request_error` | the resolved request configuration and the generation, cancellation, or pre-outcome transport terminal message |
 | `throughput` | interval token/decode/context-cache pressure counter deltas, authoritative worker Host-work deltas, current scheduler/resource gauges, and decode-round batch statistics |
