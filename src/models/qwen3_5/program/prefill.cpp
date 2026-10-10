@@ -300,10 +300,15 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     std::array<ops::GdnReplayFoldRow, kMaximumConcurrency> fold_rows{};
     std::array<std::int32_t, kMaximumConcurrency> hidden_selectors{};
     bool needs_hidden_correction = false;
+    // One round produced the whole batch, so its egress, frame and ReplaySSM records are laid out
+    // at that round family's width.
+    const std::uint32_t verify_drafts =
+        lanes.front() < max_concurrency ? requests[lanes.front()].pending.verify_drafts : 0U;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
         if (lane >= max_concurrency || requests[lane].lifecycle != Lifecycle::Pending ||
-            requests[lane].pending.kind != PendingKind::Speculative) {
+            requests[lane].pending.kind != PendingKind::Speculative ||
+            requests[lane].pending.verify_drafts != verify_drafts) {
             throw std::logic_error("speculative pending batch no longer matches Program state");
         }
         const PendingCandidate& pending = requests[lane].pending;
@@ -345,7 +350,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         // Each StateImage shard folds its own layers on the stream of the device that holds it.
         {
             const RankBinding bind(device, state_images->shard(0).rank);
-            replay_fold->execute(fold_span, compute_streams[state_images->shard(0).rank]);
+            round_replay_fold(verify_drafts)
+                .execute(fold_span, compute_streams[state_images->shard(0).rank]);
         }
         for (std::size_t shard = 1; shard < state_images->shard_count(); ++shard) {
             const std::size_t rank = state_images->shard(shard).rank;
@@ -355,15 +361,15 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
 
         // Sparse acceptance reads counts. Publish only the prefix licensed by the Frontend.
         if (speculative_backend == SpeculativeBackend::DFlash2) {
+            const Tensor licensed = io.dflash_decode->narrowed(verify_drafts).licensed_tokens;
             for (std::size_t row = 0; row < lanes.size(); ++row) {
                 if (discarded[row] || !requests[lanes[row]].sampling_host.token_counts) {
                     continue;
                 }
                 const auto count = static_cast<std::int32_t>(accepted_tokens[row]);
-                Tensor ids =
-                    io.dflash_decode->licensed_tokens.slice(1, static_cast<std::int32_t>(row), 1)
-                        .slice(0, 0, count)
-                        .view({count});
+                Tensor ids       = licensed.slice(1, static_cast<std::int32_t>(row), 1)
+                                 .slice(0, 0, count)
+                                 .view({count});
                 Tensor counts =
                     token_counts.slice(1, static_cast<std::int32_t>(lanes[row]), 1)
                         .view({dimension(parameters.model.resources().public_token_count)});
@@ -384,9 +390,9 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                 selected     = frame.target_continuation_hidden.slice(1, 0, batch);
                 destinations = frame.state_destination_slots.slice(0, 0, batch);
             } else if (is_masked_draft_backend(speculative_backend) && io.dflash_decode) {
-                qwen3_5::DFlashDecodeState& frame = *io.dflash_decode;
-                selector_tensor                   = frame.proposal_extents.slice(0, 0, batch);
-                hidden                            = frame.target_hidden.slice(2, 0, batch);
+                const qwen3_5::DFlashDecodeState frame = io.dflash_decode->narrowed(verify_drafts);
+                selector_tensor                        = frame.proposal_extents.slice(0, 0, batch);
+                hidden                                 = frame.target_hidden.slice(2, 0, batch);
                 selected     = frame.target_continuation_hidden.slice(1, 0, batch);
                 destinations = frame.state_destination_slots.slice(0, 0, batch);
             } else {
@@ -436,7 +442,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     }
 
     const double tail_seconds = std::chrono::duration<double>(Clock::now() - tail_started).count();
-    const std::uint32_t width = draft_window + 1U;
+    const std::uint32_t width = verify_drafts + 1U;
     try {
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence = active_sequence(lanes[row]);

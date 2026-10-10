@@ -152,6 +152,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       kv_capacity(plan.kv_capacity), max_concurrency(plan.max_concurrency),
       context_cache(plan.context_cache), prefill_chunk(plan.prefill_chunk),
       draft_window(plan.draft_window),
+      max_verify_drafts(detail::max_verify_drafts(plan.round_shapes)),
       speculative_backend(plan.speculative_backend),
       kv_storage(plan.kv_storage), proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
@@ -249,6 +250,22 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             extra_replay_fold.push_back(std::make_unique<ops::GdnReplayFoldPlan>(
                 *extra_replay_records.back(), state_images->linear(shard).all_layers_view()));
         }
+        for (const SpeculativeRoundShape& shape : plan.round_shapes) {
+            if (shape.verify_drafts == max_verify_drafts ||
+                round_replay_records(shape.verify_drafts) != nullptr) {
+                continue;
+            }
+            if (state_images->shard_count() != 1) {
+                throw std::logic_error("pipeline stages verify every round at one width");
+            }
+            GdnReplayRecords narrowed =
+                replay_records->narrowed(static_cast<std::int32_t>(shape.verify_drafts + 1U));
+            ops::GdnReplayFoldPlan fold(narrowed, state_images->linear(0).all_layers_view());
+            narrow_replay_views.push_back(NarrowReplayView{narrowed, std::move(fold)});
+        }
+    }
+    for (const SpeculativeRoundShape& shape : plan.round_shapes) {
+        round_families.push_back(SpeculativeRoundFamily{.shape = shape});
     }
     if (parameters.text.split_execution()) {
         stage_runtime = make_stage_runtime(device, parameters, *state_images, plan);
@@ -374,7 +391,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         grammar_masks_host.emplace(grammar_masks_device.bytes());
     }
     if (is_masked_draft_backend(speculative_backend)) {
-        dflash_draft_handoff.emplace(device, draft_window * max_concurrency);
+        dflash_draft_handoff.emplace(device, max_verify_drafts * max_concurrency);
     }
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
         lane_epochs[lane]    = 1;

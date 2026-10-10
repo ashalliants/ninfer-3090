@@ -116,6 +116,20 @@ void collect_shape_changes(std::uint32_t lo, std::uint32_t hi, const Shapes& sha
 
 } // namespace
 
+std::vector<SpeculativeRoundShape> speculative_round_shapes(SpeculativeBackend backend,
+                                                            std::uint32_t draft_window) {
+    if (backend == SpeculativeBackend::None) { return {}; }
+    return {{SpeculativeRoundKind::Neural, draft_window}};
+}
+
+std::uint32_t max_verify_drafts(std::span<const SpeculativeRoundShape> shapes) noexcept {
+    std::uint32_t widest = 0;
+    for (const SpeculativeRoundShape& shape : shapes) {
+        widest = std::max(widest, shape.verify_drafts);
+    }
+    return widest;
+}
+
 std::vector<GraphExecutionProfile> ordinary_graph_profiles(std::uint32_t capacity) {
     // E+1 is the one-token visible window; all tiers share one topology per exact B.
     return causal_resource_profiles(capacity, 1);
@@ -218,11 +232,12 @@ execution::MtpCausalAttentionEnvelopes mtp_causal_attention_envelopes(std::uint3
     return out;
 }
 
-execution::DFlashEnvelopes dflash_envelopes(std::uint32_t max_frontier, std::uint32_t k) {
+execution::DFlashEnvelopes dflash_envelopes(std::uint32_t max_frontier,
+                                            std::uint32_t append_drafts) {
     return execution::DFlashEnvelopes{
         .local  = {0, max_frontier},
         .full   = {0, max_frontier},
-        .append = {0, k + 1},
+        .append = {0, append_drafts + 1},
     };
 }
 

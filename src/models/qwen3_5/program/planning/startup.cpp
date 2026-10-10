@@ -197,6 +197,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     }
     out.state_images =
         qwen3_5::plan_state_image_device_pool(builder_pointers, state_shards, state_image_spec);
+    // Every per-round buffer below holds the widest round family; a round views it at its own
+    // width.
+    const std::uint32_t verify_drafts = max_verify_drafts(plan.round_shapes);
     if (plan.speculative_backend != SpeculativeBackend::None) {
         // A stage records only the GDN layers it holds, in its own device's memory.
         for (std::size_t shard = 0; shard < state_shards.size(); ++shard) {
@@ -205,7 +208,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 GdnReplayRecordSpec{
                     .layers          = static_cast<std::int32_t>(state_shards[shard].layers),
                     .record_capacity = static_cast<std::int32_t>(plan.max_concurrency),
-                    .width           = static_cast<std::int32_t>(plan.draft_window + 1U),
+                    .width           = static_cast<std::int32_t>(verify_drafts + 1U),
                     .conv_channels   = (config.gdn ? dimension(config.gdn->conv_channels()) : 0),
                     .qk_heads = (config.gdn ? dimension(config.gdn->linear_num_key_heads) : 0),
                     .value_heads =
@@ -271,7 +274,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             dflash.pending_features  = add_tensor(
                 builder, DType::BF16,
                 {dimension(config.hidden_size * std::uint64_t(draft->target_layer_ids.size())),
-                  static_cast<std::int32_t>(plan.draft_window + 1U),
+                  static_cast<std::int32_t>(verify_drafts + 1U),
                   static_cast<std::int32_t>(plan.max_concurrency)},
                 "DFlash pending target features");
         }
@@ -281,7 +284,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         builder, qwen3_5::RoundStateSpec{.hidden         = dimension(config.hidden_size),
                                          .output_rows    = dimension(config.vocab_size),
                                          .batch_capacity = plan.max_concurrency,
-                                         .draft_window   = plan.draft_window,
+                                         .draft_window   = verify_drafts,
                                          .backend        = plan.speculative_backend,
                                          .causal_scoring = plan.causal_scoring});
     out.prefill_hidden =
@@ -298,7 +301,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         out.grammar_masks =
             add_tensor(builder, DType::I32,
                        {dimension((parameters.model.resources().public_token_count + 31) / 32),
-                        static_cast<std::int32_t>(plan.draft_window + 1),
+                        static_cast<std::int32_t>(verify_drafts + 1U),
                         static_cast<std::int32_t>(plan.max_concurrency)},
                        "grammar token masks");
         out.token_counts        = add_tensor(builder, DType::I32,
@@ -757,25 +760,34 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             };
 
             out.dflash_context = dflash_context_capacity(chunk, 1, false);
+            // The drafter proposes at its own width and the context catch-up appends at the
+            // widest family's; each family verifies and accepts at its own.
+            const auto append_width =
+                static_cast<std::int32_t>(max_verify_drafts(plan.round_shapes)) + 1;
             for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
                  ++batch) {
-                const std::int32_t aggregate = verify * batch;
-                WorkspaceLayoutBuilder target;
-                matrix(target, DType::BF16, dimension(config.hidden_size), aggregate);
-                target_body(target, aggregate, aggregate, qwen3_5::TextPhase::Verify,
-                            GdnWorkspacePath::ReplayRecord, batch, verify, verify, text_envelope);
-                const std::size_t accept =
-                    draft->dflash2.has_value()
-                        ? ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
-                              dimension(parameters.model.resources().public_token_count), {false},
-                              drafts, drafts, batch, batch)
-                        : ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
-                              dimension(parameters.model.resources().public_token_count), drafts,
-                              drafts, batch, batch);
                 const std::size_t proposal = dflash_proposal_capacity(verify, batch);
-                out.dflash_round =
-                    std::max({out.dflash_round, finish(target), accept,
-                              dflash_context_capacity(verify, batch, true), proposal});
+                const std::size_t append   = dflash_context_capacity(append_width, batch, true);
+                out.dflash_round           = std::max({out.dflash_round, proposal, append});
+                for (const SpeculativeRoundShape& shape : plan.round_shapes) {
+                    const auto round_drafts      = static_cast<std::int32_t>(shape.verify_drafts);
+                    const std::int32_t columns   = round_drafts + 1;
+                    const std::int32_t aggregate = columns * batch;
+                    WorkspaceLayoutBuilder target;
+                    matrix(target, DType::BF16, dimension(config.hidden_size), aggregate);
+                    target_body(target, aggregate, aggregate, qwen3_5::TextPhase::Verify,
+                                GdnWorkspacePath::ReplayRecord, batch, columns, columns,
+                                text_envelope);
+                    const std::size_t accept =
+                        draft->dflash2.has_value()
+                            ? ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
+                                  dimension(parameters.model.resources().public_token_count),
+                                  {false}, round_drafts, round_drafts, batch, batch)
+                            : ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+                                  dimension(parameters.model.resources().public_token_count),
+                                  round_drafts, round_drafts, batch, batch);
+                    out.dflash_round = std::max({out.dflash_round, finish(target), accept});
+                }
             }
         }
     }
@@ -950,7 +962,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->multiprocessor_count = inputs.multiprocessor_count;
     impl->context_cache        = inputs.context_cache;
     impl->kv_storage           = inputs.kv_storage;
-    impl->persistent           = persistent_layout(*impl);
+    impl->round_shapes = speculative_round_shapes(inputs.speculative_backend, inputs.draft_window);
+    impl->persistent   = persistent_layout(*impl);
     if (!impl->context_cache.host_capacity_bytes) {
         // Default Host capacity covers 8 GiB of KV bytes plus eight complete StateImages.
         impl->context_cache.host_capacity_bytes =
@@ -998,27 +1011,33 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
                                                       "MTP exact-b graph allowance");
         } else {
-            const auto class_allowance = [&](std::uint32_t batch_size) {
+            const auto class_allowance = [&](std::uint32_t verify_drafts,
+                                             std::uint32_t batch_size) {
                 const auto profiles = dflash_graph_profiles(
-                    impl->speculative_backend, impl->capacity, impl->draft_window, batch_size);
+                    impl->speculative_backend, impl->capacity, verify_drafts, batch_size);
                 return graph_topology_allowance(
                     profiles,
                     [&](GraphExecutionProfile profile) {
                         const std::uint64_t final_visible = std::min<std::uint64_t>(
                             impl->capacity,
-                            static_cast<std::uint64_t>(profile.max) + impl->draft_window + 1ULL);
+                            static_cast<std::uint64_t>(profile.max) + verify_drafts + 1ULL);
                         // Long profiles also materialize driver execution storage; that shared
                         // cost does not shrink with the number of graph executables.
                         return (final_visible <= 4096 ? 64ULL : 192ULL) * kMiB;
                     },
                     "DFlash graph allowance");
             };
-            // Forward retains the draft's topology classes; finish has one small executable
-            // per exact B, independently of context length.
-            for (std::uint32_t batch_size = 1; batch_size <= impl->max_concurrency; ++batch_size) {
-                impl->graph_allowance_bytes = checked_add(
-                    impl->graph_allowance_bytes, class_allowance(batch_size) + 8ULL * kMiB,
-                    "DFlash exact-b graph allowance");
+            // Each round family captures its own executables. Forward retains the draft's
+            // topology classes; finish has one small executable per exact B, independently of
+            // context length.
+            for (const SpeculativeRoundShape& shape : impl->round_shapes) {
+                for (std::uint32_t batch_size = 1; batch_size <= impl->max_concurrency;
+                     ++batch_size) {
+                    impl->graph_allowance_bytes =
+                        checked_add(impl->graph_allowance_bytes,
+                                    class_allowance(shape.verify_drafts, batch_size) + 8ULL * kMiB,
+                                    "DFlash exact-b graph allowance");
+                }
             }
         }
     }

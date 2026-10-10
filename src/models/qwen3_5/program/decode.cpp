@@ -86,6 +86,40 @@ namespace ninfer::models::qwen3_5::detail {
 
 namespace {} // namespace
 
+const GdnReplayRecords* ProgramImpl::round_replay_records(std::uint32_t verify_drafts) const {
+    if (!replay_records) { return nullptr; }
+    if (verify_drafts == max_verify_drafts) { return &*replay_records; }
+    for (const NarrowReplayView& view : narrow_replay_views) {
+        if (view.records.spec.width == static_cast<std::int32_t>(verify_drafts + 1U)) {
+            return &view.records;
+        }
+    }
+    return nullptr;
+}
+
+const ops::GdnReplayFoldPlan& ProgramImpl::round_replay_fold(std::uint32_t verify_drafts) const {
+    if (!replay_fold) { throw std::logic_error("speculative round has no ReplaySSM fold"); }
+    if (verify_drafts == max_verify_drafts) { return *replay_fold; }
+    for (const NarrowReplayView& view : narrow_replay_views) {
+        if (view.records.spec.width == static_cast<std::int32_t>(verify_drafts + 1U)) {
+            return view.fold;
+        }
+    }
+    throw std::logic_error("speculative round width has no ReplaySSM fold");
+}
+
+SpeculativeRoundFamily& ProgramImpl::round_family(SpeculativeRoundKind kind, std::uint32_t drafts) {
+    SpeculativeRoundFamily* best = nullptr;
+    for (SpeculativeRoundFamily& family : round_families) {
+        if (family.shape.kind != kind || family.shape.verify_drafts < drafts) { continue; }
+        if (best == nullptr || family.shape.verify_drafts < best->shape.verify_drafts) {
+            best = &family;
+        }
+    }
+    if (best == nullptr) { throw std::logic_error("no speculative round family holds the round"); }
+    return *best;
+}
+
 void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& request,
                                    const ops::SamplingConfig& config) {
     Tensor counts = token_counts.slice(1, static_cast<std::int32_t>(sequence.lane), 1)
@@ -137,12 +171,15 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
         throw std::logic_error("DFlash context append has invalid membership");
     }
 
-    std::uint32_t minimum_count = draft_window + 1U;
-    std::uint32_t maximum_count = 0;
-    *dflash_host_ingress        = {};
+    // A terminal round appends at most its own verified columns; pending features and append
+    // positions are allocated at the widest family.
+    const std::uint32_t append_width = max_verify_drafts + 1U;
+    std::uint32_t minimum_count      = append_width;
+    std::uint32_t maximum_count      = 0;
+    *dflash_host_ingress             = {};
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
-        if (lane >= max_concurrency || counts[row] == 0 || counts[row] > draft_window + 1U ||
+        if (lane >= max_concurrency || counts[row] == 0 || counts[row] > append_width ||
             std::find(lanes.begin(), lanes.begin() + static_cast<std::ptrdiff_t>(row), lane) !=
                 lanes.begin() + static_cast<std::ptrdiff_t>(row)) {
             throw std::logic_error("DFlash context append contains an invalid row");
@@ -194,7 +231,7 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
     work.reset();
     Tensor features =
         work.alloc(DType::BF16, {dimension(parameters.draft->feature_projection.weight.k),
-                                 static_cast<std::int32_t>(draft_window + 1U), batch});
+                                 static_cast<std::int32_t>(append_width), batch});
     ops::prepare_ragged_prefix(dflash->pending_features, active_lane_tensor, device_starts,
                                device_ends, features, positions, device_counts, device.stream);
 
@@ -399,11 +436,14 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
         execution::MtpCausalAttentionEnvelopes envelopes =
             mtp_causal_attention_envelopes(maximum_frontier, draft_window, capacity);
         if (use_cuda_graph) {
+            // An MTP round verifies its own proposal: the neural family at the draft window.
+            SpeculativeRoundFamily& family =
+                round_family(SpeculativeRoundKind::Neural, draft_window);
             const auto batch = static_cast<std::uint32_t>(lanes.size());
-            auto& profile    = speculative_forward_graphs.select(batch, maximum_frontier);
-            forward          = &speculative_forward_graphs.install(profile);
-            finish           = &speculative_finish_graphs.install(
-                speculative_finish_graphs.select(batch, maximum_frontier));
+            auto& profile    = family.forward.select(batch, maximum_frontier);
+            auto& completion = family.finish.select(batch, maximum_frontier);
+            forward          = &family.forward.install(profile);
+            finish           = &family.finish.install(completion);
             envelopes = mtp_causal_attention_envelopes(profile.max_execution_frontier, draft_window,
                                                        capacity);
         }
@@ -517,6 +557,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
                 .base_S        = base_S,
                 .prompt_tokens = 0,
                 .produced      = static_cast<std::uint32_t>(count_i),
+                .verify_drafts = draft_window,
             };
             request.lifecycle = Lifecycle::Pending;
             request.timings.decode_seconds += seconds;
@@ -555,7 +596,11 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         throw std::invalid_argument("DFlash batch membership is invalid");
     }
 
-    const std::uint32_t width           = draft_window + 1U;
+    // Every row of a round verifies at its family's width; the frame, egress and ReplaySSM records
+    // are viewed at it.
+    SpeculativeRoundFamily& family      = round_family(SpeculativeRoundKind::Neural, draft_window);
+    const std::uint32_t verify_drafts   = family.shape.verify_drafts;
+    const std::uint32_t width           = verify_drafts + 1U;
     std::uint32_t maximum_frontier      = 0;
     std::uint32_t maximum_target_tokens = 1;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -575,7 +620,9 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             sequence.execution_frontier >= capacity ||
             sequence.text_kv_valid != sequence.execution_frontier ||
             sequence.dflash_context_frontier > sequence.execution_frontier ||
-            sequence.execution_frontier - sequence.dflash_context_frontier > width ||
+            // Catch-up covers the previous round's verified columns, from any family.
+            sequence.execution_frontier - sequence.dflash_context_frontier >
+                max_verify_drafts + 1U ||
             sequence.ledger_frontier != sequence.execution_frontier + 1 ||
             sequence.ledger.size() != sequence.ledger_frontier ||
             sequence.prefix_identity.size() != sequence.ledger_frontier ||
@@ -586,7 +633,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                                                 ? budgets[row].generated_tokens_remaining - 1U
                                                 : 0U;
         const std::uint32_t extent =
-            std::min({draft_window, max_by_budget, capacity - sequence.execution_frontier - 1U});
+            std::min({verify_drafts, max_by_budget, capacity - sequence.execution_frontier - 1U});
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
         maximum_target_tokens =
             std::max(maximum_target_tokens, sequence.execution_frontier + extent + 1U);
@@ -604,19 +651,20 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         }
         DecodeGraphExecutable* forward       = nullptr;
         DecodeGraphExecutable* finish        = nullptr;
-        execution::DFlashEnvelopes envelopes = dflash_envelopes(maximum_frontier, draft_window);
+        execution::DFlashEnvelopes envelopes =
+            dflash_envelopes(maximum_frontier, max_verify_drafts);
         ops::CausalAttentionExecutionEnvelope target_envelope{1, maximum_target_tokens};
         if (use_cuda_graph) {
             const auto batch = static_cast<std::uint32_t>(lanes.size());
-            auto& profile    = speculative_forward_graphs.select(batch, maximum_frontier);
-            forward          = &speculative_forward_graphs.install(profile);
-            finish           = &speculative_finish_graphs.install(
-                speculative_finish_graphs.select(batch, maximum_frontier));
-            envelopes       = dflash_envelopes(profile.max_execution_frontier, draft_window);
+            auto& profile    = family.forward.select(batch, maximum_frontier);
+            auto& completion = family.finish.select(batch, maximum_frontier);
+            forward          = &family.forward.install(profile);
+            finish           = &family.finish.install(completion);
+            envelopes       = dflash_envelopes(profile.max_execution_frontier, max_verify_drafts);
             target_envelope = {
                 1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
                        capacity, static_cast<std::uint64_t>(profile.max_execution_frontier) +
-                                     draft_window + 1ULL))};
+                                     verify_drafts + 1ULL))};
         }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -627,7 +675,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                                                     ? budgets[row].generated_tokens_remaining - 1U
                                                     : 0U;
             const std::uint32_t extent =
-                std::min({draft_window, max_by_budget, capacity - frontier - 1U});
+                std::min({verify_drafts, max_by_budget, capacity - frontier - 1U});
             dflash_host_ingress->anchors[row] = sequence.ledger.back();
             dflash_host_ingress->execution_frontiers[row] =
                 checked_i32(frontier, "DFlash batch frontier");
@@ -656,9 +704,8 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         }
 
         execution::DFlashBatchContext schedule_state{
-            {device, parameters, work, state_images->linear(0),
-             replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, stage_runtime.get()},
+            {device, parameters, work, state_images->linear(0), round_replay_records(verify_drafts),
+             io, prefill_hidden, prefill_chunk, proposal_head, stage_runtime.get()},
             decoder->text_kv,
             *dflash,
             *io.dflash_decode,
@@ -670,7 +717,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
 
         mark_workspace_usage(workspace_plan.dflash_round);
         const auto batch = static_cast<std::int32_t>(lanes.size());
-        execution::dflash_decode_batch(schedule_state, batch, draft_window, envelopes,
+        execution::dflash_decode_batch(schedule_state, batch, verify_drafts, envelopes,
                                        target_envelope, forward,
                                        execution::SpeculativePhase::Forward);
         if (constrained) {
@@ -683,10 +730,10 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                 const auto extent =
                     static_cast<std::size_t>(dflash_host_ingress->proposal_extents[row]);
                 (void)fill_grammar_mask(
-                    masks, row, schedule_state.host_drafts.subspan(row * draft_window, extent));
+                    masks, row, schedule_state.host_drafts.subspan(row * verify_drafts, extent));
             }
         }
-        execution::dflash_decode_batch(schedule_state, batch, draft_window, envelopes,
+        execution::dflash_decode_batch(schedule_state, batch, verify_drafts, envelopes,
                                        target_envelope, finish,
                                        execution::SpeculativePhase::Finish);
         submit_range.reset();
@@ -737,6 +784,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                                  .base_S        = base_S,
                                  .prompt_tokens = 0,
                                  .produced      = static_cast<std::uint32_t>(count_i),
+                                 .verify_drafts = verify_drafts,
             };
             request.lifecycle = Lifecycle::Pending;
             request.timings.decode_seconds += seconds;
