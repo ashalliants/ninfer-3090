@@ -6,7 +6,8 @@
 
 ![NInfer-3090 throughput on one RTX 3090](docs/assets/perf-banner.svg)
 
-NInfer-3090 is a specialized C++20/CUDA inference engine for **Qwen3.8-27B** and Qwen3.6 on one
+NInfer-3090 is a specialized C++20/CUDA inference engine for **Qwen3.8-27B**, Qwen3.6 and, as a
+Windows preview, the 512-expert **Qwen3.8-Flash-Next** on one
 24 GB NVIDIA GeForce RTX 3090, or split as a pipeline across several GPUs on Linux. The native SM86
 runtime loads the official groupwise `.ninfer` artifacts, serves OpenAI- and Anthropic-compatible
 APIs, and supports paged KV, compatible-prefix reuse, structured JSON output, CUDA Graphs, MTP and
@@ -21,6 +22,15 @@ concurrent cohorts through **C8**.
 | **Prefill**, 4K prompt | **3,185 tok/s** | **8,848 tok/s** |
 | **Decode**, one stream | **140 tok/s** (DFlash2) | **295 tok/s** (MTP3 + draft head) |
 | **Decode**, all lanes | **477 tok/s** at C8 (MTP3) | **383 tok/s** at C6 (MTP3) |
+
+**Qwen3.8-Flash-Next (preview, Windows), same card.** A 512-expert MoE at 2 bits per weight, with all
+33 GiB of experts pinned in host RAM: **1.15-1.18x Strata's plain decode** (81 / 80 / 78 tok/s after
+a 1K / 8K / 32K prompt against 71 / 70 / 66), **109-113 tok/s with MTP** (the launcher default, same
+tokens as plain decoding, 102.6 after a 128K prompt) and **2,345 tok/s prefill** at 4K, 1.23x Strata's,
+when the n-gram volume sits on NVMe. One request at a time, 32K context in this release. Details
+[below](#qwen38-flash-next-preview).
+
+![Qwen3.8-Flash-Next on one RTX 3090: NInfer-3090 against Strata 0.1.38 on the same GGUF](docs/assets/flash-next-speed.svg)
 
 The 27B speed rows were re-measured on 2026-10-02 for the 3090 conversion `download-model` now
 fetches, in one sitting with upstream's artifact on the same binaries. Decode is
@@ -311,7 +321,12 @@ cache whose state is saved beside the model so the next start is warm, and serve
 time at up to 32K tokens with INT8 KV. Not yet: prefix reuse (every request prefills its whole
 prompt) and more than one lane. Measured on this RTX 3090 with a warm expert cache: decode
 after 1K / 8K / 32K prompts is 108-109 / 111 / 112-113 tok/s with MTP and 81 / 80 / 78 without
-(Strata with MTP 105 / 112 / 107, plain 71 / 70 / 66). Decode speed and its breakdown are in
+(Strata with MTP 105 / 112 / 107, plain 71 / 70 / 66); prefill is 2,345 / 2,422 / 2,372 tok/s at
+4K / 32K / 128K with the volume on NVMe (Strata 1,912 / 2,397 / 2,184). Re-run on 2026-10-13 on this
+release's binary with the model and volume on the C: NVMe drive, plain decode and prefill reproduced
+(82 / 83 / 81 tok/s, 2,350-2,450 tok/s at 8K-30K); MTP decode on that run's own prompts (document
+summaries rather than the earlier prompt set) was 96-98 tok/s, 1.16-1.22x plain, because
+speculation pays off less on text that is harder to predict. Decode speed and its breakdown are in
 [the plan](docs/maintainer/flash-next-plan.md#pr-13-measurements); the server reference is
 [docs/serving.md](docs/serving.md#qwen38-flash-next-preview).
 

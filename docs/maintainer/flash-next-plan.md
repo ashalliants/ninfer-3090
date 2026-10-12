@@ -411,6 +411,28 @@ MTP 105 / 112 / 107, plain 71 / 70 / 66.
   per round). Fixed 2 drafts is 1-2% faster than either at 1K / 8K, but a fixed depth is a
   measurement switch, not a serving option. The launcher uses ceiling 3 with the `-mtp` artifact.
 
+**Reproduction on the merged build, 2026-10-13.** The worktree build of master at `04901788` (all of
+PRs #247-#277), model and volume on the C: NVMe drive, launcher defaults (INT8 KV, 32,768 context,
+vision on), the card shared with the desktop. One server per arm in the order MTP, plain, plain,
+MTP inside one GPU-lock hold; each ran four requests per tier of 512 greedy tokens after a prompt
+built from this repository's markdown (1,008 / 8,000 / 30,047 tokens, not the earlier prompt
+set), one warm-up request first. Medians per arm [min-max of the 4 requests]:
+
+| Tier | Plain, run 1 / run 2 | MTP, run 1 / run 4 | MTP / plain | Prefill, plain / MTP |
+|---|---:|---:|---:|---:|
+| 1K | 81.2 / 82.0 | 94.3 / 99.5 | 1.19 | 1,260 / 1,050-1,180 |
+| 8K | 82.7 / 82.5 | 93.9 / 98.3 | 1.16 | 2,452 / 2,326-2,422 |
+| 30K | 79.6 / 81.7 | 93.5 / 102.7 | 1.22 | 2,351-2,378 / 2,261-2,360 |
+
+Plain decode and warm prefill agree with the figures above. MTP decode is 96-98 tok/s here against
+108-113 on the earlier prompts: acceptance depends on the text, and these prompts ask for a
+summary of dense technical notes. The two MTP runs differ by up to 5% from each other (the second
+was faster at every tier), so this run does not support a tuning claim in either direction. Quality
+was not re-measured. The harness is a small streaming client that is not in the tree; the earlier
+prompt set was not kept either, so the Strata comparison in the README stays on the earlier
+measurements.
+
+
 ## PR 14 measurements
 
 Image input, 2026-10-12. RTX 3090, CUDA 12.8, desktop attached; artifact

@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 300" width="960" height="300" role="img"
-     aria-label="NInfer-3090 throughput on one RTX 3090: prefill 3,185-8,848 tok/s; decode one stream 140-295 tok/s; decode all lanes 383-477 tok/s">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 312" width="960" height="312" role="img"
+     aria-label="NInfer-3090 throughput on one RTX 3090: prefill 3,185-8,848 tok/s; decode one stream 140-295 tok/s; decode all lanes 383-477 tok/s; Qwen3.8-Flash-Next preview: prefill 2,345 tok/s, decode 111 tok/s">
   <title>NInfer-3090 throughput, one RTX 3090</title>
   <style>
     .nb-surface  { fill: #fcfcfb; }
@@ -11,6 +11,7 @@
     .nb-baseline { stroke: #c3c2b7; }
     .nb-s1       { fill: #2a78d6; }
     .nb-s2       { fill: #eb6834; }
+    .nb-s3       { fill: #1b9e8f; }
     .nb-dashed   { stroke: #898781; fill: none; stroke-dasharray: 4 3; }
     text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
     @media (prefers-color-scheme: dark) {
@@ -23,26 +24,29 @@
       .nb-baseline { stroke: #383835; }
       .nb-s1       { fill: #3987e5; }
       .nb-s2       { fill: #d95926; }
+      .nb-s3       { fill: #2fbfae; }
     }
   </style>
 
-  <rect x="1" y="1" width="958" height="298" rx="16" class="nb-surface nb-border" stroke-width="1"/>
+  <rect x="1" y="1" width="958" height="310" rx="16" class="nb-surface nb-border" stroke-width="1"/>
 
   <!-- legend -->
   <rect x="36" y="20" width="14" height="14" rx="3" class="nb-s1"/>
   <text x="56" y="31" font-size="13" font-weight="600" class="nb-primary">Qwen3.8-27B &#8212; dense</text>
   <rect x="236" y="20" width="14" height="14" rx="3" class="nb-s2"/>
   <text x="256" y="31" font-size="13" font-weight="600" class="nb-primary">Qwen3.6-35B-A3B &#8212; MoE</text>
+  <rect x="476" y="20" width="14" height="14" rx="3" class="nb-s3"/>
+  <text x="496" y="31" font-size="13" font-weight="600" class="nb-primary">Qwen3.8-Flash-Next &#8212; IQ2_XS MoE (preview)</text>
 
   <!-- subtitle -->
-  <text x="36" y="50" font-size="12" class="nb-muted">tok/s on one RTX 3090 &#183; 27B: this fork&#8217;s conversion, re-measured 2026-10-02 (8 chat prompts, INT8 KV; prefill rk4v4)</text>
+  <text x="36" y="50" font-size="12" class="nb-muted">tok/s on one RTX 3090 &#183; 27B: this fork&#8217;s conversion, re-measured 2026-10-02 (8 chat prompts, INT8 KV; prefill rk4v4) &#183; Flash-Next: 2026-10-12</text>
 
   <line x1="36" y1="64" x2="924" y2="64" class="nb-hair" stroke-width="1"/>
 
   <!-- Panel 1: Prefill -->
   <g>
     <text x="36" y="112" font-size="15" font-weight="600" class="nb-primary">Prefill &#183; 4K prompt</text>
-    <line x1="56" y1="122" x2="56" y2="204" class="nb-baseline" stroke-width="1"/>
+    <line x1="56" y1="122" x2="56" y2="244" class="nb-baseline" stroke-width="1"/>
 
     <rect x="36" y="20" width="0" height="0" opacity="0"/>
     <!-- dense: 3,185 tok/s (of 8,848 max) -->
@@ -54,12 +58,17 @@
     <rect x="56" y="168" width="190" height="22" rx="4" class="nb-s2"/>
     <text x="256" y="183" font-size="13" class="nb-secondary">8,848 tok/s</text>
     <text x="256" y="198" font-size="10" class="nb-muted">cuBLAS route</text>
+
+    <!-- Flash-Next: 2,345 tok/s, 4K prompt, n-gram volume on NVMe -->
+    <rect x="56" y="208" width="50" height="22" rx="4" class="nb-s3"/>
+    <text x="116" y="223" font-size="13" class="nb-secondary">2,345 tok/s</text>
+    <text x="116" y="238" font-size="10" class="nb-muted">1.23x Strata &#183; volume on NVMe</text>
   </g>
 
   <!-- Panel 2: Decode, one stream -->
   <g>
     <text x="340" y="112" font-size="15" font-weight="600" class="nb-primary">Decode &#183; one stream</text>
-    <line x1="360" y1="122" x2="360" y2="204" class="nb-baseline" stroke-width="1"/>
+    <line x1="360" y1="122" x2="360" y2="244" class="nb-baseline" stroke-width="1"/>
 
     <!-- dense: 140 tok/s (of 295 max) -->
     <rect x="360" y="128" width="90" height="22" rx="4" class="nb-s1"/>
@@ -70,12 +79,17 @@
     <rect x="360" y="168" width="190" height="22" rx="4" class="nb-s2"/>
     <text x="560" y="183" font-size="13" class="nb-secondary">295 tok/s</text>
     <text x="560" y="198" font-size="10" class="nb-muted">MTP3 + draft head</text>
+
+    <!-- Flash-Next: 111 tok/s with MTP after an 8K prompt (113 at 32K) -->
+    <rect x="360" y="208" width="72" height="22" rx="4" class="nb-s3"/>
+    <text x="442" y="223" font-size="13" class="nb-secondary">111 tok/s</text>
+    <text x="442" y="238" font-size="10" class="nb-muted">MTP &#183; 81 plain, 1.15x Strata plain</text>
   </g>
 
   <!-- Panel 3: Decode, all lanes -->
   <g>
     <text x="644" y="112" font-size="15" font-weight="600" class="nb-primary">Decode &#183; all lanes (max)</text>
-    <line x1="664" y1="122" x2="664" y2="204" class="nb-baseline" stroke-width="1"/>
+    <line x1="664" y1="122" x2="664" y2="244" class="nb-baseline" stroke-width="1"/>
 
     <!-- dense: 477 tok/s (max) -->
     <rect x="664" y="128" width="190" height="22" rx="4" class="nb-s1"/>
@@ -86,9 +100,13 @@
     <rect x="664" y="168" width="153" height="22" rx="4" class="nb-s2"/>
     <text x="827" y="183" font-size="13" class="nb-secondary">383 tok/s</text>
     <text x="827" y="198" font-size="10" class="nb-muted">C6 &#183; MTP3</text>
+
+    <!-- Flash-Next: one request at a time in this release -->
+    <text x="664" y="223" font-size="13" class="nb-muted">one request at a time</text>
+    <text x="664" y="238" font-size="10" class="nb-muted">preview, 32K context</text>
   </g>
 
   <!-- footer -->
-  <text x="36" y="280" font-size="11" class="nb-muted">Prefill: ninfer_bench, launcher settings (cuBLAS route, chunk 4096), measured 2026-10-02. See docs/performance for methodology.</text>
-  <text x="924" y="280" font-size="11" text-anchor="end" class="nb-muted">ashalliants/ninfer-3090</text>
+  <text x="36" y="294" font-size="11" class="nb-muted">Prefill: ninfer_bench, launcher settings (cuBLAS route, chunk 4096), measured 2026-10-02. See docs/performance for methodology.</text>
+  <text x="924" y="294" font-size="11" text-anchor="end" class="nb-muted">ashalliants/ninfer-3090</text>
 </svg>
