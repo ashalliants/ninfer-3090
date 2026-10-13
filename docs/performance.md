@@ -859,6 +859,44 @@ rate from 0.418 / 0.418 to 0.478 / 0.478 and lowered mean TTFT from 2.87 / 2.73 
 (p95 6.26 / 6.26 s to 4.80 / 4.83 s). Writing them while busy cost nothing measurable (seed-phase
 mean TTFT 3.16 / 3.16 s against 3.15 / 3.36 s).
 
+#### Other Host sizes and eight lanes
+
+Same workload and method, after the two write-on-evict fixes (write only when the release takes the
+resume point; do not re-export a shared prefix the store holds). ABBA, two runs per build, `master`
+(base) against this series; C8 uses the `mtp` launcher profile (the DFlash2 profile does not start at
+eight lanes on this card). Each cell is base / series, first run then second run of each build:
+
+| Configuration | hit rate | TTFT p50 (s) | TTFT p95 (s) | mean TTFT (s) | wall time (s) |
+|---|---|---|---|---|---|
+| C4, 2 GiB Host | 0.286 / 0.308 vs 0.724 / 0.705 | 6.73 / 7.20 vs 4.63 / 4.39 | 33.6 / 29.6 vs 10.1 / 12.4 | 11.8 / 10.6 vs 5.2 / 5.2 | 500 / 485 vs 248 / 251 |
+| C4, 8 GiB Host | 0.710 / 0.701 vs 0.735 / 0.724 | 2.91 / 3.15 vs 3.42 / 3.29 | 8.9 / 10.0 vs 8.3 / 9.7 | 3.8 / 4.2 vs 4.0 / 4.2 | 197 / 208 vs 205 / 211 |
+| C8, 2 GiB Host, MTP | 0.591 / 0.634 vs 0.733 / 0.733 | 6.10 / 5.11 vs 5.08 / 5.24 | 23.2 / 19.3 vs 13.4 / 14.0 | 8.4 / 7.3 vs 5.9 / 6.2 | 259 / 240 vs 224 / 217 |
+| C8, 8 GiB Host, MTP | 0.737 vs 0.737 (all 4 runs) | 4.08 / 3.88 vs 4.26 / 4.49 | 22.7 / 23.4 vs 15.9 / 20.5 | 9.2 / 7.0 vs 6.3 / 7.1 | 272 / 209 vs 199 / 221 |
+
+What this shows:
+
+- The store tier pays when the Host tier is smaller than the working set (2 GiB at both lane counts):
+  the hit rate rises by 0.14 to 0.42 and tail latency falls by half or more.
+- When the Host tier already holds the working set (8 GiB), the hit rate is equal or 0.02 to 0.03
+  higher, and TTFT and wall time are within run-to-run noise (the same base build ranged from 209 to
+  272 s wall at C8). Write-on-evict is neutral there, not a gain, and the store still writes
+  340-460 GB per hour.
+- Per-request prefill and decode medians are unchanged in every configuration (C4 2,400-2,490 and
+  98-107 tok/s; C8 2,220-2,385 and 63-74 tok/s).
+
+Shared-prefix filter, C8 / 8 GiB / MTP, ABCCBA (A base, B series before the filter, C the final series;
+the 8 GiB runs of the first two rows above are B). Before the filter the Engine wrote 77-83 "shared"
+images per run, nearly all of them entries the cache publishes inside one conversation's history.
+Only shared entries with repeat demand are now written:
+
+| Build | shared writes | store writes | GB/h written | hit rate | mean TTFT (s) | wall time (s) |
+|---|---:|---:|---:|---|---|---|
+| A: base | 0 / 0 | 0 / 0 | 0 / 0 | 0.737 / 0.737 | 9.21 / 6.97 | 272 / 209 |
+| B: before the filter | 77 / 77 | 115 / 112 | 382 / 333 | 0.737 / 0.737 | 6.30 / 7.12 | 199 / 221 |
+| C: with the filter | 3 / 3 | 41 / 36 | 245 / 198 | 0.737 / 0.737 | 6.36 / 7.24 | 196 / 219 |
+
+The filter removes about 40% of the bytes written without changing the hit rate or latency.
+
 ## Published coverage
 
 Published measurements use one NVIDIA GeForce RTX 5090 through NInfer's public HTTP serving route.

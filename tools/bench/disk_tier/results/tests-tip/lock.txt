@@ -1,0 +1,3 @@
+lock acquired at 2026-10-13T21:00:08.7211557+01:00
+ctest exit 0
+lock released at 2026-10-13T21:11:55.1404823+01:00

@@ -127,11 +127,18 @@ store 1A bytes_on_disk=1553384195
 run 2B free_ram_gib=44.9 gpu=1 %, 870 MiB, 245.91 W
 store 2B bytes_on_disk=13004022470
 run 3B free_ram_gib=43.9 gpu=0 %, 870 MiB, 150.48 W
+store 3B bytes_on_disk=13087154988
+run 4A free_ram_gib=44.4 gpu=0 %, 870 MiB, 150.38 W
+store 4A bytes_on_disk=1374620434
+lock released at 2026-10-13T19:51:55.6710402+01:00
    1A n=120 err=0 wall=500s hit=0.286 reprefill=914009 ttft p50=6.73 p95=33.59 p99=42.57 mean=11.78 dec/stream=13.6 wrGB/h=15.4 writes=7 evw=0 evs=0.00 shw=0 hyd=0 hydtok=0 hydfail=3 hyd_s=3.6 dropped=0 rate=0.00GB/s
    2B n=120 err=0 wall=248s hit=0.724 reprefill=353600 ttft p50=4.63 p95=10.09 p99=18.85 mean=5.15 dec/stream=20.4 wrGB/h=532.0 writes=122 evw=116 evs=35.94 shw=6 hyd=91 hydtok=840307 hydfail=1 hyd_s=106.0 dropped=0 rate=0.53GB/s
+   3B n=120 err=0 wall=251s hit=0.705 reprefill=376828 ttft p50=4.39 p95=12.42 p99=15.37 mean=5.20 dec/stream=20.0 wrGB/h=529.7 writes=123 evw=115 evs=34.83 shw=8 hyd=89 hydtok=788964 hydfail=3 hyd_s=97.9 dropped=0 rate=0.64GB/s
+   4A n=120 err=0 wall=485s hit=0.308 reprefill=885892 ttft p50=7.20 p95=29.58 p99=37.08 mean=10.55 dec/stream=12.0 wrGB/h=14.4 writes=7 evw=0 evs=0.00 shw=0 hyd=0 hydtok=0 hydfail=0 hyd_s=0.0 dropped=0 rate=0.00GB/s
 server-1A: n=120 prefill median=2420 tok/s decode median=107.1 tok/s (per request, from the server log)
 server-2B: n=120 prefill median=2415 tok/s decode median=102.4 tok/s (per request, from the server log)
-server-3B: n=59 prefill median=2600 tok/s decode median=79.1 tok/s (per request, from the server log)
+server-3B: n=120 prefill median=2490 tok/s decode median=107.0 tok/s (per request, from the server log)
+server-4A: n=120 prefill median=2410 tok/s decode median=102.3 tok/s (per request, from the server log)
 == f2-c4-8g
 lock acquired after 7109 s at 2026-10-13T19:12:04.5961381+01:00
 run 1A free_ram_gib=45.6 gpu=1 %, 868 MiB, 77.22 W
@@ -301,3 +308,30 @@ lock released at 2026-10-13T12:54:15.1085811+01:00
 lock acquired at 2026-10-13T18:23:22.1997714+01:00
 ctest exit 0
 lock released at 2026-10-13T18:33:50.0518667+01:00
+== f3-c8-8g-mtp (A base, B series before 86ea9c65, C branch tip 86ea9c65; ABCCBA)
+lock acquired after 0 s at 2026-10-13T20:30:09.9749265+01:00
+run 1A free_ram_gib=41.9 gpu=11 %, 958 MiB, 37.12 W
+store 1A bytes_on_disk=234881024
+run 2B free_ram_gib=39.6 gpu=1 %, 942 MiB, 149.56 W
+store 2B bytes_on_disk=18526519836
+run 3C free_ram_gib=43.2 gpu=2 %, 942 MiB, 107.75 W
+store 3C bytes_on_disk=10699061242
+run 4C free_ram_gib=37.9 gpu=2 %, 1036 MiB, 130.81 W
+store 4C bytes_on_disk=10369023602
+run 5B free_ram_gib=40.8 gpu=2 %, 1038 MiB, 135.16 W
+store 5B bytes_on_disk=18482560979
+run 6A free_ram_gib=44 gpu=1 %, 1049 MiB, 103.32 W
+store 6A bytes_on_disk=
+lock released at 2026-10-13T20:53:15.2520285+01:00
+   1A n=120 err=0 wall=272s hit=0.737 reprefill=337124 ttft p50=4.08 p95=22.69 p99=92.24 mean=9.21 dec/stream=7.5 wrGB/h=0.0 writes=0 evw=0 evs=0.00 shw=0 hyd=0 hydtok=0 hydfail=0 hyd_s=0.0 dropped=0 rate=0.00GB/s
+   2B n=120 err=0 wall=199s hit=0.737 reprefill=337074 ttft p50=4.26 p95=15.94 p99=20.95 mean=6.30 dec/stream=9.0 wrGB/h=382.4 writes=115 evw=38 evs=13.07 shw=77 hyd=0 hydtok=0 hydfail=0 hyd_s=0.0 dropped=0 rate=1.00GB/s
+   3C n=120 err=0 wall=196s hit=0.737 reprefill=336970 ttft p50=4.09 p95=18.00 p99=18.94 mean=6.36 dec/stream=9.8 wrGB/h=244.8 writes=41 evw=38 evs=12.81 shw=3 hyd=1 hydtok=1676 hydfail=0 hyd_s=2.2 dropped=0 rate=0.65GB/s
+   4C n=120 err=0 wall=219s hit=0.737 reprefill=336938 ttft p50=4.35 p95=22.38 p99=29.92 mean=7.24 dec/stream=8.9 wrGB/h=198.1 writes=36 evw=33 evs=10.86 shw=3 hyd=0 hydtok=0 hydfail=0 hyd_s=0.0 dropped=0 rate=1.00GB/s
+   5B n=120 err=0 wall=221s hit=0.737 reprefill=336861 ttft p50=4.49 p95=20.51 p99=27.47 mean=7.12 dec/stream=8.3 wrGB/h=332.9 writes=112 evw=34 evs=11.78 shw=77 hyd=0 hydtok=0 hydfail=0 hyd_s=0.0 dropped=0 rate=1.00GB/s
+   6A n=120 err=0 wall=209s hit=0.737 reprefill=337027 ttft p50=3.88 p95=23.38 p99=33.50 mean=6.97 dec/stream=9.5 wrGB/h=0.0 writes=0 evw=0 evs=0.00 shw=0 hyd=0 hydtok=0 hydfail=0 hyd_s=0.0 dropped=0 rate=0.00GB/s
+server-1A: n=120 prefill median=2315 tok/s decode median=63.5 tok/s (per request, from the server log)
+server-2B: n=120 prefill median=2380 tok/s decode median=74.2 tok/s (per request, from the server log)
+server-3C: n=120 prefill median=2370 tok/s decode median=71.7 tok/s (per request, from the server log)
+server-4C: n=120 prefill median=2250 tok/s decode median=66.3 tok/s (per request, from the server log)
+server-5B: n=120 prefill median=2335 tok/s decode median=70.0 tok/s (per request, from the server log)
+server-6A: n=120 prefill median=2385 tok/s decode median=68.8 tok/s (per request, from the server log)
