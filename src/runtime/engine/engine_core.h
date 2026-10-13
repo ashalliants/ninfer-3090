@@ -2895,6 +2895,10 @@ private:
         } catch (...) { next_persist_scan_ = now + std::chrono::seconds(4); }
     }
 
+    // Extra reclaim rounds a hydration import may take when free Host bytes are split too finely
+    // for the image (each round frees as much again as the image needs).
+    static constexpr int kHydrationImportRounds = 3;
+
     struct HydrationTask {
         std::shared_ptr<Request> request;
         std::string id;
@@ -3037,9 +3041,9 @@ private:
             (void)program.release_redundant_host({});
             usage = program.physical_usage();
         }
+        auto cursor = resources_.begin_reclaim(
+            program, std::nullopt, ReclaimRights{ReclaimPurpose::OptionalWrite, request->id});
         if (needed > usage.capacity.host_bytes - usage.occupied.host_bytes) {
-            auto cursor = resources_.begin_reclaim(
-                program, std::nullopt, ReclaimRights{ReclaimPurpose::OptionalWrite, request->id});
             const auto victims = resources_.host_victims(program, needed, std::nullopt, {}, {},
                                                          std::nullopt, &cursor);
             if (!victims) { return false; }
@@ -3047,6 +3051,18 @@ private:
             if (!victims->empty()) { scheduler_.capacity_released(); }
         }
         auto imported = program.import_checkpoints(image, store_.binding);
+        // Free bytes are not free geometry: each StateImage needs one contiguous Host extent, and
+        // under pressure the free space is often split below that. Give up the next-ranked Host
+        // contents (the same optional-write rights, never another request's waiting source) a
+        // round at a time until the image fits or nothing more may go.
+        for (int round = 0; !imported && round < kHydrationImportRounds; ++round) {
+            if (resources_.reclaim(program, ContextResourceUsage{.host_bytes = needed}, {},
+                                   cursor) != ReclaimProgress::Changed) {
+                break;
+            }
+            scheduler_.capacity_released();
+            imported = program.import_checkpoints(image, store_.binding);
+        }
         if (!imported) { return false; }
         const auto token = resources_.adopt_restored(program, imported->points, imported->session);
         if (!token) { return false; }
