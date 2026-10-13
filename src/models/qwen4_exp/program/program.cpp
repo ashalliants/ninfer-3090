@@ -110,9 +110,11 @@ struct BasePlanImpl {
     std::uint32_t identity_tag = 0;
     std::vector<CaptureGroup> captures;
     std::uint32_t recovery = 0; // the typed rewrite's recovery frontier (0: none)
-    // The capture groups' frontiers inside the prompt, ascending: prefill calls end there whether
-    // or not the cache is on.
+    // The capture groups' and the typed rewrite's execution frontiers inside the prompt, ascending:
+    // prefill calls end there whether or not the cache is on.
     std::vector<std::uint32_t> splits;
+    // The prompt's media items, for pricing the prefill a source leaves (prefill_work_between).
+    std::vector<MediaCost> media;
 };
 
 struct ResumeStateImpl {
@@ -921,16 +923,29 @@ public:
                                           : runtime::CheckpointRole::SharedPrefix);
         }
         std::sort(groups.begin(), groups.end(), [](const auto& a, const auto& b) { return a.frontier < b.frontier; });
-        for (const auto& group : groups) {
-            if (group.frontier < n) { base->splits.push_back(group.frontier); }
+        // Calls also end at the typed rewrite's execution frontiers (the Qwen3.5 Program's prefill
+        // does the same): a resumed request and its cold run must decompose the recurrent state
+        // there identically. The prefix identity already compares them.
+        const auto& execution = data.identity.rewrite_execution_frontiers;
+        for (std::uint32_t previous = 0; const std::uint32_t frontier : execution) {
+            if (frontier <= previous || frontier > n) {
+                throw std::invalid_argument("rewrite execution frontiers must be ordered prompt positions");
+            }
+            previous = frontier;
         }
-        // The typed rewrite's execution frontiers also end prefill calls (the Qwen3.5 Program splits
-        // at them too): they keep the recurrent decomposition the exact rewrite contract names.
-        for (const std::uint32_t frontier : data.identity.rewrite_execution_frontiers) {
-            if (frontier > 0 && frontier < n) { base->splits.push_back(frontier); }
+        std::vector<std::uint32_t> capture_frontiers;
+        capture_frontiers.reserve(groups.size());
+        for (const auto& group : groups) { capture_frontiers.push_back(group.frontier); }
+        base->splits = prefill_splits(capture_frontiers, execution, n);
+        // What a source restoring before an image leaves to encode (inspect_source's pricing).
+        for (const auto& item : data.vision_items) {
+            MediaCost cost{.patches = item.patch_count};
+            for (const auto& span : item.token_spans) {
+                // Inside the prompt (checked by the frontend), so they fit 32 bits.
+                cost.spans.emplace_back(static_cast<std::uint32_t>(span.begin), static_cast<std::uint32_t>(span.count));
+            }
+            base->media.push_back(std::move(cost));
         }
-        std::sort(base->splits.begin(), base->splits.end());
-        base->splits.erase(std::unique(base->splits.begin(), base->splits.end()), base->splits.end());
         if (base->reuse) {
             auto identity    = std::make_shared<CheckpointIdentity>();
             identity->ledger = data.token_ids;
@@ -1570,21 +1585,11 @@ public:
     }
 
     // The prefill cost of prompt positions [begin, end): its tokens and calls (the wide route's
-    // 4,096-token calls from `begin`, which is how a resumed prefill runs), and the images it still
-    // encodes: those that end at or after `begin` (plan_lane_vision's rule) and start before `end`.
+    // 4,096-token calls from `begin`, which is how a resumed prefill runs) and the images it
+    // encodes again (any image with a token at or after `begin`: plan_lane_vision's set).
     runtime::PrefillWork work_between(const BasePlanImpl& base, std::uint32_t begin, std::uint32_t end) const {
-        auto work = runtime::make_prefill_work(begin, end > begin ? end - begin : 0, 0, 0,
-                                               static_cast<std::uint32_t>(std::max(plan_.chunk, plan_.wide_chunk)));
-        if (!base.vision) { return work; }
-        for (const auto& item : base.vision->items) {
-            if (item.scatter_indices.empty() || static_cast<std::uint32_t>(item.scatter_indices.back()) < begin ||
-                static_cast<std::uint32_t>(item.scatter_indices.front()) >= end) {
-                continue;
-            }
-            ++work.vision_items;
-            work.vision_patches += item.patch_count;
-        }
-        return work;
+        return prefill_work_between(begin, end, static_cast<std::uint32_t>(std::max(plan_.chunk, plan_.wide_chunk)),
+                                    base.media);
     }
 
     std::vector<ContextRelease> plan_releases(std::span<const CheckpointHandle> allowed,
@@ -1685,10 +1690,15 @@ public:
         const auto group = lane_.captures[lane_.next_capture];
         if (group.frontier != lane_.state_tokens || group.roles.empty()) { return false; }
         const std::uint32_t need = capture_slabs(group.frontier);
-        std::vector<std::uint32_t> slabs;
+        // From here the capture's slabs are owned by `slabs` until a published record holds them:
+        // any throw below releases them (and insert_group rolls back a partial publication).
+        SlabRefs slabs(*cache_);
         if (lane_.reserved_frontier == group.frontier && lane_.reserved.size() >= need) {
-            // The capture's part; what is left was reserved for the endpoint.
-            slabs.assign(lane_.reserved.begin(), lane_.reserved.begin() + need);
+            // The capture's part; what is left was reserved for the endpoint. Room first, so the
+            // hand-over itself cannot throw halfway.
+            slabs.reserve(need);
+            lane_.endpoint.reserve(lane_.endpoint.size() + (lane_.reserved.size() - need));
+            for (std::uint32_t i = 0; i < need; ++i) { slabs.adopt(lane_.reserved[i]); }
             lane_.endpoint.insert(lane_.endpoint.end(), lane_.reserved.begin() + need, lane_.reserved.end());
             lane_.reserved.clear();
             lane_.reserved_frontier = 0;
@@ -1696,15 +1706,14 @@ public:
             release_reservation();
             auto got = cache_->allocate(need);
             if (!got) { return false; }
-            slabs = std::move(*got);
+            slabs = SlabRefs(*cache_, std::move(*got));
         }
         const auto start = Clock::now();
         auto r           = capture_record(std::move(slabs), true);
         r.identity       = lane_.base->identity;
-        // insert_roles releases every reference it was handed if it throws, so nothing leaks here.
-        captured_      = insert_roles(std::move(r), group.roles);
-        lane_.captured = std::max(lane_.captured, group.frontier);
-        tx_            = Tx::Capture; // the published records are the transaction's from here on
+        captured_        = cache_->insert_group(std::move(r), group.roles);
+        tx_              = Tx::Capture; // the transaction owns captured_ from here (abandon_capture)
+        lane_.captured   = std::max(lane_.captured, group.frontier);
         record_capture(start, group.frontier);
         return true;
     }
@@ -1825,29 +1834,30 @@ private:
     // Copies the lane's execution position at state_tokens into `slabs` (exactly capture_slabs()):
     // the KV pages past the mirror, then the state image (recurrent state, the drafter's saved
     // residual and, with `logits`, the last position's logits). The full pages it copied join the
-    // mirror. The record holds one reference on each of its slabs; identity and role are the
-    // caller's.
-    HostCheckpoint capture_record(std::vector<std::uint32_t>&& slabs, bool logits) {
+    // mirror. The returned record holds one reference on each of its slabs (it must go to
+    // HostCheckpointStore::insert_group, which always consumes them); on a throw every reference
+    // `slabs` and this call took is released. Identity and role are the caller's.
+    HostCheckpoint capture_record(SlabRefs&& slabs, bool logits) {
+        SlabRefs own(std::move(slabs));
         const std::uint32_t frontier = lane_.state_tokens;
         const std::uint32_t limit    = plan_.drafts > 0 ? std::min(frontier, lane_.mtp_cells) : frontier;
         const std::uint32_t full     = limit / kPagedKVPageSize;
         const std::uint32_t pages    = (frontier + kPagedKVPageSize - 1) / kPagedKVPageSize;
         const auto mirrored          = static_cast<std::uint32_t>(lane_.mirror.size());
-        if (mirrored > full || slabs.size() != capture_slabs(frontier)) {
-            cache_->release(slabs);
+        if (mirrored > full || own.size() != capture_slabs(frontier)) {
             throw std::logic_error("Qwen3.8-Flash-Next: a capture does not match the lane's KV");
         }
-        HostCheckpoint r;
-        // Every allocation that can throw happens before the first reference is taken (and before
-        // the mirror grows), so a failure here still owns only `slabs`, which go back.
-        try {
-            r.pages.reserve(pages);
-            r.image.reserve(slabs.size() - (pages - mirrored));
-            lane_.mirror.reserve(lane_.mirror.size() + (full - mirrored));
-        } catch (...) {
-            cache_->release(slabs);
-            throw;
+        const std::size_t copied = own.size();
+        // The record's references: the mirror's pages (one more each), then the new slabs.
+        SlabRefs held(*cache_);
+        held.reserve(mirrored + own.size());
+        for (const std::uint32_t slab : lane_.mirror) {
+            cache_->retain(slab);
+            held.adopt(slab);
         }
+        for (const std::uint32_t slab : own.take()) { held.adopt(slab); }
+        const auto& all = held.slabs();
+        HostCheckpoint r;
         r.frontier     = frontier;
         r.identity_tag = identity_tag_;
         r.full_pages   = full;
@@ -1855,82 +1865,36 @@ private:
         if (lane_.history.size() > frontier) { r.next_token = lane_.history[frontier]; }
         r.logits     = logits;
         r.rope_delta = lane_.base->rope_delta;
-        for (const std::uint32_t slab : lane_.mirror) {
-            cache_->retain(slab);
-            r.pages.push_back(slab);
-        }
-        r.pages.insert(r.pages.end(), slabs.begin(), slabs.begin() + (pages - mirrored));
-        r.image.assign(slabs.begin() + (pages - mirrored), slabs.end());
-        try {
-            copies_.clear();
-            add_page_copies(std::span<const std::uint32_t>(r.pages).subspan(mirrored), mirrored);
-            add_image_copies(r.image, logits);
-            run_copies(true);
-            device_.synchronize();
-        } catch (...) {
-            cache_->release(r.pages);
-            cache_->release(r.image);
-            throw;
-        }
+        r.pages.assign(all.begin(), all.begin() + pages);
+        r.image.assign(all.begin() + pages, all.end());
+        copies_.clear();
+        add_page_copies(std::span<const std::uint32_t>(r.pages).subspan(mirrored), mirrored);
+        add_image_copies(r.image, logits);
+        run_copies(true);
+        device_.synchronize();
+        // The full pages it copied join the mirror (their device KV equals them from now on).
+        lane_.mirror.reserve(full);
         for (std::uint32_t page = mirrored; page < full; ++page) {
             cache_->retain(r.pages[page]);
             lane_.mirror.push_back(r.pages[page]);
         }
-        captured_bytes_ += static_cast<std::uint64_t>(slabs.size()) * cache_->slab_bytes();
+        captured_bytes_ += static_cast<std::uint64_t>(copied) * cache_->slab_bytes();
+        (void)held.take(); // r owns them now
         return r;
     }
 
-    // Publishes `r` once per role (the Qwen3.5 Program's capture group: one checkpoint per role,
-    // here the same Host contents). Transactional: `r` and its references are consumed either way.
-    // On a throw every record published so far is erased and every reference not yet owned by a
-    // record is released, so a failed publication leaves the Host tier as it found it.
-    std::vector<CheckpointHandle> insert_roles(HostCheckpoint&& r, std::span<const runtime::CheckpointRole> roles) {
-        const auto drop = [&](const HostCheckpoint& record) noexcept {
-            cache_->release(record.pages);
-            cache_->release(record.image);
-        };
-        std::vector<CheckpointHandle> out;
-        try {
-            out.reserve(roles.size());
-        } catch (...) {
-            drop(r);
-            throw;
-        }
-        try {
-            for (std::size_t i = 1; i < roles.size(); ++i) {
-                HostCheckpoint copy = r;
-                copy.role           = roles[i];
-                for (const std::uint32_t slab : copy.pages) { cache_->retain(slab); }
-                for (const std::uint32_t slab : copy.image) { cache_->retain(slab); }
-                try {
-                    out.push_back(cache_->insert(std::move(copy)));
-                } catch (...) {
-                    drop(copy); // insert leaves its argument untouched when it throws
-                    throw;
-                }
-            }
-            r.role = roles.front();
-            out.insert(out.begin(), cache_->insert(std::move(r)));
-        } catch (...) {
-            for (const auto handle : out) { (void)cache_->erase(handle); }
-            drop(r);
-            throw;
-        }
-        return out;
-    }
-
-    void record_capture(Clock::time_point start, std::uint32_t frontier) {
+    void record_capture(Clock::time_point start, std::uint32_t frontier) noexcept {
         const std::uint64_t ns = elapsed_ns(start);
         ++captures_;
         capture_ns_ += ns;
-        char line[200];
-        std::snprintf(line, sizeof(line), "context cache: captured %u tokens in %.1f ms; Host tier %.2f of %.2f GiB",
-                      frontier, static_cast<double>(ns) * 1e-6,
-                      static_cast<double>(cache_->occupied_bytes()) / (1ULL << 30),
-                      static_cast<double>(cache_->capacity_bytes()) / (1ULL << 30));
         try {
+            char line[200];
+            std::snprintf(line, sizeof(line), "context cache: captured %u tokens in %.1f ms; Host tier %.2f of %.2f GiB",
+                          frontier, static_cast<double>(ns) * 1e-6,
+                          static_cast<double>(cache_->occupied_bytes()) / (1ULL << 30),
+                          static_cast<double>(cache_->capacity_bytes()) / (1ULL << 30));
             diagnostic(line);
-        } catch (...) {} // a log line must not undo a published capture
+        } catch (...) {} // a log line; the capture itself is published
     }
 
     // The capture transaction completes: its checkpoints are published (or dropped when the
@@ -1968,29 +1932,25 @@ private:
             if (plan_.drafts > 0) { mtp_write_pending(); }
             const std::uint32_t frontier = lane_.state_tokens;
             const std::uint32_t need     = capture_slabs(frontier);
-            // Slabs taken off the lane's endpoint set are owned here until capture_record() takes
-            // them: any throw before that (an allocation, the identity copy) returns them.
-            struct Detached {
-                HostCheckpointStore* cache;
-                std::vector<std::uint32_t> slabs;
-                ~Detached() { cache->release(slabs); }
-            } held{cache_.get(), {}};
-            auto& slabs     = held.slabs;
+            // The endpoint's slabs are owned by `slabs` from the moment they leave the lane's
+            // reservation until the published record holds them (insert_group): every failure
+            // below, including one in the catch's log line, releases them.
+            SlabRefs slabs(*cache_);
+            slabs.reserve(need);
             const auto take = std::min<std::size_t>(need, lane_.endpoint.size());
-            slabs.assign(lane_.endpoint.begin(), lane_.endpoint.begin() + static_cast<std::ptrdiff_t>(take));
+            for (std::size_t i = 0; i < take; ++i) { slabs.adopt(lane_.endpoint[i]); }
             lane_.endpoint.erase(lane_.endpoint.begin(), lane_.endpoint.begin() + static_cast<std::ptrdiff_t>(take));
             if (slabs.size() < need) {
                 auto more = cache_->allocate(need - static_cast<std::uint32_t>(slabs.size()));
                 if (!more) {
+                    slabs = SlabRefs(*cache_); // releases what the reservation gave
                     ++endpoints_skipped_;
                     diagnostic("context cache: no Host room for this request's endpoint (" +
                                std::to_string((static_cast<std::uint64_t>(need) * cache_->slab_bytes()) >> 20) +
                                " MiB); the next turn resumes from the prompt's checkpoint");
                     return std::nullopt;
                 }
-                Detached extra{cache_.get(), std::move(*more)};
-                slabs.insert(slabs.end(), extra.slabs.begin(), extra.slabs.end());
-                extra.slabs.clear();
+                for (const std::uint32_t slab : *more) { slabs.adopt(slab); } // reserved: cannot throw
             }
             auto identity      = std::make_shared<CheckpointIdentity>(*lane_.base->identity);
             const auto prompt  = lane_.prompt_tokens;
@@ -1998,17 +1958,17 @@ private:
             identity->ledger.assign(lane_.history.begin(), lane_.history.begin() + frontier);
             identity->prefix_identity.append_generated(added.size(), lane_.base->rope_delta);
             identity->digests.append_generated(added, lane_.base->rope_delta);
-            auto owned = std::move(slabs);
-            slabs.clear(); // capture_record() releases `owned` itself if it throws
-            auto r         = capture_record(std::move(owned), false);
+            auto r         = capture_record(std::move(slabs), false);
             r.identity     = std::move(identity);
-            constexpr runtime::CheckpointRole kEndpointRole[] = {runtime::CheckpointRole::Continuation};
-            const auto out = insert_roles(std::move(r), kEndpointRole);
+            constexpr runtime::CheckpointRole kRole[] = {runtime::CheckpointRole::Continuation};
+            const auto out = cache_->insert_group(std::move(r), kRole);
             lane_.captured = frontier;
             record_capture(start, frontier);
             return out.front();
         } catch (...) {
-            diagnostic("context cache: the endpoint capture failed; the next turn resumes from the prompt's checkpoint");
+            try {
+                diagnostic("context cache: the endpoint capture failed; the next turn resumes from the prompt's checkpoint");
+            } catch (...) {}
             return std::nullopt;
         }
     }
@@ -2069,12 +2029,16 @@ private:
         if (lane_.take_private) {
             out.private_points = lane_.carried;
         } else {
-            for (const auto point : lane_.carried) {
-                HostCheckpoint copy = cache_->at(point);
-                for (const std::uint32_t slab : copy.pages) { cache_->retain(slab); }
-                for (const std::uint32_t slab : copy.image) { cache_->retain(slab); }
-                out.private_points.push_back(cache_->insert(std::move(copy)));
+            // All or none: a failed copy erases the ones made before it.
+            std::vector<CheckpointHandle> copies;
+            try {
+                copies.reserve(lane_.carried.size());
+                for (const auto point : lane_.carried) { copies.push_back(cache_->clone(point)); }
+            } catch (...) {
+                for (const auto copy : copies) { (void)cache_->erase(copy); }
+                throw;
             }
+            out.private_points = std::move(copies);
         }
         unpin_binding();
         out.retired_checkpoints = lane_.retired;
@@ -3948,7 +3912,7 @@ bool Program::checkpoint_matches(CheckpointHandle checkpoint, const RequestBaseP
     return impl_->checkpoint_matches(checkpoint, base);
 }
 runtime::PrefillWork Program::prefill_work(const RequestBasePlan& plan, std::uint32_t begin, std::uint32_t end) const {
-    return impl_->work_between(ProgramImpl::base_of(plan), begin, end);
+    return impl_->work_between(detail::ProgramImpl::base_of(plan), begin, end);
 }
 std::uint32_t Program::checkpoint_recovery_frontier(CheckpointHandle retained, const RequestBasePlan& base,
                                                     std::uint32_t target) const {

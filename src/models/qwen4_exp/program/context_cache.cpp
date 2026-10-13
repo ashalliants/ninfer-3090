@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <new>
 #include <string>
 #include <stdexcept>
 #include <unordered_map>
@@ -93,6 +94,57 @@ void HostTier::copy(std::span<const SlabCopy> copies, bool to_tier, cudaStream_t
     gather_copies(std::span<const GatherCopy>(static_cast<const GatherCopy*>(descriptors_), gather.size()), stream);
 }
 
+std::vector<std::uint32_t> prefill_splits(std::span<const std::uint32_t> capture_frontiers,
+                                          std::span<const std::uint32_t> execution_frontiers,
+                                          std::uint32_t prompt_tokens) {
+    std::vector<std::uint32_t> out;
+    out.reserve(capture_frontiers.size() + execution_frontiers.size());
+    for (const auto* list : {&capture_frontiers, &execution_frontiers}) {
+        for (const std::uint32_t frontier : *list) {
+            if (frontier != 0 && frontier < prompt_tokens) { out.push_back(frontier); }
+        }
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+runtime::PrefillWork prefill_work_between(std::uint32_t begin, std::uint32_t end, std::uint32_t chunk,
+                                          std::span<const MediaCost> media) {
+    std::uint64_t items = 0, patches = 0;
+    if (end > begin) {
+        for (const MediaCost& item : media) {
+            if (std::any_of(item.spans.begin(), item.spans.end(), [&](const auto& span) {
+                    return static_cast<std::uint64_t>(span.first) + span.second > begin && span.first < end;
+                })) {
+                ++items;
+                patches += item.patches;
+            }
+        }
+    }
+    return runtime::make_prefill_work(begin, end > begin ? end - begin : 0, items, patches, chunk);
+}
+
+SlabRefs::~SlabRefs() {
+    if (store_ != nullptr) { store_->release(slabs_); }
+}
+
+SlabRefs& SlabRefs::operator=(SlabRefs&& other) noexcept {
+    if (this != &other) {
+        if (store_ != nullptr) { store_->release(slabs_); }
+        store_ = other.store_;
+        slabs_ = std::move(other.slabs_);
+        other.slabs_.clear();
+    }
+    return *this;
+}
+
+std::vector<std::uint32_t> SlabRefs::take() noexcept {
+    std::vector<std::uint32_t> out = std::move(slabs_);
+    slabs_.clear();
+    return out;
+}
+
 HostCheckpointStore::HostCheckpointStore(std::uint32_t slabs, std::size_t slab_bytes)
     : slab_bytes_(slab_bytes), references_(slabs, 0) {
     if (slab_bytes == 0) { throw std::invalid_argument("context cache slabs must have a size"); }
@@ -137,6 +189,13 @@ HostCheckpointStore::Handle HostCheckpointStore::insert(HostCheckpoint&& record)
     for (const std::uint32_t slab : record.image) {
         if (references_.at(slab) == 0) { throw std::logic_error("context cache: a checkpoint image slab is free"); }
     }
+    if (fail_after_) {
+        if (*fail_after_ == 0) {
+            fail_after_.reset();
+            throw std::bad_alloc();
+        }
+        --*fail_after_;
+    }
     std::uint32_t index = 0;
     while (index < slots_.size() && slots_[index].value) { ++index; }
     if (index == slots_.size()) { slots_.emplace_back(); }
@@ -144,6 +203,55 @@ HostCheckpointStore::Handle HostCheckpointStore::insert(HostCheckpoint&& record)
     slot.value = std::move(record);
     slot.pins  = 0;
     return Handle{this, index, slot.generation};
+}
+
+std::vector<HostCheckpointStore::Handle>
+HostCheckpointStore::insert_group(HostCheckpoint&& record, std::span<const runtime::CheckpointRole> roles) {
+    // The record's own references, released whatever happens: each published copy takes its own.
+    SlabRefs pages(*this, std::move(record.pages));
+    SlabRefs image(*this, std::move(record.image));
+    record.pages.clear();
+    record.image.clear();
+    if (roles.empty()) { throw std::logic_error("context cache: a capture group has no role"); }
+    std::vector<Handle> out;
+    try {
+        out.reserve(roles.size());
+        for (const runtime::CheckpointRole role : roles) {
+            HostCheckpoint copy = record;
+            copy.role           = role;
+            copy.pages          = pages.slabs();
+            copy.image          = image.slabs();
+            SlabRefs held(*this);
+            held.reserve(copy.pages.size() + copy.image.size());
+            for (const auto* list : {&copy.pages, &copy.image}) {
+                for (const std::uint32_t slab : *list) {
+                    retain(slab);
+                    held.adopt(slab);
+                }
+            }
+            out.push_back(insert(std::move(copy))); // reserved: the push cannot throw
+            (void)held.take();                       // the inserted record owns them now
+        }
+    } catch (...) {
+        for (const Handle handle : out) { (void)erase(handle); }
+        throw;
+    }
+    return out;
+}
+
+HostCheckpointStore::Handle HostCheckpointStore::clone(Handle handle) {
+    HostCheckpoint copy = at(handle);
+    SlabRefs held(*this);
+    held.reserve(copy.pages.size() + copy.image.size());
+    for (const auto* list : {&copy.pages, &copy.image}) {
+        for (const std::uint32_t slab : *list) {
+            retain(slab);
+            held.adopt(slab);
+        }
+    }
+    const Handle out = insert(std::move(copy));
+    (void)held.take(); // the inserted record owns them now
+    return out;
 }
 
 bool HostCheckpointStore::valid(Handle handle) const noexcept {

@@ -22,6 +22,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace ninfer::models::qwen4_exp {
@@ -101,6 +102,55 @@ private:
     std::size_t descriptor_bytes_ = 0;
 };
 
+// One prompt media item, for pricing a prefill: its token spans [begin, begin + count) and patches.
+struct MediaCost {
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> spans; // (begin, count)
+    std::uint64_t patches = 0;
+};
+
+// The prefill calls' forced boundaries inside a prompt of `prompt_tokens`: the capture groups'
+// frontiers and the typed rewrite's execution frontiers (where a resumed and a cold run must start
+// a call to agree), ascending and unique, each in (0, prompt_tokens).
+[[nodiscard]] std::vector<std::uint32_t> prefill_splits(std::span<const std::uint32_t> capture_frontiers,
+                                                        std::span<const std::uint32_t> execution_frontiers,
+                                                        std::uint32_t prompt_tokens);
+
+// The prefill work of prompt positions [begin, end) in calls of `chunk` tokens from `begin`, with
+// the media items any of whose spans intersect it (they are encoded again; the Qwen3.5 Program's
+// suffix-intersection rule).
+[[nodiscard]] runtime::PrefillWork prefill_work_between(std::uint32_t begin, std::uint32_t end, std::uint32_t chunk,
+                                                        std::span<const MediaCost> media);
+
+class HostCheckpointStore;
+
+// Owns one reference to each of its slabs and releases them when destroyed, unless taken: the
+// capture paths hold slabs in one of these from the moment they leave the lane's reservation until
+// a published record owns them, so no failure strands them.
+class SlabRefs {
+public:
+    explicit SlabRefs(HostCheckpointStore& store) noexcept : store_(&store) {}
+    SlabRefs(HostCheckpointStore& store, std::vector<std::uint32_t>&& slabs) noexcept
+        : store_(&store), slabs_(std::move(slabs)) {}
+    SlabRefs(SlabRefs&& other) noexcept : store_(other.store_), slabs_(std::move(other.slabs_)) { other.slabs_.clear(); }
+    // Releases what this held, then takes the other's references (same store).
+    SlabRefs& operator=(SlabRefs&& other) noexcept;
+    SlabRefs(const SlabRefs&)       = delete;
+    SlabRefs& operator=(const SlabRefs&) = delete;
+    ~SlabRefs();
+
+    [[nodiscard]] const std::vector<std::uint32_t>& slabs() const noexcept { return slabs_; }
+    [[nodiscard]] std::size_t size() const noexcept { return slabs_.size(); }
+    void reserve(std::size_t count) { slabs_.reserve(count); }
+    // Adopts a reference the caller holds; does not throw once reserve() made room for it.
+    void adopt(std::uint32_t slab) { slabs_.push_back(slab); }
+    // Hands every reference to the caller.
+    [[nodiscard]] std::vector<std::uint32_t> take() noexcept;
+
+private:
+    HostCheckpointStore* store_;
+    std::vector<std::uint32_t> slabs_;
+};
+
 class HostCheckpointStore {
 public:
     using Handle = qwen3_5::CheckpointHandle;
@@ -128,8 +178,17 @@ public:
     void release(std::span<const std::uint32_t> slabs) noexcept;
     [[nodiscard]] std::uint32_t references(std::uint32_t slab) const { return references_.at(slab); }
 
-    // Takes over one reference to each of the record's page and image slabs.
+    // Takes over one reference to each of the record's page and image slabs. On a throw nothing is
+    // inserted and the record (with its references) is still the caller's.
     [[nodiscard]] Handle insert(HostCheckpoint&& record);
+    // Publishes `record` once per role (one capture group), all or nothing: it always consumes the
+    // record's references; on a throw every record it inserted is erased and nothing stays held.
+    [[nodiscard]] std::vector<Handle> insert_group(HostCheckpoint&& record, std::span<const runtime::CheckpointRole> roles);
+    // A second record with the same contents and its own references (the slabs are shared). On a
+    // throw nothing is inserted or held.
+    [[nodiscard]] Handle clone(Handle handle);
+    // Test seam: the insert after `count` more succeed throws std::bad_alloc (nullopt: never).
+    void inject_insert_failure(std::optional<std::size_t> count) noexcept { fail_after_ = count; }
     [[nodiscard]] bool valid(Handle handle) const noexcept;
     [[nodiscard]] const HostCheckpoint& at(Handle handle) const;
     // Releases the record's references. False (nothing changed) for a stale or pinned handle.
@@ -171,6 +230,7 @@ private:
     std::vector<std::uint32_t> free_;
     std::uint32_t peak_ = 0;
     std::vector<Slot> slots_;
+    std::optional<std::size_t> fail_after_;
 };
 
 } // namespace ninfer::models::qwen4_exp

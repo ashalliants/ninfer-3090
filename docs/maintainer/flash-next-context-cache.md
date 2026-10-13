@@ -80,13 +80,16 @@ reference count:
   checkpoint alone. Repeated turns of one conversation therefore store each page once.
 - Host bytes freed by deleting a set of checkpoints are the slabs no other holder references
   (`host_bytes_released`), which is what the ResourceManager's eviction quotes.
+- A capture's slabs are owned by a `SlabRefs` from the moment they leave the lane's reservation
+  until a published record holds them, and a capture group is inserted all or nothing
+  (`insert_group`), so a failed capture (prompt or endpoint) never strands Host capacity.
 
 ## Contract mapping (mirrors the Qwen3.5 Program)
 
 | Hook | Flash-Next |
 |---|---|
 | `plan_request` | capture groups exactly as Qwen3.5: InputReplay at the prompt's recovery frontier (or its end), LongAnchor and SharedPrefix at the frontend's opportunities; vision items are never split; `publish_continuation` when the cache is on and the prompt is reusable |
-| `inspect_source` | exact match (digests, then tokens, positions and media); remaining work from F; one Host-to-Device transfer requirement of the restored bytes; carried private points and retirements as Qwen3.5 |
+| `inspect_source` | exact match (digests, then tokens, positions and media); remaining work from F, including the images it encodes again (any image with a token at or after F); one Host-to-Device transfer requirement of the restored bytes; carried private points and retirements as Qwen3.5 |
 | `start_binding` / `poll_context` | backs the request's extent, pins the source, restores pages and state, sets `state_tokens = F`, the mirror and the drafter's position (below); a consumed source is released after the restore |
 | prefill | a call stops at the next capture frontier; reaching a mid-prompt one returns `capture_ready`; the prompt-end group is offered at the Begin commit |
 | `prepare_capture` / `start_capture` / `skip_capture` | reserves slabs (the Engine's capture admission evicts for it), copies, publishes the checkpoint in the next `poll_context` |
@@ -117,7 +120,10 @@ A resumed request's greedy ids must equal the same request run cold.
   on or off (`BasePlanImpl::splits`, as Qwen3.5 splits at its rewrite frontiers): a prompt's output
   does not depend on the cache, and a resume at one of those frontiers runs exactly the calls a cold
   run of the longer prompt runs. Measured before this rule: a 28K-token chat prompt generated 18
-  tokens with the cache on and 25 with it off (both greedy, different call partitions).
+  tokens with the cache on and 25 with it off (both greedy, different call partitions). Calls also
+  end at the typed rewrite's *execution frontiers* (`rewrite_execution_frontiers`, as the Qwen3.5
+  Program's prefill does), which the prefix identity already compares: a resumed request and its
+  cold run then decompose the recurrent state at an earlier turn's rewrite identically.
 - **Short calls take the static route** (fewer than 512 columns, even while the wide route's lease is
   held): the wide route streams every non-resident expert of each layer, about 0.8 s per call,
   which made a split cost as much as a 4K call. Greedy ids of a 4,101-token prompt (a 5-token tail

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <new>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -177,6 +178,120 @@ void test_prefix_and_recovery_loss() {
     std::printf("ok: prefixes and recovery loss\n");
 }
 
+// The capture paths' ownership: a SlabRefs releases what it still holds; a group insert either
+// publishes every role or leaves nothing inserted and nothing held, whichever insert fails; a clone
+// that fails holds nothing. Run against the pool's occupancy, which a leak would leave raised.
+void test_capture_ownership() {
+    HostCheckpointStore store(64, kSlab);
+    const auto id = identity(sequence(300));
+    // A lane mirror of one page stays held throughout (the capture paths retain it again).
+    const auto mirror = store.allocate(1);
+    require(mirror.has_value(), "mirror page");
+    const std::uint32_t baseline = store.used_slabs();
+    {
+        SlabRefs refs(store, *store.allocate(3));
+        require(store.used_slabs() == baseline + 3, "held");
+    }
+    require(store.used_slabs() == baseline, "a dropped SlabRefs releases its slabs");
+    {
+        SlabRefs refs(store, *store.allocate(2));
+        auto taken = refs.take();
+        require(taken.size() == 2 && refs.size() == 0, "take hands the references over");
+        store.release(taken);
+        refs = SlabRefs(store, *store.allocate(1));
+        refs = SlabRefs(store); // assignment releases the old contents
+        require(store.used_slabs() == baseline, "move assignment releases what it replaces");
+    }
+    // A capture record at 200 tokens: the mirror's page (retained once more), 3 new pages, an image.
+    const auto make_record = [&] {
+        HostCheckpoint r;
+        r.identity = id;
+        r.frontier = 200;
+        store.retain((*mirror)[0]);
+        r.pages.push_back((*mirror)[0]);
+        const auto pages = *store.allocate(3);
+        r.pages.insert(r.pages.end(), pages.begin(), pages.end());
+        r.image = *store.allocate(2);
+        return r;
+    };
+    const runtime::CheckpointRole roles[] = {runtime::CheckpointRole::InputReplay, runtime::CheckpointRole::SharedPrefix,
+                                             runtime::CheckpointRole::LongAnchor};
+    for (std::size_t fail = 0; fail < 3; ++fail) {
+        store.inject_insert_failure(fail);
+        bool threw = false;
+        try {
+            (void)store.insert_group(make_record(), roles);
+        } catch (const std::bad_alloc&) {
+            threw = true;
+        }
+        require(threw, "the injected insert failure propagates");
+        require(store.size() == 0 && store.used_slabs() == baseline && store.references((*mirror)[0]) == 1,
+                "a group insert failing at role " + std::to_string(fail) + " leaves nothing inserted or held");
+    }
+    bool threw = false;
+    try {
+        (void)store.insert_group(make_record(), {});
+    } catch (const std::logic_error&) {
+        threw = true;
+    }
+    require(threw && store.used_slabs() == baseline, "a group without roles is refused and releases its record");
+    // Success: one record per role, each holding every slab once.
+    const auto handles = store.insert_group(make_record(), roles);
+    require(handles.size() == 3 && store.size() == 3, "one record per role");
+    for (std::size_t i = 0; i < 3; ++i) { require(store.at(handles[i]).role == roles[i], "roles in order"); }
+    const auto& record = store.at(handles[0]);
+    require(store.references(record.pages[1]) == 3 && store.references(record.image[0]) == 3 &&
+                store.references((*mirror)[0]) == 4,
+            "each record holds one reference (the mirror one more)");
+    // A clone that fails holds nothing; one that succeeds shares the slabs.
+    store.inject_insert_failure(0);
+    threw = false;
+    try {
+        (void)store.clone(handles[0]);
+    } catch (const std::bad_alloc&) {
+        threw = true;
+    }
+    require(threw && store.size() == 3 && store.references(record.pages[1]) == 3, "a failed clone holds nothing");
+    const Handle copy = store.clone(handles[0]);
+    require(store.references(store.at(copy).pages[1]) == 4, "a clone takes its own references");
+    require(store.erase(copy), "the clone erases");
+    for (const Handle handle : handles) { require(store.erase(handle), "erase"); }
+    require(store.used_slabs() == baseline, "everything back but the mirror");
+    std::printf("ok: capture ownership (SlabRefs, group insert rollback, clone)\n");
+}
+
+// Prefill calls end at the capture groups' frontiers and the typed rewrite's execution frontiers,
+// cache on or off: merged, ascending, unique, strictly inside the prompt.
+void test_prefill_splits() {
+    const std::uint32_t captures[]  = {512, 4096, 5000};
+    const std::uint32_t execution[] = {100, 512, 3000, 5000};
+    const auto splits               = prefill_splits(captures, execution, 5000);
+    require(splits == std::vector<std::uint32_t>({100, 512, 3000, 4096}), "execution frontiers split prefill too");
+    require(prefill_splits(captures, {}, 5000) == std::vector<std::uint32_t>({512, 4096}), "capture frontiers alone");
+    require(prefill_splits({}, execution, 5000) == std::vector<std::uint32_t>({100, 512, 3000}),
+            "execution frontiers split without any capture group (the cache off)");
+    std::printf("ok: prefill splits include execution frontiers\n");
+}
+
+// A source before an image is priced with the image's encode; one past it is not (the suffix
+// intersection rule, the same set plan_lane_vision encodes).
+void test_prefill_work_media() {
+    MediaCost image{.spans = {{1000, 384}}, .patches = 1536};
+    const MediaCost media[] = {image};
+    const auto before = prefill_work_between(0, 5000, 4096, media);
+    const auto at     = prefill_work_between(1000, 5000, 4096, media);
+    const auto inside = prefill_work_between(1383, 5000, 4096, media);
+    const auto after  = prefill_work_between(1384, 5000, 4096, media);
+    require(before.vision_items == 1 && before.vision_patches == 1536, "a cold prefill encodes the image");
+    require(at.vision_items == 1 && inside.vision_items == 1, "a suffix holding any image token encodes it");
+    require(after.vision_items == 0 && after.vision_patches == 0, "a suffix past the image does not");
+    require(after.tokens == 3616 && after.chunks == 1 &&
+                after.attention_pairs == runtime::make_prefill_work(1384, 3616, 0, 0, 4096).attention_pairs,
+            "token work is the plain suffix work");
+    require(prefill_work_between(5000, 5000, 4096, media).vision_items == 0, "an exact hit encodes nothing");
+    std::printf("ok: prefill pricing counts the images a source leaves\n");
+}
+
 HostMemoryDemand flash_next() {
     HostMemoryDemand d;
     d.reserve      = 2 * kGiB;
@@ -234,6 +349,9 @@ int main() {
         test_shared_pages_and_release_quotes();
         test_release_sets();
         test_prefix_and_recovery_loss();
+        test_capture_ownership();
+        test_prefill_splits();
+        test_prefill_work_media();
         test_ledger_fit();
         std::printf("qwen4_exp context cache tests passed\n");
         return 0;
