@@ -72,6 +72,72 @@ python3 tools/bench/run_agent_rotation.py --agents 4 --target-tokens 200000 \
     --out profiles/bench/agent-rotation/run.jsonl
 ```
 
+## Hosted multi-tenant workload (context cache on a provider)
+
+`run_hosted_workload.py` drives an already-running `ninfer-serve` with what a provider serving many
+people sees: N tenants, each with one conversation at a time, all conversations opening with one of a
+few shared "product" prompts (system text plus a tool catalogue), then a private opening document,
+then growing turn by turn with appended tool output. One request is in flight per conversation (a
+client waits for its reply); a `429 server_overloaded` answer is retried every second, as a gateway
+would hold it, and counted. `hosted_analysis.py` turns one or more runs into the hit split, the
+tokens an ideal cache would have saved and why they were lost, TTFT and queue percentiles, lane
+utilisation and the store counters. The baseline that uses them is
+[`docs/maintainer/cache-provider-baseline.md`](../../docs/maintainer/cache-provider-baseline.md).
+
+```powershell
+# server: the tuned 27B MTP flag set plus --request-log-jsonl (and --context-store DIR if wanted)
+python tools/bench/run_hosted_workload.py --preset hosted-32 --duration-s 600 `
+    --request-log server-requests.jsonl --out runs/c8-h8
+python tools/bench/hosted_analysis.py runs/c4-h8 runs/c8-h8 --warmup-s 300 --markdown
+```
+
+Presets (token sizes are measured with the server's own `count_tokens`; filler is about 1.35
+tokens per word):
+
+| preset | tenants | products (shared prompt tokens) | opening | per turn | think time | other |
+|---|---:|---|---|---|---:|---|
+| `smoke` | 4 | about 1.2K, 2.3K | 1-4K | 0.3-1.5K | 2 s | 10% edit, 10% branch, ends at 16K |
+| `hosted-16` | 16 | 1,608 / 4,563 / 9,090 (measured) | 2-40K | 0.3-4K | 20 s | 5% edit, 5% branch |
+| `hosted-32` | 32 | same | 2-40K | 0.3-4K | 40 s | same |
+| `hosted-64` | 64 | same | 2-40K | 0.3-4K | 80 s | same |
+| `bursty-32` | 32 | same | 2-40K | 0.3-4K | groups | groups of 8 every 45 s; 15% fan-out of 3 over a new 4-16K document |
+
+- Sizes in ranges are log-uniform. Tenant `i` uses product `i mod products`. A conversation ends
+  past 100K prompt tokens (16K for `smoke`) and its tenant opens a new one.
+- **Turn kinds.** `first` opens a conversation; `append` adds tool output after the last reply;
+  `edit` replaces the latest tool output (the prompt continues from the previous reply, a point
+  the newer turn superseded); `branch` drops the last 2-6 exchanges and continues from there;
+  `fanout` sends 3 sub-agent requests at once, each the history plus one new shared document plus
+  its own task (siblings share a prefix that ends at no chat marker); `resume` is one append per
+  saved conversation after a restart (`--save-state`, then `--resume-state FILE --resume-once`).
+- **Arrivals.** `poisson`: each tenant waits an exponential think time (mean above) after each
+  reply, so the offered rate is about tenants / think time while the server keeps up. `bursty`:
+  tenants wait until their random group of 8 is released, every 45 s.
+- **Replies.** Temperature 0. Thinking off: up to 160 tokens, the reply is replayed verbatim.
+  `--thinking on`: up to 640 tokens with `thinking_budget` 384; the client sends back only the
+  answer, as most clients do, so the template drops the closed reasoning and the reusable point is
+  the prompt before the reply rather than its end.
+- `--tenants` and `--think-s` override a preset; `--duration-s` stops issuing turns (in-flight ones
+  finish).
+
+Each run directory holds `requests.jsonl` (one record per request: prompt, cached, output tokens,
+client TTFT, retries, and the ideal reuse estimates), `server_records.json` (the joined
+`request_done` records), `load.jsonl` (`/v1/load` once a second) and `summary.json` (with
+`/metrics` before and after). `hosted_analysis.py` documents its classification in its docstring;
+its eviction split replays the trace through an LRU of the run's Device + Host bytes and is a
+ceiling model, not the engine.
+
+## Raw disk speed (`disk_seq_io.py`)
+
+Sequential write and read with the OS file cache bypassed (`FILE_FLAG_NO_BUFFERING` on Windows,
+`O_DIRECT` on Linux), one block at a time, over a scratch file it always deletes, with an optional
+buffered read for comparison. It is the disk rate to use in a disk-tier cost model, as opposed to
+the context store's end-to-end read path.
+
+```powershell
+python tools/bench/disk_seq_io.py --dir $env:TEMP --size-gib 4 --block-mib 4 8 16 32 --buffered
+```
+
 ## Copy-heavy agent replay
 
 `agent_replay/` is the copy-drafting workload: deterministic multi-turn coding-agent sessions whose
