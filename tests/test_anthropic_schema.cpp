@@ -567,6 +567,9 @@ int test_thinking_and_count_tokens() {
     body["thinking"] = Json{{"type", "future"}};
     failures += check(api_param([&] { (void)parse(body); }) == "thinking",
                       "unknown Thinking mode defaulted to enabled");
+    body["thinking"] = Json{{"type", "between_tools"}};
+    failures += check(api_code([&] { (void)parse(body); }) == "thinking_type_not_supported",
+                      "between_tools Thinking has an explicit capability rejection");
     body["thinking"] = Json{{"type", "adaptive"}, {"display", "omitted"}};
     failures += check(api_code([&] { (void)parse(body); }) == "thinking_display_not_supported",
                       "hidden Thinking was accepted without restore semantics");

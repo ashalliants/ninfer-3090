@@ -742,11 +742,16 @@ text-only `audio` configuration, and `prediction` are accepted without changing 
 Metadata, user/safety identifiers, service-tier and prompt-cache hints are likewise advisory.
 Unknown top-level fields are ignored.
 
-A string `name` on a `tool` message is accepted as an ignored, output-neutral compatibility
-extension for clients that mirror the function name onto tool results. It does not participate in
-tool identity, prompt rendering, or output. Non-string values are malformed; non-empty names on
-other message roles remain unsupported because they carry participant identity that the loaded chat
-template cannot represent.
+A string `name` on any message is accepted and ignored, as the optional OpenAI participant label
+that agent frameworks use to tag injected messages and that some clients mirror onto tool results.
+It does not participate in tool identity, prompt rendering, or output, so distinct names do not
+create distinct participants. Non-string values are malformed.
+
+Function names replayed in message history (`tool_calls`, `function_call`, `function` messages)
+must be non-empty strings but are not restricted to the definition charset, so history from other
+clients or models round-trips unchanged. Tool definitions still require `[A-Za-z0-9_-]{1,64}`.
+`allowed_tools` entries use the Chat shape `{"type":"function","function":{"name":...}}`; the flat
+`{"type":"function","name":...}` form is also accepted.
 
 For commonly generated OpenAI-compatible payloads, `repetition_penalty` is accepted only at its
 neutral value `1`, and `mm_processor_kwargs` when empty or containing only null values. String-form
@@ -1233,7 +1238,7 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 | `refusal` | assistant-message replay part; its text enters assistant history |
 | `input_image` | user- or assistant-message part with HTTP(S) or data-URI `image_url`; detail omitted or `auto`; requires server `--vision` |
 | `input_video` | NInfer extension with HTTP(S) or data-URI `video_url`; requires server `--vision` |
-| `reasoning` | raw replay Item with `reasoning_text` content; summary/encrypted metadata may accompany raw text but cannot replace it |
+| `reasoning` | raw replay Item with `reasoning_text` content (`content` itself may be omitted); summary/encrypted metadata may accompany raw text but cannot replace it |
 | `function_call` | completed assistant call with optional `id` and namespace, plus required `call_id`, `name`, and JSON-object string `arguments` |
 | `function_call_output` | completed result with required `call_id` and optional matching name/namespace assertion; `output` may be a string or a non-empty array of `input_text`/`input_image` parts |
 | `custom_tool_call` | completed assistant call of a [custom tool](#custom-tools) with optional `id` and namespace, plus required `call_id`, `name`, and string `input` |
@@ -1356,8 +1361,9 @@ A terminal wire response has `object: "response"`, one of `completed`, `incomple
 
 Ordinary model/string stops produce `completed`. Output-token or context-capacity exhaustion
 produces `incomplete` with `incomplete_details.reason: "max_output_tokens"`. Errors accepted after
-an SSE response has started produce `response.failed`; validation and preparation errors remain
-normal HTTP error responses. `completed_at` is populated only for completed Responses. A
+an SSE response has started produce `response.failed`, whose `error.code` is one of the wire enum
+values (`server_error` unless the failure already uses one) with the detail in `error.message`;
+validation and preparation errors remain normal HTTP error responses. `completed_at` is populated only for completed Responses. A
 reasoning-only incomplete result contains no invented empty assistant message.
 
 Usage is checkpoint-native:
@@ -1505,7 +1511,8 @@ completed zero-output cache-prewarm lifecycle. `temperature`, `top_p`, `top_k`, 
 `stop_reason:"stop_sequence"` together with the actual `stop_sequence`; context exhaustion returns
 `model_context_window_exceeded`.
 
-Thinking supports `disabled`, `adaptive`, and `enabled`. Enabled Thinking requires
+Thinking supports `disabled`, `adaptive`, and `enabled`; `between_tools` returns
+`thinking_type_not_supported`. Enabled Thinking requires
 `budget_tokens >= 1024` and less than `max_tokens`, and that budget is passed to Engine. Visible
 Thinking is returned with an opaque local signature; SSE emits its `signature_delta` before
 closing the block. Assistant Thinking blocks must be passed back unmodified with that signature;

@@ -851,6 +851,11 @@ void parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose p
             bad_request("thinking.budget_tokens must be less than max_tokens", "thinking");
         }
         request.thinking_budget = static_cast<std::uint32_t>(*budget);
+    } else if (type == "between_tools") {
+        bad_request("thinking.type='between_tools' requests thinking only between tool calls, "
+                    "which the loaded chat template cannot schedule; use 'disabled', 'adaptive', "
+                    "or 'enabled'",
+                    "thinking", "thinking_type_not_supported");
     } else {
         bad_request("thinking.type must be 'disabled', 'adaptive', or 'enabled'", "thinking");
     }
