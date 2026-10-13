@@ -1819,10 +1819,20 @@ private:
         std::vector<RetainedOwner> affected;
         for (const auto& owner : owners_) {
             if (owner.active || owner.superseded || owner.points.empty()) { continue; }
-            const bool hit = std::any_of(owner.points.begin(), owner.points.end(), [&](const auto& p) {
-                return contains(handles, p.handle);
-            });
-            if (!hit) { continue; }
+            // Only when the release takes the point the conversation resumes from (its deepest):
+            // losing a shallower anchor or input point leaves the next turn served from the cache,
+            // and exporting the whole conversation for it would stall the worker for nothing.
+            const Point* deepest = nullptr;
+            std::uint32_t deepest_frontier = 0;
+            for (const auto& point : owner.points) {
+                if (!program.valid_checkpoint(point.handle)) { continue; }
+                const auto frontier = program.checkpoint_metadata(point.handle).frontier;
+                if (!deepest || frontier > deepest_frontier) {
+                    deepest          = &point;
+                    deepest_frontier = frontier;
+                }
+            }
+            if (!deepest || !contains(handles, deepest->handle)) { continue; }
             auto points = this->points(owner.token);
             if (!std::all_of(points.begin(), points.end(),
                              [&](auto point) { return program.valid_checkpoint(point); })) {

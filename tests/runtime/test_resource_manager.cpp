@@ -2313,6 +2313,31 @@ void test_release_offers_live_continuations_before_their_points_go() {
             "the evicted continuation was not offered to the store before its release");
 }
 
+// Losing only a shallower point (an anchor or input point) leaves the conversation's resume point
+// in the cache: nothing is offered for writing.
+void test_release_of_a_shallower_point_is_not_offered() {
+    Fixture f(48);
+    const auto shallow = f.program.add({1, 2}, {f.program.host_block(16)}, Role::LongAnchor);
+    const auto deep = f.program.add({1, 2, 3, 4}, {f.program.host_block(16)}, Role::Continuation);
+    const Base base{.tokens = {1, 2, 3, 4}};
+    const auto owner = f.begin(base);
+    f.cache.publish(f.program, owner, shallow);
+    f.cache.publish(f.program, owner, deep);
+    f.cache.finish(f.program, owner, base, f.next_order);
+    std::vector<Fixture::Token> offered;
+    f.cache.set_durability(
+        {.releasing = [&](std::span<const Fixture::Cache::RetainedOwner> owners) {
+            for (const auto& entry : owners) { offered.push_back(entry.token); }
+        }});
+    auto cursor = f.cache.begin_reclaim(f.program);
+    f.cache.commit_host_victims(f.program, std::vector<Handle>{shallow}, cursor);
+    require(offered.empty() && !f.program.valid_checkpoint(shallow),
+            "losing a shallower point offered the whole conversation");
+    f.cache.commit_host_victims(f.program, std::vector<Handle>{deep}, cursor);
+    require(offered == std::vector<Fixture::Token>{owner},
+            "losing the resume point did not offer the conversation");
+}
+
 int main() {
     try {
         test_candidate_memo_cuts_victim_selection_work();
@@ -2376,6 +2401,7 @@ int main() {
         test_stored_continuation_is_priced_as_a_disk_restore();
         test_slow_store_read_is_not_a_discount();
         test_release_offers_live_continuations_before_their_points_go();
+        test_release_of_a_shallower_point_is_not_offered();
         std::cout << "ok\n";
         return 0;
     } catch (const std::exception& error) {
