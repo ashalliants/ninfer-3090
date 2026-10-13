@@ -912,6 +912,9 @@ int main() {
     throughput.current.host_context_occupied_bytes      = 16ULL << 20;
     throughput.current.host_context_reserved_bytes      = 4ULL << 20;
     throughput.current.host_context_peak_occupied_bytes = 20ULL << 20;
+    throughput.current.host_context_free_extents        = 6;
+    throughput.current.host_context_geometry_failures   = 9;
+    throughput.current.host_context_shortage_failures   = 4;
     throughput.current.last_selected_frontier_tokens    = 64;
     throughput.current.pressure_spill_pages             = 4;
     throughput.current.engine_recoveries                = 3;
@@ -993,6 +996,11 @@ int main() {
             throughput_json.at("context_cache").at("occupancy").at("host_context_reserved_bytes") ==
                 (4ULL << 20),
         "unified Host occupied and reserved gauges missing");
+    failures += check(
+        throughput_json.at("context_cache").at("occupancy").at("host_context_free_extents") == 6 &&
+            throughput_json.at("context_cache").at("pressure").at("host_geometry_failures") == 9 &&
+            throughput_json.at("context_cache").at("pressure").at("host_shortage_failures") == 4,
+        "Host allocator failures must be reported as interval deltas with the free-run gauge");
     failures += check(throughput_json.at("engine_recoveries") == 2 &&
                           !throughput_json.at("context_cache").contains("engine_recoveries"),
                       "engine_recoveries must be a top-level interval delta, not nested under "

@@ -153,6 +153,9 @@ PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {
         out.capacity.host_bytes      = host_context_arena->capacity_bytes();
         out.host_reserved_bytes      = host_context_arena->reserved_bytes();
         out.host_peak_occupied_bytes = host_context_arena->peak_occupied_bytes();
+        out.host_free_extents        = host_context_arena->free_extent_count();
+        out.host_geometry_failures   = host_context_arena->geometry_failures();
+        out.host_shortage_failures   = host_context_arena->shortage_failures();
     }
     return out;
 }

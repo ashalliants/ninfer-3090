@@ -227,7 +227,7 @@ std::optional<HostKVAllocation> HostKVArena::allocate(const HostKVPageLayout& la
         return std::nullopt;
     }
     const std::size_t bytes = layout.page_stride * static_cast<std::size_t>(pages);
-    auto storage            = arena_->allocate(bytes);
+    auto storage            = arena_->allocate(bytes, HostPlacement::High);
     if (!storage) { return std::nullopt; }
     const std::uint32_t descriptor_index = take_descriptor();
     Descriptor& descriptor               = descriptors_[descriptor_index];

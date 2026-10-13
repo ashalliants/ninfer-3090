@@ -79,19 +79,39 @@ std::optional<std::size_t> HostContextArena::find_free_extent(std::size_t bytes)
     return std::nullopt;
 }
 
+std::optional<std::size_t>
+HostContextArena::find_free_extent_high(std::size_t bytes) const noexcept {
+    for (std::size_t index = free_extents_.size(); index != 0; --index) {
+        if (free_extents_[index - 1].bytes >= bytes) { return index - 1; }
+    }
+    return std::nullopt;
+}
+
+std::size_t HostContextArena::largest_free_extent_bytes() const noexcept {
+    std::size_t largest = 0;
+    for (const FreeExtent& extent : free_extents_) { largest = std::max(largest, extent.bytes); }
+    return largest;
+}
+
 bool HostContextArena::can_allocate(std::size_t bytes) const noexcept {
     const std::size_t rounded = allocation_bytes(bytes);
     return rounded != 0 && find_free_extent(rounded).has_value();
 }
 
-std::optional<HostContextAllocation> HostContextArena::allocate(std::size_t bytes) noexcept {
+std::optional<HostContextAllocation>
+HostContextArena::allocate(std::size_t bytes, HostPlacement placement) noexcept {
     const std::size_t rounded = allocation_bytes(bytes);
     if (rounded == 0) { return std::nullopt; }
-    const auto free_index = find_free_extent(rounded);
-    if (!free_index) { return std::nullopt; }
-    FreeExtent& free         = free_extents_[*free_index];
-    const std::size_t offset = free.offset;
-    free.offset += rounded;
+    const bool high       = placement == HostPlacement::High;
+    const auto free_index = high ? find_free_extent_high(rounded) : find_free_extent(rounded);
+    if (!free_index) {
+        ++(free_bytes() >= rounded ? geometry_failures_ : shortage_failures_);
+        return std::nullopt;
+    }
+    FreeExtent& free = free_extents_[*free_index];
+    // Low takes the front of the first fitting extent; High takes the back of the last one.
+    const std::size_t offset = high ? free.offset + free.bytes - rounded : free.offset;
+    if (!high) { free.offset += rounded; }
     free.bytes -= rounded;
     if (free.bytes == 0) {
         free_extents_.erase(free_extents_.begin() + static_cast<std::ptrdiff_t>(*free_index));

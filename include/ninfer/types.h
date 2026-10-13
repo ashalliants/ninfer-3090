@@ -1391,6 +1391,11 @@ struct RuntimeStats {
     std::size_t host_context_reserved_bytes = 0;
     // Allocator lifetime high-water mark, including reserved transfer destinations.
     std::size_t host_context_peak_occupied_bytes = 0;
+    // Host allocator: free runs now, and allocations that found no run. A geometry failure had
+    // enough free bytes in total but no single run that fit; a shortage failure had too few bytes.
+    std::size_t host_context_free_extents          = 0;
+    std::uint64_t host_context_geometry_failures   = 0;
+    std::uint64_t host_context_shortage_failures   = 0;
     double actual_context_transfer_seconds       = 0.0;
     // Host-side failures the worker survived by failing the in-flight requests and clearing the
     // context cache instead of latching the Engine unavailable.

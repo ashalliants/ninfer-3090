@@ -59,7 +59,8 @@ bool ProgramImpl::reserve_capture_destination(std::uint32_t lane, std::uint32_t 
     }
     auto destination = state_store->reserve_destination();
     if (!destination && host_context_arena) {
-        ticket->host = host_context_arena->allocate(state_images->host_layout().image_bytes);
+        ticket->host = host_context_arena->allocate(state_images->host_layout().image_bytes,
+                                                    HostPlacement::Low);
         if (ticket->host) { destination = state_store->reserve_logical_destination(); }
     }
     if (!destination) { return false; }

@@ -263,7 +263,7 @@ HostStatePool::HostStatePool(HostContextArena& arena, StateImageHostLayout layou
 
 std::optional<HostStateSlotHandle> HostStatePool::allocate() noexcept {
     if (free_count_ == 0) { return std::nullopt; }
-    auto storage = arena_->allocate(layout_.image_bytes);
+    auto storage = arena_->allocate(layout_.image_bytes, HostPlacement::Low);
     if (!storage) { return std::nullopt; }
     const std::uint32_t index = free_slots_[--free_count_];
     Slot& slot                = slots_[index];

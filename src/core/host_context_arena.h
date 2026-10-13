@@ -3,6 +3,7 @@
 #include "core/arena.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -10,6 +11,11 @@
 namespace ninfer {
 
 class HostContextArena;
+
+// Where in the backing a new extent is carved. Fixed-size state images take the low end and
+// variable-length KV runs the high end, so the two kinds never interleave and a state image
+// always finds the single hole between them instead of being blocked by a KV island.
+enum class HostPlacement { Low, High };
 
 // A unique, immovable physical extent. Keeping this owner alive pins its bytes; views never
 // allocate or charge a second copy. Transfer destinations remain reserved until publication.
@@ -81,8 +87,22 @@ public:
 
     [[nodiscard]] std::size_t allocation_count() const noexcept { return allocation_count_; }
 
+    // Largest single extent a request could be given, and how many free runs there are.
+    // free_bytes() >= n with largest_free_extent_bytes() < n is a geometry failure. O(runs):
+    // for failure handling and reporting, not for the allocation path.
+    [[nodiscard]] std::size_t largest_free_extent_bytes() const noexcept;
+
+    [[nodiscard]] std::size_t free_extent_count() const noexcept { return free_extents_.size(); }
+
+    // Allocations that found no extent, split by why: `geometry` when enough bytes were free in
+    // total but no single run fit, `shortage` when the bytes were simply not there. Monotonic.
+    [[nodiscard]] std::uint64_t geometry_failures() const noexcept { return geometry_failures_; }
+
+    [[nodiscard]] std::uint64_t shortage_failures() const noexcept { return shortage_failures_; }
+
     [[nodiscard]] bool can_allocate(std::size_t bytes) const noexcept;
-    [[nodiscard]] std::optional<HostContextAllocation> allocate(std::size_t bytes) noexcept;
+    [[nodiscard]] std::optional<HostContextAllocation>
+    allocate(std::size_t bytes, HostPlacement placement = HostPlacement::Low) noexcept;
     [[nodiscard]] std::pair<HostContextAllocation, HostContextAllocation>
     split(HostContextAllocation&& allocation, std::size_t byte_offset);
 
@@ -96,6 +116,7 @@ private:
 
     [[nodiscard]] std::size_t allocation_bytes(std::size_t bytes) const noexcept;
     [[nodiscard]] std::optional<std::size_t> find_free_extent(std::size_t bytes) const noexcept;
+    [[nodiscard]] std::optional<std::size_t> find_free_extent_high(std::size_t bytes) const noexcept;
     void insert_free_extent(FreeExtent extent) noexcept;
     void release(std::size_t offset, std::size_t bytes, bool reserved) noexcept;
 
@@ -106,6 +127,8 @@ private:
     std::size_t reserved_bytes_      = 0;
     std::size_t peak_occupied_bytes_ = 0;
     std::size_t allocation_count_    = 0;
+    std::uint64_t geometry_failures_ = 0;
+    std::uint64_t shortage_failures_ = 0;
     std::vector<FreeExtent> free_extents_;
 };
 
