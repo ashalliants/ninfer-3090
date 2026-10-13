@@ -216,9 +216,43 @@ Costs: chat prompts split prefill at the typed recovery frontier (just before th
 header), a few-token static call: +0.07 s on a 2.5K-token first turn (+6%) and +0.2-0.3 s on
 28K (+2%), in every configuration. The 4 GiB Host tier pins in about 1 s at startup.
 
+### NVMe tier and `--context-store` (2026-10-13, same machine and flags)
+
+Server sessions, one sitting, ABBA in the order master, RAM tier, RAM + NVMe tier, NVMe only | NVMe
+only, RAM + NVMe, RAM, master (master is the build before this branch; `--context-nvme-mib 16384`;
+`tools/bench/flash_next_store/bench.py`). A 24,144-token and a 7,283-token document; the repeat is an
+exact hit, so its TTFT is the restore plus the fixed ~0.08 s of a one-token request.
+
+| | master | RAM | RAM + NVMe | NVMe only (2nd arm) |
+|---|---:|---:|---:|---:|
+| cold 24K TTFT, s | 10.63 / 10.61 | 10.64 / 10.33 | 10.76 / 10.33 | 10.55 |
+| cold 7K TTFT, s | 3.33 / 3.32 | 3.33 / 3.24 | 3.38 / 3.26 | 3.31 |
+| repeat 24K TTFT, median of 5, s | 0.118 / 0.123 | 0.118 / 0.118 | 0.108 / 0.124 | 0.198 |
+| repeat 7K TTFT, median of 5, s | 0.097 / 0.075 | 0.082 / 0.092 | 0.076 / 0.078 | 0.127 |
+| decode, 512 tokens, median of 3, tok/s | 92.7 / 93.8 | 93.9 / 96.5 | 93.7 / 96.5 | 94.8 |
+
+The first NVMe-only arm ran while something else used the card (cold 24K 14.5 s, decode 80.7 tok/s,
+repeat 0.253 s) and is not used; it is in the raw data. The tier costs nothing measurable on cold
+prefill or decode. With RAM frames in front, a hit is served from RAM exactly as before; with no RAM
+tier a 24K-token restore costs about 80 ms more (7K: 45 ms) than from RAM. Micro-benchmark
+(`ninfer_qwen4_exp_nvme_tier_test --bench`): file only, 511 MiB restore 96.5 ms (5.6 GB/s), capture
+263 ms; with RAM frames, restore 21.4 ms.
+
+Restart (first conversation, server stopped with CTRL_BREAK, started again on the same store, n = 1
+per cell, the repeats after it n = 3): the 24K-token request, cold 10.79 s, after the restart 0.211 s
+with the RAM tier and 0.445 s with `--host-context-mib 0 --context-nvme-mib 16384`; the 7K-token
+one 3.27 s cold, 0.142 s / 0.281 s after. Start-up imports one session (283-289 MiB image) in
+0.17-0.77 s.
+
+Not measured: hit rate or TTFT under a working set larger than the RAM tier (the eviction gate with
+a 1 GiB tier proves correctness, not benefit), and a store on a different volume than the model.
+
 ## Status
 
 Done: the RAM tier, capture/restore/reclaim hooks, the launcher default (`NINFER_PREFIX_CACHE=off`
 opts out), real-model gates; the NVMe tier and `--context-store` (Storage tiers, Persistence).
+The launcher keeps the NVMe tier opt-in (`NINFER_CONTEXT_NVME_MIB`): it costs nothing measurable, but
+it only pays once the working set exceeds the RAM tier, which was not measured, and it writes a
+scratch file beside the model (capped at half the volume's free space). Revisit with a hit-rate run.
 Not built: more than one lane (the handles, keys and mirror are per lane already); retrying a failed
 frame write (a frame whose write failed stays in RAM until its slab is freed).
