@@ -2988,6 +2988,25 @@ private:
         return shared;
     }
 
+    // The size of a shared image in the store with this prefix's exact key, if there is one.
+    template <class Program>
+    [[nodiscard]] std::optional<std::uint64_t> stored_shared_image(Program& program,
+                                                                   Checkpoint handle) const {
+        const auto frontier = program.checkpoint_metadata(handle).frontier;
+        const auto key      = program.checkpoint_key(handle, frontier);
+        for (const ContextStore::Info& info : store_.store->list()) {
+            if (!info.shared || info.binding != store_.binding || info.checkpoints.empty()) {
+                continue;
+            }
+            const auto& stored = info.checkpoints.front();
+            if (stored.frontier == frontier && stored.digests == key.digests &&
+                stored.identity_tag == key.identity_tag) {
+                return info.image_bytes;
+            }
+        }
+        return std::nullopt;
+    }
+
     // Writes a public shared prefix as soon as it is published, busy or not: one per second at a
     // boundary without a context transaction, while the writer is idle. A system or tools prompt
     // is captured once and then serves every tenant that sends it, so it is worth a short
@@ -3000,9 +3019,19 @@ private:
         try {
             auto& program = *instance_.program;
             if (program.has_context_transaction() || (store_.ready && !store_.ready())) { return; }
-            const auto shared = unstored_shared(program);
-            if (shared.empty()) { return; }
-            const auto handle  = shared.front();
+            std::optional<Checkpoint> pending;
+            for (const auto handle : unstored_shared(program)) {
+                // A prefix captured again after an eviction has the key of the image the store
+                // already holds: that image serves it, so it is not exported a second time.
+                if (const auto bytes = stored_shared_image(program, handle)) {
+                    shared_stored_.emplace_back(handle, *bytes);
+                    continue;
+                }
+                pending = handle;
+                break;
+            }
+            if (!pending) { return; }
+            const auto handle  = *pending;
             const auto started = Clock::now();
             auto image         = program.export_checkpoints({&handle, 1}, std::nullopt,
                                                             store_.binding);
