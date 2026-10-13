@@ -833,6 +833,32 @@ ABBA, two runs each):
 
 The other three (1.5K, 2.6K and 10K tokens) were restored at start-up in every run and are equal.
 
+### Context store as a cache tier: write-on-evict and shared prefixes (RTX 3090, Qwen3.8-27B)
+
+Hosted rotation, 2026-10-13: 24 tenants on three shared system prompts of about 2.5K tokens, each
+visit appending a 1-3K-token tool result (conversations restart at 30K tokens), one client per
+lane, 120 requests, greedy, thinking off, 64 output tokens, store on the C: NVMe, every arm from an
+empty store. Same build with and without write-on-evict (ABCCBA with the shared-prefix build as C;
+two runs each):
+
+| C4, `tuned` DFlash2 flags, 2 GiB Host tier | hit rate | re-prefilled tokens | TTFT p50 / p95 / p99 | wall time |
+|---|---:|---:|---|---:|
+| store with idle writes only | 0.320 / 0.318 | 869K / 873K | 6.89 / 34.5 / 42.5 s ; 7.29 / 32.0 / 41.5 s | 479 / 463 s |
+| + write-on-evict | 0.737 / 0.711 | 336K / 370K | 4.70 / 9.4 / 10.1 s ; 4.21 / 13.6 / 18.0 s | 235 / 248 s |
+| + shared prefixes | 0.737 / 0.737 | 336K / 336K | 4.92 / 9.0 / 10.9 s ; 4.57 / 8.9 / 10.8 s | 242 / 237 s |
+
+
+Write-on-evict is not free: copying each evicted conversation out (about 330 MB here) is a step of
+the Engine worker, 37-38 s per C4 run of about 240 s, and the store wrote 530-560 GB per hour.
+Hydrations (91-92 per run, none failed) waited about 1.1 s each for the read. Per-request prefill
+and decode medians were unchanged (2,470-2,500 and 106-112 tok/s).
+
+Warm start after a crash (each arm seeds its own store with 48 requests, is killed, restarts and
+serves 24 new tenants on the same system prompts; ABBA): stored shared prefixes raised the hit
+rate from 0.418 / 0.418 to 0.478 / 0.478 and lowered mean TTFT from 2.87 / 2.73 s to 2.09 / 2.39 s
+(p95 6.26 / 6.26 s to 4.80 / 4.83 s). Writing them while busy cost nothing measurable (seed-phase
+mean TTFT 3.16 / 3.16 s against 3.15 / 3.36 s).
+
 ## Published coverage
 
 Published measurements use one NVIDIA GeForce RTX 5090 through NInfer's public HTTP serving route.
