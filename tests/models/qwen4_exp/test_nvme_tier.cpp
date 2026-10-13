@@ -121,6 +121,8 @@ struct Harness {
     void capture(const std::vector<std::uint32_t>& slabs, const std::vector<std::byte>& bytes) {
         Device d(bytes.size());
         cuda(cudaMemcpy(d.data, bytes.data(), bytes.size(), cudaMemcpyHostToDevice), "upload");
+        // The tier works on a non-blocking stream, which the legacy-stream upload does not order.
+        cuda(cudaDeviceSynchronize(), "upload");
         const auto copies = copies_for(slabs, d.data);
         tier.copy(copies, true, stream);
         cuda(cudaStreamSynchronize(stream), "capture");
@@ -129,6 +131,7 @@ struct Harness {
     std::vector<std::byte> restore(const std::vector<std::uint32_t>& slabs) {
         Device d(region_bytes(slabs.size()));
         cuda(cudaMemset(d.data, 0xEE, d.bytes), "memset");
+        cuda(cudaDeviceSynchronize(), "memset");
         const auto copies = copies_for(slabs, d.data);
         tier.copy(copies, false, stream);
         cuda(cudaStreamSynchronize(stream), "restore");
@@ -137,6 +140,18 @@ struct Harness {
         return out;
     }
 };
+
+// Equal, or says where the first difference is.
+bool same(const std::vector<std::byte>& a, const std::vector<std::byte>& b) {
+    if (a == b) { return true; }
+    std::size_t i = 0;
+    while (i < a.size() && i < b.size() && a[i] == b[i]) { ++i; }
+    std::size_t differ = 0;
+    for (std::size_t k = 0; k < std::min(a.size(), b.size()); ++k) { differ += a[k] != b[k] ? 1 : 0; }
+    std::fprintf(stderr, "first difference at byte %zu of %zu (%zu differ; got %d, expected %d)\n", i, a.size(), differ,
+                 i < a.size() ? static_cast<int>(a[i]) : -1, i < b.size() ? static_cast<int>(b[i]) : -1);
+    return false;
+}
 
 std::vector<std::uint32_t> range(std::uint32_t first, std::uint32_t count) {
     std::vector<std::uint32_t> out(count);
@@ -155,7 +170,7 @@ void test_frames_eviction_and_direct(cudaStream_t stream) {
     tier.flush();
     auto stats = tier.stats();
     require(stats.slabs_written == 6 && stats.dirty == 0 && stats.cached == 6, "a framed capture is written through");
-    require(h.restore(first) == a, "a framed capture restores from RAM");
+    require(same(h.restore(first), a), "a framed capture restores from RAM");
     require(tier.stats().slabs_from_ram == 6 && tier.stats().slabs_read == 0, "it came from RAM");
     // Two more captures of 8 evict the least recently used frames to the file.
     const auto b = pattern(region_bytes(8), 2);
@@ -165,23 +180,23 @@ void test_frames_eviction_and_direct(cudaStream_t stream) {
     h.capture(range(120, 8), c);
     tier.flush();
     const auto before = tier.stats();
-    require(h.restore(first) == a, "evicted slabs restore from the file");
+    require(same(h.restore(first), a), "evicted slabs restore from the file");
     const auto after = tier.stats();
     require(after.slabs_read - before.slabs_read > 0, "some of them came from the file");
-    require(h.restore(range(120, 8)) == c && h.restore(range(100, 8)) == b, "the later captures restore");
+    require(same(h.restore(range(120, 8)), c) && same(h.restore(range(100, 8)), b), "the later captures restore");
     // A capture larger than half the frames goes straight to the file through the bounce halves.
     const auto big = range(200, 12);
     const auto d   = pattern(region_bytes(big.size()), 4);
     const auto written = tier.stats().slabs_written;
     h.capture(big, d);
     require(tier.stats().slabs_written == written + 12, "a large capture is written directly");
-    require(h.restore(big) == d, "a direct capture restores from the file");
+    require(same(h.restore(big), d), "a direct capture restores from the file");
     // A slab freed and captured again holds its new bytes (RAM and file).
     for (const std::uint32_t s : first) { tier.discard(s); }
     const auto e = pattern(region_bytes(first.size()), 5);
     h.capture(first, e);
     tier.flush();
-    require(h.restore(first) == e, "a rewritten slab restores its new bytes");
+    require(same(h.restore(first), e), "a rewritten slab restores its new bytes");
     // Host whole-slab I/O (images) agrees with the device copies.
     std::vector<std::byte> slabs(first.size() * kSlab);
     tier.read(first, slabs);
@@ -191,7 +206,7 @@ void test_frames_eviction_and_direct(cudaStream_t stream) {
     tier.read(range(150, 6), back);
     require(back == host, "a host write reads back");
     tier.write(range(160, 6), slabs);
-    require(h.restore(range(160, 6)) == e, "slabs copied through the host restore as the originals");
+    require(same(h.restore(range(160, 6)), e), "slabs copied through the host restore as the originals");
     std::printf("ok: frames, eviction, direct captures and host I/O\n");
 }
 
@@ -207,7 +222,7 @@ void test_failing_disk(cudaStream_t stream) {
     tier.flush();
     const auto stats = tier.stats();
     require(stats.write_failures >= 4 && stats.stuck == 4, "failed writes leave their frames stuck in RAM");
-    require(h.restore(slabs) == a, "a stuck frame still restores its bytes");
+    require(same(h.restore(slabs), a), "a stuck frame still restores its bytes");
     bool threw = false;
     try {
         h.capture(range(40, 12), pattern(region_bytes(12), 8));
@@ -228,7 +243,7 @@ void test_failing_disk(cudaStream_t stream) {
     } catch (const std::system_error&) { threw = true; }
     require(threw, "a failed read throws");
     flaky.fail_reads = false;
-    require(h.restore(range(40, 12)) == b, "the disk recovered: the bytes are there");
+    require(same(h.restore(range(40, 12)), b), "the disk recovered: the bytes are there");
     for (const std::uint32_t s : slabs) { tier.discard(s); }
     require(tier.stats().stuck == 0, "freeing a stuck slab frees its frame");
     std::printf("ok: a failing disk degrades to errors the caller turns into misses\n");
@@ -240,7 +255,7 @@ void test_no_frames(cudaStream_t stream) {
     const auto slabs = std::vector<std::uint32_t>{0, 1, 2, 7, 8, 30, 31, 32, 33, 63};
     const auto a     = pattern(region_bytes(slabs.size()), 11);
     h.capture(slabs, a);
-    require(h.restore(slabs) == a, "a tier without frames restores from the file");
+    require(same(h.restore(slabs), a), "a tier without frames restores from the file");
     require(tier.stats().slabs_from_ram == 0 && tier.stats().slabs_read == slabs.size(), "all of it from the file");
     std::printf("ok: no RAM frames\n");
 }
