@@ -26,7 +26,8 @@ HostMemoryLedger plan_host_memory(const HostMemorySnapshot& snapshot, const Host
     HostMemoryLedger out;
     out.snapshot = snapshot;
     out.demand   = demand;
-    const std::uint64_t pinned_other = with_lock_overhead(demand.other_pinned + demand.later_pinned, demand.lock_overhead);
+    const std::uint64_t pinned_other =
+        with_lock_overhead(demand.other_pinned + demand.later_pinned + demand.context_cache, demand.lock_overhead);
     out.planned   = pinned_other + demand.pageable + demand.load_staging + demand.process_growth;
     out.full_need = with_lock_overhead(demand.expert_banks, demand.lock_overhead) + demand.full_margin;
     // Physical memory: the reserve and everything planned come first.
@@ -42,7 +43,8 @@ HostMemoryLedger plan_host_memory(const HostMemorySnapshot& snapshot, const Host
     if (out.fits) { out.commit_limited = false; }
     // A finite Linux RLIMIT_MEMLOCK bounds every pinned byte, whatever memory is free.
     // The load staging is pinned too but freed before the later pins are made, so the peak is the larger of the two.
-    out.pinned_total = demand.expert_banks + demand.other_pinned + std::max(demand.later_pinned, demand.load_staging);
+    out.pinned_total = demand.expert_banks + demand.other_pinned + demand.context_cache +
+                       std::max(demand.later_pinned, demand.load_staging);
     if (snapshot.lock_limit && out.pinned_total > *snapshot.lock_limit) {
         out.lock_limited = true;
         out.fits         = false;
@@ -50,14 +52,48 @@ HostMemoryLedger plan_host_memory(const HostMemorySnapshot& snapshot, const Host
     return out;
 }
 
+ContextCacheFit fit_context_cache(const HostMemorySnapshot& snapshot, HostMemoryDemand demand, std::uint64_t requested,
+                                  std::uint64_t minimum, std::uint64_t granule) {
+    ContextCacheFit out;
+    if (requested == 0 || granule == 0) { return out; }
+    demand.context_cache = 0;
+    const HostMemoryLedger without = plan_host_memory(snapshot, demand);
+    if (!without.fits) {
+        out.shrunk = true;
+        return out;
+    }
+    // What is left above the reserve, the planned allocations and the experts' full need (the
+    // smaller of physical memory and the commit limit), and under a finite memory-lock limit.
+    const std::uint64_t floor_bytes = demand.reserve + without.planned + without.full_need;
+    std::uint64_t spare = std::min(saturating_sub(snapshot.available_physical, floor_bytes),
+                                   saturating_sub(snapshot.available_commit, floor_bytes));
+    // The cache's own lock bookkeeping comes out of the same room.
+    spare = static_cast<std::uint64_t>(static_cast<double>(spare) / (1.0 + demand.lock_overhead));
+    if (snapshot.lock_limit) { spare = std::min(spare, saturating_sub(*snapshot.lock_limit, without.pinned_total)); }
+    std::uint64_t bytes = std::min(requested, spare);
+    bytes               = bytes / granule * granule;
+    if (bytes < minimum) { bytes = 0; }
+    // The ledger with the cache must still fit (rounding of the lock overhead).
+    demand.context_cache = bytes;
+    while (bytes != 0 && !plan_host_memory(snapshot, demand).fits) {
+        bytes                = bytes > granule ? bytes - granule : 0;
+        bytes                = bytes < minimum ? 0 : bytes;
+        demand.context_cache = bytes;
+    }
+    out.bytes  = bytes;
+    out.shrunk = bytes < requested;
+    return out;
+}
+
 std::string HostMemoryLedger::describe() const {
     char line[640];
     std::snprintf(line, sizeof(line),
                   "RAM ledger: available %.2f GiB of %.2f (commit %.2f); reserve %.2f; other pins %.2f; later pins "
-                  "%.2f; caches %.2f; staging %.2f; growth %.2f -> experts %.2f GiB of %.2f needed (banks %.2f + "
-                  "margin %.2f)%s; %s",
+                  "%.2f; context cache %.2f; caches %.2f; staging %.2f; growth %.2f -> experts %.2f GiB of %.2f "
+                  "needed (banks %.2f + margin %.2f)%s; %s",
                   gib(snapshot.available_physical), gib(snapshot.total_physical), gib(snapshot.available_commit),
-                  gib(demand.reserve), gib(demand.other_pinned), gib(demand.later_pinned), gib(demand.pageable),
+                  gib(demand.reserve), gib(demand.other_pinned), gib(demand.later_pinned), gib(demand.context_cache),
+                  gib(demand.pageable),
                   gib(demand.load_staging), gib(demand.process_growth), gib(expert_ram), gib(full_need),
                   gib(demand.expert_banks), gib(demand.full_margin), commit_limited ? ", limited by the page file" : "",
                   lock_limited ? "the memory-lock limit is below the pinned total"

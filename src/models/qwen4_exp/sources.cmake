@@ -18,5 +18,6 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/expert_residency.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/vram_monitor.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/rope_positions.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/context_cache.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/program.cpp"
 )

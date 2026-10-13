@@ -1,0 +1,230 @@
+#include "models/qwen4_exp/program/context_cache.h"
+
+#include "core/paged_kv_cache.h"
+
+#include <algorithm>
+#include <stdexcept>
+#include <unordered_map>
+#include <unordered_set>
+
+namespace ninfer::models::qwen4_exp {
+
+HostCheckpointStore::HostCheckpointStore(std::uint32_t slabs, std::size_t slab_bytes)
+    : slab_bytes_(slab_bytes), references_(slabs, 0) {
+    if (slab_bytes == 0) { throw std::invalid_argument("context cache slabs must have a size"); }
+    free_.reserve(slabs);
+    // Lowest index on top, so allocation order is ascending (Host addresses grow with it).
+    for (std::uint32_t s = slabs; s-- > 0;) { free_.push_back(s); }
+}
+
+std::optional<std::vector<std::uint32_t>> HostCheckpointStore::allocate(std::uint32_t count) {
+    if (count > free_.size()) { return std::nullopt; }
+    std::vector<std::uint32_t> out(free_.end() - count, free_.end());
+    free_.resize(free_.size() - count);
+    std::reverse(out.begin(), out.end());
+    for (const std::uint32_t slab : out) { references_[slab] = 1; }
+    peak_ = std::max(peak_, used_slabs());
+    return out;
+}
+
+void HostCheckpointStore::retain(std::uint32_t slab) {
+    if (references_.at(slab) == 0) { throw std::logic_error("context cache: retaining a free slab"); }
+    ++references_[slab];
+}
+
+void HostCheckpointStore::release(std::uint32_t slab) noexcept {
+    if (slab >= references_.size() || references_[slab] == 0) { return; }
+    if (--references_[slab] == 0) { free_.push_back(slab); }
+}
+
+void HostCheckpointStore::release(std::span<const std::uint32_t> slabs) noexcept {
+    for (const std::uint32_t slab : slabs) { release(slab); }
+}
+
+HostCheckpointStore::Handle HostCheckpointStore::insert(HostCheckpoint&& record) {
+    if (!record.identity || record.frontier == 0 || record.frontier > record.identity->ledger.size() ||
+        record.frontier > record.identity->digests.size() ||
+        record.pages.size() != (record.frontier + kPagedKVPageSize - 1U) / kPagedKVPageSize) {
+        throw std::logic_error("context cache: a checkpoint does not cover its frontier");
+    }
+    for (const std::uint32_t slab : record.pages) {
+        if (references_.at(slab) == 0) { throw std::logic_error("context cache: a checkpoint page is free"); }
+    }
+    for (const std::uint32_t slab : record.image) {
+        if (references_.at(slab) == 0) { throw std::logic_error("context cache: a checkpoint image slab is free"); }
+    }
+    std::uint32_t index = 0;
+    while (index < slots_.size() && slots_[index].value) { ++index; }
+    if (index == slots_.size()) { slots_.emplace_back(); }
+    auto& slot = slots_[index];
+    slot.value = std::move(record);
+    slot.pins  = 0;
+    return Handle{this, index, slot.generation};
+}
+
+bool HostCheckpointStore::valid(Handle handle) const noexcept {
+    return handle.owner == this && handle.index < slots_.size() && slots_[handle.index].value &&
+           slots_[handle.index].generation == handle.generation;
+}
+
+const HostCheckpoint& HostCheckpointStore::at(Handle handle) const {
+    if (!valid(handle)) { throw std::logic_error("context cache: stale checkpoint handle"); }
+    return *slots_[handle.index].value;
+}
+
+bool HostCheckpointStore::erase(Handle handle) noexcept {
+    if (!valid(handle) || slots_[handle.index].pins != 0) { return false; }
+    auto& slot = slots_[handle.index];
+    release(slot.value->pages);
+    release(slot.value->image);
+    slot.value.reset();
+    if (++slot.generation == 0) { slot.generation = 1; }
+    return true;
+}
+
+void HostCheckpointStore::pin(Handle handle) {
+    if (!valid(handle)) { throw std::logic_error("context cache: pinning a stale checkpoint"); }
+    ++slots_[handle.index].pins;
+}
+
+void HostCheckpointStore::unpin(Handle handle) noexcept {
+    if (valid(handle) && slots_[handle.index].pins != 0) { --slots_[handle.index].pins; }
+}
+
+bool HostCheckpointStore::pinned(Handle handle) const noexcept {
+    return valid(handle) && slots_[handle.index].pins != 0;
+}
+
+std::vector<HostCheckpointStore::Handle> HostCheckpointStore::handles() const {
+    std::vector<Handle> out;
+    for (std::uint32_t i = 0; i < slots_.size(); ++i) {
+        if (slots_[i].value) { out.push_back(Handle{this, i, slots_[i].generation}); }
+    }
+    return out;
+}
+
+std::size_t HostCheckpointStore::size() const noexcept {
+    return static_cast<std::size_t>(std::count_if(slots_.begin(), slots_.end(), [](const Slot& s) { return s.value.has_value(); }));
+}
+
+std::size_t HostCheckpointStore::footprint_bytes(std::span<const Handle> handles) const {
+    std::unordered_set<std::uint32_t> slabs;
+    for (const Handle handle : handles) {
+        const auto& record = at(handle);
+        slabs.insert(record.pages.begin(), record.pages.end());
+        slabs.insert(record.image.begin(), record.image.end());
+    }
+    return slabs.size() * slab_bytes_;
+}
+
+std::size_t HostCheckpointStore::released_bytes(std::span<const Handle> handles) const {
+    std::unordered_map<std::uint32_t, std::uint32_t> held;
+    std::unordered_set<std::uint32_t> records;
+    for (const Handle handle : handles) {
+        if (!valid(handle) || slots_[handle.index].pins != 0) { return 0; }
+        if (!records.insert(handle.index).second) { continue; }
+        const auto& record = *slots_[handle.index].value;
+        for (const std::uint32_t slab : record.pages) { ++held[slab]; }
+        for (const std::uint32_t slab : record.image) { ++held[slab]; }
+    }
+    std::size_t slabs = 0;
+    for (const auto& [slab, count] : held) { slabs += references_[slab] == count ? 1U : 0U; }
+    return slabs * slab_bytes_;
+}
+
+std::vector<std::vector<HostCheckpointStore::Handle>>
+HostCheckpointStore::release_sets(std::span<const Handle> eligible) const {
+    std::vector<bool> allowed(slots_.size(), false);
+    for (const Handle handle : eligible) {
+        if (valid(handle) && slots_[handle.index].pins == 0) { allowed[handle.index] = true; }
+    }
+    std::vector<std::vector<std::uint32_t>> sets;
+    const auto add = [&](std::vector<std::uint32_t> set) {
+        if (std::find(sets.begin(), sets.end(), set) == sets.end()) { sets.push_back(std::move(set)); }
+    };
+    for (std::uint32_t index = 0; index < slots_.size(); ++index) {
+        if (allowed[index]) { add({index}); }
+    }
+    // Every holder of each slab, in slot order.
+    std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> holders;
+    for (std::uint32_t index = 0; index < slots_.size(); ++index) {
+        if (!slots_[index].value) { continue; }
+        const auto& record = *slots_[index].value;
+        for (const auto* list : {&record.pages, &record.image}) {
+            for (const std::uint32_t slab : *list) {
+                auto& entry = holders[slab];
+                if (entry.empty() || entry.back() != index) { entry.push_back(index); }
+            }
+        }
+    }
+    for (auto& [slab, set] : holders) {
+        if (set.size() < 2) { continue; }
+        // A slab some other holder references (the lane, or one record listing it twice) is not
+        // freed by releasing these records; such sets are still quoted through released_bytes.
+        if (!std::all_of(set.begin(), set.end(), [&](std::uint32_t index) { return allowed[index]; })) { continue; }
+        add(set);
+    }
+    std::vector<std::vector<Handle>> out;
+    out.reserve(sets.size());
+    for (const auto& set : sets) {
+        std::vector<Handle> handles;
+        for (const std::uint32_t index : set) { handles.push_back(Handle{this, index, slots_[index].generation}); }
+        out.push_back(std::move(handles));
+    }
+    return out;
+}
+
+bool HostCheckpointStore::prefix(Handle earlier, Handle later) const {
+    const auto& a = at(earlier);
+    const auto& b = at(later);
+    if (a.frontier > b.frontier || a.identity_tag != b.identity_tag ||
+        a.identity->digests.at(a.frontier) != b.identity->digests.at(a.frontier)) {
+        return false;
+    }
+    if (a.identity == b.identity) { return true; }
+    const auto count = static_cast<std::ptrdiff_t>(a.frontier);
+    return std::equal(a.identity->ledger.begin(), a.identity->ledger.begin() + count, b.identity->ledger.begin()) &&
+           a.identity->prefix_identity.prefix_equals(b.identity->prefix_identity, a.frontier);
+}
+
+std::uint64_t HostCheckpointStore::recovery_loss(std::span<const Handle> removed,
+                                                 std::span<const Handle> surviving) const {
+    std::vector<Handle> ordered;
+    for (const Handle handle : removed) {
+        if (valid(handle) && std::find(ordered.begin(), ordered.end(), handle) == ordered.end()) {
+            ordered.push_back(handle);
+        }
+    }
+    std::sort(ordered.begin(), ordered.end(), [&](Handle left, Handle right) {
+        const auto l = at(left).frontier, r = at(right).frontier;
+        return l != r ? l > r : left.index < right.index;
+    });
+    struct Lineage {
+        Handle deepest;
+        std::uint32_t tokens;
+    };
+    std::vector<Lineage> lineages;
+    for (const Handle handle : ordered) {
+        std::uint32_t fallback = 0;
+        for (const Handle retained : surviving) {
+            if (!valid(retained) || std::find(ordered.begin(), ordered.end(), retained) != ordered.end()) {
+                continue;
+            }
+            const auto frontier = at(retained).frontier;
+            if (frontier > fallback && prefix(retained, handle)) { fallback = frontier; }
+        }
+        const std::uint32_t lost = at(handle).frontier - fallback;
+        const auto lineage = std::find_if(lineages.begin(), lineages.end(),
+                                          [&](const Lineage& item) { return prefix(handle, item.deepest); });
+        if (lineage == lineages.end()) {
+            lineages.push_back({handle, lost});
+        } else {
+            lineage->tokens = std::max(lineage->tokens, lost);
+        }
+    }
+    std::uint64_t total = 0;
+    for (const Lineage& lineage : lineages) { total += lineage.tokens; }
+    return total;
+}
+
+} // namespace ninfer::models::qwen4_exp

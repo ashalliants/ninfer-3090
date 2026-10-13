@@ -3,11 +3,11 @@
 // Adapted from Infernix a3edb450 src/models/qwen4_exp/program/program.h (Apache-2.0).
 // Modified for NInfer-3090: implements NInfer's Engine execution contract (the one EngineCore,
 // Scheduler and ResourceManager drive for Qwen3.5) instead of Infernix's hybrid-cache contract:
-// prefix reuse is off (the Program reports no checkpoints, captures nothing and offers only root
-// sources), one lane, MTP speculation (Infernix's drafter, verification and commit), image input
-// (Infernix's vision program: the tower encodes in frames lent by the expert cache at the prompt's
-// first prefill unit, the handoff stays lent until the prompt's last call), no n-gram copy drafts,
-// CPU-served misses or SSD tier.
+// prefix reuse through NInfer's context cache with checkpoints held only in a pinned Host tier
+// (docs/maintainer/flash-next-context-cache.md), one lane, MTP speculation (Infernix's drafter,
+// verification and commit), image input (Infernix's vision program: the tower encodes in frames
+// lent by the expert cache at the prompt's first prefill unit, the handoff stays lent until the
+// prompt's last call), no n-gram copy drafts, CPU-served misses or SSD tier.
 //
 // The Qwen4Exp Program: the Engine-facing execution of Qwen3.8-Flash-Next. It owns the lane, its
 // paged INT8 KV (an elastic VMM pool), recurrent state, sampling state and the one pending model
@@ -74,13 +74,12 @@ public:
 
     [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
     [[nodiscard]] const qwen3_5::PreparedContextCache& context_cache() const noexcept;
-    // Prefix reuse is off: no capture frontier, no shared-prefix checkpoint a sibling could wait
-    // for, and no shortlist key.
-    [[nodiscard]] std::vector<std::uint32_t> capture_frontiers() const { return {}; }
-    [[nodiscard]] std::vector<std::uint32_t> shared_prefix_frontiers() const { return {}; }
-    [[nodiscard]] std::optional<qwen3_5::PrefixShortlistKey> prefix_shortlist_key(std::uint32_t) const noexcept {
-        return std::nullopt;
-    }
+    // The prompt frontiers this request captures (ascending), those that publish a SharedPrefix
+    // checkpoint, and the shortlist key of any prompt frontier. Empty and nullopt when the request
+    // does not use the context cache.
+    [[nodiscard]] std::vector<std::uint32_t> capture_frontiers() const;
+    [[nodiscard]] std::vector<std::uint32_t> shared_prefix_frontiers() const;
+    [[nodiscard]] std::optional<qwen3_5::PrefixShortlistKey> prefix_shortlist_key(std::uint32_t frontier) const noexcept;
 
 private:
     explicit RequestBasePlan(std::shared_ptr<detail::BasePlanImpl> impl) noexcept;
@@ -103,8 +102,8 @@ private:
     friend struct detail::ContractAccess;
 };
 
-// The context cache's types. This Program never creates a checkpoint, so every handle the Engine
-// could hold is invalid and every checkpoint query below answers for an empty cache.
+// The context cache's types (the Qwen3.5 Program's passive data). Every checkpoint lives in the
+// Host tier only, so reclaim releases Host bytes and never demotes.
 using CheckpointHandle   = qwen3_5::CheckpointHandle;
 using CheckpointMetadata = qwen3_5::CheckpointMetadata;
 using CheckpointSummary  = qwen3_5::CheckpointSummary;
@@ -127,7 +126,8 @@ struct ContextRelease {
     runtime::ContextResourceUsage released;
 };
 
-// A demotion batch over an empty cache: nothing to append, cover or finish.
+// Nothing is ever demoted (no checkpoint is on the device): a batch has nothing to append, cover
+// or finish.
 class ContextDemotionBatch {
 public:
     [[nodiscard]] bool append(const ContextDemotion&) { return false; }
@@ -135,15 +135,18 @@ public:
     [[nodiscard]] std::optional<ContextDemotion> finish() const { return std::nullopt; }
 };
 
+// Read-only facts for one synchronous evaluation: Host release actions only.
 struct ContextReclaimPlan {
     std::vector<ContextDemotion> demotions;
     std::vector<ContextRelease> releases;
 
     [[nodiscard]] ContextDemotionBatch begin_kv_batch(runtime::ContextResourceUsage) const { return {}; }
-    [[nodiscard]] std::uint64_t recovery_loss(std::span<const CheckpointHandle>,
-                                              std::span<const CheckpointHandle>) const {
-        return 0;
-    }
+    [[nodiscard]] std::uint64_t recovery_loss(std::span<const CheckpointHandle> removed,
+                                              std::span<const CheckpointHandle> surviving) const;
+
+private:
+    const detail::ProgramImpl* owner_ = nullptr;
+    friend class detail::ProgramImpl;
 };
 
 // A paused request. This Program does not pause (it has one lane and reserves a request's whole
@@ -221,8 +224,8 @@ struct PrefillProgress {
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     bool capture_ready = false;
-    // The Engine records Main KV restored under the first prefill pass. This Program keeps no Host
-    // KV to restore (prefix reuse is off), so the list stays empty.
+    // The Engine records Main KV restored under the first prefill pass. This Program's restore
+    // lands within the binding (reported by poll_context), so the list stays empty.
     std::vector<runtime::ContextTransferObservation> landed_transfers;
 };
 
@@ -363,6 +366,9 @@ struct ProgramOptions {
     // Image input: the model loaded its vision tower. Prompts with media encode it into frames lent
     // by the expert cache (its io words are planned only when set).
     bool vision = false;
+    // The context cache's pinned Host tier (checkpoints for prefix reuse), sized by the startup RAM
+    // ledger; 0: no prefix reuse.
+    std::uint64_t context_cache_bytes = 0;
 };
 
 class Program {
@@ -402,46 +408,41 @@ public:
     [[nodiscard]] CheckpointSummary checkpoint_summary(CheckpointHandle checkpoint) const;
     [[nodiscard]] CheckpointMetadata checkpoint_metadata(CheckpointHandle checkpoint) const;
     [[nodiscard]] bool checkpoint_matches(CheckpointHandle checkpoint, const RequestBasePlan& base) const;
-    // The Engine prices a sibling's remaining prefill only to wait for one of its shared-prefix
-    // checkpoints; this Program publishes none, so the call is never reached. Counts tokens only.
-    [[nodiscard]] runtime::PrefillWork prefill_work(const RequestBasePlan&, std::uint32_t begin,
-                                                    std::uint32_t end) const {
-        return runtime::PrefillWork{.tokens = end > begin ? end - begin : 0U};
-    }
+    // Prefill cost features of prompt positions [begin, end): tokens and the calls they take.
+    [[nodiscard]] runtime::PrefillWork prefill_work(const RequestBasePlan& base, std::uint32_t begin,
+                                                    std::uint32_t end) const;
     [[nodiscard]] std::uint32_t checkpoint_recovery_frontier(CheckpointHandle retained, const RequestBasePlan& base,
                                                              std::uint32_t target) const;
     [[nodiscard]] std::uint64_t checkpoint_recovery_loss(std::span<const CheckpointHandle> removed,
                                                          std::span<const CheckpointHandle> surviving) const;
-    [[nodiscard]] bool valid_checkpoint(CheckpointHandle) const noexcept { return false; }
-    [[nodiscard]] bool release_checkpoint(CheckpointHandle) noexcept { return false; }
+    [[nodiscard]] bool valid_checkpoint(CheckpointHandle checkpoint) const noexcept;
+    [[nodiscard]] bool release_checkpoint(CheckpointHandle checkpoint) noexcept;
+    // No pause, so no snapshot.
     [[nodiscard]] bool revoke_snapshot(ResumeState&) noexcept { return false; }
     [[nodiscard]] runtime::ContextResourceUsage snapshot_resources(const ResumeState&) const { return {}; }
-    [[nodiscard]] std::size_t host_bytes_released(std::span<const CheckpointHandle>) const { return 0; }
+    [[nodiscard]] std::size_t host_bytes_released(std::span<const CheckpointHandle> checkpoints) const;
     [[nodiscard]] std::optional<std::size_t> pause_host_bytes(SequenceHandle) const { return std::nullopt; }
-    [[nodiscard]] std::size_t release_redundant_host(std::span<const CheckpointHandle>,
-                                                     std::optional<SequenceHandle> = std::nullopt) {
-        return 0;
-    }
+    // Drops the lane's references to Host pages no checkpoint holds (a capture then copies them
+    // again), except for `pending_backup`'s lane. Returns the bytes freed.
+    [[nodiscard]] std::size_t release_redundant_host(std::span<const CheckpointHandle> excluded,
+                                                     std::optional<SequenceHandle> pending_backup = std::nullopt);
     [[nodiscard]] runtime::ResourceReservation reserve_units(std::span<const ExecutionUnit> units);
-    [[nodiscard]] bool reclaim_capture_reservation(runtime::ContextResourceUsage) { return false; }
+    [[nodiscard]] bool reclaim_capture_reservation(runtime::ContextResourceUsage shortage);
     void release_units(std::span<const SequenceHandle> sequences) noexcept;
     [[nodiscard]] BindingReservation start_binding(const RequestBasePlan& base, runtime::LaneId lane,
                                                    const SourceCandidate& source, ResumeState* resume = nullptr,
                                                    ExecutionUnitKind resume_kind = ExecutionUnitKind::Decode,
                                                    std::uint32_t resume_tokens   = 1);
-    [[nodiscard]] bool start_capture(SequenceHandle) { return false; }
-    [[nodiscard]] bool capture_is_input(SequenceHandle) const { return false; }
-    [[nodiscard]] std::optional<CapturePreparation> prepare_capture(SequenceHandle) { return std::nullopt; }
-    void skip_capture(SequenceHandle) {}
-    [[nodiscard]] ContextReclaimPlan plan_reclaim(std::span<const CheckpointHandle>, std::span<const CheckpointHandle>,
-                                                  runtime::ContextResourceUsage) const {
-        return {};
-    }
-    [[nodiscard]] std::vector<ContextRelease> plan_releases(std::span<const CheckpointHandle>,
-                                                            std::span<const CheckpointHandle>,
-                                                            runtime::ContextResourceUsage) const {
-        return {};
-    }
+    [[nodiscard]] bool start_capture(SequenceHandle sequence);
+    [[nodiscard]] bool capture_is_input(SequenceHandle sequence) const;
+    [[nodiscard]] std::optional<CapturePreparation> prepare_capture(SequenceHandle sequence);
+    void skip_capture(SequenceHandle sequence);
+    [[nodiscard]] ContextReclaimPlan plan_reclaim(std::span<const CheckpointHandle> allowed,
+                                                  std::span<const CheckpointHandle> excluded,
+                                                  runtime::ContextResourceUsage shortage) const;
+    [[nodiscard]] std::vector<ContextRelease> plan_releases(std::span<const CheckpointHandle> allowed,
+                                                            std::span<const CheckpointHandle> excluded,
+                                                            runtime::ContextResourceUsage shortage) const;
     [[nodiscard]] bool start_demote(const ContextDemotion&) { return false; }
     // One lane and a whole-extent reservation at admission: there is never a younger resident to
     // pause, so pausing is refused.
@@ -480,8 +481,8 @@ public:
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept {}
-    // The context store needs checkpoints, which this Program does not make; the Engine refuses
-    // the store for this model, so these are never reached.
+    // The context store (checkpoint images on disk) is not built for this model: the Engine refuses
+    // --context-store for it, so these are never reached.
     [[nodiscard]] CheckpointImage export_checkpoints(std::span<const CheckpointHandle>,
                                                      const std::optional<PreparedSessionKey>&,
                                                      std::string_view binding) const;

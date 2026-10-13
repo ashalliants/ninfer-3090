@@ -20,7 +20,7 @@
 // Program logs each request's expert-cache hit rate.
 //
 //   ninfer_qwen4_exp_engine_real_test --bench [--max-context N] [--generate N] [--no-graph]
-//       [--expert-cache-mib N] [--no-expert-state] [--split N] [--print-ids] [--vision]
+//       [--expert-cache-mib N] [--no-expert-state] [--split N] [--print-ids] [--vision] [--prefill-chunk N]
 //       [--mtp K [--mtp-fixed] [--width-cost X]] TOKENS...
 //
 // --vision loads the artifact's vision tower (an Engine started with --vision; the jobs stay text).
@@ -37,6 +37,11 @@
 // --split N streams each request with live timings and also reports decode tok/s over generated
 // tokens 2..N and N+1..end (decode right after a prefill, while the expert cache refills).
 // --print-ids prints each job's generated ids (a needle check decodes them).
+//
+// Context cache mode (cache_check below): a conversation through an Engine with the context cache,
+// every request's greedy ids against the same prompt run cold, and the prompt tokens reused.
+//
+//   ninfer_qwen4_exp_engine_real_test --cache [--mtp K] [--host-mib N] [--generate N] [--max-context N]
 //
 // TOKENS is @FILE (ids separated by commas or whitespace) or a comma-separated id list.
 
@@ -132,6 +137,7 @@ struct Run {
     std::vector<TokenId> ids;
     GenerationTimings timings;
     SpeculativeStats speculative;
+    std::uint32_t reused = 0; // prompt tokens the context cache supplied
     double wall = 0;
     // With a split: the time from the first generated token to token `split` and to the last one.
     std::uint32_t split = 0;
@@ -180,7 +186,49 @@ Run generate(Engine& engine, const std::vector<TokenId>& prompt, std::uint32_t t
     out.ids         = std::move(result.generated_token_ids);
     out.timings     = result.timings;
     out.speculative = result.speculative;
+    out.reused      = result.reused_prompt_tokens;
     out.wall    = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    return out;
+}
+
+// Cancels its request once `after` tokens have been committed (0: never).
+class CancelSink final : public OutputSink {
+public:
+    explicit CancelSink(std::uint32_t after) : after_(after) {}
+    void start(GenerationStart) override {}
+    void progress(PromptProgress) override {}
+    void publish(OutputDelta) override {}
+    void timing(GenerationTimingObservation t) override {
+        if (after_ != 0 && t.generated_tokens >= after_) { cancel_ = true; }
+    }
+    [[nodiscard]] bool cancelled() const { return cancel_.load(); }
+
+private:
+    std::uint32_t after_;
+    std::atomic<bool> cancel_{false};
+};
+
+// A greedy request that may reuse the context cache, optionally cancelled after `cancel_after`
+// committed tokens.
+Run generate_cached(Engine& engine, const std::vector<TokenId>& prompt, std::uint32_t tokens,
+                    std::uint32_t cancel_after = 0) {
+    RequestOptions request;
+    request.execution.requested_output_tokens = tokens;
+    request.execution.allow_prefix_reuse      = true;
+    request.execution.sampling.temperature    = 0.0F;
+    request.stop.include_model_defaults       = false;
+    request.output.raw                        = true;
+    const auto start = std::chrono::steady_clock::now();
+    CancelSink sink(cancel_after);
+    auto handle  = engine.submit(engine.prepare_tokens(prompt, false), request, OutputConsumerMode::Streaming,
+                                 GenerationObservationOptions{.live_timings = true});
+    auto result  = handle.wait(&sink, CancellationView([&sink] { return sink.cancelled(); }));
+    Run out;
+    out.ids         = std::move(result.generated_token_ids);
+    out.timings     = result.timings;
+    out.speculative = result.speculative;
+    out.reused      = result.reused_prompt_tokens;
+    out.wall        = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     return out;
 }
 
@@ -349,7 +397,7 @@ bool same(const char* label, const std::vector<TokenId>& reference, const std::v
 }
 
 int bench(const std::string& artifact, const std::vector<std::string>& args) {
-    std::uint32_t max_context = 33'792, tokens = 512, split = 0, mtp = 0;
+    std::uint32_t max_context = 33'792, tokens = 512, split = 0, mtp = 0, prefill_chunk = 1024;
     bool graph = true, state = true, print_ids = false, mtp_fixed = false, vision = false;
     double width_cost = -1.0;
     std::optional<std::uint64_t> cache;
@@ -382,11 +430,14 @@ int bench(const std::string& artifact, const std::vector<std::string>& args) {
             vision = true;
         } else if (a == "--width-cost" && i + 1 < args.size()) {
             width_cost = std::stod(args[++i]);
+        } else if (a == "--prefill-chunk") {
+            prefill_chunk = static_cast<std::uint32_t>(value());
         } else {
             jobs.push_back(a);
         }
     }
     EngineOptions options                  = base_options(artifact, max_context);
+    options.prefill_chunk                  = prefill_chunk;
     options.use_cuda_graph                 = graph;
     options.flash_next.expert_cache_bytes  = cache;
     options.flash_next.save_expert_state   = state;
@@ -479,6 +530,128 @@ int mtp_exact(const std::string& artifact, const std::vector<std::string>& args)
     return ok ? 0 : 1;
 }
 
+// The context cache (docs/maintainer/flash-next-context-cache.md) against cold runs. One Engine with
+// the cache runs a conversation; then one Engine without it runs the same prompts cold. Each cached
+// request's greedy ids are compared with its cold run, and its reused tokens with what the cache
+// should have supplied:
+//   a  P                 cold, captures the prompt's end and the endpoint
+//   b  P again           exact hit: sampled from the stored logits (reused = |P|)
+//   c  P + S             resumes at |P| (the prompt's checkpoint)
+//   d  P + S + c + T     resumes from c's endpoint (|P + S + c| - 1)
+//   e  A, then A + S     A is P cut to a 64-token page: resume at a page boundary
+//   f  P + S, cancelled after 4 tokens (after its capture); then P + S again from the root (the
+//      Engine abandons a cancelled request's continuation)
+// Mismatches are reported with the first differing token. --mtp K runs both Engines with MTP.
+//   ninfer_qwen4_exp_engine_real_test --cache [--mtp K] [--host-mib N] [--generate N]
+int cache_check(const std::string& artifact, const std::vector<std::string>& args,
+                const std::vector<TokenId>& long_prompt, const std::vector<TokenId>& suffix,
+                const std::vector<TokenId>& tail) {
+    std::uint32_t tokens = 32, mtp = 0, max_context = 16'384;
+    std::optional<std::uint64_t> host;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const auto value = [&] {
+            if (i + 1 >= args.size()) { throw std::invalid_argument(args[i] + " needs a value"); }
+            return std::stoull(args[++i]);
+        };
+        if (args[i] == "--mtp") {
+            mtp = static_cast<std::uint32_t>(value());
+        } else if (args[i] == "--host-mib") {
+            host = value() << 20U;
+        } else if (args[i] == "--generate") {
+            tokens = static_cast<std::uint32_t>(value());
+        } else if (args[i] == "--max-context") {
+            max_context = static_cast<std::uint32_t>(value());
+        } else {
+            throw std::invalid_argument("unknown --cache argument " + args[i]);
+        }
+    }
+    const auto options = [&](bool cache) {
+        EngineOptions o                      = base_options(artifact, max_context);
+        o.flash_next.save_expert_state       = false;
+        o.context_cache.enabled              = cache;
+        o.context_cache.host_capacity_bytes  = cache ? host : std::optional<std::size_t>(0);
+        if (mtp > 0) {
+            o.speculative.backend      = SpeculativeBackend::Mtp;
+            o.speculative.draft_tokens = mtp;
+        }
+        return o;
+    };
+    const auto concat = [](std::initializer_list<const std::vector<TokenId>*> parts) {
+        std::vector<TokenId> out;
+        for (const auto* part : parts) { out.insert(out.end(), part->begin(), part->end()); }
+        return out;
+    };
+    const std::vector<TokenId>& P = long_prompt;
+    const std::vector<TokenId> PS = concat({&P, &suffix});
+    std::vector<TokenId> A(P.begin(), P.begin() + static_cast<std::ptrdiff_t>(P.size() / 64 * 64 - 64));
+    const std::vector<TokenId> AS = concat({&A, &suffix});
+    std::vector<std::vector<TokenId>> prompts;
+    std::vector<std::string> labels;
+    std::vector<Run> cached;
+    std::vector<std::uint32_t> expected;
+    const double ram_before = available_ram_gib();
+    bool ok                 = true;
+    {
+        Engine engine(options(true));
+        const auto run = [&](const char* label, const std::vector<TokenId>& prompt, std::uint32_t reuse,
+                             std::uint32_t cancel_after = 0) {
+            Run r = generate_cached(engine, prompt, tokens, cancel_after);
+            print_run(label, r, prompt.size());
+            print_speculation(label, r.speculative);
+            std::printf("%s: reused %u of %zu prompt tokens (expected %u), first token %.3f s\n", label, r.reused,
+                        prompt.size(), reuse, r.timings.first_token_seconds);
+            if (cancel_after == 0) {
+                prompts.push_back(prompt);
+                labels.push_back(label);
+                cached.push_back(r);
+                expected.push_back(reuse);
+            }
+            return r;
+        };
+        const Run a = run("a: P (cold, captures)", P, 0);
+        (void)run("b: P again (exact hit)", P, static_cast<std::uint32_t>(P.size()));
+        const Run c = run("c: P + S (resume at P)", PS, static_cast<std::uint32_t>(P.size()));
+        const std::vector<TokenId> Q = concat({&PS, &c.ids, &tail});
+        (void)run("d: P + S + c + T (resume from c's endpoint)", Q, static_cast<std::uint32_t>(PS.size() + c.ids.size() - 1));
+        (void)run("e1: A (a page-aligned prompt)", A, 0);
+        (void)run("e2: A + S (resume at a page boundary)", AS, static_cast<std::uint32_t>(A.size()));
+        // A cancelled request's continuation is abandoned by the Engine (its checkpoints, captured
+        // before the cancel, are released), so the same prompt starts from the root again.
+        const Run f = run("f1: P + S cancelled after 4 tokens", PS, 0, 4);
+        std::printf("f1: %zu tokens before the cancel took effect\n", f.ids.size());
+        (void)run("f2: P + S after the cancelled request", PS, 0);
+        (void)a;
+        const MemorySummary memory = engine.memory_summary();
+        std::printf("Host tier: %.0f of %.0f MiB occupied, %.0f reserved, %u checkpoints, %.0f MiB of KV pages\n",
+                    static_cast<double>(memory.host_context_occupied_bytes) / (1 << 20),
+                    static_cast<double>(memory.host_context_capacity_bytes) / (1 << 20),
+                    static_cast<double>(memory.host_context_reserved_bytes) / (1 << 20), memory.host_state_occupied_slots,
+                    static_cast<double>(memory.host_kv_occupied_bytes) / (1 << 20));
+        if (memory.host_context_capacity_bytes == 0 || memory.host_context_reserved_bytes != 0 ||
+            memory.host_context_occupied_bytes > memory.host_context_capacity_bytes) {
+            std::printf("FAIL: the Host tier's accounting is inconsistent between requests\n");
+            ok = false;
+        }
+    }
+    wait_for_ram(ram_before);
+    {
+        Engine engine(options(false));
+        for (std::size_t i = 0; i < prompts.size(); ++i) {
+            const Run cold = generate(engine, prompts[i], tokens);
+            const std::string label = std::string("cold ") + labels[i];
+            print_run(label.c_str(), cold, prompts[i].size());
+            ok = same(labels[i].c_str(), cold.ids, cached[i].ids) && ok;
+            if (cached[i].reused != expected[i]) {
+                std::printf("FAIL: %s reused %u prompt tokens, expected %u\n", labels[i].c_str(), cached[i].reused,
+                            expected[i]);
+                ok = false;
+            }
+        }
+    }
+    std::printf(ok ? "qwen4_exp context cache checks passed\n" : "FAIL: qwen4_exp context cache checks\n");
+    return ok ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -499,7 +672,13 @@ int main(int argc, char** argv) {
         }
         std::string tokens_arg = "@" + std::string(NINFER_SOURCE_DIR) + "/tests/fixtures/qwen4_exp/ppl_tokens-chat.ids";
         std::uint32_t generate_tokens = 48, max_context = 8192, prompt_tokens = 300;
-        bool kv_cycle_only = false;
+        bool kv_cycle_only = false, cache_mode = false;
+        std::vector<std::string> cache_args;
+        if (!args.empty() && args.front() == "--cache") {
+            cache_mode = true;
+            cache_args.assign(args.begin() + 1, args.end());
+            args.clear();
+        }
         for (std::size_t i = 0; i < args.size(); ++i) {
             if (args[i] == "--kv-cycle") {
                 kv_cycle_only = true;
@@ -524,6 +703,15 @@ int main(int argc, char** argv) {
                                  "infernix_texts-doc", "infernix_texts-chat"}) {
             const auto part = parse_tokens("@" + std::string(NINFER_SOURCE_DIR) + "/tests/fixtures/qwen4_exp/" + name + ".ids");
             long_prompt.insert(long_prompt.end(), part.begin(), part.end());
+        }
+        if (cache_mode) {
+            const auto fixture = [&](const char* name, std::size_t count) {
+                auto ids = parse_tokens("@" + std::string(NINFER_SOURCE_DIR) + "/tests/fixtures/qwen4_exp/" + name + ".ids");
+                ids.resize(std::min(ids.size(), count));
+                return ids;
+            };
+            return cache_check(artifact, cache_args, long_prompt, fixture("ppl_tokens-code", 300),
+                               fixture("ppl_tokens-doc", 200));
         }
         if (kv_cycle_only) {
             const bool cycled = kv_cycle(artifact, prompt, long_prompt);

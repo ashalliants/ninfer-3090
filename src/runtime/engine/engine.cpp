@@ -411,23 +411,28 @@ public:
     Core core;
 
 private:
-    // Qwen3.8-Flash-Next (models/qwen4_exp): prefix reuse is off for this model (no context cache,
-    // so no checkpoint is ever retained), and the core is the common EngineCore over its Program.
+    // Qwen3.8-Flash-Next (models/qwen4_exp): the common EngineCore over its Program. Its context
+    // cache keeps checkpoints in a pinned Host tier the RAM ledger sizes (0: prefix reuse off); the
+    // resolved size replaces the requested one, as for the other models.
     void construct_qwen4_exp() {
-        if (options.context_cache.enabled) {
-            std::fprintf(stderr, "[qwen3.8-flash-next] prefix reuse is not available for this model yet: "
-                                 "every request prefills its whole prompt\n");
-        }
-        options.context_cache.enabled             = false;
-        options.context_cache.auto_host_cache     = false;
-        options.context_cache.host_capacity_bytes = 0;
         auto constructed    = runtime::construct_qwen4_exp(options, device);
         qwen4               = std::move(constructed.instance);
         load                = std::move(constructed.load);
         load.cuda_sync_mode = device.sync_mode();
         sampling_defaults   = qwen4->frontend.sampling_defaults();
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
-        core = std::make_unique<Qwen4ExpCore>(*qwen4, device, options, runtime::ContextMachineCostModel{});
+        options.context_cache.auto_host_cache     = false;
+        options.context_cache.host_capacity_bytes = qwen4->program->physical_usage().capacity.host_bytes;
+        options.context_cache.enabled = options.context_cache.enabled && *options.context_cache.host_capacity_bytes != 0;
+        // Source ranking prices restores against recomputation: this card's measured transfer costs
+        // and the generic prefill estimate (no Flash-Next prefill calibration exists yet).
+        auto context_cost = runtime::resolve_context_machine_cost(
+            {.hardware_class    = runtime::context_cost_hardware_class(device.props.name, device.props.major,
+                                                                       device.props.minor),
+             .prefill_signature = "qwen4exp"},
+            options.context_cost.preset_path);
+        load.context_cost = std::move(context_cost.summary);
+        core = std::make_unique<Qwen4ExpCore>(*qwen4, device, options, std::move(context_cost.model));
         finalize_phase.complete();
     }
 

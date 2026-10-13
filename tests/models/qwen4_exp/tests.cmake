@@ -59,6 +59,12 @@ ninfer_add_test(ninfer_qwen4_exp_memory_plan_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_memory_plan.cpp"
   LIBRARIES ninfer_model_loading ninfer_core)
 
+# Host only: the context cache's Host tier (slabs, checkpoints sharing KV pages, release quotes and
+# sets, lineage recovery loss) and the RAM ledger's sizing of it beside the experts.
+ninfer_add_test(ninfer_qwen4_exp_context_cache_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_context_cache.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_core)
+
 # GPU, real artifact (skips without NINFER_TEST_QWEN4EXP_ARTIFACT): the M1 gates through the public
 # Engine (placement invariance across cold, warm, warm-started and small expert caches; the RAM
 # ledger's refusal; the elastic KV pool's grow/shrink cycle within the VRAM budget) and, with

@@ -32,6 +32,8 @@ struct HostMemoryDemand {
     std::uint64_t other_pinned = 0;
     // Pinned and mapped allocations made after the model loads (the Program's buffers).
     std::uint64_t later_pinned = 0;
+    // The context cache's pinned Host tier (fit_context_cache sizes it).
+    std::uint64_t context_cache = 0;
     // Large pageable allocations made after planning (the n-gram row cache).
     std::uint64_t pageable = 0;
     // Transient load staging (bounce and upload slots), freed when the load ends.
@@ -71,6 +73,18 @@ struct HostMemoryLedger {
 };
 
 [[nodiscard]] HostMemoryLedger plan_host_memory(const HostMemorySnapshot& snapshot, const HostMemoryDemand& demand);
+
+// The context cache's Host tier beside everything else the ledger plans: `requested` bytes when they
+// fit with the experts (their full need and margin) above the reserve, else the most that fits in
+// whole `granule`s; zero below `minimum` (too small to hold one long checkpoint) or when the experts
+// do not fit at all. `demand.context_cache` is ignored (it is what this decides).
+struct ContextCacheFit {
+    std::uint64_t bytes = 0;
+    bool shrunk         = false; // less than requested
+};
+[[nodiscard]] ContextCacheFit fit_context_cache(const HostMemorySnapshot& snapshot, HostMemoryDemand demand,
+                                                std::uint64_t requested, std::uint64_t minimum,
+                                                std::uint64_t granule);
 
 // ---------------------------------------------------------------- device memory
 

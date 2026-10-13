@@ -1,9 +1,10 @@
 // Adapted from Infernix a3edb450 src/runtime/engine/qwen4_exp_instance.cpp (Apache-2.0).
 // Modified for NInfer-3090: full RAM mode only (no SSD tier: a ledger that cannot hold every expert
 // refuses); MTP speculation through the artifact's drafter (--spec mtp); image input through the
-// artifact's vision tower (--vision: host-pinned, streamed per encode into lent expert frames); no
-// prefix cache or n-gram drafts; the options NInfer's serving can set that this model does not
-// support are refused with the flag to change; NInfer's startup phases.
+// artifact's vision tower (--vision: host-pinned, streamed per encode into lent expert frames);
+// prefix reuse through NInfer's context cache with a pinned Host tier sized by the RAM ledger
+// (docs/maintainer/flash-next-context-cache.md); no n-gram drafts; the options NInfer's serving can
+// set that this model does not support are refused with the flag to change; NInfer's startup phases.
 
 #include "runtime/engine/qwen4_exp_instance.h"
 
@@ -39,6 +40,12 @@ constexpr std::uint32_t kFewFrames = 2048;
 // counts, convert them to signed 64-bit and divide them into 32-bit frame counts); a caller that
 // builds EngineOptions directly gets the same bound.
 constexpr std::uint64_t kMaxByteOption = 1ULL << 40;
+// The context cache's Host tier: 4 GiB unless --host-context-mib says otherwise (Infernix's Flash-Next
+// default; about six 32K-token conversations, or many more sharing a prefix), off below 512 MiB (four
+// 32K-token checkpoints' state images), sized in 64 MiB steps.
+constexpr std::uint64_t kDefaultHostContextBytes = 4ULL << 30;
+constexpr std::uint64_t kMinimumHostContextBytes = 512ULL << 20;
+constexpr std::uint64_t kHostContextGranule      = 64ULL << 20;
 
 unsigned long long mib(std::uint64_t bytes) { return static_cast<unsigned long long>(bytes >> 20); }
 
@@ -48,8 +55,8 @@ void report(const std::string& text) {
 }
 
 // What this release of the model serves: one request at a time (text, or text and images with
-// --vision), plain or MTP decode, INT8 KV, no prefix reuse. Every option a user can set otherwise is
-// refused with what to change.
+// --vision), plain or MTP decode, INT8 KV, prefix reuse from a Host-only context cache. Every option
+// a user can set otherwise is refused with what to change.
 void validate(const EngineOptions& options) {
     const auto refuse = [](const std::string& why) {
         throw std::invalid_argument("Qwen3.8-Flash-Next: " + why);
@@ -108,7 +115,13 @@ void validate(const EngineOptions& options) {
     // honored; more than one entry, or per-stage layer counts, would need pipeline stages.
     if (options.devices.size() > 1) { refuse("runs on one GPU: pass a single id to --devices"); }
     if (!options.stage_layers.empty()) { refuse("runs on one GPU with no pipeline stages: remove --stage-layers"); }
-    if (options.context_store.enabled()) { refuse("has no context store (prefix reuse is off): remove --context-store"); }
+    if (options.context_store.enabled()) {
+        refuse("keeps its context cache in memory only (no context store yet): remove --context-store");
+    }
+    if (options.context_cache.auto_host_cache) {
+        refuse("sizes its context cache's Host tier from its own RAM ledger: remove --auto-host-cache (set the size with "
+               "--host-context-mib, or 0 to turn prefix reuse off)");
+    }
     if (options.lm_head_q4 || options.lm_head_q6 || options.embedding_q4 || options.embedding_q6 ||
         options.mtp_experts_q4 || options.mlp_a8_decode || options.prefill_cublas || options.gdn_state_fp16 || !options.prefill_a8 ||
         !options.prefill_cublas_projections) {
@@ -183,10 +196,28 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         demand.pageable += options.media_cache_bytes + std::min<std::uint64_t>(options.media_live_bytes, prompt_patches);
     }
     demand.load_staging = kLoadStagingBytes;
-    const auto ledger   = models::qwen4_exp::plan_host_memory(host_memory_snapshot(), demand);
+    // The context cache's Host tier (prefix reuse) is pinned beside the experts: it gets what the
+    // ledger can spare above the reserve, up to the requested size, and is off below a minimum.
+    const auto snapshot = host_memory_snapshot();
+    const std::uint64_t requested_cache =
+        options.context_cache.enabled ? options.context_cache.host_capacity_bytes.value_or(kDefaultHostContextBytes) : 0;
+    const auto cache_fit = models::qwen4_exp::fit_context_cache(snapshot, demand, requested_cache, kMinimumHostContextBytes,
+                                                                kHostContextGranule);
+    demand.context_cache = cache_fit.bytes;
+    const auto ledger    = models::qwen4_exp::plan_host_memory(snapshot, demand);
     report(ledger.summary());
     report(ledger.describe());
     if (!ledger.fits) { throw std::runtime_error("Qwen3.8-Flash-Next cannot start: " + ledger.summary()); }
+    if (requested_cache == 0) {
+        report("context cache: off (prefix reuse disabled); every request prefills its whole prompt");
+    } else if (cache_fit.bytes == 0) {
+        report("context cache: off: the RAM ledger has no " + std::to_string(mib(kMinimumHostContextBytes)) +
+               " MiB to spare beside the experts (asked " + std::to_string(mib(requested_cache)) +
+               " MiB); every request prefills its whole prompt. Free RAM, or lower --ram-headroom-mib");
+    } else if (cache_fit.shrunk) {
+        report("context cache: " + std::to_string(mib(cache_fit.bytes)) + " MiB Host tier, less than the " +
+               std::to_string(mib(requested_cache)) + " MiB asked: that is what the RAM ledger can spare beside the experts");
+    }
     // A small reserve trims other programs' working sets; keep NInfer's own pageable memory resident
     // so its heap and driver pages never hard-fault from the page file.
     if (const auto refused = reserve_process_working_set(demand.process_growth); !refused.empty()) {
@@ -207,6 +238,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.mtp_width_cost   = next.mtp_width_cost;
     program_options.mtp_fixed_drafts = next.mtp_fixed_drafts;
     program_options.vision           = vision;
+    program_options.context_cache_bytes = cache_fit.bytes;
     program_options.ngram_volume    = next.ngram_volume_path.empty()
                                           ? models::qwen4_exp::default_ngram_volume(options.artifact_path)
                                           : next.ngram_volume_path;
