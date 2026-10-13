@@ -14,7 +14,7 @@ import urllib.request
 
 def run(port, label, messages, max_tokens):
     body = json.dumps({
-        "model": "x",
+        "model": "Qwen3.8-Flash-Next",
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": 0,

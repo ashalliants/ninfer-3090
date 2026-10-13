@@ -563,7 +563,7 @@ int cache_check(const std::string& artifact, const std::vector<std::string>& arg
 //      writes the conversation to the store.
 //   E2 (same): restores it at start-up; c': P + S again must be an exact hit (reused |P + S|) with
 //      c's ids; x: P + S + U resumes at |P + S| from the restored checkpoint.
-//   Then one byte of the store's largest file is damaged.
+//   Then one byte of each of the store's largest files is damaged.
 //   E3 (the RAM tier alone, the damaged store): restores nothing; a, c and x again, now from RAM: a
 //      and c must give E1's ids, and x must give E2's (restored from the store, and from NVMe when E2
 //      had --host-mib 0 --nvme-mib N, against restored from RAM).
@@ -615,7 +615,7 @@ int restart_check(const Options& options, const std::filesystem::path& store, co
         c1 = step(engine, "E1 c: P + S", PS, static_cast<std::uint32_t>(P.size()));
         expect_reuse("E1 c", c1, static_cast<std::uint32_t>(P.size()));
     }
-    std::filesystem::path largest;
+    std::vector<std::filesystem::path> largest; // every file of the largest size
     std::uintmax_t largest_bytes = 0;
     const auto scan_store        = [&](const char* when) {
         std::size_t files = 0;
@@ -626,8 +626,9 @@ int restart_check(const Options& options, const std::filesystem::path& store, co
             ++files;
             if (entry.file_size() > largest_bytes) {
                 largest_bytes = entry.file_size();
-                largest       = entry.path();
+                largest.clear();
             }
+            if (entry.file_size() == largest_bytes) { largest.push_back(entry.path()); }
         }
         std::printf("store after %s: %zu files, the largest %.1f MiB\n", when, files,
                     static_cast<double>(largest_bytes) / (1 << 20));
@@ -656,12 +657,13 @@ int restart_check(const Options& options, const std::filesystem::path& store, co
         x2 = step(engine, "E2 x: P + S + U (resumes at |P + S|)", PSU, static_cast<std::uint32_t>(PS.size()));
         expect_reuse("E2 x", x2, static_cast<std::uint32_t>(PS.size()));
     }
-    // E2's shutdown wrote the image again (the conversation grew), so damage the latest image's largest
-    // file: the one found after E1 may no longer belong to it.
+    // E2's shutdown wrote the image again (the conversation grew) and the store keeps the old chunks, so
+    // one "largest file" may belong to no live image. A 280 MiB image holds several full-size chunks:
+    // damage one byte in every file of the largest size, so the live image is certain to be hit.
     scan_store("E2");
-    {
+    for (const auto& path : largest) {
         // One damaged byte: the store must refuse the image (a checksum per chunk), never restore it.
-        std::fstream file(largest, std::ios::in | std::ios::out | std::ios::binary);
+        std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
         file.seekg(static_cast<std::streamoff>(largest_bytes / 2));
         char byte = 0;
         file.read(&byte, 1);
