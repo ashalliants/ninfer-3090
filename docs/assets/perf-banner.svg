@@ -107,6 +107,6 @@
   </g>
 
   <!-- footer -->
-  <text x="36" y="294" font-size="11" class="nb-muted">Prefill: ninfer_bench, launcher settings (cuBLAS route, chunk 4096). 27B prefill measured 2026-10-02, Flash-Next prefill 2026-10-12. See docs/performance for methodology.</text>
+  <text x="36" y="294" font-size="11" class="nb-muted">Prefill: ninfer_bench, launcher settings (cuBLAS route, chunk 4096); 27B 2026-10-02, Flash-Next 2026-10-12. See docs/performance.</text>
   <text x="924" y="294" font-size="11" text-anchor="end" class="nb-muted">ashalliants/ninfer-3090</text>
 </svg>
