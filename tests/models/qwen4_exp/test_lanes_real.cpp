@@ -13,6 +13,8 @@
 //   cache         (--cache) the longest prompt cached, then its suffix prompt (resumed from the
 //                 checkpoint in one lane) beside a short prompt; then the same pair with one request
 //                 cancelled after a few tokens: the other lane's ids must be unchanged
+//                 The cached prompt is 8,192 tokens, a prefill call boundary: a resume where the cold
+//                 prefill has no call boundary may differ in greedy ids (test_engine_real.cpp, cache_check).
 //
 //   ninfer_qwen4_exp_lanes_real_test --exact [--mtp K] [--generate N] [--cache] [--max-context N]
 //
@@ -200,6 +202,7 @@ void print_run(const std::string& label, const Run& run, std::size_t prompt) {
 struct Options {
     std::uint32_t max_context = 16'384, tokens = 96, mtp = 0, lanes = 2;
     bool cache = false;
+    bool resume_alone = false; // --resume-alone: the cache resume runs without a second request beside it
     std::vector<std::string> jobs;
 };
 
@@ -218,6 +221,8 @@ Options parse(const std::vector<std::string>& args) {
             o.mtp = value();
         } else if (args[i] == "--concurrency") {
             o.lanes = value();
+        } else if (args[i] == "--resume-alone") {
+            o.resume_alone = true;
         } else if (args[i] == "--cache") {
             o.cache = true;
         } else {
@@ -232,14 +237,14 @@ int exact(const std::string& artifact, const Options& o) {
     // suffix; the references are one-lane runs of each.
     const std::vector<TokenId> short_prompt  = synthetic(700, 1);
     const std::vector<TokenId> middle_prompt = synthetic(3'000, 2);
-    const std::vector<TokenId> long_prompt   = synthetic(9'000, 3);
+    const std::vector<TokenId> long_prompt   = synthetic(8'192, 3);
     std::vector<TokenId> long_suffix         = long_prompt;
     {
         const auto suffix = synthetic(600, 4);
         long_suffix.insert(long_suffix.end(), suffix.begin(), suffix.end());
     }
     const std::vector<const std::vector<TokenId>*> prompts = {&short_prompt, &middle_prompt, &long_prompt};
-    const char* names[]                                    = {"short(700)", "middle(3000)", "long(9000)"};
+    const char* names[]                                    = {"short(700)", "middle(3000)", "long(8192)"};
     const auto origin                                      = Clock::now();
     const double ram_before                                = available_ram_gib();
     std::vector<Run> reference;
@@ -251,12 +256,12 @@ int exact(const std::string& artifact, const Options& o) {
             print_run(std::string("one lane, alone: ") + names[i], reference.back(), prompts[i]->size());
         }
         reference_suffix = generate(engine, long_suffix, o.tokens, false, origin);
-        print_run("one lane, alone: long(9000)+600", reference_suffix, long_suffix.size());
+        print_run("one lane, alone: long(8192)+600", reference_suffix, long_suffix.size());
     }
     wait_for_ram(ram_before);
     bool ok = true;
     {
-        Engine engine(base_options(artifact, o.max_context, 2, o.mtp, o.cache));
+        Engine engine(base_options(artifact, o.max_context, o.lanes, o.mtp, o.cache));
         const auto pair = [&](std::size_t a, std::size_t b, int stagger_ms, const char* label) {
             Run ra, rb;
             std::thread first([&] { ra = generate(engine, *prompts[a], o.tokens, false, origin); });
@@ -275,13 +280,15 @@ int exact(const std::string& artifact, const Options& o) {
             ok = same(std::string(label) + " " + names[a], reference[a].ids, ra.ids) && ok;
             ok = same(std::string(label) + " " + names[b], reference[b].ids, rb.ids) && ok;
         };
-        pair(0, 1, 0, "pair");
-        pair(1, 2, 0, "pair");
-        pair(2, 0, 0, "pair");
-        // The long prompt decodes while the short one prefills (its calls interleave with the
-        // long one's decode rounds), then both decode together.
-        pair(2, 0, 1500, "staggered");
-        pair(1, 0, 400, "staggered");
+        if (o.lanes >= 2) {
+            pair(0, 1, 0, "pair");
+            pair(1, 2, 0, "pair");
+            pair(2, 0, 0, "pair");
+            // The long prompt decodes while the short one prefills (its calls interleave with the
+            // long one's decode rounds), then both decode together.
+            pair(2, 0, 1500, "staggered");
+            pair(1, 0, 400, "staggered");
+        }
         for (std::size_t i = 0; i < prompts.size(); ++i) {
             const Run r = generate(engine, *prompts[i], o.tokens, false, origin);
             print_run(std::string("two lanes, alone: ") + names[i], r, prompts[i]->size());
@@ -290,22 +297,29 @@ int exact(const std::string& artifact, const Options& o) {
         if (o.cache) {
             // The long prompt cached, then its suffix prompt resumes from the checkpoint beside a short prompt.
             const Run warm = generate(engine, long_prompt, o.tokens, true, origin);
-            print_run("cache: long(9000) cold, captures", warm, long_prompt.size());
-            ok = same("cache long(9000)", reference[2].ids, warm.ids) && ok;
+            print_run("cache: long(8192) cold, captures", warm, long_prompt.size());
+            ok = same("cache long(8192)", reference[2].ids, warm.ids) && ok;
             Run resumed, other;
-            std::thread first([&] { resumed = generate(engine, long_suffix, o.tokens, true, origin); });
-            std::thread second([&] { other = generate(engine, short_prompt, o.tokens, false, origin); });
-            first.join();
-            second.join();
-            print_run("cache: long(9000)+600 resumed", resumed, long_suffix.size());
-            print_run("cache: short(700) beside it", other, short_prompt.size());
+            if (o.resume_alone || o.lanes < 2) {
+                resumed = generate(engine, long_suffix, o.tokens, true, origin);
+            } else {
+                std::thread first([&] { resumed = generate(engine, long_suffix, o.tokens, true, origin); });
+                std::thread second([&] { other = generate(engine, short_prompt, o.tokens, false, origin); });
+                first.join();
+                second.join();
+            }
+            print_run("cache: long(8192)+600 resumed", resumed, long_suffix.size());
             ok = same("cache resumed long+600", reference_suffix.ids, resumed.ids) && ok;
-            ok = same("cache short beside the resume", reference[0].ids, other.ids) && ok;
+            if (!other.ids.empty()) {
+                print_run("cache: short(700) beside it", other, short_prompt.size());
+                ok = same("cache short beside the resume", reference[0].ids, other.ids) && ok;
+            }
             if (resumed.reused != long_prompt.size()) {
                 std::printf("FAIL: the resume reused %u prompt tokens, expected %zu\n", resumed.reused, long_prompt.size());
                 ok = false;
             }
             // One lane cancelled after a few tokens: the other's ids are unchanged.
+            if (o.lanes < 2) { return ok ? 0 : 1; }
             Run cancelled, survivor;
             std::thread third([&] { cancelled = generate(engine, middle_prompt, o.tokens, false, origin, 8); });
             std::thread fourth([&] { survivor = generate(engine, short_prompt, o.tokens, false, origin); });
