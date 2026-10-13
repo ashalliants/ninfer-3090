@@ -615,19 +615,25 @@ int restart_check(const Options& options, const std::filesystem::path& store, co
         c1 = step(engine, "E1 c: P + S", PS, static_cast<std::uint32_t>(P.size()));
         expect_reuse("E1 c", c1, static_cast<std::uint32_t>(P.size()));
     }
-    std::size_t files = 0;
     std::filesystem::path largest;
     std::uintmax_t largest_bytes = 0;
-    for (const auto& entry : std::filesystem::recursive_directory_iterator(store)) {
-        if (!entry.is_regular_file()) { continue; }
-        ++files;
-        if (entry.file_size() > largest_bytes) {
-            largest_bytes = entry.file_size();
-            largest       = entry.path();
+    const auto scan_store        = [&](const char* when) {
+        std::size_t files = 0;
+        largest.clear();
+        largest_bytes = 0;
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(store)) {
+            if (!entry.is_regular_file()) { continue; }
+            ++files;
+            if (entry.file_size() > largest_bytes) {
+                largest_bytes = entry.file_size();
+                largest       = entry.path();
+            }
         }
-    }
-    std::printf("store after E1: %zu files, the largest %.1f MiB\n", files, static_cast<double>(largest_bytes) / (1 << 20));
-    if (files == 0) {
+        std::printf("store after %s: %zu files, the largest %.1f MiB\n", when, files,
+                    static_cast<double>(largest_bytes) / (1 << 20));
+        return files;
+    };
+    if (scan_store("E1") == 0) {
         std::printf("FAIL: shutdown wrote nothing to the store\n");
         return 1;
     }
@@ -650,6 +656,9 @@ int restart_check(const Options& options, const std::filesystem::path& store, co
         x2 = step(engine, "E2 x: P + S + U (resumes at |P + S|)", PSU, static_cast<std::uint32_t>(PS.size()));
         expect_reuse("E2 x", x2, static_cast<std::uint32_t>(PS.size()));
     }
+    // E2's shutdown wrote the image again (the conversation grew), so damage the latest image's largest
+    // file: the one found after E1 may no longer belong to it.
+    scan_store("E2");
     {
         // One damaged byte: the store must refuse the image (a checksum per chunk), never restore it.
         std::fstream file(largest, std::ios::in | std::ios::out | std::ios::binary);

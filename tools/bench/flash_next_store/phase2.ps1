@@ -16,6 +16,9 @@ foreach ($r in $Runs) {
     'store-nvme' { & $exe ninfer_qwen4_exp_engine_real_test --cache --mtp 3 --host-mib 0 --nvme-mib 8192 --store (Fresh 'store-nvme') 2>&1 }
     'store-plain' { & $exe ninfer_qwen4_exp_engine_real_test --cache --host-mib 0 --nvme-mib 8192 --store (Fresh 'store-plain') 2>&1 }
     'vision'     { & $exe ninfer_qwen4_exp_vision_engine_real_test --cache --host-mib 0 --nvme-mib 8192 --store (Fresh 'store-vision') 2>&1 }
+    'plain'      { & $exe ninfer_qwen4_exp_engine_real_test --cache --generate 32 2>&1 }
+    'evict-ram'  { & $exe ninfer_qwen4_exp_engine_real_test --cache --evict --host-mib 512 --generate 32 2>&1 }
+    'vision-ram' { & $exe ninfer_qwen4_exp_vision_engine_real_test --cache 2>&1 }
     'evict-nvme' { & $exe ninfer_qwen4_exp_engine_real_test --cache --evict --host-mib 0 --nvme-mib 1024 2>&1 }
   }
   "=== $r exit $LASTEXITCODE"
