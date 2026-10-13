@@ -36,7 +36,9 @@ and `tools/bench/disk_seq_io.py`, described in `tools/bench/README.md`.
 - **Ranked recommendation** (details below): 1) make Host demotion failures cheap and visible, then
   decide on the slab pool (idea 7); 2) disk-aware eviction with write-on-evict, plus store writes
   that are not blocked by a busy server (ideas 1 and 2); 3) disk-backed history points for edits
-  (idea 9). The remaining ideas measured small on this workload. @@RANK_SUMMARY_BURSTY@@
+  (idea 9); 4) divergence-tap single-flight (idea 4), which matters only when clients fan out over
+  a fresh document: then it is worth 20% of all prefill, and without fan-out nothing. The remaining
+  ideas measured small on this workload.
 
 ## How it was measured
 
@@ -209,7 +211,29 @@ busy 0.28. The thinking-on path has no cache problem of its own on this workload
 
 ### Bursty arrivals with sub-agent fan-out
 
-@@BURSTY@@
+`bursty-32` with 16 tenants, C8, 8 GiB, 720 s, measurement build. Every 45 s a random group of 8
+tenants is released at once. 15% of turns are a fan-out: 3 sub-agent requests sent together, each
+the conversation plus one new 4-16K document plus its own task. Fan-out made the run saturated:
+148 requests, hit 0.646 against an ideal of 0.781, TTFT p50 / p95 / p99 30.8 / 189 / 251 s, queue
+p50 18.5 s, 67 `429`s, lanes busy 0.47.
+
+- **No sibling ever reused the shared document.** Across 18 fan-out groups (54 requests), every
+  sibling's `cached_tokens` stopped at or below the conversation's own endpoint. None reached the
+  document that its siblings were prefilling at the same moment. The document ends at no chat
+  marker, so today's single-flight (it waits only for a planned SharedPrefix frontier at a marker)
+  does not apply. **Sibling ceiling: 300,884 tokens** in this run, the document prefilled again by
+  the second and third sibling of each group. That is 20% of the 1.50M tokens the run computed,
+  about 140 s of prefill.
+- **Admission source waits are large under bursts.** `generation.admission.source_wait_seconds`
+  summed to 2,454 s over 148 requests (fan-out 1,315 s, appends 930 s; 66 requests waited over 1 s,
+  the longest 136 s). That is part of their queue wait, which summed to about 6,000 s. At
+  sustainable load the same counter summed to 32-51 s per run (at most 15 s for one request). These
+  are the engine's deliberate waits for a sibling's planned frontier or a retained source. That they
+  then often reused nothing beyond the endpoint suggests the waits did not pay off here. This was
+  not traced further.
+- The parent endpoint itself was also lost for many siblings (`evicted_policy` 537K tokens in 42
+  requests). Allocator failures were the highest of any run: 434 state and 181 KV reservation
+  failures, 4,719 splits, and 25 admissions over 100 ms (8.8 s in total).
 
 ### Host allocator failures and demotion stalls
 
@@ -227,6 +251,7 @@ source (`resource_manager.h`, the #254 workaround). The measurement build counte
 | C4, 8 GiB | 30 | 4 | 284 | 5 (0.80 s) | 0 |
 | C8, 8 GiB, store | 37 | 18 | 543 | 14 (5.16 s) | 1 |
 | C8, 8 GiB, thinking | 4 | 1 | 32 | 1 (0.16 s) | 0 |
+| C8, 8 GiB, bursty fan-out | 434 | 181 | 4,719 | 25 (8.82 s) | 0 |
 @@ALLOC_ROWS@@
 
 **The stall.** In the C8 8 GiB run, from 14:20:20 to 14:20:34, the Engine reported `running 0 |
@@ -294,7 +319,7 @@ of GPU time and of every queued request's TTFT. All ideas are measured against t
 | 1 | disk-aware eviction + write-on-evict | conversations dropped from the Host tier | every `evicted_*` token: 540-830K tokens per saturated 10-minute run (37-51% of computed prefill) and 259K post-warm-up at sustainable 2 GiB (25 requests, about 125 s of prefill). Restoring a median 8.5K-token conversation (about 0.3 GB with two states) takes 0.06 s at the drive's 4.9 GB/s, or 0.55 s through today's store path, against 4.0 s of prefill. @@IDEA1_STORE@@ |
 | 2 | disk read term in the cost model | the fixed 4,096-token hydration gate | 5-8 evicted appends per run lost less than 4,096 tokens (at most about 30K tokens, about 15 s per run). An enabler for 1 and 9 more than a gain |
 | 9 | dense taps / history points on a cheap tier | edits and branches whose resume point was superseded | 106-110K tokens per 840 s run at 8-16 GiB (6-7 of about 70 requests): hit 0.886 → 0.940, and those requests' TTFT p50 7.2 s → about 1 s. 96-171K tokens per saturated run. Scales linearly with the edit and branch rate, which is this workload's assumption (5% + 5%). The store already recovered one such edit |
-| 4 | divergence-tap single-flight | siblings prefilling the same non-marker prefix at once | @@IDEA4@@ |
+| 4 | divergence-tap single-flight | siblings prefilling the same non-marker prefix at once | 300,884 tokens (36 sibling requests) in the bursty fan-out run: 20% of everything it computed, about 140 s of prefill. Zero in the Poisson runs, which have no fan-out: there the shared product prompts sit at markers, and `shared_miss` was 0. Depends entirely on how often clients fan out over a fresh document |
 | 3 | persist shared prefixes | the product prompts after a restart | 15,261 tokens per restart (all three products), about 7 s of prefill once. `shared_miss` was 0 in every steady-state run: the existing shared entries and single-flight already cover live traffic |
 | 5 | blocked-head Host→Device prefetch | restore time of a queued request | H2D restore p50 7-23 ms and p95 45-122 ms against a TTFT p50 of about 1 s: at most 2-10% of a private hit's TTFT, and nothing under saturation, where the queue is 60-106 s |
 | 6 | write-through at release | D2H demotion on the critical path | all context transfers took 2.7-3.6 s per 840 s run (all directions), at most 0.4% of wall time. The demotion stalls are reservation failures, not copies, which idea 7 covers |
@@ -323,7 +348,10 @@ study:
    already hydrates one kind of these; extending it to keep superseded endpoints (with idea 2's
    cost term) is the cheap form. P1, the Host-only form, was rejected for Host pressure, which a
    disk tier removes.
-4. @@RANK4@@
+4. **Idea 4: divergence-tap single-flight**, if clients fan out. It recovered nothing in the Poisson
+   runs, but 300,884 tokens (20% of computed prefill) in the fan-out run, where no sibling reused
+   the shared document. Before building it, check why the existing source waits (2,454 s summed in
+   that run) did not lead to reuse.
 5. **Idea 3: persist shared prefixes.** About 7 s of prefill per restart; cheap, but small.
 6. **Idea 5: blocked-head prefetch.** At most a few tens of milliseconds per restored request.
 7. **Idea 6: write-through at release.** Under 0.4% of wall time in copies; its robustness benefit

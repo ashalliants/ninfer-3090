@@ -1,5 +1,5 @@
 {
- "description": "Analysed results behind docs/maintainer/cache-provider-baseline.md: hosted_analysis.py output per run (whole run, or after a 300 s warm-up for the sustainable s-* runs), the measurement-build stderr counts per s-* run, and the disk sweep.",
+ "description": "Analysed results behind docs/maintainer/cache-provider-baseline.md: hosted_analysis.py output per run (whole run; after a 300 s warm-up for the sustainable s-* runs), measurement-build stderr counts, and the disk sweep. Raw per-request files are not kept in the repository.",
  "whole_run": [
   {
    "run": "smoke-c4-h8",
@@ -1075,6 +1075,178 @@
     "ninfer_context_transfer_bytes_total{resource=\"backend_kv\",direction=\"h2d\"}": 349.7265625,
     "ninfer_context_transfer_bytes_total{resource=\"backend_kv\",direction=\"d2d\"}": 3.759765625
    }
+  },
+  {
+   "run": "b-c8-h8",
+   "warmup_s": 0.0,
+   "preset": "bursty-32",
+   "thinking": "off",
+   "wall_s": 870.7776100635529,
+   "requests": 148,
+   "errors": 0,
+   "rejections_429": 67,
+   "split": {
+    "none": 6,
+    "shared": 57,
+    "private": 85
+   },
+   "tokens": {
+    "prompt": 4240272,
+    "cached": 2738929,
+    "ideal": 3310195,
+    "hit_rate": 0.6459323835829399,
+    "ideal_hit_rate": 0.7806562880871794
+   },
+   "by_kind": {
+    "first": {
+     "requests": 16.0,
+     "prompt": 344724.0,
+     "cached": 39519.0,
+     "ideal": 39792.0,
+     "none": 6.0,
+     "shared": 10.0
+    },
+    "append": {
+     "requests": 72.0,
+     "prompt": 1938551.0,
+     "cached": 1578827.0,
+     "ideal": 1831193.0,
+     "private": 56.0,
+     "shared": 16.0
+    },
+    "edit": {
+     "requests": 4.0,
+     "prompt": 109787.0,
+     "cached": 98589.0,
+     "ideal": 102521.0,
+     "private": 3.0,
+     "shared": 1.0
+    },
+    "fanout": {
+     "requests": 54.0,
+     "prompt": 1808355.0,
+     "cached": 1015949.0,
+     "ideal": 1302996.0,
+     "private": 25.0,
+     "shared": 29.0
+    },
+    "branch": {
+     "requests": 2.0,
+     "prompt": 38855.0,
+     "cached": 6045.0,
+     "ideal": 33693.0,
+     "shared": 1.0,
+     "private": 1.0
+    }
+   },
+   "lost_tokens": {
+    "evicted_policy": 536608.0,
+    "evicted_policy_requests": 42.0,
+    "diverged": 31431.0,
+    "diverged_requests": 2.0,
+    "evicted_host_capacity": 1557.0,
+    "evicted_host_capacity_requests": 3.0
+   },
+   "sibling_ceiling_tokens": 300884.0,
+   "lru_ceiling_bytes": 13308526592.0,
+   "ttft_s": {
+    "n": 148,
+    "p50": 30.8019255,
+    "p95": 188.60138992000003,
+    "p99": 251.210910875,
+    "max": 284.68410475792234
+   },
+   "ttft_by_class": {
+    "private": {
+     "n": 85,
+     "p50": 17.9109509,
+     "p95": 127.45556252
+    },
+    "shared": {
+     "n": 57,
+     "p50": 81.8768624,
+     "p95": 249.83755585999998
+    },
+    "partial": {
+     "n": 0,
+     "p50": null,
+     "p95": null
+    },
+    "none": {
+     "n": 6,
+     "p50": 53.85403805,
+     "p95": 94.7074157
+    }
+   },
+   "queue_s": {
+    "n": 148,
+    "p50": 18.4925674,
+    "p95": 136.481824265,
+    "p99": 159.52431955600002
+   },
+   "binding_s": {
+    "p50": 0.03466860000000001,
+    "p95": 0.8473400400000001
+   },
+   "restore": {
+    "n": 114,
+    "seconds_p50": 0.003648992,
+    "seconds_p95": 0.0334271424,
+    "mib_p50": 75.984375
+   },
+   "source_wait_s_total": 2454.5313872,
+   "fallback_reasons": {
+    "none": 147,
+    "source_revoked": 1
+   },
+   "joined": 148,
+   "lanes": {
+    "utilisation": 0.4723515715948778,
+    "all_busy_fraction": 0.13969732246798602,
+    "waiting_mean": 6.887077997671711,
+    "waiting_max": 23,
+    "prefilling_mean": 2.982537834691502
+   },
+   "throughput": {
+    "decode_tok_s_wall": 5.356132204248571,
+    "generation_tok_s_wall": 5.526095233028329,
+    "prefill_tok_s_wall": 1724.1405643059954,
+    "prefill_tok_s_exec": 2153.157065178992
+   },
+   "counters": {
+    "checkpoint_selections_total": 142.0,
+    "root_selections_total": 6.0,
+    "prompt_tokens_total": 4240272.0,
+    "prompt_tokens_cached_total": 2738929.0,
+    "prefill_tokens_total": 1501343.0,
+    "prefill_seconds_total": 697.2751892000008,
+    "decode_tokens_total": 4664.0,
+    "generation_tokens_total": 4812.0,
+    "decode_seconds_total": 28.0429026,
+    "preemptions_total": 1.0,
+    "replayed_tokens_total": 28672.0,
+    "context_pressure_spill_pages_total": 46780.0
+   },
+   "store_mib_written_per_hour": 0.0,
+   "host_peak_mib": 8191.70703125,
+   "store_gauges": {
+    "ninfer_context_store_images": 0.0,
+    "ninfer_context_store_used_bytes": 0.0,
+    "ninfer_context_store_restored_sessions": 0.0,
+    "ninfer_context_store_restored_bytes": 0.0,
+    "ninfer_context_store_restore_seconds": 0.0
+   },
+   "transfer_seconds": 5.068962220000005,
+   "transfers_mib": {
+    "ninfer_context_transfer_bytes_total{resource=\"state\",direction=\"d2h\"}": 12420.49609375,
+    "ninfer_context_transfer_bytes_total{resource=\"state\",direction=\"h2d\"}": 7557.048828125,
+    "ninfer_context_transfer_bytes_total{resource=\"main_kv\",direction=\"d2h\"}": 25744.6875,
+    "ninfer_context_transfer_bytes_total{resource=\"main_kv\",direction=\"h2d\"}": 13940.9375,
+    "ninfer_context_transfer_bytes_total{resource=\"main_kv\",direction=\"d2d\"}": 191.40625,
+    "ninfer_context_transfer_bytes_total{resource=\"backend_kv\",direction=\"d2h\"}": 1588.80859375,
+    "ninfer_context_transfer_bytes_total{resource=\"backend_kv\",direction=\"h2d\"}": 860.302734375,
+    "ninfer_context_transfer_bytes_total{resource=\"backend_kv\",direction=\"d2d\"}": 11.826171875
+   }
   }
  ],
  "after_300s_warmup": [
@@ -1788,6 +1960,25 @@
    "demote_fail_state": 4,
    "demote_fail_kv": 1,
    "demote_split_kv": 32
+  },
+  {
+   "run": "b-c8-h8",
+   "admit_success_n": 568,
+   "admit_success_us_p50": 4125,
+   "p95": 90096,
+   "p99": 545117,
+   "max": 864228,
+   "sum_s": 13.013233,
+   "admit_fail_n": 719,
+   "admit_fail_us_p50": 0,
+   "admit_fail_p99": 9434,
+   "admit_fail_sum_s": 0.153975,
+   "admit_over_100ms_n": 25,
+   "admit_over_100ms_s": 8.81566,
+   "admit_over_1s_n": 0,
+   "demote_fail_state": 434,
+   "demote_fail_kv": 181,
+   "demote_split_kv": 4719
   }
  ],
  "disk_seq_io": {
