@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -826,19 +827,28 @@ std::optional<std::vector<std::uint8_t>> ContextStore::load(const std::string& i
             // chunks are read by several.
             std::atomic<std::size_t> next{0};
             std::mutex damage_mutex;
+            std::exception_ptr reader_failure;
             const auto read_pieces = [&] {
-                for (std::size_t index = next++; index < pieces.size(); index = next++) {
-                    const Piece& piece = pieces[index];
-                    std::ifstream file(chunk_path(piece.chunk->hash), std::ios::binary);
-                    if (!file ||
-                        !file.read(reinterpret_cast<char*>(buffer + piece.position),
-                                   piece.chunk->length) ||
-                        hash(std::span<const std::uint8_t>(buffer + piece.position,
-                                                           piece.chunk->length)) !=
-                            piece.chunk->hash) {
-                        std::scoped_lock damage(damage_mutex);
-                        damaged.push_back(*piece.chunk);
+                try {
+                    for (std::size_t index = next++; index < pieces.size(); index = next++) {
+                        const Piece& piece = pieces[index];
+                        std::ifstream file(chunk_path(piece.chunk->hash), std::ios::binary);
+                        if (!file ||
+                            !file.read(reinterpret_cast<char*>(buffer + piece.position),
+                                       piece.chunk->length) ||
+                            hash(std::span<const std::uint8_t>(buffer + piece.position,
+                                                               piece.chunk->length)) !=
+                                piece.chunk->hash) {
+                            std::scoped_lock damage(damage_mutex);
+                            damaged.push_back(*piece.chunk);
+                        }
                     }
+                } catch (...) {
+                    // An exception leaving a thread body would terminate the process: keep the
+                    // first, stop the other readers, and rethrow from load() once all are joined.
+                    std::scoped_lock damage(damage_mutex);
+                    if (!reader_failure) { reader_failure = std::current_exception(); }
+                    next = pieces.size();
                 }
             };
             const std::size_t threads =
@@ -850,6 +860,7 @@ std::optional<std::vector<std::uint8_t>> ContextStore::load(const std::string& i
             } catch (...) {} // fewer threads: the calling thread still reads every piece
             read_pieces();
             for (auto& reader : readers) { reader.join(); }
+            if (reader_failure) { std::rethrow_exception(reader_failure); }
             // Every damaged chunk is discarded and fetched again together (with a remote), so one
             // bad chunk does not leave the next to fail the retry.
             const bool intact = damaged.empty();

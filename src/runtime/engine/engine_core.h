@@ -3017,6 +3017,12 @@ private:
             per_byte_q32 == 0 ? 0.0
                               : 1e9 * static_cast<double>(kContextCostQ32One) /
                                     static_cast<double>(per_byte_q32);
+        // The rate may change while no request runs (store set up, a start-up restore), when
+        // nothing else republishes: update the published copy too. execution_mutex_ (held by the
+        // callers) before stats_mutex_ is the existing order.
+        std::lock_guard lock(stats_mutex_);
+        published_stats_.context_store_read_bytes_per_second =
+            cumulative_stats_.context_store_read_bytes_per_second;
     }
 
     void finish_hydration(const std::shared_ptr<Request>& request, bool failed) {
