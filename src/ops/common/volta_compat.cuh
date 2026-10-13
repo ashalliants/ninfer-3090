@@ -67,15 +67,16 @@ struct F16Unpack {
 //   a0:(row g,   k 2t..2t+1)  a1:(row g+8, k 2t..)  a2:(row g, k 2t+8..)  a3:(row g+8, k 2t+8..)
 //   b0:(k 2t..2t+1, n g)      b1:(k 2t+8.., n g)
 //   c0,c1:(row g, n 2t..2t+1) c2,c3:(row g+8, n 2t..2t+1)
+// Not inlined: expanding ~100 instructions at every call site made ptxas and cicc take over half
+// an hour on the attention kernels. By-value float4 keeps the accumulators in registers.
 template <class Unpack>
-__device__ __forceinline__ void mma_m16n8k16(float& c0, float& c1, float& c2, float& c3,
-                                             unsigned a0, unsigned a1, unsigned a2, unsigned a3,
-                                             unsigned b0, unsigned b1) {
+__device__ __noinline__ float4 mma_m16n8k16_impl(float4 c, unsigned a0, unsigned a1, unsigned a2,
+                                                 unsigned a3, unsigned b0, unsigned b1) {
+    float c0 = c.x, c1 = c.y, c2 = c.z, c3 = c.w;
     const int lane = threadIdx.x & 31;
     const int g    = lane >> 2;
     const int t    = lane & 3;
-// Rolled: unrolling this across the dozens of mma calls in the attention kernels sends ptxas
-    // into a half-hour compile.
+    // Rolled to keep the non-inlined body small.
 #pragma unroll 1
     for (int tp = 0; tp < 4; ++tp) {
         const int src_a = 4 * g + tp;
@@ -100,18 +101,26 @@ __device__ __forceinline__ void mma_m16n8k16(float& c0, float& c1, float& c2, fl
             hi = fmaf(A3.y, B1.y, hi);
         }
     }
+    return make_float4(c0, c1, c2, c3);
+}
+
+template <class Unpack>
+__device__ __forceinline__ void mma_m16n8k16(float& c0, float& c1, float& c2, float& c3, unsigned a0,
+                                             unsigned a1, unsigned a2, unsigned a3, unsigned b0,
+                                             unsigned b1) {
+    const float4 r = mma_m16n8k16_impl<Unpack>(make_float4(c0, c1, c2, c3), a0, a1, a2, a3, b0, b1);
+    c0 = r.x; c1 = r.y; c2 = r.z; c3 = r.w;
 }
 
 // m16n8k32 s8: a0:(row g, k 4t..4t+3) a1:(row g+8, same) a2:(row g, k 16+4t..) a3:(row g+8, 16+4t..)
 //              b0:(k 4t..4t+3, n g)   b1:(k 16+4t.., n g)
-__device__ __forceinline__ void mma_m16n8k32_s8(int& c0, int& c1, int& c2, int& c3, unsigned a0,
-                                                unsigned a1, unsigned a2, unsigned a3,
-                                                unsigned b0, unsigned b1) {
+__device__ __noinline__ int4 mma_m16n8k32_s8_impl(int4 c, unsigned a0, unsigned a1, unsigned a2,
+                                                  unsigned a3, unsigned b0, unsigned b1) {
+    int c0 = c.x, c1 = c.y, c2 = c.z, c3 = c.w;
     const int lane = threadIdx.x & 31;
     const int g    = lane >> 2;
     const int t    = lane & 3;
-// Rolled: unrolling this across the dozens of mma calls in the attention kernels sends ptxas
-    // into a half-hour compile.
+    // Rolled to keep the non-inlined body small.
 #pragma unroll 1
     for (int tp = 0; tp < 4; ++tp) {
         const int src_a = 4 * g + tp;
@@ -132,19 +141,27 @@ __device__ __forceinline__ void mma_m16n8k32_s8(int& c0, int& c1, int& c2, int& 
             hi = __dp4a(A3, B1, hi);
         }
     }
+    return make_int4(c0, c1, c2, c3);
+}
+
+__device__ __forceinline__ void mma_m16n8k32_s8(int& c0, int& c1, int& c2, int& c3, unsigned a0,
+                                                unsigned a1, unsigned a2, unsigned a3,
+                                                unsigned b0, unsigned b1) {
+    const int4 r = mma_m16n8k32_s8_impl(make_int4(c0, c1, c2, c3), a0, a1, a2, a3, b0, b1);
+    c0 = r.x; c1 = r.y; c2 = r.z; c3 = r.w;
 }
 
 // m16n8k8 tf32: a0:(row g, k t) a1:(row g+8, k t) a2:(row g, k t+4) a3:(row g+8, k t+4)
 //               b0:(k t, n g)   b1:(k t+4, n g)
-__device__ __forceinline__ void mma_m16n8k8_tf32(float& c0, float& c1, float& c2, float& c3,
-                                                 unsigned a0, unsigned a1, unsigned a2,
-                                                 unsigned a3, unsigned b0, unsigned b1) {
+__device__ __noinline__ float4 mma_m16n8k8_tf32_impl(float4 c, unsigned a0, unsigned a1,
+                                                     unsigned a2, unsigned a3, unsigned b0,
+                                                     unsigned b1) {
+    float c0 = c.x, c1 = c.y, c2 = c.z, c3 = c.w;
     constexpr unsigned kTf32Mask = 0xffffe000u;
     const int lane               = threadIdx.x & 31;
     const int g                  = lane >> 2;
     const int t                  = lane & 3;
-// Rolled: unrolling this across the dozens of mma calls in the attention kernels sends ptxas
-    // into a half-hour compile.
+    // Rolled to keep the non-inlined body small.
 #pragma unroll 1
     for (int tp = 0; tp < 4; ++tp) {
         const int src_a = 4 * g + tp;
@@ -165,6 +182,14 @@ __device__ __forceinline__ void mma_m16n8k8_tf32(float& c0, float& c1, float& c2
             hi = fmaf(A3, B1, hi);
         }
     }
+    return make_float4(c0, c1, c2, c3);
+}
+
+__device__ __forceinline__ void mma_m16n8k8_tf32(float& c0, float& c1, float& c2, float& c3,
+                                                 unsigned a0, unsigned a1, unsigned a2,
+                                                 unsigned a3, unsigned b0, unsigned b1) {
+    const float4 r = mma_m16n8k8_tf32_impl(make_float4(c0, c1, c2, c3), a0, a1, a2, a3, b0, b1);
+    c0 = r.x; c1 = r.y; c2 = r.z; c3 = r.w;
 }
 
 } // namespace ninfer::ops::volta
