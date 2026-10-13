@@ -94,6 +94,9 @@ public:
         // same conversation: this image contains everything it does, so once this one is durable
         // the older one is removed instead of being kept as a near-duplicate until it ages out.
         std::span<const std::array<std::uint64_t, 2>> prefix_digests;
+        // A prefix many conversations share (a system or tools prompt) rather than one
+        // conversation: restored before conversations when not everything fits.
+        bool shared = false;
     };
 
     struct Info {
@@ -105,7 +108,8 @@ public:
         std::int64_t last_used_ms   = 0;
         std::vector<CheckpointKey> checkpoints;
         // Every chunk of the image is in the directory, so load() does not touch the network.
-        bool local = true;
+        bool local  = true;
+        bool shared = false;
     };
 
     struct PutResult {

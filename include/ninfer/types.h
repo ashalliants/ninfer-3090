@@ -1438,6 +1438,10 @@ struct RuntimeStats {
     // first, and the Engine worker time spent copying their images out.
     std::uint64_t context_store_eviction_writes        = 0;
     double context_store_eviction_export_seconds       = 0.0;
+    // Public shared prefixes (system or tools prompts) written to the store, and the Engine
+    // worker time spent copying them out.
+    std::uint64_t context_store_shared_writes          = 0;
+    double context_store_shared_export_seconds         = 0.0;
     // With a remote: images only the remote holds, objects and bytes moved, and failures.
     std::uint64_t context_store_remote_images            = 0;
     std::uint64_t context_store_remote_uploads           = 0;

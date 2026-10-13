@@ -791,6 +791,8 @@ public:
     // the store first. Both are optional; without them every loss is a recomputation.
     struct Durability {
         std::function<std::optional<std::uint64_t>(OwnerToken)> stored_bytes;
+        // The same for a public shared prefix, stored as an image of its own.
+        std::function<std::optional<std::uint64_t>(Handle)> shared_stored_bytes;
         std::function<void(std::span<const RetainedOwner>)> releasing;
     };
 
@@ -838,6 +840,32 @@ public:
         }
         prune(program);
         return token;
+    }
+
+    // Public shared prefixes the durable store may keep: installed (pinned) context is not cache
+    // contents and is never stored.
+    [[nodiscard]] std::vector<Handle> retained_shared(Program& program) {
+        prune(program);
+        std::vector<Handle> out;
+        for (const auto& shared : shared_) {
+            if (!shared.pinned) { out.push_back(shared.handle); }
+        }
+        return out;
+    }
+
+    // Catalogues a shared prefix Native rebuilt from a durable image, with no demand evidence:
+    // like any new shared entry it earns its retention by being used. False (and released) when
+    // the cache is off or the handle is not a shared prefix.
+    bool adopt_restored_shared(Program& program, Handle handle) {
+        if (!enabled_ || !program.valid_checkpoint(handle) ||
+            program.checkpoint_metadata(handle).role != CheckpointRole::SharedPrefix) {
+            release_unreferenced(program, handle);
+            return false;
+        }
+        shared_.push_back({.handle = handle, .ordinal = ++ordinal_, .priority = {},
+                           .retained_at = ++clock_});
+        index_.insert(program, handle, program.checkpoint_metadata(handle).frontier);
+        return true;
     }
 
     // Pinned shared prefixes are kept, with their index entries: they are installed context,
@@ -1413,19 +1441,26 @@ private:
         return *facts.loss;
     }
 
-    // The store's image size when every catalog holder of every source is a continuation the
-    // store holds in full; nullopt when any source would be recomputed (a shared entry, a waiting
-    // reader's only copy, or a continuation the store does not hold as it is now).
+    // The store's image size when every catalog holder of every source is a continuation or
+    // shared prefix the store holds in full; nullopt when any source would be recomputed (a
+    // waiting reader's only copy, or a holder the store does not hold as it is now).
     [[nodiscard]] std::optional<std::uint64_t>
     stored_image_bytes(std::span<const Handle> sources) const {
         if (!durability_.stored_bytes || sources.empty()) { return std::nullopt; }
         std::vector<OwnerToken> holders;
+        std::uint64_t shared_bytes = 0;
         for (const auto handle : sources) {
+            bool held = false;
             if (std::any_of(shared_.begin(), shared_.end(),
                             [&](const auto& entry) { return entry.handle == handle; })) {
-                return std::nullopt;
+                const auto stored = durability_.shared_stored_bytes
+                                        ? durability_.shared_stored_bytes(handle)
+                                        : std::nullopt;
+                if (!stored) { return std::nullopt; }
+                shared_bytes = *stored > UINT64_MAX - shared_bytes ? UINT64_MAX
+                                                                   : shared_bytes + *stored;
+                held = true;
             }
-            bool held = false;
             for (const auto& owner : owners_) {
                 if (std::none_of(owner.points.begin(), owner.points.end(),
                                  [&](const auto& point) { return point.handle == handle; })) {
@@ -1438,7 +1473,7 @@ private:
             }
             if (!held) { return std::nullopt; }
         }
-        std::uint64_t bytes = 0;
+        std::uint64_t bytes = shared_bytes;
         for (const auto token : holders) {
             const auto stored = durability_.stored_bytes(token);
             if (!stored) { return std::nullopt; }

@@ -19,7 +19,9 @@ namespace {
 namespace fs = std::filesystem;
 
 constexpr char kManifestMagic[8]     = {'N', 'C', 'T', 'X', 'S', 'T', 'O', '1'};
-constexpr std::uint32_t kManifestVersion = 1;
+// Version 2 adds the shared flag after the creation time. Version 1 manifests (written before it)
+// are still read, as not shared, so an upgrade does not discard a store's conversations.
+constexpr std::uint32_t kManifestVersion = 2;
 // A manifest names at most this many chunks and checkpoints; larger counts mean a corrupt file, not
 // a big session (a 1M-token session at 32 MiB chunks is a few thousand chunks).
 constexpr std::uint32_t kMaximumChunksPerImage = 1U << 20U;
@@ -369,16 +371,16 @@ bool ContextStore::parse_manifest(std::span<const std::uint8_t> data, Entry& ent
         Reader reader(body);
         char magic[sizeof(kManifestMagic)];
         reader.bytes(magic, sizeof(magic));
-        if (std::memcmp(magic, kManifestMagic, sizeof(magic)) != 0 ||
-            reader.pod<std::uint32_t>() != kManifestVersion) {
-            return false;
-        }
+        if (std::memcmp(magic, kManifestMagic, sizeof(magic)) != 0) { return false; }
+        const auto version = reader.pod<std::uint32_t>();
+        if (version != 1 && version != kManifestVersion) { return false; }
         Info& info       = entry.info;
         info.id          = reader.string(64);
         info.binding     = reader.string(1U << 16U);
         info.tokens      = reader.pod<std::uint32_t>();
         info.image_bytes = reader.pod<std::uint64_t>();
         info.created_ms  = reader.pod<std::int64_t>();
+        info.shared      = version >= 2 && reader.pod<std::uint8_t>() != 0;
         const auto checkpoint_count = reader.pod<std::uint32_t>();
         if (checkpoint_count > kMaximumCheckpoints) { return false; }
         info.checkpoints.resize(checkpoint_count);
@@ -638,6 +640,7 @@ ContextStore::PutResult ContextStore::put(const Description& description,
         manifest.pod<std::uint32_t>(description.tokens);
         manifest.pod<std::uint64_t>(image.size());
         manifest.pod<std::int64_t>(now);
+        manifest.pod<std::uint8_t>(description.shared ? 1 : 0);
         manifest.pod<std::uint32_t>(static_cast<std::uint32_t>(description.checkpoints.size()));
         for (const CheckpointKey& key : description.checkpoints) {
             manifest.pod(key.frontier);
@@ -672,7 +675,8 @@ ContextStore::PutResult ContextStore::put(const Description& description,
                           .image_bytes  = image.size(),
                           .created_ms   = now,
                           .last_used_ms = now,
-                          .checkpoints  = description.checkpoints};
+                          .checkpoints  = description.checkpoints,
+                          .shared       = description.shared};
         entry.manifest_bytes = manifest.out.size();
         entry.chunks         = std::move(all_chunks);
 
@@ -713,7 +717,10 @@ ContextStore::PutResult ContextStore::put(const Description& description,
         if (!description.prefix_digests.empty()) {
             std::vector<std::string> superseded;
             for (const auto& [other_id, other] : entries_) {
+                // Every conversation reproduces the shared prefix it started from; that prefix
+                // still serves the other conversations, so it is never superseded by one.
                 if (other_id == description.id || other.info.binding != description.binding ||
+                    other.info.shared || description.shared ||
                     other.info.tokens > description.tokens || other.info.checkpoints.empty()) {
                     continue;
                 }

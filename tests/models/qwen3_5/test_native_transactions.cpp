@@ -1832,6 +1832,51 @@ public:
         expect_empty("imported checkpoint leaked typed resources");
     }
 
+    // A public shared prefix travels as an image of its own (no session, no private point beside
+    // it) and comes back as a shared prefix: same bytes on re-export, same key, still a source.
+    void shared_prefix_image_round_trip() {
+        constexpr std::string_view kBinding = "native-transactions-image";
+        auto marked         = marker_request();
+        const auto sequence = bind(marked.base);
+        reserve(sequence, qwen::ExecutionUnitKind::Prefill);
+        const auto step = program_.advance_prefill(sequence);
+        require(step.capture_ready, "shared image fixture did not reach its first marker");
+        const auto frontier = marked.frontiers.front();
+        const auto shared   = capture(sequence, frontier, runtime::CheckpointRole::SharedPrefix);
+        require(program_.abort(sequence).status == runtime::ConsumeStatus::Consumed,
+                "shared image fixture did not release its lane");
+        const std::array points{shared};
+        qwen::PreparedSessionKey session;
+        session.size = 1;
+        session.bytes[0] = 's';
+        bool rejected = false;
+        try {
+            (void)program_.export_checkpoints(points, session, kBinding);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        require(rejected, "a shared prefix was exported with a conversation's session key");
+        const auto image = program_.export_checkpoints(points, std::nullopt, kBinding);
+        require(image.keys.size() == 1 && image.keys.front().frontier == frontier,
+                "shared prefix image does not describe its endpoint");
+        require(program_.release_checkpoint(shared), "shared image source retained a reader");
+        expect_empty("released shared image source leaked typed resources");
+        auto imported = program_.import_checkpoints(image.bytes, kBinding);
+        require(imported && imported->points.size() == 1 && !imported->session,
+                "shared prefix image did not import as one point without a session");
+        const auto restored = imported->points.front();
+        require(program_.checkpoint_metadata(restored).role == runtime::CheckpointRole::SharedPrefix &&
+                    program_.checkpoint_key(restored, frontier) == image.keys.front(),
+                "imported shared prefix lost its role or key");
+        const std::array restored_points{restored};
+        require(program_.export_checkpoints(restored_points, std::nullopt, kBinding).bytes ==
+                    image.bytes,
+                "re-exporting an imported shared prefix changed bytes");
+        auto again = marker_request();
+        require(static_cast<bool>(program_.inspect_source(again.base, restored)),
+                "imported shared prefix is not a source for a prompt that starts with it");
+        require(program_.release_checkpoint(restored), "imported shared prefix stayed leased");
+        expect_empty("imported shared prefix leaked typed resources");
+    }
+
     void grammar_row_failure() {
         struct Masks final : runtime::TokenMaskProvider {
             void uploaded(std::size_t, std::size_t) noexcept override {}
@@ -2218,6 +2263,7 @@ int main(int argc, char** argv) {
             fixture.physical_facts();
             fixture.grammar_row_failure();
             fixture.checkpoint_image_round_trip();
+            fixture.shared_prefix_image_round_trip();
         }
         program.reset();
         options.kv_capacity    = KvCapacityPolicy::explicit_capacity(kCapacity);

@@ -321,8 +321,14 @@ ParsedImage parse_image(const ProgramImpl& program, std::span<const std::uint8_t
         const auto role = reader.pod<std::uint8_t>();
         if (role != static_cast<std::uint8_t>(runtime::CheckpointRole::Continuation) &&
             role != static_cast<std::uint8_t>(runtime::CheckpointRole::InputReplay) &&
-            role != static_cast<std::uint8_t>(runtime::CheckpointRole::LongAnchor)) {
-            throw std::invalid_argument("checkpoint image point role is not a private point");
+            role != static_cast<std::uint8_t>(runtime::CheckpointRole::LongAnchor) &&
+            role != static_cast<std::uint8_t>(runtime::CheckpointRole::SharedPrefix)) {
+            throw std::invalid_argument("checkpoint image point role is out of range");
+        }
+        // A shared prefix travels alone, without a session: it belongs to no conversation.
+        if (role == static_cast<std::uint8_t>(runtime::CheckpointRole::SharedPrefix) &&
+            (point_count != 1 || parsed.session)) {
+            throw std::invalid_argument("checkpoint image shares a prefix with private points");
         }
         point.role                 = static_cast<runtime::CheckpointRole>(role);
         point.frontier             = reader.pod<std::uint32_t>();
@@ -391,9 +397,13 @@ CheckpointImage ProgramImpl::export_checkpoints(std::span<const CheckpointHandle
     }
     for (const auto handle : points) {
         const auto& record = checkpoint(handle);
-        if (!record.identity || !record.kv ||
-            record.role == runtime::CheckpointRole::SharedPrefix) {
-            throw std::invalid_argument("checkpoint is not an exportable private recovery point");
+        if (!record.identity || !record.kv) {
+            throw std::invalid_argument("checkpoint is not an exportable recovery point");
+        }
+        // A shared prefix is exported on its own: an image is one conversation or one prefix.
+        if (record.role == runtime::CheckpointRole::SharedPrefix &&
+            (points.size() != 1 || session)) {
+            throw std::invalid_argument("a shared prefix is exported alone, without a session");
         }
     }
     std::stable_sort(points.begin(), points.end(), [&](auto a, auto b) {

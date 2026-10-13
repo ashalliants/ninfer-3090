@@ -409,8 +409,13 @@ and needs somewhere to hold checkpoints: a Host context cache (the default 8 GiB
 works with `--host-context-mib 0`), because stored sessions come back into that tier. What is stored is one retained conversation
 (continuation) at a time: its recovery points (the endpoint of the last turn, the point where the
 next turn's input starts, any long anchors) with their KV pages and recurrent states, byte for byte
-what the Host tier would hold for them. Public shared prefixes are not stored. A conversation is
-written to `DIR`
+what the Host tier would hold for them. Public shared prefixes (a system or tools prompt that the
+cache keeps as one entry for every conversation that starts with it) are stored too, each as an
+image of its own, written as soon as the cache has captured one (at most one a second, while the
+writer is idle, busy or not: it is a short copy of a few thousand tokens and one recurrent state,
+counted in `ninfer_context_store_shared_export_seconds_total`), so after a restart, or on a new
+box that shares the bucket, the first request of every tenant on that prompt starts warm. Prompt
+grafts are installed context and are never stored. A conversation is written to `DIR`
 
 - in the background once it has been unused for `--context-store-idle-seconds` (30 s) and has
   changed since it was last written, so a crash loses at most that much of a conversation,
@@ -426,9 +431,12 @@ is priced as the time to read it back and copy it to the GPU rather than the pre
 otherwise cost, so under pressure it goes before one that would have to be recomputed (when the
 store is slower than prefilling it, nothing changes).
 
-On start-up the most recently used conversations are restored into the Host tier, most recent first,
-while they fit in its free space and until `--context-store-restore-seconds` (120 s) is spent, before
-the server accepts requests. Nothing is evicted for them. A request then reuses a restored
+On start-up the stored images are restored into the Host tier while they fit in its free space and
+until `--context-store-restore-seconds` (120 s) is spent, before the server accepts requests, in
+order of value: shared prefixes first, then conversations by the prefill time they save per byte of
+Host tier they take (the cost model's prefill estimate for their length, over their image size),
+the most recently used first among equals. A deep conversation therefore goes before a short one
+that would fill the same room, and what does not fit stays in the store for hydration. Nothing is evicted for them. A request then reuses a restored
 conversation exactly as it would have before the restart, restoring it from the Host tier to the
 GPU like any other Host-resident checkpoint. There is nothing for a supervisor or gateway to call.
 
@@ -614,6 +622,7 @@ server restarts.
 | `ninfer_context_store_evicted_total`, `_corrupt_total` | sessions removed for space, age or supersession, and because they could not be read back intact |
 | `ninfer_context_store_restored_sessions`, `_restored_bytes`, `_restore_seconds` | gauges: what start-up restored into the cache, and how long it took |
 | `ninfer_context_store_hydrations_total`, `_hydrated_tokens_total`, `_hydration_failures_total`, `_hydration_seconds_total` | stored sessions read back for a request, the prompt tokens that saved, failures (the request was prefilled, or its admission did not use what was read) and the time requests waited for the reads, failed ones included |
+| `ninfer_context_store_shared_writes_total`, `_shared_export_seconds_total` | public shared prefixes written to the store, and the Engine worker time spent copying them out |
 | `ninfer_context_store_eviction_writes_total`, `_eviction_export_seconds_total` | conversations queued for the store as the cache evicted them, and the Engine worker time spent copying them out |
 | `ninfer_context_store_read_bytes_per_second` | gauge: the store read rate (read, verification and import into the Host tier) the cost model prices hydrations with, learned from the reads so far; 1 GB/s until the first read of at least 64 MiB |
 | `ninfer_context_store_remote_images` | gauge: with a bucket, sessions it holds that the directory does not hold in full |

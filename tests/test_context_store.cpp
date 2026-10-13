@@ -289,6 +289,36 @@ void test_supersede_and_replace() {
     check(chunk_files(directory.path()).size() == 1, "a replaced image left unreferenced chunks");
 }
 
+// A shared prefix (a system prompt every conversation of a tenant starts with) is kept as its own
+// image: the flag survives a restart, and a conversation that reproduces its endpoint key (as every
+// conversation starting from it does) does not supersede it.
+void test_shared_prefix_is_kept_and_flagged() {
+    TempDirectory directory;
+    const auto kv = pseudo_random(3000, 1);
+    {
+        ContextStore store(options_for(directory.path()));
+        auto prefix   = describe("0a5");
+        prefix.shared = true;
+        (void)store.put(prefix, concat({pseudo_random(30, 1), kv}),
+                        std::array{ContextStore::Region{30, 3000}});
+        std::vector<std::array<std::uint64_t, 2>> digests(130, {5, 5});
+        digests[99]               = {0x1111, 0x2222};
+        auto conversation         = describe("0b", 120);
+        conversation.prefix_digests = digests;
+        (void)store.put(conversation, concat({pseudo_random(40, 2), kv, pseudo_random(900, 3)}),
+                        std::array{ContextStore::Region{40, 3900}});
+        check(store.find("0a5") && store.find("0b") && store.stats().superseded == 0,
+              "a conversation superseded the shared prefix it starts with");
+        check(store.find("0a5")->shared && !store.find("0b")->shared,
+              "the shared flag was not recorded");
+    }
+    ContextStore reopened(options_for(directory.path()));
+    const auto info = reopened.find("0a5");
+    check(info && info->shared && reopened.find("0b") && !reopened.find("0b")->shared,
+          "the shared flag did not survive a restart");
+    check(reopened.load("0a5").has_value(), "the shared prefix did not load after a restart");
+}
+
 void test_invalid_input_and_failed_put() {
     TempDirectory directory;
     ContextStore store(options_for(directory.path()));
@@ -976,6 +1006,7 @@ int main() {
     test_space_limit_evicts_least_recently_used();
     test_ttl_and_use_extend_life();
     test_supersede_and_replace();
+    test_shared_prefix_is_kept_and_flagged();
     test_invalid_input_and_failed_put();
     test_remote_upload_and_second_engine();
     test_remote_survives_local_eviction();

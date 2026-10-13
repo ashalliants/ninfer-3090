@@ -391,7 +391,12 @@ public:
     std::atomic<std::uint64_t> store_write_failures{0};
     std::mutex writer_mutex;
     std::condition_variable writer_cv;
-    std::deque<CheckpointImage> pending_writes;
+    enum class StoreWrite : std::uint8_t { Idle, Eviction, SharedPrefix };
+    struct PendingWrite {
+        CheckpointImage image;
+        bool shared = false;
+    };
+    std::deque<PendingWrite> pending_writes;
     bool writer_active = false;
     bool writer_stop   = false;
     std::optional<std::chrono::steady_clock::time_point> drain_deadline;
@@ -444,12 +449,15 @@ private:
             .store   = store.get(),
             .binding = store_binding,
             .sink    = [this](CheckpointImage&& image) {
-                return enqueue_store_write(std::move(image), false);
+                return enqueue_store_write(std::move(image), StoreWrite::Idle);
             },
             .evict_sink = [this](CheckpointImage&& image) {
-                return enqueue_store_write(std::move(image), true);
+                return enqueue_store_write(std::move(image), StoreWrite::Eviction);
             },
-            .ready   = [this] { return store_queue_idle(); },
+            .shared_sink = [this](CheckpointImage&& image) {
+                return enqueue_store_write(std::move(image), StoreWrite::SharedPrefix);
+            },
+            .ready   =[this] { return store_queue_idle(); },
             .failures = [this] { return store_write_failures.load(std::memory_order_relaxed); },
             .idle_persist =
                 std::chrono::duration_cast<std::chrono::milliseconds>(options.context_store.idle_persist),
@@ -499,21 +507,24 @@ private:
         store_binding = context_store_binding(options, load);
     }
 
-    // Lowercase hex of the image's endpoint key: an image of the same endpoint replaces it.
-    static std::string image_id(const CheckpointImage& image) {
+    // Lowercase hex of the image's endpoint key: an image of the same endpoint replaces it. A
+    // shared prefix's id ends in an extra digit, so it never replaces a conversation image whose
+    // endpoint happens to fall at the same position.
+    static std::string image_id(const CheckpointImage& image, bool shared) {
         const auto& key = image.keys.front();
-        char text[41];
-        std::snprintf(text, sizeof(text), "%016llx%016llx%08x",
+        char text[42];
+        std::snprintf(text, sizeof(text), "%016llx%016llx%08x%s",
                       static_cast<unsigned long long>(key.digests[0]),
                       static_cast<unsigned long long>(key.digests[1]),
-                      static_cast<unsigned>(key.frontier));
+                      static_cast<unsigned>(key.frontier), shared ? "5" : "");
         return text;
     }
 
     // Writes one image to the store. On the writer thread, or at shutdown.
-    void store_put(const CheckpointImage& image) {
+    void store_put(const CheckpointImage& image, bool shared) {
         runtime::ContextStore::Description description;
-        description.id      = image_id(image);
+        description.id      = image_id(image, shared);
+        description.shared  = shared;
         description.binding = store_binding;
         description.tokens  = image.tokens;
         description.checkpoints.reserve(image.keys.size());
@@ -538,9 +549,28 @@ private:
             with_generation([&](auto& generation) {
                 const auto deadline = started + options.context_store.restore_budget;
                 auto images         = store->list();
-                std::sort(images.begin(), images.end(), [](const auto& a, const auto& b) {
-                    return a.last_used_ms > b.last_used_ms;
+                // By value when not everything fits: shared prefixes first (each serves every
+                // conversation that starts with it), then conversations by recomputation time
+                // saved per byte of Host tier they take, the most recently used first among equals.
+                std::vector<double> density(images.size());
+                for (std::size_t i = 0; i < images.size(); ++i) {
+                    density[i] =
+                        static_cast<double>(generation.prefill_estimate_ns(images[i].tokens)) /
+                        static_cast<double>(std::max<std::uint64_t>(1, images[i].image_bytes));
+                }
+                std::vector<std::size_t> order(images.size());
+                for (std::size_t i = 0; i < order.size(); ++i) { order[i] = i; }
+                std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+                    if (images[a].shared != images[b].shared) { return images[a].shared; }
+                    if (density[a] != density[b]) { return density[a] > density[b]; }
+                    return images[a].last_used_ms > images[b].last_used_ms;
                 });
+                {
+                    std::vector<runtime::ContextStore::Info> sorted;
+                    sorted.reserve(images.size());
+                    for (const auto i : order) { sorted.push_back(std::move(images[i])); }
+                    images = std::move(sorted);
+                }
                 // Sessions written under another model, configuration or image format are never read;
                 // counted once here so the start-up summary says why they were not restored.
                 foreign_images = static_cast<std::uint64_t>(
@@ -579,9 +609,9 @@ private:
         try {
             with_generation([&](auto& generation) {
                 (void)generation.persist_all(
-                    [this](CheckpointImage&& image) {
+                    [this](CheckpointImage&& image, bool shared) {
                         try {
-                            store_put(image);
+                            store_put(image, shared);
                             return true;
                         } catch (...) { return false; }
                     },
@@ -598,20 +628,22 @@ private:
     // Queues an image for the writer thread. Never blocks: when the queue is full the image is
     // not written now; an idle continuation is tried again later, an evicted one is lost to the
     // store as it would be without write-on-evict.
-    bool enqueue_store_write(CheckpointImage&& image, bool eviction) {
+    bool enqueue_store_write(CheckpointImage&& image, StoreWrite kind) {
         std::unique_lock lock(writer_mutex);
         if (writer_stop) { return false; } // shutting down: the final flush writes it instead
         std::size_t queued_bytes = 0;
-        for (const auto& pending : pending_writes) { queued_bytes += pending.bytes.size(); }
-        const bool full = eviction ? !pending_writes.empty() &&
-                                         queued_bytes + image.bytes.size() > kMaximumPendingEvictionBytes
-                                   : pending_writes.size() >= kMaximumPendingStoreWrites;
+        for (const auto& pending : pending_writes) { queued_bytes += pending.image.bytes.size(); }
+        const bool full =
+            kind == StoreWrite::Eviction
+                ? !pending_writes.empty() &&
+                      queued_bytes + image.bytes.size() > kMaximumPendingEvictionBytes
+                : pending_writes.size() >= kMaximumPendingStoreWrites;
         if (full) {
             store_dropped.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
         if (!writer.joinable()) { writer = std::thread([this] { writer_loop(); }); }
-        pending_writes.push_back(std::move(image));
+        pending_writes.push_back({std::move(image), kind == StoreWrite::SharedPrefix});
         lock.unlock();
         writer_cv.notify_one();
         return true;
@@ -619,7 +651,7 @@ private:
 
     void writer_loop() noexcept {
         for (;;) {
-            CheckpointImage image;
+            PendingWrite write;
             {
                 std::unique_lock lock(writer_mutex);
                 writer_cv.wait(lock, [&] { return writer_stop || !pending_writes.empty(); });
@@ -628,17 +660,17 @@ private:
                      std::chrono::steady_clock::now() >= *drain_deadline)) {
                     return;
                 }
-                image = std::move(pending_writes.front());
+                write = std::move(pending_writes.front());
                 pending_writes.pop_front();
                 writer_active = true;
             }
             ContextStoreWriteEvent event;
-            event.id           = image_id(image);
-            event.tokens       = image.tokens;
-            event.bytes        = image.bytes.size();
+            event.id           = image_id(write.image, write.shared);
+            event.tokens       = write.image.tokens;
+            event.bytes        = write.image.bytes.size();
             const auto started = std::chrono::steady_clock::now();
             try {
-                store_put(image);
+                store_put(write.image, write.shared);
             } catch (const std::exception& error) {
                 event.error = error.what();
             } catch (...) { event.error = "unknown context store write failure"; }

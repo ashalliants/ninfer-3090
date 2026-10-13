@@ -558,7 +558,9 @@ public:
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
     // Writes the checkpoints' byte image. Device-only contents are copied through the caller's
-    // memory, never by pinning more Host context. Requires no open context transaction.
+    // memory, never by pinning more Host context. Requires no open context transaction. An image
+    // holds either one conversation's private points or exactly one SharedPrefix point with no
+    // session; import rebuilds the points with the roles they were exported with.
     [[nodiscard]] CheckpointImage
     export_checkpoints(std::span<const CheckpointHandle> points,
                        const std::optional<PreparedSessionKey>& session,
