@@ -22,6 +22,9 @@
 // alternate three times on a full expert cache; the process stays within its OS video-memory budget
 // at every sample, greedy ids repeat, and the frames come back.
 //
+// --cache: the context cache with the chart in the cached prefix (cache_check below): turn 1, its
+// repeat and a second turn resume past the image without encoding it again and match cold runs.
+//
 // --bench [--mtp K] [--generate N] CASE...: one Engine, each case (chart, scene, compare, wallpaper)
 // once per argument; prints prompt tokens, image tokens, vision and prefill seconds, decode tok/s and
 // the answer.
@@ -420,6 +423,98 @@ int bench(const std::string& artifact, const std::vector<std::string>& args) {
     return 0;
 }
 
+// The context cache with an image in the cached prefix: a two-turn chat about the chart through an
+// Engine with the cache (MTP when the artifact holds the drafter), then the same prompts cold. The
+// repeat of turn 1 and turn 2 must resume past the image (reused tokens beyond it, no encode) and
+// produce the cold run's ids.
+int cache_check(const std::string& artifact, bool mtp, std::uint32_t tokens, std::uint32_t max_context) {
+    const Case chart = cases()[0];
+    const auto request = [&] {
+        RequestOptions r                     = greedy(tokens);
+        r.execution.allow_prefix_reuse       = true;
+        return r;
+    };
+    const auto options = [&](bool cache) {
+        EngineOptions o                     = base_options(artifact, max_context);
+        o.context_cache.enabled             = cache;
+        o.context_cache.host_capacity_bytes = cache ? std::nullopt : std::optional<std::size_t>(0);
+        if (mtp) {
+            o.speculative.backend      = SpeculativeBackend::Mtp;
+            o.speculative.draft_tokens = 3;
+        }
+        return o;
+    };
+    const auto turn2 = [&](const std::string& answer) {
+        PromptInput input = prompt_of(chart);
+        ChatMessage reply;
+        reply.role = ChatRole::Assistant;
+        reply.parts.push_back(MessagePart{.kind = MessagePartKind::Text, .text = answer, .media = {}});
+        input.messages.push_back(std::move(reply));
+        ChatMessage next;
+        next.role = ChatRole::User;
+        next.parts.push_back(MessagePart{.kind = MessagePartKind::Text,
+                                         .text = "Now say how many green triangles there are, in one word.",
+                                         .media = {}});
+        input.messages.push_back(std::move(next));
+        return input;
+    };
+    std::vector<GenerationResult> cached;
+    std::string answer;
+    std::uint32_t image_end = 0;
+    {
+        // Where the image's tokens end (the frontend alone, as check_placement renders it).
+        const artifact::Reader reader(artifact);
+        const auto plan     = q4::plan_load(reader, false, true);
+        const auto frontend = q35::make_frontend(plan.resources(), {.architecture   = models::Architecture::Qwen4Exp,
+                                                                    .vision_enabled = true,
+                                                                    .max_context    = max_context});
+        const auto prepared = frontend.prepare(prompt_of(chart));
+        const auto& item    = q35::PreparedPromptAccess::view(prepared).vision_items.front();
+        image_end = static_cast<std::uint32_t>(item.token_spans.back().begin + item.token_spans.back().count);
+    }
+    const double ram_before = available_ram_gib();
+    {
+        Engine engine(options(true));
+        cached.push_back(engine.generate(engine.prepare(prompt_of(chart)), request()));
+        print_result("cache turn 1 (cold, captures)", cached.back());
+        answer = cached.back().content;
+        cached.push_back(engine.generate(engine.prepare(prompt_of(chart)), request()));
+        print_result("cache turn 1 repeated", cached.back());
+        cached.push_back(engine.generate(engine.prepare(turn2(answer)), request()));
+        print_result("cache turn 2", cached.back());
+    }
+    wait_for_ram(ram_before);
+    std::vector<GenerationResult> cold;
+    {
+        Engine engine(options(false));
+        cold.push_back(engine.generate(engine.prepare(prompt_of(chart)), greedy(tokens)));
+        print_result("cold turn 1", cold.back());
+        cold.push_back(cold.back());
+        cold.push_back(engine.generate(engine.prepare(turn2(answer)), greedy(tokens)));
+        print_result("cold turn 2", cold.back());
+    }
+    const char* names[] = {"turn 1", "turn 1 repeated", "turn 2"};
+    for (std::size_t i = 0; i < cached.size(); ++i) {
+        const auto& a = cached[i].generated_token_ids;
+        const auto& b = cold[i].generated_token_ids;
+        std::size_t first = 0;
+        while (first < a.size() && first < b.size() && a[first] == b[first]) { ++first; }
+        check(a == b, std::string(names[i]) + ": cached and cold greedy ids identical (" + std::to_string(b.size()) +
+                          " ids" + (a == b ? "" : ", first difference at " + std::to_string(first)) + ")");
+        std::printf("%s: reused %u of %u prompt tokens (the image ends at %u), vision %.3f s\n", names[i],
+                    cached[i].reused_prompt_tokens, cached[i].prompt.prompt_tokens, image_end,
+                    cached[i].timings.vision_seconds);
+        if (i > 0) {
+            check(cached[i].reused_prompt_tokens >= image_end && cached[i].timings.vision_seconds == 0.0,
+                  std::string(names[i]) + ": resumed past the image without encoding it again");
+        }
+    }
+    std::printf(g_failures == 0 ? "qwen4_exp vision context cache checks passed\n"
+                                : "FAIL: %d qwen4_exp vision context cache check(s)\n",
+                g_failures);
+    return g_failures == 0 ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -443,6 +538,9 @@ int main(int argc, char** argv) {
         std::vector<std::string> args(argv + 1, argv + argc);
         if (!args.empty() && args.front() == "--bench") {
             return bench(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
+        }
+        if (!args.empty() && args.front() == "--cache") {
+            return cache_check(artifact, mtp_available, 32, 16'384);
         }
         if (!args.empty() && args.front() == "--kv-cycle") {
             const bool cycled = kv_cycle(artifact);

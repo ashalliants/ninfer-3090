@@ -10,8 +10,9 @@ rem   qwen38-27b        tuned (default), int8, c8   <- recommended
 rem   qwen36-35b-a3b    tuned (default)
 rem   qwen38-flash-next tuned (default)      <- Qwen3.8-Flash-Next from the IQ2_XS GGUF (preview)
 rem
-rem QWEN3.8-FLASH-NEXT: one request at a time, 32,768 tokens of context, INT8 KV, no prefix reuse
-rem yet (every request prefills its whole prompt). MTP speculation (up to 3 drafts, 1.4x decode) is
+rem QWEN3.8-FLASH-NEXT: one request at a time, 32,768 tokens of context, INT8 KV, prefix reuse from
+rem a 4 GiB Host cache (a conversation's next turn prefills only what is new; NINFER_PREFIX_CACHE=off
+rem turns it off, NINFER_HOST_CONTEXT_MIB sizes it). MTP speculation (up to 3 drafts, 1.4x decode) is
 rem on when the model is qwen4exp-iq2xs-mtp.ninfer or qwen4exp-iq2xs-mtp-vision.ninfer, preferred in
 rem that order (vision first) when they sit beside the plain qwen4exp-iq2xs.ninfer; NINFER_SPEC=none
 rem turns it off. Images are accepted with a -vision model (NINFER_VISION=off: text only). It pins all 33 GiB
@@ -401,8 +402,22 @@ if /i not "%SPEC%"=="mtp" if /i not "%SPEC%"=="none" (
   echo NINFER_SPEC must be mtp or none for Qwen3.8-Flash-Next, got %SPEC% 1>&2
   exit /b 2
 )
-set "PROFILE_ARGS=--max-concurrency 1 --max-context %CONTEXT% --kv-capacity %CONTEXT% --kv-dtype int8 --prefill-chunk 1024 --max-pending-requests 16 --pending-timeout-ms 600000 %SPEC_ARGS% %FN_VISION_ARGS%"
-set "LABEL=one request  ^|  context %CONTEXT%  ^|  INT8 KV  ^|  %FN_INPUT%, %SPEC_LABEL%"
+rem Prefix reuse (the context cache): checkpoints of the conversation in a pinned Host tier beside the
+rem experts, 4 GiB by default; the server shrinks it to what its RAM ledger can spare (off below
+rem 512 MiB) and says so. NINFER_PREFIX_CACHE=off turns it off; NINFER_HOST_CONTEXT_MIB sets its size.
+set "FN_CACHE=on"
+if not "%NINFER_PREFIX_CACHE%"=="" set "FN_CACHE=%NINFER_PREFIX_CACHE%"
+if /i not "%FN_CACHE%"=="on" if /i not "%FN_CACHE%"=="off" (
+  echo NINFER_PREFIX_CACHE must be on or off, got %FN_CACHE% 1>&2
+  exit /b 2
+)
+set "FN_CACHE_ARGS="
+set "FN_CACHE_LABEL=prefix cache"
+if not "%NINFER_HOST_CONTEXT_MIB%"=="" set "FN_CACHE_ARGS=--host-context-mib %NINFER_HOST_CONTEXT_MIB%"
+if /i "%FN_CACHE%"=="off" set "FN_CACHE_ARGS=--host-context-mib 0"
+if /i "%FN_CACHE%"=="off" set "FN_CACHE_LABEL=no prefix cache"
+set "PROFILE_ARGS=--max-concurrency 1 --max-context %CONTEXT% --kv-capacity %CONTEXT% --kv-dtype int8 --prefill-chunk 1024 --max-pending-requests 16 --pending-timeout-ms 600000 %SPEC_ARGS% %FN_VISION_ARGS% %FN_CACHE_ARGS%"
+set "LABEL=one request  ^|  context %CONTEXT%  ^|  INT8 KV  ^|  %FN_INPUT%, %SPEC_LABEL%  ^|  %FN_CACHE_LABEL%"
 if /i "%FN_VISION%"=="off" if "%NINFER_VISION%"=="" set "HINT=Images: convert with --mtp-gguf and --mmproj to qwen4exp-iq2xs-mtp-vision.ninfer (docs\weight-conversion.md); this launcher then uses it."
 if /i "%FN_VISION%"=="off" if "%NINFER_VISION%"=="" if not "%NINFER_MODEL%"=="" if exist "%MODEL_FOLDER%qwen4exp-iq2xs-mtp-vision.ninfer" set "HINT=Images: qwen4exp-iq2xs-mtp-vision.ninfer is beside this model; clear NINFER_MODEL to use it."
 if /i "%SPEC%"=="none" if exist "%MODEL%" for %%F in ("%MODEL%") do if /i not "%%~nF"=="qwen4exp-iq2xs-mtp" if /i not "%%~nF"=="qwen4exp-iq2xs-mtp-vision" set "HINT=Faster decode: convert with --mtp-gguf to qwen4exp-iq2xs-mtp.ninfer (docs\weight-conversion.md); this launcher then uses it."

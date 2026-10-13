@@ -42,6 +42,7 @@
 // every request's greedy ids against the same prompt run cold, and the prompt tokens reused.
 //
 //   ninfer_qwen4_exp_engine_real_test --cache [--mtp K] [--host-mib N] [--generate N] [--max-context N]
+//       [--evict]   (--evict: four distinct prompts twice round through a small Host tier)
 //
 // TOKENS is @FILE (ids separated by commas or whitespace) or a comma-separated id list.
 
@@ -220,7 +221,8 @@ Run generate_cached(Engine& engine, const std::vector<TokenId>& prompt, std::uin
     request.output.raw                        = true;
     const auto start = std::chrono::steady_clock::now();
     CancelSink sink(cancel_after);
-    auto handle  = engine.submit(engine.prepare_tokens(prompt, false), request, OutputConsumerMode::Streaming,
+    // A reusable prompt identity: the context cache keys it.
+    auto handle  = engine.submit(engine.prepare_tokens(prompt, true), request, OutputConsumerMode::Streaming,
                                  GenerationObservationOptions{.live_timings = true});
     auto result  = handle.wait(&sink, CancellationView([&sink] { return sink.cancelled(); }));
     Run out;
@@ -533,22 +535,32 @@ int mtp_exact(const std::string& artifact, const std::vector<std::string>& args)
 // The context cache (docs/maintainer/flash-next-context-cache.md) against cold runs. One Engine with
 // the cache runs a conversation; then one Engine without it runs the same prompts cold. Each cached
 // request's greedy ids are compared with its cold run, and its reused tokens with what the cache
-// should have supplied:
-//   a  P                 cold, captures the prompt's end and the endpoint
-//   b  P again           exact hit: sampled from the stored logits (reused = |P|)
-//   c  P + S             resumes at |P| (the prompt's checkpoint)
-//   d  P + S + c + T     resumes from c's endpoint (|P + S + c| - 1)
-//   e  A, then A + S     A is P cut to a 64-token page: resume at a page boundary
+// should have supplied. P is 4,096 tokens, one prefill call, and S 600 (a wide call too), so a
+// resume at |P| runs exactly the calls the cold prompt runs:
+//   a  P                 cold, captures the prompt's end and the endpoint          must equal cold
+//   b  P again           exact hit: sampled from the stored logits (reused = |P|)  must equal cold
+//   c  P + S             resumes at |P| (the prompt's checkpoint)                  must equal cold
+//   d  P + S + c + T     resumes from c's endpoint (|P + S + c| - 1)               reported
+//   e  A, then A + S     A = 5,120 tokens: a resume where cold prefill has no call boundary, reported
 //   f  P + S, cancelled after 4 tokens (after its capture); then P + S again from the root (the
-//      Engine abandons a cancelled request's continuation)
-// Mismatches are reported with the first differing token. --mtp K runs both Engines with MTP.
+//      Engine abandons a cancelled request's continuation)                         must equal cold
+// The prefill's numerics depend on where its calls start (greedy ids differ between
+// --prefill-chunk 64, 96, 100 and 1024 on a 300-token prompt, master 04901788), so a resume where
+// cold prefill has no call boundary, and one from decode-computed state (d), may differ from the
+// cold run; those are reported with the first differing token, not failed. --mtp K runs both
+// Engines with MTP.
 //   ninfer_qwen4_exp_engine_real_test --cache [--mtp K] [--host-mib N] [--generate N]
 int cache_check(const std::string& artifact, const std::vector<std::string>& args,
                 const std::vector<TokenId>& long_prompt, const std::vector<TokenId>& suffix,
                 const std::vector<TokenId>& tail) {
     std::uint32_t tokens = 32, mtp = 0, max_context = 16'384;
     std::optional<std::uint64_t> host;
+    bool evict = false;
     for (std::size_t i = 0; i < args.size(); ++i) {
+        if (args[i] == "--evict") {
+            evict = true;
+            continue;
+        }
         const auto value = [&] {
             if (i + 1 >= args.size()) { throw std::invalid_argument(args[i] + " needs a value"); }
             return std::stoull(args[++i]);
@@ -581,45 +593,89 @@ int cache_check(const std::string& artifact, const std::vector<std::string>& arg
         for (const auto* part : parts) { out.insert(out.end(), part->begin(), part->end()); }
         return out;
     };
-    const std::vector<TokenId>& P = long_prompt;
+    if (long_prompt.size() < 5'120) { throw std::invalid_argument("the cache check needs 5,120 prompt tokens"); }
+    const std::vector<TokenId> P(long_prompt.begin(), long_prompt.begin() + 4'096);
     const std::vector<TokenId> PS = concat({&P, &suffix});
-    std::vector<TokenId> A(P.begin(), P.begin() + static_cast<std::ptrdiff_t>(P.size() / 64 * 64 - 64));
+    const std::vector<TokenId> A(long_prompt.begin(), long_prompt.begin() + 5'120);
     const std::vector<TokenId> AS = concat({&A, &suffix});
     std::vector<std::vector<TokenId>> prompts;
     std::vector<std::string> labels;
     std::vector<Run> cached;
     std::vector<std::uint32_t> expected;
+    std::vector<bool> exact;
     const double ram_before = available_ram_gib();
     bool ok                 = true;
+    if (evict) {
+        // Eviction under a small Host tier (--host-mib 512: about three 4K-token checkpoints with
+        // their endpoints): four distinct 4,096-token prompts, twice round. Every request must match
+        // its cold run (a resume here is an exact hit or none), whatever the cache kept.
+        std::vector<std::vector<TokenId>> distinct;
+        for (std::size_t k = 0; k < 4; ++k) {
+            std::vector<TokenId> x;
+            for (std::size_t i = 0; i < 4'096; ++i) { x.push_back(long_prompt[(i + k * 1'024) % long_prompt.size()]); }
+            distinct.push_back(std::move(x));
+        }
+        std::vector<Run> runs;
+        {
+            Engine engine(options(true));
+            for (int round = 0; round < 2; ++round) {
+                for (std::size_t k = 0; k < distinct.size(); ++k) {
+                    const std::string label = "evict round " + std::to_string(round) + " prompt " + std::to_string(k);
+                    runs.push_back(generate_cached(engine, distinct[k], tokens));
+                    print_run(label.c_str(), runs.back(), distinct[k].size());
+                    std::printf("%s: reused %u\n", label.c_str(), runs.back().reused);
+                }
+            }
+            const MemorySummary memory = engine.memory_summary();
+            std::printf("Host tier: %.0f of %.0f MiB occupied, %u checkpoints\n",
+                        static_cast<double>(memory.host_context_occupied_bytes) / (1 << 20),
+                        static_cast<double>(memory.host_context_capacity_bytes) / (1 << 20),
+                        memory.host_state_occupied_slots);
+            ok = memory.host_context_occupied_bytes <= memory.host_context_capacity_bytes && ok;
+        }
+        wait_for_ram(ram_before);
+        Engine engine(options(false));
+        for (std::size_t k = 0; k < distinct.size(); ++k) {
+            const Run cold = generate(engine, distinct[k], tokens);
+            for (int round = 0; round < 2; ++round) {
+                const std::string label = "evict round " + std::to_string(round) + " prompt " + std::to_string(k);
+                ok = same(label.c_str(), cold.ids, runs[static_cast<std::size_t>(round) * distinct.size() + k].ids) && ok;
+            }
+        }
+        std::printf(ok ? "qwen4_exp context cache eviction checks passed\n" : "FAIL: qwen4_exp context cache eviction\n");
+        return ok ? 0 : 1;
+    }
     {
         Engine engine(options(true));
-        const auto run = [&](const char* label, const std::vector<TokenId>& prompt, std::uint32_t reuse,
+        const auto run = [&](const char* label, const std::vector<TokenId>& prompt, std::uint32_t reuse, bool must,
                              std::uint32_t cancel_after = 0) {
             Run r = generate_cached(engine, prompt, tokens, cancel_after);
             print_run(label, r, prompt.size());
             print_speculation(label, r.speculative);
-            std::printf("%s: reused %u of %zu prompt tokens (expected %u), first token %.3f s\n", label, r.reused,
-                        prompt.size(), reuse, r.timings.first_token_seconds);
+            std::printf("%s: reused %u of %zu prompt tokens (expected %u), first token %.3f s, prefill %.3f s\n", label,
+                        r.reused, prompt.size(), reuse, r.timings.first_token_seconds, r.timings.prefill_seconds);
             if (cancel_after == 0) {
                 prompts.push_back(prompt);
                 labels.push_back(label);
                 cached.push_back(r);
                 expected.push_back(reuse);
+                exact.push_back(must);
             }
             return r;
         };
-        const Run a = run("a: P (cold, captures)", P, 0);
-        (void)run("b: P again (exact hit)", P, static_cast<std::uint32_t>(P.size()));
-        const Run c = run("c: P + S (resume at P)", PS, static_cast<std::uint32_t>(P.size()));
+        const Run a = run("a: P (cold, captures)", P, 0, true);
+        (void)run("b: P again (exact hit)", P, static_cast<std::uint32_t>(P.size()), true);
+        const Run c = run("c: P + S (resume at P)", PS, static_cast<std::uint32_t>(P.size()), true);
         const std::vector<TokenId> Q = concat({&PS, &c.ids, &tail});
-        (void)run("d: P + S + c + T (resume from c's endpoint)", Q, static_cast<std::uint32_t>(PS.size() + c.ids.size() - 1));
-        (void)run("e1: A (a page-aligned prompt)", A, 0);
-        (void)run("e2: A + S (resume at a page boundary)", AS, static_cast<std::uint32_t>(A.size()));
+        (void)run("d: P + S + c + T (resume from c's endpoint)", Q, static_cast<std::uint32_t>(PS.size() + c.ids.size() - 1),
+                  false);
+        (void)run("e1: A (5,120 tokens)", A, 0, true);
+        (void)run("e2: A + S (resume at 5,120)", AS, static_cast<std::uint32_t>(A.size()), false);
         // A cancelled request's continuation is abandoned by the Engine (its checkpoints, captured
         // before the cancel, are released), so the same prompt starts from the root again.
-        const Run f = run("f1: P + S cancelled after 4 tokens", PS, 0, 4);
+        const Run f = run("f1: P + S cancelled after 4 tokens", PS, 0, false, 4);
         std::printf("f1: %zu tokens before the cancel took effect\n", f.ids.size());
-        (void)run("f2: P + S after the cancelled request", PS, 0);
+        (void)run("f2: P + S after the cancelled request", PS, 0, true);
         (void)a;
         const MemorySummary memory = engine.memory_summary();
         std::printf("Host tier: %.0f of %.0f MiB occupied, %.0f reserved, %u checkpoints, %.0f MiB of KV pages\n",
@@ -640,7 +696,18 @@ int cache_check(const std::string& artifact, const std::vector<std::string>& arg
             const Run cold = generate(engine, prompts[i], tokens);
             const std::string label = std::string("cold ") + labels[i];
             print_run(label.c_str(), cold, prompts[i].size());
-            ok = same(labels[i].c_str(), cold.ids, cached[i].ids) && ok;
+            if (exact[i]) {
+                ok = same(labels[i].c_str(), cold.ids, cached[i].ids) && ok;
+            } else {
+                std::size_t first = 0;
+                while (first < cold.ids.size() && first < cached[i].ids.size() && cold.ids[first] == cached[i].ids[first]) {
+                    ++first;
+                }
+                std::printf("REPORT: %s: %s\n", labels[i].c_str(),
+                            cold.ids == cached[i].ids
+                                ? "ids identical to the cold run"
+                                : ("differs from the cold run from generated token " + std::to_string(first)).c_str());
+            }
             if (cached[i].reused != expected[i]) {
                 std::printf("FAIL: %s reused %u prompt tokens, expected %u\n", labels[i].c_str(), cached[i].reused,
                             expected[i]);
@@ -710,8 +777,8 @@ int main(int argc, char** argv) {
                 ids.resize(std::min(ids.size(), count));
                 return ids;
             };
-            return cache_check(artifact, cache_args, long_prompt, fixture("ppl_tokens-code", 300),
-                               fixture("ppl_tokens-doc", 200));
+            return cache_check(artifact, cache_args, long_prompt, fixture("ppl_tokens-doc", 600),
+                               fixture("ppl_tokens-code", 200));
         }
         if (kv_cycle_only) {
             const bool cycled = kv_cycle(artifact, prompt, long_prompt);
