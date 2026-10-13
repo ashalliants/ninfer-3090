@@ -103,9 +103,11 @@ add_test(NAME ninfer_softmax_attention_k8v4_test
 add_test(NAME ninfer_softmax_attention_dflash2_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --dflash2-only)
 # INT8-family (INT8-G64, rk8v4, rk4v4) FA2 prompt route: full prefill chunks, short launches and
-# key splits over 4K-40K histories against the FP64 oracle at sampled query rows.
+# key splits over 4K-40K histories against the FP64 oracle at sampled query rows. ~530 s with the
+# oracle on 12 threads (546 cases; 45-60 min single-threaded). TIMEOUT leaves room for a busy host.
 add_test(NAME ninfer_softmax_attention_int8_prompt_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --int8-prompt-only)
+set_tests_properties(ninfer_softmax_attention_int8_prompt_test PROPERTIES TIMEOUT 1500)
 
 set_tests_properties(
   ninfer_softmax_attention_nvfp4_test

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -1363,7 +1364,8 @@ std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache
             },
             [&](int d, int head, int token, double value) {
                 output[q_index(geometry, head, d, token)] = value;
-            });
+            },
+            oracle_worker_count());
         for (std::int32_t token = 0; token < tokens; ++token) {
             for (std::int32_t head = 0; head < geometry.q_heads; ++head) {
                 std::array<double, kHeadDim> row{};
@@ -1391,7 +1393,8 @@ std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache
         },
         [&](int d, int head, int token, double value) {
             output[q_index(geometry, head, d, token)] = value;
-        });
+        },
+        oracle_worker_count());
     return output;
 }
 
@@ -3552,6 +3555,36 @@ int run_k8v4_prompt_cases() {
 // masked batch row and graph replay. Whether a launch splits is read from the public launch shape
 // (a split adds the merge kernel), so the plan constants can move without the cases silently
 // losing their split coverage.
+// Elapsed-time progress for the INT8-family sweeps: one flushed line per case, so a redirected
+// run shows where it is and how long each part took.
+class SweepProgress {
+public:
+    void note(const std::string& label) {
+        ++cases_;
+        const double seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count();
+        std::cout << "    [" << static_cast<int>(seconds) << " s] " << label << " (case "
+                  << cases_ << ")" << std::endl;
+    }
+
+private:
+    std::chrono::steady_clock::time_point start_ = std::chrono::steady_clock::now();
+    int cases_                                   = 0;
+};
+
+SweepProgress& sweep_progress() {
+    static SweepProgress progress;
+    return progress;
+}
+
+std::string progress_label(KvCacheStorage storage, const Geometry& geometry, const char* kind,
+                           const AttentionCase& test_case, int result) {
+    return std::string(cache_name(storage)) + " " + geometry.name + " " + kind +
+           " tokens=" + std::to_string(test_case.tokens) +
+           " history=" + std::to_string(test_case.base) +
+           " keys=" + std::to_string(test_case.envelope_max) + (result == 0 ? " ok" : " FAIL");
+}
+
 bool int8_prompt_splits(const Geometry& geometry, KvCacheStorage storage, std::int32_t tokens,
                         std::uint32_t visible_keys) {
     return ops::causal_softmax_attention_launch_shape(op_geometry(geometry), storage,
@@ -3578,7 +3611,7 @@ constexpr std::array<KvCacheStorage, 3> kInt8FamilyStorages{
 
 int run_int8_prompt_cases(KvCacheStorage storage) {
     std::cout << "  " << cache_name(storage)
-              << " FA2 prompt route (FP16 PV accumulation, key splits):\n";
+              << " FA2 prompt route (FP16 PV accumulation, key splits):" << std::endl;
     const bool packed_values = storage != KvCacheStorage::Int8Group64;
     int failures             = 0;
     for (const Geometry& geometry : kGeometries) {
@@ -3590,14 +3623,18 @@ int run_int8_prompt_cases(KvCacheStorage storage) {
             }
             const std::vector<int> rows =
                 sample_rows ? sampled_query_rows(test_case.tokens) : std::vector<int>{};
-            return run_a1_case(geometry, storage, test_case, mapping, rows);
+            const int result = run_a1_case(geometry, storage, test_case, mapping, rows);
+            sweep_progress().note(progress_label(storage, geometry, "a1", test_case, result));
+            return result;
         };
         const auto a3 = [&](const AttentionCase& test_case, MappingPattern mapping) {
             if (int8_prompt_splits(geometry, storage, test_case.tokens, test_case.envelope_max)) {
                 ++split_launches;
             }
             const std::vector<int> rows = sampled_query_rows(test_case.tokens);
-            return run_a3_case(geometry, storage, test_case, mapping, rows);
+            const int result = run_a3_case(geometry, storage, test_case, mapping, rows);
+            sweep_progress().note(progress_label(storage, geometry, "a3", test_case, result));
+            return result;
         };
 
         // V amplitudes on either side of the FP16 partial shift: 2048 forces it for every coding;
@@ -3615,14 +3652,17 @@ int run_int8_prompt_cases(KvCacheStorage storage) {
         // Full prefill chunks as the first chunk and after an 8K history.
         const std::array<int, 6> chunk_rows_3584{0, 127, 128, 1791, 3584 - 128, 3584 - 1};
         const std::array<int, 6> chunk_rows_4096{0, 127, 128, 1791, 4096 - 128, 4096 - 1};
-        failures += run_a1_case(geometry, storage, {3584, 0, 3584, 2111u},
-                                MappingPattern::Fragmented, chunk_rows_3584);
-        failures += run_a1_case(geometry, storage, {4096, 0, 4096, 2112u},
-                                MappingPattern::Fragmented, chunk_rows_4096);
-        failures += run_a1_case(geometry, storage, {3584, 8192, 8192 + 3584, 2113u},
-                                MappingPattern::Fragmented, chunk_rows_3584);
-        failures += run_a1_case(geometry, storage, {4096, 8192, 8192 + 4096, 2114u},
-                                MappingPattern::Fragmented, chunk_rows_4096);
+        const auto chunk = [&](const AttentionCase& test_case, std::span<const int> rows) {
+            const int result =
+                run_a1_case(geometry, storage, test_case, MappingPattern::Fragmented, rows);
+            sweep_progress().note(
+                progress_label(storage, geometry, "a1 chunk", test_case, result));
+            return result;
+        };
+        failures += chunk({3584, 0, 3584, 2111u}, chunk_rows_3584);
+        failures += chunk({4096, 0, 4096, 2112u}, chunk_rows_4096);
+        failures += chunk({3584, 8192, 8192 + 3584, 2113u}, chunk_rows_3584);
+        failures += chunk({4096, 8192, 8192 + 4096, 2114u}, chunk_rows_4096);
 
         // Short follow-ups over long histories: the split domain, with partial last row blocks
         // and a partial last page (neither history is a multiple of 64).
@@ -3682,6 +3722,8 @@ int run_int8_prompt_cases(KvCacheStorage storage) {
         failures += run_batch_case(geometry, storage,
                                    {65, {8191}, {17}, {0}, MappingPattern::Fragmented, seed++},
                                    33000);
+        sweep_progress().note(std::string(cache_name(storage)) + " " + geometry.name +
+                              " masked batch row over 33K envelope");
 
         if (split_launches == 0) {
             std::cerr << cache_name(storage) << " prompt cases " << geometry.name
@@ -3698,7 +3740,7 @@ int run_int8_prompt_cases(KvCacheStorage storage) {
 // public launch shape, so the table can move without the cases losing their boundaries, and is
 // qualified at b-1, b and b+1 visible keys against the FP64 oracle.
 int run_int8_verify_route_boundary_cases(KvCacheStorage storage) {
-    std::cout << "  " << cache_name(storage) << " verify-width route boundaries:\n";
+    std::cout << "  " << cache_name(storage) << " verify-width route boundaries:" << std::endl;
     int failures       = 0;
     int boundaries     = 0;
     std::uint32_t seed = 2400u;
@@ -3722,10 +3764,13 @@ int run_int8_verify_route_boundary_cases(KvCacheStorage storage) {
                 ++boundaries;
                 for (const std::uint32_t k : {keys - 1, keys, keys + 1}) {
                     if (k < static_cast<std::uint32_t>(width)) { continue; }
-                    failures += run_a1_case(
-                        geometry, storage,
-                        {width, static_cast<std::int32_t>(k) - width, k, seed++},
-                        MappingPattern::Fragmented);
+                    const AttentionCase test_case{
+                        width, static_cast<std::int32_t>(k) - width, k, seed++};
+                    const int result =
+                        run_a1_case(geometry, storage, test_case, MappingPattern::Fragmented);
+                    failures += result;
+                    sweep_progress().note(
+                        progress_label(storage, geometry, "a1 route boundary", test_case, result));
                 }
             }
         }
