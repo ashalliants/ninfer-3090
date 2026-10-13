@@ -2,7 +2,8 @@
 all submitted at t = 0 (an agent burst, in index order), streamed, to a local ninfer-serve. Prints one JSON line
 per request (seconds to first token, to completion, completion tokens) and a summary line.
 
-usage: python burst_client.py <port> <out json> <repo root>
+usage: python burst_client.py <port> <out json> <repo root> [seq]
+(seq: one request at a time, as the spike's client did, for lone-request speed)
 """
 import json
 import os
@@ -127,7 +128,12 @@ stream({**prepared({"messages": [{"role": "user", "content": "Say hello in five 
 results = [dict(i=i, name=name) for i, (name, _) in enumerate(CONVERSATIONS)]
 t0 = time.time()
 threads = []
+sequential = len(sys.argv) > 4 and sys.argv[4] == "seq"
 for i, (name, body) in enumerate(CONVERSATIONS):
+    if sequential:
+        t0 = time.time()
+        stream(prepared(body), t0, results[i])
+        continue
     th = threading.Thread(target=stream, args=(prepared(body), t0, results[i]))
     th.start()
     threads.append(th)
