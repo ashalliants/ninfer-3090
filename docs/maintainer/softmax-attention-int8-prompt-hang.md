@@ -1,6 +1,6 @@
 # softmax_attention int8-prompt test: hang or slow? (investigation note)
 
-Status: WORK IN PROGRESS, started 2026-10-13. Delete this file when the question is settled.
+Status: findings complete 2026-10-13, no fix applied. Delete this file once the test is fixed or the question is closed.
 
 ## Question
 
@@ -55,5 +55,41 @@ build-ninja\tests\ninfer_tests.exe ninfer_softmax_attention_test --int8-prompt-o
 
 Not a kernel bug. Options: shrink the 33K-history cases (oracle rows sampled for every case, fewer
 repeats at 33K), run the oracle with `worker_limit` > 1 (the oracle already takes `worker_limit`),
-and set an explicit `TIMEOUT` plus a note in AGENTS.md next to the other slow tests. Final numbers
-to follow.
+and set an explicit `TIMEOUT` plus a note in AGENTS.md next to the other slow tests. See the second run below.
+
+## Second run (per-case timing, 900 s cap, same hold of the GPU lock)
+
+Local-only instrumentation: a destructor timer in `run_a1_case`/`run_a3_case` printing to stderr.
+In 900 s the test completed 150 cases whose own wall times sum to 881 s (98% of the run is inside
+cases, so there is no hidden stall between them):
+
+- 29 cases over 10 s account for 695 s. Every one is a 33,000-token-history launch (17-1,100 query
+  columns, 17-37 s each; the 24-head geometry is the slow one) or an 8K-history verify-width case
+  (6-11 s).
+- Only `int8-g64` was reached: both geometries of its prompt cases finished, and it was inside its
+  "verify-width route boundaries" block (about 130 small cases, 0.05-11 s each) when the cap hit.
+  `rk8v4` and `rk4v4` had not started. Each storage repeats the same work, so the whole test is
+  roughly 3x this: 45-60 minutes on one core. Not measured to completion (cap was 15 min as asked).
+- No case showed a time out of line with its shape; the time scales with
+  `rows x q_heads x visible_keys`. GPU memory moved between cases (1.3 to 2.5 GB), GPU work is in
+  short bursts: the kernel launches return normally.
+
+Conclusion: slow by construction, not hung. The other agent's 49 min / 2,900 CPU-s kill was
+probably within a few minutes of finishing or at most 10-20 minutes short of it.
+
+## CI
+
+`.github/workflows` contains only `host-checks.yml` and `codepulse.yml`; no CUDA test runs in CI, so
+this test only ever runs on a developer's GPU host with `ctest`.
+
+## Recommendation
+
+1. Make the oracle cheaper before touching the kernel: the 33K cases dominate and are repeated
+   (5 widths x 2 bases, 6 plan-boundary cases, an envelope case, a cached-entry case, a graph case)
+   for 3 storages x 2 geometries. Keep one or two 33K cases per storage and move the plan-boundary
+   scan to a 4K-8K history (the split boundary is a function of width and visible keys; check that
+   it still splits there), or run the oracle with `worker_limit` = the core count (the oracle
+   already accepts it) so the same cases take a few minutes.
+2. Give the test an explicit `TIMEOUT` and add it to the slow-test list in AGENTS.md (it is not in
+   the "three op tests" list there, which predates it).
+3. Print progress per storage with `std::endl` so a redirected run is not silent for an hour.
