@@ -18,6 +18,16 @@ target_sources(ninfer_ops PRIVATE
 if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(80|86|89)$")
   target_sources(ninfer_ops PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t.cu"
+    "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_i8_g24_t1_3.cu"
+    "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_i8_g24_t4.cu"
+    "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_i8_g24_t5.cu"
+    "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_i8_g24_t6.cu"
+    "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_i8_g24_t7.cu"
+    "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_i8_g24_t8.cu"
+    "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_i8_g16_t1_3.cu"
+    "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_i8_g16_t4.cu"
+    "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_i8_g16_t5.cu"
+    "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_i8_g16_t6.cu"
     "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_fp8.cu"
     "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_nvfp4.cu"
     "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_k8v4.cu"
