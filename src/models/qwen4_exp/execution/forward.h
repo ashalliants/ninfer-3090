@@ -169,6 +169,50 @@ struct MtpCall {
     const Tap* tap = nullptr;
 };
 
+// ------------------------------------------------------------ several sequences ("rows")
+// Slice 1 of serving several requests at once (docs/maintainer/flash-next-lanes-spike.md): the
+// state of up to `slots` independent sequences, one per state slot, and a plain decode call over B
+// of them, one token per row. A row's prompt is prefilled through the single-sequence path on that
+// slot (Forward::select_row); its decode tokens then go through run_rows together with the other
+// rows'. Each row's logits are bitwise those of a one-column decode call of that sequence alone:
+// every Op a row's column passes is column-invariant at B <= kMaxForwardRows columns, the two BF16
+// Linears run one column at a time (as a verification call runs them), and the stateful Ops act on
+// each row's own slot.
+
+// Rows of one call: the column-invariance bound of the dense Linears, MoE and QSA attention, and
+// the batched GDN update's domain.
+inline constexpr std::int32_t kMaxForwardRows = 8;
+
+// Recurrent state of `slots` sequences, owned by the caller, zeroed before a slot's first prompt.
+struct ForwardRowsState {
+    std::vector<Tensor> gdn_conv;      // per GDN block: BF16 [C, K - 1, slots], oldest first
+    std::vector<Tensor> gdn_recurrent; // per GDN block: FP32 [Dk, Dv, value heads, slots]
+    Tensor ple_conv;                   // BF16 [S*H, span, slots]: the PLE convolution histories
+    std::vector<Tensor> qsa_tails;     // per attention block: BF16 [Di, R - 1, slots]
+    Tensor slot_ids;                   // device I32 [slots] holding 0 .. slots - 1
+};
+
+// Paged KV of the attention blocks: one page pool, one block table per slot.
+struct ForwardRowsKV {
+    std::vector<PagedKVLayerView> layers; // per attention block (Int8Group64); block_table unused
+    std::vector<Tensor> pooled;           // per attention block: BF16 [Di / R, 64, 1, pool pages]
+    Tensor block_tables;                  // device I32 [pages, slots]: slot s's table is column s
+    std::uint32_t max_visible_keys = 0;   // the context each slot's KV and selection are sized for
+};
+
+// One plain decode call over B rows: column b is the next token of slot slots[b]. Tensors are
+// device memory at addresses that may be captured in a CUDA graph.
+struct ForwardRowsBatch {
+    std::vector<std::int32_t> slots; // host: B distinct slots, B in [1, kMaxForwardRows]
+    Tensor slot_ids;                 // I32 [B]: the same slots
+    Tensor ids;                      // I32 [B]
+    Tensor positions;                // I32 [B]: each row's KV position
+    Tensor rope_positions;           // I32 [B, 3] axis-major
+    Tensor row_rope;                 // I32 [3, B]: column b's three RoPE axes, contiguous at word 3 b
+    Tensor block_start_rope;         // I32 [3, B]: each row's pooled-block start (ops::qsa_pool_keys)
+    Tensor ngram_rows;               // U8 [row bytes, heads, B]: each column's n-gram rows
+};
+
 // Optional observation of every block, for reference comparison: BF16 copies per block of the
 // residual after it ([S*H, T]), its routed expert ids (I32 [top k, T]), and the mixer (GDN/QSA)
 // and MoE inputs and outputs ([H, T]), so each op chain can be checked on identical inputs.
@@ -185,6 +229,16 @@ class Forward {
 public:
     Forward(const Parameters& parameters, DeviceContext& device, WorkspaceArena& work, ForwardState state,
             ForwardKV kv, ForwardExperts experts, std::optional<ForwardMtp> mtp = std::nullopt);
+    // Several sequences: single-sequence calls act on the selected slot (slot 0 at first); run_rows
+    // decodes several slots at once. No MTP drafter.
+    Forward(const Parameters& parameters, DeviceContext& device, WorkspaceArena& work, ForwardRowsState state,
+            ForwardRowsKV kv, ForwardExperts experts);
+
+    // Several sequences: the slot later single-sequence calls (run, run_front, run_back) act on.
+    void select_row(std::int32_t slot);
+    // Several sequences: one plain decode call over batch.slots, FP32 logits [V, B] (column b of
+    // slot slots[b]). Uses the workspace like a forward call.
+    void run_rows(const ForwardRowsBatch& batch, Tensor& logits);
 
     // Runs one call of the MTP drafter (requires its parameters and ForwardMtp). Uses the
     // workspace like a forward call (not between run_front and run_back).
@@ -217,6 +271,16 @@ private:
     void layers(std::uint32_t begin, std::uint32_t end, const ForwardBatch& batch, const ForwardTap* tap);
     void layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, const ForwardTap* tap);
     void ple(const PleParameters& p, Tensor& residual, const ForwardBatch& batch);
+    // The PLE injection of a call's columns: n-gram rows to the projection (one column at a time
+    // when `columnwise`), the gate, and the convolution over `states` from `source` to
+    // `destination` slots (one per sequence; an empty destination leaves the states unchanged).
+    // `normalized` receives the convolution inputs when set (a verification call's records).
+    void ple_inject(const PleParameters& p, Tensor& residual, const Tensor& ngram_rows, bool columnwise,
+                    const Tensor* normalized, Tensor& states, const Tensor& source, const Tensor& destination);
+    void layer_rows(std::uint32_t layer, const ForwardRowsBatch& batch);
+    Tensor gdn_rows(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardRowsBatch& batch);
+    Tensor attention_rows(const AttentionParameters& p, const Tensor& x, std::uint32_t index,
+                          const ForwardRowsBatch& batch);
     Tensor mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject);
     Tensor gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch);
     Tensor attention(const AttentionParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch);
@@ -239,6 +303,14 @@ private:
     Tensor mtp_frames_; // I32 [E]: every drafter expert resident at its own index
     DeviceBuffer mtp_frames_backing_;
     Tensor residual_; // the call's residual stream, in the workspace from run_front to run_back
+    // Several sequences: the slotted state and KV, and each slot's single-sequence views.
+    struct Rows {
+        ForwardRowsState state;
+        ForwardRowsKV kv;
+        std::vector<ForwardState> slot_state;
+        std::vector<ForwardKV> slot_kv;
+    };
+    std::optional<Rows> rows_;
 };
 
 // The QSA indexer geometry of the configuration.
