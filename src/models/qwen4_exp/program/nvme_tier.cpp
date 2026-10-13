@@ -18,6 +18,9 @@ constexpr std::size_t kRequestBytes = 4ULL << 20;
 constexpr std::size_t kDepth        = 8;
 // Frames the writer takes per pass.
 constexpr std::size_t kWriteBatch = 16;
+// Frames, the bounce buffer and descriptors are read through their device addresses by the gather
+// kernel, so they are allocated mapped (and portable), as the Host tier's.
+constexpr unsigned int kMappedPinned = cudaHostAllocPortable | cudaHostAllocMapped;
 
 class ScratchTierFile final : public TierFile {
 public:
@@ -93,7 +96,7 @@ NvmeTier::NvmeTier(Options options, std::unique_ptr<TierFile> file) : options_(o
     }
     const auto pin = [](Pinned& p, std::size_t bytes) {
         if (bytes == 0) { return; }
-        if (cudaHostAlloc(&p.p, bytes, cudaHostAllocDefault) != cudaSuccess) {
+        if (cudaHostAlloc(&p.p, bytes, kMappedPinned) != cudaSuccess) {
             (void)cudaGetLastError();
             p.p = nullptr;
             throw std::runtime_error("context cache NVMe tier: cudaHostAlloc of " + std::to_string(bytes >> 20) + " MiB failed");
@@ -239,7 +242,7 @@ void NvmeTier::gather(std::vector<GatherCopy>& copies, Pinned& descriptors, cuda
         // The old descriptors may still be read by an earlier gather.
         check(cudaStreamSynchronize(stream), "stream");
         void* grown = nullptr;
-        check(cudaHostAlloc(&grown, bytes + bytes / 2, cudaHostAllocDefault), "cudaHostAlloc of the gather descriptors");
+        check(cudaHostAlloc(&grown, bytes + bytes / 2, kMappedPinned), "cudaHostAlloc of the gather descriptors");
         cudaFreeHost(descriptors.p);
         descriptors.p     = grown;
         descriptors.bytes = bytes + bytes / 2;
