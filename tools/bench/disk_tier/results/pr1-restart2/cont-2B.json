@@ -1,0 +1,44 @@
+[
+ {
+  "words": 1100,
+  "prompt": 1554,
+  "cached": 1532,
+  "ttft": 0.0858395,
+  "error": null
+ },
+ {
+  "words": 1900,
+  "prompt": 2669,
+  "cached": 2647,
+  "ttft": 0.0934298,
+  "error": null
+ },
+ {
+  "words": 3000,
+  "prompt": 4097,
+  "cached": 4074,
+  "ttft": 0.449513,
+  "error": null
+ },
+ {
+  "words": 4600,
+  "prompt": 6188,
+  "cached": 6166,
+  "ttft": 0.9368281,
+  "error": null
+ },
+ {
+  "words": 7600,
+  "prompt": 10268,
+  "cached": 10246,
+  "ttft": 0.1251248,
+  "error": null
+ },
+ {
+  "words": 12000,
+  "prompt": 16076,
+  "cached": 16054,
+  "ttft": 1.0709986,
+  "error": null
+ }
+]

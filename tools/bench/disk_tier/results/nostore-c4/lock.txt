@@ -1,0 +1,6 @@
+lock acquired after 5482 s at 2026-10-13T11:45:49.8109383+01:00
+run 1A free_ram_gib=45.7 gpu=0 %, 1200 MiB, 82.76 W
+run 2B free_ram_gib=38.1 gpu=0 %, 1187 MiB, 94.36 W
+run 3B free_ram_gib=41 gpu=2 %, 1118 MiB, 273.21 W
+run 4A free_ram_gib=42.9 gpu=3 %, 1117 MiB, 295.65 W
+lock released at 2026-10-13T12:00:11.6480541+01:00

@@ -1,0 +1,7 @@
+lock acquired at 2026-10-13T11:25:23.1332289+01:00
+seed writes=6 images=6
+run 1A restored=3 hydrations=2 hydrated_tokens=22220 failures=0 hyd_s=2.6495991 rate=0
+run 2B restored=3 hydrations=3 hydrated_tokens=26294 failures=0 hyd_s=2.0501577 rate=621394893.972616
+run 3B restored=3 hydrations=3 hydrated_tokens=26294 failures=0 hyd_s=2.0224032 rate=627295309.050778
+run 4A restored=3 hydrations=2 hydrated_tokens=22220 failures=0 hyd_s=2.5336885 rate=0
+lock released at 2026-10-13T11:27:34.8904703+01:00

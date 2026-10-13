@@ -1,0 +1,10 @@
+lock acquired after 0 s at 2026-10-13T17:11:36.0314842+01:00
+run 1A free_ram_gib=42.5 gpu=4 %, 1168 MiB, 248.55 W
+store 1A bytes_on_disk=
+run 2B free_ram_gib=43.4 gpu=4 %, 1106 MiB, 252.32 W
+store 2B bytes_on_disk=20013277729
+run 3B free_ram_gib=42.2 gpu=0 %, 1127 MiB, 82.91 W
+store 3B bytes_on_disk=18820943666
+run 4A free_ram_gib=43.5 gpu=0 %, 898 MiB, 135.17 W
+store 4A bytes_on_disk=405215232
+lock released at 2026-10-13T17:28:10.6469022+01:00

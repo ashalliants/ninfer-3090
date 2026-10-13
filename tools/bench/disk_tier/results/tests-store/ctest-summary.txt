@@ -1,0 +1,16 @@
+ 1/15 Test #21: ninfer_state_store_test ..........................   Passed    0.64 sec
+ 2/15 Test #32: ninfer_worker_recovery_test ......................   Passed    0.27 sec
+ 3/15 Test #33: ninfer_context_cost_test .........................   Passed    0.13 sec
+ 4/15 Test #34: ninfer_resource_manager_test .....................   Passed    0.12 sec
+ 5/15 Test #35: ninfer_context_store_test ........................   Passed    1.14 sec
+ 6/15 Test #37: ninfer_host_cache_test ...........................   Passed    0.18 sec
+ 7/15 Test #57: ninfer_metrics_test ..............................   Passed    0.12 sec
+ 8/15 Test #60: ninfer_s3_object_store_test ......................***Skipped   0.12 sec
+ 9/15 Test #72: ninfer_qwen3_5_context_store_test ................   Passed    0.33 sec
+10/15 Test #73: ninfer_qwen3_5_native_transactions_test ..........   Passed   22.18 sec
+11/15 Test #74: ninfer_qwen3_5_prefix_real_test ..................   Passed   79.66 sec
+12/15 Test #75: ninfer_qwen3_5_context_store_real_test ...........   Passed  148.91 sec
+13/15 Test #77: ninfer_qwen3_5_recovery_real_test ................   Passed   35.59 sec
+14/15 Test #92: ninfer_qwen3_5_context_store_dflash2_real_test ...   Passed  190.85 sec
+15/15 Test #93: ninfer_qwen3_5_context_store_ngram_real_test .....   Passed  154.41 sec
+100% tests passed, 0 tests failed out of 15

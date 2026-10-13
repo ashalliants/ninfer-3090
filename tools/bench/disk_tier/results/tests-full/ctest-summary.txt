@@ -1,0 +1,189 @@
+  1/205 Test  #92: ninfer_qwen3_5_context_store_dflash2_real_test ...***Skipped   0.45 sec
+  2/205 Test  #93: ninfer_qwen3_5_context_store_ngram_real_test .....***Skipped   0.23 sec
+  3/205 Test  #75: ninfer_qwen3_5_context_store_real_test ...........***Skipped   0.12 sec
+  4/205 Test  #74: ninfer_qwen3_5_prefix_real_test ..................***Skipped   0.13 sec
+  5/205 Test  #77: ninfer_qwen3_5_recovery_real_test ................***Skipped   0.13 sec
+  6/205 Test  #73: ninfer_qwen3_5_native_transactions_test ..........***Skipped   0.28 sec
+  7/205 Test  #21: ninfer_state_store_test ..........................   Passed    0.31 sec
+  8/205 Test  #72: ninfer_qwen3_5_context_store_test ................   Passed    0.31 sec
+  9/205 Test  #32: ninfer_worker_recovery_test ......................   Passed    0.27 sec
+ 10/205 Test  #37: ninfer_host_cache_test ...........................   Passed    0.17 sec
+ 11/205 Test  #35: ninfer_context_store_test ........................   Passed    1.10 sec
+ 12/205 Test  #33: ninfer_context_cost_test .........................   Passed    0.19 sec
+ 13/205 Test  #57: ninfer_metrics_test ..............................   Passed    0.11 sec
+ 14/205 Test  #34: ninfer_resource_manager_test .....................   Passed    0.31 sec
+ 15/205 Test   #1: ninfer_public_api_test ...........................   Passed    0.18 sec
+ 16/205 Test   #2: ninfer_wide_math_test ............................   Passed    0.27 sec
+ 17/205 Test   #4: ninfer_arena_ranks_test ..........................   Passed    0.27 sec
+ 18/205 Test   #3: ninfer_multi_gpu_test ............................   Passed    0.54 sec
+ 19/205 Test   #6: ninfer_vmm_graph_remap_test ......................   Passed    0.35 sec
+ 20/205 Test   #5: ninfer_device_buffer_visibility_test .............   Passed    0.54 sec
+ 21/205 Test   #7: ninfer_evictable_kv_pool_test ....................   Passed    0.30 sec
+ 22/205 Test   #8: ninfer_evictable_weight_pool_test ................   Passed    0.68 sec
+ 23/205 Test   #9: ninfer_device_test ...............................   Passed    0.67 sec
+ 24/205 Test  #10: ninfer_device_sync_spin_test .....................   Passed    0.43 sec
+ 25/205 Test  #11: ninfer_device_sync_blocking_test .................   Passed    0.35 sec
+ 26/205 Test  #12: ninfer_device_sync_yield_test ....................   Passed    0.32 sec
+ 27/205 Test  #14: ninfer_device_sync_invalid_test ..................   Passed    0.10 sec
+ 28/205 Test  #13: ninfer_device_sync_auto_test .....................   Passed    0.29 sec
+ 29/205 Test  #16: ninfer_tensor_test ...............................   Passed    0.11 sec
+ 30/205 Test  #17: ninfer_read_only_file_test .......................   Passed    0.11 sec
+ 31/205 Test  #15: ninfer_decode_graph_test .........................   Passed    0.29 sec
+ 32/205 Test  #18: ninfer_arena_test ................................   Passed    0.32 sec
+ 33/205 Test  #19: ninfer_kv_cache_test .............................   Passed    0.30 sec
+ 34/205 Test  #22: ninfer_gdn_replay_records_test ...................   Passed    0.10 sec
+ 35/205 Test  #23: ninfer_host_timing_test ..........................   Passed    0.10 sec
+ 36/205 Test  #20: ninfer_host_context_arena_test ...................   Passed    0.28 sec
+ 37/205 Test  #24: ninfer_jinja_test ................................   Passed    0.07 sec
+ 38/205 Test  #26: ninfer_artifact_reader_test ......................   Passed    0.14 sec
+ 39/205 Test  #27: ninfer_artifact_permute_row_split_test ...........   Passed    0.28 sec
+ 40/205 Test  #25: ninfer_chat_templates_test .......................   Passed    0.47 sec
+ 41/205 Test  #29: ninfer_artifact_writer_interop_test ..............***Failed    0.36 sec
+ 42/205 Test  #30: ninfer_artifact_ggml_real_test ...................***Skipped   0.07 sec
+ 43/205 Test  #31: ninfer_scheduler_test ............................   Passed    0.11 sec
+ 44/205 Test  #36: ninfer_kv_capacity_test ..........................   Passed    0.11 sec
+ 45/205 Test  #38: ninfer_sampling_defaults_test ....................   Passed    0.11 sec
+ 46/205 Test  #39: ninfer_effective_thinking_budget_test ............   Passed    0.03 sec
+ 47/205 Test  #40: ninfer_grammar_test ..............................   Passed    0.12 sec
+ 48/205 Test  #41: ninfer_regex_choice_test .........................***Not Run   0.00 sec
+ 49/205 Test  #42: ninfer_regex_choice_oracle_test ..................***Failed    0.16 sec
+ 50/205 Test  #43: ninfer_json_schema_test ..........................***Not Run   0.00 sec
+ 51/205 Test  #44: ninfer_json_schema_oracle_test ...................***Failed    0.16 sec
+ 52/205 Test  #45: ninfer_media_decode_test .........................   Passed    0.23 sec
+ 53/205 Test  #46: ninfer_prompt_input_test .........................   Passed    0.13 sec
+ 54/205 Test  #47: ninfer_pretty_logging_test .......................   Passed    0.12 sec
+ 55/205 Test  #48: ninfer_perplexity_evaluation_test ................   Passed    0.11 sec
+ 56/205 Test  #28: ninfer_artifact_materialization_test .............   Passed    1.97 sec
+ 57/205 Test  #49: ninfer_cli_options_test ..........................   Passed    0.11 sec
+ 58/205 Test  #50: ninfer_openai_schema_test ........................   Passed    0.11 sec
+ 59/205 Test  #51: ninfer_openai_responses_test .....................   Passed    0.11 sec
+ 60/205 Test  #52: ninfer_openai_responses_store_test ...............   Passed    0.10 sec
+ 61/205 Test  #53: ninfer_anthropic_schema_test .....................   Passed    0.11 sec
+ 62/205 Test  #54: ninfer_serve_options_test ........................   Passed    0.12 sec
+ 63/205 Test  #55: ninfer_request_log_test ..........................   Passed    0.13 sec
+ 64/205 Test  #56: ninfer_load_report_test ..........................   Passed    0.11 sec
+ 65/205 Test  #58: ninfer_http_error_handler_test ...................   Passed    0.11 sec
+ 66/205 Test  #59: ninfer_http_transport_test .......................   Passed    0.11 sec
+ 67/205 Test  #60: ninfer_s3_object_store_test ......................***Skipped   0.12 sec
+ 68/205 Test  #61: ninfer_bench_support_test ........................   Passed    0.11 sec
+ 69/205 Test  #63: ninfer_context_cost_measure_test .................   Passed    0.03 sec
+ 70/205 Test  #62: ninfer_bench_fixtures_test .......................   Passed    0.28 sec
+ 71/205 Test  #65: ninfer_qwen3_5_loading_test ......................   Passed    0.33 sec
+ 72/205 Test  #67: ninfer_qwen3_5_graft_loader_test .................   Passed    0.23 sec
+ 73/205 Test  #68: ninfer_qwen3_5_reasoning_loop_test ...............   Passed    0.12 sec
+ 74/205 Test  #69: ninfer_qwen3_5_runtime_mechanisms_test ...........   Passed    0.11 sec
+ 75/205 Test  #70: ninfer_qwen3_5_state_image_test ..................   Passed    0.32 sec
+ 76/205 Test  #71: ninfer_qwen3_5_state_image_layout_test ...........   Passed    0.10 sec
+ 77/205 Test  #90: ninfer_tool_call_parser_test .....................   Passed    0.11 sec
+ 78/205 Test  #66: ninfer_qwen3_5_frontend_test .....................   Passed    1.28 sec
+ 79/205 Test  #95: ninfer_qwen3_5_mtp_graph_profiles_test ...........   Passed    0.90 sec
+ 80/205 Test  #96: ninfer_qwen3_5_speculative_round_shapes_test .....   Passed    0.12 sec
+ 81/205 Test  #97: ninfer_qwen3_5_mlp_a8_decode_test ................   Passed    0.12 sec
+ 82/205 Test  #98: ninfer_qwen3_5_ngram_proposer_test ...............   Passed    0.36 sec
+ 83/205 Test  #99: ninfer_qwen3_5_tool_constraints_test .............***Not Run   0.00 sec
+ 84/205 Test #100: ninfer_qwen3_5_tool_schema_oracle_test ...........***Failed    0.15 sec
+ 85/205 Test #101: ninfer_qwen4_exp_ngram_hash_test .................   Passed    0.14 sec
+ 86/205 Test  #91: ninfer_qwen3_5_visual_scatter_test ...............   Passed    1.98 sec
+ 87/205 Test #103: ninfer_qwen4_exp_forward_real_test ...............***Skipped   0.12 sec
+ 88/205 Test #104: ninfer_qwen4_exp_mtp_real_test ...................***Skipped   0.13 sec
+ 89/205 Test #105: ninfer_qwen4_exp_rope_positions_test .............   Passed    0.13 sec
+ 90/205 Test #106: ninfer_qwen4_exp_vision_real_test ................***Skipped   0.13 sec
+ 91/205 Test #107: ninfer_qwen4_exp_vision_engine_real_test .........***Skipped   0.13 sec
+ 92/205 Test #108: ninfer_qwen4_exp_expert_cache_test ...............   Passed    0.25 sec
+ 93/205 Test #109: ninfer_qwen4_exp_memory_plan_test ................   Passed    0.12 sec
+ 94/205 Test #110: ninfer_qwen4_exp_engine_real_test ................***Skipped   0.27 sec
+ 95/205 Test #102: ninfer_qwen4_exp_ngram_volume_test ...............   Passed    2.43 sec
+ 96/205 Test #111: ninfer_add_bias_test .............................   Passed    1.37 sec
+ 97/205 Test #112: ninfer_gelu_test .................................   Passed    1.50 sec
+ 98/205 Test #113: ninfer_silu_mul_test .............................   Passed    1.54 sec
+ 99/205 Test #114: ninfer_residual_add_test .........................   Passed    1.62 sec
+100/205 Test #115: ninfer_sigmoid_mul_test ..........................   Passed    1.62 sec
+101/205 Test #117: ninfer_rmsnorm_pack_tail_test ....................   Passed    1.95 sec
+102/205 Test #118: ninfer_gated_rmsnorm_test ........................   Passed    1.70 sec
+103/205 Test #119: ninfer_l2norm_test ...............................   Passed    1.50 sec
+104/205 Test #116: ninfer_rmsnorm_test ..............................   Passed    7.91 sec
+105/205 Test #121: ninfer_kimi_delta_attention_test .................   Passed   21.22 sec
+106/205 Test #122: ninfer_causal_conv1d_silu_test ...................   Passed    2.78 sec
+107/205 Test #123: ninfer_layer_norm_test ...........................   Passed    1.28 sec
+108/205 Test #124: ninfer_embedding_test ............................   Passed    6.30 sec
+109/205 Test #125: ninfer_argmax_test ...............................   Passed    1.68 sec
+110/205 Test #126: ninfer_gdn_gating_test ...........................   Passed    1.38 sec
+111/205 Test #120: ninfer_gated_delta_net_test ......................   Passed   46.13 sec
+112/205 Test #127: ninfer_gdn_gating_proj_test ......................   Passed   10.03 sec
+113/205 Test #128: ninfer_rope_test .................................   Passed    1.72 sec
+114/205 Test #129: ninfer_vision_pos_embed_test .....................   Passed    1.51 sec
+115/205 Test #130: ninfer_sampling_test .............................   Passed    1.64 sec
+116/205 Test #131: ninfer_scalar_test ...............................   Passed    1.28 sec
+117/205 Test #132: ninfer_cast_test .................................   Passed    1.63 sec
+118/205 Test #134: ninfer_scatter_test ..............................   Passed    1.66 sec
+119/205 Test #133: ninfer_prepare_ragged_prefix_test ................   Passed    3.28 sec
+120/205 Test #136: ninfer_target_logprobs_test ......................   Passed    1.64 sec
+121/205 Test #137: ninfer_position_test .............................   Passed    1.72 sec
+122/205 Test #138: ninfer_ggml_blocks_decode_test ...................   Passed    0.30 sec
+123/205 Test #139: ninfer_offloaded_moe_cpu_test ....................   Passed    1.44 sec
+124/205 Test #135: ninfer_scatter_bf16_batch_test ...................   Passed    7.85 sec
+125/205 Test #141: ninfer_offloaded_moe_wide_test ...................   Passed   21.22 sec
+126/205 Test #140: ninfer_offloaded_moe_layer_test ..................   Passed   23.87 sec
+127/205 Test #143: ninfer_hyper_connection_test .....................   Passed    2.11 sec
+128/205 Test #144: ninfer_ple_test ..................................   Passed    1.38 sec
+129/205 Test #142: ninfer_linear_topk_test ..........................   Passed    5.76 sec
+130/205 Test #145: ninfer_projection_fp32_test ......................   Passed    2.76 sec
+131/205 Test #146: ninfer_rows_test .................................   Passed    2.09 sec
+132/205 Test #148: ninfer_candidate_selector_test ...................   Passed    3.59 sec
+133/205 Test #147: ninfer_qsa_test ..................................   Passed   10.15 sec
+134/205 Test #150: ninfer_softmax_attention_nvfp4_test ..............   Passed   28.51 sec
+135/205 Test #151: ninfer_softmax_attention_k8v4_test ...............   Passed   68.57 sec
+136/205 Test #149: ninfer_softmax_attention_test ....................   Passed  254.64 sec
+137/205 Test #152: ninfer_softmax_attention_dflash2_test ............   Passed  677.88 sec
+138/205 Test #154: ninfer_sliding_window_attention_test .............   Passed    2.54 sec
+139/205 Test #155: ninfer_kv_cache_append_test ......................   Passed   14.41 sec
+140/205 Test #156: ninfer_kv_plane_types_test .......................   Passed    0.12 sec
+141/205 Test #157: ninfer_rmsnorm_rope_test .........................   Passed    2.45 sec
+142/205 Test #158: ninfer_context_kv_materialize_test ...............   Passed  254.10 sec
+143/205 Test #159: ninfer_kv_cache_append_nvfp4_test ................   Passed    1.21 sec
+144/205 Test #160: ninfer_kv_cache_append_k8v4_test .................   Passed    1.24 sec
+145/205 Test #161: ninfer_prepare_masked_block_test .................   Passed    1.23 sec
+146/205 Test #162: ninfer_sparse_moe_test ...........................   Passed    2.61 sec
+147/205 Test #163: ninfer_sparse_moe_route_network_test .............   Passed    0.25 sec
+148/205 Test #164: ninfer_mtp_pack_test .............................   Passed    1.21 sec
+149/205 Test #165: ninfer_mtp_round_test ............................   Passed    1.31 sec
+150/205 Test #166: ninfer_speculative_round_test ....................   Passed   32.90 sec
+151/205 Test #167: ninfer_attn_input_proj_test ......................   Passed   40.50 sec
+152/205 Test #168: ninfer_gdn_input_proj_test .......................   Passed    4.50 sec
+153/205 Test #169: ninfer_gdn_input_small_t_test ....................   Passed    3.49 sec
+154/205 Test #170: ninfer_attn_input_small_t_test ...................   Passed    3.23 sec
+155/205 Test #171: ninfer_dynamic_grouped_conv_prepare_test .........   Passed    1.58 sec
+156/205 Test #172: ninfer_linear_dynamic_grouped_conv_add_test ......   Passed    2.92 sec
+157/205 Test #173: ninfer_gdn_input_proj_conv_snapshot_test .........   Passed   45.00 sec
+158/205 Test #174: ninfer_gdn_input_proj_conv_record_test ...........   Passed    3.25 sec
+159/205 Test #175: ninfer_gated_delta_net_replay_record_test ........   Passed    2.92 sec
+160/205 Test #176: ninfer_gdn_replay_fold_test ......................   Passed   13.14 sec
+161/205 Test #177: ninfer_gdn_state_fp16_test .......................   Passed    1.96 sec
+162/205 Test #178: ninfer_gdn_state_fp16_chunked_test ...............   Passed    1.77 sec
+163/205 Test #179: ninfer_vocabulary_transcode_test .................   Passed   20.50 sec
+164/205 Test #180: ninfer_route_coverage_test .......................   Passed    0.26 sec
+165/205 Test #181: ninfer_linear_q4_a16_test ........................   Passed   32.46 sec
+166/205 Test #182: ninfer_linear_q5_a16_test ........................   Passed   19.90 sec
+167/205 Test #183: ninfer_linear_q6_a16_test ........................   Passed   12.93 sec
+168/205 Test #184: ninfer_linear_q8_a16_test ........................   Passed   29.71 sec
+169/205 Test #185: ninfer_linear_nvfp4_a16_test .....................   Passed    3.89 sec
+170/205 Test #186: ninfer_linear_nvfp4_a4_test ......................   Passed    6.31 sec
+171/205 Test #187: ninfer_linear_fp8_a16_test .......................   Passed    9.08 sec
+172/205 Test #188: ninfer_linear_fp8_a8_test ........................   Passed    3.68 sec
+173/205 Test #189: ninfer_linear_bf16_a16_test ......................   Passed  137.85 sec
+174/205 Test #190: ninfer_linear_ggml_test ..........................   Passed    7.72 sec
+175/205 Test #191: ninfer_linear_add_q4_a16_test ....................   Passed    2.58 sec
+176/205 Test #192: ninfer_linear_add_q5_a16_test ....................   Passed   22.94 sec
+177/205 Test #193: ninfer_linear_add_q5_small_t_test ................   Passed    4.74 sec
+178/205 Test #194: ninfer_linear_add_bf16_a16_test ..................   Passed    1.44 sec
+179/205 Test #195: ninfer_linear_add_q8_a16_test ....................   Passed    6.34 sec
+180/205 Test #196: ninfer_linear_add_nvfp4_test .....................   Passed    1.58 sec
+181/205 Test #197: ninfer_linear_add_fp8_test .......................   Passed    2.11 sec
+182/205 Test #198: ninfer_linear_pair_q8_a16_test ...................   Passed    1.91 sec
+183/205 Test #199: ninfer_linear_swiglu_q4_a16_test .................   Passed    3.51 sec
+184/205 Test #200: ninfer_linear_swiglu_q8_a16_test .................   Passed    4.58 sec
+185/205 Test #201: ninfer_linear_swiglu_nvfp4_test ..................   Passed    2.37 sec
+186/205 Test #202: ninfer_linear_swiglu_fp8_test ....................   Passed    3.05 sec
+187/205 Test #203: ninfer_linear_swiglu_q4_a8int_test ...............   Passed    2.40 sec
+188/205 Test #204: ninfer_linear_swiglu_q4a8_int_test ...............   Passed   13.68 sec
+189/205 Test #205: ninfer_w4_cublas_prefill_test ....................   Passed   13.22 sec

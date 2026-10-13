@@ -1,0 +1,10 @@
+lock acquired at 2026-10-13T13:43:31.5398546+01:00
+seed 1A store_bytes=7888044308
+warm 1A ninfer_context_store_restored_sessions 6
+seed 2B store_bytes=8559684107
+warm 2B ninfer_context_store_restored_sessions 9
+seed 3B store_bytes=8834683928
+warm 3B ninfer_context_store_restored_sessions 8
+seed 4A store_bytes=8141044913
+warm 4A ninfer_context_store_restored_sessions 6
+lock released at 2026-10-13T13:53:33.9486423+01:00
