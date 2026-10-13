@@ -74,7 +74,9 @@ __device__ __forceinline__ void mma_m16n8k16(float& c0, float& c1, float& c2, fl
     const int lane = threadIdx.x & 31;
     const int g    = lane >> 2;
     const int t    = lane & 3;
-#pragma unroll
+// Rolled: unrolling this across the dozens of mma calls in the attention kernels sends ptxas
+    // into a half-hour compile.
+#pragma unroll 1
     for (int tp = 0; tp < 4; ++tp) {
         const int src_a = 4 * g + tp;
         const float2 A0 = Unpack::apply(__shfl_sync(kFullMask, a0, src_a));
@@ -108,7 +110,9 @@ __device__ __forceinline__ void mma_m16n8k32_s8(int& c0, int& c1, int& c2, int& 
     const int lane = threadIdx.x & 31;
     const int g    = lane >> 2;
     const int t    = lane & 3;
-#pragma unroll
+// Rolled: unrolling this across the dozens of mma calls in the attention kernels sends ptxas
+    // into a half-hour compile.
+#pragma unroll 1
     for (int tp = 0; tp < 4; ++tp) {
         const int src_a = 4 * g + tp;
         const int A0    = static_cast<int>(__shfl_sync(kFullMask, a0, src_a));
@@ -139,7 +143,9 @@ __device__ __forceinline__ void mma_m16n8k8_tf32(float& c0, float& c1, float& c2
     const int lane               = threadIdx.x & 31;
     const int g                  = lane >> 2;
     const int t                  = lane & 3;
-#pragma unroll
+// Rolled: unrolling this across the dozens of mma calls in the attention kernels sends ptxas
+    // into a half-hour compile.
+#pragma unroll 1
     for (int tp = 0; tp < 4; ++tp) {
         const int src_a = 4 * g + tp;
         const float A0  = __uint_as_float(__shfl_sync(kFullMask, a0, src_a) & kTf32Mask);
