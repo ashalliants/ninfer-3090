@@ -39,11 +39,16 @@ __device__ __forceinline__ float exp2_approx_ftz(float x) {
 __device__ __forceinline__ float exp_approx_ftz(float x) { return exp2_approx_ftz(x * kLog2E); }
 
 __device__ __forceinline__ std::uint32_t pack_bf16x2(float lo, float hi) {
+#if defined(NINFER_VOLTA_EMULATION)
+    const __nv_bfloat162 packed = __floats2bfloat162_rn(lo, hi);
+    return *reinterpret_cast<const std::uint32_t*>(&packed);
+#else
     std::uint32_t out;
     const std::uint32_t lo_bits = __float_as_uint(lo);
     const std::uint32_t hi_bits = __float_as_uint(hi);
     asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(out) : "r"(hi_bits), "r"(lo_bits));
     return out;
+#endif
 }
 
 // Exact BF16 expansion for consumers that need FP32 operand bits, including TF32 MMA.
