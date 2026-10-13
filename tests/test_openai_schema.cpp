@@ -518,11 +518,12 @@ int test_tools() {
 
     body          = base_request();
     body["tools"] = Json::array({function_tool(), function_tool("search")});
-    body["tool_choice"] =
-        Json{{"type", "allowed_tools"},
-             {"allowed_tools",
-              Json{{"mode", "auto"},
-                   {"tools", Json::array({Json{{"type", "function"}, {"name", "search"}}})}}}};
+    body["tool_choice"] = Json{
+        {"type", "allowed_tools"},
+        {"allowed_tools",
+         Json{{"mode", "auto"},
+              {"tools", Json::array({Json{{"type", "function"},
+                                          {"function", Json{{"name", "search"}}}}})}}}};
     const GenerationRequest allowed = parse(body).generation;
     failures += check(allowed.tools.size() == 2 &&
                           allowed.tool_choice.allowed_names == std::vector<std::string>{"search"} &&
@@ -850,8 +851,11 @@ int test_messages_and_media() {
 
     body                        = base_request();
     body["messages"][0]["name"] = "speaker";
-    failures += check(api_error([&] { (void)parse(body); }).code == "message_name_not_supported",
-                      "message name rejected");
+    const GenerationRequest named_user = parse(body).generation;
+    failures += check(named_user.messages.size() == 1 &&
+                          named_user.messages[0].role == ninfer::ChatRole::User &&
+                          named_user.messages[0].content.size() == 1,
+                      "user message name is accepted and ignored");
 
     body = base_request();
     body["messages"].push_back(Json{
@@ -909,6 +913,10 @@ int test_messages_and_media() {
                           legacy.messages[2].role == ninfer::ChatRole::Tool,
                       "legacy function-call history lowers to Engine tool history");
 
+    body["messages"][2]["content"] = nullptr;
+    failures += check(parse(body).generation.messages[2].role == ninfer::ChatRole::Tool,
+                      "legacy function message accepts null content");
+
     body["messages"] = Json::array(
         {Json{{"role", "assistant"},
               {"content", nullptr},
@@ -919,6 +927,13 @@ int test_messages_and_media() {
          Json{{"role", "tool"}, {"tool_call_id", ""}, {"content", "done"}}});
     failures += check(parse(body).generation.has_tool_history(),
                       "string tool-call identifiers may be empty without changing history");
+
+    body["messages"].back() = Json{{"role", "tool"}, {"tool_call_id", "c"}, {"content", "done"}};
+    body["messages"][body["messages"].size() - 2]["tool_calls"][0]["id"] = "c";
+    body["messages"][body["messages"].size() - 2]["tool_calls"][0]["function"]["name"] =
+        "mcp.server.get weather";
+    failures += check(parse(body).generation.has_tool_history(),
+                      "history tool-call names are not restricted to the definition charset");
     return failures;
 }
 

@@ -209,7 +209,7 @@ int test_budgets_and_nonsemantic_hints() {
                   {"prompt_cache_retention", "24h"},
                   {"prompt_cache_options",
                    Json{{"mode", "explicit"}, {"ttl", "30m"}, {"future_hint", true}}},
-                  {"safety_identifier", "local-user"},
+                  {"safety_identifier", std::string(128, 'x')},
                   {"service_tier", "auto"},
                   {"stream_options", Json{{"include_obfuscation", false}}},
                   {"text", Json{{"format", Json{{"type", "text"}}}, {"verbosity", "medium"}}},
@@ -578,6 +578,12 @@ int test_assistant_item_boundaries_and_errors() {
              {"content", Json::array({Json{{"type", "reasoning_text"}, {"text", "thought"}}})}};
     const Json call = Json{
         {"type", "function_call"}, {"call_id", "call_1"}, {"name", "lookup"}, {"arguments", "{}"}};
+    const OpenAIResponsesCreateRequest bare_reasoning = parse_openai_responses_create_request(
+        Json{{"model", "m"},
+             {"input", Json::array({Json{{"type", "reasoning"}, {"summary", Json::array()}}, first})}},
+        limits());
+    failures += check(bare_reasoning.prompt.input_turns.size() == 1,
+                      "reasoning Item without optional content is accepted");
     const auto rejected = [&](Json input) {
         return api_error([&] {
             (void)parse_openai_responses_create_request(
@@ -1173,6 +1179,42 @@ int test_explicit_rejections() {
         parse_openai_responses_create_request(value, limits()).prompt.generation.tools[0].strict,
         "strict function schema reaches generation");
 
+    value          = base;
+    value["tools"] = Json::array({Json{{"type", "function"}, {"name", "f"}, {"async", false}}});
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(value, limits());
+                      }).empty(),
+                      "async:false is the neutral synchronous function contract");
+    value["tools"][0]["async"] = true;
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(value, limits());
+                      }) == "async_tools_not_supported",
+                      "async:true function tools are rejected explicitly");
+
+    value          = base;
+    value["tools"] = Json::array({Json{{"type", "custom"}, {"name", "c"}, {"async", false}}});
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(value, limits());
+                      }).empty(),
+                      "async:false is accepted on custom tools");
+    value["tools"][0]["async"] = true;
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(value, limits());
+                      }) == "async_tools_not_supported",
+                      "async:true custom tools are rejected explicitly");
+
+    value                     = base;
+    value["access_programs"] = Json::array();
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(value, limits());
+                      }) == "access_programs_not_supported",
+                      "access_programs is a recognized but unsupported request field");
+    value["access_programs"] = nullptr;
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(value, limits());
+                      }).empty(),
+                      "null access_programs is accepted");
+
     value         = base;
     value["text"] = Json{{"format", Json{{"type", "json_schema"}}}};
     failures += check(api_error([&] {
@@ -1422,6 +1464,12 @@ int test_response_object() {
                           response.at("output")[0].at("type") == "reasoning" &&
                           response.at("output")[1].at("type") == "message",
                       "reasoning and message are emitted as typed output Items");
+    failures += check(response.contains("access_programs") && response.at("access_programs").is_null() &&
+                          response.at("output")[1].at("content")[0].at("logprobs").is_array() &&
+                          response.at("usage").at("input_tokens_details").at("cache_write_tokens") ==
+                              0,
+                      "response carries the spec-required access_programs, logprobs and "
+                      "cache_write_tokens fields");
     failures +=
         check(response.at("usage").at("input_tokens_details").at("cached_tokens") == 4 &&
                   response.at("usage").at("output_tokens_details").at("reasoning_tokens") == 3 &&
@@ -1514,7 +1562,8 @@ int test_sse_sequence_and_failures() {
         ApiError{.status = 500, .type = "server_error", .message = "stopped", .code = "stopped"}));
     failures += check(failure.at("type") == "response.failed" &&
                           failure.at("response").at("status") == "failed" &&
-                          failure.at("response").at("completed_at").is_null(),
+                          failure.at("response").at("completed_at").is_null() &&
+                          failure.at("response").at("error").at("code") == "server_error",
                       "runtime failure uses response.failed with no completion timestamp");
 
     OpenAIResponsesCreateRequest cancelled_request = parse_openai_responses_create_request(

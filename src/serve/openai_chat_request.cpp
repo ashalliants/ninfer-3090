@@ -56,12 +56,17 @@ ChatRole parse_message_role(const std::string& role) {
     bad_request("unsupported role: " + role, "messages", "unsupported_role");
 }
 
-std::string require_function_name(const Json& object, const char* param) {
+// The spec restricts the name charset only on tool definitions. Names replayed in message
+// history (tool_calls, function_call, function messages) keep whatever the originating client or
+// model used, so they are only required to be non-empty strings.
+std::string require_function_name(const Json& object, const char* param,
+                                  bool definition = true) {
     if (!object.contains("name") || !object.at("name").is_string()) {
         bad_request("function name must be a string", param);
     }
     std::string name = object.at("name").get<std::string>();
-    if (!valid_tool_name(name, 64)) {
+    if (name.empty()) { bad_request("function name must not be empty", param); }
+    if (definition && !valid_tool_name(name, 64)) {
         bad_request("function name must match [A-Za-z0-9_-]{1,64}", param);
     }
     return name;
@@ -373,7 +378,7 @@ std::vector<ToolCall> parse_assistant_tool_calls(const Json& message, std::size_
             if (!custom.contains("input") || !custom.at("input").is_string()) {
                 bad_request("custom tool_calls must contain a string input", "messages");
             }
-            std::string name = require_function_name(custom, "messages");
+            std::string name = require_function_name(custom, "messages", false);
             require_tool_kind(request, name, true, "messages", "invalid_tool_history");
             const std::string& input = custom.at("input").get_ref<const std::string&>();
             require_representable_custom_tool_input(input, "messages");
@@ -393,7 +398,7 @@ std::vector<ToolCall> parse_assistant_tool_calls(const Json& message, std::size_
         if (!function.contains("arguments") || !function.at("arguments").is_string()) {
             bad_request("function tool_calls must contain string arguments", "messages");
         }
-        std::string name = require_function_name(function, "messages");
+        std::string name = require_function_name(function, "messages", false);
         require_tool_kind(request, name, false, "messages", "invalid_tool_history");
         calls.push_back(ToolCall{.id             = value.at("id").get<std::string>(),
                                  .name           = std::move(name),
@@ -416,7 +421,7 @@ std::optional<ToolCall> parse_legacy_assistant_function_call(const Json& message
     if (!call.contains("arguments") || !call.at("arguments").is_string()) {
         bad_request("assistant function_call must contain string arguments", "messages");
     }
-    std::string name = require_function_name(call, "messages");
+    std::string name = require_function_name(call, "messages", false);
     require_tool_kind(request, name, false, "messages", "invalid_tool_history");
     return ToolCall{.id             = {},
                     .name           = std::move(name),
@@ -446,18 +451,13 @@ std::optional<std::string> parse_assistant_reasoning(const Json& message, std::s
     return reasoning ? reasoning : content;
 }
 
-void validate_message_name(const Json& item, ChatRole role) {
+// The optional OpenAI message `name` is a participant label that clients (LangChain/DeerFlow
+// middleware, role=tool mirrors of the function name) attach to any role. The chat template has no
+// participant slot, so a string name is accepted and ignored: it never reaches the Engine or prompt
+// renderer. Non-string values remain malformed.
+void validate_message_name(const Json& item) {
     if (!item.contains("name") || item.at("name").is_null()) { return; }
     if (!item.at("name").is_string()) { bad_request("message name must be a string", "messages"); }
-    const std::string& name = item.at("name").get_ref<const std::string&>();
-    // Some OpenAI-compatible clients mirror the function name onto role=tool messages. Accept
-    // that non-standard field as an ignored compatibility hint; it never reaches the Engine or
-    // prompt renderer.
-    if (!name.empty() && role != ChatRole::Tool) {
-        bad_request("a non-empty message name changes participant identity, which NInfer's chat "
-                    "template cannot represent",
-                    "messages", "message_name_not_supported");
-    }
 }
 
 void validate_non_assistant_fields(const Json& item, ChatRole role) {
@@ -504,7 +504,10 @@ ChatTurn parse_tool_message(const Json& item, std::size_t index, bool legacy_fun
         !item.at("tool_call_id").is_string()) {
         bad_request("tool_call_id must be a string", "messages");
     }
-    if (!item.contains("content") || item.at("content").is_null()) {
+    // The legacy function message schema allows content:null (a call with no output); tool
+    // messages require content.
+    const bool null_content = !item.contains("content") || item.at("content").is_null();
+    if (null_content && !(legacy_function && item.contains("content"))) {
         bad_request("tool messages must contain content", "messages");
     }
 
@@ -513,7 +516,7 @@ ChatTurn parse_tool_message(const Json& item, std::size_t index, bool legacy_fun
     if (item.contains("tool_call_id") && item.at("tool_call_id").is_string()) {
         turn.tool_call_id = item.at("tool_call_id").get<std::string>();
     }
-    parse_content_parts(item.at("content"), turn, index);
+    parse_content_parts(null_content ? Json("") : item.at("content"), turn, index);
     return turn;
 }
 
@@ -578,8 +581,8 @@ ChatTurn parse_message(const Json& item, std::size_t index, const OpenAIChatRequ
     const bool legacy_function  = role_name == "function";
     const ChatRole role         = legacy_function ? ChatRole::Tool : parse_message_role(role_name);
 
-    validate_message_name(item, role);
-    if (legacy_function) { (void)require_function_name(item, "messages"); }
+    validate_message_name(item);
+    if (legacy_function) { (void)require_function_name(item, "messages", false); }
     validate_non_assistant_fields(item, role);
 
     if (role == ChatRole::Tool) { return parse_tool_message(item, index, legacy_function); }

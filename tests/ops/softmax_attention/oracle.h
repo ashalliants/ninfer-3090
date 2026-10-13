@@ -12,6 +12,14 @@
 
 namespace ninfer::test {
 
+// Worker count for oracle sweeps that run one oracle call at a time: the core count, capped so a
+// shared host is not starved. Rows are independent, so the result does not depend on it.
+inline int oracle_worker_count() {
+    static const int count =
+        static_cast<int>(std::clamp(std::thread::hardware_concurrency(), 1U, 12U));
+    return count;
+}
+
 // Independent logical Softmax Attention oracle. Callbacks expose represented public values and
 // the entry-specific visible set; no production staging cast, tile, cache address, or reduction
 // tree is reproduced here. Parallel workers own separate query/head rows; value callbacks must

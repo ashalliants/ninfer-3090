@@ -241,7 +241,11 @@ wall at `-j2`, 8 of them skipped without `NINFER_TEST_ARTIFACT` (the `*_real_tes
 earlier "~70 s / 100 tests" figure is stale. Three op tests account for most of it and are not
 related to engine or scheduler changes: `ninfer_softmax_attention_dflash2_test` (~575 s),
 `ninfer_context_kv_materialize_test` (~258 s) and `ninfer_softmax_attention_test` (~184 s); exclude
-them with `ctest -E` when iterating on something else. Building only `ninfer_tests` leaves five
+them with `ctest -E` when iterating on something else. `ninfer_softmax_attention_int8_prompt_test`
+(`--int8-prompt-only`, 546 cases, CTest TIMEOUT 1500 s) is a fourth: ~530 s measured 2026-10-13 with
+the FP64 oracle on 12 threads (it was 45-60 min single-threaded), about 3,800 CPU-seconds, so it
+uses most cores while it runs. The 184 s figure above is for the no-argument invocation, which does
+not include it; exclude it with `ctest -E int8_prompt` too. Building only `ninfer_tests` leaves five
 standalone test programs unbuilt, so `ctest` reports `public_api`, `jinja`, `artifact_materialization`,
 `effective_thinking_budget` and `context_cost_measure` as Not Run, and `chat_templates` and
 `artifact_writer_interop` as Failed (they launch those programs). That is a missing build, not a
