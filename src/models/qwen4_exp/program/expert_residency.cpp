@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <limits>
@@ -257,6 +259,38 @@ void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, st
     const auto* routes = static_cast<const std::int32_t*>(route_host_.data());
     auto* table        = static_cast<std::int32_t*>(table_host_.data());
     const std::size_t used = static_cast<std::size_t>(top_k_) * static_cast<std::size_t>(columns);
+    // SPIKE INSTRUMENTATION (spike/qwen4exp-lanes, not for merge): with NINFER_ROUTE_TRACE set, every
+    // round's routes are appended to that file as {i32 columns, i32 top_k, i32 layers, i32 budget,
+    // i32 hits, i32 routed, then layers * top_k * columns i32 ids, layer-major}, for the CPU replay
+    // of interleaved lanes (tools/flash_next/lanes_spike/lanes_replay.cpp).
+    static const char* const trace = std::getenv("NINFER_ROUTE_TRACE");
+    if (trace != nullptr && *trace != '\0') {
+        std::int32_t hits = 0, routed = 0;
+        for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+            const std::int32_t* ids = routes + static_cast<std::size_t>(layer) * route_stride_;
+            for (std::size_t i = 0; i < used; ++i) {
+                const auto expert = static_cast<std::uint32_t>(ids[i]);
+                if (expert >= experts_ || seen_[expert]) { continue; }
+                seen_[expert] = 1;
+                ++routed;
+                if (table[layer * experts_ + expert] >= 0) { ++hits; }
+            }
+            for (std::size_t i = 0; i < used; ++i) {
+                const auto expert = static_cast<std::uint32_t>(ids[i]);
+                if (expert < experts_) { seen_[expert] = 0; }
+            }
+        }
+        if (std::FILE* f = std::fopen(trace, "ab"); f != nullptr) {
+            const std::int32_t head[6] = {columns, static_cast<std::int32_t>(top_k_), static_cast<std::int32_t>(layers_),
+                                          static_cast<std::int32_t>(std::min<std::size_t>(per_layer_budget, 1u << 30)),
+                                          hits, routed};
+            std::fwrite(head, sizeof(head), 1, f);
+            for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+                std::fwrite(routes + static_cast<std::size_t>(layer) * route_stride_, sizeof(std::int32_t), used, f);
+            }
+            std::fclose(f);
+        }
+    }
     ++round_;
     commands_.clear();
     for (std::uint32_t layer = 0; layer < layers_; ++layer) {

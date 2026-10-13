@@ -2633,6 +2633,18 @@ private:
                       static_cast<double>(plan_.kv.mapped_bytes(plan_.pages)) / (1 << 20));
         diagnostic(line);
         diagnostic(sizing_.describe());
+        // SPIKE INSTRUMENTATION (spike/qwen4exp-lanes, not for merge): the device plan's parts, the
+        // per-lane cost inputs of docs/maintainer/flash-next-lanes-spike.md.
+        const auto& b = plan_.bytes;
+        std::snprintf(line, sizeof(line),
+                      "spike plan bytes: kv_base %llu kv_max %llu workspace %llu staging %llu state %llu io %llu "
+                      "residency %llu speculation %llu frame %llu graphs %u pages %u",
+                      static_cast<unsigned long long>(b.kv), static_cast<unsigned long long>(b.kv_max),
+                      static_cast<unsigned long long>(b.workspace), static_cast<unsigned long long>(b.staging),
+                      static_cast<unsigned long long>(b.state), static_cast<unsigned long long>(b.io),
+                      static_cast<unsigned long long>(b.residency), static_cast<unsigned long long>(b.speculation),
+                      static_cast<unsigned long long>(b.expert_record_stride), b.graph_bound, b.kv_pages);
+        diagnostic(line);
     }
 
     // The expert cache and n-gram traffic of the finished request: one line per request.
