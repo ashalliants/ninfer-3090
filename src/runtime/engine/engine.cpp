@@ -302,23 +302,7 @@ public:
                         "the context store restores sessions into the Host context cache; give it "
                         "a nonzero Host budget (--host-context-mib or --auto-host-cache)");
                 }
-                open_context_store();
-                using Hooks = GenerationCore::ContextStoreHooks;
-                generation->set_context_store(Hooks{
-                    .store   = store.get(),
-                    .binding = store_binding,
-                    .sink    = [this](CheckpointImage&& image) {
-                        return enqueue_store_write(std::move(image));
-                    },
-                    .ready    = [this] { return store_queue_idle(); },
-                    .failures = [this] {
-                        return store_write_failures.load(std::memory_order_relaxed);
-                    },
-                    .idle_persist = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        options.context_store.idle_persist),
-                    .hydration_budget = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        options.context_store.restore_budget),
-                });
+                attach_context_store(*generation);
             }
             core = std::move(generation);
             if (store) { restore_from_store(); }
@@ -432,8 +416,47 @@ private:
              .prefill_signature = "qwen4exp"},
             options.context_cost.preset_path);
         load.context_cost = std::move(context_cost.summary);
-        core = std::make_unique<Qwen4ExpCore>(*qwen4, device, options, std::move(context_cost.model));
+        auto generation   = std::make_unique<Qwen4ExpCore>(*qwen4, device, options, std::move(context_cost.model));
+        if (options.context_store.enabled()) {
+            if (!options.context_cache.enabled) {
+                throw std::invalid_argument(
+                    "the context store restores sessions into the context cache, which is off: give it a Host "
+                    "budget (--host-context-mib) or an NVMe tier (--context-nvme-mib)");
+            }
+            attach_context_store(*generation);
+        }
+        core = std::move(generation);
+        if (store) { restore_from_store(); }
         finalize_phase.complete();
+    }
+
+    // Opens the context store and hands the generation core its hooks (both cores: the Qwen3.5
+    // models' and Qwen3.8-Flash-Next's).
+    template <class GenerationCoreT>
+    void attach_context_store(GenerationCoreT& generation) {
+        open_context_store();
+        using Hooks = typename GenerationCoreT::ContextStoreHooks;
+        generation.set_context_store(Hooks{
+            .store   = store.get(),
+            .binding = store_binding,
+            .sink    = [this](CheckpointImage&& image) { return enqueue_store_write(std::move(image)); },
+            .ready    = [this] { return store_queue_idle(); },
+            .failures = [this] { return store_write_failures.load(std::memory_order_relaxed); },
+            .idle_persist =
+                std::chrono::duration_cast<std::chrono::milliseconds>(options.context_store.idle_persist),
+            .hydration_budget =
+                std::chrono::duration_cast<std::chrono::milliseconds>(options.context_store.restore_budget),
+        });
+    }
+
+    // Runs `f` on the generation core (either kind); nothing for a scoring engine.
+    template <class F>
+    void with_generation(F&& f) {
+        if (auto* generation = std::get_if<std::unique_ptr<GenerationCore>>(&core); generation && *generation) {
+            f(**generation);
+        } else if (auto* next = std::get_if<std::unique_ptr<Qwen4ExpCore>>(&core); next && *next) {
+            f(**next);
+        }
     }
 
     void open_context_store() {
@@ -503,38 +526,39 @@ private:
     void restore_from_store() noexcept {
         const auto started = std::chrono::steady_clock::now();
         try {
-            auto& generation    = *std::get<std::unique_ptr<GenerationCore>>(core);
-            const auto deadline = started + options.context_store.restore_budget;
-            auto images         = store->list();
-            std::sort(images.begin(), images.end(), [](const auto& a, const auto& b) {
-                return a.last_used_ms > b.last_used_ms;
+            with_generation([&](auto& generation) {
+                const auto deadline = started + options.context_store.restore_budget;
+                auto images         = store->list();
+                std::sort(images.begin(), images.end(), [](const auto& a, const auto& b) {
+                    return a.last_used_ms > b.last_used_ms;
+                });
+                // Sessions written under another model, configuration or image format are never read;
+                // counted once here so the start-up summary says why they were not restored.
+                foreign_images = static_cast<std::uint64_t>(
+                    std::count_if(images.begin(), images.end(),
+                                  [&](const auto& info) { return info.binding != store_binding; }));
+                for (const runtime::ContextStore::Info& info : images) {
+                    if (std::chrono::steady_clock::now() >= deadline) { break; }
+                    if (info.binding != store_binding || info.tokens > options.max_context) {
+                        continue;
+                    }
+                    // The payload is nearly all of an image: one larger than the free Host space
+                    // cannot fit, and reading it would only spend the budget.
+                    if (info.image_bytes > generation.free_host_bytes()) { continue; }
+                    const auto read_started = std::chrono::steady_clock::now();
+                    std::optional<std::vector<std::uint8_t>> bytes = store->load(info.id, false);
+                    if (!bytes) { continue; }
+                    const auto read_ns = static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - read_started)
+                            .count());
+                    if (generation.restore_image(*bytes, read_ns)) {
+                        store->touch(info.id);
+                        ++restored_sessions;
+                        restored_bytes += bytes->size();
+                    }
+                }
             });
-            // Sessions written under another model, configuration or image format are never read;
-            // counted once here so the start-up summary says why they were not restored.
-            foreign_images = static_cast<std::uint64_t>(
-                std::count_if(images.begin(), images.end(),
-                              [&](const auto& info) { return info.binding != store_binding; }));
-            for (const runtime::ContextStore::Info& info : images) {
-                if (std::chrono::steady_clock::now() >= deadline) { break; }
-                if (info.binding != store_binding || info.tokens > options.max_context) {
-                    continue;
-                }
-                // The payload is nearly all of an image: one larger than the free Host space
-                // cannot fit, and reading it would only spend the budget.
-                if (info.image_bytes > generation.free_host_bytes()) { continue; }
-                const auto read_started = std::chrono::steady_clock::now();
-                std::optional<std::vector<std::uint8_t>> bytes = store->load(info.id, false);
-                if (!bytes) { continue; }
-                const auto read_ns = static_cast<std::uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now() - read_started)
-                        .count());
-                if (generation.restore_image(*bytes, read_ns)) {
-                    store->touch(info.id);
-                    ++restored_sessions;
-                    restored_bytes += bytes->size();
-                }
-            }
         } catch (...) {}
         restore_seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
@@ -544,16 +568,16 @@ private:
     // first, within the flush budget.
     void flush_context_store(std::chrono::steady_clock::time_point deadline) noexcept {
         try {
-            auto* generation = std::get_if<std::unique_ptr<GenerationCore>>(&core);
-            if (generation == nullptr || *generation == nullptr) { return; }
-            (void)(*generation)->persist_all(
-                [this](CheckpointImage&& image) {
-                    try {
-                        store_put(image);
-                        return true;
-                    } catch (...) { return false; }
-                },
-                deadline);
+            with_generation([&](auto& generation) {
+                (void)generation.persist_all(
+                    [this](CheckpointImage&& image) {
+                        try {
+                            store_put(image);
+                            return true;
+                        } catch (...) { return false; }
+                    },
+                    deadline);
+            });
         } catch (...) {}
     }
 

@@ -427,7 +427,13 @@ int bench(const std::string& artifact, const std::vector<std::string>& args) {
 // Engine with the cache (MTP when the artifact holds the drafter), then the same prompts cold. The
 // repeat of turn 1 and turn 2 must resume past the image (reused tokens beyond it, no encode) and
 // produce the cold run's ids.
-int cache_check(const std::string& artifact, bool mtp, std::uint32_t tokens, std::uint32_t max_context) {
+//
+// --host-mib N and --nvme-mib N choose the tiers (--host-mib 0 --nvme-mib N: every checkpoint on
+// disk). --store DIR (an empty directory) restarts between turn 1 and its repeat: the first Engine
+// writes the conversation to the context store at shutdown, a second restores it, and the repeat and
+// turn 2 must resume from the restored checkpoints.
+int cache_check(const std::string& artifact, bool mtp, std::uint32_t tokens, std::uint32_t max_context,
+                std::optional<std::uint64_t> host, std::uint64_t nvme, const std::filesystem::path& store) {
     // The chart after ~1,000 tokens of text: prompts shorter than 512 tokens are not captured.
     Case chart = cases()[0];
     std::string preface = "Background notes before the image:";
@@ -443,7 +449,12 @@ int cache_check(const std::string& artifact, bool mtp, std::uint32_t tokens, std
     const auto options = [&](bool cache) {
         EngineOptions o                     = base_options(artifact, max_context);
         o.context_cache.enabled             = cache;
-        o.context_cache.host_capacity_bytes = cache ? std::nullopt : std::optional<std::size_t>(0);
+        o.context_cache.host_capacity_bytes = cache ? host : std::optional<std::size_t>(0);
+        if (cache) {
+            o.flash_next.context_nvme_bytes = nvme;
+            o.context_store.directory       = store;
+            o.context_store.idle_persist    = std::chrono::seconds(0);
+        }
         if (mtp) {
             o.speculative.backend      = SpeculativeBackend::Mtp;
             o.speculative.draft_tokens = 3;
@@ -480,13 +491,25 @@ int cache_check(const std::string& artifact, bool mtp, std::uint32_t tokens, std
     }
     const double ram_before = available_ram_gib();
     {
-        Engine engine(options(true));
-        cached.push_back(engine.generate(engine.prepare(prompt_of(chart)), request()));
+        std::optional<Engine> engine(std::in_place, options(true));
+        cached.push_back(engine->generate(engine->prepare(prompt_of(chart)), request()));
         print_result("cache turn 1 (cold, captures)", cached.back());
         answer = cached.back().content;
-        cached.push_back(engine.generate(engine.prepare(prompt_of(chart)), request()));
+        if (!store.empty()) {
+            // Restart: shutdown writes the conversation, the next Engine restores it.
+            engine.reset();
+            wait_for_ram(ram_before);
+            engine.emplace(options(true));
+            const auto stats = engine->runtime_stats();
+            std::printf("restarted: restored %llu session(s), %.0f MiB, in %.3f s\n",
+                        static_cast<unsigned long long>(stats.context_store_restored),
+                        static_cast<double>(stats.context_store_restored_bytes) / (1 << 20),
+                        stats.context_store_restore_seconds);
+            check(stats.context_store_restored != 0, "the restarted Engine restored the conversation from the store");
+        }
+        cached.push_back(engine->generate(engine->prepare(prompt_of(chart)), request()));
         print_result("cache turn 1 repeated", cached.back());
-        cached.push_back(engine.generate(engine.prepare(turn2(answer)), request()));
+        cached.push_back(engine->generate(engine->prepare(turn2(answer)), request()));
         print_result("cache turn 2", cached.back());
     }
     wait_for_ram(ram_before);
@@ -546,7 +569,21 @@ int main(int argc, char** argv) {
             return bench(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
         }
         if (!args.empty() && args.front() == "--cache") {
-            return cache_check(artifact, mtp_available, 32, 16'384);
+            std::optional<std::uint64_t> host;
+            std::uint64_t nvme = 0;
+            std::filesystem::path store;
+            for (std::size_t i = 1; i + 1 < args.size(); i += 2) {
+                if (args[i] == "--host-mib") {
+                    host = std::stoull(args[i + 1]) << 20U;
+                } else if (args[i] == "--nvme-mib") {
+                    nvme = std::stoull(args[i + 1]) << 20U;
+                } else if (args[i] == "--store") {
+                    store = args[i + 1];
+                } else {
+                    throw std::invalid_argument("unknown --cache argument " + args[i]);
+                }
+            }
+            return cache_check(artifact, mtp_available, 32, 16'384, host, nvme, store);
         }
         if (!args.empty() && args.front() == "--kv-cycle") {
             const bool cycled = kv_cycle(artifact);

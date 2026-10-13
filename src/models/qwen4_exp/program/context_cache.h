@@ -10,6 +10,7 @@
 // produced them hold the same full pages, so a page is freed when its last holder lets go. A state
 // image belongs to exactly one checkpoint.
 
+#include "core/host_gather.h"
 #include "models/qwen3_5/program/prefix_identity.h"
 #include "models/qwen3_5/program/program.h"
 #include "ninfer/types.h"
@@ -19,6 +20,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -71,15 +73,34 @@ struct SlabCopy {
 };
 
 // Where checkpoint bytes live. Capture and restore describe their copies in slab terms only, so the
-// placement (pinned RAM here; an NVMe file or a remote object later) is not part of them. A tier
-// moves the bytes in stream order; the caller synchronizes before reusing the slabs.
+// placement (pinned RAM, or an NVMe file with a RAM cache: nvme_tier.h) is not part of them.
 class CheckpointTier {
 public:
     virtual ~CheckpointTier() = default;
     [[nodiscard]] virtual std::uint32_t slabs() const noexcept    = 0;
     [[nodiscard]] virtual std::size_t slab_bytes() const noexcept = 0;
+    // Device <-> slabs in stream order; the caller synchronizes the stream before reusing the slabs
+    // or the device regions. Throws when the bytes cannot be moved (a disk tier's I/O failure): the
+    // slabs written are then undefined and the caller releases them.
     virtual void copy(std::span<const SlabCopy> copies, bool to_tier, cudaStream_t stream) = 0;
+    // Host <-> whole slabs, synchronous (checkpoint images: export and import). `bytes` holds
+    // slabs.size() * slab_bytes() bytes, slab i at i * slab_bytes(). Throws as copy() does.
+    virtual void read(std::span<const std::uint32_t> slabs, std::span<std::byte> bytes)        = 0;
+    virtual void write(std::span<const std::uint32_t> slabs, std::span<const std::byte> bytes) = 0;
+    // Nothing references `slab` any longer: its bytes need not be kept.
+    virtual void discard(std::uint32_t /*slab*/) noexcept {}
 };
+
+// One SlabCopy row's Host address, or null when the slab's bytes are not in the Host memory this
+// lookup describes (nvme_tier.cpp translates in batches).
+using SlabAddress = std::byte* (*)(const void* context, std::uint32_t slab);
+
+// The gather copies of `copies` (core/host_gather.h) with each slab's Host bytes at
+// `address(context, slab)`: rows whose slab has no address are left out, and consecutive rows
+// whose Host addresses keep the slab pitch stay one copy. A copy's rows lie in one slab, or one
+// per slab over consecutive slabs (slab_pitch == slab_bytes).
+void translate_slab_copies(std::span<const SlabCopy> copies, std::size_t slab_bytes, bool to_tier,
+                           SlabAddress address, const void* context, std::vector<GatherCopy>& out);
 
 // The pinned host RAM tier: one identity-mapped pinned allocation, copied by the gather kernel
 // (core/host_gather.h) so the single WDDM copy engine stays free for the rounds' inputs. Throws
@@ -93,6 +114,8 @@ public:
     [[nodiscard]] std::uint32_t slabs() const noexcept override { return slabs_; }
     [[nodiscard]] std::size_t slab_bytes() const noexcept override { return slab_bytes_; }
     void copy(std::span<const SlabCopy> copies, bool to_tier, cudaStream_t stream) override;
+    void read(std::span<const std::uint32_t> slabs, std::span<std::byte> bytes) override;
+    void write(std::span<const std::uint32_t> slabs, std::span<const std::byte> bytes) override;
 
 private:
     std::uint32_t slabs_;
@@ -158,6 +181,9 @@ public:
     HostCheckpointStore(std::uint32_t slabs, std::size_t slab_bytes);
     HostCheckpointStore(const HostCheckpointStore&)            = delete;
     HostCheckpointStore& operator=(const HostCheckpointStore&) = delete;
+
+    // Called with each slab whose last reference goes (the tier may drop its bytes).
+    void on_free(std::function<void(std::uint32_t)> callback) { on_free_ = std::move(callback); }
 
     [[nodiscard]] std::size_t slab_bytes() const noexcept { return slab_bytes_; }
     [[nodiscard]] std::uint32_t capacity_slabs() const noexcept { return static_cast<std::uint32_t>(references_.size()); }
@@ -226,6 +252,7 @@ private:
     };
 
     std::size_t slab_bytes_;
+    std::function<void(std::uint32_t)> on_free_;
     std::vector<std::uint32_t> references_;
     std::vector<std::uint32_t> free_;
     std::uint32_t peak_ = 0;

@@ -166,7 +166,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--vision] [--vision-residency resident|overlay] [--vision-max-merged N] "
            "[--no-cuda-graph] [--no-prefix-reuse] [--devices N,M,...] [--stage-layers A,B,...] "
            "[--ngram-volume FILE] [--expert-state FILE|--no-expert-state] [--vram-headroom-mib N] "
-           "[--ram-headroom-mib N] [--expert-cache-mib N] "
+           "[--ram-headroom-mib N] [--expert-cache-mib N] [--context-nvme-mib N [--context-nvme-dir DIR]] "
            "[--chat-template FILE] "
            "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
            "[--gdn-state-fp16] "
@@ -211,7 +211,11 @@ std::string serve_usage_text(const char* argv0) {
            "small perplexity cost (docs/performance.md), off by default, and it wants a larger "
            "--prefill-chunk to pay; --no-prefill-cublas-projections keeps the attention and GDN "
            "input projections off that route\n"
-           "       Qwen3.8-Flash-Next (one request at a time, --kv-dtype int8, no prefix reuse): "
+           "       Qwen3.8-Flash-Next (one request at a time, --kv-dtype int8): prefix reuse keeps "
+           "checkpoints in pinned RAM (--host-context-mib, default 4096, 0 turns reuse off) or, with "
+           "--context-nvme-mib N, in a scratch file of up to N MiB on local disk (removed at exit; "
+           "--context-nvme-dir DIR, default beside the model) with --host-context-mib as its RAM "
+           "cache (0: disk only); --context-store DIR keeps it across restarts; "
            "--ngram-volume FILE is its n-gram table (default <model>.ngram); --expert-state FILE "
            "keeps the VRAM expert cache's state across restarts (default <model>.expert-state; "
            "--no-expert-state starts it empty and saves nothing); --vram-headroom-mib N is the VRAM "
@@ -230,7 +234,8 @@ std::string serve_usage_text(const char* argv0) {
            "       --no-prefix-reuse disables cross-request history; request pause/replay "
            "resources remain available\n"
            "       --context-store DIR keeps retained sessions on disk so a restart or crash does "
-           "not lose the context cache; it needs a nonzero Host context budget. "
+           "not lose the context cache; it needs a nonzero Host context budget (Qwen3.8-Flash-Next: "
+           "or an NVMe tier). "
            "--context-store-max-gib N bounds the store (default: half the volume's free "
            "space); --context-store-ttl-hours N removes sessions unused that long (default 168, "
            "0 keeps them until space is needed); --context-store-idle-seconds N writes a session "
@@ -569,6 +574,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--expert-cache-mib") {
             options.flash_next.expert_cache_bytes =
                 parse_mib_bytes(require_value("--expert-cache-mib"), "expert-cache-mib");
+        } else if (arg == "--context-nvme-mib") {
+            options.flash_next.context_nvme_bytes =
+                parse_mib_bytes(require_value("--context-nvme-mib"), "context-nvme-mib");
+        } else if (arg == "--context-nvme-dir") {
+            options.flash_next.context_nvme_dir = require_value("--context-nvme-dir");
+            if (options.flash_next.context_nvme_dir.empty()) {
+                throw std::invalid_argument("--context-nvme-dir must not be empty");
+            }
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
         } else if (arg == "--context-store") {

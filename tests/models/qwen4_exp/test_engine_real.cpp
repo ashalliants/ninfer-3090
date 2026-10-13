@@ -41,8 +41,11 @@
 // Context cache mode (cache_check below): a conversation through an Engine with the context cache,
 // every request's greedy ids against the same prompt run cold, and the prompt tokens reused.
 //
-//   ninfer_qwen4_exp_engine_real_test --cache [--mtp K] [--host-mib N] [--generate N] [--max-context N]
-//       [--evict]   (--evict: four distinct prompts twice round through a small Host tier)
+//   ninfer_qwen4_exp_engine_real_test --cache [--mtp K] [--host-mib N] [--nvme-mib N] [--generate N]
+//       [--max-context N] [--evict] [--store DIR]
+//   --evict: four distinct prompts twice round through a small Host tier. --nvme-mib N: the NVMe tier
+//   (--host-mib 0 with it: every checkpoint on disk). --store DIR: restart survival through the
+//   context store (restart_check below).
 //
 // TOKENS is @FILE (ids separated by commas or whitespace) or a comma-separated id list.
 
@@ -549,16 +552,152 @@ int mtp_exact(const std::string& artifact, const std::vector<std::string>& args)
 // cold prefill has no call boundary, and one from decode-computed state (d), may differ from the
 // cold run; those are reported with the first differing token, not failed. --mtp K runs both
 // Engines with MTP.
-//   ninfer_qwen4_exp_engine_real_test --cache [--mtp K] [--host-mib N] [--generate N]
+//   ninfer_qwen4_exp_engine_real_test --cache [--mtp K] [--host-mib N] [--nvme-mib N] [--generate N]
+//       (--nvme-mib: the NVMe tier, the Host tier its RAM cache; --host-mib 0 with it: disk only)
+int cache_check(const std::string& artifact, const std::vector<std::string>& args,
+                const std::vector<TokenId>& long_prompt, const std::vector<TokenId>& suffix,
+                const std::vector<TokenId>& tail);
+
+// Restart survival through the context store (--cache ... --store DIR, an empty directory):
+//   E1 (the configured tiers, the store): a: P cold, c: P + S (resumes at |P|); shut down, which
+//      writes the conversation to the store.
+//   E2 (same): restores it at start-up; c': P + S again must be an exact hit (reused |P + S|) with
+//      c's ids; x: P + S + U resumes at |P + S| from the restored checkpoint.
+//   Then one byte of the store's largest file is damaged.
+//   E3 (the RAM tier alone, the damaged store): restores nothing; a, c and x again, now from RAM: a
+//      and c must give E1's ids, and x must give E2's (restored from the store, and from NVMe when E2
+//      had --host-mib 0 --nvme-mib N, against restored from RAM).
+template <class Options>
+int restart_check(const Options& options, const std::filesystem::path& store, const std::vector<TokenId>& long_prompt,
+                  const std::vector<TokenId>& suffix, std::uint32_t tokens) {
+    std::error_code error;
+    if (std::filesystem::exists(store, error) && !std::filesystem::is_empty(store, error)) {
+        throw std::invalid_argument("--store needs an empty (or new) directory: " + store.string());
+    }
+    const auto concat = [](std::initializer_list<const std::vector<TokenId>*> parts) {
+        std::vector<TokenId> out;
+        for (const auto* part : parts) { out.insert(out.end(), part->begin(), part->end()); }
+        return out;
+    };
+    const std::vector<TokenId> P(long_prompt.begin(), long_prompt.begin() + 4'096);
+    const std::vector<TokenId> PS = concat({&P, &suffix});
+    const std::vector<TokenId> U(long_prompt.begin() + 4'096, long_prompt.begin() + 4'096 + 700);
+    const std::vector<TokenId> PSU = concat({&PS, &U});
+    const auto stored = [&](bool tiers) {
+        EngineOptions o                    = options(true);
+        o.context_store.directory          = store;
+        o.context_store.idle_persist       = std::chrono::seconds(0); // written at shutdown only
+        if (!tiers) {
+            o.context_cache.host_capacity_bytes = std::nullopt;
+            o.flash_next.context_nvme_bytes     = 0;
+        }
+        return o;
+    };
+    const auto step = [&](Engine& engine, const char* label, const std::vector<TokenId>& prompt, std::uint32_t reuse) {
+        Run r = generate_cached(engine, prompt, tokens);
+        print_run(label, r, prompt.size());
+        std::printf("%s: reused %u of %zu prompt tokens (expected %u), first token %.3f s\n", label, r.reused, prompt.size(),
+                    reuse, r.timings.first_token_seconds);
+        return r;
+    };
+    bool ok                 = true;
+    const auto expect_reuse = [&](const char* label, const Run& r, std::uint32_t reuse) {
+        if (r.reused != reuse) {
+            std::printf("FAIL: %s reused %u prompt tokens, expected %u\n", label, r.reused, reuse);
+            ok = false;
+        }
+    };
+    const double ram_before = available_ram_gib();
+    Run a1, c1, c2, x2;
+    {
+        Engine engine(stored(true));
+        a1 = step(engine, "E1 a: P (cold)", P, 0);
+        c1 = step(engine, "E1 c: P + S", PS, static_cast<std::uint32_t>(P.size()));
+        expect_reuse("E1 c", c1, static_cast<std::uint32_t>(P.size()));
+    }
+    std::size_t files = 0;
+    std::filesystem::path largest;
+    std::uintmax_t largest_bytes = 0;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(store)) {
+        if (!entry.is_regular_file()) { continue; }
+        ++files;
+        if (entry.file_size() > largest_bytes) {
+            largest_bytes = entry.file_size();
+            largest       = entry.path();
+        }
+    }
+    std::printf("store after E1: %zu files, the largest %.1f MiB\n", files, static_cast<double>(largest_bytes) / (1 << 20));
+    if (files == 0) {
+        std::printf("FAIL: shutdown wrote nothing to the store\n");
+        return 1;
+    }
+    wait_for_ram(ram_before);
+    {
+        const auto start = std::chrono::steady_clock::now();
+        Engine engine(stored(true));
+        const auto stats = engine.runtime_stats();
+        std::printf("E2: started in %.1f s, restored %llu session(s), %.0f MiB, in %.3f s\n",
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(),
+                    static_cast<unsigned long long>(stats.context_store_restored),
+                    static_cast<double>(stats.context_store_restored_bytes) / (1 << 20), stats.context_store_restore_seconds);
+        if (stats.context_store_restored == 0) {
+            std::printf("FAIL: E2 restored nothing from the store\n");
+            ok = false;
+        }
+        c2 = step(engine, "E2 c': P + S again (restored)", PS, static_cast<std::uint32_t>(PS.size()));
+        expect_reuse("E2 c'", c2, static_cast<std::uint32_t>(PS.size()));
+        ok = same("E2 c' against E1 c", c1.ids, c2.ids) && ok;
+        x2 = step(engine, "E2 x: P + S + U (resumes at |P + S|)", PSU, static_cast<std::uint32_t>(PS.size()));
+        expect_reuse("E2 x", x2, static_cast<std::uint32_t>(PS.size()));
+    }
+    {
+        // One damaged byte: the store must refuse the image (a checksum per chunk), never restore it.
+        std::fstream file(largest, std::ios::in | std::ios::out | std::ios::binary);
+        file.seekg(static_cast<std::streamoff>(largest_bytes / 2));
+        char byte = 0;
+        file.read(&byte, 1);
+        byte = static_cast<char>(byte ^ 0x5A);
+        file.seekp(static_cast<std::streamoff>(largest_bytes / 2));
+        file.write(&byte, 1);
+    }
+    wait_for_ram(ram_before);
+    {
+        Engine engine(stored(false));
+        const auto stats = engine.runtime_stats();
+        std::printf("E3 (RAM tier, damaged store): restored %llu session(s)\n",
+                    static_cast<unsigned long long>(stats.context_store_restored));
+        if (stats.context_store_restored != 0) {
+            std::printf("FAIL: a damaged store image was restored\n");
+            ok = false;
+        }
+        const Run a3 = step(engine, "E3 a: P (cold)", P, 0);
+        expect_reuse("E3 a", a3, 0);
+        ok = same("E3 a against E1 a", a1.ids, a3.ids) && ok;
+        const Run c3 = step(engine, "E3 c: P + S", PS, static_cast<std::uint32_t>(P.size()));
+        ok = same("E3 c against E1 c", c1.ids, c3.ids) && ok;
+        const Run x3 = step(engine, "E3 x: P + S + U (from RAM)", PSU, static_cast<std::uint32_t>(PS.size()));
+        expect_reuse("E3 x", x3, static_cast<std::uint32_t>(PS.size()));
+        ok = same("E2 x (restored from the store) against E3 x (from RAM)", x3.ids, x2.ids) && ok;
+    }
+    std::printf(ok ? "qwen4_exp context store restart checks passed\n" : "FAIL: qwen4_exp context store restart checks\n");
+    return ok ? 0 : 1;
+}
+
 int cache_check(const std::string& artifact, const std::vector<std::string>& args,
                 const std::vector<TokenId>& long_prompt, const std::vector<TokenId>& suffix,
                 const std::vector<TokenId>& tail) {
     std::uint32_t tokens = 32, mtp = 0, max_context = 16'384;
     std::optional<std::uint64_t> host;
+    std::uint64_t nvme = 0;
+    std::filesystem::path store;
     bool evict = false;
     for (std::size_t i = 0; i < args.size(); ++i) {
         if (args[i] == "--evict") {
             evict = true;
+            continue;
+        }
+        if (args[i] == "--store" && i + 1 < args.size()) {
+            store = args[++i];
             continue;
         }
         const auto value = [&] {
@@ -569,6 +708,8 @@ int cache_check(const std::string& artifact, const std::vector<std::string>& arg
             mtp = static_cast<std::uint32_t>(value());
         } else if (args[i] == "--host-mib") {
             host = value() << 20U;
+        } else if (args[i] == "--nvme-mib") {
+            nvme = value() << 20U;
         } else if (args[i] == "--generate") {
             tokens = static_cast<std::uint32_t>(value());
         } else if (args[i] == "--max-context") {
@@ -582,12 +723,14 @@ int cache_check(const std::string& artifact, const std::vector<std::string>& arg
         o.flash_next.save_expert_state       = false;
         o.context_cache.enabled              = cache;
         o.context_cache.host_capacity_bytes  = cache ? host : std::optional<std::size_t>(0);
+        o.flash_next.context_nvme_bytes      = cache ? nvme : 0;
         if (mtp > 0) {
             o.speculative.backend      = SpeculativeBackend::Mtp;
             o.speculative.draft_tokens = mtp;
         }
         return o;
     };
+    if (!store.empty()) { return restart_check(options, store, long_prompt, suffix, tokens); }
     const auto concat = [](std::initializer_list<const std::vector<TokenId>*> parts) {
         std::vector<TokenId> out;
         for (const auto* part : parts) { out.insert(out.end(), part->begin(), part->end()); }

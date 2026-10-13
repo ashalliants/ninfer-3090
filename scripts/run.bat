@@ -12,7 +12,8 @@ rem   qwen38-flash-next tuned (default)      <- Qwen3.8-Flash-Next from the IQ2_
 rem
 rem QWEN3.8-FLASH-NEXT: one request at a time, 32,768 tokens of context, INT8 KV, prefix reuse from
 rem a 4 GiB Host cache (a conversation's next turn prefills only what is new; NINFER_PREFIX_CACHE=off
-rem turns it off, NINFER_HOST_CONTEXT_MIB sizes it). MTP speculation (up to 3 drafts, 1.4x decode) is
+rem turns it off, NINFER_HOST_CONTEXT_MIB sizes it, NINFER_CONTEXT_NVME_MIB adds a disk tier,
+rem NINFER_CONTEXT_STORE keeps it across restarts). MTP speculation (up to 3 drafts, 1.4x decode) is
 rem on when the model is qwen4exp-iq2xs-mtp.ninfer or qwen4exp-iq2xs-mtp-vision.ninfer, preferred in
 rem that order (vision first) when they sit beside the plain qwen4exp-iq2xs.ninfer; NINFER_SPEC=none
 rem turns it off. Images are accepted with a -vision model (NINFER_VISION=off: text only). It pins all 33 GiB
@@ -414,8 +415,17 @@ if /i not "%FN_CACHE%"=="on" if /i not "%FN_CACHE%"=="off" (
 set "FN_CACHE_ARGS="
 set "FN_CACHE_LABEL=prefix cache"
 if not "%NINFER_HOST_CONTEXT_MIB%"=="" set "FN_CACHE_ARGS=--host-context-mib %NINFER_HOST_CONTEXT_MIB%"
+rem NINFER_CONTEXT_NVME_MIB=N also keeps checkpoints in a scratch file of up to N MiB beside the model
+rem (deleted at exit), the host cache its RAM cache; with NINFER_HOST_CONTEXT_MIB=0, disk only.
+if not "%NINFER_CONTEXT_NVME_MIB%"=="" set "FN_CACHE_ARGS=%FN_CACHE_ARGS% --context-nvme-mib %NINFER_CONTEXT_NVME_MIB%"
+if not "%NINFER_CONTEXT_NVME_MIB%"=="" set "FN_CACHE_LABEL=prefix cache + disk"
 if /i "%FN_CACHE%"=="off" set "FN_CACHE_ARGS=--host-context-mib 0"
 if /i "%FN_CACHE%"=="off" set "FN_CACHE_LABEL=no prefix cache"
+rem NINFER_CONTEXT_STORE=DIR keeps the conversations across restarts (--context-store); not with the
+rem cache off. The unquoted set form keeps metacharacters in the path inert (as below).
+set "STORE_ARGS="
+if /i "%FN_CACHE%"=="on" if not "%NINFER_CONTEXT_STORE%"=="" set STORE_ARGS=--context-store "%NINFER_CONTEXT_STORE%"
+if /i "%FN_CACHE%"=="on" if not "%NINFER_CONTEXT_STORE%"=="" if not "%NINFER_CONTEXT_STORE_MAX_GIB%"=="" set STORE_ARGS=%STORE_ARGS% --context-store-max-gib %NINFER_CONTEXT_STORE_MAX_GIB%
 set "PROFILE_ARGS=--max-concurrency 1 --max-context %CONTEXT% --kv-capacity %CONTEXT% --kv-dtype int8 --prefill-chunk 1024 --max-pending-requests 16 --pending-timeout-ms 600000 %SPEC_ARGS% %FN_VISION_ARGS% %FN_CACHE_ARGS%"
 set "LABEL=one request  ^|  context %CONTEXT%  ^|  INT8 KV  ^|  %FN_INPUT%, %SPEC_LABEL%  ^|  %FN_CACHE_LABEL%"
 if /i "%FN_VISION%"=="off" if "%NINFER_VISION%"=="" set "HINT=Images: convert with --mtp-gguf and --mmproj to qwen4exp-iq2xs-mtp-vision.ninfer (docs\weight-conversion.md); this launcher then uses it."

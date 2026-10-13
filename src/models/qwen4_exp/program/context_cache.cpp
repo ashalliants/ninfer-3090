@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace ninfer::models::qwen4_exp {
 namespace {
@@ -18,7 +19,62 @@ constexpr std::size_t kGatherPiece = 64 * 1024;
 // Host tier and descriptors are read through cudaHostGetDevicePointer by the gather kernel, so they
 // are allocated mapped (and portable), like PinnedHostBuffer in core/arena.cu.
 constexpr unsigned int kMappedPinned = cudaHostAllocPortable | cudaHostAllocMapped;
+
+std::byte* contiguous_address(const void* context, std::uint32_t slab) {
+    const auto* tier = static_cast<const std::pair<std::byte*, std::size_t>*>(context);
+    return tier->first + static_cast<std::size_t>(slab) * tier->second;
+}
 } // namespace
+
+void translate_slab_copies(std::span<const SlabCopy> copies, std::size_t slab_bytes, bool to_tier,
+                           SlabAddress address, const void* context, std::vector<GatherCopy>& out) {
+    for (const SlabCopy& c : copies) {
+        if (c.rows == 0 || c.width == 0) { continue; }
+        if (c.offset + c.width > slab_bytes || c.slab_pitch == 0) {
+            throw std::logic_error("context cache: a copy row runs outside its slab");
+        }
+        // Rows one per slab (a pitch of whole slabs), or all in the first slab.
+        const bool per_slab = c.slab_pitch % slab_bytes == 0;
+        const std::size_t stride = per_slab ? c.slab_pitch / slab_bytes : 0;
+        if (!per_slab && c.offset + (c.rows - 1) * c.slab_pitch + c.width > slab_bytes) {
+            throw std::logic_error("context cache: a copy's rows run past its slab");
+        }
+        std::byte* single = per_slab ? nullptr : address(context, c.slab);
+        const auto host_of = [&](std::size_t row) -> std::byte* {
+            if (!per_slab) { return single == nullptr ? nullptr : single + c.offset + row * c.slab_pitch; }
+            std::byte* base = address(context, static_cast<std::uint32_t>(c.slab + row * stride));
+            return base == nullptr ? nullptr : base + c.offset;
+        };
+        std::size_t row = 0;
+        while (row < c.rows) {
+            std::byte* first = host_of(row);
+            if (first == nullptr) {
+                if (!per_slab) { break; } // the whole copy lies in a slab this lookup does not hold
+                ++row;
+                continue;
+            }
+            std::size_t end = row + 1;
+            while (end < c.rows && host_of(end) == first + (end - row) * c.slab_pitch) { ++end; }
+            GatherCopy g;
+            g.width  = c.width;
+            g.height = end - row;
+            std::byte* device = c.device + row * c.device_pitch;
+            if (to_tier) {
+                g.destination       = first;
+                g.destination_pitch = c.slab_pitch;
+                g.source            = device;
+                g.source_pitch      = c.device_pitch;
+            } else {
+                g.destination       = device;
+                g.destination_pitch = c.device_pitch;
+                g.source            = first;
+                g.source_pitch      = c.slab_pitch;
+            }
+            out.push_back(g);
+            row = end;
+        }
+    }
+}
 
 HostTier::HostTier(std::uint32_t slabs, std::size_t slab_bytes, std::size_t descriptors)
     : slabs_(slabs), slab_bytes_(slab_bytes) {
@@ -54,27 +110,13 @@ void HostTier::copy(std::span<const SlabCopy> copies, bool to_tier, cudaStream_t
     std::vector<GatherCopy> gather;
     gather.reserve(copies.size());
     for (const SlabCopy& c : copies) {
-        if (c.slab >= slabs_ || c.offset + c.width > slab_bytes_ ||
-            c.offset + (c.rows - 1) * c.slab_pitch + c.width > (slabs_ - c.slab) * slab_bytes_) {
+        if (c.rows != 0 && (c.slab >= slabs_ || c.offset + c.width > slab_bytes_ ||
+                            c.offset + (c.rows - 1) * c.slab_pitch + c.width > (slabs_ - c.slab) * slab_bytes_)) {
             throw std::logic_error("context cache: a copy runs outside the Host tier");
         }
-        std::byte* host = static_cast<std::byte*>(memory_) + static_cast<std::size_t>(c.slab) * slab_bytes_ + c.offset;
-        GatherCopy g;
-        g.width  = c.width;
-        g.height = c.rows;
-        if (to_tier) {
-            g.destination       = host;
-            g.destination_pitch = c.slab_pitch;
-            g.source            = c.device;
-            g.source_pitch      = c.device_pitch;
-        } else {
-            g.destination       = c.device;
-            g.destination_pitch = c.device_pitch;
-            g.source            = host;
-            g.source_pitch      = c.slab_pitch;
-        }
-        gather.push_back(g);
     }
+    const std::pair<std::byte*, std::size_t> layout{static_cast<std::byte*>(memory_), slab_bytes_};
+    translate_slab_copies(copies, slab_bytes_, to_tier, &contiguous_address, &layout, gather);
     split_gather_copies(gather, kGatherPiece);
     if (gather.empty()) { return; }
     const std::size_t bytes = gather.size() * sizeof(GatherCopy);
@@ -145,6 +187,24 @@ std::vector<std::uint32_t> SlabRefs::take() noexcept {
     return out;
 }
 
+void HostTier::read(std::span<const std::uint32_t> slabs, std::span<std::byte> bytes) {
+    if (bytes.size() != slabs.size() * slab_bytes_) { throw std::logic_error("context cache: slab read size mismatch"); }
+    for (std::size_t i = 0; i < slabs.size(); ++i) {
+        if (slabs[i] >= slabs_) { throw std::logic_error("context cache: a slab outside the Host tier"); }
+        std::memcpy(bytes.data() + i * slab_bytes_, static_cast<const std::byte*>(memory_) + slabs[i] * slab_bytes_,
+                    slab_bytes_);
+    }
+}
+
+void HostTier::write(std::span<const std::uint32_t> slabs, std::span<const std::byte> bytes) {
+    if (bytes.size() != slabs.size() * slab_bytes_) { throw std::logic_error("context cache: slab write size mismatch"); }
+    for (std::size_t i = 0; i < slabs.size(); ++i) {
+        if (slabs[i] >= slabs_) { throw std::logic_error("context cache: a slab outside the Host tier"); }
+        std::memcpy(static_cast<std::byte*>(memory_) + slabs[i] * slab_bytes_, bytes.data() + i * slab_bytes_,
+                    slab_bytes_);
+    }
+}
+
 HostCheckpointStore::HostCheckpointStore(std::uint32_t slabs, std::size_t slab_bytes)
     : slab_bytes_(slab_bytes), references_(slabs, 0) {
     if (slab_bytes == 0) { throw std::invalid_argument("context cache slabs must have a size"); }
@@ -170,7 +230,10 @@ void HostCheckpointStore::retain(std::uint32_t slab) {
 
 void HostCheckpointStore::release(std::uint32_t slab) noexcept {
     if (slab >= references_.size() || references_[slab] == 0) { return; }
-    if (--references_[slab] == 0) { free_.push_back(slab); }
+    if (--references_[slab] == 0) {
+        free_.push_back(slab);
+        if (on_free_) { on_free_(slab); }
+    }
 }
 
 void HostCheckpointStore::release(std::span<const std::uint32_t> slabs) noexcept {

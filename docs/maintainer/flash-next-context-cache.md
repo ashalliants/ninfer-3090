@@ -11,7 +11,7 @@ contract in the Flash-Next Program. The Engine, ResourceManager and Scheduler ar
 ## What a checkpoint is
 
 A Flash-Next checkpoint is the lane's complete execution position at one token frontier F, held
-only in pinned Host memory:
+in pinned Host memory or in the NVMe tier's file (Storage tiers):
 
 | Part | Size (INT8 KV, MTP on) | Source |
 |---|---|---|
@@ -21,8 +21,8 @@ only in pinned Host memory:
 | BF16 logits of position F - 1, when F is the end of a prefill call | ~0.5 MiB | the last call's logits |
 | Identity: tokens `[0, F)`, three-axis positions, media items, rolling digests; `mtp_cells`, `history[F]` | host vectors | the request |
 
-Nothing lives in VRAM: the expert cache keeps every frame it had. A restore copies Host to the
-lane's own KV pool and state, so the source checkpoint is never written.
+Nothing lives in VRAM: the expert cache keeps every frame it had. A restore copies Host (or disk,
+through Host) to the lane's own KV pool and state, so the source checkpoint is never written.
 
 ## Host tier
 
@@ -43,30 +43,66 @@ lane's own KV pool and state, so the source checkpoint is never written.
 Capture and restore never name the memory a checkpoint lives in. They describe their copies as
 `SlabCopy` entries (a slab index and offset, a device region, rows and pitches) and hand them to a
 `CheckpointTier` (`program/context_cache.h`); `HostCheckpointStore` keeps the slab bookkeeping
-(records, shared pages, release quotes) independent of the tier. `HostTier` (pinned RAM, gather
-kernel) is the only tier built.
+(records, shared pages, release quotes) independent of the tier, and tells the tier when a slab's
+last reference goes. A tier also moves whole slabs to and from host memory (`read`, `write`), which
+is what checkpoint images use. Two tiers are built:
 
-Order of the tiers, each a separate step:
+1. **RAM** (`HostTier`): one pinned allocation of the Host budget, copied by the gather kernel. This
+   is the tier when no NVMe tier is configured.
+2. **NVMe** (`NvmeTier`, `program/nvme_tier.h`, `--context-nvme-mib N`): every slab is an offset in a
+   scratch file (`core/scratch_file.h`: unbuffered overlapped I/O, sparse, created at startup in
+   `--context-nvme-dir` or beside the model, deleted on close and by Windows when the process dies).
+   The Host budget becomes its RAM cache of *frames*:
+   - a capture gathers into frames and a writer thread writes them to the file at once
+     (write-through; SSD wear is not a concern). A frame is evictable as soon as its write lands, so
+     RAM never holds the only copy for long; the least recently used clean frame goes first;
+   - a capture larger than half the frames (or with no frames) gathers into a pinned bounce buffer
+     (128 MiB from the RAM ledger, two halves) and writes the file directly, one half's write
+     overlapping the next half's gather;
+   - a restore gathers the slabs RAM holds from their frames and reads the rest through the bounce
+     halves (8 requests of 4 MiB in flight), one half's reads overlapping the other's copy to the
+     device;
+   - images import through the file and keep what fits in frames (a hydrated session then restores
+     from RAM).
+   The Engine sees the file's size as the Host capacity (`host_bytes`), so the ResourceManager evicts
+   only when the file is full. The file is capped at half the volume's free space at startup.
 
-1. **RAM** (this change). Sized by the RAM ledger beside the experts.
-2. **Persistence on NVMe through the Engine's context store** (`--context-store`): implement
-   `export_checkpoints` / `checkpoint_image_host_bytes` / `import_checkpoints` for this Program, with
-   the Qwen3.5 Program's image container (magic and version, a configuration section, KV pages once
-   in first-reached order so successive images of a conversation share bytes in the
-   content-addressed store, the state images, exact identities, a point table, a trailing checksum)
-   and a Flash-Next configuration section (page record and state image layout, drafter on or off,
-   vision). The Engine's store plumbing (idle and shutdown writes, start-up and on-demand hydration,
-   S3 copies) is then reused unchanged. It imports into the RAM tier, so it needs a nonzero one.
-3. **An NVMe tier for little or no RAM**: a `CheckpointTier` whose slabs are offsets in a file on
-   local NVMe, moved through a small pinned bounce buffer (tens to a few hundred MiB from the
-   ledger). A 32K-token checkpoint (567 MiB) then restores in roughly 0.2-0.3 s at NVMe speed
-   instead of 13 s of prefill. Its byte layout is the same slab layout, so step 2's images can be
-   written from it without a second format.
+**A 0 GiB (or too small) Host budget** without an NVMe tier degrades, deliberately, to *prefix
+reuse off*: startup does not refuse; one line says the ledger had no room (or that
+`--host-context-mib 0` asked for none), requests prefill their whole prompts, and everything else
+runs as before. With an NVMe tier the same case is *disk-only reuse*: no frames, every capture and
+restore goes through the bounce buffer.
 
-**A 0 GiB (or too small) Host budget** degrades, deliberately, to *prefix reuse off*: startup does
-not refuse; one line says the ledger had no room (or that `--host-context-mib 0` asked for none),
-requests prefill their whole prompts, and everything else runs as before. With step 3 the same case
-becomes disk-only reuse.
+**Failures degrade to misses.** A capture whose bytes the tier cannot store (an I/O error, a full
+disk) is skipped (`start_capture` returns false; the Engine skips the group). A frame whose write
+failed stays resident (`stuck`) with the only good copy until its slab is freed. A restore the tier
+cannot read leaves the lane at the root: the request prefills its whole prompt (its begin summary
+reports 0 reused tokens). An import that cannot be stored returns nullopt (a miss) and keeps nothing.
+
+## Persistence (`--context-store`)
+
+`export_checkpoints`, `checkpoint_image_host_bytes` and `import_checkpoints`
+(`program/checkpoint_image.h`) write and read the Qwen3.5 Program's image container
+(`qwen3_5/program/storage/checkpoint_image_codec.h`, shared by both Programs): magic, a version of
+its own (`0x464E0001`, so neither Program's parser accepts the other's image), the model binding,
+then a Flash-Next configuration section (the five plane sizes per attention layer, the state block,
+the drafter's residual and the logits sizes, vision, the identity tag), the session, each exact
+identity once, a point table (role, frontier, full pages, the drafter's cells and next token, the
+logits flag, rope delta, page indices, key), then the payload: every KV page once in the order the
+points (deepest first) first reach them, every state image once, and a trailing checksum. Pages and
+state images are stored *compact* (planes back to back, none of a slab's alignment padding; logits
+never captured as zeros), so an image does not depend on where its slabs were and successive images
+of one conversation share their leading pages byte for byte in the content-addressed store. A
+shared prefix is exported alone, without a session (the rule the shared engine uses).
+
+Import checks the binding, the configuration and the checksum before it takes a slab, then the
+table bounds and each point's key against its identity, and the drafter's position (cells at the
+frontier or one behind; none without the drafter); any mismatch is `std::invalid_argument`, which
+the Engine counts as a foreign or damaged image. It imports into whichever tier is configured, so
+with an NVMe tier a 0 GiB Host budget still restores stored sessions.
+
+The Engine's store plumbing is reused: idle and shutdown writes, start-up restore, request-time
+hydration and S3 copies (`engine.cpp` now attaches the store to either generation core).
 
 ## Sharing
 
@@ -183,5 +219,6 @@ header), a few-token static call: +0.07 s on a 2.5K-token first turn (+6%) and +
 ## Status
 
 Done: the RAM tier, capture/restore/reclaim hooks, the launcher default (`NINFER_PREFIX_CACHE=off`
-opts out), real-model gates. Not built: `--context-store` and the NVMe tier (see Storage tiers),
-more than one lane (the handles, keys and mirror are per lane already).
+opts out), real-model gates; the NVMe tier and `--context-store` (Storage tiers, Persistence).
+Not built: more than one lane (the handles, keys and mirror are per lane already); retrying a failed
+frame write (a frame whose write failed stays in RAM until its slab is freed).

@@ -1,5 +1,6 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
+#include "models/qwen3_5/program/storage/checkpoint_image_codec.h"
 #include "core/device.h"
 #include "core/host_kv_arena.h"
 
@@ -53,111 +54,11 @@
 namespace ninfer::models::qwen3_5::detail {
 namespace {
 
-constexpr char kImageMagic[8]                   = {'N', 'I', 'N', 'F', 'C', 'K', 'P', 'T'};
-constexpr std::uint32_t kImageVersion           = 2;
-constexpr std::size_t kMaximumModelBindingBytes = 4096;
-constexpr std::uint32_t kMaximumImagePoints     = 64;
-
-class ImageWriter {
-public:
-    explicit ImageWriter(std::vector<std::uint8_t>& out) : out_(out) {}
-
-    void bytes(const void* data, std::size_t count) {
-        const auto* begin = static_cast<const std::uint8_t*>(data);
-        out_.insert(out_.end(), begin, begin + count);
-    }
-
-    template <class T>
-    void pod(T value) {
-        static_assert(std::is_trivially_copyable_v<T>);
-        bytes(&value, sizeof(T));
-    }
-
-    template <class T>
-    void vector(const std::vector<T>& values) {
-        static_assert(std::is_trivially_copyable_v<T>);
-        pod<std::uint64_t>(values.size());
-        bytes(values.data(), values.size() * sizeof(T));
-    }
-
-    // Sizes a payload region the caller fills once the whole image is sized, so no asynchronous
-    // copy records a destination the vector later reallocates away.
-    std::size_t reserve(std::size_t count) {
-        const std::size_t offset = out_.size();
-        out_.resize(out_.size() + count);
-        return offset;
-    }
-
-private:
-    std::vector<std::uint8_t>& out_;
-};
-
-class ImageReader {
-public:
-    explicit ImageReader(std::span<const std::uint8_t> data) : data_(data) {}
-
-    void bytes(void* out, std::size_t count) {
-        if (count > data_.size() - cursor_) {
-            throw std::invalid_argument("checkpoint image is truncated");
-        }
-        std::memcpy(out, data_.data() + cursor_, count);
-        cursor_ += count;
-    }
-
-    template <class T>
-    [[nodiscard]] T pod() {
-        static_assert(std::is_trivially_copyable_v<T>);
-        T value{};
-        bytes(&value, sizeof(T));
-        return value;
-    }
-
-    template <class T>
-    [[nodiscard]] std::vector<T> vector(std::size_t maximum, const char* label) {
-        static_assert(std::is_trivially_copyable_v<T>);
-        const auto count = pod<std::uint64_t>();
-        if (count > maximum) {
-            throw std::invalid_argument(std::string("checkpoint image ") + label +
-                                        " count is out of range");
-        }
-        std::vector<T> values(static_cast<std::size_t>(count));
-        bytes(values.data(), values.size() * sizeof(T));
-        return values;
-    }
-
-    [[nodiscard]] std::span<const std::uint8_t> payload(std::size_t count) {
-        if (count > data_.size() - cursor_) {
-            throw std::invalid_argument("checkpoint image payload is truncated");
-        }
-        const auto region = data_.subspan(cursor_, count);
-        cursor_ += count;
-        return region;
-    }
-
-    [[nodiscard]] std::size_t remaining() const noexcept { return data_.size() - cursor_; }
-
-private:
-    std::span<const std::uint8_t> data_;
-    std::size_t cursor_ = 0;
-};
-
-// Word-wise, so a multi-GB image hashes at memory speed. Not cryptographic: the store is trusted
-// local state and the threat is corruption, not tampering.
-std::uint64_t image_checksum(std::span<const std::uint8_t> bytes) {
-    std::uint64_t hash      = 0x9e3779b97f4a7c15ULL ^ static_cast<std::uint64_t>(bytes.size());
-    const std::size_t words = bytes.size() / sizeof(std::uint64_t);
-    for (std::size_t index = 0; index < words; ++index) {
-        std::uint64_t word = 0;
-        std::memcpy(&word, bytes.data() + index * sizeof(std::uint64_t), sizeof(word));
-        hash = (hash ^ word) * 0xff51afd7ed558ccdULL;
-        hash ^= hash >> 32U;
-    }
-    for (std::size_t index = words * sizeof(std::uint64_t); index < bytes.size(); ++index) {
-        hash = (hash ^ bytes[index]) * 0xc4ceb9fe1a85ec53ULL;
-        hash ^= hash >> 29U;
-    }
-    return hash;
-}
+constexpr std::uint32_t kImageVersion = 2;
+using image_codec::ImageReader;
+using image_codec::ImageWriter;
+using image_codec::kMaximumImagePoints;
+using image_codec::kMaximumModelBindingBytes;
 
 // Everything an importing Program must match for the payload bytes to mean the same thing.
 struct ImageConfig {
@@ -244,57 +145,6 @@ ImageConfig read_config(ImageReader& reader) {
     return config;
 }
 
-void write_vision_items(ImageWriter& writer, const std::vector<VisionItem>& items) {
-    writer.pod<std::uint32_t>(static_cast<std::uint32_t>(items.size()));
-    for (const VisionItem& item : items) {
-        writer.pod<std::uint8_t>(static_cast<std::uint8_t>(item.modality));
-        writer.pod<std::int32_t>(item.grid.temporal);
-        writer.pod<std::int32_t>(item.grid.height);
-        writer.pod<std::int32_t>(item.grid.width);
-        writer.pod<std::uint64_t>(item.patch_begin);
-        writer.pod<std::uint64_t>(item.patch_count);
-        writer.bytes(item.content_digest.data(), item.content_digest.size());
-        writer.vector(item.timestamps);
-        writer.pod<std::uint32_t>(static_cast<std::uint32_t>(item.token_spans.size()));
-        for (const TokenSpan& span : item.token_spans) {
-            writer.pod<std::uint64_t>(span.begin);
-            writer.pod<std::uint64_t>(span.count);
-        }
-    }
-}
-
-std::vector<VisionItem> read_vision_items(ImageReader& reader, std::size_t tokens) {
-    const auto count = reader.pod<std::uint32_t>();
-    if (count > tokens) {
-        throw std::invalid_argument("checkpoint image vision item count is out of range");
-    }
-    std::vector<VisionItem> items(count);
-    for (VisionItem& item : items) {
-        const auto modality = reader.pod<std::uint8_t>();
-        if (modality != static_cast<std::uint8_t>(PromptModality::Image) &&
-            modality != static_cast<std::uint8_t>(PromptModality::Video)) {
-            throw std::invalid_argument("checkpoint image vision item modality is invalid");
-        }
-        item.modality      = static_cast<PromptModality>(modality);
-        item.grid.temporal = reader.pod<std::int32_t>();
-        item.grid.height   = reader.pod<std::int32_t>();
-        item.grid.width    = reader.pod<std::int32_t>();
-        item.patch_begin   = static_cast<std::size_t>(reader.pod<std::uint64_t>());
-        item.patch_count   = static_cast<std::size_t>(reader.pod<std::uint64_t>());
-        reader.bytes(item.content_digest.data(), item.content_digest.size());
-        item.timestamps  = reader.vector<double>(tokens, "vision timestamp");
-        const auto spans = reader.pod<std::uint32_t>();
-        if (spans > tokens) {
-            throw std::invalid_argument("checkpoint image vision span count is out of range");
-        }
-        item.token_spans.resize(spans);
-        for (TokenSpan& span : item.token_spans) {
-            span.begin = static_cast<std::size_t>(reader.pod<std::uint64_t>());
-            span.count = static_cast<std::size_t>(reader.pod<std::uint64_t>());
-        }
-    }
-    return items;
-}
 
 struct HistoryRecord {
     std::uint32_t text_frontier = 0;
@@ -382,49 +232,17 @@ ImageConfig program_config(const ProgramImpl& program) {
 
 ParsedImage parse_image(const ProgramImpl& program, std::span<const std::uint8_t> image,
                         std::string_view binding) {
-    if (image.size() < sizeof(kImageMagic) + sizeof(std::uint64_t)) {
-        throw std::invalid_argument("checkpoint image is truncated");
-    }
-    const auto body              = image.first(image.size() - sizeof(std::uint64_t));
-    std::uint64_t stored_checksum = 0;
-    std::memcpy(&stored_checksum, image.data() + body.size(), sizeof(stored_checksum));
-    ImageReader reader(body);
-    char magic[sizeof(kImageMagic)] = {};
-    reader.bytes(magic, sizeof(magic));
-    if (std::memcmp(magic, kImageMagic, sizeof(magic)) != 0) {
-        throw std::invalid_argument("bytes are not a checkpoint image");
-    }
-    if (reader.pod<std::uint32_t>() != kImageVersion) {
-        throw std::invalid_argument("checkpoint image version is unsupported");
-    }
-    const auto binding_bytes = reader.pod<std::uint32_t>();
-    if (binding_bytes > kMaximumModelBindingBytes) {
-        throw std::invalid_argument("checkpoint image model binding is too long");
-    }
-    std::string stored_binding(binding_bytes, '\0');
-    reader.bytes(stored_binding.data(), binding_bytes);
-    if (stored_binding != binding) {
-        throw std::invalid_argument("checkpoint image was written for a different model");
-    }
+    auto head            = image_codec::read_head(image, kImageVersion, binding);
+    ImageReader& reader  = head.reader;
     if (read_config(reader) != program_config(program)) {
         throw std::invalid_argument(
             "checkpoint image KV, speculative or state configuration differs from this Program");
     }
     // Verified before anything is allocated or copied.
-    if (image_checksum(body) != stored_checksum) {
-        throw std::invalid_argument("checkpoint image is corrupt: checksum mismatch");
-    }
+    image_codec::verify_checksum(head);
 
     ParsedImage parsed;
-    if (reader.pod<std::uint8_t>() != 0) {
-        PreparedSessionKey key;
-        key.size = reader.pod<std::uint16_t>();
-        if (key.size == 0 || key.size > key.bytes.size()) {
-            throw std::invalid_argument("checkpoint image session key is out of range");
-        }
-        reader.bytes(key.bytes.data(), key.size);
-        parsed.session = key;
-    }
+    parsed.session = image_codec::read_session(reader);
     const auto identity_count = reader.pod<std::uint32_t>();
     const auto history_count  = reader.pod<std::uint32_t>();
     const auto text_pages     = reader.pod<std::uint32_t>();
@@ -442,29 +260,9 @@ ParsedImage parse_image(const ProgramImpl& program, std::span<const std::uint8_t
     const auto vocabulary =
         execution::dimension(program.parameters.model.resources().public_token_count);
     for (std::uint32_t index = 0; index < identity_count; ++index) {
-        auto backing    = std::make_shared<PreparedCaptureBacking>();
-        backing->ledger = reader.vector<TokenId>(capacity, "ledger");
-        for (const TokenId id : backing->ledger) {
-            if (id < 0 || id >= vocabulary) {
-                throw std::invalid_argument("checkpoint image ledger token is out of domain");
-            }
-        }
-        const std::size_t tokens = backing->ledger.size();
-        auto token_types         = reader.vector<std::uint8_t>(tokens, "token type");
-        std::array<std::vector<std::int32_t>, 3> positions;
-        for (auto& axis : positions) { axis = reader.vector<std::int32_t>(tokens, "position"); }
-        auto vision  = read_vision_items(reader, tokens);
-        auto rewrite = reader.vector<std::uint32_t>(tokens, "rewrite frontier");
-        if (token_types.size() != tokens) {
-            throw std::invalid_argument("checkpoint image identity does not match its ledger");
-        }
-        backing->prefix_identity.restore(std::move(token_types), std::move(positions),
-                                         std::move(vision), std::move(rewrite));
-        auto digests = reader.vector<std::array<std::uint64_t, 2>>(capacity + 1U, "digest");
-        if (digests.size() != tokens + 1U) {
-            throw std::invalid_argument("checkpoint image digests do not match their ledger");
-        }
-        backing->digests.restore(std::move(digests));
+        auto backing = std::make_shared<PreparedCaptureBacking>();
+        image_codec::read_identity(reader, capacity, vocabulary, backing->ledger,
+                                   backing->prefix_identity, backing->digests);
         parsed.identities.push_back(std::move(backing));
     }
 
@@ -700,16 +498,9 @@ CheckpointImage ProgramImpl::export_checkpoints(std::span<const CheckpointHandle
 
     CheckpointImage image;
     ImageWriter writer(image.bytes);
-    writer.bytes(kImageMagic, sizeof(kImageMagic));
-    writer.pod(kImageVersion);
-    writer.pod<std::uint32_t>(static_cast<std::uint32_t>(binding.size()));
-    writer.bytes(binding.data(), binding.size());
+    image_codec::write_head(writer, kImageVersion, binding);
     write_config(writer, config);
-    writer.pod<std::uint8_t>(session ? 1 : 0);
-    if (session) {
-        writer.pod<std::uint16_t>(session->size);
-        writer.bytes(session->bytes.data(), session->size);
-    }
+    image_codec::write_session(writer, session);
     writer.pod<std::uint32_t>(static_cast<std::uint32_t>(identities.size()));
     writer.pod<std::uint32_t>(static_cast<std::uint32_t>(histories.size()));
     writer.pod<std::uint32_t>(static_cast<std::uint32_t>(text_table.handles.size()));
@@ -717,14 +508,7 @@ CheckpointImage ProgramImpl::export_checkpoints(std::span<const CheckpointHandle
     writer.pod<std::uint32_t>(static_cast<std::uint32_t>(states.size()));
     writer.pod<std::uint32_t>(static_cast<std::uint32_t>(records.size()));
     for (const PreparedCaptureBacking* identity : identities) {
-        writer.vector(identity->ledger);
-        writer.vector(identity->prefix_identity.token_types());
-        for (std::size_t axis = 0; axis < 3; ++axis) {
-            writer.vector(identity->prefix_identity.position_axis(axis));
-        }
-        write_vision_items(writer, identity->prefix_identity.vision_items());
-        writer.vector(identity->prefix_identity.rewrite_execution_frontiers());
-        writer.vector(identity->digests.image());
+        image_codec::write_identity(writer, identity->ledger, identity->prefix_identity, identity->digests);
     }
     writer.bytes(text_table.columns.data(), text_table.columns.size() * sizeof(std::uint32_t));
     writer.bytes(backend_table.columns.data(),
@@ -829,9 +613,7 @@ CheckpointImage ProgramImpl::export_checkpoints(std::span<const CheckpointHandle
             CUDA_CHECK(cudaStreamSynchronize(streams[rank]));
         }
     }
-    const std::uint64_t checksum =
-        image_checksum(std::span<const std::uint8_t>(base, checksum_offset));
-    std::memcpy(base + checksum_offset, &checksum, sizeof(checksum));
+    image_codec::seal(image.bytes, checksum_offset);
 
     for (const PointRecord& point : records) { image.keys.push_back(point.key); }
     image.tokens = records.front().frontier;

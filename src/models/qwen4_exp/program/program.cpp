@@ -49,10 +49,12 @@
 #include "models/qwen4_exp/execution/vision.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 #include "models/qwen4_exp/model.h"
+#include "models/qwen4_exp/program/checkpoint_image.h"
 #include "models/qwen4_exp/program/context_cache.h"
 #include "models/qwen4_exp/program/expert_cache/expert_state.h"
 #include "models/qwen4_exp/program/expert_residency.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
+#include "models/qwen4_exp/program/nvme_tier.h"
 #include "models/qwen4_exp/program/rope_positions.h"
 #include "models/qwen4_exp/program/vram_monitor.h"
 #include "ninfer/ops/argmax.h"
@@ -77,6 +79,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 
 namespace ninfer::models::qwen4_exp {
 namespace detail {
@@ -822,7 +825,7 @@ public:
         warm_start_experts();
         device_.synchronize();
         report_startup();
-        if (options_.context_cache_bytes != 0) { setup_context_cache(); }
+        if (options_.context_cache_bytes != 0 || options_.context_nvme_bytes != 0) { setup_context_cache(); }
     }
 
     ~ProgramImpl() noexcept {
@@ -1097,18 +1100,7 @@ public:
         lane_.history       = *base.prompt;
         lane_.prompt_tokens = base.summary.prompt_tokens;
         lane_.rope          = LaneRope{base.rope_positions, lane_.prompt_tokens, base.rope_delta};
-        lane_.begin         = {.prompt_tokens        = lane_.prompt_tokens,
-                               .reused_prompt_tokens = lane_.reused,
-                               .prefix_reuse_path = lane_.reused != 0 ? PrefixReusePath::Checkpoint : PrefixReusePath::Root};
-        install_sampling(base.sampling);
-        lane_.mtp_accept.fill(kAcceptancePrior);
-        lane_.mtp_live = plan_.drafts > 0;
-        plan_lane_vision(base, lane_.reused);
-        if (base.reuse) {
-            for (const auto& group : base.captures) {
-                if (group.frontier > lane_.reused) { lane_.captures.push_back(group); }
-            }
-        }
+        // The restore first: a source the tier cannot read leaves the lane at the root (reused 0).
         if (lane_.source) {
             try {
                 restore(out);
@@ -1118,9 +1110,22 @@ public:
                 lane_ = Lane{.epoch = lane_.epoch};
                 throw;
             }
-        } else {
+        }
+        if (lane_.reused == 0) {
             // A fresh sequence: zero recurrent state (the KV is written before it is read).
             CUDA_CHECK(cudaMemsetAsync(state_backing_.p, 0, state_backing_.bytes, device_.stream));
+        }
+        lane_.begin = {.prompt_tokens        = lane_.prompt_tokens,
+                       .reused_prompt_tokens = lane_.reused,
+                       .prefix_reuse_path    = lane_.reused != 0 ? PrefixReusePath::Checkpoint : PrefixReusePath::Root};
+        install_sampling(base.sampling);
+        lane_.mtp_accept.fill(kAcceptancePrior);
+        lane_.mtp_live = plan_.drafts > 0;
+        plan_lane_vision(base, lane_.reused);
+        if (base.reuse) {
+            for (const auto& group : base.captures) {
+                if (group.frontier > lane_.reused) { lane_.captures.push_back(group); }
+            }
         }
         lane_.cache_at_admission = residency_->stats();
         lane_.ngram_at_admission = volume_.counters();
@@ -1709,13 +1714,58 @@ public:
             slabs = SlabRefs(*cache_, std::move(*got));
         }
         const auto start = Clock::now();
-        auto r           = capture_record(std::move(slabs), true);
+        std::optional<HostCheckpoint> captured;
+        try {
+            captured = capture_record(std::move(slabs), true);
+        } catch (const std::system_error& error) {
+            // The tier could not store the bytes (an NVMe tier's I/O failure, a full disk): the
+            // Engine skips the group, and a later request prefills what this checkpoint would have
+            // saved.
+            diagnostic(std::string("context cache: a capture failed (") + error.what() + "); skipped");
+            return false;
+        }
+        auto r           = std::move(*captured);
         r.identity       = lane_.base->identity;
         captured_        = cache_->insert_group(std::move(r), group.roles);
         tx_              = Tx::Capture; // the transaction owns captured_ from here (abandon_capture)
         lane_.captured   = std::max(lane_.captured, group.frontier);
         record_capture(start, group.frontier);
         return true;
+    }
+
+    // ---------------------------------------------------------------- context store images
+    CheckpointImage export_checkpoints(std::span<const CheckpointHandle> points,
+                                       const std::optional<PreparedSessionKey>& session, std::string_view binding) const {
+        if (tx_ != Tx::None || pending_ != 0) {
+            throw std::logic_error("checkpoints cannot be exported during a context transaction");
+        }
+        if (!cache_) { throw std::invalid_argument("Qwen3.8-Flash-Next: the context cache is off"); }
+        return export_checkpoint_image(*cache_, *tier_, layout_, points, session, binding);
+    }
+
+    std::size_t checkpoint_image_host_bytes(std::span<const std::uint8_t> image, std::string_view binding) const {
+        if (!cache_) { throw std::invalid_argument("Qwen3.8-Flash-Next: the context cache is off"); }
+        return checkpoint_image_slab_bytes(layout_, image, binding);
+    }
+
+    std::optional<ImportedCheckpoints> import_checkpoints(std::span<const std::uint8_t> image, std::string_view binding) {
+        if (tx_ != Tx::None || pending_ != 0) {
+            throw std::logic_error("checkpoints cannot be imported during a context transaction");
+        }
+        if (!cache_) { throw std::invalid_argument("Qwen3.8-Flash-Next: the context cache is off"); }
+        const auto start = Clock::now();
+        auto imported    = import_checkpoint_image(*cache_, *tier_, layout_, image, binding);
+        char line[200];
+        if (imported) {
+            std::snprintf(line, sizeof(line), "context cache: imported %zu checkpoint(s) (%.0f MiB image) in %.1f ms",
+                          imported->points.size(), static_cast<double>(image.size()) / (1 << 20),
+                          static_cast<double>(elapsed_ns(start)) * 1e-6);
+        } else {
+            std::snprintf(line, sizeof(line), "context cache: a %.0f MiB image did not fit or could not be stored",
+                          static_cast<double>(image.size()) / (1 << 20));
+        }
+        diagnostic(line);
+        return imported;
     }
 
     MemorySummary memory() const noexcept {
@@ -1974,15 +2024,27 @@ private:
     }
 
     // Restores the binding's source into the lane (pages, state image, the drafter's position,
-    // the mirror) and settles its reader leases, the consumed source and the carried points.
+    // the mirror) and settles its reader leases, the consumed source and the carried points. When
+    // the tier cannot read the bytes (an NVMe tier's I/O failure) the lane starts from the root
+    // instead (lane_.reused = 0): the request prefills its whole prompt.
     void restore(ContextProgress& out) {
         const auto start             = Clock::now();
         const HostCheckpoint& source = cache_->at(*lane_.source);
         const std::uint32_t frontier = source.frontier;
+        const auto before            = nvme_ != nullptr ? nvme_->stats() : NvmeTier::Stats{};
         copies_.clear();
         add_page_copies(source.pages, 0);
         add_image_copies(source.image, source.logits);
-        run_copies(false);
+        try {
+            run_copies(false);
+        } catch (const std::system_error& error) {
+            copies_.clear();
+            diagnostic(std::string("context cache: a restore could not be read (") + error.what() +
+                       "); the request prefills its whole prompt");
+            lane_.reused = 0;
+            settle_source(out);
+            return;
+        }
         device_.synchronize();
         const std::uint64_t ns = elapsed_ns(start);
         lane_.state_tokens     = frontier;
@@ -2023,8 +2085,28 @@ private:
         ++restores_;
         restore_ns_ += ns;
         restored_bytes_ += image_bytes_ + kv_bytes;
-        // Carried points: the same handles when this request takes them over, else copies the new
-        // owner holds (the old owner keeps its own).
+        std::string split;
+        if (nvme_ != nullptr) {
+            const auto after = nvme_->stats();
+            const double slab = static_cast<double>(cache_->slab_bytes()) / (1 << 20);
+            char text[120];
+            std::snprintf(text, sizeof(text), "; %.0f MiB from RAM, %.0f MiB from NVMe",
+                          static_cast<double>(after.slabs_from_ram - before.slabs_from_ram) * slab,
+                          static_cast<double>(after.slabs_read - before.slabs_read) * slab);
+            split = text;
+        }
+        settle_source(out);
+        char line[300];
+        std::snprintf(line, sizeof(line), "context cache: resumed at %u of %u prompt tokens (%.0f MiB restored in %.1f ms%s)",
+                      frontier, lane_.prompt_tokens, static_cast<double>(image_bytes_ + kv_bytes) / (1 << 20),
+                      static_cast<double>(ns) * 1e-6, split.c_str());
+        diagnostic(line);
+    }
+
+    // The binding's bookkeeping once its restore was tried: the carried points (the same handles when
+    // this request takes them over, else copies the new owner holds; the old owner keeps its own),
+    // the reader leases, the retired points and the consumed source.
+    void settle_source(ContextProgress& out) {
         const auto source_handle = *lane_.source;
         if (lane_.take_private) {
             out.private_points = lane_.carried;
@@ -2043,11 +2125,6 @@ private:
         unpin_binding();
         out.retired_checkpoints = lane_.retired;
         if (lane_.consume_source && cache_->erase(source_handle)) { out.retired_checkpoints.push_back(source_handle); }
-        char line[200];
-        std::snprintf(line, sizeof(line), "context cache: resumed at %u of %u prompt tokens (%.0f MiB restored in %.1f ms)",
-                      frontier, lane_.prompt_tokens, static_cast<double>(image_bytes_ + kv_bytes) / (1 << 20),
-                      static_cast<double>(ns) * 1e-6);
-        diagnostic(line);
     }
 
     // Host tier occupancy split for observation: checkpoints (as state images) and KV page bytes.
@@ -2143,9 +2220,10 @@ private:
         copies_.clear();
     }
 
-    // Sizes and pins the Host tier: the page record (every attention layer's five planes of one
-    // page), the state image, the slabs and the descriptor buffer. A tier that cannot be pinned
-    // leaves prefix reuse off and says so.
+    // Sizes and opens the tier: the page record (every attention layer's five planes of one page),
+    // the state image, the slabs and the descriptor buffer; the NVMe tier when one is configured (its
+    // RAM cache the Host bytes), else the pinned Host tier. An NVMe tier that cannot be opened falls
+    // back to the Host tier; a tier that cannot be pinned leaves prefix reuse off. Each says so.
     void setup_context_cache() {
         std::size_t at = 0;
         page_kv_bytes_ = 0;
@@ -2164,23 +2242,62 @@ private:
         image_logits_            = image_saved_ + (plan_.drafts > 0 ? align(2ULL * c_.residual_width()) : 0);
         image_bytes_             = image_logits_ + 2ULL * c_.vocab_size;
         image_slabs_             = static_cast<std::uint32_t>((image_bytes_ + record - 1) / record);
-        const auto slabs         = static_cast<std::uint32_t>(options_.context_cache_bytes / record);
-        if (slabs < 2 * image_slabs_) {
-            diagnostic("context cache: a Host tier of " + std::to_string(options_.context_cache_bytes >> 20) +
-                       " MiB cannot hold two checkpoints; prefix reuse is off");
-            return;
-        }
+        const auto ram_slabs     = static_cast<std::uint32_t>(options_.context_cache_bytes / record);
+        const auto disk_slabs    = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(options_.context_nvme_bytes / record, std::numeric_limits<std::uint32_t>::max() / 2));
         const auto start = Clock::now();
-        // The gather descriptors of the largest copy: every page of the context, and an image.
-        const std::size_t descriptors =
-            static_cast<std::size_t>(plan_.pages) * plan_.kv.layers.size() * 5 + image_bytes_ / kGatherPiece + 8 * image_slabs_ + 64;
-        try {
-            tier_ = std::make_unique<HostTier>(slabs, record, descriptors);
-        } catch (const std::exception& error) {
-            diagnostic(std::string("context cache: could not pin its Host tier (") + error.what() + "); prefix reuse is off");
-            return;
+        std::uint32_t slabs = 0;
+        std::string where;
+        if (disk_slabs >= 2 * image_slabs_) {
+            try {
+                NvmeTier::Options tier;
+                tier.slabs        = disk_slabs;
+                tier.slab_bytes   = record;
+                tier.frames       = ram_slabs;
+                tier.bounce_slabs = static_cast<std::uint32_t>(std::max<std::uint64_t>(1, options_.context_bounce_bytes / 2 / record));
+                auto file =
+                    open_scratch_tier_file(options_.context_nvme_path, static_cast<std::uint64_t>(disk_slabs) * record);
+                auto nvme = std::make_unique<NvmeTier>(tier, std::move(file));
+                nvme_     = nvme.get();
+                tier_     = std::move(nvme);
+                slabs     = disk_slabs;
+                char line[400];
+                std::snprintf(line, sizeof(line), "an NVMe tier of %.1f GiB (%s, removed at exit) behind %.2f GiB of pinned RAM",
+                              static_cast<double>(disk_slabs) * record / (1ULL << 30), options_.context_nvme_path.string().c_str(),
+                              static_cast<double>(ram_slabs) * record / (1ULL << 30));
+                where = line;
+            } catch (const std::exception& error) {
+                diagnostic(std::string("context cache: could not open its NVMe tier (") + error.what() +
+                           "); checkpoints stay in RAM only");
+            }
+        } else if (options_.context_nvme_bytes != 0) {
+            diagnostic("context cache: an NVMe tier of " + std::to_string(options_.context_nvme_bytes >> 20) +
+                       " MiB cannot hold two checkpoints; checkpoints stay in RAM only");
+        }
+        if (!tier_) {
+            if (ram_slabs < 2 * image_slabs_) {
+                if (options_.context_cache_bytes != 0) {
+                    diagnostic("context cache: a Host tier of " + std::to_string(options_.context_cache_bytes >> 20) +
+                               " MiB cannot hold two checkpoints; prefix reuse is off");
+                }
+                return;
+            }
+            // The gather descriptors of the largest copy: every page of the context, and an image.
+            const std::size_t descriptors =
+                static_cast<std::size_t>(plan_.pages) * plan_.kv.layers.size() * 5 + image_bytes_ / kGatherPiece + 8 * image_slabs_ + 64;
+            try {
+                tier_ = std::make_unique<HostTier>(ram_slabs, record, descriptors);
+            } catch (const std::exception& error) {
+                diagnostic(std::string("context cache: could not pin its Host tier (") + error.what() + "); prefix reuse is off");
+                return;
+            }
+            slabs = ram_slabs;
+            char line[200];
+            std::snprintf(line, sizeof(line), "%.2f GiB pinned Host tier", static_cast<double>(ram_slabs) * record / (1ULL << 30));
+            where = line;
         }
         cache_ = std::make_unique<HostCheckpointStore>(slabs, record);
+        cache_->on_free([tier = tier_.get()](std::uint32_t slab) { tier->discard(slab); });
         // The configuration a checkpoint belongs to: its page record and state image layout.
         std::uint64_t tag = 1469598103934665603ULL;
         for (const std::uint64_t v : {std::uint64_t{record}, std::uint64_t{plan_.state}, std::uint64_t{image_bytes_},
@@ -2189,12 +2306,30 @@ private:
             tag = (tag ^ v) * 1099511628211ULL;
         }
         identity_tag_ = static_cast<std::uint32_t>(tag ^ (tag >> 32));
-        char line[320];
+        // What a checkpoint image must match (checkpoint_image.h).
+        layout_               = CheckpointLayout{};
+        layout_.slab_bytes    = record;
+        layout_.plane_offsets = record_planes_;
+        for (const auto& planes : plan_.kv.layers) {
+            std::array<std::size_t, 5> bytes{};
+            for (std::size_t p = 0; p < 5; ++p) { bytes[p] = planes[p].page_bytes; }
+            layout_.plane_bytes.push_back(bytes);
+        }
+        layout_.state_bytes     = plan_.state;
+        layout_.residual_offset = image_saved_;
+        layout_.residual_bytes  = plan_.drafts > 0 ? 2ULL * c_.residual_width() : 0;
+        layout_.logits_offset   = image_logits_;
+        layout_.logits_bytes    = 2ULL * c_.vocab_size;
+        layout_.image_slabs     = image_slabs_;
+        layout_.vision          = options_.vision;
+        layout_.identity_tag    = identity_tag_;
+        layout_.capacity        = options_.max_context;
+        layout_.vocabulary      = plan_.token_domain;
+        char line[700];
         std::snprintf(line, sizeof(line),
-                      "context cache: %.2f GiB pinned Host tier (%u slabs of %zu KiB, pinned in %.1f s); a checkpoint is "
+                      "context cache: %s (%u slabs of %zu KiB, ready in %.1f s); a checkpoint is "
                       "%.0f MiB of state plus %.2f MiB per 64 tokens of KV (a 32K-token one %.0f MiB)",
-                      static_cast<double>(cache_->capacity_bytes()) / (1ULL << 30), slabs, record >> 10,
-                      std::chrono::duration<double>(Clock::now() - start).count(),
+                      where.c_str(), slabs, record >> 10, std::chrono::duration<double>(Clock::now() - start).count(),
                       static_cast<double>(image_slabs_) * record / (1 << 20), static_cast<double>(record) / (1 << 20),
                       (static_cast<double>(image_slabs_) + 512.0) * record / (1 << 20));
         diagnostic(line);
@@ -3796,7 +3931,9 @@ private:
     // saved residual, the logits) and slab count, the configuration tag every key carries, the
     // capture transaction's checkpoints, the gather's descriptors, and counters.
     std::unique_ptr<CheckpointTier> tier_;
+    NvmeTier* nvme_ = nullptr; // tier_ when it is the NVMe tier
     std::unique_ptr<HostCheckpointStore> cache_;
+    CheckpointLayout layout_;  // the checkpoint images' layout
     std::vector<std::array<std::size_t, 5>> record_planes_;
     std::size_t page_kv_bytes_ = 0;
     std::size_t image_saved_ = 0, image_logits_ = 0, image_bytes_ = 0;
@@ -4000,17 +4137,17 @@ void Program::fail_all_cleanup() noexcept { impl_->fail_all_cleanup(); }
 PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->usage(); }
 MemorySummary Program::memory_summary() const noexcept { return impl_->memory(); }
 
-CheckpointImage Program::export_checkpoints(std::span<const CheckpointHandle>, const std::optional<PreparedSessionKey>&,
-                                            std::string_view) const {
-    throw std::logic_error("Qwen3.8-Flash-Next has no context store");
+CheckpointImage Program::export_checkpoints(std::span<const CheckpointHandle> points,
+                                            const std::optional<PreparedSessionKey>& session, std::string_view binding) const {
+    return impl_->export_checkpoints(points, session, binding);
 }
 
-std::size_t Program::checkpoint_image_host_bytes(std::span<const std::uint8_t>, std::string_view) const {
-    throw std::invalid_argument("Qwen3.8-Flash-Next has no context store");
+std::size_t Program::checkpoint_image_host_bytes(std::span<const std::uint8_t> image, std::string_view binding) const {
+    return impl_->checkpoint_image_host_bytes(image, binding);
 }
 
-std::optional<ImportedCheckpoints> Program::import_checkpoints(std::span<const std::uint8_t>, std::string_view) {
-    throw std::invalid_argument("Qwen3.8-Flash-Next has no context store");
+std::optional<ImportedCheckpoints> Program::import_checkpoints(std::span<const std::uint8_t> image, std::string_view binding) {
+    return impl_->import_checkpoints(image, binding);
 }
 
 } // namespace ninfer::models::qwen4_exp

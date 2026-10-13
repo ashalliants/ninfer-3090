@@ -301,6 +301,13 @@ struct FlashNextOptions {
     // relative to a plain round, and a measurement mode that always drafts --draft-tokens.
     double mtp_width_cost = 0.38;
     bool mtp_fixed_drafts = false;
+    // The context cache's NVMe tier: a scratch file of up to this many bytes holds the checkpoints,
+    // with the Host context budget as its RAM cache (a zero Host budget then reuses prefixes from
+    // disk alone); 0: none. The file is created in `context_nvme_dir` (empty: beside the artifact),
+    // grows with what is written, and is removed at exit. Its size is capped at half the volume's
+    // free space at startup.
+    std::uint64_t context_nvme_bytes = 0;
+    std::filesystem::path context_nvme_dir;
 };
 
 struct EngineOptions {

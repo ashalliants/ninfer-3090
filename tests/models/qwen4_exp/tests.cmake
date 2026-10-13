@@ -60,10 +60,18 @@ ninfer_add_test(ninfer_qwen4_exp_memory_plan_test
   LIBRARIES ninfer_model_loading ninfer_core)
 
 # Host only: the context cache's Host tier (slabs, checkpoints sharing KV pages, release quotes and
-# sets, lineage recovery loss) and the RAM ledger's sizing of it beside the experts.
+# sets, lineage recovery loss), the RAM ledger's sizing of it beside the experts, and the context
+# store's checkpoint images (round trip, refusals, no-room and failing-tier misses).
 ninfer_add_test(ninfer_qwen4_exp_context_cache_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_context_cache.cpp"
   LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_core)
+
+# GPU, no artifact: the context cache's NVMe tier on a scratch file (RAM frames, write-through and
+# eviction, direct captures, host I/O, a failing disk, no frames); --bench DIR [MiB] measures it.
+ninfer_add_test(ninfer_qwen4_exp_nvme_tier_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_nvme_tier.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_core)
+set_tests_properties(ninfer_qwen4_exp_nvme_tier_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu")
 
 # GPU, real artifact (skips without NINFER_TEST_QWEN4EXP_ARTIFACT): the M1 gates through the public
 # Engine (placement invariance across cold, warm, warm-started and small expert caches; the RAM

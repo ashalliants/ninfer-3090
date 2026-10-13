@@ -27,11 +27,11 @@ add_library(ninfer_core STATIC
   vram_budget.cpp
 )
 if(WIN32)
-  target_sources(ninfer_core PRIVATE read_only_file_win32.cpp)
+  target_sources(ninfer_core PRIVATE read_only_file_win32.cpp scratch_file_win32.cpp)
   # vram_budget.cpp reads the OS video-memory budget through DXGI.
   target_link_libraries(ninfer_core PRIVATE dxgi)
 else()
-  target_sources(ninfer_core PRIVATE read_only_file_posix.cpp)
+  target_sources(ninfer_core PRIVATE read_only_file_posix.cpp scratch_file_posix.cpp)
   # vram_budget.cpp loads libnvidia-ml.so.1 via dlopen/dlsym/dlclose.
   target_link_libraries(ninfer_core PRIVATE ${CMAKE_DL_LIBS})
 endif()

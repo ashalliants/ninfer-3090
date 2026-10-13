@@ -3,11 +3,12 @@
 // Adapted from Infernix a3edb450 src/models/qwen4_exp/program/program.h (Apache-2.0).
 // Modified for NInfer-3090: implements NInfer's Engine execution contract (the one EngineCore,
 // Scheduler and ResourceManager drive for Qwen3.5) instead of Infernix's hybrid-cache contract:
-// prefix reuse through NInfer's context cache with checkpoints held only in a pinned Host tier
+// prefix reuse through NInfer's context cache with checkpoints in a pinned Host tier or an NVMe tier
+// behind a RAM cache, persisted by the Engine's context store
 // (docs/maintainer/flash-next-context-cache.md), one lane, MTP speculation (Infernix's drafter,
 // verification and commit), image input (Infernix's vision program: the tower encodes in frames
 // lent by the expert cache at the prompt's first prefill unit, the handoff stays lent until the
-// prompt's last call), no n-gram copy drafts, CPU-served misses or SSD tier.
+// prompt's last call), no n-gram copy drafts, CPU-served misses or SSD expert tier.
 //
 // The Qwen4Exp Program: the Engine-facing execution of Qwen3.8-Flash-Next. It owns the lane, its
 // paged INT8 KV (an elastic VMM pool), recurrent state, sampling state and the one pending model
@@ -367,8 +368,15 @@ struct ProgramOptions {
     // by the expert cache (its io words are planned only when set).
     bool vision = false;
     // The context cache's pinned Host tier (checkpoints for prefix reuse), sized by the startup RAM
-    // ledger; 0: no prefix reuse.
+    // ledger. Without an NVMe tier it holds every checkpoint (0: no prefix reuse); with one it is
+    // the NVMe tier's RAM cache (0: disk-only reuse).
     std::uint64_t context_cache_bytes = 0;
+    // The context cache's NVMe tier (program/nvme_tier.h): a scratch file of this many bytes at
+    // context_nvme_path holds every checkpoint, created at startup and removed at exit; 0: none.
+    // Its pinned bounce buffer (both halves) is context_bounce_bytes.
+    std::uint64_t context_nvme_bytes = 0;
+    std::filesystem::path context_nvme_path;
+    std::uint64_t context_bounce_bytes = 128ULL << 20;
 };
 
 class Program {
@@ -481,14 +489,16 @@ public:
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept {}
-    // The context store (checkpoint images on disk) is not built for this model: the Engine refuses
-    // --context-store for it, so these are never reached.
-    [[nodiscard]] CheckpointImage export_checkpoints(std::span<const CheckpointHandle>,
-                                                     const std::optional<PreparedSessionKey>&,
+    // The context store's checkpoint images (program/checkpoint_image.h). Export and import require
+    // no open context transaction or pending unit; an image binds to this Program's page and state
+    // layout and to the caller's model binding, and import rejects any other with
+    // std::invalid_argument. Import returns nullopt when the cache has no room for it now.
+    [[nodiscard]] CheckpointImage export_checkpoints(std::span<const CheckpointHandle> points,
+                                                     const std::optional<PreparedSessionKey>& session,
                                                      std::string_view binding) const;
-    [[nodiscard]] std::size_t checkpoint_image_host_bytes(std::span<const std::uint8_t>, std::string_view) const;
-    [[nodiscard]] std::optional<ImportedCheckpoints> import_checkpoints(std::span<const std::uint8_t>,
-                                                                        std::string_view);
+    [[nodiscard]] std::size_t checkpoint_image_host_bytes(std::span<const std::uint8_t> image, std::string_view binding) const;
+    [[nodiscard]] std::optional<ImportedCheckpoints> import_checkpoints(std::span<const std::uint8_t> image,
+                                                                        std::string_view binding);
 
 private:
     std::unique_ptr<detail::ProgramImpl> impl_;

@@ -2,7 +2,8 @@
 // Modified for NInfer-3090: full RAM mode only (no SSD tier: a ledger that cannot hold every expert
 // refuses); MTP speculation through the artifact's drafter (--spec mtp); image input through the
 // artifact's vision tower (--vision: host-pinned, streamed per encode into lent expert frames);
-// prefix reuse through NInfer's context cache with a pinned Host tier sized by the RAM ledger
+// prefix reuse through NInfer's context cache with a pinned Host tier sized by the RAM ledger, an
+// optional NVMe tier behind it and the Engine's context store
 // (docs/maintainer/flash-next-context-cache.md); no n-gram drafts; the options NInfer's serving can
 // set that this model does not support are refused with the flag to change; NInfer's startup phases.
 
@@ -22,9 +23,17 @@
 
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
+
+#ifdef _WIN32
+#    include <process.h>
+#else
+#    include <unistd.h>
+#endif
 
 namespace ninfer::runtime {
 namespace {
@@ -46,6 +55,10 @@ constexpr std::uint64_t kMaxByteOption = 1ULL << 40;
 constexpr std::uint64_t kDefaultHostContextBytes = 4ULL << 30;
 constexpr std::uint64_t kMinimumHostContextBytes = 512ULL << 20;
 constexpr std::uint64_t kHostContextGranule      = 64ULL << 20;
+// The context cache's NVMe tier: its pinned bounce buffer (both halves), and the share of the
+// volume's free space it may take at most.
+constexpr std::uint64_t kNvmeBounceBytes      = 128ULL << 20;
+constexpr std::uint64_t kNvmeFreeSpaceDivisor = 2;
 
 unsigned long long mib(std::uint64_t bytes) { return static_cast<unsigned long long>(bytes >> 20); }
 
@@ -54,8 +67,38 @@ void report(const std::string& text) {
     std::fflush(stderr);
 }
 
+unsigned long process_id() noexcept {
+#ifdef _WIN32
+    return static_cast<unsigned long>(_getpid());
+#else
+    return static_cast<unsigned long>(::getpid());
+#endif
+}
+
+// The NVMe tier's file and size: in --context-nvme-dir (else beside the artifact), named for the
+// artifact and this process, at most half the volume's free space. Zero bytes: no NVMe tier.
+std::pair<std::filesystem::path, std::uint64_t> plan_nvme_tier(const EngineOptions& options) {
+    const auto& next = options.flash_next;
+    if (!options.context_cache.enabled || next.context_nvme_bytes == 0) { return {{}, 0}; }
+    const std::filesystem::path artifact = std::filesystem::absolute(options.artifact_path);
+    const std::filesystem::path dir      = next.context_nvme_dir.empty() ? artifact.parent_path() : next.context_nvme_dir;
+    std::error_code error;
+    if (!std::filesystem::is_directory(dir, error)) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next: --context-nvme-dir is not a directory: " + dir.string());
+    }
+    std::uint64_t bytes = next.context_nvme_bytes;
+    const auto space    = std::filesystem::space(dir, error);
+    if (!error && space.available / kNvmeFreeSpaceDivisor < bytes) {
+        bytes = space.available / kNvmeFreeSpaceDivisor;
+        report("context cache: NVMe tier capped at " + std::to_string(mib(bytes)) + " MiB (asked " +
+               std::to_string(mib(next.context_nvme_bytes)) + "), half the free space on " + dir.string());
+    }
+    return {dir / (artifact.filename().string() + ".context-" + std::to_string(process_id()) + ".tier"), bytes};
+}
+
 // What this release of the model serves: one request at a time (text, or text and images with
-// --vision), plain or MTP decode, INT8 KV, prefix reuse from a Host-only context cache. Every option
+// --vision), plain or MTP decode, INT8 KV, prefix reuse from a Host and NVMe context cache that the
+// context store can persist. Every option
 // a user can set otherwise is refused with what to change.
 void validate(const EngineOptions& options) {
     const auto refuse = [](const std::string& why) {
@@ -115,9 +158,7 @@ void validate(const EngineOptions& options) {
     // honored; more than one entry, or per-stage layer counts, would need pipeline stages.
     if (options.devices.size() > 1) { refuse("runs on one GPU: pass a single id to --devices"); }
     if (!options.stage_layers.empty()) { refuse("runs on one GPU with no pipeline stages: remove --stage-layers"); }
-    if (options.context_store.enabled()) {
-        refuse("keeps its context cache in memory only (no context store yet): remove --context-store");
-    }
+    if (options.flash_next.context_nvme_bytes > kMaxByteOption) { refuse("--context-nvme-mib is at most 1048576"); }
     if (options.context_cache.auto_host_cache) {
         refuse("sizes its context cache's Host tier from its own RAM ledger: remove --auto-host-cache (set the size with "
                "--host-context-mib, or 0 to turn prefix reuse off)");
@@ -196,6 +237,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         demand.pageable += options.media_cache_bytes + std::min<std::uint64_t>(options.media_live_bytes, prompt_patches);
     }
     demand.load_staging = kLoadStagingBytes;
+    // The context cache's NVMe tier (--context-nvme-mib): checkpoints in a scratch file, the Host tier
+    // below as its RAM cache, moved through a pinned bounce buffer.
+    const auto [nvme_path, nvme_bytes] = plan_nvme_tier(options);
+    if (nvme_bytes != 0) { demand.later_pinned += kNvmeBounceBytes; }
     // The context cache's Host tier (prefix reuse) is pinned beside the experts: it gets what the
     // ledger can spare above the reserve, up to the requested size, and is off below a minimum.
     const auto snapshot = host_memory_snapshot();
@@ -208,8 +253,13 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     report(ledger.summary());
     report(ledger.describe());
     if (!ledger.fits) { throw std::runtime_error("Qwen3.8-Flash-Next cannot start: " + ledger.summary()); }
-    if (requested_cache == 0) {
+    if (requested_cache == 0 && nvme_bytes != 0) {
+        report("context cache: on NVMe only (no RAM cache: --host-context-mib 0)");
+    } else if (requested_cache == 0) {
         report("context cache: off (prefix reuse disabled); every request prefills its whole prompt");
+    } else if (cache_fit.bytes == 0 && nvme_bytes != 0) {
+        report("context cache: on NVMe only: the RAM ledger has no " + std::to_string(mib(kMinimumHostContextBytes)) +
+               " MiB to spare beside the experts for its RAM cache (asked " + std::to_string(mib(requested_cache)) + " MiB)");
     } else if (cache_fit.bytes == 0) {
         report("context cache: off: the RAM ledger has no " + std::to_string(mib(kMinimumHostContextBytes)) +
                " MiB to spare beside the experts (asked " + std::to_string(mib(requested_cache)) +
@@ -238,7 +288,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.mtp_width_cost   = next.mtp_width_cost;
     program_options.mtp_fixed_drafts = next.mtp_fixed_drafts;
     program_options.vision           = vision;
-    program_options.context_cache_bytes = cache_fit.bytes;
+    program_options.context_cache_bytes  = cache_fit.bytes;
+    program_options.context_nvme_bytes   = nvme_bytes;
+    program_options.context_nvme_path    = nvme_path;
+    program_options.context_bounce_bytes = kNvmeBounceBytes;
     program_options.ngram_volume    = next.ngram_volume_path.empty()
                                           ? models::qwen4_exp::default_ngram_volume(options.artifact_path)
                                           : next.ngram_volume_path;

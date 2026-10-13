@@ -2,17 +2,25 @@
 // host only: the slab pool, checkpoints sharing KV pages by reference, the bytes a release frees
 // (shared pages count only when every holder goes, and a page the lane still mirrors is never
 // counted), pins, the release sets the ResourceManager ranks, the lineage arithmetic of recovery
-// loss, and the RAM ledger's sizing of the tier beside the experts.
+// loss, and the RAM ledger's sizing of the tier beside the experts. The context store's checkpoint
+// images over an in-memory tier: an export imports into another store as the same checkpoints (shared
+// pages shared again, the bytes of every plane and state part, the drafter's position) and exports
+// back to the same bytes; damaged, foreign or mismatched images are refused before a slab is taken;
+// a full store or a tier that cannot write leaves nothing behind.
 
 #include "models/qwen4_exp/memory_plan.h"
+#include "models/qwen4_exp/program/checkpoint_image.h"
 #include "models/qwen4_exp/program/context_cache.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <new>
+#include <cstring>
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 
 using namespace ninfer;
 using namespace ninfer::models::qwen4_exp;
@@ -341,6 +349,255 @@ void test_ledger_fit() {
     std::printf("ok: RAM ledger sizes the Host tier\n");
 }
 
+void test_free_callback() {
+    HostCheckpointStore store(16, kSlab);
+    std::vector<std::uint32_t> freed;
+    store.on_free([&](std::uint32_t slab) { freed.push_back(slab); });
+    const auto id   = identity(sequence(200));
+    const Handle a  = checkpoint(store, id, 128, {});
+    const auto full = store.at(a).pages;
+    const Handle b  = checkpoint(store, id, 192, full);
+    require(store.erase(a) && freed.size() == 2, "erasing A frees only its image (its pages are B's too)");
+    require(store.erase(b) && freed.size() == 2 + 3 + 2, "erasing B frees every page and its image");
+    std::printf("ok: the store reports freed slabs\n");
+}
+
+// An in-memory tier for the image tests: whole-slab reads and writes, no device copies.
+class MemoryTier final : public CheckpointTier {
+public:
+    MemoryTier(std::uint32_t slabs, std::size_t slab_bytes)
+        : slabs_(slabs), slab_bytes_(slab_bytes), bytes_(static_cast<std::size_t>(slabs) * slab_bytes) {}
+    [[nodiscard]] std::uint32_t slabs() const noexcept override { return slabs_; }
+    [[nodiscard]] std::size_t slab_bytes() const noexcept override { return slab_bytes_; }
+    void copy(std::span<const SlabCopy>, bool, cudaStream_t) override { throw std::logic_error("no device copies here"); }
+    void read(std::span<const std::uint32_t> slabs, std::span<std::byte> out) override {
+        for (std::size_t i = 0; i < slabs.size(); ++i) { std::memcpy(out.data() + i * slab_bytes_, slab(slabs[i]), slab_bytes_); }
+    }
+    void write(std::span<const std::uint32_t> slabs, std::span<const std::byte> in) override {
+        if (fail_writes) { throw std::system_error(ENOSPC, std::generic_category(), "test: the disk is full"); }
+        for (std::size_t i = 0; i < slabs.size(); ++i) { std::memcpy(slab(slabs[i]), in.data() + i * slab_bytes_, slab_bytes_); }
+    }
+    std::byte* slab(std::uint32_t s) { return bytes_.data() + static_cast<std::size_t>(s) * slab_bytes_; }
+    bool fail_writes = false;
+
+private:
+    std::uint32_t slabs_;
+    std::size_t slab_bytes_;
+    std::vector<std::byte> bytes_;
+};
+
+// Two attention layers of five planes with padding between them in the record, and a two-slab state
+// image (state block, the drafter's residual, logits) with gaps between its parts.
+CheckpointLayout test_layout() {
+    CheckpointLayout layout;
+    layout.slab_bytes      = kSlab;
+    layout.plane_offsets   = {{0, 512, 1024, 1152, 1280}, {1536, 2048, 2560, 2688, 2816}};
+    layout.plane_bytes     = {{500, 500, 100, 100, 200}, {500, 500, 100, 100, 200}};
+    layout.state_bytes     = 6000;
+    layout.residual_offset = 6144;
+    layout.residual_bytes  = 512;
+    layout.logits_offset   = 6656;
+    layout.logits_bytes    = 1000;
+    layout.image_slabs     = 2;
+    layout.identity_tag    = 0xABCD;
+    layout.capacity        = 4096;
+    layout.vocabulary      = 100000;
+    return layout;
+}
+
+void fill(MemoryTier& tier, std::span<const std::uint32_t> slabs, std::uint32_t seed) {
+    for (const std::uint32_t s : slabs) {
+        for (std::size_t i = 0; i < kSlab; ++i) { tier.slab(s)[i] = static_cast<std::byte>((seed * 131 + s * 7 + i * 13) & 0xff); }
+    }
+}
+
+// A checkpoint as a capture leaves it: its own pages and image filled, `shared` leading pages held.
+Handle point(HostCheckpointStore& store, MemoryTier& tier, const CheckpointLayout& layout,
+             std::shared_ptr<CheckpointIdentity> id, std::uint32_t frontier, const std::vector<std::uint32_t>& shared,
+             runtime::CheckpointRole role, std::uint32_t mtp_cells, std::optional<TokenId> next, bool logits,
+             std::uint32_t seed) {
+    HostCheckpoint record;
+    record.identity     = std::move(id);
+    record.identity_tag = layout.identity_tag;
+    record.frontier     = frontier;
+    record.role         = role;
+    record.full_pages   = frontier / 64;
+    record.mtp_cells    = mtp_cells;
+    record.next_token   = next;
+    record.logits       = logits;
+    record.rope_delta   = 7;
+    for (const std::uint32_t slab : shared) {
+        store.retain(slab);
+        record.pages.push_back(slab);
+    }
+    const auto fresh = store.allocate(pages_for(frontier) - static_cast<std::uint32_t>(shared.size()));
+    const auto image = store.allocate(layout.image_slabs);
+    require(fresh && image, "pool too small for the test point");
+    fill(tier, *fresh, seed);
+    fill(tier, *image, seed + 100);
+    record.pages.insert(record.pages.end(), fresh->begin(), fresh->end());
+    record.image = *image;
+    return store.insert(std::move(record));
+}
+
+bool same_planes(MemoryTier& a, std::uint32_t sa, MemoryTier& b, std::uint32_t sb, const CheckpointLayout& layout) {
+    for (std::size_t l = 0; l < layout.plane_bytes.size(); ++l) {
+        for (std::size_t p = 0; p < 5; ++p) {
+            if (std::memcmp(a.slab(sa) + layout.plane_offsets[l][p], b.slab(sb) + layout.plane_offsets[l][p],
+                            layout.plane_bytes[l][p]) != 0) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+std::vector<std::byte> image_part(MemoryTier& tier, const HostCheckpoint& r, std::size_t offset, std::size_t bytes) {
+    std::vector<std::byte> all(r.image.size() * kSlab);
+    tier.read(r.image, all);
+    return {all.begin() + static_cast<std::ptrdiff_t>(offset), all.begin() + static_cast<std::ptrdiff_t>(offset + bytes)};
+}
+
+template <class F>
+bool refused(F&& f) {
+    try {
+        f();
+    } catch (const std::invalid_argument&) { return true; }
+    return false;
+}
+
+void test_image_round_trip() {
+    const CheckpointLayout layout = test_layout();
+    HostCheckpointStore a(64, kSlab);
+    MemoryTier ta(64, kSlab);
+    const auto tokens = sequence(400);
+    const auto prompt = identity(tokens);
+    const auto reply  = identity(sequence(330));
+    // P: the prompt's checkpoint at 200 (its logits, the drafter at 200 with the token at 200); E:
+    // the endpoint at 330 sharing P's three full pages (the drafter one cell behind, no logits).
+    const Handle p = point(a, ta, layout, prompt, 200, {}, runtime::CheckpointRole::InputReplay, 200, tokens[200], true, 1);
+    const std::vector<std::uint32_t> full(a.at(p).pages.begin(), a.at(p).pages.begin() + 3);
+    const Handle e = point(a, ta, layout, reply, 330, full, runtime::CheckpointRole::Continuation, 329, std::nullopt, false, 2);
+    models::qwen3_5::PreparedSessionKey session;
+    session.size = 5;
+    std::memcpy(session.bytes.data(), "chat1", 5);
+    const Handle both[] = {p, e};
+    const auto image    = export_checkpoint_image(a, ta, layout, both, session, "binding-1");
+    require(image.keys.size() == 2 && image.keys[0].frontier == 330 && image.keys[1].frontier == 200 && image.tokens == 330,
+            "keys deepest first");
+    require(image.keys[0].digests == reply->digests.at(330) && image.keys[0].identity_tag == layout.identity_tag,
+            "the endpoint's key");
+    require(image.prefix_digests.size() == 331 && image.regions.size() == 2, "prefix digests and payload regions");
+    // Pages once: P's four and E's three own; two images of two slabs.
+    require(checkpoint_image_slab_bytes(layout, image.bytes, "binding-1") == (7 + 4) * kSlab, "slab bytes of the import");
+
+    HostCheckpointStore b(64, kSlab);
+    MemoryTier tb(64, kSlab);
+    const auto taken = b.allocate(5); // different slab numbers on the importing side
+    const auto imported = import_checkpoint_image(b, tb, layout, image.bytes, "binding-1");
+    require(imported && imported->points.size() == 2 && imported->session == session, "imported both points");
+    require(b.used_slabs() == 5 + 11, "the import holds exactly the image's slabs");
+    const HostCheckpoint& be = b.at(imported->points[0]);
+    const HostCheckpoint& bp = b.at(imported->points[1]);
+    for (const auto& [x, y] : {std::pair{&a.at(e), &be}, std::pair{&a.at(p), &bp}}) {
+        require(x->frontier == y->frontier && x->role == y->role && x->full_pages == y->full_pages &&
+                    x->mtp_cells == y->mtp_cells && x->next_token == y->next_token && x->logits == y->logits &&
+                    x->rope_delta == y->rope_delta && y->identity_tag == layout.identity_tag,
+                "a point's fields survive");
+        require(x->identity->ledger == y->identity->ledger && x->identity->digests.image() == y->identity->digests.image() &&
+                    x->identity->prefix_identity.equals(y->identity->prefix_identity),
+                "a point's identity survives");
+        for (std::size_t i = 0; i < x->pages.size(); ++i) {
+            require(same_planes(ta, x->pages[i], tb, y->pages[i], layout), "every plane of every page survives");
+        }
+        require(image_part(ta, *x, 0, layout.state_bytes) == image_part(tb, *y, 0, layout.state_bytes) &&
+                    image_part(ta, *x, layout.residual_offset, layout.residual_bytes) ==
+                        image_part(tb, *y, layout.residual_offset, layout.residual_bytes),
+                "the state block and the drafter's residual survive");
+    }
+    require(std::equal(be.pages.begin(), be.pages.begin() + 3, bp.pages.begin()), "shared pages are shared again");
+    require(image_part(ta, a.at(p), layout.logits_offset, layout.logits_bytes) ==
+                image_part(tb, bp, layout.logits_offset, layout.logits_bytes),
+            "captured logits survive");
+    const auto zero = image_part(tb, be, layout.logits_offset, layout.logits_bytes);
+    require(std::all_of(zero.begin(), zero.end(), [](std::byte v) { return v == std::byte{0}; }),
+            "logits never captured come back as zeros");
+    // The same checkpoints export to the same bytes wherever their slabs are.
+    const auto again = export_checkpoint_image(b, tb, layout, imported->points, session, "binding-1");
+    require(again.bytes == image.bytes, "a re-export is byte-identical");
+    b.release(*taken);
+    std::printf("ok: a checkpoint image round-trips\n");
+}
+
+void test_image_refusals() {
+    const CheckpointLayout layout = test_layout();
+    HostCheckpointStore a(64, kSlab);
+    MemoryTier ta(64, kSlab);
+    const auto tokens = sequence(300);
+    const auto id     = identity(tokens);
+    const Handle p = point(a, ta, layout, id, 256, {}, runtime::CheckpointRole::InputReplay, 256, tokens[256], true, 3);
+    const auto image = export_checkpoint_image(a, ta, layout, {&p, 1}, std::nullopt, "binding-1").bytes;
+    HostCheckpointStore b(64, kSlab);
+    MemoryTier tb(64, kSlab);
+    const auto load = [&](const std::vector<std::uint8_t>& bytes, std::string_view binding, const CheckpointLayout& l) {
+        return import_checkpoint_image(b, tb, l, bytes, binding);
+    };
+    auto truncated = image;
+    truncated.pop_back();
+    require(refused([&] { (void)load(truncated, "binding-1", layout); }), "a truncated image is refused");
+    auto corrupt = image;
+    corrupt[corrupt.size() / 2] ^= 0x5A;
+    require(refused([&] { (void)load(corrupt, "binding-1", layout); }), "a damaged payload is refused");
+    auto header = image;
+    header[20] ^= 0x01; // inside the binding
+    require(refused([&] { (void)load(header, "binding-1", layout); }), "a damaged header is refused");
+    require(refused([&] { (void)load(image, "binding-2", layout); }), "another model's image is refused");
+    auto other_tag = layout;
+    ++other_tag.identity_tag;
+    require(refused([&] { (void)load(image, "binding-1", other_tag); }), "another configuration's image is refused");
+    auto other_planes = layout;
+    other_planes.plane_bytes[1][4] = 196;
+    require(refused([&] { (void)load(image, "binding-1", other_planes); }), "another page layout's image is refused");
+    auto no_drafter = layout;
+    no_drafter.residual_bytes = 0;
+    require(refused([&] { (void)load(image, "binding-1", no_drafter); }), "an image with the drafter needs the drafter");
+    require(refused([&] { (void)load(std::vector<std::uint8_t>(64, 7), "binding-1", layout); }), "random bytes are refused");
+    require(b.used_slabs() == 0, "nothing was taken by a refused image");
+    // No room, or a tier that cannot store the bytes: nothing kept.
+    HostCheckpointStore small(5, kSlab);
+    require(!import_checkpoint_image(small, tb, layout, image, "binding-1") && small.used_slabs() == 0, "no room: a miss");
+    tb.fail_writes = true;
+    require(!load(image, "binding-1", layout) && b.used_slabs() == 0, "a failing tier: a miss");
+    tb.fail_writes = false;
+    require(load(image, "binding-1", layout).has_value(), "the same image imports once the tier can write");
+    std::printf("ok: damaged, foreign and mismatched images are refused\n");
+}
+
+void test_shared_prefix_images() {
+    const CheckpointLayout layout = test_layout();
+    HostCheckpointStore a(64, kSlab);
+    MemoryTier ta(64, kSlab);
+    const auto tokens = sequence(300);
+    const auto id     = identity(tokens);
+    const Handle s = point(a, ta, layout, id, 128, {}, runtime::CheckpointRole::SharedPrefix, 128, tokens[128], false, 4);
+    const Handle p = point(a, ta, layout, id, 256, {}, runtime::CheckpointRole::InputReplay, 256, tokens[256], true, 5);
+    models::qwen3_5::PreparedSessionKey session;
+    session.size = 1;
+    session.bytes[0] = 'x';
+    const Handle pair[] = {s, p};
+    require(refused([&] { (void)export_checkpoint_image(a, ta, layout, pair, std::nullopt, "b"); }),
+            "a shared prefix is not exported with private points");
+    require(refused([&] { (void)export_checkpoint_image(a, ta, layout, {&s, 1}, session, "b"); }),
+            "a shared prefix is not exported with a session");
+    const auto image = export_checkpoint_image(a, ta, layout, {&s, 1}, std::nullopt, "b");
+    HostCheckpointStore b(64, kSlab);
+    MemoryTier tb(64, kSlab);
+    const auto imported = import_checkpoint_image(b, tb, layout, image.bytes, "b");
+    require(imported && imported->points.size() == 1 && b.at(imported->points[0]).role == runtime::CheckpointRole::SharedPrefix,
+            "a shared prefix round-trips alone");
+    std::printf("ok: shared prefix images\n");
+}
+
 } // namespace
 
 int main() {
@@ -353,6 +610,10 @@ int main() {
         test_prefill_splits();
         test_prefill_work_media();
         test_ledger_fit();
+        test_free_callback();
+        test_image_round_trip();
+        test_image_refusals();
+        test_shared_prefix_images();
         std::printf("qwen4_exp context cache tests passed\n");
         return 0;
     } catch (const std::exception& error) {
