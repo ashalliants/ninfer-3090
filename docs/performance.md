@@ -796,6 +796,43 @@ alone, about fourteen times `rk4v4`'s whole +0.214%, and it agrees with the rule
 any 3-bit key coding costs +0.7% or more. `rk4v4` already reaches the model's native 262,144-token
 context on the 27B, so the extra headroom does not pay for the quality.
 
+### Context store read and write speed (RTX 3090 host, Windows 11, C: NVMe)
+
+The [context store](serving.md#context-store) reads a stored conversation back into the Host tier
+(hydration) when that is cheaper than prefilling it, priced with a read rate the server learns. The
+drive and the store's own path were measured on 2026-10-13, on the shared box with other work idle
+on the disk:
+
+| What | Write | Read |
+|---|---:|---:|
+| Drive, unbuffered sequential, 32 MiB requests, 8 GiB file (two runs) | 1.84 / 0.92 GB/s | 5.56 / 5.47 GB/s |
+| Store, 2 GiB image, one thread per image (before) | 0.98 GB/s | cold 0.45-0.48, warm 0.58-0.70 GB/s |
+| Store, 2 GiB image, chunks read and verified on up to 8 threads (now) | 0.98-0.99 GB/s | cold 1.27-1.44, warm 1.67-2.27 GB/s |
+| Server, read plus import into the Host tier, as learned by the cost model | | 0.53-1.15 GB/s |
+
+The drive figures come from a small Win32 probe (`FILE_FLAG_NO_BUFFERING`, `WRITE_THROUGH`); the
+second write run is slower, most likely the drive's write cache filling. The store figures are
+`ninfer_context_store_bench put|load` (`bench/context_cost/context_store_bench.cpp`, a benchmarks
+build): "cold" is a copy of the store made with unbuffered I/O (`xcopy /J`), so none of it is in the
+file cache; "warm" reads the same directory again. A single reader was bound by hashing and page
+faults at about a tenth of the drive's rate; reading the 32 MiB chunks in parallel tripled it. The
+learned rate (`ninfer_context_store_read_bytes_per_second`) adds the import into pinned Host memory
+and the server's other work, so it sits below the store's own.
+
+With the read priced, a short conversation is read back when that is cheaper than prefilling it
+instead of only when the store holds at least 4,096 more tokens than the cache. Restart probe on
+the 27B (`tuned` DFlash2 profile at four lanes, 1 GiB Host tier, six one-turn conversations stored,
+the server restarted on a fresh unbuffered copy of the store, then each conversation continued;
+ABBA, two runs each):
+
+| Conversation | Before (first token) | Now (first token) |
+|---:|---:|---:|
+| 4,097 tokens | 1.55 / 1.56 s, prefilled | 0.42 / 0.45 s, read back |
+| 6,188 tokens | 1.25 / 1.40 s, read back | 0.94 / 0.94 s, read back |
+| 16,076 tokens | 1.71 / 1.71 s, read back | 1.06 / 1.07 s, read back |
+
+The other three (1.5K, 2.6K and 10K tokens) were restored at start-up in every run and are equal.
+
 ## Published coverage
 
 Published measurements use one NVIDIA GeForce RTX 5090 through NInfer's public HTTP serving route.

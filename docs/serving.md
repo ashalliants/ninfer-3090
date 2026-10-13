@@ -421,7 +421,8 @@ difference. A stored conversation that cannot be read, does not fit or misses it
 and the request is prefilled as without the store. A read counts as a hydration only if the
 admission actually resumes from it. On the 27B on an RTX 3090, a 7.8k-token conversation (an
 856 MB image) read back from a warm file cache in about 1.5 s gave a first token after 1.6 s, against
-5.1 s for prefilling it and 0.1 s when it had stayed resident.
+5.1 s for prefilling it and 0.1 s when it had stayed resident; that was before the store read its
+chunks in parallel, which about tripled its read rate ([measurements](performance.md#context-store-read-and-write-speed-rtx-3090-host-windows-11-c-nvme)).
 
 The store works with MTP and DFlash2, including the launchers' default DFlash2, and with no
 speculation. A stored recovery point carries the draft's own context with the target's: DFlash2's
