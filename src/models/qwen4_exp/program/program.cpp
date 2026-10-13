@@ -110,6 +110,9 @@ struct BasePlanImpl {
     std::uint32_t identity_tag = 0;
     std::vector<CaptureGroup> captures;
     std::uint32_t recovery = 0; // the typed rewrite's recovery frontier (0: none)
+    // The capture groups' frontiers inside the prompt, ascending: prefill calls end there whether
+    // or not the cache is on.
+    std::vector<std::uint32_t> splits;
 };
 
 struct ResumeStateImpl {
@@ -882,6 +885,45 @@ public:
         }
         base->reuse = cache_ != nullptr && options.allow_prefix_reuse && data.identity.reusable;
         base->summary.publish_continuation = base->reuse;
+        // The groups' frontiers split prefill calls whether or not this request captures them, so
+        // a prompt's greedy output does not depend on whether the cache is on (the forward's
+        // numerics depend on where calls start), and a later request resuming at one of them runs
+        // the calls a cold run of its prompt runs.
+        const auto accepts = [&](std::uint32_t frontier) {
+            // A checkpoint costs a 111 MiB state image (and a split prefill call when it falls
+            // inside the prompt) for what it saves: below kMinimumCaptureTokens it saves less
+            // prefill than it costs, so the group is not planned.
+            if (frontier < kMinimumCaptureTokens || frontier > n) { return false; }
+            for (const auto& item : data.vision_items) {
+                if (item.token_spans.empty()) { continue; }
+                const auto begin = item.token_spans.front().begin;
+                const auto end   = item.token_spans.back().begin + item.token_spans.back().count;
+                if (begin < frontier && frontier < end) { return false; }
+            }
+            return true;
+        };
+        std::vector<BasePlanImpl::CaptureGroup> groups;
+        const auto add = [&](std::uint32_t frontier, runtime::CheckpointRole role) {
+            if (!accepts(frontier)) { return; }
+            auto it = std::find_if(groups.begin(), groups.end(), [&](const auto& group) { return group.frontier == frontier; });
+            if (it == groups.end()) {
+                groups.push_back({.frontier = frontier, .roles = {}});
+                it = std::prev(groups.end());
+            }
+            if (std::find(it->roles.begin(), it->roles.end(), role) == it->roles.end()) { it->roles.push_back(role); }
+        };
+        const auto& rewrite = data.identity.rewrite_checkpoint;
+        base->recovery      = rewrite ? rewrite->recovery_frontier : 0;
+        add(rewrite ? rewrite->recovery_frontier : n, runtime::CheckpointRole::InputReplay);
+        for (const auto& opportunity : data.context_cache.opportunities) {
+            add(opportunity.frontier, opportunity.kind == PromptCacheMarkerKind::PrivateLongAnchor
+                                          ? runtime::CheckpointRole::LongAnchor
+                                          : runtime::CheckpointRole::SharedPrefix);
+        }
+        std::sort(groups.begin(), groups.end(), [](const auto& a, const auto& b) { return a.frontier < b.frontier; });
+        for (const auto& group : groups) {
+            if (group.frontier < n) { base->splits.push_back(group.frontier); }
+        }
         if (base->reuse) {
             auto identity    = std::make_shared<CheckpointIdentity>();
             identity->ledger = data.token_ids;
@@ -889,39 +931,7 @@ public:
             identity->digests.assign(data);
             base->identity     = std::move(identity);
             base->identity_tag = identity_tag_;
-            const auto accepts = [&](std::uint32_t frontier) {
-                // A checkpoint costs a 111 MiB state image (and a split prefill call when it falls
-                // inside the prompt) for what it saves: below kMinimumCaptureTokens it saves less
-                // prefill than it costs, so the group is not captured.
-                if (frontier < kMinimumCaptureTokens || frontier > n) { return false; }
-                for (const auto& item : data.vision_items) {
-                    if (item.token_spans.empty()) { continue; }
-                    const auto begin = item.token_spans.front().begin;
-                    const auto end   = item.token_spans.back().begin + item.token_spans.back().count;
-                    if (begin < frontier && frontier < end) { return false; }
-                }
-                return true;
-            };
-            const auto add = [&](std::uint32_t frontier, runtime::CheckpointRole role) {
-                if (!accepts(frontier)) { return; }
-                auto it = std::find_if(base->captures.begin(), base->captures.end(),
-                                       [&](const auto& group) { return group.frontier == frontier; });
-                if (it == base->captures.end()) {
-                    base->captures.push_back({.frontier = frontier, .roles = {}});
-                    it = std::prev(base->captures.end());
-                }
-                if (std::find(it->roles.begin(), it->roles.end(), role) == it->roles.end()) { it->roles.push_back(role); }
-            };
-            const auto& rewrite = data.identity.rewrite_checkpoint;
-            base->recovery      = rewrite ? rewrite->recovery_frontier : 0;
-            add(rewrite ? rewrite->recovery_frontier : n, runtime::CheckpointRole::InputReplay);
-            for (const auto& opportunity : data.context_cache.opportunities) {
-                add(opportunity.frontier, opportunity.kind == PromptCacheMarkerKind::PrivateLongAnchor
-                                              ? runtime::CheckpointRole::LongAnchor
-                                              : runtime::CheckpointRole::SharedPrefix);
-            }
-            std::sort(base->captures.begin(), base->captures.end(),
-                      [](const auto& a, const auto& b) { return a.frontier < b.frontier; });
+            base->captures     = std::move(groups);
         }
         base->prompt = std::make_shared<const std::vector<TokenId>>(std::move(data.token_ids));
         return RequestBasePlan(std::move(base));
@@ -2283,10 +2293,9 @@ private:
     // capture group's frontier, whichever comes first (a capture copies the state there).
     std::int32_t call_span(std::int32_t begin, bool wide) const noexcept {
         std::int32_t width = std::min(call_width(wide), static_cast<std::int32_t>(lane_.prompt_tokens) - begin);
-        for (std::size_t g = lane_.next_capture; g < lane_.captures.size(); ++g) {
-            const auto frontier = static_cast<std::int32_t>(lane_.captures[g].frontier);
-            if (frontier > begin) {
-                width = std::min(width, frontier - begin);
+        for (const std::uint32_t split : lane_.base->splits) {
+            if (static_cast<std::int32_t>(split) > begin) {
+                width = std::min(width, static_cast<std::int32_t>(split) - begin);
                 break;
             }
         }

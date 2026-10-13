@@ -719,8 +719,9 @@ and the design are in `docs/maintainer/pipeline-parallel-plan.md`.
 - The shared KV pool is fixed at startup and is not divided statically among request lanes.
 - This is bounded small-scale batching, not preemptive large-scale continuous batching.
 - Tool calls are returned to the client but are not executed by NInfer.
-- Qwen3.8-Flash-Next (preview) serves one request at a time with INT8 KV and no prefix reuse; it
-  has been built and run on Windows only (Linux is neither built nor tested).
+- Qwen3.8-Flash-Next (preview) serves one request at a time with INT8 KV; its prefix reuse keeps
+  checkpoints in host RAM only (no `--context-store` yet). It has been built and run on Windows only
+  (Linux is neither built nor tested).
 - This fork targets `sm_86`. NVFP4 A4, FP8 A8 and TMA *weight and activation* kernels require
   Blackwell and are unavailable; FP8 and NVFP4 weights are admitted through their A16 dequantizing
   routes. KV-cache storage is a separate axis: all seven KV formats, including row-scaled FP8 E4M3,
