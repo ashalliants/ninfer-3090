@@ -35,9 +35,39 @@ lane's own KV pool and state, so the source checkpoint is never written.
   overrides, `--host-context-mib 0` turns the cache off. If the ledger cannot fit the request it
   shrinks to what fits above the reserve, and says so; below 512 MiB the cache is off.
   `--auto-host-cache` is refused for this model (the ledger sizes the tier).
-- Copies use `gather_copies` (a kernel reading or writing pinned Host memory, one launch per
-  restore or capture), so the single WDDM copy engine stays free for the round's inputs and the
-  expert stream.
+- The RAM tier copies with `gather_copies` (a kernel reading or writing pinned Host memory, one
+  launch per restore or capture), so the single WDDM copy engine stays free for the round's inputs
+  and the expert stream.
+
+## Storage tiers
+
+Capture and restore never name the memory a checkpoint lives in. They describe their copies as
+`SlabCopy` entries (a slab index and offset, a device region, rows and pitches) and hand them to a
+`CheckpointTier` (`program/context_cache.h`); `HostCheckpointStore` keeps the slab bookkeeping
+(records, shared pages, release quotes) independent of the tier. `HostTier` (pinned RAM, gather
+kernel) is the only tier built.
+
+Order of the tiers, each a separate step:
+
+1. **RAM** (this change). Sized by the RAM ledger beside the experts.
+2. **Persistence on NVMe through the Engine's context store** (`--context-store`): implement
+   `export_checkpoints` / `checkpoint_image_host_bytes` / `import_checkpoints` for this Program, with
+   the Qwen3.5 Program's image container (magic and version, a configuration section, KV pages once
+   in first-reached order so successive images of a conversation share bytes in the
+   content-addressed store, the state images, exact identities, a point table, a trailing checksum)
+   and a Flash-Next configuration section (page record and state image layout, drafter on or off,
+   vision). The Engine's store plumbing (idle and shutdown writes, start-up and on-demand hydration,
+   S3 copies) is then reused unchanged. It imports into the RAM tier, so it needs a nonzero one.
+3. **An NVMe tier for little or no RAM**: a `CheckpointTier` whose slabs are offsets in a file on
+   local NVMe, moved through a small pinned bounce buffer (tens to a few hundred MiB from the
+   ledger). A 32K-token checkpoint (567 MiB) then restores in roughly 0.2-0.3 s at NVMe speed
+   instead of 13 s of prefill. Its byte layout is the same slab layout, so step 2's images can be
+   written from it without a second format.
+
+**A 0 GiB (or too small) Host budget** degrades, deliberately, to *prefix reuse off*: startup does
+not refuse; one line says the ledger had no room (or that `--host-context-mib 0` asked for none),
+requests prefill their whole prompts, and everything else runs as before. With step 3 the same case
+becomes disk-only reuse.
 
 ## Sharing
 

@@ -1,8 +1,9 @@
 #pragma once
 
 // The Host tier of the Qwen3.8-Flash-Next context cache (docs/maintainer/flash-next-context-cache.md):
-// a pool of fixed-size pinned slabs, the checkpoints held in it and the KV pages they share. This is
-// bookkeeping only; the Program owns the pinned memory and does every copy.
+// a pool of fixed-size slabs, the checkpoints held in it and the KV pages they share
+// (HostCheckpointStore, bookkeeping only), and the tier that holds the slabs' bytes and moves them
+// (CheckpointTier; HostTier is pinned RAM).
 //
 // A slab holds one KV page record (every attention layer's planes of one 64-token page) or one part
 // of a state image. KV pages are reference counted: checkpoints of one history and the lane that
@@ -13,6 +14,8 @@
 #include "models/qwen3_5/program/program.h"
 #include "ninfer/types.h"
 #include "runtime/contract/resources.h"
+
+#include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -50,6 +53,52 @@ struct HostCheckpoint {
     std::optional<TokenId> next_token;
     bool logits             = false;
     std::int32_t rope_delta = 0;
+};
+
+// One copy between a device region and checkpoint slab bytes: `rows` rows of `width` bytes, row r at
+// device + r * device_pitch and at byte offset + r * slab_pitch of `slab` (a pitch may run past the
+// slab into the next slab index only when slab_pitch is a whole number of slabs: a run of
+// consecutive slabs, one row each).
+struct SlabCopy {
+    std::uint32_t slab        = 0;
+    std::size_t offset        = 0;
+    std::size_t slab_pitch    = 0;
+    std::byte* device         = nullptr;
+    std::size_t device_pitch  = 0;
+    std::size_t width         = 0;
+    std::size_t rows          = 0;
+};
+
+// Where checkpoint bytes live. Capture and restore describe their copies in slab terms only, so the
+// placement (pinned RAM here; an NVMe file or a remote object later) is not part of them. A tier
+// moves the bytes in stream order; the caller synchronizes before reusing the slabs.
+class CheckpointTier {
+public:
+    virtual ~CheckpointTier() = default;
+    [[nodiscard]] virtual std::uint32_t slabs() const noexcept    = 0;
+    [[nodiscard]] virtual std::size_t slab_bytes() const noexcept = 0;
+    virtual void copy(std::span<const SlabCopy> copies, bool to_tier, cudaStream_t stream) = 0;
+};
+
+// The pinned host RAM tier: one identity-mapped pinned allocation, copied by the gather kernel
+// (core/host_gather.h) so the single WDDM copy engine stays free for the rounds' inputs. Throws
+// when the memory cannot be pinned or is not identity-mapped.
+class HostTier final : public CheckpointTier {
+public:
+    HostTier(std::uint32_t slabs, std::size_t slab_bytes, std::size_t descriptors);
+    ~HostTier() override;
+    HostTier(const HostTier&)            = delete;
+    HostTier& operator=(const HostTier&) = delete;
+    [[nodiscard]] std::uint32_t slabs() const noexcept override { return slabs_; }
+    [[nodiscard]] std::size_t slab_bytes() const noexcept override { return slab_bytes_; }
+    void copy(std::span<const SlabCopy> copies, bool to_tier, cudaStream_t stream) override;
+
+private:
+    std::uint32_t slabs_;
+    std::size_t slab_bytes_;
+    void* memory_ = nullptr;
+    void* descriptors_ = nullptr;
+    std::size_t descriptor_bytes_ = 0;
 };
 
 class HostCheckpointStore {

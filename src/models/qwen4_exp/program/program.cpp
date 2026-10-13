@@ -1811,9 +1811,9 @@ private:
         r.image.assign(slabs.begin() + (pages - mirrored), slabs.end());
         try {
             copies_.clear();
-            add_page_copies(std::span<const std::uint32_t>(r.pages).subspan(mirrored), mirrored, true);
-            add_image_copies(r.image, true, logits);
-            run_gather();
+            add_page_copies(std::span<const std::uint32_t>(r.pages).subspan(mirrored), mirrored);
+            add_image_copies(r.image, logits);
+            run_copies(true);
             device_.synchronize();
         } catch (...) {
             cache_->release(r.pages);
@@ -1932,9 +1932,9 @@ private:
         const HostCheckpoint& source = cache_->at(*lane_.source);
         const std::uint32_t frontier = source.frontier;
         copies_.clear();
-        add_page_copies(source.pages, 0, false);
-        add_image_copies(source.image, false, source.logits);
-        run_gather();
+        add_page_copies(source.pages, 0);
+        add_image_copies(source.image, source.logits);
+        run_copies(false);
         device_.synchronize();
         const std::uint64_t ns = elapsed_ns(start);
         lane_.state_tokens     = frontier;
@@ -2027,40 +2027,27 @@ private:
     }
 
     // ---------------------------------------------------------------- context cache: copies
-    // A Host slab's address.
-    std::byte* slab_address(std::uint32_t slab) const {
-        return static_cast<std::byte*>(cache_memory_->data()) + static_cast<std::size_t>(slab) * cache_->slab_bytes();
-    }
+    // Captures and restores describe their copies in slab terms (SlabCopy); the tier holding the
+    // slabs (tier_, pinned RAM today) moves the bytes.
 
-    // The copies of KV pages [first_page, first_page + slabs.size()) between the pool and the Host
-    // slabs (one page record each), one 2D copy per plane over each run of consecutive slabs.
-    void add_page_copies(std::span<const std::uint32_t> slabs, std::uint32_t first_page, bool to_host) {
+    // The copies of KV pages [first_page, first_page + slabs.size()) between the pool and the slabs
+    // (one page record each), one 2D copy per plane over each run of consecutive slabs.
+    void add_page_copies(std::span<const std::uint32_t> slabs, std::uint32_t first_page) {
         const std::size_t record = cache_->slab_bytes();
         for (std::size_t i = 0; i < slabs.size();) {
             std::size_t j = i + 1;
             while (j < slabs.size() && slabs[j] == slabs[j - 1] + 1) { ++j; }
-            std::byte* host         = slab_address(slabs[i]);
-            const std::size_t page  = first_page + i;
+            const std::size_t page = first_page + i;
             for (std::size_t l = 0; l < plan_.kv.layers.size(); ++l) {
                 for (std::size_t p = 0; p < 5; ++p) {
                     const auto& plane = plan_.kv.layers[l][p];
-                    std::byte* device = kv_base_ + plane.offset + page * plane.page_bytes;
-                    std::byte* record_plane = host + record_planes_[l][p];
-                    GatherCopy copy;
-                    copy.width  = plane.page_bytes;
-                    copy.height = j - i;
-                    if (to_host) {
-                        copy.destination       = record_plane;
-                        copy.destination_pitch = record;
-                        copy.source            = device;
-                        copy.source_pitch      = plane.page_bytes;
-                    } else {
-                        copy.destination       = device;
-                        copy.destination_pitch = plane.page_bytes;
-                        copy.source            = record_plane;
-                        copy.source_pitch      = record;
-                    }
-                    copies_.push_back(copy);
+                    copies_.push_back(SlabCopy{.slab         = slabs[i],
+                                               .offset       = record_planes_[l][p],
+                                               .slab_pitch   = record,
+                                               .device       = kv_base_ + plane.offset + page * plane.page_bytes,
+                                               .device_pitch = plane.page_bytes,
+                                               .width        = plane.page_bytes,
+                                               .rows         = j - i});
                 }
             }
             i = j;
@@ -2068,16 +2055,27 @@ private:
     }
 
     // The copies of the state image: [0, state) the state block, then the saved residual (with
-    // MTP), then (with `logits`) the last position's BF16 logits, laid over the image's slabs.
-    void add_image_copies(std::span<const std::uint32_t> slabs, bool to_host, bool logits) {
+    // MTP), then (with `logits`) the last position's BF16 logits, laid over the image's slabs as
+    // rows of kGatherRow bytes.
+    void add_image_copies(std::span<const std::uint32_t> slabs, bool logits) {
+        const std::size_t slab_bytes = cache_->slab_bytes();
         const auto region = [&](std::byte* device, std::size_t offset, std::size_t bytes) {
-            const std::size_t slab_bytes = cache_->slab_bytes();
-            std::size_t done             = 0;
+            std::size_t done = 0;
             while (done < bytes) {
                 const std::size_t at    = offset + done;
                 const std::size_t index = at / slab_bytes, within = at % slab_bytes;
                 const std::size_t chunk = std::min(bytes - done, slab_bytes - within);
-                add_linear(device + done, slab_address(slabs[index]) + within, chunk, to_host);
+                const std::size_t rows = chunk / kGatherRow, tail = chunk % kGatherRow;
+                if (rows != 0) {
+                    copies_.push_back(SlabCopy{.slab = slabs[index], .offset = within, .slab_pitch = kGatherRow,
+                                               .device = device + done, .device_pitch = kGatherRow,
+                                               .width = kGatherRow, .rows = rows});
+                }
+                if (tail != 0) {
+                    copies_.push_back(SlabCopy{.slab = slabs[index], .offset = within + rows * kGatherRow,
+                                               .slab_pitch = tail, .device = device + done + rows * kGatherRow,
+                                               .device_pitch = tail, .width = tail, .rows = 1});
+                }
                 done += chunk;
             }
         };
@@ -2086,37 +2084,10 @@ private:
         if (logits) { region(static_cast<std::byte*>(logits16_.data), image_logits_, 2ULL * c_.vocab_size); }
     }
 
-    // One linear copy as rows of kGatherRow bytes (the gather splits rows across its blocks).
-    void add_linear(std::byte* device, std::byte* host, std::size_t bytes, bool to_host) {
-        const std::size_t rows = bytes / kGatherRow, tail = bytes % kGatherRow;
-        const auto push = [&](std::size_t offset, std::size_t width, std::size_t height) {
-            GatherCopy copy;
-            copy.width             = width;
-            copy.height            = height;
-            copy.destination_pitch = width;
-            copy.source_pitch      = width;
-            copy.destination       = to_host ? static_cast<void*>(host + offset) : static_cast<void*>(device + offset);
-            copy.source            = to_host ? static_cast<const void*>(device + offset) : static_cast<const void*>(host + offset);
-            copies_.push_back(copy);
-        };
-        if (rows != 0) { push(0, kGatherRow, rows); }
-        if (tail != 0) { push(rows * kGatherRow, tail, 1); }
-    }
-
-    // Runs the staged copies as one gather kernel on the compute stream (after every earlier
-    // kernel that wrote or reads the lane's KV and state). The caller synchronizes before the
-    // descriptors are rewritten.
-    void run_gather() {
-        split_gather_copies(copies_, kGatherPiece);
-        if (copies_.empty()) { return; }
-        const std::size_t bytes = copies_.size() * sizeof(GatherCopy);
-        if (!gather_host_ || gather_host_->size() < bytes) {
-            device_.synchronize(); // the old descriptors may still be read
-            gather_host_ = std::make_unique<PinnedHostBuffer>(bytes + bytes / 2);
-        }
-        std::memcpy(gather_host_->data(), copies_.data(), bytes);
-        gather_copies(std::span<const GatherCopy>(static_cast<const GatherCopy*>(gather_host_->data()), copies_.size()),
-                      device_.stream);
+    // Moves the staged copies on the compute stream (after every earlier kernel that wrote or reads
+    // the lane's KV and state). The caller synchronizes before the slabs or descriptors are reused.
+    void run_copies(bool to_tier) {
+        tier_->copy(copies_, to_tier, device_.stream);
         copies_.clear();
     }
 
@@ -2148,23 +2119,16 @@ private:
             return;
         }
         const auto start = Clock::now();
+        // The gather descriptors of the largest copy: every page of the context, and an image.
+        const std::size_t descriptors =
+            static_cast<std::size_t>(plan_.pages) * plan_.kv.layers.size() * 5 + image_bytes_ / kGatherPiece + 8 * image_slabs_ + 64;
         try {
-            cache_memory_ = std::make_unique<PinnedHostBuffer>(static_cast<std::size_t>(slabs) * record);
-            void* mapped  = nullptr;
-            if (cudaHostGetDevicePointer(&mapped, cache_memory_->data(), 0) != cudaSuccess || mapped != cache_memory_->data()) {
-                throw std::runtime_error("pinned Host memory is not identity-mapped on this device");
-            }
+            tier_ = std::make_unique<HostTier>(slabs, record, descriptors);
         } catch (const std::exception& error) {
-            (void)cudaGetLastError();
-            cache_memory_.reset();
             diagnostic(std::string("context cache: could not pin its Host tier (") + error.what() + "); prefix reuse is off");
             return;
         }
         cache_ = std::make_unique<HostCheckpointStore>(slabs, record);
-        // The descriptors of the largest copy: every page of the context, and an image.
-        const std::size_t descriptors =
-            static_cast<std::size_t>(plan_.pages) * plan_.kv.layers.size() * 5 + image_bytes_ / kGatherPiece + 8 * image_slabs_ + 64;
-        gather_host_ = std::make_unique<PinnedHostBuffer>(descriptors * sizeof(GatherCopy));
         // The configuration a checkpoint belongs to: its page record and state image layout.
         std::uint64_t tag = 1469598103934665603ULL;
         for (const std::uint64_t v : {std::uint64_t{record}, std::uint64_t{plan_.state}, std::uint64_t{image_bytes_},
@@ -3780,7 +3744,7 @@ private:
     // page record and the KV bytes of one page, the state image's layout (state block, the drafter's
     // saved residual, the logits) and slab count, the configuration tag every key carries, the
     // capture transaction's checkpoints, the gather's descriptors, and counters.
-    std::unique_ptr<PinnedHostBuffer> cache_memory_;
+    std::unique_ptr<CheckpointTier> tier_;
     std::unique_ptr<HostCheckpointStore> cache_;
     std::vector<std::array<std::size_t, 5>> record_planes_;
     std::size_t page_kv_bytes_ = 0;
@@ -3788,8 +3752,7 @@ private:
     std::uint32_t image_slabs_  = 0;
     std::uint32_t identity_tag_ = 0;
     std::vector<CheckpointHandle> captured_;
-    std::vector<GatherCopy> copies_;
-    std::unique_ptr<PinnedHostBuffer> gather_host_;
+    std::vector<SlabCopy> copies_;
     std::uint64_t captures_ = 0, capture_ns_ = 0, captured_bytes_ = 0;
     std::uint64_t restores_ = 0, restore_ns_ = 0, restored_bytes_ = 0, endpoints_skipped_ = 0;
 

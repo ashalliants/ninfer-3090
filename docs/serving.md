@@ -70,8 +70,8 @@ model's positions; KV above 32,768 tokens is borrowed from the expert cache). Wh
 the Qwen3.5 models:
 
 - **One request at a time.** `--max-concurrency` above 1, `--kv-dtype` other than `int8`,
-  `--spec dflash|dflash2`, `--ngram-draft-tokens`, `--graft`, `--context-store` and the load-time weight
-  flags are refused at startup with the flag to change.
+  `--spec dflash|dflash2`, `--ngram-draft-tokens`, `--graft`, `--context-store`, `--auto-host-cache`
+  and the load-time weight flags are refused at startup with the flag to change.
 - **Images** (`--vision`, an artifact converted with `--mmproj`; otherwise startup refuses with that
   instruction): OpenAI `image_url` parts (data URIs, local files) and Anthropic image blocks, through
   the same media handling and processor as the Qwen3.5 models. The vision tower (0.84 GiB) stays
@@ -88,8 +88,19 @@ the Qwen3.5 models:
   ceiling: each round drafts as many tokens as the recent acceptance pays for, mostly two on prose;
   a ceiling of 3 measured best or tied against 2 and against deeper fixed drafts (the
   [plan's PR 13 measurements](maintainer/flash-next-plan.md#pr-13-measurements)), about 1.4x plain decode.
-- **No prefix reuse yet.** The server's context cache is switched off for this model (one line at
-  startup says so), so every request prefills its whole prompt and reports 0 cached prompt tokens.
+- **Prefix reuse** through the same context cache as the other models, with checkpoints held only
+  in pinned host RAM ([design](maintainer/flash-next-context-cache.md)). A conversation's next turn
+  (or an agent's next tool round) restores the previous turn's state and prefills only the new
+  tokens; repeating a prompt exactly samples its first token from the stored logits. A checkpoint is
+  about 111 MiB of recurrent state plus 0.89 MiB per 64 tokens of KV (a 32K-token one 567 MiB), and
+  checkpoints of one conversation share their KV pages. The host tier is 4 GiB unless
+  `--host-context-mib N` says otherwise; it is planned in the RAM ledger beside the experts, so on a
+  machine with less RAM to spare it shrinks to what fits (one startup line says so) and is off below
+  512 MiB. `--host-context-mib 0` or `--no-prefix-reuse` turn reuse off; in the launcher,
+  `NINFER_PREFIX_CACHE=off` (and `NINFER_HOST_CONTEXT_MIB` for the size). Restores and captures are
+  host-to-device copies of a few milliseconds; nothing is kept in VRAM, so the expert cache keeps
+  every frame. `--context-store` (keeping the cache across restarts) is not available for this
+  model yet.
 - **Host RAM.** All 33 GiB of routed experts are pinned in host RAM at startup (with `--vision` also
   the 0.84 GiB tower, and the ledger counts up to 1.4 GiB of decoded media: about 2.2 GiB more in
   all). Before anything is pinned, a RAM ledger checks that the experts, every other planned allocation and a reserve for

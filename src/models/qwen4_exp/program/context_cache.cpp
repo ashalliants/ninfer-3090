@@ -1,13 +1,94 @@
 #include "models/qwen4_exp/program/context_cache.h"
 
+#include "core/host_gather.h"
 #include "core/paged_kv_cache.h"
 
 #include <algorithm>
+#include <cstring>
+#include <string>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace ninfer::models::qwen4_exp {
+namespace {
+// The gather's per-block piece: long copies are split so its blocks share them.
+constexpr std::size_t kGatherPiece = 64 * 1024;
+} // namespace
+
+HostTier::HostTier(std::uint32_t slabs, std::size_t slab_bytes, std::size_t descriptors)
+    : slabs_(slabs), slab_bytes_(slab_bytes) {
+    const std::size_t bytes = static_cast<std::size_t>(slabs) * slab_bytes;
+    if (cudaHostAlloc(&memory_, bytes, cudaHostAllocDefault) != cudaSuccess) {
+        (void)cudaGetLastError();
+        memory_ = nullptr;
+        throw std::runtime_error("cudaHostAlloc of " + std::to_string(bytes >> 20) + " MiB failed");
+    }
+    void* mapped = nullptr;
+    if (cudaHostGetDevicePointer(&mapped, memory_, 0) != cudaSuccess || mapped != memory_) {
+        (void)cudaGetLastError();
+        cudaFreeHost(memory_);
+        memory_ = nullptr;
+        throw std::runtime_error("pinned host memory is not identity-mapped on this device");
+    }
+    descriptor_bytes_ = std::max<std::size_t>(descriptors, 64) * sizeof(GatherCopy);
+    if (cudaHostAlloc(&descriptors_, descriptor_bytes_, cudaHostAllocDefault) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaFreeHost(memory_);
+        memory_      = nullptr;
+        descriptors_ = nullptr;
+        throw std::runtime_error("cudaHostAlloc of the gather descriptors failed");
+    }
+}
+
+HostTier::~HostTier() {
+    if (descriptors_ != nullptr) { cudaFreeHost(descriptors_); }
+    if (memory_ != nullptr) { cudaFreeHost(memory_); }
+}
+
+void HostTier::copy(std::span<const SlabCopy> copies, bool to_tier, cudaStream_t stream) {
+    std::vector<GatherCopy> gather;
+    gather.reserve(copies.size());
+    for (const SlabCopy& c : copies) {
+        if (c.slab >= slabs_ || c.offset + c.width > slab_bytes_ ||
+            c.offset + (c.rows - 1) * c.slab_pitch + c.width > (slabs_ - c.slab) * slab_bytes_) {
+            throw std::logic_error("context cache: a copy runs outside the Host tier");
+        }
+        std::byte* host = static_cast<std::byte*>(memory_) + static_cast<std::size_t>(c.slab) * slab_bytes_ + c.offset;
+        GatherCopy g;
+        g.width  = c.width;
+        g.height = c.rows;
+        if (to_tier) {
+            g.destination       = host;
+            g.destination_pitch = c.slab_pitch;
+            g.source            = c.device;
+            g.source_pitch      = c.device_pitch;
+        } else {
+            g.destination       = c.device;
+            g.destination_pitch = c.device_pitch;
+            g.source            = host;
+            g.source_pitch      = c.slab_pitch;
+        }
+        gather.push_back(g);
+    }
+    split_gather_copies(gather, kGatherPiece);
+    if (gather.empty()) { return; }
+    const std::size_t bytes = gather.size() * sizeof(GatherCopy);
+    if (bytes > descriptor_bytes_) {
+        // The old descriptors may still be read by an earlier gather.
+        if (cudaStreamSynchronize(stream) != cudaSuccess) { throw std::runtime_error("context cache: stream failed"); }
+        void* grown = nullptr;
+        if (cudaHostAlloc(&grown, bytes + bytes / 2, cudaHostAllocDefault) != cudaSuccess) {
+            (void)cudaGetLastError();
+            throw std::runtime_error("cudaHostAlloc of the gather descriptors failed");
+        }
+        cudaFreeHost(descriptors_);
+        descriptors_      = grown;
+        descriptor_bytes_ = bytes + bytes / 2;
+    }
+    std::memcpy(descriptors_, gather.data(), bytes);
+    gather_copies(std::span<const GatherCopy>(static_cast<const GatherCopy*>(descriptors_), gather.size()), stream);
+}
 
 HostCheckpointStore::HostCheckpointStore(std::uint32_t slabs, std::size_t slab_bytes)
     : slab_bytes_(slab_bytes), references_(slabs, 0) {
