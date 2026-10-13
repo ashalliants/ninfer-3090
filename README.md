@@ -26,7 +26,7 @@ concurrent cohorts through **C8**.
 **Qwen3.8-Flash-Next (preview, Windows), same card.** A 512-expert MoE at 2 bits per weight, with all
 33 GiB of experts pinned in host RAM: **1.15-1.18x Strata's plain decode** (81 / 80 / 78 tok/s after
 a 1K / 8K / 32K prompt against 71 / 70 / 66), **109-113 tok/s with MTP** (the launcher default, same
-tokens as plain decoding, 102.6 after a 128K prompt) and **2,345 tok/s prefill** at 4K, 1.23x Strata's,
+tokens as plain decoding; 102.6 after a 128K prompt, in a separate run with the context raised above this release's 32K default) and **2,345 tok/s prefill** at 4K, 1.23x Strata's,
 when the n-gram volume sits on NVMe. One request at a time, 32K context in this release. Details
 [below](#qwen38-flash-next-preview).
 
