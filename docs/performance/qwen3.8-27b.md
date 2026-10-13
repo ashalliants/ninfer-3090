@@ -325,7 +325,7 @@ and the same numbers within 1.5%, so v0.15.0 and v0.15.1 are interchangeable as 
 | **decode 512 from a one-token seed, tok/s** | 62.95 | 60.10 | **-4.5%** | 60.5 | **-3.9%** |
 
 Memory at 73,728 tokens: weights and workspace are byte-identical; the sequence reservation is
-1,789,305,344 B (v0.15.0), 1,789,306,112 B (master) and 1,808,323,072 B with n-gram (+18.1 MiB).
+1,789,305,344 B (v0.15.0 binary, from the earlier set; the two releases are interchangeable as a baseline here), 1,789,306,112 B (master) and 1,808,323,072 B with n-gram (+18.1 MiB).
 
 **The one drop, `tg512`, is a different token stream, not a slower round.** Rounds cost the same
 (v0.15.1 846 rounds at 62.95 tok/s is 34.6 rounds/s; master 882 rounds at 60.10 is 34.5), and the
