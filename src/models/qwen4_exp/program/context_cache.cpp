@@ -14,12 +14,15 @@ namespace ninfer::models::qwen4_exp {
 namespace {
 // The gather's per-block piece: long copies are split so its blocks share them.
 constexpr std::size_t kGatherPiece = 64 * 1024;
+// Host tier and descriptors are read through cudaHostGetDevicePointer by the gather kernel, so they
+// are allocated mapped (and portable), like PinnedHostBuffer in core/arena.cu.
+constexpr unsigned int kMappedPinned = cudaHostAllocPortable | cudaHostAllocMapped;
 } // namespace
 
 HostTier::HostTier(std::uint32_t slabs, std::size_t slab_bytes, std::size_t descriptors)
     : slabs_(slabs), slab_bytes_(slab_bytes) {
     const std::size_t bytes = static_cast<std::size_t>(slabs) * slab_bytes;
-    if (cudaHostAlloc(&memory_, bytes, cudaHostAllocDefault) != cudaSuccess) {
+    if (cudaHostAlloc(&memory_, bytes, kMappedPinned) != cudaSuccess) {
         (void)cudaGetLastError();
         memory_ = nullptr;
         throw std::runtime_error("cudaHostAlloc of " + std::to_string(bytes >> 20) + " MiB failed");
@@ -32,7 +35,7 @@ HostTier::HostTier(std::uint32_t slabs, std::size_t slab_bytes, std::size_t desc
         throw std::runtime_error("pinned host memory is not identity-mapped on this device");
     }
     descriptor_bytes_ = std::max<std::size_t>(descriptors, 64) * sizeof(GatherCopy);
-    if (cudaHostAlloc(&descriptors_, descriptor_bytes_, cudaHostAllocDefault) != cudaSuccess) {
+    if (cudaHostAlloc(&descriptors_, descriptor_bytes_, kMappedPinned) != cudaSuccess) {
         (void)cudaGetLastError();
         cudaFreeHost(memory_);
         memory_      = nullptr;
@@ -78,7 +81,7 @@ void HostTier::copy(std::span<const SlabCopy> copies, bool to_tier, cudaStream_t
         // The old descriptors may still be read by an earlier gather.
         if (cudaStreamSynchronize(stream) != cudaSuccess) { throw std::runtime_error("context cache: stream failed"); }
         void* grown = nullptr;
-        if (cudaHostAlloc(&grown, bytes + bytes / 2, cudaHostAllocDefault) != cudaSuccess) {
+        if (cudaHostAlloc(&grown, bytes + bytes / 2, kMappedPinned) != cudaSuccess) {
             (void)cudaGetLastError();
             throw std::runtime_error("cudaHostAlloc of the gather descriptors failed");
         }
