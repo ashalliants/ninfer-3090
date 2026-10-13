@@ -136,6 +136,10 @@ std::string context_store_binding(const EngineOptions& options, const LoadSummar
 // Images queued for the writer thread. Each holds a whole continuation, several GB for a deep one;
 // beyond the bound an idle continuation is simply written later.
 constexpr std::size_t kMaximumPendingStoreWrites = 2;
+// A conversation the cache is evicting has no later chance: its image is queued while the queue
+// holds less than this many bytes (always when it is empty), on top of the idle bound. Host RAM,
+// not pinned memory; it drains at the store's write rate.
+constexpr std::size_t kMaximumPendingEvictionBytes = std::size_t{4} << 30U;
 
 // The store keeps up to this share of the volume's free space when no limit is configured.
 constexpr std::uint64_t kAutomaticStoreShareDivisor = 2;
@@ -439,8 +443,13 @@ private:
         generation.set_context_store(Hooks{
             .store   = store.get(),
             .binding = store_binding,
-            .sink    = [this](CheckpointImage&& image) { return enqueue_store_write(std::move(image)); },
-            .ready    = [this] { return store_queue_idle(); },
+            .sink    = [this](CheckpointImage&& image) {
+                return enqueue_store_write(std::move(image), false);
+            },
+            .evict_sink = [this](CheckpointImage&& image) {
+                return enqueue_store_write(std::move(image), true);
+            },
+            .ready   = [this] { return store_queue_idle(); },
             .failures = [this] { return store_write_failures.load(std::memory_order_relaxed); },
             .idle_persist =
                 std::chrono::duration_cast<std::chrono::milliseconds>(options.context_store.idle_persist),
@@ -587,11 +596,17 @@ private:
     }
 
     // Queues an image for the writer thread. Never blocks: when the queue is full the image is
-    // not written now, and its continuation is tried again later.
-    bool enqueue_store_write(CheckpointImage&& image) {
+    // not written now; an idle continuation is tried again later, an evicted one is lost to the
+    // store as it would be without write-on-evict.
+    bool enqueue_store_write(CheckpointImage&& image, bool eviction) {
         std::unique_lock lock(writer_mutex);
         if (writer_stop) { return false; } // shutting down: the final flush writes it instead
-        if (pending_writes.size() >= kMaximumPendingStoreWrites) {
+        std::size_t queued_bytes = 0;
+        for (const auto& pending : pending_writes) { queued_bytes += pending.bytes.size(); }
+        const bool full = eviction ? !pending_writes.empty() &&
+                                         queued_bytes + image.bytes.size() > kMaximumPendingEvictionBytes
+                                   : pending_writes.size() >= kMaximumPendingStoreWrites;
+        if (full) {
             store_dropped.fetch_add(1, std::memory_order_relaxed);
             return false;
         }

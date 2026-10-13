@@ -1434,6 +1434,10 @@ struct RuntimeStats {
     // The rate the cost model currently assumes for reading a stored image back into the Host tier
     // (store read and import), learned from the reads observed so far; prices every hydration.
     double context_store_read_bytes_per_second = 0.0;
+    // Write-on-evict: continuations the cache was about to lose that were queued for the store
+    // first, and the Engine worker time spent copying their images out.
+    std::uint64_t context_store_eviction_writes        = 0;
+    double context_store_eviction_export_seconds       = 0.0;
     // With a remote: images only the remote holds, objects and bytes moved, and failures.
     std::uint64_t context_store_remote_images            = 0;
     std::uint64_t context_store_remote_uploads           = 0;

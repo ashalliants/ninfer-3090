@@ -10,6 +10,7 @@
 #include <array>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -782,6 +783,19 @@ public:
         std::vector<Handle> points;
     };
 
+    // The durable context store's view of retained continuations. `stored_bytes` names a
+    // continuation whose every current point the store holds (or has queued), with the size of
+    // that image: losing it from the cache costs reading it back, not recomputing it, and reclaim
+    // prices it so. `releasing` is told about the inactive, live continuations a committed release
+    // is about to take points from, while every point is still valid, so they can be written to
+    // the store first. Both are optional; without them every loss is a recomputation.
+    struct Durability {
+        std::function<std::optional<std::uint64_t>(OwnerToken)> stored_bytes;
+        std::function<void(std::span<const RetainedOwner>)> releasing;
+    };
+
+    void set_durability(Durability durability) { durability_ = std::move(durability); }
+
     [[nodiscard]] std::vector<RetainedOwner> retained_owners(Program& program) {
         prune(program);
         std::vector<RetainedOwner> out;
@@ -1390,11 +1404,65 @@ private:
         if (!facts.loss) {
             facts.loss = sources.empty()
                              ? 0
-                             : recovery_loss(program, sources,
-                                             action_survivors(program, sources, facts, evaluation),
-                                             evaluation);
+                             : stored_loss(sources,
+                                           recovery_loss(program, sources,
+                                                         action_survivors(program, sources, facts,
+                                                                          evaluation),
+                                                         evaluation));
         }
         return *facts.loss;
+    }
+
+    // The store's image size when every catalog holder of every source is a continuation the
+    // store holds in full; nullopt when any source would be recomputed (a shared entry, a waiting
+    // reader's only copy, or a continuation the store does not hold as it is now).
+    [[nodiscard]] std::optional<std::uint64_t>
+    stored_image_bytes(std::span<const Handle> sources) const {
+        if (!durability_.stored_bytes || sources.empty()) { return std::nullopt; }
+        std::vector<OwnerToken> holders;
+        for (const auto handle : sources) {
+            if (std::any_of(shared_.begin(), shared_.end(),
+                            [&](const auto& entry) { return entry.handle == handle; })) {
+                return std::nullopt;
+            }
+            bool held = false;
+            for (const auto& owner : owners_) {
+                if (std::none_of(owner.points.begin(), owner.points.end(),
+                                 [&](const auto& point) { return point.handle == handle; })) {
+                    continue;
+                }
+                held = true;
+                if (std::find(holders.begin(), holders.end(), owner.token) == holders.end()) {
+                    holders.push_back(owner.token);
+                }
+            }
+            if (!held) { return std::nullopt; }
+        }
+        std::uint64_t bytes = 0;
+        for (const auto token : holders) {
+            const auto stored = durability_.stored_bytes(token);
+            if (!stored) { return std::nullopt; }
+            bytes = *stored > UINT64_MAX - bytes ? UINT64_MAX : bytes + *stored;
+        }
+        return bytes;
+    }
+
+    // Recovery loss is counted in prompt tokens to recompute. A loss the store can restore costs
+    // its read and upload instead: the same tokens, scaled by restore time over prefill time.
+    [[nodiscard]] std::uint64_t stored_loss(std::span<const Handle> sources,
+                                            std::uint64_t loss) const {
+        if (loss == 0) { return 0; }
+        const auto bytes = stored_image_bytes(sources);
+        if (!bytes) { return loss; }
+        const auto prefill = costs_.prefill_ns(make_prefill_work(0, loss, 0, 0, 0));
+        const auto restore = store_restore_ns(*bytes);
+        if (prefill == 0 || restore >= prefill) { return loss; }
+        // restore < prefill, so the result is below `loss`. At least one token: a restorable loss
+        // is still a loss, ranked after any release that loses nothing.
+        const auto scaled = static_cast<std::uint64_t>(static_cast<long double>(loss) *
+                                                       static_cast<long double>(restore) /
+                                                       static_cast<long double>(prefill));
+        return std::max<std::uint64_t>(1, scaled);
     }
 
     [[nodiscard]] CacheRetentionPriority action_priority(Program& program,
@@ -1585,6 +1653,7 @@ private:
         if (!may_revoke(handles, cursor.rights)) {
             throw std::logic_error("cache release lacks waiting-source revocation rights");
         }
+        notify_releasing(program, handles);
         const auto loss =
             cursor.gain_limit && !superseded_only(handles)
                 ? (quoted_loss
@@ -1707,6 +1776,31 @@ private:
         return selected;
     }
 
+    // Write-on-evict: the inactive, live continuations about to lose a point, while every point is
+    // still valid. Superseded branches are not offered: they are evict-first because nothing is
+    // expected to come back to them.
+    void notify_releasing(Program& program, std::span<const Handle> handles) {
+        if (!durability_.releasing) { return; }
+        std::vector<RetainedOwner> affected;
+        for (const auto& owner : owners_) {
+            if (owner.active || owner.superseded || owner.points.empty()) { continue; }
+            const bool hit = std::any_of(owner.points.begin(), owner.points.end(), [&](const auto& p) {
+                return contains(handles, p.handle);
+            });
+            if (!hit) { continue; }
+            auto points = this->points(owner.token);
+            if (!std::all_of(points.begin(), points.end(),
+                             [&](auto point) { return program.valid_checkpoint(point); })) {
+                continue;
+            }
+            affected.push_back({.token   = owner.token,
+                                .active  = false,
+                                .session = owner.session,
+                                .points  = std::move(points)});
+        }
+        if (!affected.empty()) { durability_.releasing(affected); }
+    }
+
     void balance_reused(Program& program) {
         const auto amounts = [](ContextResourceUsage r) {
             return std::array<std::uint64_t, 4>{r.state_slots, r.main_kv_pages, r.backend_kv_pages,
@@ -1783,6 +1877,7 @@ private:
 
     bool enabled_;
     ContextMachineCostModel costs_;
+    Durability durability_;
     PrefixIndex<Model> index_;
     bool candidate_memo_ = true;
     std::vector<Owner> owners_;

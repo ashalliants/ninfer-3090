@@ -350,6 +350,10 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
             "Hydrations that failed; the request was prefilled normally.");
     COUNTER(context_store_hydration_seconds, "context_store_hydration_seconds_total",
             "Time requests waited for stored sessions to be read back, failed reads included.");
+    COUNTER(context_store_eviction_writes, "context_store_eviction_writes_total",
+            "Conversations written to the store as the cache evicted them (write-on-evict).");
+    COUNTER(context_store_eviction_export_seconds, "context_store_eviction_export_seconds_total",
+            "Engine worker time spent copying evicted conversations out for the store.");
     GAUGE(context_store_read_bytes_per_second, "context_store_read_bytes_per_second",
           "Read rate the cache cost model assumes for the context store, learned from reads.");
     GAUGE(context_store_remote_images, "context_store_remote_images",

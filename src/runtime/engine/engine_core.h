@@ -318,6 +318,9 @@ public:
         ContextStore* store = nullptr;
         std::string binding;
         std::function<bool(CheckpointImage&&)> sink;
+        // Write-on-evict: queues the image of a continuation the cache is about to lose. May take
+        // more than `sink` (it is the last chance to keep the conversation); must not block.
+        std::function<bool(CheckpointImage&&)> evict_sink;
         std::function<bool()> ready;
         std::function<std::uint64_t()> failures;
         // A retained continuation unused this long is written in the background; zero disables it.
@@ -334,6 +337,23 @@ public:
         if (store_.store && !hydration_reader_.joinable()) {
             hydration_reader_ = std::thread([this] { hydration_reader_loop(); });
         }
+        typename ResourceManagement::Durability durability;
+        if (store_.store) {
+            durability.stored_bytes =
+                [this](ContinuationOwnerToken token) -> std::optional<std::uint64_t> {
+                const auto found = owner_marks_.find(token);
+                if (found == owner_marks_.end() ||
+                    !holds(found->second, resources_.points(token))) {
+                    return std::nullopt;
+                }
+                return found->second.stored_bytes;
+            };
+        }
+        if (store_.evict_sink) {
+            durability.releasing = [this](std::span<const typename ResourceManagement::RetainedOwner>
+                                              owners) { write_on_evict(owners); };
+        }
+        resources_.set_durability(std::move(durability));
         publish_store_read_rate();
     }
 
@@ -363,8 +383,8 @@ public:
             const auto token =
                 resources_.adopt_restored(program, imported->points, imported->session);
             if (!token) { return false; }
-            owner_marks_[token] = {.persisted = fingerprint(imported->points),
-                                   .last_used = Clock::now()};
+            mark(token).last_used = Clock::now();
+            record_stored(token, imported->points, image.size());
         } catch (const std::invalid_argument&) { return false; }
         if (read_ns) {
             observe_store_read(image.size(),
@@ -394,12 +414,13 @@ public:
         std::uint32_t written = 0;
         for (const auto& owner : owners) {
             if (Clock::now() >= deadline) { break; }
-            const auto print = fingerprint(owner.points);
-            if (owner.active || mark(owner.token).persisted == print) { continue; }
+            if (owner.active || holds(mark(owner.token), owner.points)) { continue; }
             try {
-                if (write(program.export_checkpoints(owner.points, owner.session,
-                                                     store_.binding))) {
-                    mark(owner.token).persisted = print;
+                auto image        = program.export_checkpoints(owner.points, owner.session,
+                                                               store_.binding);
+                const auto bytes  = image.bytes.size();
+                if (write(std::move(image))) {
+                    record_stored(owner.token, owner.points, bytes);
                     ++written;
                 }
             } catch (...) {}
@@ -2777,9 +2798,28 @@ private:
     // ---- Durable context store ----------------------------------------------------------------
 
     struct OwnerMark {
-        std::uint64_t persisted = 0; // fingerprint of the point set last written, 0: never
+        // The points of the image last written (or queued) for this continuation and its size.
+        // Checkpoint contents never change under a handle, and handles carry a generation, so a
+        // continuation whose current points are all among them is held by the store as it is now.
+        std::vector<Checkpoint> stored;
+        std::uint64_t stored_bytes = 0;
         Clock::time_point last_used{};
     };
+
+    [[nodiscard]] static bool holds(const OwnerMark& entry, std::span<const Checkpoint> points) {
+        return !entry.stored.empty() && !points.empty() &&
+               std::all_of(points.begin(), points.end(), [&](const auto point) {
+                   return std::find(entry.stored.begin(), entry.stored.end(), point) !=
+                          entry.stored.end();
+               });
+    }
+
+    void record_stored(ContinuationOwnerToken token, std::span<const Checkpoint> points,
+                       std::uint64_t bytes) {
+        auto& entry        = mark(token);
+        entry.stored       = std::vector<Checkpoint>(points.begin(), points.end());
+        entry.stored_bytes = bytes;
+    }
 
     OwnerMark& mark(ContinuationOwnerToken token) {
         auto [found, inserted] = owner_marks_.try_emplace(token);
@@ -2787,20 +2827,6 @@ private:
         return found->second;
     }
 
-    // Checkpoint contents never change under a handle, and handles carry a generation, so the
-    // point set identifies what an image of the continuation holds.
-    [[nodiscard]] static std::uint64_t fingerprint(std::span<const Checkpoint> points) {
-        std::vector<std::pair<std::uint32_t, std::uint64_t>> keys;
-        keys.reserve(points.size());
-        for (const auto point : points) { keys.emplace_back(point.index, point.generation); }
-        std::sort(keys.begin(), keys.end());
-        std::uint64_t hash = 0x84222325cbf29ce4ULL;
-        for (const auto& [index, generation] : keys) {
-            hash = (hash ^ index) * 0x100000001b3ULL;
-            hash = (hash ^ generation) * 0x100000001b3ULL;
-        }
-        return hash == 0 ? 1 : hash;
-    }
 
     // Images the store removed on its own (space, age, damage). A continuation marked as stored
     // whose image is gone would never be written again, so every mark is cleared when it grows.
@@ -2816,7 +2842,7 @@ private:
         const auto removed = store_removal_count();
         if (removed == store_removals_seen_) { return; }
         store_removals_seen_ = removed;
-        for (auto& [token, entry] : owner_marks_) { entry.persisted = 0; }
+        for (auto& [token, entry] : owner_marks_) { entry.stored.clear(); }
     }
 
     // A write that was accepted into the queue and then failed left its continuation marked.
@@ -2825,7 +2851,7 @@ private:
         const auto failed = store_.failures();
         if (failed == store_failures_seen_) { return false; }
         store_failures_seen_ = failed;
-        for (auto& [token, entry] : owner_marks_) { entry.persisted = 0; }
+        for (auto& [token, entry] : owner_marks_) { entry.stored.clear(); }
         return true;
     }
 
@@ -2870,7 +2896,7 @@ private:
             for (const auto& owner : owners) {
                 if (owner.active) { continue; }
                 auto& entry = mark(owner.token);
-                if (entry.persisted == fingerprint(owner.points) ||
+                if (holds(entry, owner.points) ||
                     now - entry.last_used < store_.idle_persist) {
                     continue;
                 }
@@ -2884,10 +2910,11 @@ private:
                 chosen_depth = depth;
             }
             if (!chosen) { return; }
-            const auto print = fingerprint(chosen->points);
-            if (store_.sink(
-                    program.export_checkpoints(chosen->points, chosen->session, store_.binding))) {
-                mark(chosen->token).persisted = print;
+            auto image       = program.export_checkpoints(chosen->points, chosen->session,
+                                                              store_.binding);
+            const auto bytes = image.bytes.size();
+            if (store_.sink(std::move(image))) {
+                record_stored(chosen->token, chosen->points, bytes);
             } else {
                 // The write queue is full: try again later, not on every unit.
                 next_persist_scan_ = now + std::chrono::seconds(4);
@@ -2898,6 +2925,33 @@ private:
     // Extra reclaim rounds a hydration import may take when free Host bytes are split too finely
     // for the image (each round frees as much again as the image needs).
     static constexpr int kHydrationImportRounds = 3;
+
+    // Write-on-evict: a retained continuation the cache is about to lose a point of, and that the
+    // store does not hold as it is now, is exported and queued before the release. The export is
+    // a step of the Engine worker (a D2H/H2H copy of the image, measured in
+    // context_store_eviction_export_seconds); the queued image is caller memory, so the
+    // conversation survives until it is written even though its Host copy is released now. A
+    // full queue, an open context transaction or a failed export leaves today's behaviour: the
+    // points are released and the next turn prefills.
+    void write_on_evict(std::span<const typename ResourceManagement::RetainedOwner> owners) noexcept {
+        if (!store_.evict_sink) { return; }
+        auto& program = *instance_.program;
+        if (program.has_context_transaction()) { return; }
+        for (const auto& owner : owners) {
+            try {
+                if (holds(mark(owner.token), owner.points)) { continue; }
+                const auto started = Clock::now();
+                auto image = program.export_checkpoints(owner.points, owner.session, store_.binding);
+                const auto bytes = image.bytes.size();
+                cumulative_stats_.context_store_eviction_export_seconds +=
+                    std::chrono::duration<double>(Clock::now() - started).count();
+                if (store_.evict_sink(std::move(image))) {
+                    record_stored(owner.token, owner.points, bytes);
+                    ++cumulative_stats_.context_store_eviction_writes;
+                }
+            } catch (...) {}
+        }
+    }
 
     struct HydrationTask {
         std::shared_ptr<Request> request;
@@ -3072,8 +3126,8 @@ private:
         if (!imported) { return false; }
         const auto token = resources_.adopt_restored(program, imported->points, imported->session);
         if (!token) { return false; }
-        owner_marks_[token] = {.persisted = fingerprint(imported->points),
-                               .last_used = Clock::now()};
+        mark(token).last_used = Clock::now();
+        record_stored(token, imported->points, image.size());
         auto sources = resources_.candidates(program, *request->base_plan, UINT32_MAX, std::nullopt,
                                              request->id, request->publication_order);
         const auto restored = std::find_if(sources.begin(), sources.end(), [&](const auto& choice) {
