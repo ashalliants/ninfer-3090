@@ -1472,8 +1472,8 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 {"object":"response.input_tokens","input_tokens":11}
 ```
 
-Unsupported Create fields include Conversations, prompt templates, context management, hosted
-moderation, non-empty `include`, background execution, compaction,
+Unsupported Create fields include Conversations, prompt templates, context management,
+`access_programs`, hosted moderation, non-empty `include`, background execution, compaction,
 files/audio, and OpenAI-hosted/MCP tools. These are compatibility boundaries, not silently
 accepted placeholders.
 

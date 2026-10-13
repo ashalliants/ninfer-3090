@@ -474,8 +474,9 @@ ToolCall parse_custom_tool_call_item(
     const Json& item, Json& canonical,
     std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& identities) {
     static const std::unordered_set<std::string> allowed = {
-        "id", "type", "call_id", "name", "input", "status", "caller", "namespace"};
+        "id", "type", "call_id", "name", "input", "status", "caller", "namespace", "async"};
     reject_nonnull_unknown_members(item, allowed, "input");
+    reject_async_function(item, "input");
     if (item.contains("caller") && !item.at("caller").is_null()) {
         bad_request("custom_tool_call.caller is not supported", "input",
                     "tool_relationship_not_supported");
@@ -860,8 +861,9 @@ parse_custom_tool(const Json& item, std::optional<std::string> wire_namespace,
                   std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& identities,
                   std::string schema_param) {
     static const std::unordered_set<std::string> allowed_members = {
-        "type", "name", "description", "format", "allowed_callers", "defer_loading"};
+        "type", "name", "description", "format", "allowed_callers", "defer_loading", "async"};
     reject_nonnull_unknown_members(item, allowed_members, "tools");
+    reject_async_function(item, "tools");
     const OpenAIResponsesFunctionIdentity identity{.name = require_function_name(item, "tools"),
                                                    .wire_namespace = std::move(wire_namespace),
                                                    .custom         = true};
@@ -1323,6 +1325,8 @@ void reject_unsupported_platform_fields(const Json& body) {
          "prompt requires an OpenAI prompt-template resource"},
         {"context_management", "context_management_not_supported",
          "context_management requires an API compaction pipeline"},
+        {"access_programs", "access_programs_not_supported",
+         "access_programs requires an OpenAI program-access resource"},
         {"moderation", "moderation_not_supported",
          "moderation changes request acceptance and output but no moderator is configured"},
     };
@@ -1335,7 +1339,8 @@ void reject_unsupported_platform_fields(const Json& body) {
 }
 
 void validate_common_top_level(const Json& body, bool create) {
-    static const std::unordered_set<std::string> create_fields = {"background",
+    static const std::unordered_set<std::string> create_fields = {"access_programs",
+                                                                  "background",
                                                                   "structured_outputs",
                                                                   "chat_template_kwargs",
                                                                   "client_metadata",

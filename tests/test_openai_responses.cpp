@@ -1191,6 +1191,30 @@ int test_explicit_rejections() {
                       }) == "async_tools_not_supported",
                       "async:true function tools are rejected explicitly");
 
+    value          = base;
+    value["tools"] = Json::array({Json{{"type", "custom"}, {"name", "c"}, {"async", false}}});
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(value, limits());
+                      }).empty(),
+                      "async:false is accepted on custom tools");
+    value["tools"][0]["async"] = true;
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(value, limits());
+                      }) == "async_tools_not_supported",
+                      "async:true custom tools are rejected explicitly");
+
+    value                     = base;
+    value["access_programs"] = Json::array();
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(value, limits());
+                      }) == "access_programs_not_supported",
+                      "access_programs is a recognized but unsupported request field");
+    value["access_programs"] = nullptr;
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(value, limits());
+                      }).empty(),
+                      "null access_programs is accepted");
+
     value         = base;
     value["text"] = Json{{"format", Json{{"type", "json_schema"}}}};
     failures += check(api_error([&] {
