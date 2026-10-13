@@ -115,9 +115,12 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
 }
 
 Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceArena& work, ForwardRowsState state,
-                 ForwardRowsKV kv, ForwardExperts experts)
+                 ForwardRowsKV kv, ForwardExperts experts, std::optional<ForwardRowsMtp> mtp)
     : parameters_(parameters), config_(parameters.model.config()), device_(device), work_(&work),
       experts_(std::move(experts)) {
+    if (mtp.has_value() != parameters_.mtp.has_value()) {
+        throw std::invalid_argument("Qwen4Exp forward: the MTP drafter's parameters and state go together");
+    }
     const auto& c        = config_;
     const auto slots     = static_cast<std::int32_t>(state.slot_ids.numel());
     const std::int32_t C = dim(c.gdn.conv_channels()), K = dim(c.gdn.conv_kernel - 1);
@@ -167,8 +170,30 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
             layer.block_table = table.block_table;
             table.layers.push_back(layer);
         }
+        if (mtp) {
+            if (mtp->tails.data == nullptr || !shaped(mtp->tails, DType::BF16, {Di, R - 1, slots}) ||
+                mtp->pooled.data == nullptr || mtp->ones.data == nullptr) {
+                throw std::invalid_argument("Qwen4Exp forward: the slotted drafter state is incomplete");
+            }
+            ForwardMtp drafter;
+            drafter.kv             = mtp->kv;
+            drafter.kv.block_table = table.block_table;
+            drafter.pooled         = mtp->pooled;
+            drafter.tail           = mtp->tails.slice(2, s, 1).view({Di, R - 1});
+            drafter.ones           = mtp->ones;
+            rows.slot_mtp.push_back(std::move(drafter));
+        }
         rows.slot_state.push_back(std::move(view));
         rows.slot_kv.push_back(std::move(table));
+    }
+    if (mtp) {
+        // Every drafter expert is resident: expert e's record is frame e of its device bank.
+        const auto E = static_cast<std::int32_t>(config_.moe.experts);
+        std::vector<std::int32_t> identity(static_cast<std::size_t>(E));
+        for (std::int32_t e = 0; e < E; ++e) { identity[static_cast<std::size_t>(e)] = e; }
+        mtp_frames_backing_ = DeviceBuffer(identity.size() * sizeof(std::int32_t));
+        mtp_frames_backing_.copy_from_host(identity.data(), mtp_frames_backing_.bytes);
+        mtp_frames_ = Tensor(mtp_frames_backing_.p, DType::I32, {E});
     }
     rows_ = std::move(rows);
     select_row(0);
@@ -180,6 +205,7 @@ void Forward::select_row(std::int32_t slot) {
     }
     state_ = rows_->slot_state[static_cast<std::size_t>(slot)];
     kv_    = rows_->slot_kv[static_cast<std::size_t>(slot)];
+    if (!rows_->slot_mtp.empty()) { mtp_ = rows_->slot_mtp[static_cast<std::size_t>(slot)]; }
 }
 
 std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, std::uint32_t max_visible_keys,
@@ -573,6 +599,11 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
 // a row's KV, pooled keys and index-key tail run once per row through its own block table.
 
 void Forward::run_rows(const ForwardRowsBatch& batch, Tensor& logits) {
+    run_rows_front(batch);
+    run_rows_back(batch, logits);
+}
+
+void Forward::run_rows_front(const ForwardRowsBatch& batch) {
     if (!rows_) { throw std::logic_error("Qwen4Exp forward: run_rows needs the slotted state"); }
     const auto B     = static_cast<std::int32_t>(batch.slots.size());
     const auto slots = static_cast<std::int32_t>(rows_->slot_state.size());
@@ -585,8 +616,7 @@ void Forward::run_rows(const ForwardRowsBatch& batch, Tensor& logits) {
     if (!distinct || batch.slot_ids.numel() != B || batch.ids.ne[0] != B || batch.positions.ne[0] != B ||
         batch.rope_positions.ne[0] != B || batch.rope_positions.ne[1] != 3 || batch.row_rope.ne[0] != 3 ||
         batch.row_rope.ne[1] != B || batch.block_start_rope.ne[0] != 3 || batch.block_start_rope.ne[1] != B ||
-        batch.ngram_rows.ne[2] != B || logits.dtype != DType::FP32 || logits.ne[0] != dim(config_.vocab_size) ||
-        logits.ne[1] != B) {
+        batch.ngram_rows.ne[2] != B) {
         throw std::invalid_argument("Qwen4Exp forward: rows batch geometry is invalid");
     }
     const cudaStream_t s = device_.stream;
@@ -599,12 +629,36 @@ void Forward::run_rows(const ForwardRowsBatch& batch, Tensor& logits) {
         ops::embedding(batch.ids, parameters_.token_embedding, x0, s);
         ops::hyper_connection_expand(x0, dim(config_.hc.streams), residual_, s);
     }
-    for (std::uint32_t l = 0; l < config_.num_hidden_layers; ++l) {
+    const std::uint32_t split = rows_layer();
+    for (std::uint32_t l = 0; l < split; ++l) {
         try {
             layer_rows(l, batch);
         } catch (const std::exception& error) {
             throw std::runtime_error("qwen4_exp/rows/layers/" + std::to_string(l) + ": " + error.what());
         }
+    }
+}
+
+void Forward::run_rows_back(const ForwardRowsBatch& batch, Tensor& logits) {
+    const auto B = static_cast<std::int32_t>(batch.slots.size());
+    if (residual_.data == nullptr || residual_.ne[1] != B || logits.dtype != DType::FP32 ||
+        logits.ne[0] != dim(config_.vocab_size) || logits.ne[1] != B) {
+        throw std::invalid_argument("Qwen4Exp forward: the rows back part needs its front's batch and FP32 logits");
+    }
+    const cudaStream_t s = device_.stream;
+    for (std::uint32_t l = rows_layer(); l < config_.num_hidden_layers; ++l) {
+        try {
+            layer_rows(l, batch);
+        } catch (const std::exception& error) {
+            throw std::runtime_error("qwen4_exp/rows/layers/" + std::to_string(l) + ": " + error.what());
+        }
+    }
+    if (batch.residual_out.data != nullptr) {
+        if (batch.residual_out.bytes() != residual_.bytes()) {
+            throw std::invalid_argument("Qwen4Exp forward: residual_out must be BF16 [S*H, B]");
+        }
+        CUDA_CHECK(cudaMemcpyAsync(batch.residual_out.data, residual_.data, residual_.bytes(),
+                                   cudaMemcpyDeviceToDevice, s));
     }
     {
         auto scope     = work_->scope();

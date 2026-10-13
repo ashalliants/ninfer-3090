@@ -123,7 +123,10 @@ void validate(const EngineOptions& options) {
     if (options.purpose != EnginePurpose::Generation) {
         refuse("serves generation only (perplexity scoring is not available for this model yet)");
     }
-    if (options.max_concurrency != 1) { refuse("serves one request at a time in this release: use --max-concurrency 1"); }
+    if (options.max_concurrency < 1 || options.max_concurrency > 2) {
+        refuse("serves one or two requests at once: use --max-concurrency 1 or 2 (three or more lanes lose to two on "
+               "one RTX 3090: docs/maintainer/flash-next-lanes-spike.md)");
+    }
     if (options.kv_cache != KvCacheStorage::Int8Group64) { refuse("its attention cache is INT8: use --kv-dtype int8"); }
     const auto& spec = options.speculative;
     if (spec.backend != SpeculativeBackend::None && spec.backend != SpeculativeBackend::Mtp) {
@@ -244,12 +247,12 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     demand.later_pinned = kProgramPinnedAllowance;
     demand.pageable     = models::qwen4_exp::NgramVolume::cache_bytes(config.ple.table);
     // Decoded media: the frontend's cache up to its budget, and in flight at most one prompt's patches
-    // (one lane; the prompt's vision tokens are bounded by the context).
+    // (one prompt per lane; a prompt's vision tokens are bounded by the context).
     if (vision) {
         const std::uint64_t prompt_patches =
             std::min<std::uint64_t>(options.max_context, models::qwen3_5::kMaximumPromptVisionTokens) *
             models::qwen3_5::kRawPatchesPerVisionToken * models::qwen3_5::kPreparedVisionPatchFeatures * 2;
-        demand.pageable += options.media_cache_bytes + std::min<std::uint64_t>(options.media_live_bytes, prompt_patches);
+        demand.pageable += options.media_cache_bytes + std::min<std::uint64_t>(options.media_live_bytes, prompt_patches * options.max_concurrency);
     }
     demand.load_staging = kLoadStagingBytes;
     // The context cache's NVMe tier (--context-nvme-mib): checkpoints in a scratch file, the Host tier

@@ -77,6 +77,16 @@ set_tests_properties(ninfer_qwen4_exp_nvme_tier_test PROPERTIES SKIP_RETURN_CODE
 # Engine (placement invariance across cold, warm, warm-started and small expert caches; the RAM
 # ledger's refusal; the elastic KV pool's grow/shrink cycle within the VRAM budget) and, with
 # --bench, the decode measurements.
+# GPU, real artifact (skips without NINFER_TEST_QWEN4EXP_ARTIFACT): two lanes through the public
+# Engine (--exact: every request's greedy ids against the same request on a one-lane Engine, with
+# the context cache and a cancelled lane; --bench: requests in flight at once). Standalone: a script
+# runs it by path with its own arguments.
+ninfer_add_test(ninfer_qwen4_exp_lanes_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lanes_real.cpp"
+  STANDALONE
+  LIBRARIES ninfer_engine ninfer_core)
+set_tests_properties(ninfer_qwen4_exp_lanes_real_test PROPERTIES SKIP_RETURN_CODE 77)
+
 ninfer_add_test(ninfer_qwen4_exp_engine_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_real.cpp"
   NEEDS_SOURCE_DIR

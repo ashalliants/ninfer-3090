@@ -159,6 +159,22 @@ struct ContractAccess {
         out.speculative_ = true;
         return out;
     }
+    // A plain round over several rows: one sampled token per row.
+    static PendingBatch make_rows(const void* owner, std::uint64_t transaction, std::span<const SequenceHandle> rows,
+                                  std::span<const TokenId> tokens, runtime::ExecutionTiming timing,
+                                  std::span<const bool> constraint_failed) {
+        PendingBatch out;
+        out.owner_       = owner;
+        out.transaction_ = transaction;
+        out.row_count_   = rows.size();
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            out.rows_[i]              = rows[i];
+            out.constraint_failed_[i] = constraint_failed[i];
+        }
+        out.tokens_ = tokens;
+        out.timing_ = timing;
+        return out;
+    }
     static const void* owner(const PendingBatch& p) noexcept { return p.owner_; }
     static std::uint64_t transaction(const PendingBatch& p) noexcept { return p.transaction_; }
     static std::span<const SequenceHandle> rows(const PendingBatch& p) noexcept { return {p.rows_.data(), p.row_count_}; }
@@ -191,6 +207,9 @@ constexpr std::uint32_t kKvBaseTokens = 32768;
 constexpr std::uint32_t kKvGrowPages = 64;
 // Misses staged per pass of a layer's experts.
 constexpr std::int32_t kStagingSlots = 64;
+// Lanes (requests decoded in the same rounds): two. Three and four give +14% and +17% over two at
+// 41 and 32 tok/s per stream (docs/maintainer/flash-next-lanes-spike.md).
+constexpr std::uint32_t kMaximumLanes = 2;
 // Wide prefill calls (Infernix's 4,096-token calls): their workspace and the expert stream's ring
 // are frames lent by the expert cache for the prompt, so the static workspace stays sized for the
 // configured chunk. A prompt shorter than kStreamMinColumns runs static calls without the stream.
@@ -250,13 +269,15 @@ struct KvLayout {
         std::size_t offset     = 0;
         std::size_t page_bytes = 0;
     };
-    std::uint32_t pages = 0;
+    std::uint32_t pages = 0; // the pool's pages (every lane's extent comes out of them)
     std::vector<std::array<Plane, 5>> layers; // k, v, k scales, v scales, pooled keys
-    std::size_t table  = 0;
-    std::size_t bytes  = 0;
+    std::size_t table       = 0;
+    std::size_t table_bytes = 0; // one block table per lane
+    std::size_t bytes       = 0;
 
-    // `layers` attention layers: the text model's, plus the MTP drafter's when it runs.
-    static KvLayout plan(const TextConfig& c, std::uint32_t pages, std::uint32_t layers) {
+    // `layers` attention layers: the text model's, plus the MTP drafter's when it runs. The block
+    // tables take `table_words` entries (the lanes' tables, each as long as a lane's context).
+    static KvLayout plan(const TextConfig& c, std::uint32_t pages, std::uint32_t layers, std::size_t table_words) {
         KvLayout out;
         out.pages = pages;
         const std::size_t D = c.attention.head_dim, Hkv = c.attention.kv_heads;
@@ -264,7 +285,8 @@ struct KvLayout {
         const std::size_t codes  = D * kPagedKVPageSize * Hkv;
         const std::size_t scales = (D / 64) * kPagedKVPageSize * Hkv * 2;
         const std::size_t keys   = pooled * kPagedKVPageSize * 2;
-        std::size_t at           = align(static_cast<std::size_t>(pages) * 4, kKvChunkBytes);
+        out.table_bytes          = table_words * 4;
+        std::size_t at           = align(out.table_bytes, kKvChunkBytes);
         out.table                = 0;
         for (std::uint32_t l = 0; l < layers; ++l) {
             std::array<Plane, 5> planes{};
@@ -286,7 +308,7 @@ struct KvLayout {
             if (n == 0) { return; }
             for (std::size_t c = offset / kKvChunkBytes; c <= (offset + n - 1) / kKvChunkBytes; ++c) { need[c] = 1; }
         };
-        mark(table, static_cast<std::size_t>(pages) * 4);
+        mark(table, table_bytes);
         for (const auto& planes : layers) {
             for (const auto& plane : planes) { mark(plane.offset, plane.page_bytes * backed); }
         }
@@ -309,16 +331,23 @@ struct IoLayout {
     std::size_t mtp_ids = 0, mtp_cells = 0, mtp_rope = 0, mtp_block_rope = 0;
     std::size_t draft_cells = 0, draft_rope = 0, draft_block_rope = 0, draft_anchor = 0;
     std::size_t vision_columns = 0, mtp_vision_columns = 0;
+    // A plain round over several lanes: the slot of each row, each row's RoPE words (3 per row)
+    // and pooled-block start (3 per row); the ids, positions and [rows, 3] RoPE words are the call's.
+    std::size_t rows_slots = 0, rows_rope = 0, rows_block = 0;
     std::size_t ngram = 0, bytes = 0;
 
     static IoLayout plan(std::size_t columns, std::size_t row_bytes, std::size_t logits, std::size_t drafts,
-                         bool vision) {
+                         bool vision, std::size_t lanes) {
         IoLayout out;
         out.positions     = align(4 * columns);
         out.rope          = align(out.positions + 4 * columns);
         out.block_rope    = align(out.rope + 12 * columns);
         out.logit_columns = align(out.block_rope + 12);
         std::size_t at    = align(out.logit_columns + 4 * logits);
+        out.rows_slots    = at;
+        out.rows_rope     = align(out.rows_slots + 4 * lanes);
+        out.rows_block    = align(out.rows_rope + 12 * lanes);
+        at                = align(out.rows_block + 12 * lanes);
         if (vision) {
             out.vision_columns = at;
             at                 = align(at + 4 * columns);
@@ -356,11 +385,15 @@ struct SpecLayout {
     std::size_t gdn_bytes = 0;
     std::size_t ple = 0, qsa_keys = 0, mtp_keys = 0, tails = 0, mtp_tail = 0, conv = 0, slot = 0;
     std::size_t residuals = 0, saved = 0, chain = 0, ones = 0, words = 0, bytes = 0;
+    // The drafter's saved residual of each lane (`saved_stride` apart) and the PLE slot word of
+    // each lane's verification (`slot`: a word per lane holding the lane's index).
+    std::size_t saved_stride = 0;
     // Round words (I32): the drafts, verification targets, licensed tokens, then one word each.
     std::size_t w_drafts = 0, w_target = 0, w_licensed = 0, w_counts = 0, w_accepted = 0, w_extents = 0,
                 w_lengths = 0, w_anchors = 0, w_commit = 0, w_mtp_ids = 0, w_count = 0;
 
-    static SpecLayout plan(const TextConfig& c, std::int32_t drafts, std::size_t tail_bytes, std::size_t conv_bytes) {
+    static SpecLayout plan(const TextConfig& c, std::int32_t drafts, std::size_t tail_bytes, std::size_t conv_bytes,
+                           std::size_t lanes) {
         SpecLayout out;
         out.drafts = drafts;
         out.width  = drafts + 1;
@@ -381,9 +414,11 @@ struct SpecLayout {
         out.tails     = take(align(tail_bytes) * c.attention_layers);
         out.mtp_tail  = take(tail_bytes);
         out.conv      = take(conv_bytes);
-        out.slot      = take(4);
-        out.residuals = take(w * W * 2);
-        out.saved     = take(w * 2);
+        out.slot      = take(4 * lanes);
+        // A rows round exports one residual per row too: the widest round has at least `lanes` columns.
+        out.residuals = take(w * std::max<std::size_t>(W, lanes) * 2);
+        out.saved_stride = align(w * 2);
+        out.saved     = take(out.saved_stride * lanes);
         out.chain     = take(w * 2);
         out.ones      = take(static_cast<std::size_t>(c.hc.streams) * execution::kMtpChunkColumns * 4);
         // Round words.
@@ -418,9 +453,19 @@ struct SpecLayout {
 struct Layout {
     std::int32_t chunk = 0, wide_chunk = 0, columns = 0, token_domain = 0;
     std::size_t wide_work = 0; // workspace of a wide call (in the lent frames)
-    std::uint32_t pages = 0, base_pages = 0;
+    // pages: one lane's context; pool_pages: the KV pool every lane's extent comes out of.
+    std::uint32_t lanes = 1, pages = 0, pool_pages = 0, base_pages = 0;
     KvLayout kv;
     IoLayout io;
+    // One lane's state image (its sections below, the PLE slot word included) and the device
+    // backing of every lane's, slot-minor: each section holds `lanes` copies of one lane's piece.
+    struct StateSection {
+        std::size_t at = 0;    // lane 0's copy in the backing
+        std::size_t bytes = 0; // one lane's copy
+        std::size_t image = 0; // the section's offset in a lane's state image
+    };
+    std::vector<StateSection> sections; // in image order; the slot word is not a section
+    std::size_t state_total = 0, slots_at = 0;
     std::size_t state = 0, gdn_conv = 0, gdn_recurrent = 0, ple = 0, tail = 0;
     std::size_t work = 0, staging = 0, mask_words = 0;
     std::uint64_t frame_stride = 0;
@@ -434,9 +479,10 @@ struct Layout {
 
 Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t public_tokens,
                    std::span<const std::uint64_t> strides) {
-    if (o.max_concurrency != 1) {
+    if (o.max_concurrency < 1 || o.max_concurrency > kMaximumLanes) {
         throw std::invalid_argument(
-            "Qwen3.8-Flash-Next serves one request at a time in this release: use --max-concurrency 1");
+            "Qwen3.8-Flash-Next serves one or two requests at once: use --max-concurrency 1 or 2 "
+            "(three or more lanes lose to two on one RTX 3090: docs/maintainer/flash-next-lanes-spike.md)");
     }
     if (o.max_context == 0 || o.prefill_chunk == 0) {
         throw std::invalid_argument("Qwen3.8-Flash-Next: max_context and prefill_chunk must be nonzero");
@@ -461,23 +507,51 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     d.wide_chunk   = std::min(kWideChunk, static_cast<std::int32_t>(o.max_context));
     d.columns      = std::max(d.chunk, d.wide_chunk);
     d.token_domain = static_cast<std::int32_t>(public_tokens);
+    d.lanes        = o.max_concurrency;
     d.pages        = (o.max_context + kPagedKVPageSize - 1) / kPagedKVPageSize;
+    // Every lane may hold a full context: the pool's address range covers them all. What is backed
+    // at startup is the pool's base (32,768 tokens by default), whatever the lane count.
+    d.pool_pages   = d.pages * d.lanes;
     const std::uint32_t base_tokens = o.kv_base_tokens != 0 ? o.kv_base_tokens : kKvBaseTokens;
-    d.base_pages = std::min(d.pages, std::max(1U, base_tokens / kPagedKVPageSize));
+    d.base_pages = std::min(d.pool_pages, std::max(1U, base_tokens / kPagedKVPageSize));
     // The drafter's KV is one more attention layer through the same block table.
-    d.kv         = KvLayout::plan(c, d.pages, c.attention_layers + (d.drafts > 0 ? 1U : 0U));
+    d.kv         = KvLayout::plan(c, d.pool_pages, c.attention_layers + (d.drafts > 0 ? 1U : 0U),
+                                  static_cast<std::size_t>(d.pages) * d.lanes);
     const NgramHash hash(c.ple.ngram, 0);
     d.io = IoLayout::plan(static_cast<std::size_t>(d.columns),
                           static_cast<std::size_t>(c.ple.table.row_bytes) * hash.heads(),
-                          static_cast<std::size_t>(d.max_width), static_cast<std::size_t>(d.drafts), o.vision);
+                          static_cast<std::size_t>(d.max_width), static_cast<std::size_t>(d.drafts), o.vision,
+                          d.lanes);
     d.gdn_conv      = std::size_t(c.gdn.conv_channels()) * (c.gdn.conv_kernel - 1) * 2;
     d.gdn_recurrent = std::size_t(c.gdn.key_head_dim) * c.gdn.value_head_dim * c.gdn.value_heads * 4;
     d.ple           = std::size_t(c.residual_width()) * c.ple.conv_span() * 2;
     d.tail          = std::size_t(c.qsa.index_head_dim) * (c.qsa.compress_ratio - 1) * 2;
-    // GDN, PLE and QSA tail state, the PLE slot word, then (with MTP) the drafter's tail.
-    d.state = align(c.gdn_layers * (align(d.gdn_conv) + align(d.gdn_recurrent)) + align(d.ple) +
-                    c.attention_layers * align(d.tail) + align(sizeof(std::int32_t)) + (d.drafts > 0 ? align(d.tail) : 0));
-    if (d.drafts > 0) { d.spec = SpecLayout::plan(c, d.drafts, d.tail, d.gdn_conv); }
+    // One lane's state image: GDN, PLE and QSA tail state, the PLE slot word, then (with MTP) the
+    // drafter's tail. The device backing holds every lane's copy of each piece next to each other
+    // (the slotted Ops index the pieces by slot).
+    {
+        std::size_t image = 0, at = 0;
+        // A piece's copies are `bytes` apart (the slotted Ops take them as one contiguous tensor
+        // with a slot axis); each piece starts on a 256-byte boundary in the backing and the image.
+        const auto section = [&](std::size_t bytes) {
+            at = align(at);
+            d.sections.push_back({at, bytes, image});
+            at += d.lanes * bytes;
+            image += align(bytes);
+        };
+        for (std::uint32_t l = 0; l < c.gdn_layers; ++l) {
+            section(d.gdn_conv);
+            section(d.gdn_recurrent);
+        }
+        section(d.ple);
+        for (std::uint32_t l = 0; l < c.attention_layers; ++l) { section(d.tail); }
+        image += align(sizeof(std::int32_t)); // the slot word: not part of a lane's image
+        if (d.drafts > 0) { section(d.tail); }
+        d.state       = align(image);
+        d.slots_at    = align(at);
+        d.state_total = d.slots_at + align(4ULL * d.lanes);
+    }
+    if (d.drafts > 0) { d.spec = SpecLayout::plan(c, d.drafts, d.tail, d.gdn_conv, d.lanes); }
     for (const std::uint64_t stride : strides) { d.frame_stride = std::max(d.frame_stride, stride); }
     if (d.frame_stride == 0) { throw std::invalid_argument("Qwen3.8-Flash-Next: no expert banks"); }
     d.staging    = static_cast<std::size_t>(kStagingSlots) * d.frame_stride;
@@ -505,23 +579,28 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     d.vmm = VmmArena::supported(o.device);
 
     auto& b     = d.bytes;
-    b.kv_pages  = d.pages;
+    b.kv_pages  = d.pool_pages;
     b.kv_max    = d.kv.bytes;
     b.kv        = d.vmm ? d.kv.mapped_bytes(d.base_pages) : d.kv.bytes;
     b.workspace = d.work;
     b.staging   = d.staging;
-    b.state     = d.state;
-    // Logits of the widest round (FP32 and BF16), then the sampling words.
-    b.io        = d.io.bytes + (sizeof(float) + 2ULL) * c.vocab_size * d.max_width + 256 * 4 +
-                  sizeof(ops::SamplingConfig) + 4ULL * public_tokens + 4 * d.mask_words + 4096;
+    b.state     = d.state_total;
+    // Logits of the widest round (FP32 and BF16; at least one column per lane), then the sampling
+    // words (a config, the counts and a mask per lane).
+    const std::uint64_t logit_columns = std::max<std::uint64_t>(static_cast<std::uint64_t>(d.max_width), d.lanes);
+    b.io        = d.io.bytes + (sizeof(float) + 2ULL) * c.vocab_size * logit_columns + 2ULL * c.vocab_size * d.lanes +
+                  256 * 4 +
+                  (sizeof(ops::SamplingConfig) + 4ULL * public_tokens + 4ULL * d.mask_words + 256) * d.lanes + 4096;
     b.residency            = ExpertResidency::table_bytes(c, d.columns);
     b.speculation          = d.drafts > 0 ? d.spec.bytes : 0;
     b.expert_record_stride = d.frame_stride;
     b.max_frames           = ExpertResidency::max_frames(c);
-    // The decode forward in two parts; with MTP a verification forward in two parts per width, a
-    // draft graph per step count, a drafter catch-up per committed count and the pending cell's.
-    b.graph_bound = 2 * graph_bound(1, 1, 0) +
-                    (d.drafts > 0 ? static_cast<std::uint32_t>(2 * d.drafts + d.drafts + d.max_width + 1) : 0U);
+    // Each lane's decode forward in two parts (and with MTP its verification forwards in two parts
+    // per width, a draft graph per step count, a drafter catch-up per committed count and the
+    // pending cell's), plus the plain round over every lane in two parts.
+    b.graph_bound = d.lanes * (2 * graph_bound(1, 1, 0) +
+                               (d.drafts > 0 ? static_cast<std::uint32_t>(2 * d.drafts + d.drafts + d.max_width + 1) : 0U)) +
+                    (d.lanes > 1 ? 2 * graph_bound(1, 1, 0) + (d.drafts > 0 ? 1U : 0U) * d.lanes : 0U);
     return d;
 }
 
@@ -592,6 +671,8 @@ public:
         std::vector<std::uint32_t> endpoint; // slabs set aside for the endpoint at finish()
         std::uint32_t captured          = 0;
         std::uint32_t permit_frontier   = 0;
+        // The KV pool pages of the lane's extent, in logical order (its block table's column).
+        std::vector<std::uint32_t> pages;
     };
 
     ProgramImpl(const execution::Parameters& parameters, DeviceContext& device, ProgramOptions options)
@@ -610,8 +691,15 @@ public:
         guard.begin();
         std::uint64_t allocated = 0;
 
-        state_backing_ = DeviceBuffer(plan_.state);
-        allocated += plan_.state;
+        state_backing_ = DeviceBuffer(plan_.bytes.state);
+        allocated += plan_.bytes.state;
+        {
+            // The PLE slot of each lane: its own index, for the slotted Ops.
+            std::vector<std::int32_t> slots(plan_.lanes);
+            for (std::uint32_t s = 0; s < plan_.lanes; ++s) { slots[s] = static_cast<std::int32_t>(s); }
+            CUDA_CHECK(cudaMemcpy(static_cast<std::byte*>(state_backing_.p) + plan_.slots_at, slots.data(),
+                                  slots.size() * 4, cudaMemcpyHostToDevice));
+        }
         if (plan_.vmm) {
             kv_vmm_ = std::make_unique<VmmRange>(device_.device, plan_.kv.bytes, kKvChunkBytes);
             kv_base_ = static_cast<std::byte*>(kv_vmm_->base());
@@ -623,31 +711,38 @@ public:
             kv_base_ = static_cast<std::byte*>(kv_backing_.p);
             allocated += plan_.kv.bytes;
         }
-        backed_pages_ = plan_.vmm ? plan_.base_pages : plan_.pages;
+        backed_pages_ = plan_.vmm ? plan_.base_pages : plan_.pool_pages;
+        page_used_.assign(plan_.pool_pages, 0);
 
         io_device_ = DeviceBuffer(plan_.bytes.io);
         allocated += plan_.bytes.io;
         io_host_ = PinnedHostBuffer(plan_.io.bytes);
         host_token_ = PinnedHostBuffer(64);
-        mask_host_  = PinnedHostBuffer(4 * plan_.mask_words + 64);
-        config_host_ = PinnedHostBuffer(sizeof(ops::SamplingConfig) + 64);
+        mask_host_  = PinnedHostBuffer(4ULL * plan_.mask_words * plan_.lanes + 64);
+        config_host_ = PinnedHostBuffer(sizeof(ops::SamplingConfig) * plan_.lanes + 64);
         auto* io = static_cast<std::byte*>(io_device_.p);
         std::size_t at = align(plan_.io.bytes);
-        // One column's logits; a verification round reads the widest round's columns from here on.
+        // One column's logits; a verification round reads the widest round's columns (and a round
+        // over the lanes one per lane) from here on.
+        const std::size_t logit_columns = std::max<std::size_t>(static_cast<std::size_t>(plan_.max_width), plan_.lanes);
         logits32_ = Tensor(io + at, DType::FP32, {vocab_, 1});
-        at = align(at + sizeof(float) * c_.vocab_size * plan_.max_width);
+        at = align(at + sizeof(float) * c_.vocab_size * logit_columns);
         logits16_ = Tensor(io + at, DType::BF16, {vocab_, 1});
-        at = align(at + 2ULL * c_.vocab_size * plan_.max_width);
+        at = align(at + 2ULL * c_.vocab_size * logit_columns);
+        lane_logits_ = Tensor(io + at, DType::BF16, {vocab_, static_cast<std::int32_t>(plan_.lanes)});
+        at = align(at + 2ULL * c_.vocab_size * plan_.lanes);
         sampled_ = Tensor(io + at, DType::I32, {1});
-        at = align(at + 4);
+        at = align(at + 4ULL * plan_.lanes);
         sample_position_ = Tensor(io + at, DType::I32, {1});
-        at = align(at + 4);
+        at = align(at + 4ULL * plan_.lanes);
+        // A SamplingConfig per row of a round, the committed-token counts and the grammar mask of
+        // each lane.
         configs_ = reinterpret_cast<ops::SamplingConfig*>(io + at);
-        at = align(at + sizeof(ops::SamplingConfig));
-        token_counts_ = Tensor(io + at, DType::I32, {plan_.token_domain});
-        at = align(at + 4ULL * plan_.token_domain);
+        at = align(at + sizeof(ops::SamplingConfig) * plan_.lanes);
+        token_counts_ = Tensor(io + at, DType::I32, {plan_.token_domain, static_cast<std::int32_t>(plan_.lanes)});
+        at = align(at + 4ULL * plan_.token_domain * plan_.lanes);
         masks_ = reinterpret_cast<std::uint32_t*>(io + at);
-        at = align(at + 4 * plan_.mask_words);
+        at = align(at + 4ULL * plan_.mask_words * plan_.lanes);
         if (at > io_device_.bytes) { throw std::logic_error("Qwen3.8-Flash-Next: io layout exceeds its plan"); }
 
         work_ = std::make_unique<WorkspaceArena>(plan_.work);
@@ -695,7 +790,7 @@ public:
                     std::min<std::uint64_t>(*options_.expert_cache_bytes / plan_.frame_stride, demand.max_frames));
             }
             // The KV above the base comes out of the frames: keep room for the request's whole extent.
-            const std::uint64_t kv_growth = plan_.vmm ? plan_.kv.mapped_bytes(plan_.pages) - kv_vmm_->mapped_bytes() : 0;
+            const std::uint64_t kv_growth = plan_.vmm ? plan_.kv.mapped_bytes(plan_.pool_pages) - kv_vmm_->mapped_bytes() : 0;
             sizing_ = size_expert_frames(vram_->query(), demand);
             demand_ = demand;
             const auto grown = residency_->resize(sizing_.frames, device_.stream, *vram_);
@@ -731,55 +826,58 @@ public:
             }
         }
 
-        // The forward over the lane's state, KV and the expert sources.
-        execution::ForwardState state;
-        auto* p = static_cast<std::byte*>(state_backing_.p);
-        for (std::uint32_t l = 0; l < c_.gdn_layers; ++l) {
-            state.gdn_conv.emplace_back(p, DType::BF16, std::initializer_list<std::int32_t>{
-                                                            dim(c_.gdn.conv_channels()), dim(c_.gdn.conv_kernel - 1)});
-            p += align(plan_.gdn_conv);
-            state.gdn_recurrent.emplace_back(p, DType::FP32, std::initializer_list<std::int32_t>{
-                                                                 dim(c_.gdn.key_head_dim), dim(c_.gdn.value_head_dim),
-                                                                 dim(c_.gdn.value_heads)});
-            p += align(plan_.gdn_recurrent);
-        }
-        state.ple_conv = Tensor(p, DType::BF16, {dim(c_.residual_width()), dim(c_.ple.conv_span()), 1});
-        p += align(plan_.ple);
+        // The forward over the lanes' state, KV and the expert sources: one slot per lane; the
+        // single-sequence calls act on the lane select_lane() chose.
+        const std::int32_t slots = dim(plan_.lanes);
+        execution::ForwardRowsState state;
+        auto* backing = static_cast<std::byte*>(state_backing_.p);
         const std::int32_t di = dim(c_.qsa.index_head_dim), r = dim(c_.qsa.compress_ratio);
-        for (std::uint32_t l = 0; l < c_.attention_layers; ++l) {
-            state.qsa_tails.emplace_back(p, DType::BF16, std::initializer_list<std::int32_t>{di, r - 1});
-            p += align(plan_.tail);
-        }
-        state.ple_slot = Tensor(p, DType::I32, {1}); // 0 with the rest of the state at binding
-        p += align(sizeof(std::int32_t));
-        tails_base_ = state.qsa_tails.empty() ? nullptr : state.qsa_tails.front().data;
-        ple_state_  = state.ple_conv;
-        ple_slot_   = state.ple_slot;
-        if (plan_.drafts > 0) {
-            mtp_tail_ = Tensor(p, DType::BF16, {di, r - 1});
-            if (parameters_.mtp == std::nullopt) {
-                throw std::invalid_argument("Qwen3.8-Flash-Next: MTP speculation needs the model's drafter loaded");
+        {
+            std::size_t next = 0;
+            const auto piece = [&]() { return backing + plan_.sections.at(next++).at; };
+            for (std::uint32_t l = 0; l < c_.gdn_layers; ++l) {
+                state.gdn_conv.emplace_back(piece(), DType::BF16,
+                                            std::initializer_list<std::int32_t>{dim(c_.gdn.conv_channels()),
+                                                                                dim(c_.gdn.conv_kernel - 1), slots});
+                state.gdn_recurrent.emplace_back(
+                    piece(), DType::FP32,
+                    std::initializer_list<std::int32_t>{dim(c_.gdn.key_head_dim), dim(c_.gdn.value_head_dim),
+                                                        dim(c_.gdn.value_heads), slots});
+            }
+            state.ple_conv = Tensor(piece(), DType::BF16, {dim(c_.residual_width()), dim(c_.ple.conv_span()), slots});
+            for (std::uint32_t l = 0; l < c_.attention_layers; ++l) {
+                state.qsa_tails.emplace_back(piece(), DType::BF16, std::initializer_list<std::int32_t>{di, r - 1, slots});
+            }
+            state.slot_ids = Tensor(backing + plan_.slots_at, DType::I32, {slots});
+            if (plan_.drafts > 0) {
+                mtp_tails_ = Tensor(piece(), DType::BF16, {di, r - 1, slots});
+                if (parameters_.mtp == std::nullopt) {
+                    throw std::invalid_argument("Qwen3.8-Flash-Next: MTP speculation needs the model's drafter loaded");
+                }
             }
         }
-
-        const std::int32_t P = dim(plan_.pages), D = dim(c_.attention.head_dim), Hkv = dim(c_.attention.kv_heads);
-        execution::ForwardKV kv;
-        kv.block_table      = Tensor(kv_base_ + plan_.kv.table, DType::I32, {P});
-        kv.max_visible_keys = plan_.pages * kPagedKVPageSize;
+        state_ = state;
         {
-            // One lane: the identity table over the pool.
-            std::vector<std::int32_t> table(static_cast<std::size_t>(P));
-            for (std::int32_t i = 0; i < P; ++i) { table[static_cast<std::size_t>(i)] = i; }
-            CUDA_CHECK(cudaMemcpy(kv.block_table.data, table.data(), table.size() * 4, cudaMemcpyHostToDevice));
+            // Layer l's tail of lane s: its section's base plus s tails; the sections of consecutive
+            // layers sit one section apart.
+            const std::size_t first_tail = 2ULL * c_.gdn_layers + 1;
+            tail_layer_stride_ = c_.attention_layers > 1
+                                     ? plan_.sections.at(first_tail + 1).at - plan_.sections.at(first_tail).at
+                                     : plan_.tail;
         }
-        std::optional<execution::ForwardMtp> drafter;
+
+        const std::int32_t P = dim(plan_.pool_pages), D = dim(c_.attention.head_dim), Hkv = dim(c_.attention.kv_heads);
+        execution::ForwardRowsKV kv;
+        // Lane s's block table is column s: its logical pages' pool pages, written at its binding.
+        kv.block_tables     = Tensor(kv_base_ + plan_.kv.table, DType::I32, {dim(plan_.pages), slots});
+        kv.max_visible_keys = plan_.pages * kPagedKVPageSize;
+        std::optional<execution::ForwardRowsMtp> drafter;
         for (const auto& planes : plan_.kv.layers) {
             PagedKVLayerView view;
             view.k_pages       = Tensor(kv_base_ + planes[0].offset, DType::I8, {D, kPagedKVPageSize, Hkv, P});
             view.v_pages       = Tensor(kv_base_ + planes[1].offset, DType::I8, {D, kPagedKVPageSize, Hkv, P});
             view.k_scale_pages = Tensor(kv_base_ + planes[2].offset, DType::FP16, {D / 64, kPagedKVPageSize, Hkv, P});
             view.v_scale_pages = Tensor(kv_base_ + planes[3].offset, DType::FP16, {D / 64, kPagedKVPageSize, Hkv, P});
-            view.block_table   = kv.block_table;
             view.head_dim      = D;
             view.num_kv_heads  = Hkv;
             view.storage       = KvCacheStorage::Int8Group64;
@@ -792,10 +890,10 @@ public:
             // The drafter's layer, after the text model's.
             const auto& s = plan_.spec;
             auto* spec    = static_cast<std::byte*>(spec_backing_.p);
-            drafter.emplace(execution::ForwardMtp{
+            drafter.emplace(execution::ForwardRowsMtp{
                 .kv     = view,
                 .pooled = pooled,
-                .tail   = mtp_tail_,
+                .tails  = mtp_tails_,
                 .ones   = Tensor(spec + s.ones, DType::FP32, {dim(c_.hc.streams), execution::kMtpChunkColumns})});
         }
         if (plan_.drafts > 0) { bind_speculation(); }
@@ -821,6 +919,8 @@ public:
         ngram_next_ = PinnedHostBuffer(plan_.io.bytes - plan_.io.ngram);
         forward_ = std::make_unique<execution::Forward>(parameters_, device_, *work_, std::move(state), std::move(kv),
                                                         std::move(experts), std::move(drafter));
+        lane_graphs_.resize(plan_.lanes);
+        select_lane(0);
         warm_vision();
         warm_start_experts();
         device_.synchronize();
@@ -1027,9 +1127,11 @@ public:
             out.source_valid = false;
             return out;
         }
-        if (tx_ != Tx::None || lane_id.value != 0 || lane_.phase != Phase::Free || pending_ != 0) {
+        if (tx_ != Tx::None || lane_id.value >= plan_.lanes || lanes_[lane_id.value].phase != Phase::Free ||
+            pending_ != 0) {
             throw std::logic_error("Qwen3.8-Flash-Next: binding on a busy lane");
         }
+        select_lane(lane_id.value);
         const auto& base = base_of(plan);
         // The source is checked again: the quote may be older than a release since.
         std::optional<SourceCandidate> actual;
@@ -1046,43 +1148,57 @@ public:
         }
         const std::uint32_t extent =
             std::min(options_.max_context, base.summary.prompt_tokens + base.summary.effective_output_tokens);
-        // The request's whole extent is backed now, so its units never meet a shortage.
-        ensure_kv((extent + kPagedKVPageSize - 1) / kPagedKVPageSize);
+        // The request's whole extent is taken from the pool and backed now, so its units never meet
+        // a shortage: its pages are the lowest free ones (a lane alone gets pages [0, n)).
+        const std::uint32_t need_pages = (extent + kPagedKVPageSize - 1) / kPagedKVPageSize;
+        std::vector<std::uint32_t> pages;
+        if (!take_pages(need_pages, pages, out)) { return out; }
         drop_lane_cache();
-        lane_          = Lane{};
-        lane_.phase    = Phase::Binding;
-        lane_.epoch    = ++epoch_;
-        lane_.base     = plan.impl_;
-        lane_.extent   = extent;
-        lane_.admitted = Clock::now();
+        {
+            const std::uint64_t epoch = L().epoch;
+            L()                       = Lane{};
+            L().epoch                 = epoch;
+        }
+        L().pages    = std::move(pages);
+        L().phase    = Phase::Binding;
+        L().epoch    = ++epoch_;
+        L().base     = plan.impl_;
+        L().extent   = extent;
+        L().admitted = Clock::now();
         if (actual) {
             // Retirement first (the Qwen3.5 Program releases them before taking its reservations),
             // then reader leases on the source and every carried point until the restore landed.
             for (const auto point : actual->retired_points) {
                 if (!cache_->erase(point)) { throw std::logic_error("Qwen3.8-Flash-Next: binding retirement changed"); }
             }
-            lane_.source       = candidate.checkpoint;
-            lane_.reused       = actual->reused_tokens;
-            lane_.carried      = actual->private_points;
-            lane_.take_private = candidate.take_private;
-            lane_.consume_source =
+            L().source       = candidate.checkpoint;
+            L().reused       = actual->reused_tokens;
+            L().carried      = actual->private_points;
+            L().take_private = candidate.take_private;
+            L().consume_source =
                 actual->consume_source &&
-                std::find(lane_.carried.begin(), lane_.carried.end(), *candidate.checkpoint) == lane_.carried.end();
-            cache_->pin(*lane_.source);
-            for (const auto point : lane_.carried) {
-                if (point != *lane_.source) { cache_->pin(point); }
+                std::find(L().carried.begin(), L().carried.end(), *candidate.checkpoint) == L().carried.end();
+            cache_->pin(*L().source);
+            for (const auto point : L().carried) {
+                if (point != *L().source) { cache_->pin(point); }
             }
             out.retired_points = actual->retired_points;
-            lane_.retired      = actual->retired_points;
-            if (lane_.consume_source) { out.consumed_source = candidate.checkpoint; }
+            L().retired      = actual->retired_points;
+            if (L().consume_source) { out.consumed_source = candidate.checkpoint; }
         }
         tx_          = Tx::Bind;
+        tx_lane_     = lane_id.value;
         out.reserved = true;
         return out;
     }
 
     ContextProgress poll_context(runtime::CancellationFlagView cancellation) {
         ContextProgress out;
+        if (tx_ == Tx::None) {
+            out.kind = ContextOperationKind::Bind;
+            return out;
+        }
+        select_lane(tx_lane_);
         if (tx_ == Tx::Capture) { return finish_capture(cancellation); }
         out.kind = ContextOperationKind::Bind;
         if (tx_ != Tx::Bind) { return out; }
@@ -1092,44 +1208,44 @@ public:
         if (cancellation.requested()) {
             unpin_binding();
             drop_lane_cache();
-            lane_ = Lane{.epoch = lane_.epoch};
+            reset_lane();
             settle_idle(); // the same idle reconciliation a finished request gets
             return out; // not published: the Engine completes the request as cancelled
         }
-        const auto& base    = *lane_.base;
-        lane_.history       = *base.prompt;
-        lane_.prompt_tokens = base.summary.prompt_tokens;
-        lane_.rope          = LaneRope{base.rope_positions, lane_.prompt_tokens, base.rope_delta};
+        const auto& base    = *L().base;
+        L().history       = *base.prompt;
+        L().prompt_tokens = base.summary.prompt_tokens;
+        L().rope          = LaneRope{base.rope_positions, L().prompt_tokens, base.rope_delta};
         // The restore first: a source the tier cannot read leaves the lane at the root (reused 0).
-        if (lane_.source) {
+        if (L().source) {
             try {
                 restore(out);
             } catch (...) {
                 unpin_binding();
                 drop_lane_cache();
-                lane_ = Lane{.epoch = lane_.epoch};
+                reset_lane();
                 throw;
             }
         }
-        if (lane_.reused == 0) {
-            // A fresh sequence: zero recurrent state (the KV is written before it is read).
-            CUDA_CHECK(cudaMemsetAsync(state_backing_.p, 0, state_backing_.bytes, device_.stream));
+        if (L().reused == 0) {
+            // A fresh sequence: zero its recurrent state (the KV is written before it is read).
+            zero_lane_state();
         }
-        lane_.begin = {.prompt_tokens        = lane_.prompt_tokens,
-                       .reused_prompt_tokens = lane_.reused,
-                       .prefix_reuse_path    = lane_.reused != 0 ? PrefixReusePath::Checkpoint : PrefixReusePath::Root};
+        L().begin = {.prompt_tokens        = L().prompt_tokens,
+                     .reused_prompt_tokens = L().reused,
+                     .prefix_reuse_path    = L().reused != 0 ? PrefixReusePath::Checkpoint : PrefixReusePath::Root};
         install_sampling(base.sampling);
-        lane_.mtp_accept.fill(kAcceptancePrior);
-        lane_.mtp_live = plan_.drafts > 0;
-        plan_lane_vision(base, lane_.reused);
+        L().mtp_accept.fill(kAcceptancePrior);
+        L().mtp_live = plan_.drafts > 0;
+        plan_lane_vision(base, L().reused);
         if (base.reuse) {
             for (const auto& group : base.captures) {
-                if (group.frontier > lane_.reused) { lane_.captures.push_back(group); }
+                if (group.frontier > L().reused) { L().captures.push_back(group); }
             }
         }
-        lane_.cache_at_admission = residency_->stats();
-        lane_.ngram_at_admission = volume_.counters();
-        lane_.phase              = Phase::Prefill;
+        L().cache_at_admission = residency_->stats();
+        L().ngram_at_admission = volume_.counters();
+        L().phase              = Phase::Prefill;
         out.published            = true;
         out.sequence             = handle();
         return out;
@@ -1139,22 +1255,22 @@ public:
         for (const auto& unit : units) {
             require_sequence(unit.sequence);
             const std::uint32_t frontier =
-                unit.kind == ExecutionUnitKind::Control ? lane_.state_tokens + 1 + unit.tokens : lane_.state_tokens + 1;
+                unit.kind == ExecutionUnitKind::Control ? L().state_tokens + 1 + unit.tokens : L().state_tokens + 1;
             if (unit.kind == ExecutionUnitKind::Replay) { throw std::logic_error("Qwen3.8-Flash-Next: no replay"); }
             if (frontier > options_.max_context + 1) { throw std::logic_error("Qwen3.8-Flash-Next: unit exceeds the context"); }
-            lane_.permit = true;
+            L().permit = true;
             // How far a prefill unit's call can reach (prepare_capture reserves for a group there).
-            lane_.permit_frontier =
+            L().permit_frontier =
                 unit.kind == ExecutionUnitKind::Prefill
-                    ? std::min(lane_.prompt_tokens, lane_.state_tokens + static_cast<std::uint32_t>(plan_.columns))
-                    : lane_.state_tokens;
+                    ? std::min(L().prompt_tokens, L().state_tokens + static_cast<std::uint32_t>(plan_.columns))
+                    : L().state_tokens;
         }
         return {.reserved = true};
     }
 
     void release_units(std::span<const SequenceHandle> sequences) noexcept {
         for (const auto& s : sequences) {
-            if (valid(s)) { lane_.permit = false; }
+            if (valid(s)) { lanes_[ContractAccess::lane(s)].permit = false; }
         }
     }
 
@@ -1162,21 +1278,31 @@ public:
     PrefillProgress advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming* failed, runtime::TokenMaskProvider* masks) {
         const auto start = Clock::now();
         require_sequence(sequence);
-        if (lane_.phase != Phase::Prefill || pending_ != 0) {
+        if (L().phase != Phase::Prefill || pending_ != 0) {
             throw std::logic_error("Qwen3.8-Flash-Next: prefill on a lane that is not prefilling");
         }
-        if (lane_.capture_pending) { throw std::logic_error("Qwen3.8-Flash-Next: prefill while a capture is pending"); }
+        if (L().capture_pending) { throw std::logic_error("Qwen3.8-Flash-Next: prefill while a capture is pending"); }
         const nvtx::ScopedRange range(nvtx::Name::Prefill, nvtx::Category::Prefill);
-        const std::int32_t begin     = static_cast<std::int32_t>(lane_.state_tokens);
-        const std::int32_t remaining = static_cast<std::int32_t>(lane_.prompt_tokens) - begin;
+        const std::int32_t begin     = static_cast<std::int32_t>(L().state_tokens);
+        const std::int32_t remaining = static_cast<std::int32_t>(L().prompt_tokens) - begin;
         PrefillProgress out;
-        out.summary = lane_.begin;
+        out.summary = L().begin;
         try {
             // An exact hit: the restored state is the prompt's, and its last position's logits
             // were restored with it. The first token is sampled from them as the prompt's last call
             // would (same logits, position and seed).
             if (remaining == 0) { return sample_exact_hit(start, masks, out); }
-            // The prompt's images first: their frames are lent before the wide calls' lease.
+            // The prompt's images first: their frames are lent before the wide calls' lease. One
+            // lane's handoff stays lent for the whole prompt, and leases go back in the order they
+            // were lent, so a second lane's images wait (this turn does no work) until the first
+            // prompt has run its last call.
+            if (!L().vision_items.empty() && !L().vision_encoded && other_lane_holds_handoff()) {
+                out.processed_prompt_tokens = 0;
+                out.complete                = false;
+                out.timing.submit_host_ns   = elapsed_ns(start);
+                L().permit                  = false;
+                return out;
+            }
             encode_lane_vision();
             bool wide          = wide_ready(remaining);
             std::int32_t width = call_span(begin, wide);
@@ -1197,18 +1323,19 @@ public:
                 const std::int32_t next = begin + width;
                 prefetch_rows(next, call_span(next, wide));
             }
-            lane_.state_tokens += static_cast<std::uint32_t>(width);
+            const bool owns_lease = lease_.valid() && lease_owner_ == cur_;
+            L().state_tokens += static_cast<std::uint32_t>(width);
             // A capture group at the end of this call (not the prompt's end, which the first token's
             // commit offers): the Engine captures before the next unit.
-            if (!last && lane_.next_capture < lane_.captures.size() &&
-                lane_.captures[lane_.next_capture].frontier == lane_.state_tokens) {
-                lane_.capture_pending = true;
+            if (!last && L().next_capture < L().captures.size() &&
+                L().captures[L().next_capture].frontier == L().state_tokens) {
+                L().capture_pending = true;
                 out.capture_ready     = true;
             }
-            // No promotion while the lease is held, whatever the call's width: a trailing short call
+            // No promotion while any lease is held, whatever the call's width: a trailing short call
             // would evict residents after lend() recorded the displaced set, which give_back restores.
             const std::size_t promotions =
-                !lease_.valid() && width <= kServedCallColumns ? decode_budget(static_cast<std::uint32_t>(width)) : 0;
+                !any_lease() && width <= kServedCallColumns ? decode_budget(static_cast<std::uint32_t>(width)) : 0;
             if (last) {
                 const bool failed_constraint = sample(begin + width - 1, masks);
                 residency_->enqueue_route_download(device_.stream, width);
@@ -1217,12 +1344,12 @@ public:
                 out.timing.device_wait_ns = elapsed_ns(wait);
                 const TokenId token = sampled_token();
                 residency_->after_round(device_.stream, width, promotions);
-                return_lease();
+                if (owns_lease) { return_lease(); }
                 return_vision();
                 apply_vram_target(false);
                 pending_token_ = token;
                 pending_       = ++transaction_;
-                lane_.phase    = Phase::Pending;
+                L().phase    = Phase::Pending;
                 out.timing.submit_host_ns = elapsed_ns(start) - out.timing.device_wait_ns;
                 out.pending.emplace(ContractAccess::make_pending(this, pending_, handle(), {&pending_token_, 1}, out.timing,
                                                                  failed_constraint));
@@ -1235,8 +1362,8 @@ public:
                 apply_vram_target(false);
                 out.timing.submit_host_ns = elapsed_ns(start) - out.timing.device_wait_ns;
             }
-            lane_.prefill_ns += elapsed_ns(start);
-            lane_.permit = false;
+            L().prefill_ns += elapsed_ns(start);
+            L().permit = false;
             return out;
         } catch (...) {
             if (failed != nullptr) { failed->submit_host_ns += elapsed_ns(start); }
@@ -1248,13 +1375,25 @@ public:
     PendingBatch decode(std::span<const SequenceHandle> sequences, std::span<const runtime::RoundBudget> budgets,
                         runtime::ExecutionTiming* failed, runtime::TokenMaskProvider* masks) {
         const auto start = Clock::now();
-        if (sequences.size() != 1 || budgets.size() != 1) {
-            throw std::invalid_argument("Qwen3.8-Flash-Next decodes one row");
+        if (sequences.empty() || sequences.size() != budgets.size() || sequences.size() > plan_.lanes) {
+            throw std::invalid_argument("Qwen3.8-Flash-Next: a decode round has one row per lane");
         }
-        require_sequence(sequences[0]);
-        if (lane_.phase != Phase::Decode || pending_ != 0 || lane_.history.size() != lane_.state_tokens + 1ULL) {
-            throw std::logic_error("Qwen3.8-Flash-Next: decode row is not at a committed frontier");
+        if (pending_ != 0) { throw std::logic_error("Qwen3.8-Flash-Next: decode with a pending batch open"); }
+        for (std::size_t row = 0; row < sequences.size(); ++row) {
+            require_sequence(sequences[row]);
+            const Lane& lane = lanes_[ContractAccess::lane(sequences[row])];
+            for (std::size_t other = 0; other < row; ++other) {
+                if (ContractAccess::lane(sequences[other]) == ContractAccess::lane(sequences[row])) {
+                    throw std::logic_error("Qwen3.8-Flash-Next: a lane appears twice in a decode round");
+                }
+            }
+            if (lane.phase != Phase::Decode || lane.history.size() != lane.state_tokens + 1ULL) {
+                throw std::logic_error("Qwen3.8-Flash-Next: decode row is not at a committed frontier");
+            }
         }
+        // Several rows decode together in one plain round (MTP drafts only when one row decodes:
+        // docs/maintainer/flash-next-lanes-spike.md); one row runs the single-sequence round.
+        if (sequences.size() > 1) { return decode_rows(sequences, failed, masks, start); }
         const nvtx::ScopedRange range(nvtx::Name::DecodeOrdinaryRound, nvtx::Category::Decode);
         try {
             // With the MTP drafter, a verification round when the policy drafts.
@@ -1263,10 +1402,10 @@ public:
                 // A plain round keeps the drafter current: its pending cell first, the round's cell at
                 // commit.
                 mtp_write_pending();
-                plain_round_ = lane_.mtp_live;
-                ++lane_.speculative.fallback_steps;
+                plain_round_ = L().mtp_live;
+                ++L().speculative.fallback_steps;
             }
-            const std::int32_t position = static_cast<std::int32_t>(lane_.state_tokens);
+            const std::int32_t position = static_cast<std::int32_t>(L().state_tokens);
             // The layers before the PLE layer run while the host reads the round's n-gram rows from
             // the volume; the rest of the forward follows their upload.
             upload_inputs(position, 1);
@@ -1277,7 +1416,7 @@ public:
                 upload_rows(position, 1);
             }
             run_decode(Part::Back);
-            lane_.state_tokens += 1;
+            L().state_tokens += 1;
             const bool failed_constraint = sample(position, masks);
             residency_->enqueue_route_download(device_.stream, 1);
             const auto wait = Clock::now();
@@ -1290,9 +1429,9 @@ public:
             pending_token_        = sampled_token();
             deferred_             = true; // the round's cache update runs at commit
             pending_              = ++transaction_;
-            lane_.phase           = Phase::Pending;
+            L().phase           = Phase::Pending;
             timing.submit_host_ns = elapsed_ns(start) - timing.device_wait_ns;
-            lane_.decode_ns += elapsed_ns(start);
+            L().decode_ns += elapsed_ns(start);
             ++decode_rounds_;
             return ContractAccess::make_pending(this, pending_, sequences[0], {&pending_token_, 1}, timing,
                                                 failed_constraint);
@@ -1303,15 +1442,28 @@ public:
         }
     }
 
+    // The forced tokens of each row, one lane after another (each runs as its own call over its
+    // lane's state).
     runtime::ExecutionTiming append_forced(std::span<const SequenceHandle> sequences, std::span<const TokenId> tokens,
                                            std::uint32_t stride, runtime::ExecutionTiming* failed) {
-        const auto start = Clock::now();
-        if (sequences.size() != 1 || stride == 0 || tokens.size() != stride) {
-            throw std::invalid_argument("Qwen3.8-Flash-Next: forced tokens do not match their row");
+        if (sequences.empty() || sequences.size() > plan_.lanes || stride == 0 ||
+            tokens.size() != static_cast<std::size_t>(stride) * sequences.size()) {
+            throw std::invalid_argument("Qwen3.8-Flash-Next: forced tokens do not match their rows");
         }
-        require_sequence(sequences[0]);
-        if (lane_.phase != Phase::Decode || pending_ != 0 || lane_.history.size() != lane_.state_tokens + 1ULL ||
-            lane_.state_tokens + stride > options_.max_context) {
+        runtime::ExecutionTiming total;
+        for (std::size_t row = 0; row < sequences.size(); ++row) {
+            const auto timing = append_forced_one(sequences[row], tokens.subspan(row * stride, stride), stride, failed);
+            total.submit_host_ns += timing.submit_host_ns;
+        }
+        return total;
+    }
+
+    runtime::ExecutionTiming append_forced_one(SequenceHandle sequence, std::span<const TokenId> tokens,
+                                               std::uint32_t stride, runtime::ExecutionTiming* failed) {
+        const auto start = Clock::now();
+        require_sequence(sequence);
+        if (L().phase != Phase::Decode || pending_ != 0 || L().history.size() != L().state_tokens + 1ULL ||
+            L().state_tokens + stride > options_.max_context) {
             throw std::logic_error("Qwen3.8-Flash-Next: forced tokens on a lane that is not at a committed frontier");
         }
         for (const TokenId token : tokens) {
@@ -1320,14 +1472,15 @@ public:
         try {
             // The model reads the pending input token and every forced token but the last, which
             // becomes the next decode input.
-            lane_.history.insert(lane_.history.end(), tokens.begin(), tokens.end());
-            if (lane_.sampling.token_counts != nullptr) {
+            L().history.insert(L().history.end(), tokens.begin(), tokens.end());
+            if (L().sampling.token_counts != nullptr) {
                 upload_pinned_words(tokens);
                 Tensor ids(io_device_.p, DType::I32, {static_cast<std::int32_t>(stride)});
-                ops::increment_token_counts(ids, token_counts_, device_.stream);
+                Tensor counts = lane_counts(cur_);
+                ops::increment_token_counts(ids, counts, device_.stream);
                 device_.synchronize(); // the staging below rewrites the pinned block the upload reads
             }
-            std::int32_t begin = static_cast<std::int32_t>(lane_.state_tokens);
+            std::int32_t begin = static_cast<std::int32_t>(L().state_tokens);
             const std::int32_t end = begin + static_cast<std::int32_t>(stride);
             while (begin < end) {
                 const std::int32_t width = std::min(plan_.chunk, end - begin);
@@ -1335,14 +1488,14 @@ public:
                 residency_->enqueue_route_download(device_.stream, width);
                 device_.synchronize();
                 residency_->after_round(device_.stream, width, kDecodePromotionsPerLayer);
-                lane_.state_tokens += static_cast<std::uint32_t>(width);
+                L().state_tokens += static_cast<std::uint32_t>(width);
                 begin += width;
             }
             apply_vram_target(false);
-            lane_.permit = false;
+            L().permit = false;
             runtime::ExecutionTiming timing;
             timing.submit_host_ns = elapsed_ns(start);
-            lane_.decode_ns += timing.submit_host_ns;
+            L().decode_ns += timing.submit_host_ns;
             return timing;
         } catch (...) {
             if (failed != nullptr) { failed->submit_host_ns += elapsed_ns(start); }
@@ -1357,16 +1510,30 @@ public:
             throw std::logic_error("Qwen3.8-Flash-Next: commit of a foreign or stale pending batch");
         }
         const auto rows = ContractAccess::rows(pending);
-        if (rows.size() != 1 || decisions.size() != 1 || !valid(rows[0])) {
+        if (rows.empty() || rows.size() != decisions.size()) {
             throw std::logic_error("Qwen3.8-Flash-Next: commit decisions are not row aligned");
         }
+        for (const auto& row : rows) {
+            if (!valid(row)) { throw std::logic_error("Qwen3.8-Flash-Next: commit decisions are not row aligned"); }
+        }
+        if (rows.size() > 1) {
+            std::array<bool, kMaximumLanes> constraint{};
+            for (std::size_t row = 0; row < rows.size(); ++row) { constraint[row] = pending.constraint_failed(row); }
+            std::array<SequenceHandle, kMaximumLanes> handles{};
+            std::copy(rows.begin(), rows.end(), handles.begin());
+            const std::size_t count = rows.size();
+            ContractAccess::consume(pending);
+            pending_ = 0;
+            return commit_rows({handles.data(), count}, decisions, constraint, start);
+        }
+        select_lane(ContractAccess::lane(rows[0]));
         const auto& d = decisions[0];
         const bool constraint_failed = pending.constraint_failed(0);
         ContractAccess::consume(pending);
         pending_ = 0;
         if (round_width_ > 1) {
             CommitResult out        = commit_verified(d, constraint_failed);
-            lane_.permit            = false;
+            L().permit            = false;
             out.timing.post_host_ns = elapsed_ns(start);
             return out;
         }
@@ -1392,22 +1559,22 @@ public:
                 release_lane();
                 throw std::logic_error("Qwen3.8-Flash-Next: a row commits exactly one token");
             }
-            const bool first = lane_.history.size() == lane_.prompt_tokens;
+            const bool first = L().history.size() == L().prompt_tokens;
             if (first) {
-                lane_.first_token_seconds = std::chrono::duration<double>(Clock::now() - lane_.admitted).count();
-                lane_.cache_at_decode     = residency_->stats();
-                lane_.ngram_at_decode     = volume_.counters();
+                L().first_token_seconds = std::chrono::duration<double>(Clock::now() - L().admitted).count();
+                L().cache_at_decode     = residency_->stats();
+                L().ngram_at_decode     = volume_.counters();
             }
-            lane_.history.push_back(pending_token_);
+            L().history.push_back(pending_token_);
             // The drafter's cell of the round's position, from its exported residual.
-            if (catch_up) { mtp_catch_up(static_cast<std::int32_t>(lane_.state_tokens) - 1, 1); }
-            lane_.phase = d.terminal ? Phase::Finishable : Phase::Decode;
+            if (catch_up) { mtp_catch_up(static_cast<std::int32_t>(L().state_tokens) - 1, 1); }
+            L().phase = d.terminal ? Phase::Finishable : Phase::Decode;
             out.rows[0].disposition = d.terminal ? runtime::CommitDisposition::Finishable : runtime::CommitDisposition::Active;
             // The prompt's last capture group is offered once its first token is committed (the
             // Qwen3.5 Program's Begin commit): the state is the prompt's, decode has not moved it.
-            if (first && !d.terminal && lane_.next_capture < lane_.captures.size() &&
-                lane_.captures[lane_.next_capture].frontier == lane_.prompt_tokens) {
-                lane_.capture_pending = true;
+            if (first && !d.terminal && L().next_capture < L().captures.size() &&
+                L().captures[L().next_capture].frontier == L().prompt_tokens) {
+                L().capture_pending = true;
                 out.capture_ready[0]  = true;
             }
             out.rows[0].timings     = timings();
@@ -1415,7 +1582,7 @@ public:
             out.rows[0].speculative_counters = speculative_counters();
             settle_round();
         }
-        lane_.permit           = false;
+        L().permit           = false;
         out.timing.post_host_ns = elapsed_ns(start);
         return out;
     }
@@ -1423,15 +1590,24 @@ public:
     DiscardResult discard(PendingBatch&& pending) noexcept {
         DiscardResult out;
         if (ContractAccess::owner(pending) != this || ContractAccess::transaction(pending) != pending_) { return out; }
-        out.row_count = ContractAccess::rows(pending).size();
+        const auto rows = ContractAccess::rows(pending);
+        out.row_count   = rows.size();
+        std::array<std::uint32_t, kMaximumLanes> lanes{};
+        for (std::size_t row = 0; row < rows.size(); ++row) { lanes[row] = ContractAccess::lane(rows[row]); }
+        const std::size_t count = rows.size();
         ContractAccess::consume(pending);
         pending_     = 0;
-        // The round ran on the device: settle its cache update before the lane goes, as a commit would.
-        try { settle_round(round_width_, 0); } catch (...) { deferred_ = false; }
+        // The round ran on the device: settle its cache update before the lanes go, as a commit would.
+        try {
+            settle_round(count > 1 ? static_cast<std::int32_t>(count) : round_width_, 0);
+        } catch (...) { deferred_ = false; }
         deferred_    = false;
         round_width_ = 1;
         plain_round_ = false;
-        release_lane();
+        for (std::size_t row = 0; row < count; ++row) {
+            select_lane(lanes[row]);
+            release_lane();
+        }
         settle_idle();
         out.status = runtime::ConsumeStatus::Consumed;
         return out;
@@ -1440,7 +1616,9 @@ public:
     FinishResult finish(SequenceHandle sequence) noexcept {
         FinishResult out;
         try {
-            if (!valid(sequence) || lane_.phase != Phase::Finishable || pending_ != 0) { return out; }
+            if (!valid(sequence)) { return out; }
+            select_lane(ContractAccess::lane(sequence));
+            if (L().phase != Phase::Finishable || pending_ != 0) { return out; }
             out.timings     = timings();
             out.speculative = speculative_stats();
             out.checkpoint  = capture_endpoint();
@@ -1457,6 +1635,7 @@ public:
         AbortResult out;
         try {
             if (!valid(sequence) || pending_ != 0) { return out; }
+            select_lane(ContractAccess::lane(sequence));
             out.timings     = timings();
             out.speculative = speculative_stats();
             device_.synchronize();
@@ -1484,23 +1663,32 @@ public:
         deferred_    = false;
         round_width_ = 1;
         plain_round_ = false;
-        release_lane();
+        for (std::uint32_t lane = 0; lane < plan_.lanes; ++lane) {
+            select_lane(lane);
+            release_lane();
+        }
+        select_lane(0);
     }
 
     bool has_context_transaction() const noexcept { return tx_ != Tx::None; }
 
     PhysicalUsageSnapshot usage() const noexcept {
         PhysicalUsageSnapshot out;
-        out.capacity.state_slots   = 1;
-        out.occupied.state_slots   = lane_.phase != Phase::Free ? 1U : 0U;
-        out.capacity.main_kv_pages = plan_.pages;
-        out.occupied.main_kv_pages =
-            lane_.phase != Phase::Free ? (lane_.extent + kPagedKVPageSize - 1) / kPagedKVPageSize : 0U;
+        out.capacity.state_slots   = plan_.lanes;
+        out.capacity.main_kv_pages = plan_.pool_pages;
+        std::size_t reserved       = 0;
+        for (std::uint32_t lane = 0; lane < plan_.lanes; ++lane) {
+            const Lane& ln = lanes_[lane];
+            if (ln.phase == Phase::Free) { continue; }
+            ++out.occupied.state_slots;
+            out.occupied.main_kv_pages += (ln.extent + kPagedKVPageSize - 1) / kPagedKVPageSize;
+            reserved += ln.reserved.size() + ln.endpoint.size();
+        }
         if (cache_) {
-            // One Host backing: reserved slabs and the lane's mirror are occupied as well.
+            // One Host backing: reserved slabs and the lanes' mirrors are occupied as well.
             out.capacity.host_bytes      = cache_->capacity_bytes();
             out.occupied.host_bytes      = cache_->occupied_bytes();
-            out.host_reserved_bytes      = (lane_.reserved.size() + lane_.endpoint.size()) * cache_->slab_bytes();
+            out.host_reserved_bytes      = reserved * cache_->slab_bytes();
             out.host_peak_occupied_bytes = cache_->peak_bytes();
             const auto split             = host_split();
             out.host_state_slots         = split.first;
@@ -1582,10 +1770,15 @@ public:
     }
 
     std::size_t release_redundant_host(std::optional<SequenceHandle> pending_backup) {
-        if (!cache_ || lane_.mirror.empty() || (pending_backup && valid(*pending_backup))) { return 0; }
+        if (!cache_) { return 0; }
         const std::size_t before = cache_->occupied_bytes();
-        cache_->release(lane_.mirror);
-        lane_.mirror.clear();
+        for (std::uint32_t lane = 0; lane < plan_.lanes; ++lane) {
+            if (lanes_[lane].mirror.empty()) { continue; }
+            // The lane a pending backup protects keeps its references.
+            if (pending_backup && valid(*pending_backup) && ContractAccess::lane(*pending_backup) == lane) { continue; }
+            cache_->release(lanes_[lane].mirror);
+            lanes_[lane].mirror.clear();
+        }
         return before - cache_->occupied_bytes();
     }
 
@@ -1623,12 +1816,12 @@ public:
     }
 
     // ---------------------------------------------------------------- capture
-    bool capture_is_input(SequenceHandle sequence) const {
+    bool capture_is_input(SequenceHandle sequence) {
         require_sequence(sequence);
-        if (lane_.next_capture >= lane_.captures.size()) { return false; }
-        const auto& group = lane_.captures[lane_.next_capture];
+        if (L().next_capture >= L().captures.size()) { return false; }
+        const auto& group = L().captures[L().next_capture];
         return std::find(group.roles.begin(), group.roles.end(), runtime::CheckpointRole::InputReplay) != group.roles.end() &&
-               (lane_.capture_pending || (lane_.permit && group.frontier <= lane_.permit_frontier));
+               (L().capture_pending || (L().permit && group.frontier <= L().permit_frontier));
     }
 
     // Reserves the Host slabs of the next capture group the reserved unit reaches (the Qwen3.5
@@ -1637,24 +1830,24 @@ public:
     // which finish() uses (best effort: the capture alone is reserved when both do not fit).
     std::optional<CapturePreparation> prepare_capture(SequenceHandle sequence) {
         require_sequence(sequence);
-        if (!cache_ || !lane_.permit) { return std::nullopt; }
-        while (lane_.next_capture < lane_.captures.size() && !lane_.capture_pending &&
-               lane_.captures[lane_.next_capture].frontier <= lane_.state_tokens) {
-            ++lane_.next_capture;
+        if (!cache_ || !L().permit) { return std::nullopt; }
+        while (L().next_capture < L().captures.size() && !L().capture_pending &&
+               L().captures[L().next_capture].frontier <= L().state_tokens) {
+            ++L().next_capture;
         }
-        if (lane_.next_capture >= lane_.captures.size()) { return std::nullopt; }
-        const std::uint32_t frontier = lane_.captures[lane_.next_capture].frontier;
-        if (!lane_.reserved.empty() && lane_.reserved_frontier == frontier) {
+        if (L().next_capture >= L().captures.size()) { return std::nullopt; }
+        const std::uint32_t frontier = L().captures[L().next_capture].frontier;
+        if (!L().reserved.empty() && L().reserved_frontier == frontier) {
             return CapturePreparation{.frontier = frontier, .reserved = true};
         }
-        if (frontier > lane_.permit_frontier && !lane_.capture_pending) { return std::nullopt; }
+        if (frontier > L().permit_frontier && !L().capture_pending) { return std::nullopt; }
         release_reservation();
         const std::uint32_t need  = capture_slabs(frontier);
-        const std::uint32_t extra = frontier == lane_.prompt_tokens ? endpoint_reserve_slabs() : 0;
+        const std::uint32_t extra = frontier == L().prompt_tokens ? endpoint_reserve_slabs() : 0;
         for (const std::uint32_t count : {need + extra, need}) {
             if (auto slabs = cache_->allocate(count)) {
-                lane_.reserved          = std::move(*slabs);
-                lane_.reserved_frontier = frontier;
+                L().reserved          = std::move(*slabs);
+                L().reserved_frontier = frontier;
                 return CapturePreparation{.frontier = frontier, .reserved = true};
             }
         }
@@ -1670,20 +1863,28 @@ public:
     void skip_capture(SequenceHandle sequence) {
         require_sequence(sequence);
         release_reservation();
-        if (!lane_.capture_pending) {
-            if (lane_.next_capture < lane_.captures.size()) { ++lane_.next_capture; }
+        if (!L().capture_pending) {
+            if (L().next_capture < L().captures.size()) { ++L().next_capture; }
             return;
         }
-        lane_.capture_pending = false;
-        ++lane_.next_capture;
+        L().capture_pending = false;
+        ++L().next_capture;
     }
 
     bool reclaim_capture_reservation(runtime::ContextResourceUsage shortage) {
-        if (!cache_ || !shortage.host_bytes || (lane_.reserved.empty() && lane_.endpoint.empty())) { return false; }
-        release_reservation();
-        cache_->release(lane_.endpoint);
-        lane_.endpoint.clear();
-        return true;
+        if (!cache_ || !shortage.host_bytes) { return false; }
+        bool any = false;
+        for (std::uint32_t lane = 0; lane < plan_.lanes; ++lane) {
+            Lane& ln = lanes_[lane];
+            if (ln.reserved.empty() && ln.endpoint.empty()) { continue; }
+            any = true;
+            cache_->release(ln.reserved);
+            ln.reserved.clear();
+            ln.reserved_frontier = 0;
+            cache_->release(ln.endpoint);
+            ln.endpoint.clear();
+        }
+        return any;
     }
 
     // Captures the offered group at the lane's frontier into its reserved slabs (or free ones) and
@@ -1691,22 +1892,22 @@ public:
     bool start_capture(SequenceHandle sequence) {
         if (tx_ != Tx::None || pending_ != 0 || !cache_) { return false; }
         require_sequence(sequence);
-        if (!lane_.capture_pending || lane_.next_capture >= lane_.captures.size()) { return false; }
-        const auto group = lane_.captures[lane_.next_capture];
-        if (group.frontier != lane_.state_tokens || group.roles.empty()) { return false; }
+        if (!L().capture_pending || L().next_capture >= L().captures.size()) { return false; }
+        const auto group = L().captures[L().next_capture];
+        if (group.frontier != L().state_tokens || group.roles.empty()) { return false; }
         const std::uint32_t need = capture_slabs(group.frontier);
         // From here the capture's slabs are owned by `slabs` until a published record holds them:
         // any throw below releases them (and insert_group rolls back a partial publication).
         SlabRefs slabs(*cache_);
-        if (lane_.reserved_frontier == group.frontier && lane_.reserved.size() >= need) {
+        if (L().reserved_frontier == group.frontier && L().reserved.size() >= need) {
             // The capture's part; what is left was reserved for the endpoint. Room first, so the
             // hand-over itself cannot throw halfway.
             slabs.reserve(need);
-            lane_.endpoint.reserve(lane_.endpoint.size() + (lane_.reserved.size() - need));
-            for (std::uint32_t i = 0; i < need; ++i) { slabs.adopt(lane_.reserved[i]); }
-            lane_.endpoint.insert(lane_.endpoint.end(), lane_.reserved.begin() + need, lane_.reserved.end());
-            lane_.reserved.clear();
-            lane_.reserved_frontier = 0;
+            L().endpoint.reserve(L().endpoint.size() + (L().reserved.size() - need));
+            for (std::uint32_t i = 0; i < need; ++i) { slabs.adopt(L().reserved[i]); }
+            L().endpoint.insert(L().endpoint.end(), L().reserved.begin() + need, L().reserved.end());
+            L().reserved.clear();
+            L().reserved_frontier = 0;
         } else {
             release_reservation();
             auto got = cache_->allocate(need);
@@ -1725,10 +1926,11 @@ public:
             return false;
         }
         auto r           = std::move(*captured);
-        r.identity       = lane_.base->identity;
+        r.identity       = L().base->identity;
         captured_        = cache_->insert_group(std::move(r), group.roles);
         tx_              = Tx::Capture; // the transaction owns captured_ from here (abandon_capture)
-        lane_.captured   = std::max(lane_.captured, group.frontier);
+        tx_lane_         = cur_;
+        L().captured   = std::max(L().captured, group.frontier);
         record_capture(start, group.frontier);
         return true;
     }
@@ -1772,9 +1974,9 @@ public:
         MemorySummary out;
         out.device                       = device_.device;
         out.max_context                  = options_.max_context;
-        out.kv_capacity                  = plan_.pages * kPagedKVPageSize;
-        out.kv_capacity_page_groups      = plan_.pages;
-        out.kv_capacity_max_page_groups  = plan_.pages;
+        out.kv_capacity                  = plan_.pool_pages * kPagedKVPageSize;
+        out.kv_capacity_page_groups      = plan_.pool_pages;
+        out.kv_capacity_max_page_groups  = plan_.pool_pages;
         out.kv_cache                     = KvCacheStorage::Int8Group64;
         out.kv_payload_bytes             = kv_vmm_ ? kv_vmm_->mapped_bytes() : kv_backing_.bytes;
         out.workspace_logical_peak_bytes = plan_.work;
@@ -1797,66 +1999,184 @@ private:
         return out;
     }
 
-    SequenceHandle handle() const noexcept { return ContractAccess::make_sequence(this, 0, lane_.epoch); }
-
-    bool valid(const SequenceHandle& s) const noexcept {
-        return ContractAccess::owner(s) == this && ContractAccess::lane(s) == 0 && ContractAccess::epoch(s) == lane_.epoch &&
-               lane_.phase != Phase::Free && lane_.phase != Phase::Binding;
+    // ---------------------------------------------------------------- lanes
+    // The lane the single-lane helpers act on (L(), the forward's selected slot, the lane's views
+    // of its state). Every entry point that names a sequence selects its lane first.
+    void select_lane(std::uint32_t lane) {
+        cur_ = lane;
+        const auto s = static_cast<std::int32_t>(lane);
+        forward_->select_row(s);
+        tails_base_ = state_.qsa_tails.empty() ? nullptr
+                                               : static_cast<std::byte*>(state_.qsa_tails.front().data) + lane * plan_.tail;
+        ple_state_  = state_.ple_conv;
+        ple_slot_   = state_.slot_ids.slice(0, s, 1);
+        if (plan_.drafts > 0) {
+            mtp_tail_ = mtp_tails_.slice(2, s, 1).view({dim(c_.qsa.index_head_dim), dim(c_.qsa.compress_ratio) - 1});
+        }
     }
 
-    void require_sequence(const SequenceHandle& s) const {
+    // The committed-token counts of lane `lane` (the penalties' occurrence counts).
+    Tensor lane_counts(std::uint32_t lane) const {
+        return token_counts_.slice(1, static_cast<std::int32_t>(lane), 1).view({plan_.token_domain});
+    }
+
+    SequenceHandle handle() const noexcept { return ContractAccess::make_sequence(this, cur_, L().epoch); }
+
+    bool valid(const SequenceHandle& s) const noexcept {
+        if (ContractAccess::owner(s) != this || ContractAccess::lane(s) >= plan_.lanes) { return false; }
+        const Lane& lane = lanes_[ContractAccess::lane(s)];
+        return ContractAccess::epoch(s) == lane.epoch && lane.phase != Phase::Free && lane.phase != Phase::Binding;
+    }
+
+    // Validates a sequence and makes its lane the current one.
+    void require_sequence(const SequenceHandle& s) {
         if (!valid(s)) { throw std::logic_error("Qwen3.8-Flash-Next: stale or foreign sequence"); }
+        select_lane(ContractAccess::lane(s));
+    }
+
+    // Any lent run: promotions and pool resizes wait until every lease is back.
+    bool any_lease() const noexcept {
+        if (lease_.valid()) { return true; }
+        for (std::uint32_t lane = 0; lane < plan_.lanes; ++lane) {
+            if (lanes_[lane].vision_lease.valid()) { return true; }
+        }
+        return false;
+    }
+
+    // Another lane's image handoff is lent (until its prompt's last call ran).
+    bool other_lane_holds_handoff() const noexcept {
+        for (std::uint32_t lane = 0; lane < plan_.lanes; ++lane) {
+            if (lane != cur_ && lanes_[lane].vision_lease.valid()) { return true; }
+        }
+        return false;
+    }
+
+    // Takes `count` pool pages for the current lane, the lowest free ones, and backs the pool up to
+    // the highest page in use (the frames release memory before the pool maps it). False, with
+    // `out` describing a shortage another lane's progress can clear, when the pool cannot grow now.
+    bool take_pages(std::uint32_t count, std::vector<std::uint32_t>& pages, BindingReservation& out) {
+        pages.clear();
+        for (std::uint32_t page = 0; page < plan_.pool_pages && pages.size() < count; ++page) {
+            if (!page_used_[page]) { pages.push_back(page); }
+        }
+        if (pages.size() < count) {
+            out.shortage.main_kv_pages = count - static_cast<std::uint32_t>(pages.size());
+            out.capacity_possible      = true;
+            pages.clear();
+            return false;
+        }
+        std::uint32_t top = 0;
+        for (std::uint32_t page = 0; page < plan_.pool_pages; ++page) {
+            if (page_used_[page]) { top = page + 1; }
+        }
+        top = std::max(top, pages.back() + 1);
+        // A growth moves the expert frames: no lent frame may be out (another lane's image handoff
+        // stays lent for its whole prompt, so this binding waits for it).
+        const bool grows = plan_.vmm && top > backed_pages_;
+        if (grows && lease_.valid()) { return_lease(); }
+        if (grows && any_lease()) {
+            out.shortage.main_kv_pages = count;
+            out.capacity_possible      = true;
+            pages.clear();
+            return false;
+        }
+        try {
+            ensure_kv(top);
+        } catch (...) {
+            // Another lane's progress may free the memory: wait for it. With none running the request
+            // can never fit now, so it fails.
+            bool others = false;
+            for (std::uint32_t lane = 0; lane < plan_.lanes; ++lane) {
+                others = others || (lane != cur_ && lanes_[lane].phase != Phase::Free);
+            }
+            if (!others) { throw; }
+            diagnostic("no VRAM for this request's KV beside the other lane's: it waits for that request to finish");
+            out.shortage.main_kv_pages = count;
+            out.capacity_possible      = true;
+            pages.clear();
+            return false;
+        }
+        for (const std::uint32_t page : pages) { page_used_[page] = 1; }
+        write_block_table(cur_, pages);
+        return true;
+    }
+
+    // Lane `lane`'s block table column: its logical pages' pool pages (the rest 0).
+    void write_block_table(std::uint32_t lane, const std::vector<std::uint32_t>& pages) {
+        std::vector<std::int32_t> table(plan_.pages, 0);
+        for (std::size_t i = 0; i < pages.size() && i < table.size(); ++i) {
+            table[i] = static_cast<std::int32_t>(pages[i]);
+        }
+        auto* column = static_cast<std::byte*>(kv_base_) + plan_.kv.table + static_cast<std::size_t>(lane) * plan_.pages * 4;
+        device_.synchronize();
+        CUDA_CHECK(cudaMemcpy(column, table.data(), table.size() * 4, cudaMemcpyHostToDevice));
+    }
+
+    // Zeroes the current lane's recurrent state, PLE history and index-key tails.
+    void zero_lane_state() {
+        auto* backing = static_cast<std::byte*>(state_backing_.p);
+        for (const auto& section : plan_.sections) {
+            CUDA_CHECK(cudaMemsetAsync(backing + section.at + cur_ * section.bytes, 0, section.bytes, device_.stream));
+        }
+    }
+
+    // The current lane back to Free: its pool pages go back, its Host references are dropped by
+    // the caller.
+    void reset_lane() noexcept {
+        for (const std::uint32_t page : L().pages) { page_used_[page] = 0; }
+        const std::uint64_t epoch = L().epoch;
+        L()                       = Lane{};
+        L().epoch                 = epoch;
     }
 
     void release_lane() noexcept {
-        if (lease_.valid() || lane_.vision_lease.valid()) {
+        const bool wide = lease_.valid() && lease_owner_ == cur_;
+        if (wide || L().vision_lease.valid()) {
             // Each step runs whatever the earlier ones did: a failed sync or lease return must not
-            // leave the other lease lent (lane_ is reset below, which would drop its only owner).
+            // leave the other lease lent (the lane is reset below, which would drop its only owner).
             auto sync   = [&] { device_.synchronize(); };
-            auto lease  = [&] { return_lease(); };
+            auto lease  = [&] { if (wide) { return_lease(); } };
             auto vision = [&] { return_vision(); };
             try {
                 run_all(sync, lease, vision);
             } catch (...) {}
         }
         call_vision_ = nullptr;
-        next_begin_               = -1;
+        if (next_lane_ == cur_) { next_begin_ = -1; }
         unpin_binding();
         drop_lane_cache();
-        const std::uint64_t epoch = lane_.epoch;
-        lane_       = Lane{};
-        lane_.epoch = epoch;
-        if (tx_ == Tx::Bind) { tx_ = Tx::None; }
+        reset_lane();
+        if (tx_ == Tx::Bind && tx_lane_ == cur_) { tx_ = Tx::None; }
     }
 
     // ---------------------------------------------------------------- context cache: lane state
     // The lane's Host references: its mirror and reservations go back to the pool.
     void drop_lane_cache() noexcept {
         if (!cache_) { return; }
-        cache_->release(lane_.mirror);
-        cache_->release(lane_.reserved);
-        cache_->release(lane_.endpoint);
-        lane_.mirror.clear();
-        lane_.reserved.clear();
-        lane_.endpoint.clear();
-        lane_.reserved_frontier = 0;
+        cache_->release(L().mirror);
+        cache_->release(L().reserved);
+        cache_->release(L().endpoint);
+        L().mirror.clear();
+        L().reserved.clear();
+        L().endpoint.clear();
+        L().reserved_frontier = 0;
     }
 
     void release_reservation() noexcept {
         if (!cache_) { return; }
-        cache_->release(lane_.reserved);
-        lane_.reserved.clear();
-        lane_.reserved_frontier = 0;
+        cache_->release(L().reserved);
+        L().reserved.clear();
+        L().reserved_frontier = 0;
     }
 
     // Ends the binding's reader leases (the source and the carried points).
     void unpin_binding() noexcept {
-        if (!cache_ || !lane_.source) { return; }
-        for (const auto point : lane_.carried) {
-            if (point != *lane_.source) { cache_->unpin(point); }
+        if (!cache_ || !L().source) { return; }
+        for (const auto point : L().carried) {
+            if (point != *L().source) { cache_->unpin(point); }
         }
-        cache_->unpin(*lane_.source);
-        lane_.source.reset();
+        cache_->unpin(*L().source);
+        L().source.reset();
     }
 
     // A capture transaction that will not be polled (failure cleanup): its records were never
@@ -1871,13 +2191,13 @@ private:
     // Slabs a capture at `frontier` takes on this lane: KV pages past the mirror and a state image.
     std::uint32_t capture_slabs(std::uint32_t frontier) const {
         const std::uint32_t pages = (frontier + kPagedKVPageSize - 1) / kPagedKVPageSize;
-        return (pages > lane_.mirror.size() ? pages - static_cast<std::uint32_t>(lane_.mirror.size()) : 0U) + image_slabs_;
+        return (pages > L().mirror.size() ? pages - static_cast<std::uint32_t>(L().mirror.size()) : 0U) + image_slabs_;
     }
 
     // Set aside at the prompt's capture for the endpoint: its image and the pages of up to
     // kEndpointReserveTokens generated tokens (plus the partial page).
     std::uint32_t endpoint_reserve_slabs() const {
-        const std::uint32_t output = std::min(lane_.base->summary.effective_output_tokens, kEndpointReserveTokens);
+        const std::uint32_t output = std::min(L().base->summary.effective_output_tokens, kEndpointReserveTokens);
         return image_slabs_ + (output + kPagedKVPageSize - 1) / kPagedKVPageSize + 2;
     }
 
@@ -1889,11 +2209,11 @@ private:
     // `slabs` and this call took is released. Identity and role are the caller's.
     HostCheckpoint capture_record(SlabRefs&& slabs, bool logits) {
         SlabRefs own(std::move(slabs));
-        const std::uint32_t frontier = lane_.state_tokens;
-        const std::uint32_t limit    = plan_.drafts > 0 ? std::min(frontier, lane_.mtp_cells) : frontier;
+        const std::uint32_t frontier = L().state_tokens;
+        const std::uint32_t limit    = plan_.drafts > 0 ? std::min(frontier, L().mtp_cells) : frontier;
         const std::uint32_t full     = limit / kPagedKVPageSize;
         const std::uint32_t pages    = (frontier + kPagedKVPageSize - 1) / kPagedKVPageSize;
-        const auto mirrored          = static_cast<std::uint32_t>(lane_.mirror.size());
+        const auto mirrored          = static_cast<std::uint32_t>(L().mirror.size());
         if (mirrored > full || own.size() != capture_slabs(frontier)) {
             throw std::logic_error("Qwen3.8-Flash-Next: a capture does not match the lane's KV");
         }
@@ -1901,7 +2221,7 @@ private:
         // The record's references: the mirror's pages (one more each), then the new slabs.
         SlabRefs held(*cache_);
         held.reserve(mirrored + own.size());
-        for (const std::uint32_t slab : lane_.mirror) {
+        for (const std::uint32_t slab : L().mirror) {
             cache_->retain(slab);
             held.adopt(slab);
         }
@@ -1911,10 +2231,10 @@ private:
         r.frontier     = frontier;
         r.identity_tag = identity_tag_;
         r.full_pages   = full;
-        r.mtp_cells    = plan_.drafts > 0 ? lane_.mtp_cells : 0;
-        if (lane_.history.size() > frontier) { r.next_token = lane_.history[frontier]; }
+        r.mtp_cells    = plan_.drafts > 0 ? L().mtp_cells : 0;
+        if (L().history.size() > frontier) { r.next_token = L().history[frontier]; }
         r.logits     = logits;
-        r.rope_delta = lane_.base->rope_delta;
+        r.rope_delta = L().base->rope_delta;
         r.pages.assign(all.begin(), all.begin() + pages);
         r.image.assign(all.begin() + pages, all.end());
         copies_.clear();
@@ -1923,10 +2243,10 @@ private:
         run_copies(true);
         device_.synchronize();
         // The full pages it copied join the mirror (their device KV equals them from now on).
-        lane_.mirror.reserve(full);
+        L().mirror.reserve(full);
         for (std::uint32_t page = mirrored; page < full; ++page) {
             cache_->retain(r.pages[page]);
-            lane_.mirror.push_back(r.pages[page]);
+            L().mirror.push_back(r.pages[page]);
         }
         captured_bytes_ += static_cast<std::uint64_t>(copied) * cache_->slab_bytes();
         (void)held.take(); // r owns them now
@@ -1962,8 +2282,8 @@ private:
             out.captured_checkpoints = std::move(captured_);
             captured_.clear();
         }
-        lane_.capture_pending = false;
-        if (lane_.next_capture < lane_.captures.size()) { ++lane_.next_capture; }
+        L().capture_pending = false;
+        if (L().next_capture < L().captures.size()) { ++L().next_capture; }
         return out;
     }
 
@@ -1971,8 +2291,8 @@ private:
     // committed token, its identity the prompt plus the committed output. Best effort: skipped when
     // the Host tier has no room beyond what the prompt's capture set aside, or on any failure.
     std::optional<CheckpointHandle> capture_endpoint() noexcept {
-        if (!cache_ || !lane_.base || !lane_.base->reuse || lane_.state_tokens == 0 ||
-            lane_.state_tokens <= lane_.captured || lane_.state_tokens < lane_.prompt_tokens) {
+        if (!cache_ || !L().base || !L().base->reuse || L().state_tokens == 0 ||
+            L().state_tokens <= L().captured || L().state_tokens < L().prompt_tokens) {
             return std::nullopt;
         }
         try {
@@ -1980,16 +2300,16 @@ private:
             // MR3: the drafter's cell of the last position (its next token is the pending one), as
             // the next round would write it, so the endpoint carries every cell below it.
             if (plan_.drafts > 0) { mtp_write_pending(); }
-            const std::uint32_t frontier = lane_.state_tokens;
+            const std::uint32_t frontier = L().state_tokens;
             const std::uint32_t need     = capture_slabs(frontier);
             // The endpoint's slabs are owned by `slabs` from the moment they leave the lane's
             // reservation until the published record holds them (insert_group): every failure
             // below, including one in the catch's log line, releases them.
             SlabRefs slabs(*cache_);
             slabs.reserve(need);
-            const auto take = std::min<std::size_t>(need, lane_.endpoint.size());
-            for (std::size_t i = 0; i < take; ++i) { slabs.adopt(lane_.endpoint[i]); }
-            lane_.endpoint.erase(lane_.endpoint.begin(), lane_.endpoint.begin() + static_cast<std::ptrdiff_t>(take));
+            const auto take = std::min<std::size_t>(need, L().endpoint.size());
+            for (std::size_t i = 0; i < take; ++i) { slabs.adopt(L().endpoint[i]); }
+            L().endpoint.erase(L().endpoint.begin(), L().endpoint.begin() + static_cast<std::ptrdiff_t>(take));
             if (slabs.size() < need) {
                 auto more = cache_->allocate(need - static_cast<std::uint32_t>(slabs.size()));
                 if (!more) {
@@ -2002,17 +2322,17 @@ private:
                 }
                 for (const std::uint32_t slab : *more) { slabs.adopt(slab); } // reserved: cannot throw
             }
-            auto identity      = std::make_shared<CheckpointIdentity>(*lane_.base->identity);
-            const auto prompt  = lane_.prompt_tokens;
-            const auto added   = std::span<const TokenId>(lane_.history).subspan(prompt, frontier - prompt);
-            identity->ledger.assign(lane_.history.begin(), lane_.history.begin() + frontier);
-            identity->prefix_identity.append_generated(added.size(), lane_.base->rope_delta);
-            identity->digests.append_generated(added, lane_.base->rope_delta);
+            auto identity      = std::make_shared<CheckpointIdentity>(*L().base->identity);
+            const auto prompt  = L().prompt_tokens;
+            const auto added   = std::span<const TokenId>(L().history).subspan(prompt, frontier - prompt);
+            identity->ledger.assign(L().history.begin(), L().history.begin() + frontier);
+            identity->prefix_identity.append_generated(added.size(), L().base->rope_delta);
+            identity->digests.append_generated(added, L().base->rope_delta);
             auto r         = capture_record(std::move(slabs), false);
             r.identity     = std::move(identity);
             constexpr runtime::CheckpointRole kRole[] = {runtime::CheckpointRole::Continuation};
             const auto out = cache_->insert_group(std::move(r), kRole);
-            lane_.captured = frontier;
+            L().captured = frontier;
             record_capture(start, frontier);
             return out.front();
         } catch (...) {
@@ -2026,10 +2346,10 @@ private:
     // Restores the binding's source into the lane (pages, state image, the drafter's position,
     // the mirror) and settles its reader leases, the consumed source and the carried points. When
     // the tier cannot read the bytes (an NVMe tier's I/O failure) the lane starts from the root
-    // instead (lane_.reused = 0): the request prefills its whole prompt.
+    // instead (L().reused = 0): the request prefills its whole prompt.
     void restore(ContextProgress& out) {
         const auto start             = Clock::now();
-        const HostCheckpoint& source = cache_->at(*lane_.source);
+        const HostCheckpoint& source = cache_->at(*L().source);
         const std::uint32_t frontier = source.frontier;
         const auto before            = nvme_ != nullptr ? nvme_->stats() : NvmeTier::Stats{};
         copies_.clear();
@@ -2041,33 +2361,33 @@ private:
             copies_.clear();
             diagnostic(std::string("context cache: a restore could not be read (") + error.what() +
                        "); the request prefills its whole prompt");
-            lane_.reused = 0;
+            L().reused = 0;
             settle_source(out);
             return;
         }
         device_.synchronize();
         const std::uint64_t ns = elapsed_ns(start);
-        lane_.state_tokens     = frontier;
-        lane_.captured         = frontier;
+        L().state_tokens     = frontier;
+        L().captured         = frontier;
         // MR6: cell frontier - 1 encodes the token at frontier; it stays only when this prompt has
         // that token there (an exact hit's next token is not known yet).
         std::uint32_t cells = 0;
         if (plan_.drafts > 0) {
             cells = std::min(source.mtp_cells, frontier);
             if (cells == frontier &&
-                (frontier >= lane_.prompt_tokens || !source.next_token || *source.next_token != lane_.history[frontier])) {
+                (frontier >= L().prompt_tokens || !source.next_token || *source.next_token != L().history[frontier])) {
                 cells = frontier - 1;
             }
             if (cells + 1 < frontier) { throw std::logic_error("Qwen3.8-Flash-Next: a checkpoint's drafter lags its frontier"); }
         }
-        lane_.mtp_cells = cells;
+        L().mtp_cells = cells;
         // The mirror: the source's full pages below the drafter's written cells (a rewritten cell's
         // page differs from the Host copy from then on).
         const std::uint32_t limit = plan_.drafts > 0 ? std::min(frontier, cells) : frontier;
         const std::uint32_t full  = std::min(limit / static_cast<std::uint32_t>(kPagedKVPageSize), source.full_pages);
         for (std::uint32_t page = 0; page < full; ++page) {
             cache_->retain(source.pages[page]);
-            lane_.mirror.push_back(source.pages[page]);
+            L().mirror.push_back(source.pages[page]);
         }
         const std::uint64_t kv_bytes = source.pages.size() * page_kv_bytes_;
         out.transfers.push_back({.resource   = runtime::ContextResourceClass::State,
@@ -2098,7 +2418,7 @@ private:
         settle_source(out);
         char line[300];
         std::snprintf(line, sizeof(line), "context cache: resumed at %u of %u prompt tokens (%.0f MiB restored in %.1f ms%s)",
-                      frontier, lane_.prompt_tokens, static_cast<double>(image_bytes_ + kv_bytes) / (1 << 20),
+                      frontier, L().prompt_tokens, static_cast<double>(image_bytes_ + kv_bytes) / (1 << 20),
                       static_cast<double>(ns) * 1e-6, split.c_str());
         diagnostic(line);
     }
@@ -2107,15 +2427,15 @@ private:
     // this request takes them over, else copies the new owner holds; the old owner keeps its own),
     // the reader leases, the retired points and the consumed source.
     void settle_source(ContextProgress& out) {
-        const auto source_handle = *lane_.source;
-        if (lane_.take_private) {
-            out.private_points = lane_.carried;
+        const auto source_handle = *L().source;
+        if (L().take_private) {
+            out.private_points = L().carried;
         } else {
             // All or none: a failed copy erases the ones made before it.
             std::vector<CheckpointHandle> copies;
             try {
-                copies.reserve(lane_.carried.size());
-                for (const auto point : lane_.carried) { copies.push_back(cache_->clone(point)); }
+                copies.reserve(L().carried.size());
+                for (const auto point : L().carried) { copies.push_back(cache_->clone(point)); }
             } catch (...) {
                 for (const auto copy : copies) { (void)cache_->erase(copy); }
                 throw;
@@ -2123,8 +2443,8 @@ private:
             out.private_points = std::move(copies);
         }
         unpin_binding();
-        out.retired_checkpoints = lane_.retired;
-        if (lane_.consume_source && cache_->erase(source_handle)) { out.retired_checkpoints.push_back(source_handle); }
+        out.retired_checkpoints = L().retired;
+        if (L().consume_source && cache_->erase(source_handle)) { out.retired_checkpoints.push_back(source_handle); }
     }
 
     // Host tier occupancy split for observation: checkpoints (as state images) and KV page bytes.
@@ -2146,10 +2466,12 @@ private:
                 }
             }
         }
-        for (const std::uint32_t slab : lane_.mirror) {
-            if (!seen[slab]) {
-                seen[slab] = 1;
-                ++pages;
+        for (std::uint32_t lane = 0; lane < plan_.lanes; ++lane) {
+            for (const std::uint32_t slab : lanes_[lane].mirror) {
+                if (!seen[slab]) {
+                    seen[slab] = 1;
+                    ++pages;
+                }
             }
         }
         return {images, pages * cache_->slab_bytes()};
@@ -2163,10 +2485,19 @@ private:
     // (one page record each), one 2D copy per plane over each run of consecutive slabs.
     void add_page_copies(std::span<const std::uint32_t> slabs, std::uint32_t first_page) {
         const std::size_t record = cache_->slab_bytes();
+        // A lane's logical page p is pool page L().pages[p]: a run is consecutive in both the slabs
+        // and the pool.
+        const auto& physical = L().pages;
         for (std::size_t i = 0; i < slabs.size();) {
+            if (first_page + slabs.size() > physical.size()) {
+                throw std::logic_error("Qwen3.8-Flash-Next: a checkpoint's pages exceed the lane's extent");
+            }
             std::size_t j = i + 1;
-            while (j < slabs.size() && slabs[j] == slabs[j - 1] + 1) { ++j; }
-            const std::size_t page = first_page + i;
+            while (j < slabs.size() && slabs[j] == slabs[j - 1] + 1 &&
+                   physical[first_page + j] == physical[first_page + j - 1] + 1) {
+                ++j;
+            }
+            const std::size_t page = physical[first_page + i];
             for (std::size_t l = 0; l < plan_.kv.layers.size(); ++l) {
                 for (std::size_t p = 0; p < 5; ++p) {
                     const auto& plane = plan_.kv.layers[l][p];
@@ -2208,9 +2539,15 @@ private:
                 done += chunk;
             }
         };
-        region(static_cast<std::byte*>(state_backing_.p), 0, plan_.state);
-        if (plan_.drafts > 0) { region(spec_base() + plan_.spec.saved, image_saved_, 2ULL * c_.residual_width()); }
-        if (logits) { region(static_cast<std::byte*>(logits16_.data), image_logits_, 2ULL * c_.vocab_size); }
+        // The lane's pieces of state, in image order (the slot word is no part of the image).
+        auto* backing = static_cast<std::byte*>(state_backing_.p);
+        for (const auto& section : plan_.sections) {
+            region(backing + section.at + cur_ * section.bytes, section.image, section.bytes);
+        }
+        if (plan_.drafts > 0) {
+            region(spec_base() + plan_.spec.saved + cur_ * plan_.spec.saved_stride, image_saved_, 2ULL * c_.residual_width());
+        }
+        if (logits) { region(lane_logits_ptr(cur_), image_logits_, 2ULL * c_.vocab_size); }
     }
 
     // Moves the staged copies on the compute stream (after every earlier kernel that wrote or reads
@@ -2284,7 +2621,8 @@ private:
             }
             // The gather descriptors of the largest copy: every page of the context, and an image.
             const std::size_t descriptors =
-                static_cast<std::size_t>(plan_.pages) * plan_.kv.layers.size() * 5 + image_bytes_ / kGatherPiece + 8 * image_slabs_ + 64;
+                static_cast<std::size_t>(plan_.pages) * plan_.kv.layers.size() * 5 + image_bytes_ / kGatherPiece + 8 * image_slabs_ +
+                4 * plan_.sections.size() + 64;
             try {
                 tier_ = std::make_unique<HostTier>(ram_slabs, record, descriptors);
             } catch (const std::exception& error) {
@@ -2337,28 +2675,29 @@ private:
 
     GenerationTimings timings() const {
         GenerationTimings out;
-        out.prefill_seconds     = seconds(lane_.prefill_ns);
-        out.decode_seconds      = seconds(lane_.decode_ns);
-        out.first_token_seconds = lane_.first_token_seconds;
+        out.prefill_seconds     = seconds(L().prefill_ns);
+        out.decode_seconds      = seconds(L().decode_ns);
+        out.first_token_seconds = L().first_token_seconds;
         // The image encode (inside the first prefill unit, so also counted in prefill_seconds) and
         // its one lent window, reported in the overlay fields.
-        out.vision_seconds = lane_.vision_seconds;
-        if (lane_.vision_encoded) {
+        out.vision_seconds = L().vision_seconds;
+        if (L().vision_encoded) {
             out.overlay_windows        = 1;
-            out.overlay_window_seconds = lane_.vision_seconds;
-            out.overlay_staged_bytes   = lane_.vision_uploaded;
+            out.overlay_window_seconds = L().vision_seconds;
+            out.overlay_staged_bytes   = L().vision_uploaded;
         }
         return out;
     }
 
     void install_sampling(const ops::SamplingConfig& config) {
-        lane_.sampling = config;
+        L().sampling = config;
         const bool penalties = config.presence_penalty != 0.0F || config.frequency_penalty != 0.0F;
         if (penalties) {
-            CUDA_CHECK(cudaMemsetAsync(token_counts_.data, 0, token_counts_.bytes(), device_.stream));
-            lane_.sampling.token_counts = static_cast<std::int32_t*>(token_counts_.data);
+            Tensor counts = lane_counts(cur_);
+            CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device_.stream));
+            L().sampling.token_counts = static_cast<std::int32_t*>(counts.data);
         } else {
-            lane_.sampling.token_counts = nullptr;
+            L().sampling.token_counts = nullptr;
         }
     }
 
@@ -2402,12 +2741,12 @@ private:
         auto* block    = reinterpret_cast<std::int32_t*>(host + io.block_rope);
         auto* columns  = reinterpret_cast<std::int32_t*>(host + io.logit_columns);
         for (std::int32_t t = 0; t < width; ++t) {
-            ids[t] = lane_.history[static_cast<std::size_t>(begin + t)];
+            ids[t] = L().history[static_cast<std::size_t>(begin + t)];
             pos[t] = begin + t;
         }
         const auto first = static_cast<std::uint32_t>(begin);
-        stage_rope(lane_.rope, first, width, std::span<std::int32_t>(rope, 3ULL * width), width, 0);
-        stage_rope_value(block_start_rope(lane_.rope, first, c_.qsa.compress_ratio), std::span<std::int32_t>(block, 3), 1, 0);
+        stage_rope(L().rope, first, width, std::span<std::int32_t>(rope, 3ULL * width), width, 0);
+        stage_rope_value(block_start_rope(L().rope, first, c_.qsa.compress_ratio), std::span<std::int32_t>(block, 3), 1, 0);
         columns[0] = width - 1;
     }
 
@@ -2419,19 +2758,41 @@ private:
         const std::int32_t context = dim(c_.ple.ngram.ngram_size) - 1;
         ngram_window_.assign(static_cast<std::size_t>(std::max(0, context - begin)), c_.eos_token_id);
         const std::int32_t from = std::max(0, begin - context);
-        ngram_window_.insert(ngram_window_.end(), lane_.history.begin() + from, lane_.history.begin() + begin + width);
+        ngram_window_.insert(ngram_window_.end(), L().history.begin() + from, L().history.begin() + begin + width);
         const std::size_t heads = hash_.heads();
         row_ids_.resize(static_cast<std::size_t>(width) * heads);
         hash_.row_ids(ngram_window_, static_cast<std::size_t>(width), row_ids_.data());
         const std::size_t row_bytes = c_.ple.table.row_bytes;
         const std::size_t rows      = static_cast<std::size_t>(width) * hash_.heads() * row_bytes;
-        if (next_begin_ == begin && next_width_ == width) {
+        if (next_begin_ == begin && next_width_ == width && next_lane_ == cur_) {
             std::memcpy(host + io.ngram, ngram_next_.data(), rows);
+            next_begin_ = -1;
         } else {
+            // Another lane's prefetched call stays for that lane's next call.
             volume_.read_rows(row_ids_, std::span<std::byte>(host + io.ngram, row_ids_.size() * row_bytes));
         }
-        next_begin_ = -1;
         return rows;
+    }
+
+    // The n-gram rows of one decode column per row (the lane's token at its state position) into
+    // the pinned block; returns their bytes.
+    std::size_t read_rows_of(std::span<const std::uint32_t> rows_lanes) {
+        const auto& io = plan_.io;
+        auto* host     = static_cast<std::byte*>(io_host_.data());
+        const std::int32_t context = dim(c_.ple.ngram.ngram_size) - 1;
+        const std::size_t heads    = hash_.heads();
+        row_ids_.resize(rows_lanes.size() * heads);
+        for (std::size_t b = 0; b < rows_lanes.size(); ++b) {
+            const Lane& lane       = lanes_[rows_lanes[b]];
+            const std::int32_t at  = static_cast<std::int32_t>(lane.state_tokens);
+            ngram_window_.assign(static_cast<std::size_t>(std::max(0, context - at)), c_.eos_token_id);
+            const std::int32_t from = std::max(0, at - context);
+            ngram_window_.insert(ngram_window_.end(), lane.history.begin() + from, lane.history.begin() + at + 1);
+            hash_.row_ids(ngram_window_, 1, row_ids_.data() + b * heads);
+        }
+        const std::size_t row_bytes = c_.ple.table.row_bytes;
+        volume_.read_rows(row_ids_, std::span<std::byte>(host + io.ngram, row_ids_.size() * row_bytes));
+        return row_ids_.size() * row_bytes;
     }
 
     // Reads the n-gram rows of positions [begin, begin + width) into ngram_next_ (the next call's
@@ -2440,13 +2801,14 @@ private:
         const std::int32_t context = dim(c_.ple.ngram.ngram_size) - 1;
         ngram_window_.assign(static_cast<std::size_t>(std::max(0, context - begin)), c_.eos_token_id);
         const std::int32_t from = std::max(0, begin - context);
-        ngram_window_.insert(ngram_window_.end(), lane_.history.begin() + from, lane_.history.begin() + begin + width);
+        ngram_window_.insert(ngram_window_.end(), L().history.begin() + from, L().history.begin() + begin + width);
         row_ids_.resize(static_cast<std::size_t>(width) * hash_.heads());
         hash_.row_ids(ngram_window_, static_cast<std::size_t>(width), row_ids_.data());
         volume_.read_rows(row_ids_, std::span<std::byte>(static_cast<std::byte*>(ngram_next_.data()),
                                                          row_ids_.size() * c_.ple.table.row_bytes));
         next_begin_ = begin;
         next_width_ = width;
+        next_lane_  = cur_;
     }
 
     // The width of a prefill call. A half-width first call (to start the GPU after fewer n-gram
@@ -2456,8 +2818,8 @@ private:
     // The prefill call from `begin`: the route's width, ending at the prompt's end or at the next
     // capture group's frontier, whichever comes first (a capture copies the state there).
     std::int32_t call_span(std::int32_t begin, bool wide) const noexcept {
-        std::int32_t width = std::min(call_width(wide), static_cast<std::int32_t>(lane_.prompt_tokens) - begin);
-        for (const std::uint32_t split : lane_.base->splits) {
+        std::int32_t width = std::min(call_width(wide), static_cast<std::int32_t>(L().prompt_tokens) - begin);
+        for (const std::uint32_t split : L().base->splits) {
             if (static_cast<std::int32_t>(split) > begin) {
                 width = std::min(width, static_cast<std::int32_t>(split) - begin);
                 break;
@@ -2469,28 +2831,36 @@ private:
     // An exact hit's first token: sampled from the restored logits of the prompt's last position,
     // with that position's sampling words, as the prompt's last call would.
     PrefillProgress sample_exact_hit(Clock::time_point start, runtime::TokenMaskProvider* masks, PrefillProgress& out) {
-        const auto position          = static_cast<std::int32_t>(lane_.prompt_tokens) - 1;
-        const bool failed_constraint = sample(position, masks);
+        const auto position          = static_cast<std::int32_t>(L().prompt_tokens) - 1;
+        const Tensor restored(lane_logits_ptr(cur_), DType::BF16, {vocab_, 1});
+        const bool failed_constraint = sample(position, masks, &restored);
         const auto wait              = Clock::now();
         device_.synchronize();
         out.timing.device_wait_ns   = elapsed_ns(wait);
         pending_token_              = sampled_token();
         pending_                    = ++transaction_;
-        lane_.phase                 = Phase::Pending;
+        L().phase                 = Phase::Pending;
         out.processed_prompt_tokens = 0;
         out.complete                = true;
         out.timing.submit_host_ns   = elapsed_ns(start) - out.timing.device_wait_ns;
         out.pending.emplace(
             ContractAccess::make_pending(this, pending_, handle(), {&pending_token_, 1}, out.timing, failed_constraint));
-        lane_.prefill_ns += elapsed_ns(start);
-        lane_.permit = false;
+        L().prefill_ns += elapsed_ns(start);
+        L().permit = false;
         return std::move(out);
     }
 
     // Whether this prefill call runs wide (kWideChunk columns, the expert stream, the lent workspace):
     // the lease is held, or a prompt with at least kStreamMinColumns left takes one now.
     bool wide_ready(std::int32_t remaining) {
-        if (lease_.valid()) { return true; }
+        if (lease_.valid()) {
+            if (lease_owner_ == cur_) { return true; }
+            // Another lane's prompt holds the lent run, sized for its own widest call: give it
+            // back (the device is idle between calls) and lend this prompt's.
+            if (remaining < kStreamMinColumns) { return false; }
+            device_.synchronize();
+            return_lease();
+        }
         if (!stream_ || plan_.wide_work == 0 || remaining < kStreamMinColumns) { return false; }
         // The workspace of this prompt's widest call (not the planned wide_chunk columns). The keys
         // stay the planned envelope: Forward::attention runs the QSA selection at
@@ -2507,6 +2877,7 @@ private:
         if (can < work_frames + 2) { return false; } // a small cache: static calls through staging
         const std::uint32_t ring    = std::min(2 * c_.moe.experts, (can - work_frames) & ~1U);
         lease_          = residency_->lend(work_frames + ring, device_.stream);
+        lease_owner_    = cur_;
         auto* base      = static_cast<std::byte*>(lease_.memory.data);
         stream_tables_  = reinterpret_cast<std::int32_t*>(base);
         try {
@@ -2663,9 +3034,9 @@ private:
     void plan_lane_vision(const BasePlanImpl& base, std::uint32_t reused) {
         if (!base.vision) { return; }
         if (reused == 0) {
-            for (std::size_t k = 0; k < base.vision->items.size(); ++k) { lane_.vision_items.push_back(k); }
-            lane_.visual      = base.visual;
-            lane_.vision_plan = base.vision_plan;
+            for (std::size_t k = 0; k < base.vision->items.size(); ++k) { L().vision_items.push_back(k); }
+            L().visual      = base.visual;
+            L().vision_plan = base.vision_plan;
             return;
         }
         std::vector<std::size_t> merged;
@@ -2675,23 +3046,29 @@ private:
             if (static_cast<std::uint32_t>(item.scatter_indices.front()) < reused) {
                 throw std::logic_error("Qwen3.8-Flash-Next: a resumed frontier falls inside an image");
             }
-            lane_.vision_items.push_back(k);
+            L().vision_items.push_back(k);
             merged.push_back(item.merged_count);
-            for (const std::int32_t token : item.scatter_indices) { lane_.visual.push_back(static_cast<std::uint32_t>(token)); }
+            for (const std::int32_t token : item.scatter_indices) { L().visual.push_back(static_cast<std::uint32_t>(token)); }
         }
-        if (!lane_.vision_items.empty()) {
+        if (!L().vision_items.empty()) {
             const auto& model = parameters_.model;
-            lane_.vision_plan =
+            L().vision_plan =
                 execution::plan_vision_pass(*model.vision_config(), *parameters_.vision, *model.vision_layout(), merged);
         }
     }
 
     void encode_lane_vision() {
-        const auto& base = *lane_.base;
-        if (lane_.vision_items.empty() || lane_.vision_encoded) { return; }
-        const auto& plan  = lane_.vision_plan;
+        const auto& base = *L().base;
+        if (L().vision_items.empty() || L().vision_encoded) { return; }
+        const auto& plan  = L().vision_plan;
         const auto& model = parameters_.model;
         const nvtx::ScopedRange range(nvtx::Name::VisionEncode, nvtx::Category::Vision);
+        // Leases go back in the order they were lent: another lane's wide run goes back first (its
+        // next call lends again).
+        if (lease_.valid()) {
+            device_.synchronize();
+            return_lease();
+        }
         const std::uint32_t handoff_frames = frames_for(plan.handoff_bytes), window_frames = frames_for(plan.window_bytes);
         if (handoff_frames + window_frames > residency_->lendable()) {
             throw std::runtime_error("Qwen3.8-Flash-Next: the expert cache cannot lend the " +
@@ -2701,30 +3078,30 @@ private:
         }
         // Everything that can throw without a lease is done first, so no lent frame is held across it.
         std::vector<execution::VisionEncodeItem> items;
-        for (const std::size_t k : lane_.vision_items) {
+        for (const std::size_t k : L().vision_items) {
             items.push_back({base.payloads.at(k)->span(), &base.vision->items[k]});
         }
         const auto start    = Clock::now();
-        lane_.vision_lease = residency_->lend(handoff_frames, device_.stream); // release_lane returns it
+        L().vision_lease = residency_->lend(handoff_frames, device_.stream); // release_lane returns it
         // The window goes back on every exit, including a throw from the encode or the sync.
         ScopedLease window(*residency_, device_, residency_->lend(window_frames, device_.stream));
-        lane_.vision_handoff = Tensor(lane_.vision_lease.memory.data, DType::BF16,
+        L().vision_handoff = Tensor(L().vision_lease.memory.data, DType::BF16,
                                       {plan.out, static_cast<std::int32_t>(plan.tokens)});
-        lane_.vision_uploaded = execution::encode_vision(device_, *model.vision_config(), *parameters_.vision,
+        L().vision_uploaded = execution::encode_vision(device_, *model.vision_config(), *parameters_.vision,
                                                          *model.vision_layout(), model.pinned_weights(), items, plan,
-                                                         window.lease().memory, lane_.vision_handoff, device_.stream);
+                                                         window.lease().memory, L().vision_handoff, device_.stream);
         device_.synchronize();
-        lane_.vision_seconds = std::chrono::duration<double>(Clock::now() - start).count();
+        L().vision_seconds = std::chrono::duration<double>(Clock::now() - start).count();
         refilled_ += window.give_back();
         frames_now_          = residency_->frames();
-        lane_.vision_encoded = true;
+        L().vision_encoded = true;
         char line[240];
         std::snprintf(line, sizeof(line),
                       "vision: %zu image(s), %u tokens encoded in %.1f ms (window %.0f MiB and handoff %.1f MiB lent "
                       "from %u expert frames, %.0f MiB of the tower streamed)",
-                      items.size(), plan.tokens, lane_.vision_seconds * 1e3,
+                      items.size(), plan.tokens, L().vision_seconds * 1e3,
                       static_cast<double>(plan.window_bytes) / (1 << 20), static_cast<double>(plan.handoff_bytes) / (1 << 20),
-                      handoff_frames + window_frames, static_cast<double>(lane_.vision_uploaded) / (1 << 20));
+                      handoff_frames + window_frames, static_cast<double>(L().vision_uploaded) / (1 << 20));
         diagnostic(line);
     }
 
@@ -2775,24 +3152,29 @@ private:
 
     // Returns the handoff's frames once the device has run the prompt's calls.
     void return_vision() {
-        if (!lane_.vision_lease.valid()) { return; }
-        refilled_ += residency_->give_back(lane_.vision_lease, device_.stream);
+        if (!L().vision_lease.valid()) { return; }
+        // Another lane's wide run sits above this handoff: it goes back first.
+        if (lease_.valid() && lease_owner_ != cur_) {
+            device_.synchronize();
+            return_lease();
+        }
+        refilled_ += residency_->give_back(L().vision_lease, device_.stream);
         frames_now_          = residency_->frames();
-        lane_.vision_handoff = Tensor{};
+        L().vision_handoff = Tensor{};
     }
 
     // The image columns of call [begin, begin + width): their handoff slice and call-local columns
     // (written to the io block the call uploads), or null when the call holds no image token.
     const execution::VisionInput* stage_vision(std::int32_t begin, std::int32_t width) {
-        if (!lane_.vision_lease.valid() || lane_.visual.empty()) { return nullptr; }
+        if (!L().vision_lease.valid() || L().visual.empty()) { return nullptr; }
         auto* words = reinterpret_cast<std::int32_t*>(static_cast<std::byte*>(io_host_.data()) + plan_.io.vision_columns);
         const auto a = static_cast<std::uint32_t>(begin), b = static_cast<std::uint32_t>(begin + width);
         const VisualSlice slice =
-            visual_slice(lane_.visual, a, b, a, std::span<std::int32_t>(words, static_cast<std::size_t>(width)));
+            visual_slice(L().visual, a, b, a, std::span<std::int32_t>(words, static_cast<std::size_t>(width)));
         if (slice.count == 0) { return nullptr; }
-        const std::int32_t out = lane_.vision_handoff.ne[0];
+        const std::int32_t out = L().vision_handoff.ne[0];
         auto* base             = static_cast<std::byte*>(io_device_.p);
-        vision_input_ = {Tensor(static_cast<std::byte*>(lane_.vision_handoff.data) + 2ULL * out * slice.first,
+        vision_input_ = {Tensor(static_cast<std::byte*>(L().vision_handoff.data) + 2ULL * out * slice.first,
                                 DType::BF16, {out, static_cast<std::int32_t>(slice.count)}),
                          Tensor(base + plan_.io.vision_columns, DType::I32, {static_cast<std::int32_t>(slice.count)})};
         return &vision_input_;
@@ -2802,9 +3184,9 @@ private:
     // token after it, so its columns are the image tokens in [first + K k + 1, + n_k + 1). Null when
     // no cell's next token is an image token.
     const execution::VisionInput* stage_mtp_vision(std::int32_t first, std::int32_t cells) {
-        if (!lane_.vision_lease.valid() || lane_.visual.empty() || cells <= 0) { return nullptr; }
+        if (!L().vision_lease.valid() || L().visual.empty() || cells <= 0) { return nullptr; }
         const std::int32_t K   = execution::kMtpChunkColumns, subchunks = (cells + K - 1) / K;
-        const std::int32_t out = lane_.vision_handoff.ne[0];
+        const std::int32_t out = L().vision_handoff.ne[0];
         auto* words = reinterpret_cast<std::int32_t*>(static_cast<std::byte*>(io_host_.data()) + plan_.io.mtp_vision_columns);
         auto* base  = static_cast<std::byte*>(io_device_.p);
         mtp_vision_inputs_.assign(static_cast<std::size_t>(subchunks), execution::VisionInput{});
@@ -2813,12 +3195,12 @@ private:
             const std::int32_t n   = std::min(K, cells - k * K);
             const auto lo          = static_cast<std::uint32_t>(first + k * K + 1);
             const std::size_t at   = static_cast<std::size_t>(k) * K;
-            const VisualSlice slice = visual_slice(lane_.visual, lo, lo + static_cast<std::uint32_t>(n), lo,
+            const VisualSlice slice = visual_slice(L().visual, lo, lo + static_cast<std::uint32_t>(n), lo,
                                                    std::span<std::int32_t>(words + at, static_cast<std::size_t>(n)));
             if (slice.count == 0) { continue; }
             any = true;
             mtp_vision_inputs_[static_cast<std::size_t>(k)] = {
-                Tensor(static_cast<std::byte*>(lane_.vision_handoff.data) + 2ULL * out * slice.first, DType::BF16,
+                Tensor(static_cast<std::byte*>(L().vision_handoff.data) + 2ULL * out * slice.first, DType::BF16,
                        {out, static_cast<std::int32_t>(slice.count)}),
                 Tensor(base + plan_.io.mtp_vision_columns + 4 * at, DType::I32, {static_cast<std::int32_t>(slice.count)})};
         }
@@ -2873,10 +3255,18 @@ private:
             forward_->use_workspace(*work_);
         }
         ops::cast_fp32_to_bf16(logits32_, logits16_, device_.stream);
+        // The call's last column stays with the lane: its checkpoints (and an exact hit's first
+        // token) read it, and another lane's rounds overwrite logits16_ before they would.
+        CUDA_CHECK(cudaMemcpyAsync(lane_logits_ptr(cur_), logits16_.data, 2ULL * c_.vocab_size, cudaMemcpyDeviceToDevice,
+                                   device_.stream));
     }
 
-    // One part of the decode forward: eager on the first round (the kernels' one-time setup runs
-    // outside a capture), then each part captured once and replayed. The front runs the layers
+    std::byte* lane_logits_ptr(std::uint32_t lane) const noexcept {
+        return static_cast<std::byte*>(lane_logits_.data) + 2ULL * c_.vocab_size * lane;
+    }
+
+    // One part of the decode forward: eager on the lane's first round (the kernels' one-time setup
+    // runs outside a capture), then each part captured once and replayed. The front runs the layers
     // before the PLE layer, the back the rest and the head. Inputs were staged at fixed addresses.
     enum class Part : std::uint8_t { Front, Back };
     void run_decode(Part part) {
@@ -2889,24 +3279,18 @@ private:
             forward_->run_back(batch(1, true), split, logits32_);
             ops::cast_fp32_to_bf16(logits32_, logits16_, device_.stream);
         };
-        if (!options_.use_cuda_graph || decode_rounds_ == 0) {
-            body();
-            return;
+        if (part == Part::Front) {
+            replay(G().front_graph, G().front_exec, G().front_runs, body);
+        } else {
+            replay(G().back_graph, G().back_exec, G().back_runs, body);
         }
-        auto& graph = part == Part::Front ? front_graph_ : back_graph_;
-        auto& exec  = part == Part::Front ? front_exec_ : back_exec_;
-        if (!exec.ready()) {
-            graph.capture(device_.stream, body);
-            exec.instantiate(graph);
-            exec.upload(device_.stream);
-        }
-        exec.launch(device_.stream);
     }
 
-    // Samples the next token from the last call's logits at `position` into sampled_, with the
-    // row's grammar mask when constrained. Returns whether the grammar has a dead end there.
-    bool sample(std::int32_t position, runtime::TokenMaskProvider* masks) {
-        ops::SamplingConfig config = lane_.sampling;
+    // Samples the next token from the last call's logits (`logits`, or the shared logits16_) at
+    // `position` into sampled_, with the row's grammar mask when constrained. Returns whether the
+    // grammar has a dead end there.
+    bool sample(std::int32_t position, runtime::TokenMaskProvider* masks, const Tensor* logits = nullptr) {
+        ops::SamplingConfig config = L().sampling;
         std::uint32_t dead         = 0;
         if (masks != nullptr && masks->constrained(0)) {
             auto* words = static_cast<std::uint32_t*>(mask_host_.data());
@@ -2918,28 +3302,305 @@ private:
         auto* host_config = static_cast<ops::SamplingConfig*>(config_host_.data());
         *host_config      = config;
         upload_pinned(configs_, host_config, sizeof(ops::SamplingConfig), device_.stream);
-        upload_pinned(sample_position_.data, &position_word(position), 4, device_.stream);
+        upload_pinned(sample_position_.data, &position_word(0, position), 4, device_.stream);
         // The forward's workspace is free once its kernels precede these in stream order.
         work_->reset();
-        ops::sample(logits16_, sampled_, plan_.token_domain, configs_, sample_position_, ops::kSamplePurposeDecode, *work_,
-                    device_.stream);
+        ops::sample(logits != nullptr ? *logits : logits16_, sampled_, plan_.token_domain, configs_, sample_position_,
+                    ops::kSamplePurposeDecode, *work_, device_.stream);
         CUDA_CHECK(cudaMemcpyAsync(host_token_.data(), sampled_.data, 4, cudaMemcpyDeviceToHost, device_.stream));
         return (dead & 1U) != 0;
     }
 
-    std::int32_t& position_word(std::int32_t position) {
-        auto* word = reinterpret_cast<std::int32_t*>(static_cast<std::byte*>(host_token_.data()) + 32);
+    // Row `row`'s sampling position word (after the sampled tokens in the small pinned block).
+    std::int32_t& position_word(std::size_t row, std::int32_t position) {
+        auto* word = reinterpret_cast<std::int32_t*>(static_cast<std::byte*>(host_token_.data()) + 32) + row;
         *word      = position;
         return *word;
     }
 
-    TokenId sampled_token() const {
-        const TokenId token = *static_cast<const std::int32_t*>(host_token_.data());
+    TokenId sampled_token(std::size_t row = 0) const {
+        const TokenId token = static_cast<const std::int32_t*>(host_token_.data())[row];
         if (token < 0 || token >= plan_.token_domain) {
             throw std::runtime_error("Qwen3.8-Flash-Next: the forward produced non-finite logits (sampled " +
                                      std::to_string(token) + ")");
         }
         return token;
+    }
+
+    // ---------------------------------------------------------------- a plain round over several lanes
+    // Each row is one lane's next token; the forward decodes them in one call (Forward::run_rows),
+    // and every row's logits are bitwise those of that lane decoding alone (the column-invariant
+    // Ops). The drafter is not run: its cells are written from the round's exported residuals when
+    // the tokens commit (mtp_catch_up_row), so a lane that decodes alone afterwards drafts as before.
+    PendingBatch decode_rows(std::span<const SequenceHandle> sequences, runtime::ExecutionTiming* failed,
+                             runtime::TokenMaskProvider* masks, Clock::time_point start) {
+        const nvtx::ScopedRange range(nvtx::Name::DecodeOrdinaryRound, nvtx::Category::Decode);
+        const auto B = static_cast<std::int32_t>(sequences.size());
+        for (std::int32_t b = 0; b < B; ++b) {
+            round_lanes_[static_cast<std::size_t>(b)] = ContractAccess::lane(sequences[static_cast<std::size_t>(b)]);
+        }
+        try {
+            std::array<bool, kMaximumLanes> constraint_failed{};
+            const std::span<const std::uint32_t> lanes(round_lanes_.data(), static_cast<std::size_t>(B));
+            if (plan_.drafts > 0) {
+                // Each drafter's pending cell first (after a prompt), the round's cell at commit.
+                for (std::int32_t b = 0; b < B; ++b) {
+                    select_lane(lanes[static_cast<std::size_t>(b)]);
+                    const bool written = L().mtp_live && L().mtp_cells < L().state_tokens;
+                    mtp_write_pending();
+                    // The staging block of the drafter's words is rewritten by the next lane's.
+                    if (written) { device_.synchronize(); }
+                    round_catch_up_[static_cast<std::size_t>(b)] = L().mtp_live;
+                    ++L().speculative.fallback_steps;
+                }
+            }
+            stage_rows_inputs(lanes);
+            residency_->before_round(device_.stream);
+            run_rows_part(lanes, Part::Front);
+            {
+                const nvtx::ScopedRange rows(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode);
+                const std::size_t bytes = read_rows_of(lanes);
+                upload_pinned(static_cast<std::byte*>(io_device_.p) + plan_.io.ngram,
+                              static_cast<std::byte*>(io_host_.data()) + plan_.io.ngram, bytes, device_.stream);
+            }
+            run_rows_part(lanes, Part::Back);
+            for (std::int32_t b = 0; b < B; ++b) { ++lanes_[lanes[static_cast<std::size_t>(b)]].state_tokens; }
+            sample_rows(lanes, masks, constraint_failed);
+            residency_->enqueue_route_download(device_.stream, B);
+            const auto wait = Clock::now();
+            {
+                const nvtx::ScopedRange waiting(nvtx::Name::DecodeOrdinaryWait, nvtx::Category::Decode);
+                device_.synchronize();
+            }
+            runtime::ExecutionTiming timing;
+            timing.device_wait_ns = elapsed_ns(wait);
+            for (std::int32_t b = 0; b < B; ++b) { round_tokens_[static_cast<std::size_t>(b)] = sampled_token(static_cast<std::size_t>(b)); }
+            deferred_ = true; // the round's cache update runs at commit
+            pending_  = ++transaction_;
+            timing.submit_host_ns = elapsed_ns(start) - timing.device_wait_ns;
+            for (std::int32_t b = 0; b < B; ++b) {
+                Lane& lane = lanes_[lanes[static_cast<std::size_t>(b)]];
+                lane.phase = Phase::Pending;
+                lane.decode_ns += elapsed_ns(start);
+            }
+            ++decode_rounds_;
+            ++rows_rounds_;
+            return ContractAccess::make_rows(this, pending_, sequences, {round_tokens_.data(), static_cast<std::size_t>(B)},
+                                             timing, {constraint_failed.data(), static_cast<std::size_t>(B)});
+        } catch (...) {
+            if (failed != nullptr) { failed->submit_host_ns += elapsed_ns(start); }
+            for (std::int32_t b = 0; b < B; ++b) {
+                select_lane(round_lanes_[static_cast<std::size_t>(b)]);
+                release_lane();
+            }
+            throw;
+        }
+    }
+
+    // The rows' input words: each lane's pending token, its position, RoPE words and pooled-block
+    // start, and its slot.
+    void stage_rows_inputs(std::span<const std::uint32_t> lanes) {
+        const auto& io   = plan_.io;
+        auto* host       = static_cast<std::byte*>(io_host_.data());
+        const auto B     = static_cast<std::int32_t>(lanes.size());
+        auto* ids        = reinterpret_cast<std::int32_t*>(host + io.ids);
+        auto* pos        = reinterpret_cast<std::int32_t*>(host + io.positions);
+        auto* rope       = reinterpret_cast<std::int32_t*>(host + io.rope);
+        auto* slots      = reinterpret_cast<std::int32_t*>(host + io.rows_slots);
+        auto* row_rope   = reinterpret_cast<std::int32_t*>(host + io.rows_rope);
+        auto* row_block  = reinterpret_cast<std::int32_t*>(host + io.rows_block);
+        for (std::int32_t b = 0; b < B; ++b) {
+            const Lane& lane = lanes_[lanes[static_cast<std::size_t>(b)]];
+            // state_tokens was advanced by the previous round only at commit time: the round's
+            // position is the committed frontier.
+            const std::uint32_t at = lane.state_tokens;
+            ids[b]   = lane.history[at];
+            pos[b]   = static_cast<std::int32_t>(at);
+            slots[b] = static_cast<std::int32_t>(lanes[static_cast<std::size_t>(b)]);
+            const RopePosition position = rope_of(lane.rope, at);
+            stage_rope_value(position, std::span<std::int32_t>(rope, 3ULL * B), B, b);
+            const RopePosition block = block_start_rope(lane.rope, at, c_.qsa.compress_ratio);
+            for (std::size_t a = 0; a < 3; ++a) {
+                row_rope[3 * b + static_cast<std::int32_t>(a)]  = position[a];
+                row_block[3 * b + static_cast<std::int32_t>(a)] = block[a];
+            }
+        }
+        upload_pinned(io_device_.p, io_host_.data(), io.ngram, device_.stream);
+    }
+
+    execution::ForwardRowsBatch rows_batch(std::span<const std::uint32_t> lanes) const {
+        const auto& io = plan_.io;
+        auto* base     = static_cast<std::byte*>(io_device_.p);
+        const auto B   = static_cast<std::int32_t>(lanes.size());
+        execution::ForwardRowsBatch b;
+        for (const std::uint32_t lane : lanes) { b.slots.push_back(static_cast<std::int32_t>(lane)); }
+        b.slot_ids         = Tensor(base + io.rows_slots, DType::I32, {B});
+        b.ids              = Tensor(base + io.ids, DType::I32, {B});
+        b.positions        = Tensor(base + io.positions, DType::I32, {B});
+        b.rope_positions   = Tensor(base + io.rope, DType::I32, {B, 3});
+        b.row_rope         = Tensor(base + io.rows_rope, DType::I32, {3, B});
+        b.block_start_rope = Tensor(base + io.rows_block, DType::I32, {3, B});
+        b.ngram_rows       = Tensor(base + io.ngram, DType::U8, {dim(c_.ple.table.row_bytes), dim(hash_.heads()), B});
+        if (plan_.drafts > 0) {
+            b.residual_out = Tensor(spec_base() + plan_.spec.residuals, DType::BF16, {dim(c_.residual_width()), B});
+        }
+        return b;
+    }
+
+    // One part of the rows round: eager on its first use, then captured once and replayed (the
+    // lanes of a round are fixed by their rows, so one pair serves the two-lane round).
+    void run_rows_part(std::span<const std::uint32_t> lanes, Part part) {
+        const auto B = static_cast<std::int32_t>(lanes.size());
+        const std::vector<std::uint32_t> held(lanes.begin(), lanes.end());
+        const auto body = [this, held, part, B] {
+            const auto batch = rows_batch(held);
+            if (part == Part::Front) {
+                forward_->run_rows_front(batch);
+                return;
+            }
+            Tensor wide32(logits32_.data, DType::FP32, {vocab_, B});
+            Tensor wide16(logits16_.data, DType::BF16, {vocab_, B});
+            forward_->run_rows_back(batch, wide32);
+            ops::cast_fp32_to_bf16(wide32, wide16, device_.stream);
+        };
+        if (part == Part::Front) {
+            replay(rows_front_graph_, rows_front_exec_, rows_front_runs_, body);
+        } else {
+            replay(rows_back_graph_, rows_back_exec_, rows_back_runs_, body);
+        }
+    }
+
+    // Samples every row's next token from the round's BF16 logits [V, B] into sampled_ and the
+    // host (each row with its lane's sampling config, committed-token counts and grammar mask).
+    void sample_rows(std::span<const std::uint32_t> lanes, runtime::TokenMaskProvider* masks,
+                     std::array<bool, kMaximumLanes>& constraint_failed) {
+        const auto B = static_cast<std::int32_t>(lanes.size());
+        auto* host_configs = static_cast<ops::SamplingConfig*>(config_host_.data());
+        auto* mask_words   = static_cast<std::uint32_t*>(mask_host_.data());
+        for (std::int32_t b = 0; b < B; ++b) {
+            const auto row            = static_cast<std::size_t>(b);
+            ops::SamplingConfig config = lanes_[lanes[row]].sampling;
+            if (masks != nullptr && masks->constrained(row)) {
+                auto words = std::span<std::uint32_t>(mask_words + row * plan_.mask_words, plan_.mask_words);
+                const std::uint32_t dead = masks->fill(row, {}, words);
+                upload_pinned(masks_ + row * plan_.mask_words, words.data(), 4 * plan_.mask_words, device_.stream);
+                masks->uploaded(row, 4 * plan_.mask_words);
+                config.mask = {masks_ + row * plan_.mask_words, static_cast<std::int32_t>(plan_.mask_words)};
+                constraint_failed[row] = (dead & 1U) != 0;
+            }
+            host_configs[row] = config;
+            position_word(row, static_cast<std::int32_t>(lanes_[lanes[row]].state_tokens) - 1);
+        }
+        upload_pinned(configs_, host_configs, sizeof(ops::SamplingConfig) * static_cast<std::size_t>(B), device_.stream);
+        upload_pinned(sample_position_.data, static_cast<std::byte*>(host_token_.data()) + 32, 4ULL * B, device_.stream);
+        work_->reset();
+        Tensor wide16(logits16_.data, DType::BF16, {vocab_, B});
+        Tensor out(sampled_.data, DType::I32, {B});
+        const Tensor positions(sample_position_.data, DType::I32, {B});
+        ops::sample(wide16, out, plan_.token_domain, configs_, positions, ops::kSamplePurposeDecode, *work_,
+                    device_.stream);
+        CUDA_CHECK(cudaMemcpyAsync(host_token_.data(), sampled_.data, 4ULL * B, cudaMemcpyDeviceToHost, device_.stream));
+    }
+
+    // The drafter's cell of row `b`'s round position `S` (the lane selected), from the round's
+    // exported residual of that row: its input is the committed token after the position.
+    void mtp_catch_up_row(std::int32_t b, std::int32_t S) {
+        const cudaStream_t s = device_.stream;
+        const nvtx::ScopedRange range(nvtx::Name::MtpForward, nvtx::Category::Decode);
+        const auto& sp = plan_.spec;
+        auto* words    = spec_words_host();
+        const auto row = static_cast<std::size_t>(b);
+        words[sp.w_mtp_ids + row] = L().history[static_cast<std::size_t>(S) + 1];
+        upload_pinned(spec_words_device() + sp.w_mtp_ids + row, words + sp.w_mtp_ids + row, 4, s);
+        const auto& io = plan_.io;
+        auto* base     = static_cast<std::byte*>(io_device_.p);
+        const std::size_t col = 2ULL * c_.residual_width();
+        replay(G().row_catch_graphs.at(row), G().row_catch_execs.at(row), G().row_catch_runs.at(row), [&] {
+            execution::MtpCall call;
+            call.residuals        = Tensor(spec_base() + sp.residuals + col * row, DType::BF16, {dim(c_.residual_width()), 1});
+            call.ids              = spec_word(sp.w_mtp_ids + row, 1);
+            call.positions        = Tensor(base + io.positions + 4 * row, DType::I32, {1});
+            call.rope_positions   = Tensor(base + io.rows_rope + 12 * row, DType::I32, {1, 3});
+            call.block_start_rope = Tensor(base + io.rows_block + 12 * row, DType::I32, {3});
+            call.tail             = mtp_tail_;
+            call.kv_only          = true;
+            forward_->run_mtp(call);
+            CUDA_CHECK(cudaMemcpyAsync(spec_base() + sp.saved + cur_ * sp.saved_stride, call.residuals.data, col,
+                                       cudaMemcpyDeviceToDevice, s));
+        });
+        L().mtp_cells = static_cast<std::uint32_t>(S + 1);
+    }
+
+    // Commits a plain round over several rows: each row keeps its one sampled token (or its lane
+    // goes when cancelled or failed), the drafters take the round's cells, and the expert cache
+    // settles once for the round.
+    CommitResult commit_rows(std::span<const SequenceHandle> rows, std::span<const runtime::CommitDecision> decisions,
+                             const std::array<bool, kMaximumLanes>& constraint_failed, Clock::time_point start) {
+        CommitResult out;
+        out.row_count = rows.size();
+        const std::size_t B = rows.size();
+        for (std::size_t b = 0; b < B; ++b) {
+            const auto& d = decisions[b];
+            const bool released = d.cancelled || d.failed;
+            const bool bad = released ? ((d.cancelled && d.failed) || (!d.cancelled && d.failed != constraint_failed[b]) ||
+                                         d.accepted_tokens != 0 || !d.terminal)
+                                      : d.accepted_tokens != 1;
+            if (bad) {
+                for (std::size_t r = 0; r < B; ++r) {
+                    select_lane(ContractAccess::lane(rows[r]));
+                    release_lane();
+                }
+                deferred_ = false;
+                throw std::logic_error("Qwen3.8-Flash-Next: a round's pending decision is invalid");
+            }
+        }
+        std::int32_t advanced = 0;
+        bool any_released     = false;
+        std::array<bool, kMaximumLanes> release{};
+        for (std::size_t b = 0; b < B; ++b) {
+            const auto& d = decisions[b];
+            select_lane(ContractAccess::lane(rows[b]));
+            CommitRowResult& row = out.rows[b];
+            if (d.cancelled || d.failed) {
+                row.timings     = timings();
+                row.speculative = speculative_stats();
+                row.disposition = d.failed ? runtime::CommitDisposition::FailedReleased
+                                           : runtime::CommitDisposition::CancelledReleased;
+                release[b]      = true;
+                any_released    = true;
+                continue;
+            }
+            const bool first = L().history.size() == L().prompt_tokens;
+            if (first) {
+                L().first_token_seconds = std::chrono::duration<double>(Clock::now() - L().admitted).count();
+                L().cache_at_decode     = residency_->stats();
+                L().ngram_at_decode     = volume_.counters();
+            }
+            L().history.push_back(round_tokens_[b]);
+            // The drafter's cell of the round's position, from the row's exported residual.
+            if (round_catch_up_[b]) { mtp_catch_up_row(static_cast<std::int32_t>(b), static_cast<std::int32_t>(L().state_tokens) - 1); }
+            L().phase       = d.terminal ? Phase::Finishable : Phase::Decode;
+            row.disposition = d.terminal ? runtime::CommitDisposition::Finishable : runtime::CommitDisposition::Active;
+            if (first && !d.terminal && L().next_capture < L().captures.size() &&
+                L().captures[L().next_capture].frontier == L().prompt_tokens) {
+                L().capture_pending = true;
+                out.capture_ready[b] = true;
+            }
+            row.timings              = timings();
+            row.speculative          = speculative_stats();
+            row.speculative_counters = speculative_counters();
+            L().permit               = false;
+            ++advanced;
+        }
+        settle_round(static_cast<std::int32_t>(B), advanced);
+        for (std::size_t b = 0; b < B; ++b) {
+            if (!release[b]) { continue; }
+            select_lane(ContractAccess::lane(rows[b]));
+            release_lane();
+        }
+        if (any_released) { settle_idle(); }
+        out.timing.post_host_ns = elapsed_ns(start);
+        return out;
     }
 
     // ---------------------------------------------------------------- MTP speculation
@@ -2969,7 +3630,7 @@ private:
         return Tensor(spec_words_device() + offset, DType::I32, {count});
     }
     Tensor saved_residual() const {
-        return Tensor(spec_base() + plan_.spec.saved, DType::BF16, {dim(c_.residual_width()), 1});
+        return Tensor(spec_base() + plan_.spec.saved + cur_ * plan_.spec.saved_stride, DType::BF16, {dim(c_.residual_width()), 1});
     }
     Tensor round_residuals(std::int32_t columns) const {
         return Tensor(spec_base() + plan_.spec.residuals, DType::BF16, {dim(c_.residual_width()), columns});
@@ -2985,19 +3646,26 @@ private:
         std::vector<float> ones(static_cast<std::size_t>(c_.hc.streams) * execution::kMtpChunkColumns, 1.0F);
         CUDA_CHECK(cudaMemcpy(spec_base() + s.ones, ones.data(), ones.size() * sizeof(float), cudaMemcpyHostToDevice));
         records_.resize(static_cast<std::size_t>(plan_.max_width) + 1);
-        folds_.resize(static_cast<std::size_t>(plan_.max_width) + 1);
-        verify_front_.resize(static_cast<std::size_t>(plan_.max_width) + 1);
-        verify_back_.resize(static_cast<std::size_t>(plan_.max_width) + 1);
-        verify_front_exec_.resize(static_cast<std::size_t>(plan_.max_width) + 1);
-        verify_back_exec_.resize(static_cast<std::size_t>(plan_.max_width) + 1);
-        verify_runs_.assign(static_cast<std::size_t>(plan_.max_width) + 1, 0);
-        verify_back_runs_.assign(static_cast<std::size_t>(plan_.max_width) + 1, 0);
-        draft_graphs_.resize(static_cast<std::size_t>(plan_.drafts) + 1);
-        draft_execs_.resize(static_cast<std::size_t>(plan_.drafts) + 1);
-        draft_runs_.assign(static_cast<std::size_t>(plan_.drafts) + 1, 0);
-        catch_graphs_.resize(static_cast<std::size_t>(plan_.max_width) + 1);
-        catch_execs_.resize(static_cast<std::size_t>(plan_.max_width) + 1);
-        catch_runs_.assign(static_cast<std::size_t>(plan_.max_width) + 1, 0);
+        lane_graphs_.resize(plan_.lanes);
+        for (auto& g : lane_graphs_) {
+            g.folds.resize(static_cast<std::size_t>(plan_.max_width) + 1);
+            g.verify_front.resize(static_cast<std::size_t>(plan_.max_width) + 1);
+            g.verify_back.resize(static_cast<std::size_t>(plan_.max_width) + 1);
+            g.verify_front_exec.resize(static_cast<std::size_t>(plan_.max_width) + 1);
+            g.verify_back_exec.resize(static_cast<std::size_t>(plan_.max_width) + 1);
+            g.verify_runs.assign(static_cast<std::size_t>(plan_.max_width) + 1, 0);
+            g.verify_back_runs.assign(static_cast<std::size_t>(plan_.max_width) + 1, 0);
+            g.draft_graphs.resize(static_cast<std::size_t>(plan_.drafts) + 1);
+            g.draft_execs.resize(static_cast<std::size_t>(plan_.drafts) + 1);
+            g.draft_runs.assign(static_cast<std::size_t>(plan_.drafts) + 1, 0);
+            g.catch_graphs.resize(static_cast<std::size_t>(plan_.max_width) + 1);
+            g.catch_execs.resize(static_cast<std::size_t>(plan_.max_width) + 1);
+            g.catch_runs.assign(static_cast<std::size_t>(plan_.max_width) + 1, 0);
+            // The catch-up of a plain round over several rows: one graph per row.
+            g.row_catch_graphs.resize(plan_.lanes);
+            g.row_catch_execs.resize(plan_.lanes);
+            g.row_catch_runs.assign(plan_.lanes, 0);
+        }
         pending_tokens_.assign(static_cast<std::size_t>(plan_.max_width), 0);
     }
 
@@ -3029,15 +3697,19 @@ private:
     }
 
     const ops::GdnReplayFoldPlan& fold(std::int32_t W) {
-        auto& plan = folds_.at(static_cast<std::size_t>(W));
+        auto& plan = G().folds.at(static_cast<std::size_t>(W));
         if (!plan) {
             (void)verify_view(W);
+            // The lane's own copy of every layer's convolution window and recurrence (one slot).
             const auto* state = static_cast<std::byte*>(state_backing_.p);
-            const auto stride = static_cast<std::int64_t>(align(plan_.gdn_conv) + align(plan_.gdn_recurrent));
+            const auto& conv0 = plan_.sections.at(0);
+            const auto& rec0  = plan_.sections.at(1);
+            const std::int64_t stride =
+                c_.gdn_layers > 1 ? static_cast<std::int64_t>(plan_.sections.at(2).at - conv0.at) : 0;
             LinearAttentionStateAllLayersView view;
-            view.conv_layer0      = Tensor(const_cast<std::byte*>(state), DType::BF16,
+            view.conv_layer0      = Tensor(const_cast<std::byte*>(state) + conv0.at + cur_ * conv0.bytes, DType::BF16,
                                            {dim(c_.gdn.conv_channels()), dim(c_.gdn.conv_kernel - 1), 1});
-            view.recurrent_layer0 = Tensor(const_cast<std::byte*>(state) + align(plan_.gdn_conv), DType::FP32,
+            view.recurrent_layer0 = Tensor(const_cast<std::byte*>(state) + rec0.at + cur_ * rec0.bytes, DType::FP32,
                                            {dim(c_.gdn.key_head_dim), dim(c_.gdn.value_head_dim),
                                             dim(c_.gdn.value_heads), 1});
             view.conv_layer_stride_bytes      = stride;
@@ -3076,8 +3748,8 @@ private:
     void write_mtp_chunk(std::int32_t begin, std::int32_t width) {
         mtp_chunk_.reset();
         if (plan_.drafts == 0) { return; }
-        const bool prepend = begin > 0 && lane_.mtp_cells < static_cast<std::uint32_t>(begin);
-        const bool known   = lane_.history.size() > static_cast<std::size_t>(begin + width);
+        const bool prepend = begin > 0 && L().mtp_cells < static_cast<std::uint32_t>(begin);
+        const bool known   = L().history.size() > static_cast<std::size_t>(begin + width);
         const std::int32_t columns = known ? width : width - 1;
         const std::int32_t first   = prepend ? begin - 1 : begin;
         const std::int32_t cells   = (prepend ? 1 : 0) + columns;
@@ -3090,17 +3762,17 @@ private:
         const std::int32_t K = execution::kMtpChunkColumns;
         for (std::int32_t i = 0; i < cells; ++i) {
             positions[i] = first + i;
-            ids[i]       = lane_.history[static_cast<std::size_t>(first + i + 1)];
+            ids[i]       = L().history[static_cast<std::size_t>(first + i + 1)];
         }
         if (cells > 0) {
             // Sub-chunk k's [n_k, 3] axis-major block and its pooled-block start (the lane's RoPE
             // positions of the cells: the target's).
             const std::int32_t subchunks = (cells + K - 1) / K;
-            stage_mtp_chunk_rope(lane_.rope, static_cast<std::uint32_t>(first), cells, K, c_.qsa.compress_ratio,
+            stage_mtp_chunk_rope(L().rope, static_cast<std::uint32_t>(first), cells, K, c_.qsa.compress_ratio,
                                  std::span<std::int32_t>(rope, 3ULL * cells), std::span<std::int32_t>(block, 3ULL * subchunks));
         }
-        lane_.mtp_cells = static_cast<std::uint32_t>(begin + columns);
-        lane_.mtp_live  = true;
+        L().mtp_cells = static_cast<std::uint32_t>(begin + columns);
+        L().mtp_live  = true;
         execution::MtpChunk chunk;
         chunk.saved   = saved_residual().view({dim(c_.residual_width())});
         chunk.prepend = prepend;
@@ -3121,8 +3793,8 @@ private:
     void stage_draft_words(std::int32_t steps) {
         const auto& io = plan_.io;
         auto* host     = static_cast<std::byte*>(io_host_.data());
-        const std::int32_t S = static_cast<std::int32_t>(lane_.state_tokens);
-        *reinterpret_cast<std::int32_t*>(host + io.draft_anchor) = lane_.history.back();
+        const std::int32_t S = static_cast<std::int32_t>(L().state_tokens);
+        *reinterpret_cast<std::int32_t*>(host + io.draft_anchor) = L().history.back();
         auto* cells = reinterpret_cast<std::int32_t*>(host + io.draft_cells);
         auto* rope  = reinterpret_cast<std::int32_t*>(host + io.draft_rope);
         auto* block = reinterpret_cast<std::int32_t*>(host + io.draft_block_rope);
@@ -3130,8 +3802,8 @@ private:
             const std::int32_t cell = S - 1 + j;
             const auto at           = static_cast<std::size_t>(3 * j);
             cells[j]                = cell;
-            stage_rope_value(rope_of(lane_.rope, static_cast<std::uint32_t>(cell)), std::span<std::int32_t>(rope + at, 3), 1, 0);
-            stage_rope_value(block_start_rope(lane_.rope, static_cast<std::uint32_t>(cell), c_.qsa.compress_ratio),
+            stage_rope_value(rope_of(L().rope, static_cast<std::uint32_t>(cell)), std::span<std::int32_t>(rope + at, 3), 1, 0);
+            stage_rope_value(block_start_rope(L().rope, static_cast<std::uint32_t>(cell), c_.qsa.compress_ratio),
                              std::span<std::int32_t>(block + at, 3), 1, 0);
         }
         upload_pinned(static_cast<std::byte*>(io_device_.p) + io.draft_cells, host + io.draft_cells,
@@ -3151,7 +3823,7 @@ private:
     // The pending cell (state_tokens - 1, its residual saved, its next token the anchor) when the
     // drafter has not written it: after a prompt, whose last cell waits for the first token.
     void mtp_write_pending() {
-        if (!lane_.mtp_live || lane_.mtp_cells >= lane_.state_tokens) { return; }
+        if (!L().mtp_live || L().mtp_cells >= L().state_tokens) { return; }
         stage_draft_words(0);
         auto call      = draft_call(0);
         call.residuals = saved_residual();
@@ -3159,7 +3831,7 @@ private:
         call.tail      = mtp_tail_;
         call.kv_only   = true;
         forward_->run_mtp(call);
-        lane_.mtp_cells = lane_.state_tokens;
+        L().mtp_cells = L().state_tokens;
     }
 
     // `steps` chained drafter steps from the saved residual and the anchor (Infernix mtp_draft):
@@ -3172,9 +3844,9 @@ private:
         stage_draft_words(steps);
         const std::size_t column = 2ULL * c_.residual_width();
         auto* chain = spec_base() + plan_.spec.chain;
-        replay(draft_graphs_.at(static_cast<std::size_t>(steps)), draft_execs_.at(static_cast<std::size_t>(steps)),
-               draft_runs_.at(static_cast<std::size_t>(steps)), [&] {
-                   CUDA_CHECK(cudaMemcpyAsync(chain, spec_base() + plan_.spec.saved, column, cudaMemcpyDeviceToDevice, s));
+        replay(G().draft_graphs.at(static_cast<std::size_t>(steps)), G().draft_execs.at(static_cast<std::size_t>(steps)),
+               G().draft_runs.at(static_cast<std::size_t>(steps)), [&] {
+                   CUDA_CHECK(cudaMemcpyAsync(chain, saved_residual().data, column, cudaMemcpyDeviceToDevice, s));
                    const Tensor scratch = mtp_scratch_tail();
                    CUDA_CHECK(cudaMemcpyAsync(scratch.data, mtp_tail_.data, mtp_tail_.bytes(), cudaMemcpyDeviceToDevice, s));
                    const Tensor chain_tensor(chain, DType::BF16, {dim(c_.residual_width()), 1});
@@ -3208,7 +3880,7 @@ private:
         std::int32_t best = 0;
         double best_score = 1.0, reach = 1.0, tokens = 1.0;
         for (std::int32_t k = 1; k <= limit; ++k) {
-            reach *= lane_.mtp_accept[static_cast<std::size_t>(k - 1)];
+            reach *= L().mtp_accept[static_cast<std::size_t>(k - 1)];
             tokens += reach;
             const double score = tokens / (1.0 + width_cost() * k);
             if (score > best_score) {
@@ -3216,7 +3888,7 @@ private:
                 best       = k;
             }
         }
-        if (++lane_.mtp_policy_rounds % kProbeInterval == 0) { best = std::min(best + 1, limit); }
+        if (++L().mtp_policy_rounds % kProbeInterval == 0) { best = std::min(best + 1, limit); }
         if (options_.mtp_fixed_drafts) { best = limit; }
         return best;
     }
@@ -3225,11 +3897,11 @@ private:
     // constrained row, too little budget or context, or the policy chose no drafts).
     std::optional<PendingBatch> try_speculate(SequenceHandle row, const runtime::RoundBudget& budget,
                                               runtime::TokenMaskProvider* masks, Clock::time_point start) {
-        if (plan_.drafts == 0 || !lane_.mtp_live || (masks != nullptr && masks->constrained(0))) { return std::nullopt; }
+        if (plan_.drafts == 0 || !L().mtp_live || (masks != nullptr && masks->constrained(0))) { return std::nullopt; }
         // A row drafts at most one token fewer than it may still emit, and every verified position
         // lies within the request's reserved extent.
         const std::int64_t room = std::min<std::int64_t>(static_cast<std::int64_t>(budget.generated_tokens_remaining) - 1,
-                                                         static_cast<std::int64_t>(lane_.extent) - lane_.state_tokens - 1);
+                                                         static_cast<std::int64_t>(L().extent) - L().state_tokens - 1);
         const std::int32_t limit = static_cast<std::int32_t>(std::clamp<std::int64_t>(room, 0, plan_.drafts));
         if (limit <= 0) { return std::nullopt; }
         const std::int32_t steps = choose_draft_length(limit);
@@ -3243,12 +3915,12 @@ private:
     PendingBatch verify(SequenceHandle row, std::span<const TokenId> drafts, Clock::time_point start) {
         const cudaStream_t s  = device_.stream;
         const std::int32_t K  = static_cast<std::int32_t>(drafts.size()), W = K + 1;
-        const std::int32_t S  = static_cast<std::int32_t>(lane_.state_tokens);
+        const std::int32_t S  = static_cast<std::int32_t>(L().state_tokens);
         const auto& sp        = plan_.spec;
         const nvtx::ScopedRange range(nvtx::Name::DecodeMtpRound, nvtx::Category::Decode);
         // The columns' tokens: the history's anchor, then the drafts (appended while staging).
-        const std::size_t history = lane_.history.size();
-        lane_.history.insert(lane_.history.end(), drafts.begin(), drafts.end());
+        const std::size_t history = L().history.size();
+        L().history.insert(L().history.end(), drafts.begin(), drafts.end());
         write_inputs(S, W);
         auto* columns = reinterpret_cast<std::int32_t*>(static_cast<std::byte*>(io_host_.data()) + plan_.io.logit_columns);
         for (std::int32_t j = 0; j < W; ++j) { columns[j] = j; }
@@ -3258,26 +3930,27 @@ private:
         for (std::int32_t j = 0; j < K; ++j) { words[sp.w_drafts + j] = drafts[static_cast<std::size_t>(j)]; }
         words[sp.w_extents] = K;
         words[sp.w_lengths] = S;
-        words[sp.w_anchors] = lane_.history[history - 1];
+        words[sp.w_anchors] = L().history[history - 1];
         upload_pinned(spec_words_device(), words, 4 * sp.w_mtp_ids, s);
         residency_->before_round(s);
         const execution::ForwardVerify view = verify_view(W);
         const std::uint32_t split          = forward_->rows_layer();
-        const auto tails_bytes             = align(plan_.tail) * c_.attention_layers;
         const Tensor wide32(logits32_.data, DType::FP32, {vocab_, W});
         Tensor wide16(logits16_.data, DType::BF16, {vocab_, W});
         const auto w = static_cast<std::size_t>(W);
-        replay(verify_front_.at(w), verify_front_exec_.at(w), verify_runs_.at(w), [&] {
+        replay(G().verify_front.at(w), G().verify_front_exec.at(w), G().verify_runs.at(w), [&] {
             // The verification pools from copies of the live tails.
-            CUDA_CHECK(cudaMemcpyAsync(spec_base() + sp.tails, tails_base_, tails_bytes, cudaMemcpyDeviceToDevice, s));
+            // (the lane's tails sit one lane stride apart per layer; the copies are packed)
+            CUDA_CHECK(cudaMemcpy2DAsync(spec_base() + sp.tails, align(plan_.tail), tails_base_, tail_layer_stride_,
+                                         plan_.tail, c_.attention_layers, cudaMemcpyDeviceToDevice, s));
             forward_->run_front(batch(W, true, &view), split);
         });
         {
             const nvtx::ScopedRange rows(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode);
             upload_rows(S, W);
         }
-        lane_.history.resize(history);
-        replay(verify_back_.at(w), verify_back_exec_.at(w), verify_back_runs_.at(w), [&] {
+        L().history.resize(history);
+        replay(G().verify_back.at(w), G().verify_back_exec.at(w), G().verify_back_runs.at(w), [&] {
             Tensor logits = wide32;
             forward_->run_back(batch(W, true, &view), split, logits);
             ops::cast_fp32_to_bf16(wide32, wide16, s);
@@ -3308,12 +3981,12 @@ private:
         }
         runtime::ExecutionTiming timing;
         timing.device_wait_ns = elapsed_ns(wait);
-        const std::int32_t L = words[sp.w_counts], A = words[sp.w_accepted];
-        if (L < 1 || L > W || A != L - 1) {
+        const std::int32_t LC = words[sp.w_counts], A = words[sp.w_accepted];
+        if (LC < 1 || LC > W || A != LC - 1) {
             release_lane();
             throw std::logic_error("Qwen3.8-Flash-Next: acceptance returned an invalid extent");
         }
-        for (std::int32_t j = 0; j < L; ++j) {
+        for (std::int32_t j = 0; j < LC; ++j) {
             const TokenId token = words[sp.w_licensed + j];
             if (token < 0 || token >= plan_.token_domain) {
                 release_lane();
@@ -3322,7 +3995,7 @@ private:
             pending_tokens_[static_cast<std::size_t>(j)] = token;
         }
         // Statistics, and the acceptance estimate (positions 1..A accepted, A + 1 the first rejected).
-        auto& stats = lane_.speculative;
+        auto& stats = L().speculative;
         ++stats.rounds;
         stats.drafted_tokens += static_cast<std::uint64_t>(K);
         stats.accepted_tokens += static_cast<std::uint64_t>(A);
@@ -3331,31 +4004,31 @@ private:
         }
         for (std::int32_t j = 0; j < A; ++j) { ++stats.accepted_per_position[static_cast<std::size_t>(j)]; }
         for (std::int32_t j = 0; j < K; ++j) {
-            ++lane_.mtp_offered[static_cast<std::size_t>(j)];
-            if (j < A) { ++lane_.mtp_taken[static_cast<std::size_t>(j)]; }
+            ++L().mtp_offered[static_cast<std::size_t>(j)];
+            if (j < A) { ++L().mtp_taken[static_cast<std::size_t>(j)]; }
         }
         for (std::int32_t j = 0; j < K && j <= A; ++j) {
-            double& a = lane_.mtp_accept[static_cast<std::size_t>(j)];
+            double& a = L().mtp_accept[static_cast<std::size_t>(j)];
             a         = (1.0 - kAcceptanceWeight) * a + kAcceptanceWeight * (j < A ? 1.0 : 0.0);
         }
         ++verify_rounds_[static_cast<std::size_t>(W)];
-        pending_count_ = L;
+        pending_count_ = LC;
         round_width_   = W;
         deferred_      = true; // the round's cache update runs at commit
         pending_       = ++transaction_;
-        lane_.phase    = Phase::Pending;
+        L().phase    = Phase::Pending;
         timing.submit_host_ns = elapsed_ns(start) - timing.device_wait_ns;
-        lane_.decode_ns += elapsed_ns(start);
+        L().decode_ns += elapsed_ns(start);
         ++decode_rounds_;
         return ContractAccess::make_speculative(this, pending_, row,
-                                                {pending_tokens_.data(), static_cast<std::size_t>(W)}, L,
+                                                {pending_tokens_.data(), static_cast<std::size_t>(W)}, LC,
                                                 static_cast<std::uint32_t>(W), timing);
     }
 
     // The row's sampling config on the device (acceptance reads it), without a grammar mask.
     void install_round_config() {
         auto* host_config = static_cast<ops::SamplingConfig*>(config_host_.data());
-        *host_config      = lane_.sampling;
+        *host_config      = L().sampling;
         upload_pinned(configs_, host_config, sizeof(ops::SamplingConfig), device_.stream);
     }
 
@@ -3368,13 +4041,13 @@ private:
         const auto& sp       = plan_.spec;
         auto* words          = spec_words_host();
         for (std::int32_t j = 0; j < k; ++j) {
-            words[sp.w_mtp_ids + j] = lane_.history[static_cast<std::size_t>(S + j + 1)];
+            words[sp.w_mtp_ids + j] = L().history[static_cast<std::size_t>(S + j + 1)];
         }
         upload_pinned(spec_words_device() + sp.w_mtp_ids, words + sp.w_mtp_ids, 4ULL * k, s);
         const auto& io = plan_.io;
         auto* base     = static_cast<std::byte*>(io_device_.p);
         const auto w   = static_cast<std::size_t>(k);
-        replay(catch_graphs_.at(w), catch_execs_.at(w), catch_runs_.at(w), [&] {
+        replay(G().catch_graphs.at(w), G().catch_execs.at(w), G().catch_runs.at(w), [&] {
             // The round's positions and RoPE words are the call's own (positions S..S+W-1); a
             // k-column view of them is valid for k <= W.
             execution::MtpCall call;
@@ -3386,11 +4059,11 @@ private:
             call.tail             = mtp_tail_;
             call.kv_only          = true;
             forward_->run_mtp(call);
-            CUDA_CHECK(cudaMemcpyAsync(spec_base() + sp.saved,
+            CUDA_CHECK(cudaMemcpyAsync(saved_residual().data,
                                        spec_base() + sp.residuals + 2ULL * c_.residual_width() * (k - 1),
                                        2ULL * c_.residual_width(), cudaMemcpyDeviceToDevice, s));
         });
-        lane_.mtp_cells = static_cast<std::uint32_t>(S + k);
+        L().mtp_cells = static_cast<std::uint32_t>(S + k);
     }
 
 
@@ -3400,7 +4073,7 @@ private:
     CommitResult commit_verified(const runtime::CommitDecision& d, bool constraint_failed) {
         const cudaStream_t s = device_.stream;
         const auto& sp       = plan_.spec;
-        const std::int32_t W = round_width_, S = static_cast<std::int32_t>(lane_.state_tokens);
+        const std::int32_t W = round_width_, S = static_cast<std::int32_t>(L().state_tokens);
         CommitResult out;
         out.row_count = 1;
         round_width_  = 1;
@@ -3423,13 +4096,13 @@ private:
             release_lane();
             throw std::logic_error("Qwen3.8-Flash-Next: commit exceeds the licensed tokens");
         }
-        if (lane_.history.size() == lane_.prompt_tokens) {
-            lane_.first_token_seconds = std::chrono::duration<double>(Clock::now() - lane_.admitted).count();
-            lane_.cache_at_decode     = residency_->stats();
-            lane_.ngram_at_decode     = volume_.counters();
+        if (L().history.size() == L().prompt_tokens) {
+            L().first_token_seconds = std::chrono::duration<double>(Clock::now() - L().admitted).count();
+            L().cache_at_decode     = residency_->stats();
+            L().ngram_at_decode     = volume_.counters();
         }
-        for (std::int32_t j = 0; j < k; ++j) { lane_.history.push_back(pending_tokens_[static_cast<std::size_t>(j)]); }
-        lane_.state_tokens += static_cast<std::uint32_t>(k);
+        for (std::int32_t j = 0; j < k; ++j) { L().history.push_back(pending_tokens_[static_cast<std::size_t>(j)]); }
+        L().state_tokens += static_cast<std::uint32_t>(k);
         auto* words         = spec_words_host();
         words[sp.w_commit]  = k;
         upload_pinned(spec_words_device() + sp.w_commit, words + sp.w_commit, 4, s);
@@ -3441,7 +4114,7 @@ private:
         Tensor tail0(tails_base_, DType::BF16, {dim(c_.qsa.index_head_dim), dim(c_.qsa.compress_ratio) - 1});
         ops::qsa_commit_tails(Tensor(spec_base() + sp.qsa_keys, DType::BF16,
                                      {dim(c_.qsa.index_head_dim), W, dim(c_.attention_layers)}),
-                              positions, commit, tail0, static_cast<std::int64_t>(align(plan_.tail)), s);
+                              positions, commit, tail0, static_cast<std::int64_t>(tail_layer_stride_), s);
         ops::ple_conv_commit(Tensor(spec_base() + sp.ple, DType::BF16, {dim(c_.residual_width()), W, 1}), commit,
                              ple_state_, ple_slot_, s);
         // The catch-up's RoPE words: the committed cells' positions, [k, 3] axis-major over the
@@ -3449,10 +4122,10 @@ private:
         // its own.
         auto* host = static_cast<std::byte*>(io_host_.data());
         auto* rope = reinterpret_cast<std::int32_t*>(host + plan_.io.rope);
-        stage_rope(lane_.rope, static_cast<std::uint32_t>(S), k, std::span<std::int32_t>(rope, 3ULL * k), k, 0);
+        stage_rope(L().rope, static_cast<std::uint32_t>(S), k, std::span<std::int32_t>(rope, 3ULL * k), k, 0);
         upload_pinned(base + plan_.io.rope, rope, 12ULL * k, s);
         mtp_catch_up(S, k);
-        lane_.phase = d.terminal ? Phase::Finishable : Phase::Decode;
+        L().phase = d.terminal ? Phase::Finishable : Phase::Decode;
         out.rows[0].disposition = d.terminal ? runtime::CommitDisposition::Finishable : runtime::CommitDisposition::Active;
         out.rows[0].timings     = timings();
         out.rows[0].speculative = speculative_stats();
@@ -3462,7 +4135,7 @@ private:
     }
 
     SpeculativeStats speculative_stats() const {
-        SpeculativeStats out = lane_.speculative;
+        SpeculativeStats out = L().speculative;
         out.backend          = plan_.drafts > 0 ? SpeculativeBackend::Mtp : SpeculativeBackend::None;
         out.enabled          = plan_.drafts > 0;
         out.draft_window     = static_cast<std::uint32_t>(plan_.drafts);
@@ -3471,7 +4144,7 @@ private:
 
     CommitRowResult::SpeculativeCounters speculative_counters() const {
         if (plan_.drafts == 0) { return {}; }
-        const auto& s = lane_.speculative;
+        const auto& s = L().speculative;
         return {s.rounds, s.drafted_tokens, s.accepted_tokens, s.fallback_steps};
     }
 
@@ -3498,8 +4171,9 @@ private:
     void settle_round(std::int32_t columns = 1, std::int32_t tokens = 1) {
         if (!deferred_) { return; }
         deferred_ = false;
+        // No promotion while another prompt's frames are lent (see advance_prefill).
         residency_->after_round(device_.stream, columns,
-                                tokens > 0 ? decode_budget(static_cast<std::uint32_t>(tokens)) : 0);
+                                tokens > 0 && !any_lease() ? decode_budget(static_cast<std::uint32_t>(tokens)) : 0);
         apply_vram_target(false);
     }
 
@@ -3522,9 +4196,11 @@ private:
     // At a boundary (no round in flight; `idle`: no request active): resizes the expert cache to
     // the VRAM control law's decision.
     void apply_vram_target(bool idle) {
+        // Idle means no request at all: another lane's request is still running.
+        for (std::uint32_t lane = 0; lane < plan_.lanes && idle; ++lane) { idle = lanes_[lane].phase == Phase::Free; }
         // The pool does not resize while lent: the wide-call lease, or the image handoff that
         // stays lent across the prompt's prefill calls (resize would move or free its frames).
-        if (!control_ || !monitor_ || lease_.valid() || lane_.vision_lease.valid()) { return; }
+        if (!control_ || !monitor_ || any_lease()) { return; }
         const double now = std::chrono::duration<double>(Clock::now() - vram_epoch_).count();
         const auto d     = control_->decide(monitor_->latest(), pool_now_, frames_now_, now, idle);
         if (d.frames == frames_now_) { return; }
@@ -3631,9 +4307,9 @@ private:
     // free memory meanwhile, cuMemSetAccess failed with CUDA_ERROR_NOT_READY.
     void ensure_kv(std::uint32_t need) {
         if (!kv_vmm_) { return; }
-        need = std::min(need, plan_.pages);
+        need = std::min(need, plan_.pool_pages);
         std::uint32_t target = std::max(plan_.base_pages, (need + kKvGrowPages - 1) / kKvGrowPages * kKvGrowPages);
-        target               = std::min(target, plan_.pages);
+        target               = std::min(target, plan_.pool_pages);
         if (target == backed_pages_) { return; }
         device_.synchronize();
         residency_->drain(device_.stream);
@@ -3751,9 +4427,9 @@ private:
                       "backed (grows to %.0f MiB from the frames)",
                       residency_->frames(), static_cast<double>(residency_->frames()) * plan_.frame_stride / gib,
                       100.0 * residency_->frames() / (c_.num_hidden_layers * c_.moe.experts),
-                      c_.num_hidden_layers * c_.moe.experts, plan_.pages * kPagedKVPageSize,
+                      c_.num_hidden_layers * c_.moe.experts, plan_.pool_pages * kPagedKVPageSize,
                       static_cast<double>(kv_vmm_ ? kv_vmm_->mapped_bytes() : kv_backing_.bytes) / (1 << 20),
-                      static_cast<double>(plan_.kv.mapped_bytes(plan_.pages)) / (1 << 20));
+                      static_cast<double>(plan_.kv.mapped_bytes(plan_.pool_pages)) / (1 << 20));
         diagnostic(line);
         diagnostic(sizing_.describe());
     }
@@ -3763,15 +4439,15 @@ private:
         try {
             if (plan_.drafts > 0) {
                 // The request's speculation: rounds, acceptance, and acceptance at each draft position.
-                const auto& sp = lane_.speculative;
+                const auto& sp = L().speculative;
                 std::string per;
                 for (std::size_t j = 0; j < static_cast<std::size_t>(plan_.drafts); ++j) {
                     // Of the rounds that drafted position j + 1: offered, and the share accepted.
                     char item[64];
                     std::snprintf(item, sizeof(item), "%s%llu:%.1f%%", j ? " " : "",
-                                  static_cast<unsigned long long>(lane_.mtp_offered[j]),
-                                  lane_.mtp_offered[j] ? 100.0 * static_cast<double>(lane_.mtp_taken[j]) /
-                                                             static_cast<double>(lane_.mtp_offered[j])
+                                  static_cast<unsigned long long>(L().mtp_offered[j]),
+                                  L().mtp_offered[j] ? 100.0 * static_cast<double>(L().mtp_taken[j]) /
+                                                             static_cast<double>(L().mtp_offered[j])
                                                        : 0.0);
                     per += item;
                 }
@@ -3792,14 +4468,14 @@ private:
                 diagnostic(line);
             }
             const auto& s = residency_->stats();
-            const auto& a = lane_.cache_at_admission;
+            const auto& a = L().cache_at_admission;
             const auto n  = volume_.counters();
-            const auto& m = lane_.ngram_at_admission;
+            const auto& m = L().ngram_at_admission;
             const std::uint64_t routed = s.routed - a.routed, hits = s.hits - a.hits;
-            const auto& d = lane_.cache_at_decode;
+            const auto& d = L().cache_at_decode;
             const std::uint64_t decode_routed = s.routed - d.routed, decode_hits = s.hits - d.hits;
             const std::uint32_t generated =
-                lane_.history.size() > lane_.prompt_tokens ? static_cast<std::uint32_t>(lane_.history.size() - lane_.prompt_tokens) : 0;
+                L().history.size() > L().prompt_tokens ? static_cast<std::uint32_t>(L().history.size() - L().prompt_tokens) : 0;
             std::size_t free_vram = 0, total_vram = 0;
             if (cudaMemGetInfo(&free_vram, &total_vram) != cudaSuccess) { free_vram = 0; }
             char text[640];
@@ -3808,8 +4484,8 @@ private:
                           "cache %u frames, %.1f%% of %llu routed experts hit, %llu promotions; decode %.1f%% of %llu hit, "
                           "%llu promotions; since start %.1f%%; n-gram rows %llu (%llu cached, %llu block reads, %.2f s; "
                           "decode %llu block reads, %.2f s); VRAM free %zu MiB",
-                          lane_.prompt_tokens, generated, seconds(lane_.prefill_ns), seconds(lane_.decode_ns),
-                          lane_.decode_ns ? (generated > 1 ? (generated - 1) / seconds(lane_.decode_ns) : 0.0) : 0.0,
+                          L().prompt_tokens, generated, seconds(L().prefill_ns), seconds(L().decode_ns),
+                          L().decode_ns ? (generated > 1 ? (generated - 1) / seconds(L().decode_ns) : 0.0) : 0.0,
                           residency_->frames(), routed ? 100.0 * static_cast<double>(hits) / static_cast<double>(routed) : 0.0,
                           static_cast<unsigned long long>(routed),
                           static_cast<unsigned long long>(s.promotions - a.promotions),
@@ -3819,8 +4495,8 @@ private:
                           s.routed ? 100.0 * static_cast<double>(s.hits) / static_cast<double>(s.routed) : 0.0,
                           static_cast<unsigned long long>(n.rows - m.rows), static_cast<unsigned long long>(n.hits - m.hits),
                           static_cast<unsigned long long>(n.reads - m.reads), seconds(n.read_ns - m.read_ns),
-                          static_cast<unsigned long long>(n.reads - lane_.ngram_at_decode.reads),
-                          seconds(n.read_ns - lane_.ngram_at_decode.read_ns), free_vram >> 20);
+                          static_cast<unsigned long long>(n.reads - L().ngram_at_decode.reads),
+                          seconds(n.read_ns - L().ngram_at_decode.read_ns), free_vram >> 20);
             diagnostic(text);
             if (stream_ && leases_ != 0) {
                 const auto& st = stream_->stats();
@@ -3867,6 +4543,7 @@ private:
     PinnedHostBuffer mask_host_{1};
     PinnedHostBuffer config_host_{1};
     Tensor logits32_, logits16_, sampled_, sample_position_, token_counts_;
+    Tensor lane_logits_; // BF16 [V, lanes]: each lane's last prefill call's logits (checkpoints, exact hits)
     ops::SamplingConfig* configs_ = nullptr;
     std::uint32_t* masks_         = nullptr;
     std::unique_ptr<WorkspaceArena> work_;
@@ -3886,29 +4563,53 @@ private:
     // The next prefill call's n-gram rows, read while the device runs the current one.
     PinnedHostBuffer ngram_next_{1};
     std::int32_t next_begin_ = -1, next_width_ = 0;
-    DecodeGraphDefinition front_graph_, back_graph_;
-    DecodeGraphExecutable front_exec_, back_exec_;
+    std::uint32_t next_lane_ = 0; // the lane whose call the prefetched rows are for
+    // Wide prefill's lease belongs to one lane (the one whose prompt it is sized for).
+    std::uint32_t lease_owner_ = 0;
+    // The CUDA graphs of a lane: each captures the addresses of its lane's state and KV, so every
+    // lane has its own set; the plain round over several rows has one pair.
+    struct LaneGraphs {
+        DecodeGraphDefinition front_graph, back_graph;
+        DecodeGraphExecutable front_exec, back_exec;
+        std::uint64_t front_runs = 0, back_runs = 0;
+        std::vector<std::optional<ops::GdnReplayFoldPlan>> folds;
+        std::vector<DecodeGraphDefinition> verify_front, verify_back, draft_graphs, catch_graphs, row_catch_graphs;
+        std::vector<DecodeGraphExecutable> verify_front_exec, verify_back_exec, draft_execs, catch_execs, row_catch_execs;
+        std::vector<std::uint64_t> verify_runs, verify_back_runs, draft_runs, catch_runs, row_catch_runs;
+    };
+    std::vector<LaneGraphs> lane_graphs_;
+    LaneGraphs& G() noexcept { return lane_graphs_[cur_]; }
+    DecodeGraphDefinition rows_front_graph_, rows_back_graph_;
+    DecodeGraphExecutable rows_front_exec_, rows_back_exec_;
+    std::uint64_t rows_front_runs_ = 0, rows_back_runs_ = 0;
     // MTP speculation (see the MTP section).
     DeviceBuffer spec_backing_;
     PinnedHostBuffer spec_host_{1};
     Tensor mtp_tail_, ple_state_, ple_slot_;
     void* tails_base_ = nullptr;
+    std::size_t tail_layer_stride_ = 0; // bytes between one layer's tail and the next, of one lane
     std::optional<execution::MtpChunk> mtp_chunk_;
     // The staged call's image columns and its drafter cells' (per sub-chunk).
     execution::VisionInput vision_input_;
     const execution::VisionInput* call_vision_ = nullptr;
     std::vector<execution::VisionInput> mtp_vision_inputs_;
     std::vector<std::optional<GdnReplayRecords>> records_;
-    std::vector<std::optional<ops::GdnReplayFoldPlan>> folds_;
-    std::vector<DecodeGraphDefinition> verify_front_, verify_back_, draft_graphs_, catch_graphs_;
-    std::vector<DecodeGraphExecutable> verify_front_exec_, verify_back_exec_, draft_execs_, catch_execs_;
-    std::vector<std::uint64_t> verify_runs_, verify_back_runs_, draft_runs_, catch_runs_;
     std::vector<TokenId> pending_tokens_, drafts_;
     std::int32_t pending_count_ = 0, round_width_ = 1;
     bool plain_round_           = false;
     std::array<std::uint64_t, 9> verify_rounds_{};
 
-    Lane lane_;
+    // The lanes and the one the single-lane helpers act on (select_lane).
+    std::array<Lane, kMaximumLanes> lanes_;
+    std::uint32_t cur_         = 0;
+    Lane& L() noexcept { return lanes_[cur_]; }
+    const Lane& L() const noexcept { return lanes_[cur_]; }
+    // The forward's state views (slot axis last), the drafter's tails, each pool page's use.
+    execution::ForwardRowsState state_;
+    Tensor mtp_tails_;
+    std::vector<std::uint8_t> page_used_;
+    // The lane a context transaction (a binding or a capture) belongs to.
+    std::uint32_t tx_lane_ = 0;
     std::uint64_t epoch_       = 0;
     // The open context transaction: a binding (until its restore is polled) or a capture (until
     // its checkpoints are published).
@@ -3917,8 +4618,13 @@ private:
     std::uint64_t pending_     = 0; // the open pending transaction, 0 when none
     std::uint64_t transaction_ = 0;
     TokenId pending_token_     = 0;
+    // A plain round over several rows: its lanes (row order), their sampled tokens and whether each
+    // row's drafter takes the round's cell at commit.
+    std::array<std::uint32_t, kMaximumLanes> round_lanes_{};
+    std::array<TokenId, kMaximumLanes> round_tokens_{};
+    std::array<bool, kMaximumLanes> round_catch_up_{};
     bool deferred_             = false; // a decode round's cache update awaits its commit
-    std::uint64_t decode_rounds_ = 0;
+    std::uint64_t decode_rounds_ = 0, rows_rounds_ = 0;
     std::uint64_t budget_tokens_ = 0;
     std::vector<std::int32_t> ngram_window_;
     std::vector<std::uint32_t> row_ids_;

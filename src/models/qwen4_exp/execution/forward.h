@@ -200,6 +200,15 @@ struct ForwardRowsKV {
     std::uint32_t max_visible_keys = 0;   // the context each slot's KV and selection are sized for
 };
 
+// The MTP drafter's layer and state over the same slots: one more attention layer through each
+// slot's block table (`kv`'s own table is unused), and one index-key tail per slot.
+struct ForwardRowsMtp {
+    PagedKVLayerView kv;
+    Tensor pooled; // BF16 [Di / R, 64, 1, pool pages]
+    Tensor tails;  // BF16 [Di, R - 1, slots]
+    Tensor ones;   // FP32 [S, columns] of 1
+};
+
 // One plain decode call over B rows: column b is the next token of slot slots[b]. Tensors are
 // device memory at addresses that may be captured in a CUDA graph.
 struct ForwardRowsBatch {
@@ -211,6 +220,7 @@ struct ForwardRowsBatch {
     Tensor row_rope;                 // I32 [3, B]: column b's three RoPE axes, contiguous at word 3 b
     Tensor block_start_rope;         // I32 [3, B]: each row's pooled-block start (ops::qsa_pool_keys)
     Tensor ngram_rows;               // U8 [row bytes, heads, B]: each column's n-gram rows
+    Tensor residual_out;             // when set: BF16 [S*H, B], the final residual (the drafter's input)
 };
 
 // Optional observation of every block, for reference comparison: BF16 copies per block of the
@@ -230,15 +240,20 @@ public:
     Forward(const Parameters& parameters, DeviceContext& device, WorkspaceArena& work, ForwardState state,
             ForwardKV kv, ForwardExperts experts, std::optional<ForwardMtp> mtp = std::nullopt);
     // Several sequences: single-sequence calls act on the selected slot (slot 0 at first); run_rows
-    // decodes several slots at once. No MTP drafter.
+    // decodes several slots at once. With the MTP drafter, `mtp` holds its layer over the slots and
+    // select_row also selects the slot's drafter state.
     Forward(const Parameters& parameters, DeviceContext& device, WorkspaceArena& work, ForwardRowsState state,
-            ForwardRowsKV kv, ForwardExperts experts);
+            ForwardRowsKV kv, ForwardExperts experts, std::optional<ForwardRowsMtp> mtp = std::nullopt);
 
     // Several sequences: the slot later single-sequence calls (run, run_front, run_back) act on.
     void select_row(std::int32_t slot);
     // Several sequences: one plain decode call over batch.slots, FP32 logits [V, B] (column b of
     // slot slots[b]). Uses the workspace like a forward call.
     void run_rows(const ForwardRowsBatch& batch, Tensor& logits);
+    // The same call in two parts, like run_front / run_back: the front runs the embedding and the
+    // layers before rows_layer() (it reads no batch.ngram_rows), the back the rest and the head.
+    void run_rows_front(const ForwardRowsBatch& batch);
+    void run_rows_back(const ForwardRowsBatch& batch, Tensor& logits);
 
     // Runs one call of the MTP drafter (requires its parameters and ForwardMtp). Uses the
     // workspace like a forward call (not between run_front and run_back).
@@ -309,6 +324,7 @@ private:
         ForwardRowsKV kv;
         std::vector<ForwardState> slot_state;
         std::vector<ForwardKV> slot_kv;
+        std::vector<ForwardMtp> slot_mtp; // empty without the drafter
     };
     std::optional<Rows> rows_;
 };
