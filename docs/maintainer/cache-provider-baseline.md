@@ -100,7 +100,7 @@ After the 300 s warm-up:
 | C8, Host 8 GiB | 71 | 0.886 | 0.940 | 65 / 6 / 0 | 1.05 / 12.7 / 19.9 | 0.04 / 3.21 | 0.09 |
 | C8, Host 16 GiB | 71 | 0.886 | 0.940 | 65 / 6 / 0 | 1.10 / 11.4 / 19.3 | 0.02 / 4.71 | 0.08 |
 | C4, Host 8 GiB | 70 | 0.882 | 0.939 | 63 / 7 / 0 | 1.22 / 10.9 / 19.7 | 0.04 / 5.63 | 0.14 |
-| C4, Host 2 GiB | @@C4H2@@ |
+| C4, Host 2 GiB | 67 | 0.750 | 0.940 | 43 / 22 / 2 | 4.32 / 19.4 / 25.1 | 0.04 / 8.84 | 0.21 |
 
 Tokens an ideal cache would have saved, by cause (requests in brackets):
 
@@ -110,7 +110,7 @@ Tokens an ideal cache would have saved, by cause (requests in brackets):
 | C8, 8 GiB | 106,125 (6) | 0 | 0 | 0 | 0 |
 | C8, 16 GiB | 106,121 (6) | 0 | 0 | 0 | 0 |
 | C4, 8 GiB | 109,856 (7) | 0 | 0 | 0 | 0 |
-@@C4H2_LOSS@@
+| C4, 2 GiB | 160,261 (7) | 0 | 124,205 (12) | 50,769 (4) | 12,658 (1) |
 
 - **TTFT by outcome** (C8, 8 GiB): a private hit p50 0.93 s, p95 5.1 s (n 65); a request that
   reused only the product prompt p50 7.2 s, p95 20.5 s (n 6). At 2 GiB: private 1.12 / 7.9 s (n 36),
@@ -121,8 +121,9 @@ Tokens an ideal cache would have saved, by cause (requests in brackets):
 - **Edits and branches** are the only loss left at 8 GiB or more. Their resume point is an earlier
   turn's endpoint, which the newer turn superseded and reclaim drops first. With little pressure
   (the smoke run) all 16 edits and 14 branches hit. Under these runs' pressure 1-2 of 8 did.
-- **Including warm-up** (all requests): hit 0.698 / 0.814 / 0.814 / 0.811 and TTFT p50 4.2 / 1.4 /
-  1.4 / 1.5 s, p99 53 / 49 / 49 / 42 s for C8-2, C8-8, C8-16 and C4-8 GiB. The tail is the first
+- **Including warm-up** (all requests): hit 0.698 / 0.814 / 0.814 / 0.811 / 0.717 and TTFT p50
+  4.2 / 1.4 / 1.4 / 1.5 / 4.2 s, p99 53 / 49 / 49 / 42 / 42 s for C8-2, C8-8, C8-16, C4-8 and
+  C4-2 GiB. The tail is the first
   request of each conversation, prefilling up to 50K tokens behind the others.
 - **Throughput.** Prefill ran at 2,091-2,141 tok/s while busy. The prompt traffic averaged
   660-1,040 tok/s, so the GPU idled roughly 50-70% of the time. Decode was 4.1-4.4 tok/s of wall
@@ -252,6 +253,7 @@ source (`resource_manager.h`, the #254 workaround). The measurement build counte
 | C8, 8 GiB, store | 37 | 18 | 543 | 14 (5.16 s) | 1 |
 | C8, 8 GiB, thinking | 4 | 1 | 32 | 1 (0.16 s) | 0 |
 | C8, 8 GiB, bursty fan-out | 434 | 181 | 4,719 | 25 (8.82 s) | 0 |
+| C4, 2 GiB | 267 | 56 | 613 | 8 (1.46 s) | 0 |
 @@ALLOC_ROWS@@
 
 **The stall.** In the C8 8 GiB run, from 14:20:20 to 14:20:34, the Engine reported `running 0 |
