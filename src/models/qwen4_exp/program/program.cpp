@@ -211,6 +211,8 @@ constexpr std::chrono::minutes kExpertStateInterval{10};
 // generated tokens, so finish() can capture it when the Host tier is otherwise full; the gather's
 // row and per-block piece sizes for the Host copies.
 constexpr std::uint32_t kEndpointReserveTokens = 2048;
+// Prompt frontiers below this are not captured (see plan_request): about 0.2 s of prefill.
+constexpr std::uint32_t kMinimumCaptureTokens = 512;
 constexpr std::size_t kGatherRow               = 16 * 1024;
 constexpr std::size_t kGatherPiece             = 64 * 1024;
 
@@ -888,7 +890,10 @@ public:
             base->identity     = std::move(identity);
             base->identity_tag = identity_tag_;
             const auto accepts = [&](std::uint32_t frontier) {
-                if (frontier == 0 || frontier > n) { return false; }
+                // A checkpoint costs a 111 MiB state image (and a split prefill call when it falls
+                // inside the prompt) for what it saves: below kMinimumCaptureTokens it saves less
+                // prefill than it costs, so the group is not captured.
+                if (frontier < kMinimumCaptureTokens || frontier > n) { return false; }
                 for (const auto& item : data.vision_items) {
                     if (item.token_spans.empty()) { continue; }
                     const auto begin = item.token_spans.front().begin;
@@ -1136,9 +1141,17 @@ public:
             if (remaining == 0) { return sample_exact_hit(start, masks, out); }
             // The prompt's images first: their frames are lent before the wide calls' lease.
             encode_lane_vision();
-            const bool wide          = wide_ready(remaining);
-            const std::int32_t width = call_span(begin, wide);
-            const bool last          = width == remaining;
+            bool wide          = wide_ready(remaining);
+            std::int32_t width = call_span(begin, wide);
+            // A short call (a capture group's split, or a prompt's short tail) is served by the
+            // static route even while the lease is held: the expert stream copies every
+            // non-resident expert of each layer (~0.8 s per call measured), the static route only
+            // the ones its few columns route to. Same output (the routes are placement invariant).
+            if (wide && width < kStreamMinColumns) {
+                wide  = false;
+                width = call_span(begin, false);
+            }
+            const bool last = width == remaining;
             out.processed_prompt_tokens = static_cast<std::uint32_t>(width);
             out.complete                = last;
             run_call(begin, width, wide);

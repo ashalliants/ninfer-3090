@@ -428,7 +428,13 @@ int bench(const std::string& artifact, const std::vector<std::string>& args) {
 // repeat of turn 1 and turn 2 must resume past the image (reused tokens beyond it, no encode) and
 // produce the cold run's ids.
 int cache_check(const std::string& artifact, bool mtp, std::uint32_t tokens, std::uint32_t max_context) {
-    const Case chart = cases()[0];
+    // The chart after ~1,000 tokens of text: prompts shorter than 512 tokens are not captured.
+    Case chart = cases()[0];
+    std::string preface = "Background notes before the image:";
+    for (int i = 0; i < 80; ++i) {
+        preface += " Note " + std::to_string(i) + ": the chart series were sampled weekly and checked twice.";
+    }
+    chart.question = preface + "\n" + chart.question;
     const auto request = [&] {
         RequestOptions r                     = greedy(tokens);
         r.execution.allow_prefix_reuse       = true;
