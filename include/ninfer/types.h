@@ -1419,6 +1419,9 @@ struct RuntimeStats {
     std::uint64_t context_store_hydrated_tokens    = 0;
     std::uint64_t context_store_hydration_failures = 0;
     double context_store_hydration_seconds         = 0.0;
+    // The rate the cost model currently assumes for reading a stored image back into the Host tier
+    // (store read and import), learned from the reads observed so far; prices every hydration.
+    double context_store_read_bytes_per_second = 0.0;
     // With a remote: images only the remote holds, objects and bytes moved, and failures.
     std::uint64_t context_store_remote_images            = 0;
     std::uint64_t context_store_remote_uploads           = 0;

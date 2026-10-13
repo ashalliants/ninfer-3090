@@ -24,6 +24,8 @@ constexpr std::uint32_t kManifestVersion = 1;
 constexpr std::uint32_t kMaximumChunksPerImage = 1U << 20U;
 constexpr std::uint32_t kMaximumCheckpoints    = 1024;
 constexpr std::uint32_t kMaximumSegments       = 1U << 16U;
+// Threads that read and verify the chunks of one image (load).
+constexpr std::size_t kLoadThreads = 8;
 
 // xxHash64 (Yann Collet, BSD-2-Clause), little-endian hosts. Two independently seeded passes give
 // the 128-bit chunk name. This is a content address for trusted local files, not a security
@@ -795,37 +797,64 @@ std::optional<std::vector<std::uint8_t>> ContextStore::load(const std::string& i
                 return std::nullopt;
             };
             if (!read_manifest(manifest_path(id), entry, &segments)) { return fail(); }
-            std::vector<std::uint8_t> image(static_cast<std::size_t>(entry.info.image_bytes));
+            const auto image_bytes = static_cast<std::size_t>(entry.info.image_bytes);
+            std::vector<std::uint8_t> image(image_bytes);
+            std::uint8_t* const buffer = image.data();
+            struct Piece {
+                const ChunkRef* chunk;
+                std::size_t position;
+            };
+            std::vector<Piece> pieces;
             std::size_t position = 0;
-            bool intact          = true;
             for (const Segment& segment : segments) {
                 if (!segment.chunked) {
-                    std::memcpy(image.data() + position, segment.inline_bytes.data(),
+                    if (segment.inline_bytes.size() > image_bytes - position) { return fail(); }
+                    std::memcpy(buffer + position, segment.inline_bytes.data(),
                                 segment.inline_bytes.size());
                     position += segment.inline_bytes.size();
                     continue;
                 }
                 for (const ChunkRef& chunk : segment.chunks) {
-                    std::ifstream file(chunk_path(chunk.hash), std::ios::binary);
-                    if (!file ||
-                        !file.read(reinterpret_cast<char*>(image.data() + position), chunk.length) ||
-                        hash(std::span<const std::uint8_t>(image.data() + position, chunk.length)) !=
-                            chunk.hash) {
-                        if (options_.remote && pass == 0) {
-                            // Keep reading: every damaged chunk is discarded and fetched again
-                            // together, so one bad chunk does not leave the next to fail the retry.
-                            damaged.push_back(chunk);
-                            intact = false;
-                            position += chunk.length;
-                            continue;
-                        }
-                        return fail();
-                    }
+                    if (chunk.length > image_bytes - position) { return fail(); }
+                    pieces.push_back({&chunk, position});
                     position += chunk.length;
                 }
             }
+            if (position != image_bytes) { return fail(); }
+            // Reading and verifying a chunk is independent of every other chunk; one thread is
+            // bound by hashing and page faults at well under the drive's sequential rate, so the
+            // chunks are read by several.
+            std::atomic<std::size_t> next{0};
+            std::mutex damage_mutex;
+            const auto read_pieces = [&] {
+                for (std::size_t index = next++; index < pieces.size(); index = next++) {
+                    const Piece& piece = pieces[index];
+                    std::ifstream file(chunk_path(piece.chunk->hash), std::ios::binary);
+                    if (!file ||
+                        !file.read(reinterpret_cast<char*>(buffer + piece.position),
+                                   piece.chunk->length) ||
+                        hash(std::span<const std::uint8_t>(buffer + piece.position,
+                                                           piece.chunk->length)) !=
+                            piece.chunk->hash) {
+                        std::scoped_lock damage(damage_mutex);
+                        damaged.push_back(*piece.chunk);
+                    }
+                }
+            };
+            const std::size_t threads =
+                std::min<std::size_t>({pieces.size(), kLoadThreads,
+                                       std::max(1U, std::thread::hardware_concurrency())});
+            std::vector<std::thread> readers;
+            try {
+                for (std::size_t t = 1; t < threads; ++t) { readers.emplace_back(read_pieces); }
+            } catch (...) {} // fewer threads: the calling thread still reads every piece
+            read_pieces();
+            for (auto& reader : readers) { reader.join(); }
+            // Every damaged chunk is discarded and fetched again together (with a remote), so one
+            // bad chunk does not leave the next to fail the retry.
+            const bool intact = damaged.empty();
+            if (!intact && !(options_.remote && pass == 0)) { return fail(); }
             if (intact) {
-                if (position != image.size()) { return fail(); }
                 if (touch) {
                     std::scoped_lock lock(mutex_);
                     const auto found = entries_.find(id);

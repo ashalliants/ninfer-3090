@@ -39,15 +39,29 @@ struct ContextPrefillCost {
                                                    ContextPrefillCost) noexcept = default;
 };
 
+// Reading one stored checkpoint image back from the durable context store into the Host tier:
+// the store's read and chunk verification, and the import copy. A property of the store's volume
+// and the host CPU, not of the GPU, so it is not part of the per-hardware presets: it starts from
+// this default (measured on an RTX 3090 host's NVMe, docs/performance.md "Context store") and the
+// Engine refines it from the reads it observes.
+inline constexpr ContextTransferCost kDefaultStoreReadCost{
+    .batch_ns = 5'000'000, .operation_ns = 0, .ns_per_byte_q32 = 1ULL << 32U}; // 1 GB/s
+
 struct ContextMachineCostModel {
     // Direction order is DeviceToHost, HostToDevice, DeviceToDevice.
     std::array<ContextTransferCost, 3> transfer{};
     ContextPrefillCost prefill;
+    ContextTransferCost store_read = kDefaultStoreReadCost;
 
     // max(batch + copy_operations * operation, payload_bytes * ns_per_byte)
     [[nodiscard]] std::uint64_t transfer_ns(ContextTransferDirection direction,
                                             TransferWork work) const noexcept;
     [[nodiscard]] std::uint64_t prefill_ns(PrefillWork work) const noexcept;
+    // batch + image_bytes * ns_per_byte
+    [[nodiscard]] std::uint64_t store_read_ns(std::uint64_t image_bytes) const noexcept;
+    // Folds one observed read (image bytes, wall nanoseconds for read and import) into the
+    // per-byte rate, weighting the newest observation by a quarter.
+    void observe_store_read(std::uint64_t image_bytes, std::uint64_t nanoseconds) noexcept;
 
     [[nodiscard]] friend constexpr bool
     operator==(const ContextMachineCostModel&, const ContextMachineCostModel&) noexcept = default;

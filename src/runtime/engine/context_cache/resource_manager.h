@@ -84,6 +84,29 @@ public:
         return costs_.prefill_ns(work);
     }
 
+    // The ranking cost of a prepared source: its transfers plus the prefill it leaves.
+    [[nodiscard]] std::uint64_t source_cost_ns(const Source& source) const noexcept {
+        const auto transfer = price_context_transfer_requirements(costs_, source.transfers);
+        const auto prefill  = costs_.prefill_ns(source.remaining_work);
+        return transfer > UINT64_MAX - prefill ? UINT64_MAX : transfer + prefill;
+    }
+
+    // Reading a stored image of `image_bytes` back into the Host tier and copying it to the
+    // device: what resuming from the durable store costs before the prefill it leaves.
+    [[nodiscard]] std::uint64_t store_restore_ns(std::uint64_t image_bytes) const noexcept {
+        const auto read   = costs_.store_read_ns(image_bytes);
+        const auto upload = costs_.transfer_ns(
+            ContextTransferDirection::HostToDevice,
+            TransferWork{.payload_bytes = image_bytes, .copy_operations = 1});
+        return read > UINT64_MAX - upload ? UINT64_MAX : read + upload;
+    }
+
+    void observe_store_read(std::uint64_t image_bytes, std::uint64_t nanoseconds) noexcept {
+        costs_.observe_store_read(image_bytes, nanoseconds);
+    }
+
+    [[nodiscard]] const ContextMachineCostModel& costs() const noexcept { return costs_; }
+
     [[nodiscard]] std::vector<SourceChoice>
     candidates(Program& program, const Base& base, std::uint32_t maximum_frontier = UINT32_MAX,
                std::optional<OwnerToken> own_resume = std::nullopt, std::uint64_t request = 0,
@@ -131,11 +154,7 @@ public:
         }
         std::erase_if(
             result, [&](auto& choice) { return !prepare_source(program, base, choice, request); });
-        const auto cost = [&](const Source& source) {
-            const auto transfer = price_context_transfer_requirements(costs_, source.transfers);
-            const auto prefill  = costs_.prefill_ns(source.remaining_work);
-            return transfer > UINT64_MAX - prefill ? UINT64_MAX : transfer + prefill;
-        };
+        const auto cost = [&](const Source& source) { return source_cost_ns(source); };
         const auto bytes = [](const Source& source) {
             std::uint64_t total = 0;
             for (const auto& transfer : source.transfers) {

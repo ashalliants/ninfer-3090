@@ -404,9 +404,16 @@ conversation exactly as it would have before the restart, restoring it from the 
 GPU like any other Host-resident checkpoint. There is nothing for a supervisor or gateway to call.
 
 The store is also read while the server runs. When a request is about to be admitted and the store
-holds a checkpoint of that very prompt at least 4,096 tokens deeper than the deepest checkpoint the
-cache offers it (the conversation was evicted since), a background reader loads the image while the
-request waits, out of the admission order but without holding up other requests, for at most
+holds a checkpoint of that very prompt deeper than the deepest checkpoint the cache offers it (the
+conversation was evicted since), and reading that image back, copying it to the GPU and prefilling
+the rest is cheaper than the best start the cache offers, a background reader loads the image while
+the request waits. The context cost model prices all three: the prefill and copy terms are the
+calibrated ones the cache already ranks its own sources by, and the read is a fixed 5 ms plus the
+image size at a rate that starts at 1 GB/s and is refined from every read the server makes (at
+start-up and for requests), so a slow or a fast store volume is priced as it is
+(`ninfer_context_store_read_bytes_per_second` shows the rate in use). A short gain on a large image
+is therefore prefilled, and a long one is read back however deep the cache's own start is. The
+reader runs out of the admission order but without holding up other requests, for at most
 `--context-store-restore-seconds` or the request's queue deadline. The image is then rebuilt in the
 Host tier, giving up the cache's lowest-ranked Host contents if it needs the room (never another
 waiting request's chosen source), and the request resumes from it instead of prefilling the
@@ -570,6 +577,7 @@ server restarts.
 | `ninfer_context_store_evicted_total`, `_corrupt_total` | sessions removed for space, age or supersession, and because they could not be read back intact |
 | `ninfer_context_store_restored_sessions`, `_restored_bytes`, `_restore_seconds` | gauges: what start-up restored into the cache, and how long it took |
 | `ninfer_context_store_hydrations_total`, `_hydrated_tokens_total`, `_hydration_failures_total`, `_hydration_seconds_total` | stored sessions read back for a request, the prompt tokens that saved, failures (the request was prefilled, or its admission did not use what was read) and the time requests waited for the reads, failed ones included |
+| `ninfer_context_store_read_bytes_per_second` | gauge: the store read rate (read, verification and import into the Host tier) the cost model prices hydrations with, learned from the reads so far; 1 GB/s until the first read of at least 64 MiB |
 | `ninfer_context_store_remote_images` | gauge: with a bucket, sessions it holds that the directory does not hold in full |
 | `ninfer_context_store_remote_uploads_total`, `_remote_upload_bytes_total`, `_remote_upload_failures_total` | objects and bytes uploaded to the bucket, and uploads that failed |
 | `ninfer_context_store_remote_downloads_total`, `_remote_download_bytes_total`, `_remote_download_failures_total` | chunks and bytes fetched from the bucket, and listings or fetches that failed or returned damaged data |

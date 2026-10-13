@@ -314,8 +314,49 @@ void test_resolution_and_atomic_upserts() {
 
 } // namespace
 
+// The store read term: a fixed cost plus a per-byte rate, refined from observed reads. A stored
+// image is worth reading back only when this is below the prefill it saves, so the rate must
+// follow the volume it is read from and ignore observations that cannot be a real read.
+void test_store_read_rate() {
+    using ninfer::runtime::ContextMachineCostModel;
+    using ninfer::runtime::kContextCostQ32One;
+    ContextMachineCostModel model;
+    const std::uint64_t gib = std::uint64_t{1} << 30U;
+    // Default: 5 ms + 1 ns per byte.
+    expect(model.store_read_ns(0) == 5'000'000, "the store read has a fixed cost");
+    expect(model.store_read_ns(gib) == 5'000'000 + gib, "the default rate is 1 GB/s");
+
+    // A disk four times slower is reached within a few reads; each moves a quarter of the way.
+    model.observe_store_read(gib, 5'000'000 + 4 * gib);
+    expect(model.store_read.ns_per_byte_q32 == kContextCostQ32One * 7 / 4,
+           "one observation moves the rate a quarter of the way");
+    for (int i = 0; i < 40; ++i) { model.observe_store_read(gib, 5'000'000 + 4 * gib); }
+    const auto slow = model.store_read_ns(gib);
+    expect(slow > 5'000'000 + gib * 399 / 100 && slow <= 5'000'000 + 4 * gib,
+           "repeated observations converge on the observed rate");
+
+    // Small reads (fixed cost dominated) and impossible ones are not observations.
+    const auto before = model.store_read;
+    model.observe_store_read(std::uint64_t{1} << 20U, 1);
+    model.observe_store_read(gib, 1'000);
+    expect(model.store_read == before, "small or faster-than-the-fixed-cost reads are ignored");
+
+    // A sample beyond 50 GB/s or below 20 MB/s is clamped, never zero or unbounded.
+    ContextMachineCostModel fast;
+    for (int i = 0; i < 80; ++i) { fast.observe_store_read(gib, 5'000'001); }
+    expect(fast.store_read.ns_per_byte_q32 > 0 && fast.store_read_ns(gib) >= 5'000'000 + gib / 51,
+           "an implausibly fast read is clamped to 50 GB/s");
+    ContextMachineCostModel stuck;
+    for (int i = 0; i < 80; ++i) {
+        stuck.observe_store_read(gib, std::numeric_limits<std::uint64_t>::max());
+    }
+    expect(stuck.store_read_ns(gib) <= 5'000'000 + 50 * gib,
+           "an implausibly slow read is clamped to 20 MB/s");
+}
+
 int main() {
     test_exact_evaluation();
+    test_store_read_rate();
     test_schema_validation();
     test_resolution_and_atomic_upserts();
     if (failures == 0) { std::cout << "ok\n"; }

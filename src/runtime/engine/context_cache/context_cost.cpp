@@ -360,6 +360,25 @@ std::uint64_t ContextMachineCostModel::prefill_ns(PrefillWork work) const noexce
     return result;
 }
 
+std::uint64_t ContextMachineCostModel::store_read_ns(std::uint64_t image_bytes) const noexcept {
+    return saturating_add(store_read.batch_ns,
+                          q32_product_ns(store_read.ns_per_byte_q32, image_bytes));
+}
+
+void ContextMachineCostModel::observe_store_read(std::uint64_t image_bytes,
+                                                 std::uint64_t nanoseconds) noexcept {
+    // Small reads are dominated by the fixed cost and say little about the rate.
+    constexpr std::uint64_t kMinimumObservedBytes = std::uint64_t{64} << 20U;
+    if (image_bytes < kMinimumObservedBytes || nanoseconds <= store_read.batch_ns) { return; }
+    const long double per_byte =
+        static_cast<long double>(nanoseconds - store_read.batch_ns) / image_bytes;
+    // 0.02-50 ns per byte (50 GB/s to 20 MB/s): anything outside is a clock or accounting fault.
+    const long double bounded = std::clamp<long double>(per_byte, 0.02L, 50.0L);
+    const auto observed = static_cast<std::uint64_t>(bounded * kContextCostQ32One);
+    store_read.ns_per_byte_q32 = store_read.ns_per_byte_q32 - store_read.ns_per_byte_q32 / 4U +
+                                 observed / 4U;
+}
+
 std::uint64_t price_context_transfer_requirements(
     const ContextMachineCostModel& model,
     std::span<const ContextTransferRequirement> requirements) noexcept {

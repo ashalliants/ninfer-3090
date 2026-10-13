@@ -9,3 +9,8 @@ ninfer_add_bench(ninfer_context_cost_bench
 target_include_directories(ninfer_context_cost_bench PRIVATE ${CMAKE_CURRENT_LIST_DIR})
 target_compile_definitions(ninfer_context_cost_bench PRIVATE
   NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+
+# Durable context store put/load throughput (CPU and disk only).
+ninfer_add_bench(ninfer_context_store_bench
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/context_store_bench.cpp"
+  LIBRARIES ninfer_runtime_support)

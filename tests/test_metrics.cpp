@@ -145,6 +145,7 @@ int main() {
     fork.context_store_hydrated_tokens    = 70000;
     fork.context_store_remote_uploads     = 7;
     fork.context_store_remote_images      = 1;
+    fork.context_store_read_bytes_per_second = 2.5e9;
     fork.main_kv_h2d_bytes                = 123456;
     fork.root_selections                  = 7;
     fork.checkpoint_selections            = 31;
@@ -168,7 +169,8 @@ int main() {
               has_line(series, "ninfer_context_store_hydrated_tokens_total 70000") &&
               has_line(series, "ninfer_context_store_hydration_failures_total 0") &&
               has_line(series, "ninfer_context_store_remote_uploads_total 7") &&
-              has_line(series, "ninfer_context_store_remote_images 1"),
+              has_line(series, "ninfer_context_store_remote_images 1") &&
+              has_line(series, "ninfer_context_store_read_bytes_per_second 2500000000"),
           "context store series must be reported");
     check(has_line(series,
                    "ninfer_context_transfer_bytes_total{resource=\"main_kv\",direction=\"h2d\"} "

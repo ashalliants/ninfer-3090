@@ -517,9 +517,14 @@ private:
                 // The payload is nearly all of an image: one larger than the free Host space
                 // cannot fit, and reading it would only spend the budget.
                 if (info.image_bytes > generation.free_host_bytes()) { continue; }
+                const auto read_started = std::chrono::steady_clock::now();
                 std::optional<std::vector<std::uint8_t>> bytes = store->load(info.id, false);
                 if (!bytes) { continue; }
-                if (generation.restore_image(*bytes)) {
+                const auto read_ns = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - read_started)
+                        .count());
+                if (generation.restore_image(*bytes, read_ns)) {
                     store->touch(info.id);
                     ++restored_sessions;
                     restored_bytes += bytes->size();
