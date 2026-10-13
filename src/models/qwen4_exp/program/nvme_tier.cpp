@@ -94,7 +94,8 @@ NvmeTier::NvmeTier(Options options, std::unique_ptr<TierFile> file) : options_(o
         options_.bounce_slabs == 0) {
         throw std::invalid_argument("context cache NVMe tier: bad options");
     }
-    const auto pin = [](Pinned& p, std::size_t bytes) {
+    // `io`: the file reads and writes into it directly, so it must be sector-aligned.
+    const auto pin = [](Pinned& p, std::size_t bytes, bool io) {
         if (bytes == 0) { return; }
         if (cudaHostAlloc(&p.p, bytes, kMappedPinned) != cudaSuccess) {
             (void)cudaGetLastError();
@@ -103,16 +104,18 @@ NvmeTier::NvmeTier(Options options, std::unique_ptr<TierFile> file) : options_(o
         }
         p.bytes = bytes;
         void* mapped = nullptr;
-        if (cudaHostGetDevicePointer(&mapped, p.p, 0) != cudaSuccess || mapped != p.p ||
-            reinterpret_cast<std::uintptr_t>(p.p) % ScratchFile::kAlignment != 0) {
+        if (cudaHostGetDevicePointer(&mapped, p.p, 0) != cudaSuccess || mapped != p.p) {
             (void)cudaGetLastError();
-            throw std::runtime_error("context cache NVMe tier: pinned memory is not identity-mapped and page-aligned");
+            throw std::runtime_error("context cache NVMe tier: pinned memory is not identity-mapped on this device");
+        }
+        if (io && reinterpret_cast<std::uintptr_t>(p.p) % ScratchFile::kAlignment != 0) {
+            throw std::runtime_error("context cache NVMe tier: pinned memory is not 4 KiB-aligned");
         }
     };
     try {
-        pin(frames_memory_, static_cast<std::size_t>(options_.frames) * options_.slab_bytes);
-        pin(bounce_, 2ULL * options_.bounce_slabs * options_.slab_bytes);
-        for (auto& d : descriptors_) { pin(d, 4096 * sizeof(GatherCopy)); }
+        pin(frames_memory_, static_cast<std::size_t>(options_.frames) * options_.slab_bytes, true);
+        pin(bounce_, 2ULL * options_.bounce_slabs * options_.slab_bytes, true);
+        for (auto& d : descriptors_) { pin(d, 4096 * sizeof(GatherCopy), false); }
         for (auto& event : half_done_) { check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "cudaEventCreate"); }
     } catch (...) {
         for (auto& event : half_done_) {
