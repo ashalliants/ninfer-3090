@@ -34,6 +34,26 @@ on a headless card by extrapolation, and the server fits the context to the free
 does not. Sources and conditions are in
 [Performance on an RTX 3090](#performance-on-an-rtx-3090).
 
+### Faster than v0.15.1
+
+![Qwen3.8-27B on one RTX 3090: v0.15.1 against this release](docs/assets/perf-uplift.svg)
+
+Measured 2026-10-13 on one RTX 3090, with the launcher's settings, as interleaved runs in one
+sitting (so the pairs compare; the headline table above is an earlier session's absolute figures):
+
+- **Long prompts are read faster.** A 16K prompt prefills 6% faster, 32K 12% and 64K 19%
+  (1,823 to 2,172 tok/s). Prompts of 4K and below gain 1-2%.
+- **Agent turns that write a file back decode faster.** Text copied from the prompt decodes at
+  454 tok/s against 243 at 2K context (+87%) and 403 against 254 at 32K (+59%). That is the best
+  case; a replay of whole agent sessions (four sessions of Read, Edit and explain turns, up to
+  117K tokens) gained 42% decode at one lane, with turns that explain rather than copy unchanged
+  to 5% slower. Method and tables: [performance](docs/performance.md#n-gram-copy-drafting-rtx-3090-qwen38-27b).
+- **Unchanged:** decode of text that is not a copy (-0.2% to -0.4%, same cost per round), and
+  memory, apart from 18 MiB more reserved for copying.
+
+Full table, method and what was not measured:
+[performance/qwen3.8-27b](docs/performance/qwen3.8-27b.md#v0151-against-master-on-rtx-3090-2026-10-13).
+
 ![Qwen3.8-27B: upstream artifact vs this fork's 3090 conversion](docs/assets/qwen38-artifact-gains.svg)
 
 The default 27B is this fork's own conversion ([model card](model-cards/Qwen3.8-27B-NInfer-3090/README.md)):
