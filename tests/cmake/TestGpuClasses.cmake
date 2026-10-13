@@ -39,6 +39,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_metrics_test
   ninfer_offloaded_moe_cpu_test
   ninfer_openai_responses_store_test
+  ninfer_openai_responses_test
   ninfer_openai_schema_test
   ninfer_perplexity_evaluation_test
   ninfer_pretty_logging_test
@@ -68,6 +69,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_request_log_test
   ninfer_resource_manager_test
   ninfer_route_coverage_test
+  ninfer_s3_object_store_test
   ninfer_sampling_defaults_test
   ninfer_scheduler_test
   ninfer_serve_options_test
