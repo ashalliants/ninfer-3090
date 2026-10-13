@@ -1,7 +1,6 @@
 # Qwen3.8-Flash-Next context cache
 
-Status: in progress on `feat/qwen4exp-context-cache` (design note; becomes the authority for the
-Flash-Next cache once merged, beside [the model reference](qwen4-exp-model.md)).
+The design authority for the Flash-Next context cache, beside [the model reference](qwen4-exp-model.md).
 
 The Qwen3.8-27B/35B Programs implement NInfer's context cache contract (capture frontiers, private
 continuations, shared prefixes, Host tier, reclaim), driven by the shared `EngineCore` and
@@ -110,30 +109,73 @@ before the page holding F - 1 (that page is rewritten).
 
 ## Exactness
 
-A resumed request's greedy ids must equal the same request run cold. Two effects can break it and
-are measured, not assumed:
+A resumed request's greedy ids must equal the same request run cold.
 
-1. Prefill call boundaries. Cold prefill runs 4,096-token calls from 0; a resume runs them from F.
-   Whether the forward is invariant to where calls start (the GDN route is chunked) decides whether
-   capture frontiers must be rounded to a page (stage 0 probe below).
-2. The endpoint E carries decode-computed state (one-column and verification rounds); a later
-   prompt resumed from E is computed differently from a cold prefill of the same tokens. This is
-   inherent to continuing from a generated turn (Qwen3.5 has the same property) and is reported.
+- **Where prefill calls start changes the numerics.** On master 04901788, the same 300-token prompt
+  gives four different 48-token greedy outputs with `--prefill-chunk` 1024, 100, 64 and 96. So the
+  capture groups' frontiers inside a prompt split its prefill calls *in every configuration*, cache
+  on or off (`BasePlanImpl::splits`, as Qwen3.5 splits at its rewrite frontiers): a prompt's output
+  does not depend on the cache, and a resume at one of those frontiers runs exactly the calls a cold
+  run of the longer prompt runs. Measured before this rule: a 28K-token chat prompt generated 18
+  tokens with the cache on and 25 with it off (both greedy, different call partitions).
+- **Short calls take the static route** (fewer than 512 columns, even while the wide route's lease is
+  held): the wide route streams every non-resident expert of each layer, about 0.8 s per call,
+  which made a split cost as much as a 4K call. Greedy ids of a 4,101-token prompt (a 5-token tail
+  call) are identical to master's.
+- **Groups below 512 tokens are not planned** (a 111 MiB image and a split for less than 0.2 s of
+  prefill).
+- **Exact repeats** sample from the stored logits of the prompt's last position: same first token,
+  same state.
+- **Endpoints** carry decode-computed state (one-column and verification rounds); a later prompt
+  resumed from one is computed differently from a cold prefill of the same tokens, inherent to
+  continuing a generated turn (Qwen3.5 has the same property). In the real test it matched the cold
+  run for 32 tokens (with and without MTP); it is reported, not asserted.
 
-An exact repeat of a prompt whose checkpoint is at the prompt end samples from the stored logits,
-so it reproduces the cold first token and state exactly.
+The real tests (`ninfer_qwen4_exp_engine_real_test --cache [--mtp 3]`, `--cache --evict`,
+`ninfer_qwen4_exp_vision_engine_real_test --cache`) assert ids equal to cold for the exact hit, the
+resume at a call boundary, the cold runs with captures, an image in the cached prefix, eviction
+under a 512 MiB tier, and a request after a cancelled one.
 
-## Stages
+## Measurements
 
-0. Baseline build at master; probe call-boundary invariance (cold ids with prefill split at
-   aligned and unaligned positions).
-1. Host checkpoint registry (CPU only): slab pool, shared pages, footprint and release quotes,
-   lineage loss; unit tests in `tests/models/qwen4_exp/`.
-2. Program integration: plans, prefill splits, capture, endpoint, restore, reclaim hooks, RAM
-   ledger and startup report, Engine wiring and option validation.
-3. Real-model gates (GPU lock): resume == cold (repeat, extension), MTP on and off, image prefix,
-   eviction under a tiny budget, cancel during capture, failure after capture, restart cycles.
-4. Serving smoke and measurements (TTFT repeat / extend / agent rotation, capture cost, decode
-   and cold prefill regression), ABBA against the same build with the cache off.
-5. Defaults (launcher opt-out `NINFER_PREFIX_CACHE=off`), documentation.
-6. `--context-store` only if 0-5 are green.
+RTX 3090, Windows 11, CUDA 12.8, `qwen4exp-iq2xs-mtp-vision.ninfer` with the launcher's flags
+(`--spec mtp --draft-tokens 3 --vision`, 32K context, n-gram volume on NVMe), 2026-10-13. Each server
+starts with an empty expert cache (`--no-expert-state`); arms in ABBA order in one sitting; "off" is
+the same build with `--host-context-mib 0`; one request per cell per arm. The chat requests are
+`temperature 0`, thinking off.
+
+| Request (TTFT) | off | on |
+|---|---:|---:|
+| 28,011-token document, cold | 11.72 s (other off arm: 18.03 s, an outlier) | 11.71 / 11.70 s |
+| the same request again | 11.28 s (17.49) | 0.102 / 0.101 s, 28,002 reused |
+| + its reply + a ~1K-token user turn (29,036 tokens) | 11.91 s (13.32) | 0.953 / 0.966 s, 28,028 reused |
+
+Against master in an earlier sitting (master, off, on, on, off, master; before the splits were made
+unconditional, so "off" did not split there): cold 11.32 / 11.47 s master, 11.38 / 11.45 off,
+11.62 / 11.61 on.
+
+Agent rotation (`tools/bench/run_agent_rotation.py --agents 3 --turn-words 1500 --target-tokens
+22000 --edit-every 0`, 27 requests per arm, prompts 2.5K-22.7K tokens, same earlier sitting): mean
+TTFT of the 24 continuing turns 5.82 / 5.84 s off and 1.20 / 1.21 s on (82% of their prompt tokens
+reused); the 3 first turns 1.10 / 1.10 s off and 1.17 / 1.17 s on (the split, below).
+
+Decode, 512 greedy tokens after a 27-token prompt: six requests per arm, the five after the first
+102.4 / 102.2 tok/s median off and 102.2 / 102.4 on (ranges 101.7-102.6 and 101.0-102.7); in the earlier sitting master 72.1 / 72.1,
+off 71.9 / 71.7, on 74.1 / 73.6 (one request each, a cold expert cache). One sitting measured
+on 62.0 / 64.8 against off 71.5 / 72.9 on that cell (and 0.24 s against 0.18 s of its prefill);
+it did not repeat in the next two sittings and is reported, not explained.
+
+Restore: 500 MiB (a 28K-token checkpoint) in 20.5-21.2 ms. Capture: 21-22 ms for the prompt's
+checkpoint (every page), 5-7 ms for a later one (its image and new pages). The first capture of a
+process measured 650-680 ms in the real test: it waits for the prefill's expert refill already
+queued on the stream (decode would wait for it too).
+
+Costs: chat prompts split prefill at the typed recovery frontier (just before the assistant
+header), a few-token static call: +0.07 s on a 2.5K-token first turn (+6%) and +0.2-0.3 s on
+28K (+2%), in every configuration. The 4 GiB Host tier pins in about 1 s at startup.
+
+## Status
+
+Done: the RAM tier, capture/restore/reclaim hooks, the launcher default (`NINFER_PREFIX_CACHE=off`
+opts out), real-model gates. Not built: `--context-store` and the NVMe tier (see Storage tiers),
+more than one lane (the handles, keys and mirror are per lane already).

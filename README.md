@@ -308,8 +308,11 @@ the expert cache only while it encodes). A plain `qwen4exp-iq2xs.ninfer` runs wi
 It pins all 33 GiB of routed experts in host RAM (startup refuses, saying how much is missing, when
 Windows cannot keep 2 GiB free beside them), keeps the most-used ~11,000-12,500 experts in a VRAM
 cache whose state is saved beside the model so the next start is warm, and serves one request at a
-time at up to 32K tokens with INT8 KV. Not yet: prefix reuse (every request prefills its whole
-prompt) and more than one lane. Measured on this RTX 3090 with a warm expert cache: decode
+time at up to 32K tokens with INT8 KV. Repeated and continued prompts reuse their prefix from a
+4 GiB pinned host-RAM cache (`NINFER_PREFIX_CACHE=off` turns it off): a repeated 28K-token prompt
+starts answering in 0.1 s instead of 11.7 s, and the next turn of that conversation in 0.95 s
+([measurements](docs/maintainer/flash-next-context-cache.md#measurements)). Not yet: more than one
+lane, and checkpoints that survive a restart (`--context-store`). Measured on this RTX 3090 with a warm expert cache: decode
 after 1K / 8K / 32K prompts is 108-109 / 111 / 112-113 tok/s with MTP and 81 / 80 / 78 without
 (Strata with MTP 105 / 112 / 107, plain 71 / 70 / 66). Decode speed and its breakdown are in
 [the plan](docs/maintainer/flash-next-plan.md#pr-13-measurements); the server reference is
