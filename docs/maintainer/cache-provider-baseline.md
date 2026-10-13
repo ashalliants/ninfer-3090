@@ -26,10 +26,16 @@ and `tools/bench/disk_seq_io.py`, described in `tools/bench/README.md`.
   8 GiB run a single admission retried a failing KV demotion page by page for about 14 s. Each
   attempt took 1.5-4.0 s on the Engine worker, with the GPU idle and a request waiting. No log line
   or metric shows any of this today.
-- **The context store works and recovers restarts, but it cannot help a saturated server.** After a
-  crash, 16 of 16 conversations resumed from the store (TTFT p50 1.07 s, max 3.0 s). It also served
-  one deep edit by hydration (TTFT 7.5 s against about 20 s). At sustainable load it wrote 19.0 GB
-  of new chunks in 10 minutes, about 110 GB per hour. @@STORE_SAT_SUMMARY@@
+- **The context store works and recovers restarts, and it already repairs a small Host tier at
+  sustainable load, but it writes nothing under saturation.** After a crash, 16 of 16
+  conversations resumed from the store (TTFT p50 1.07 s, max 3.0 s). With a 2 GiB Host at
+  sustainable load it raised the post-warm-up hit from 0.732 to 0.876 (ideal 0.941), cut TTFT p50
+  from 4.07 to 1.99 s and p95 from 16.6 to 8.0 s, and cut tokens prefilled over the run by 33%
+  (892K to 595K), for about 90-110 GB of new chunks per hour. Under saturation (C8, 8 GiB) it
+  wrote 0 sessions in 12 minutes and changed nothing (hit 0.610 against 0.603, TTFT p50 81.9
+  against 83.3 s), because the background writer runs only while no request waits and no lane
+  prefills (`persist_idle_session`, `engine_core.h:2821`), and a saturated server is never in that
+  state.
 - **Lanes are not the limit.** C4 and C8 gave the same reuse and almost the same TTFT. Under
   saturation a request waited with a lane free 70-89% of the time: prefill compute is the limit, and
   C8's extra lanes mostly idle (mean busy 0.36).
@@ -80,10 +86,10 @@ and `tools/bench/disk_seq_io.py`, described in `tools/bench/README.md`.
   This is a ceiling model. The engine also keeps E and R points, shared entries and pause
   snapshots in the same bytes; with 2 or 4 StateImages per conversation the policy share shrinks
   but stays (see Saturated).
-- **Measurement build.** Runs named `s-*` and `b-*` used a build of the same commit with a
+- **Measurement build.** Runs named `s-*` and `b-*`, and the saturated store run `c8-h8-store`, used a build of the same commit with a
   measurement-only patch (appendix; not in this PR). It writes one stderr line per `try_admit_one`
   with its wall time, and one per Host demotion that failed to reserve its destination or had to
-  split a KV batch. Nothing else differs. The saturated runs used the unpatched build.
+  split a KV batch. Nothing else differs. The other saturated runs used the unpatched build.
 - **Sample size.** One run per configuration, about 70 requests after warm-up for sustainable runs
   and 118-162 requests for saturated ones. Differences of a few percent in TTFT between two runs are
   within what one run cannot resolve; the reuse figures are exact counts.
@@ -131,20 +137,21 @@ Tokens an ideal cache would have saved, by cause (requests in brackets):
 
 ### Saturated load (32 tenants, 40 s think)
 
-Whole run, unpatched build:
+Whole run. The first three rows used the unpatched build; the store row used the measurement build:
 
 | run | n | hit | ideal | private / shared / none | TTFT p50 / p95 / p99 s | queue p50 / p95 s | lanes busy | 429s |
 |---|---:|---:|---:|---|---|---|---:|---:|
 | C4, Host 8 GiB | 162 | 0.620 | 0.807 | 85 / 72 / 5 | 84.7 / 178 / 221 | 59.7 / 118 | 0.57 | 2,347 |
 | C8, Host 8 GiB | 150 | 0.603 | 0.793 | 66 / 75 / 9 | 83.3 / 183 / 229 | 69.3 / 150 | 0.36 | 1,052 |
 | C8, Host 2 GiB | 118 | 0.407 | 0.743 | 23 / 91 / 4 | 142 / 194 / 247 | 106 / 150 | 0.68 | 1,045 |
-@@SAT_STORE_ROW@@
+| C8, Host 8 GiB, store | 152 | 0.610 | 0.798 | 62 / 84 / 6 | 81.9 / 178 / 223 | 75.5 / 150 | 0.34 | 901 |
 
 | run | diverged | evicted_capacity | evicted_host_capacity | evicted_policy | total evicted |
 |---|---:|---:|---:|---:|---:|
 | C4, 8 GiB | 170,894 (9) | 163,516 (10) | 169,690 (9) | 246,860 (17) | 580,066 (36) |
 | C8, 8 GiB | 163,374 (8) | 78,085 (6) | 98,987 (10) | 359,673 (28) | 536,745 (44) |
 | C8, 2 GiB | 95,926 (5) | 271,148 (15) | 338,991 (19) | 217,790 (24) | 827,929 (58) |
+| C8, 8 GiB, store | 121,311 (7) | 129,605 (12) | 111,154 (8) | 346,761 (31) | 587,520 (51) |
 
 - **Prefill-bound.** Prefill ran 689-734 s of each 740-770 s run at 2,124-2,224 tok/s. Per run,
   1.46-1.63M tokens were computed: openings (about 570K), evicted appends (540-830K, 37-51% of the
@@ -199,7 +206,41 @@ and each of the 16 open conversations sent one more turn, 2 s apart.
   against 6 over 1 s without the store in the 840 s run. The counts are too small to say whether
   the store changes this.
 
-@@STORE_EXTRA@@
+### Context store at a 2 GiB Host, and under saturation
+
+Two further runs with the store on and no restart.
+
+| | C8, 2 GiB, sustainable, store | same, no store | C8, 8 GiB, saturated, store | same, no store |
+|---|---:|---:|---:|---:|
+| requests after warm-up (sustainable) / whole run (saturated) | 69 | 69 | 152 | 150 |
+| hit / ideal | 0.876 / 0.941 | 0.732 / 0.941 | 0.610 / 0.798 | 0.603 / 0.793 |
+| private / shared / none | 53 / 14 / 2 | 36 / 31 / 2 | 62 / 84 / 6 | 66 / 75 / 9 |
+| TTFT p50 / p95 / p99 s | 1.99 / 8.0 / 10.6 | 4.07 / 16.6 / 25.4 | 81.9 / 178 / 223 | 83.3 / 183 / 229 |
+| evicted tokens (requests) | 64,896 (9) | 258,844 (25) | 587,520 (51) | 536,745 (44) |
+| diverged tokens (requests) | 56,192 (7) | 138,004 (8) | 121,311 (7) | 163,374 (8) |
+| prompt tokens prefilled, whole run | 595,351 | 891,677 | 1,475,875 | 1,462,518 |
+| store writes / new bytes / reused bytes | 85 / 21.8 GB / 31.7 GB | n/a | 0 / 0 / 0 | n/a |
+| hydrations / tokens / seconds waiting | 14 / 302,004 / 14.8 | n/a | 0 | n/a |
+
+- **At 2 GiB and sustainable load the store recovers about three quarters of the eviction loss.**
+  Evicted tokens fell from 258,844 to 64,896, and private hits rose from 36 to 53 of 69. Prefill
+  over the whole run fell by 296K tokens (33%, about 140 s of GPU time). The writes were about
+  88,800 MiB per hour (93 GB/h; 21.8 GB in 841 s), each image taking 0.16-0.61 s. The 14
+  hydrations cost 14.8 s of waiting in total (1.06 s each, 21K tokens per second of restored
+  context), one hydration failed (`hydration_failures_total` 1; not traced, the request was
+  served by prefill), and the store held 28 images, 12.0 GiB, at the end. The 9 evicted requests
+  that remain were not traced; the plausible causes are conversations evicted before the 30 s idle
+  threshold and hydrations under the 4,096-token gate, and neither was checked.
+- **At 8 GiB under saturation the store never wrote.** `ninfer_context_store_writes_total` stayed
+  at 0 for the whole run, so there was nothing to hydrate (`hydrations_total` 0). The only
+  difference from the no-store run, hit 0.610 against 0.603 and TTFT p50 81.9 against 83.3 s, is
+  within what one run resolves. Evicted conversations were evicted before they were ever written,
+  because they are evicted 30-65 s after their last turn, while their next turn queues, and the
+  writer waits for an empty queue and idle lanes. A store that only writes in idle moments cannot
+  recover saturation losses; the write has to happen at or before eviction (idea 1).
+- **Allocator failures were not reduced by the store**: 250 state and 57 KV failures at 2 GiB
+  (291 and 172 without), and 727 and 294 under saturation (the highest of any run except the
+  bursty one; there is no matching unpatched count).
 
 ### Thinking on
 
@@ -254,7 +295,8 @@ source (`resource_manager.h`, the #254 workaround). The measurement build counte
 | C8, 8 GiB, thinking | 4 | 1 | 32 | 1 (0.16 s) | 0 |
 | C8, 8 GiB, bursty fan-out | 434 | 181 | 4,719 | 25 (8.82 s) | 0 |
 | C4, 2 GiB | 267 | 56 | 613 | 8 (1.46 s) | 0 |
-@@ALLOC_ROWS@@
+| C8, 2 GiB, store | 250 | 57 | 916 | 8 (2.30 s) | 1 |
+| C8, 8 GiB, saturated, store | 727 | 294 | 7,887 | 10 (1.69 s) | 0 |
 
 **The stall.** In the C8 8 GiB run, from 14:20:20 to 14:20:34, the Engine reported `running 0 |
 waiting 1 | host 80-86%`, and the stderr shows this sequence repeated:
@@ -318,7 +360,7 @@ of GPU time and of every queued request's TTFT. All ideas are measured against t
 | # | idea | what it addresses here | measured ceiling on this workload |
 |---|---|---|---|
 | 7 | slab Host pool (no geometry failures) | demotion reservation failures, page-by-page retries, worker stalls | 30-291 state and 4-172 KV failures per run at ≤ 8 GiB; up to 15 s of GPU-idle Engine stall per 840 s run, concentrated on single requests (14 s on one). Upper bound on top: the `evicted_policy` losses under saturation (218-360K tokens per run), which failed demotions can cause by deleting live sources. Not proven to be the cause |
-| 1 | disk-aware eviction + write-on-evict | conversations dropped from the Host tier | every `evicted_*` token: 540-830K tokens per saturated 10-minute run (37-51% of computed prefill) and 259K post-warm-up at sustainable 2 GiB (25 requests, about 125 s of prefill). Restoring a median 8.5K-token conversation (about 0.3 GB with two states) takes 0.06 s at the drive's 4.9 GB/s, or 0.55 s through today's store path, against 4.0 s of prefill. @@IDEA1_STORE@@ |
+| 1 | disk-aware eviction + write-on-evict | conversations dropped from the Host tier | every `evicted_*` token: 540-830K tokens per saturated 10-minute run (37-51% of computed prefill) and 259K post-warm-up at sustainable 2 GiB (25 requests, about 125 s of prefill). Restoring a median 8.5K-token conversation (about 0.3 GB with two states) takes 0.06 s at the drive's 4.9 GB/s, or 0.55 s through today's store path, against 4.0 s of prefill. Measured: today's idle-write store already recovers 75% of the 2 GiB sustainable loss (194K of 259K tokens, hit 0.732 → 0.876), but writes nothing under saturation, where the loss is largest, so the missing part is writing at eviction, not the disk tier itself. The cost of write-on-evict was measured on the disk-tier branch as about 16% of Engine-worker time and about 550 GB/h (agent-replay workload, C4 2 GiB, `tools/bench/disk_tier/results/RESULTS.txt` on the disk-tier branch, PR #295: hit 0.32 to 0.74, 550 GB/h; not re-measured on this hosted workload) |
 | 2 | disk read term in the cost model | the fixed 4,096-token hydration gate | 5-8 evicted appends per run lost less than 4,096 tokens (at most about 30K tokens, about 15 s per run). An enabler for 1 and 9 more than a gain |
 | 9 | dense taps / history points on a cheap tier | edits and branches whose resume point was superseded | 106-110K tokens per 840 s run at 8-16 GiB (6-7 of about 70 requests): hit 0.886 → 0.940, and those requests' TTFT p50 7.2 s → about 1 s. 96-171K tokens per saturated run. Scales linearly with the edit and branch rate, which is this workload's assumption (5% + 5%). The store already recovered one such edit |
 | 4 | divergence-tap single-flight | siblings prefilling the same non-marker prefix at once | 300,884 tokens (36 sibling requests) in the bursty fan-out run: 20% of everything it computed, about 140 s of prefill. Zero in the Poisson runs, which have no fan-out: there the shared product prompts sit at markers, and `shared_miss` was 0. Depends entirely on how often clients fan out over a fresh document |
@@ -343,7 +385,7 @@ study:
    saturation.
 2. **Ideas 1 and 2: disk-aware eviction with write-on-evict, and a disk term in the cost model.**
    The largest token ceiling (540-830K tokens per saturated 10-minute run, 259K at 2 GiB
-   sustainable), and the drive reads 4.9 GB/s. @@RANK2_STORE@@ Write volume is not counted as a
+   sustainable), and the drive reads 4.9 GB/s. Today's idle-write store recovers 75% of the sustainable 2 GiB loss and none of the saturated one (it never writes there), so the work is to write at eviction time, not to build a new tier. Write volume is not counted as a
    cost (the user's decision for hosted instances).
 3. **Idea 9: history points on disk.** About 6% of prompt tokens on this workload (5% edits,
    5% branches), and the TTFT of those requests drops from about 7 s to about 1 s. The store
