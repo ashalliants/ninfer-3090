@@ -844,11 +844,14 @@ public:
 
     // Public shared prefixes the durable store may keep: installed (pinned) context is not cache
     // contents and is never stored.
+    // Only entries with repeat demand (another request crossed or reused the prefix): the cache
+    // also publishes shared entries at points inside one conversation's history, which no other
+    // tenant will ask for and which are not worth an export.
     [[nodiscard]] std::vector<Handle> retained_shared(Program& program) {
         prune(program);
         std::vector<Handle> out;
         for (const auto& shared : shared_) {
-            if (!shared.pinned) { out.push_back(shared.handle); }
+            if (!shared.pinned && shared.priority.reused) { out.push_back(shared.handle); }
         }
         return out;
     }
