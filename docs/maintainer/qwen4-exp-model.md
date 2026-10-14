@@ -5,7 +5,7 @@ from the ISTA DASLab GSQ-RCO IQ2_XS GGUF. The composition is lifted from Inferni
 `src/models/qwen4_exp`, Apache-2.0); the weights stay the GGUF's GGML blocks. Status and the staged
 plan are in [flash-next-plan.md](flash-next-plan.md); formats in [tensor-formats.md](tensor-formats.md).
 
-The model runs through the Program and Engine (one lane) and `ninfer-serve`; the whole forward is
+The model runs through the Program and Engine (one or two lanes) and `ninfer-serve`; the whole forward is
 also checked directly by `ninfer_qwen4_exp_forward_real_test` (one sequence, teacher-forced or
 decoding).
 

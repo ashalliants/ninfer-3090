@@ -255,4 +255,5 @@ The launcher keeps the NVMe tier opt-in (`NINFER_CONTEXT_NVME_MIB`): it costs no
 it only pays once the working set exceeds the RAM tier, which was not measured, and it writes a
 scratch file beside the model (capped at half the volume's free space). Revisit with a hit-rate run.
 Not built: more than one lane (the handles, keys and mirror are per lane already); retrying a failed
-frame write (a frame whose write failed stays in RAM until its slab is freed).
+Not built: retrying a failed frame write (a frame whose write failed stays in RAM until its slab is freed).
+The cache is per lane at two lanes (PR 16 in [the plan](flash-next-plan.md#pr-16-two-lanes)): handles, mirror, reservations and captures per lane, one Host pool.

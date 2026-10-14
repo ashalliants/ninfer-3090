@@ -27,6 +27,7 @@ references, `engine-architecture.md`).
 | 13 | MTP speculation: the drafter imported exactly from Strata's `mtp-q2_0.gguf` (13a, `--mtp-gguf`, `ggml_rec_q2_0_q2_0`); Infernix's chained drafts, exact W-column verification and record commit (13b); the draft ceiling and the launcher (13c) | done (spec gate missed, below) |
 | 14 | Vision: the tower imported exactly from the model's mmproj GGUF (14a, `--mmproj`, Qwen3.5's vision component); bound pinned in host RAM and encoded through Qwen3.5's streamed tower in a lent window, against an FP64 oracle (14b); M-RoPE positions, the embedding scatter (text and drafter), the Engine, serving and the launcher (14c) | done (below) |
 | 15 | Prefix reuse: NInfer's context cache contract in this Program with a Host-only tier sized by the RAM ledger, on by default in the launcher ([design and measurements](flash-next-context-cache.md)); then `--context-store` images and an NVMe tier behind a RAM cache | done |
+| 16 | Two lanes (`--max-concurrency 2`): slotted state and KV, a batched plain round for two decoding lanes (MTP stays at one), per-lane context cache, graphs and leases ([measurements](#pr-16-two-lanes), spike [#284](https://github.com/ashalliants/ninfer-3090/pull/284)) | done, opt-in (aggregate gate missed, below) |
 
 The C++ loader reads and places every `ggml_*` and `ggml_rec_*` object. Linear and LinearAdd execute
 the six dense formats (PR 3); offloaded_sparse_moe executes the three expert record formats (PR 7).
@@ -466,6 +467,58 @@ three GGUFs).
 - **Text unchanged** (#264's engine against this branch with `--vision`, A B B A, s60's prompts):
   greedy ids identical; plain decode 0.997 / 0.996 / 0.998 (+-0.002-0.003, 1K / 8K / 32K), MTP decode
   1.001 / 0.996 / 0.999, prefill 0.998 / 1.003 (4K / 32K).
+
+## PR 16 (two lanes)
+
+`--max-concurrency 2` for Flash-Next. Two requests decode in the same rounds as one plain batched round
+(`Forward::run_rows`, from the spike's slice 1, #286); one decoding lane runs today's single-row round
+with MTP. Design: the PR description of #291. The launcher stays at one lane (`NINFER_CONCURRENCY=2` opts in).
+
+Gates (RTX 3090, WDDM, artifact `qwen4exp-iq2xs-mtp-vision.ninfer`, every run under the shared GPU lock):
+
+1. **Exactness: passed.** `ninfer_qwen4_exp_lanes_real_test --exact --mtp 3 [--cache]`, 96 greedy tokens: 3 pairs
+   (all overlapped), 2 staggered pairs and each of three prompts (700 / 3,000 / 8,192 or 9,000 tokens) alone on the
+   two-lane Engine, every one identical to its one-lane run. With the cache: the 8,192-token prompt cached, its
+   +600-token suffix resumed in one lane beside a short prompt (identical to the cold run), a lane cancelled after 8
+   tokens (the other lane and the next request unchanged); also at `--concurrency 1`. A resume where the cold prefill
+   has no call boundary (a 9,000-token prompt at chunk 1,024) differs in greedy ids on its own, with the cache
+   at any lane count; `test_engine_real.cpp` documents it, so the gate resumes at 8,192.
+2. **Aggregate decode, >= 1.15x of MTP at one lane on the spike's 8-request burst: MISSED.** `ninfer-serve --spec
+   mtp --draft-tokens 3 --no-expert-state --no-prefix-reuse --max-context 32768 --prefill-chunk 1024`, the spike's
+   eight conversations (`tools/flash_next/lanes/burst_client.py`, all queued at t = 0, 1,024 greedy tokens each, 7,242
+   in all), a fresh server per run, order C1 C2 C2 C1 in one lock hold (`burst_gate.ps1`):
+
+   | | C = 1 (two runs) | C = 2 (two runs) | C = 2 / C = 1 |
+   |---|---:|---:|---:|
+   | makespan | 101.4, 97.4 s | 93.5, 92.7 s | 0.94 (6.3% sooner) |
+   | tokens / makespan | 71.4, 74.4 | 77.5, 78.2 | **1.07x** |
+   | decode only (tokens / (makespan - prefill)) | 84.8 | 91.6 | 1.08x |
+   | mean completion | 61.6, 59.1 s | 60.1, 59.4 s | 0.99 |
+   | mean time to first token | 50.7, 48.7 s | 40.4, 39.9 s | 0.81 (19% lower) |
+
+   A pair decodes at 47-52 tok/s per stream (about 95-104 aggregate, the spike modelled 109), against 80-95 for one
+   stream with MTP; the last request of the burst runs alone and slower (72 tok/s) than the one-lane MTP rate.
+   The one-lane MTP figures here (median 87-91 per request) are close to the spike's 92.6. The workload is queued
+   prefill-heavy (about 14 s of prefill in 97 s), which a second lane cannot shrink.
+3. **4K / 32K / 128K alternation at two lanes: passed.** `--bench --concurrency 2 --mtp 3 --max-context 135168`,
+   ten requests (4,096 / 32,000 / 130,000 tokens, 64 generated), no crash or error, KV pool growing and shrinking
+   (up to 2,560 pages), the process at most 22.7 GiB of the 23.1 GiB OS budget (VRAM free 375-786 MiB at the
+   growths), all ten finished.
+4. **A lone request at two lanes within 2% of one lane and of master: not separable from noise.** The eight
+   conversations one at a time (`lone_gate.ps1`), median decode tok/s per full-length request, order M L1 L2 L2 L1 M:
+   master 90.2 and 91.6, this branch at one lane 85.9 and 91.6, at two lanes 86.2 and 91.1. The first two runs of the
+   branch were slow and the last two equal to master, so a drift in the sitting is as likely as a cost. Prefill of the
+   7,106 / 3,233 / 10,527-token prompts: master 3.22 / 3.68 / 4.60 s, branch 3.20-3.35 / 3.60-3.77 / 4.58-4.78 s.
+5. **Existing tests: passed.** The Flash-Next cache gates (`tools/bench/qwen4exp_cache_gates.ps1` runs: plain, MTP 3,
+   eviction at 512 MiB, vision cache), `ctest -R qwen4_exp` (12 tests, all pass; `forward_real` and `lanes_real` skip without
+   arguments, so `forward_real` ran directly: single-sequence decode and `--rows 32` with three prompts, greedy ids and
+   logits bit-identical to each prompt alone at B = 1..3 on the slotted forward) and `ctest` over the built
+   `ninfer_tests` bundle: 193 of 207 ran green or skipped; the 14 failures are the known `jsonschema` oracles and
+   `ninfer_artifact_writer_interop_test`, the tests whose standalone executables were not built (`Not Run`), the
+   chat-template renderer and `ninfer_openai_responses_test` (exit 0xc0000409; this branch touches no serve code).
+
+Decision: C = 2 beats C = 1 in makespan and queued time to first token but not by the aggregate decode the
+spike promised (about 1.07x against 1.18x modelled). It ships opt-in; the launcher default stays at one lane.
 
 ## Artifact decisions
 

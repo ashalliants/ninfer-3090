@@ -10,7 +10,7 @@ rem   qwen38-27b        tuned (default), int8, c8   <- recommended
 rem   qwen36-35b-a3b    tuned (default)
 rem   qwen38-flash-next tuned (default)      <- Qwen3.8-Flash-Next from the IQ2_XS GGUF (preview)
 rem
-rem QWEN3.8-FLASH-NEXT: one request at a time, 32,768 tokens of context, INT8 KV, prefix reuse from
+rem QWEN3.8-FLASH-NEXT: one request at a time (NINFER_CONCURRENCY=2: two), 32,768 tokens of context, INT8 KV, prefix reuse from
 rem a 4 GiB Host cache (a conversation's next turn prefills only what is new; NINFER_PREFIX_CACHE=off
 rem turns it off, NINFER_HOST_CONTEXT_MIB sizes it, NINFER_CONTEXT_NVME_MIB adds a disk tier,
 rem NINFER_CONTEXT_STORE keeps it across restarts). MTP speculation (up to 3 drafts, 1.4x decode) is
@@ -164,7 +164,7 @@ rem no console to read from; that must not silently pick a model.
 echo Which model?
 echo   1  Qwen3.8-27B  (recommended)
 echo   2  Qwen3.6-35B-A3B
-echo   3  Qwen3.8-Flash-Next  (preview: one request at a time, 32K context)
+echo   3  Qwen3.8-Flash-Next  (preview: one request at a time, 32K context; NINFER_CONCURRENCY=2 for two)
 choice /c 123 /n /m "Choose 1, 2 or 3: "
 if errorlevel 255 exit /b 2
 if errorlevel 3 (

@@ -29,7 +29,7 @@ The repository holds [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Fl
 [ISTA DASLab GSQ-RCO IQ2_XS GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
 rewritten into NInfer's `.ninfer` container without re-quantizing anything, plus the MTP drafter and
 the vision tower. It is not a Transformers checkpoint, Safetensors distribution or GGUF file, and it
-needs this fork's executables. Support is a **preview**: one request at a time, Windows launcher only.
+needs this fork's executables. Support is a **preview**: one request at a time (two lanes opt-in), Windows launcher only.
 It takes text and images (below).
 
 ## What the conversion does
@@ -222,8 +222,8 @@ set NINFER_NGRAM_VOLUME=D:\ninfer-models\qwen4exp-iq2xs-mtp-vision.ninfer.ngram
 scripts\run.bat qwen38-flash-next
 ```
 
-or start the server directly with `--ngram-volume FILE`. The launcher serves one request at a time
-at 32,768 tokens with INT8 KV, MTP and images; `NINFER_CONTEXT` raises the context (KV beyond 32,768
+or start the server directly with `--ngram-volume FILE`. The launcher serves one request at a time by default
+(`NINFER_CONCURRENCY=2` runs two lanes) at 32,768 tokens with INT8 KV, MTP and images; `NINFER_CONTEXT` raises the context (KV beyond 32,768
 tokens is borrowed from the expert cache; 128K was measured), `NINFER_SPEC=none` turns MTP off and
 `NINFER_VISION=off` turns images off.
 
@@ -248,8 +248,9 @@ is that of the local copy. Model code adapted from [Infernix](https://github.com
 - **MTP missed its target.** The goal was 1.2x Strata's MTP decode at 8K (134 tok/s); it reached
   111-113 tok/s, level with Strata (1.01x at 8K, 1.05x at 1K and 32K). The cost is in verifying each
   draft column: every extra column routes more experts.
-- **One request at a time, no prefix reuse.** Every request prefills its whole prompt, and a second
-  request waits. INT8 KV only.
+- **One request at a time by default.** `NINFER_CONCURRENCY=2` serves two lanes; the second request then
+  decodes beside the first (plain, no MTP while both decode) instead of waiting. A burst of eight agent
+  requests finished 6.5% sooner with a 19% lower mean time to first token. INT8 KV only.
 - **Slow first request** after a start with no saved expert state (above).
 - **Needs the fork's image-input change.** At the time of writing, the change that reads this file's
   vision tower and picks it up in the launcher (PRs #270-#272) and the launcher's

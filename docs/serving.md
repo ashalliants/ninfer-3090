@@ -59,7 +59,7 @@ set NINFER_MODEL=K:\ninfer-models\qwen4exp\qwen4exp-iq2xs-mtp-vision.ninfer
 scripts\run.bat qwen38-flash-next
 ```
 
-That launcher profile runs `ninfer-serve <model> --max-concurrency 1 --max-context 32768
+That launcher profile runs `ninfer-serve <model> --max-concurrency 1 (2 with NINFER_CONCURRENCY=2) --max-context 32768
 --kv-capacity 32768 --kv-dtype int8 --prefill-chunk 1024`, the only serving shape this release
 supports, adding `--spec mtp --draft-tokens 3` when the model is `qwen4exp-iq2xs-mtp.ninfer` or
 `qwen4exp-iq2xs-mtp-vision.ninfer` (the artifacts with the MTP drafter) and `--vision` when it is a
@@ -170,6 +170,14 @@ the Qwen3.5 models:
 | `--vram-headroom-mib N` | VRAM the expert cache leaves free for the desktop and other programs | 512 with a display, 256 without |
 | `--ram-headroom-mib N` | host RAM left free for Windows once every expert is pinned; startup refuses when it cannot be kept | `2048` |
 | `--expert-cache-mib N` | cap the expert cache (measurement) | what fits |
+| `--max-concurrency 1\|2` | requests that decode in the same rounds (two lanes: see below) | 1 |
+
+Two lanes (`set NINFER_CONCURRENCY=2`, opt-in): a second request no longer waits for the first. Two requests
+decode in the same rounds (plain, without MTP: speculation runs only while one request is decoding), and a lane's
+prefill calls run between the other lane's decode rounds, so it pauses for up to one call (about 1.7 s per
+4,096-token call). On the spike's eight-conversation agent burst it finished 6.5% sooner and cut the mean time to
+first token by 19%, which is less than the 1.15x aggregate decode the design aimed for
+([measurements](maintainer/flash-next-plan.md#pr-16-two-lanes)). One lane stays the default; three or more are refused.
 
 ### Vision residency
 
