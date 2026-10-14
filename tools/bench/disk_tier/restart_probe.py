@@ -75,7 +75,8 @@ def main() -> int:
         time.sleep(0.5)
     if args.out:
         args.out.write_text(json.dumps(rows, indent=1))
-    failed = [r for r in rows if r["error"]]
+    # The same predicate sum_restart.py uses: no first output is as invalid as an error.
+    failed = [r for r in rows if r["error"] or r["ttft"] is None]
     if failed:
         print(f"continue error: {len(failed)} of {len(rows)} continuations failed")
         return 1

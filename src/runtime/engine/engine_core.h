@@ -2910,8 +2910,10 @@ private:
             // write-on-evict read them whether or not this worker ever writes.
             const bool failing = forget_failed_store_writes();
             forget_removed_store_images();
-            if (store_.idle_persist.count() <= 0) { return; }
-            if (failing) {
+            // With idle writes off the scan still runs to the pruning below: write-on-evict adds a
+            // mark for every owner it is offered, and nothing else ever erases them.
+            const bool idle_writes = store_.idle_persist.count() > 0;
+            if (idle_writes && failing) {
                 // A failing disk: do not export deep sessions over and over.
                 next_persist_scan_ = now + std::chrono::seconds(30);
                 return;
@@ -2937,6 +2939,7 @@ private:
                 return std::none_of(owners.begin(), owners.end(),
                                     [&](const auto& owner) { return owner.token == entry.first; });
             });
+            if (!idle_writes) { return; }
             const typename ResourceManagement::RetainedOwner* chosen = nullptr;
             std::uint32_t chosen_depth                                = 0;
             for (const auto& owner : owners) {
