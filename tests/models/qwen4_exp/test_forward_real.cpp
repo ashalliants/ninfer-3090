@@ -24,9 +24,32 @@
 // [layers][mixer in, mixer out, MoE in, MoE out][T][H]); then, in a fresh state, it prefills all but
 // the last N tokens (N = --decode, default 1) and decodes them one call per token, and checks that
 // the last decode step's top token equals the single prefill's.
+//
+// Rows mode (several sequences decoded together, Forward::run_rows):
+//
+//   ninfer_qwen4_exp_forward_real_test --rows STEPS [--time ROUNDS] [--frames-mib N] [--staging SLOTS]
+//       PROMPT PROMPT [PROMPT ...]
+//
+// PROMPT is TOKENS or text:FILE (UTF-8 text, tokenized as is, no chat template); 1 to 8 prompts.
+//  1. Each prompt alone through the single-sequence path (a Forward of its own): prefilled in calls
+//     of 1024, then STEPS greedy decode calls. Its greedy ids and every decode call's logits are the
+//     reference.
+//  2. One Forward over one state slot per prompt: each prompt prefilled into its slot (select_row),
+//     the state saved; then for B = 1 .. P the first B slots decode STEPS rounds together from the
+//     saved state (run_rows, eager). Every row's greedy ids must equal its reference; the logits are
+//     compared bit for bit too.
+//  3. --time ROUNDS: every expert the B = P run routed in its first ROUNDS rounds is made resident
+//     in device frames (most used first, as many as fit in the free VRAM or --frames-mib), then the
+//     first ROUNDS rounds of each configuration are timed on the GPU (CUDA events around the replay
+//     of a captured CUDA graph, the way the Program decodes): the single-sequence call on slot 0 (S)
+//     against B rows, in S R_B R_B S order for every B, twice. Reports the median ms per round, the
+//     distinct experts per layer and misses per round, and the cost per extra row.
+//     --configs LIST (0 = the single-sequence call, B = B rows) instead runs the listed
+//     configurations once each inside a cudaProfilerStart/Stop range, for an nsys kernel breakdown.
 
 #include "artifact/reader.h"
 #include "core/arena.h"
+#include "core/decode_graph.h"
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
 #include "models/qwen4_exp/execution/forward.h"
@@ -34,7 +57,9 @@
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 #include "models/qwen4_exp/model.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
+#include "models/qwen3_5/frontend/tokenizer.h"
 
+#include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -282,6 +307,600 @@ double median(std::vector<double> v) {
     return v.empty() ? 0.0 : v[v.size() / 2];
 }
 
+// ------------------------------------------------------------------------------- rows mode
+
+constexpr std::int32_t kPrefillChunk = 1024;
+
+std::int32_t argmax(const float* v, std::size_t n) {
+    return static_cast<std::int32_t>(std::max_element(v, v + n) - v);
+}
+
+// A prompt argument: TOKENS as for the other modes, or text:FILE (UTF-8, tokenized as is).
+std::vector<std::int32_t> parse_prompt(const std::string& argument, const q4::FrontendResources& resources) {
+    if (argument.rfind("text:", 0) != 0) { return parse_tokens(argument); }
+    std::ifstream file(argument.substr(5), std::ios::binary);
+    if (!file || resources.tokenizer == nullptr) { throw std::invalid_argument("cannot tokenize " + argument); }
+    const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    const std::vector<int> ids = resources.tokenizer->encode(text);
+    return {ids.begin(), ids.end()};
+}
+
+// The n-gram rows of the last position of `history` (column-major [row bytes, heads]).
+std::vector<std::byte> last_rows(const q4::TextConfig& c, const q4::NgramVolume& volume,
+                                 const std::vector<std::int32_t>& history) {
+    const q4::NgramHash hash(c.ple.ngram, 0);
+    std::vector<std::int32_t> padded(c.ple.ngram.ngram_size - 1, c.eos_token_id);
+    padded.insert(padded.end(), history.begin(), history.end());
+    std::vector<std::uint32_t> row_ids(hash.heads());
+    hash.row_ids(padded, 1, row_ids.data());
+    std::vector<std::byte> rows(row_ids.size() * c.ple.table.row_bytes);
+    volume.read_rows(row_ids, rows);
+    return rows;
+}
+
+// `slots` sequences in one Forward: slotted recurrent state, one KV page pool with a block table per
+// slot (slot s owns pages [s P, s P + P)), and the expert sources (no resident experts until
+// make_resident). The state and the KV can be saved once and restored before every run.
+struct RowsHarness {
+    RowsHarness(const ex::Parameters& parameters, DeviceContext& device, std::int32_t slots, std::int32_t context,
+                std::int32_t staging_slots, std::uint64_t frame_budget_bytes)
+        : config(parameters.model.config()), parameters(parameters), device(device), slots(slots) {
+        const auto& c   = config;
+        const auto dims = [](auto v) { return static_cast<std::int32_t>(v); };
+        const std::int32_t C = dims(c.gdn.conv_channels()), K = dims(c.gdn.conv_kernel - 1);
+        const std::int32_t Dk = dims(c.gdn.key_head_dim), Dv = dims(c.gdn.value_head_dim), Hv = dims(c.gdn.value_heads);
+        const std::int32_t di = dims(c.qsa.index_head_dim), r = dims(c.qsa.compress_ratio);
+        const std::size_t n         = static_cast<std::size_t>(slots);
+        const std::size_t conv      = std::size_t(C) * K * 2 * n, recurrent = std::size_t(Dk) * Dv * Hv * 4 * n;
+        const std::size_t ple_bytes = std::size_t(c.residual_width()) * c.ple.conv_span() * 2 * n;
+        const std::size_t tail      = std::size_t(di) * (r - 1) * 2 * n;
+        state_backing = DeviceBuffer(c.gdn_layers * (conv + recurrent) + ple_bytes + c.attention_layers * tail + 4096);
+        state_backing.fill(0);
+        auto* p = static_cast<std::byte*>(state_backing.p);
+        ex::ForwardRowsState state;
+        for (std::uint32_t l = 0; l < c.gdn_layers; ++l) {
+            state.gdn_conv.emplace_back(p, DType::BF16, std::initializer_list<std::int32_t>{C, K, slots});
+            p += conv;
+            state.gdn_recurrent.emplace_back(p, DType::FP32, std::initializer_list<std::int32_t>{Dk, Dv, Hv, slots});
+            p += recurrent;
+        }
+        state.ple_conv = Tensor(p, DType::BF16, {dims(c.residual_width()), dims(c.ple.conv_span()), slots});
+        p += ple_bytes;
+        for (std::uint32_t l = 0; l < c.attention_layers; ++l) {
+            state.qsa_tails.emplace_back(p, DType::BF16, std::initializer_list<std::int32_t>{di, r - 1, slots});
+            p += tail;
+        }
+        std::vector<std::int32_t> ids(n);
+        std::iota(ids.begin(), ids.end(), 0);
+        state.slot_ids = Tensor(p, DType::I32, {slots});
+        state_backing.copy_from_host(ids.data(), n * 4, static_cast<std::size_t>(p - static_cast<std::byte*>(state_backing.p)));
+
+        const std::int32_t pages = (context + kPagedKVPageSize - 1) / kPagedKVPageSize, pool = pages * slots;
+        const std::int32_t D = dims(c.attention.head_dim), Hkv = dims(c.attention.kv_heads);
+        const std::size_t codes  = std::size_t(D) * kPagedKVPageSize * Hkv * pool;
+        const std::size_t scales = std::size_t(D / 64) * kPagedKVPageSize * Hkv * pool * 2;
+        const std::size_t pooled = std::size_t(di / r) * kPagedKVPageSize * pool * 2;
+        const std::size_t table_bytes = (std::size_t(pool) * 4 + 255) / 256 * 256;
+        kv_backing = DeviceBuffer(table_bytes + c.attention_layers * (2 * codes + 2 * scales + pooled) + 4096);
+        kv_backing.fill(0);
+        std::vector<std::int32_t> tables(static_cast<std::size_t>(pool));
+        std::iota(tables.begin(), tables.end(), 0); // slot s, page i: s * pages + i
+        kv_backing.copy_from_host(tables.data(), tables.size() * 4);
+        auto* kvp = static_cast<std::byte*>(kv_backing.p);
+        ex::ForwardRowsKV kv;
+        kv.block_tables     = Tensor(kvp, DType::I32, {pages, slots});
+        kv.max_visible_keys = static_cast<std::uint32_t>(context);
+        kvp += table_bytes;
+        for (std::uint32_t l = 0; l < c.attention_layers; ++l) {
+            PagedKVLayerView view;
+            view.k_pages = Tensor(kvp, DType::I8, {D, kPagedKVPageSize, Hkv, pool});
+            kvp += codes;
+            view.v_pages = Tensor(kvp, DType::I8, {D, kPagedKVPageSize, Hkv, pool});
+            kvp += codes;
+            view.k_scale_pages = Tensor(kvp, DType::FP16, {D / 64, kPagedKVPageSize, Hkv, pool});
+            kvp += scales;
+            view.v_scale_pages = Tensor(kvp, DType::FP16, {D / 64, kPagedKVPageSize, Hkv, pool});
+            kvp += scales;
+            view.head_dim     = D;
+            view.num_kv_heads = Hkv;
+            view.storage      = KvCacheStorage::Int8Group64;
+            kv.layers.push_back(view);
+            kv.pooled.emplace_back(kvp, DType::BF16, std::initializer_list<std::int32_t>{di / r, kPagedKVPageSize, 1, pool});
+            kvp += pooled;
+        }
+
+        // Expert sources: frame tables (all -1 until make_resident), the frame pool, staging, the
+        // route log (every call's routed ids per layer).
+        const std::size_t E = c.moe.experts, L = c.num_hidden_layers;
+        tables_host.assign(L * E, -1);
+        frames_backing = DeviceBuffer(L * E * 4);
+        frames_backing.fill(0xFF);
+        for (const auto& bank : parameters.model.expert_banks()) { frame_stride = std::max(frame_stride, bank.record_stride); }
+        staging = DeviceBuffer(static_cast<std::size_t>(staging_slots) * frame_stride);
+        route_stride = c.moe.top_k * static_cast<std::size_t>(kPrefillChunk);
+        route_log    = DeviceBuffer(L * route_stride * 4);
+        frame_capacity = static_cast<std::int32_t>(frame_budget_bytes / frame_stride);
+        if (frame_capacity > 0) { frame_pool = DeviceBuffer(static_cast<std::size_t>(frame_capacity) * frame_stride); }
+        ex::ForwardExperts experts;
+        for (std::size_t l = 0; l < L; ++l) {
+            experts.frames.push_back(static_cast<const std::int32_t*>(frames_backing.p) + l * E);
+        }
+        experts.frame_base    = static_cast<const std::uint8_t*>(frame_pool.p);
+        experts.frame_stride  = frame_stride;
+        experts.staging_base  = static_cast<std::uint8_t*>(staging.p);
+        experts.staging_slots = staging_slots;
+        experts.route_log     = static_cast<std::int32_t*>(route_log.p);
+        experts.route_stride  = route_stride;
+        work = std::make_unique<WorkspaceArena>(
+            ex::Forward::workspace_bytes(c, kPrefillChunk, static_cast<std::uint32_t>(context), device.execution_view()));
+        forward = std::make_unique<ex::Forward>(parameters, device, *work, std::move(state), std::move(kv),
+                                                std::move(experts));
+    }
+
+    void save() {
+        state_saved = DeviceBuffer(state_backing.bytes);
+        kv_saved    = DeviceBuffer(kv_backing.bytes);
+        CUDA_CHECK(cudaMemcpy(state_saved.p, state_backing.p, state_backing.bytes, cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaMemcpy(kv_saved.p, kv_backing.p, kv_backing.bytes, cudaMemcpyDeviceToDevice));
+    }
+    void restore() {
+        device.synchronize();
+        CUDA_CHECK(cudaMemcpy(state_backing.p, state_saved.p, state_backing.bytes, cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaMemcpy(kv_backing.p, kv_saved.p, kv_backing.bytes, cudaMemcpyDeviceToDevice));
+    }
+
+    // Makes the given (layer, expert) pairs resident, in order, as far as the frames reach.
+    std::int32_t make_resident(const std::vector<std::pair<std::uint32_t, std::uint32_t>>& experts) {
+        const std::size_t E = config.moe.experts;
+        std::int32_t used   = 0;
+        for (const auto& [l, e] : experts) {
+            if (used == frame_capacity) { break; }
+            const ex::MoeParameters& moe = parameters.layers[l].moe;
+            CUDA_CHECK(cudaMemcpy(static_cast<std::byte*>(frame_pool.p) + std::size_t(used) * frame_stride,
+                                  moe.bank->host_records + std::size_t(e) * moe.bank->record_stride,
+                                  moe.bank->record_stride, cudaMemcpyHostToDevice));
+            tables_host[l * E + e] = used++;
+        }
+        frames_backing.copy_from_host(tables_host.data(), tables_host.size() * 4);
+        return used;
+    }
+
+    // The routed ids of the last call of B columns: [layer][column][k].
+    std::vector<std::int32_t> routes(std::int32_t columns) const {
+        const std::size_t L = config.num_hidden_layers, K = config.moe.top_k;
+        std::vector<std::int32_t> all(L * route_stride), out(L * K * static_cast<std::size_t>(columns));
+        route_log.copy_to_host(all.data(), all.size() * 4);
+        for (std::size_t l = 0; l < L; ++l) {
+            std::copy_n(all.begin() + static_cast<std::ptrdiff_t>(l * route_stride), K * columns,
+                        out.begin() + static_cast<std::ptrdiff_t>(l * K * columns));
+        }
+        return out;
+    }
+
+    const q4::TextConfig& config;
+    const ex::Parameters& parameters;
+    DeviceContext& device;
+    std::int32_t slots;
+    std::uint64_t frame_stride = 0;
+    std::size_t route_stride   = 0;
+    std::int32_t frame_capacity = 0;
+    std::vector<std::int32_t> tables_host;
+    DeviceBuffer state_backing, kv_backing, frames_backing, frame_pool, staging, route_log, state_saved, kv_saved;
+    std::unique_ptr<WorkspaceArena> work;
+    std::unique_ptr<ex::Forward> forward;
+};
+
+// Device inputs of one rows call at fixed addresses (a captured graph reads them every replay).
+struct RowsInputs {
+    RowsInputs(const q4::TextConfig& c, std::int32_t rows) : rows(rows) {
+        const q4::NgramHash hash(c.ple.ngram, 0);
+        row_bytes = c.ple.table.row_bytes * hash.heads();
+        buffer    = DeviceBuffer(4096 + row_bytes * rows);
+        auto* p   = static_cast<std::byte*>(buffer.p);
+        batch.slot_ids         = Tensor(p, DType::I32, {rows});
+        batch.ids              = Tensor(p + 256, DType::I32, {rows});
+        batch.positions        = Tensor(p + 512, DType::I32, {rows});
+        batch.rope_positions   = Tensor(p + 768, DType::I32, {rows, 3});
+        batch.row_rope         = Tensor(p + 1024, DType::I32, {3, rows});
+        batch.block_start_rope = Tensor(p + 1280, DType::I32, {3, rows});
+        batch.ngram_rows       = Tensor(p + 4096, DType::U8,
+                                        {static_cast<std::int32_t>(c.ple.table.row_bytes), static_cast<std::int32_t>(hash.heads()), rows});
+        for (std::int32_t b = 0; b < rows; ++b) { batch.slots.push_back(b); }
+    }
+
+    // Column b: slot b's token `ids[b]` at position `positions[b]`, with that position's n-gram rows.
+    void stage(const q4::TextConfig& c, const std::vector<std::int32_t>& ids, const std::vector<std::int32_t>& positions,
+               const std::vector<std::vector<std::byte>>& ngram) {
+        // Words at the tensors' byte offsets / 4; a text token's three RoPE axes equal its position.
+        const auto R = static_cast<std::int32_t>(c.qsa.compress_ratio);
+        std::vector<std::int32_t> words(384, 0);
+        for (std::int32_t b = 0; b < rows; ++b) {
+            const std::int32_t p = positions[b];
+            words[b]       = b;     // slot_ids
+            words[64 + b]  = ids[b];
+            words[128 + b] = p;
+            for (int a = 0; a < 3; ++a) {
+                words[192 + a * rows + b] = p;         // rope_positions [B, 3] axis-major
+                words[256 + 3 * b + a]    = p;         // row_rope [3, B]
+                words[320 + 3 * b + a]    = p / R * R; // block_start_rope [3, B]
+            }
+        }
+        buffer.copy_from_host(words.data(), words.size() * 4);
+        for (std::int32_t b = 0; b < rows; ++b) {
+            buffer.copy_from_host(ngram[b].data(), row_bytes, 4096 + row_bytes * b);
+        }
+    }
+
+    std::int32_t rows;
+    std::size_t row_bytes = 0;
+    DeviceBuffer buffer;
+    ex::ForwardRowsBatch batch;
+};
+
+// Device inputs of one single-sequence decode call at fixed addresses.
+struct SingleInputs {
+    explicit SingleInputs(const q4::TextConfig& c) {
+        const q4::NgramHash hash(c.ple.ngram, 0);
+        row_bytes = c.ple.table.row_bytes * hash.heads();
+        buffer    = DeviceBuffer(4096 + row_bytes);
+        auto* p   = static_cast<std::byte*>(buffer.p);
+        batch.ids              = Tensor(p, DType::I32, {1});
+        batch.positions        = Tensor(p + 256, DType::I32, {1});
+        batch.rope_positions   = Tensor(p + 512, DType::I32, {1, 3});
+        batch.block_start_rope = Tensor(p + 768, DType::I32, {3});
+        batch.logit_columns    = Tensor(p + 1024, DType::I32, {1});
+        batch.ngram_rows       = Tensor(p + 4096, DType::U8,
+                                        {static_cast<std::int32_t>(c.ple.table.row_bytes), static_cast<std::int32_t>(hash.heads()), 1});
+    }
+
+    void stage(const q4::TextConfig& c, std::int32_t id, std::int32_t position, const std::vector<std::byte>& ngram) {
+        const std::int32_t block = position / static_cast<std::int32_t>(c.qsa.compress_ratio) *
+                                   static_cast<std::int32_t>(c.qsa.compress_ratio);
+        std::vector<std::int32_t> words(257, 0);
+        words[0]   = id;
+        words[64]  = position;
+        words[128] = words[129] = words[130] = position;
+        words[192] = words[193] = words[194] = block;
+        words[256] = 0;
+        buffer.copy_from_host(words.data(), words.size() * 4);
+        buffer.copy_from_host(ngram.data(), row_bytes, 4096);
+    }
+
+    std::size_t row_bytes = 0;
+    DeviceBuffer buffer;
+    ex::ForwardBatch batch;
+};
+
+// Rows mode: see the file comment.
+int rows_mode(int argc, char** argv, const char* artifact_env) {
+    std::int32_t steps = 0, time_rounds = 0, staging_slots = 64;
+    std::int64_t frames_mib = -1;
+    std::vector<std::string> prompt_args;
+    std::vector<std::int32_t> configs;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg.rfind("--", 0) != 0) {
+            prompt_args.push_back(arg);
+            continue;
+        }
+        if (i + 1 >= argc) { throw std::invalid_argument(arg + " needs a value"); }
+        const std::string value = argv[++i];
+        if (arg == "--rows") {
+            steps = std::stoi(value);
+        } else if (arg == "--time") {
+            time_rounds = std::stoi(value);
+        } else if (arg == "--frames-mib") {
+            frames_mib = std::stoll(value);
+        } else if (arg == "--staging") {
+            staging_slots = std::stoi(value);
+        } else if (arg == "--configs") {
+            configs = parse_tokens(value);
+        } else {
+            throw std::invalid_argument("unknown option " + arg);
+        }
+    }
+    const auto P = static_cast<std::int32_t>(prompt_args.size());
+    if (steps < 1 || P < 1 || P > ex::kMaxForwardRows || time_rounds < 0 || time_rounds > steps) {
+        throw std::invalid_argument("--rows STEPS needs 1 to 8 prompts, and --time ROUNDS at most STEPS");
+    }
+    print_memory("start");
+    DeviceContext device(0);
+    auto t0 = std::chrono::steady_clock::now();
+    artifact::Reader reader(artifact_env);
+    if (!q4::is_qwen4_exp(reader)) {
+        std::printf("SKIP: %s is not a Qwen4Exp artifact\n", artifact_env);
+        return 77;
+    }
+    const auto model = q4::load_model(reader, device);
+    device.synchronize();
+    std::printf("loaded in %.1f s: %.2f GiB device, %.2f GiB pinned host\n", seconds_since(t0),
+                gib(model->storage_stats().device_capacity_bytes), gib(model->storage_stats().pinned_bytes));
+    const ex::Parameters parameters(*model);
+    const auto& c         = model->config();
+    const char* ngram_env = std::getenv("NINFER_TEST_QWEN4EXP_NGRAM");
+    q4::NgramVolume volume(ngram_env != nullptr ? std::filesystem::path(ngram_env) : q4::default_ngram_volume(artifact_env),
+                           c.ple.table);
+    volume.set_keepalive(std::chrono::milliseconds(100), std::chrono::milliseconds(60000));
+    const std::size_t vocab = c.vocab_size;
+
+    std::vector<std::vector<std::int32_t>> prompts;
+    std::int32_t longest = 0;
+    for (const auto& arg : prompt_args) {
+        prompts.push_back(parse_prompt(arg, model->resources()));
+        if (prompts.back().size() < 2) { throw std::invalid_argument("a prompt needs at least two tokens"); }
+        longest = std::max<std::int32_t>(longest, static_cast<std::int32_t>(prompts.back().size()));
+    }
+    const std::int32_t context = (longest + steps + 1 + 63) / 64 * 64;
+    std::printf("rows mode: %d prompts (", P);
+    for (const auto& p : prompts) { std::printf(" %zu", p.size()); }
+    std::printf(" tokens), %d decode steps each, context %d, staging slots %d\n", steps, context, staging_slots);
+
+    // 1. Each prompt alone through the single-sequence path: greedy ids [steps + 1] (the prefill's
+    // argmax, then one per decode call) and each decode call's logits.
+    std::vector<std::vector<std::int32_t>> reference(static_cast<std::size_t>(P));
+    std::vector<std::vector<std::vector<float>>> reference_logits(static_cast<std::size_t>(P));
+    DeviceBuffer logits(vocab * ex::kMaxForwardRows * sizeof(float));
+    std::vector<float> host(vocab * ex::kMaxForwardRows);
+    double ngram_ms = 0.0;
+    std::int64_t ngram_reads = 0;
+    for (std::int32_t i = 0; i < P; ++i) {
+        auto tokens = prompts[static_cast<std::size_t>(i)];
+        const auto n = static_cast<std::int32_t>(tokens.size());
+        Harness harness(parameters, device, context, std::min(kPrefillChunk, n), staging_slots);
+        Tensor one(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), 1});
+        for (std::int32_t first = 0; first < n; first += kPrefillChunk) {
+            auto call = make_call(c, volume, tokens, first, std::min(kPrefillChunk, n - first), false);
+            harness.forward->run(call.batch, one);
+            device.synchronize();
+        }
+        logits.copy_to_host(host.data(), vocab * 4);
+        auto& ids = reference[static_cast<std::size_t>(i)];
+        ids.push_back(argmax(host.data(), vocab));
+        t0 = std::chrono::steady_clock::now();
+        for (std::int32_t k = 0; k < steps; ++k) {
+            tokens.push_back(ids.back());
+            const auto ngram_start = std::chrono::steady_clock::now();
+            auto step = make_call(c, volume, tokens, n + k, 1, false);
+            ngram_ms += seconds_since(ngram_start) * 1e3;
+            ++ngram_reads;
+            harness.forward->run(step.batch, one);
+            device.synchronize();
+            logits.copy_to_host(host.data(), vocab * 4);
+            reference_logits[static_cast<std::size_t>(i)].emplace_back(host.begin(), host.begin() + vocab);
+            ids.push_back(argmax(host.data(), vocab));
+        }
+        std::printf("prompt %d alone: %d tokens prefilled, %d decode calls in %.1f s (eager, every expert staged)\n", i, n,
+                    steps, seconds_since(t0));
+    }
+    std::printf("n-gram rows of one decode column (hash, read, stage; host): mean %.3f ms over %lld reads\n",
+                ngram_ms / static_cast<double>(ngram_reads), static_cast<long long>(ngram_reads));
+
+    // 2. One Forward over P slots.
+    std::size_t free_bytes = 0, total_bytes = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+    const std::uint64_t reserve = 3ULL << 30; // the rows harness's state, KV, workspace and graphs
+    std::uint64_t frame_budget  = time_rounds > 0 && free_bytes > reserve ? free_bytes - reserve : 0;
+    if (frames_mib >= 0) { frame_budget = std::min<std::uint64_t>(frame_budget, std::uint64_t(frames_mib) << 20); }
+    RowsHarness rows(parameters, device, P, context, staging_slots, frame_budget);
+    for (std::int32_t i = 0; i < P; ++i) {
+        const auto& tokens = prompts[static_cast<std::size_t>(i)];
+        const auto n       = static_cast<std::int32_t>(tokens.size());
+        rows.forward->select_row(i);
+        Tensor one(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), 1});
+        for (std::int32_t first = 0; first < n; first += kPrefillChunk) {
+            auto call = make_call(c, volume, tokens, first, std::min(kPrefillChunk, n - first), false);
+            rows.forward->run(call.batch, one);
+            device.synchronize();
+        }
+        logits.copy_to_host(host.data(), vocab * 4);
+        if (argmax(host.data(), vocab) != reference[static_cast<std::size_t>(i)].front()) {
+            std::printf("FAIL: slot %d's prefill disagrees with the prompt alone\n", i);
+            return 1;
+        }
+    }
+    rows.save();
+
+    // The n-gram rows of every decode column: column k of prompt i is position n_i + k.
+    std::vector<std::vector<std::vector<std::byte>>> ngram(static_cast<std::size_t>(P));
+    for (std::int32_t i = 0; i < P; ++i) {
+        auto tokens = prompts[static_cast<std::size_t>(i)];
+        for (std::int32_t k = 0; k < steps; ++k) {
+            tokens.push_back(reference[static_cast<std::size_t>(i)][static_cast<std::size_t>(k)]);
+            ngram[static_cast<std::size_t>(i)].push_back(last_rows(c, volume, tokens));
+        }
+    }
+    const auto stage_round = [&](RowsInputs& inputs, std::int32_t k) {
+        std::vector<std::int32_t> ids, positions;
+        std::vector<std::vector<std::byte>> rows_ngram;
+        for (std::int32_t b = 0; b < inputs.rows; ++b) {
+            ids.push_back(reference[static_cast<std::size_t>(b)][static_cast<std::size_t>(k)]);
+            positions.push_back(static_cast<std::int32_t>(prompts[static_cast<std::size_t>(b)].size()) + k);
+            rows_ngram.push_back(ngram[static_cast<std::size_t>(b)][static_cast<std::size_t>(k)]);
+        }
+        inputs.stage(c, ids, positions, rows_ngram);
+    };
+
+    // B rows from the saved state, `steps` rounds: every row's ids and logits against its reference.
+    std::vector<std::vector<std::int32_t>> discovered; // the routes of the widest run, per round
+    bool all_equal = true;
+    for (std::int32_t B = 1; B <= P; ++B) {
+        rows.restore();
+        RowsInputs inputs(c, B);
+        Tensor out(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), B});
+        std::int32_t ids_equal = 0, logits_equal = 0;
+        double max_diff = 0.0;
+        for (std::int32_t k = 0; k < steps; ++k) {
+            stage_round(inputs, k);
+            rows.forward->run_rows(inputs.batch, out);
+            device.synchronize();
+            logits.copy_to_host(host.data(), vocab * B * 4);
+            if (B == P) { discovered.push_back(rows.routes(B)); }
+            for (std::int32_t b = 0; b < B; ++b) {
+                const float* row     = host.data() + vocab * b;
+                const auto& expected = reference_logits[static_cast<std::size_t>(b)][static_cast<std::size_t>(k)];
+                ids_equal += argmax(row, vocab) == reference[static_cast<std::size_t>(b)][static_cast<std::size_t>(k) + 1];
+                logits_equal += std::equal(row, row + vocab, expected.begin());
+                for (std::size_t v = 0; v < vocab; ++v) { max_diff = std::max(max_diff, std::abs(double(row[v]) - expected[v])); }
+            }
+        }
+        const bool equal = ids_equal == B * steps;
+        all_equal        = all_equal && equal;
+        std::printf("B = %d: greedy ids equal to each prompt alone in %d of %d row-steps, logits bitwise equal in %d, "
+                    "max |logit diff| %.6f%s\n",
+                    B, ids_equal, B * steps, logits_equal, max_diff, equal ? "" : "  <-- FAIL");
+    }
+    if (!all_equal) {
+        std::printf("FAIL: rows decode disagrees with the prompts decoded alone\n");
+        return 1;
+    }
+    if (time_rounds == 0) {
+        std::printf("rows checks passed\n");
+        return 0;
+    }
+
+    // 3. Timing. Every expert the widest run routed, most used first, in device frames.
+    const std::size_t L = c.num_hidden_layers, K = c.moe.top_k, E = c.moe.experts;
+    std::vector<std::uint32_t> uses(L * E, 0);
+    for (std::int32_t k = 0; k < time_rounds; ++k) {
+        const auto& r = discovered[static_cast<std::size_t>(k)];
+        for (std::size_t l = 0; l < L; ++l) {
+            for (std::size_t j = 0; j < K * static_cast<std::size_t>(P); ++j) { ++uses[l * E + r[l * K * P + j]]; }
+        }
+    }
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> wanted;
+    for (std::size_t i = 0; i < uses.size(); ++i) {
+        if (uses[i] > 0) { wanted.emplace_back(static_cast<std::uint32_t>(i / E), static_cast<std::uint32_t>(i % E)); }
+    }
+    std::stable_sort(wanted.begin(), wanted.end(), [&](const auto& a, const auto& b) {
+        return uses[a.first * E + a.second] > uses[b.first * E + b.second];
+    });
+    const std::int32_t resident = rows.make_resident(wanted);
+    std::printf("timing: %zu distinct experts routed in %d rounds of B = %d; %d resident (%d frames of %.2f MiB)\n",
+                wanted.size(), time_rounds, P, resident, rows.frame_capacity, rows.frame_stride / 1048576.0);
+
+    struct Sample {
+        std::vector<double> ms;
+        double distinct = 0.0, misses = 0.0;
+        std::int32_t rounds = 0;
+    };
+    // One timed run: restore, then `time_rounds` rounds of B rows (B = 0: the single-sequence call on
+    // slot 0), round 0 eager, round 1 captured, every later round a replay of the graph.
+    const auto timed = [&](std::int32_t B, Sample& sample) {
+        rows.restore();
+        const std::int32_t columns = std::max(B, 1);
+        RowsInputs inputs(c, columns);
+        SingleInputs single(c);
+        Tensor out(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), columns});
+        DecodeGraphDefinition graph;
+        DecodeGraphExecutable exec;
+        cudaEvent_t start = nullptr, stop = nullptr;
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+        const auto body = [&] {
+            if (B == 0) {
+                rows.forward->select_row(0);
+                rows.forward->run(single.batch, out);
+            } else {
+                rows.forward->run_rows(inputs.batch, out);
+            }
+        };
+        for (std::int32_t k = 0; k < time_rounds; ++k) {
+            if (B == 0) {
+                single.stage(c, reference[0][static_cast<std::size_t>(k)], static_cast<std::int32_t>(prompts[0].size()) + k,
+                             ngram[0][static_cast<std::size_t>(k)]);
+            } else {
+                stage_round(inputs, k);
+            }
+            if (k == 0) {
+                body();
+            } else {
+                if (!exec.ready()) {
+                    graph.capture(device.stream, body);
+                    exec.instantiate(graph);
+                    exec.upload(device.stream);
+                }
+                CUDA_CHECK(cudaEventRecord(start, device.stream));
+                exec.launch(device.stream);
+                CUDA_CHECK(cudaEventRecord(stop, device.stream));
+            }
+            device.synchronize();
+            if (k > 0) {
+                float ms = 0.0F;
+                CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+                sample.ms.push_back(ms);
+            }
+            logits.copy_to_host(host.data(), vocab * columns * 4);
+            for (std::int32_t b = 0; b < columns; ++b) {
+                if (argmax(host.data() + vocab * b, vocab) !=
+                    reference[static_cast<std::size_t>(b)][static_cast<std::size_t>(k) + 1]) {
+                    throw std::runtime_error("timed decode diverged from the reference");
+                }
+            }
+            const auto r = rows.routes(columns);
+            for (std::size_t l = 0; l < L; ++l) {
+                std::vector<std::int32_t> ids(r.begin() + static_cast<std::ptrdiff_t>(l * K * columns),
+                                              r.begin() + static_cast<std::ptrdiff_t>((l + 1) * K * columns));
+                std::sort(ids.begin(), ids.end());
+                ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+                sample.distinct += static_cast<double>(ids.size()) / static_cast<double>(L);
+                for (const std::int32_t e : ids) { sample.misses += rows.tables_host[l * E + static_cast<std::size_t>(e)] < 0; }
+            }
+            ++sample.rounds;
+        }
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+    };
+    std::vector<Sample> samples(static_cast<std::size_t>(P + 1));
+    if (configs.empty()) {
+        // ABBA against the single-sequence call: S R_B R_B S for B = 1 .. P, twice.
+        for (int repeat = 0; repeat < 2; ++repeat) {
+            for (std::int32_t B = 1; B <= P; ++B) {
+                for (const std::int32_t run : {0, B, B, 0}) { timed(run, samples[static_cast<std::size_t>(run)]); }
+            }
+        }
+    } else {
+        // The listed configurations once each, inside a profiler capture range (nsys
+        // --capture-range=cudaProfilerApi attributes kernel time to exactly these rounds).
+        CUDA_CHECK(cudaProfilerStart());
+        for (const std::int32_t run : configs) {
+            if (run < 0 || run > P) { throw std::invalid_argument("--configs entries are 0 (single) to P"); }
+            timed(run, samples[static_cast<std::size_t>(run)]);
+        }
+        CUDA_CHECK(cudaProfilerStop());
+    }
+    const auto report = [&](const char* name, const Sample& s) {
+        const auto [lo, hi] = std::minmax_element(s.ms.begin(), s.ms.end());
+        std::printf("%-26s median %.3f ms per round [%.3f-%.3f] over %zu rounds; %.2f distinct experts per layer, "
+                    "%.2f misses per round\n",
+                    name, median(s.ms), *lo, *hi, s.ms.size(), s.distinct / s.rounds, s.misses / s.rounds);
+    };
+    report("single-sequence call", samples[0]);
+    for (std::int32_t B = 1; B <= P; ++B) {
+        const std::string name = "rows call, B = " + std::to_string(B);
+        report(name.c_str(), samples[static_cast<std::size_t>(B)]);
+    }
+    if (samples[0].ms.empty()) {
+        std::printf("rows checks passed\n");
+        return 0;
+    }
+    const double base   = median(samples[0].ms), base_d = samples[0].distinct / samples[0].rounds;
+    const double base_m = samples[0].misses / samples[0].rounds;
+    for (std::int32_t B = 2; B <= P; ++B) {
+        const Sample& s = samples[static_cast<std::size_t>(B)];
+        if (s.ms.empty()) { continue; }
+        const double delta = (median(s.ms) - base) / (B - 1);
+        // The spike's terms: per layer 3.67 us per distinct expert and 4.3 us per column (Op bench),
+        // and 43.6 us per miss (its fit of the server's C = 1 decode).
+        const double expert = 48.0 * (3.67 * (s.distinct / s.rounds - base_d) + 4.3 * (B - 1)) / 1000.0 / (B - 1);
+        const double misses = 0.0436 * (s.misses / s.rounds - base_m) / (B - 1);
+        std::printf("B = %d: +%.3f ms per extra row over the single-sequence call; of which routed-expert work "
+                    "(bench model) %.3f ms, extra misses (43.6 us each) %.3f ms, non-expert %.3f ms\n",
+                    B, delta, expert, misses, delta - expert - misses);
+    }
+    std::printf("rows checks passed\n");
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -298,6 +917,7 @@ int main(int argc, char** argv) {
     };
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     try {
+        if (std::string(argv[1]) == "--rows") { return rows_mode(argc, argv, artifact_env); }
         std::vector<Job> jobs;
         std::int32_t staging_slots = 64;
         for (int i = 1; i < argc; ++i) {
