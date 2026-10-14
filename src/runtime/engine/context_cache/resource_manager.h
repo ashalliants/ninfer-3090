@@ -1696,7 +1696,8 @@ private:
             cursor.gain_limit && !superseded_only(handles)
                 ? (quoted_loss
                        ? *quoted_loss
-                       : program.checkpoint_recovery_loss(handles, surviving(program, handles)))
+                       : stored_loss(handles, program.checkpoint_recovery_loss(
+                                                  handles, surviving(program, handles))))
                 : 0;
         for (const auto handle : handles) {
             if (!erase(program, handle, cursor.rights)) {

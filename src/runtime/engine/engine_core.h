@@ -434,6 +434,10 @@ public:
                 }
             } catch (...) {}
         }
+        // A shared write can make the store evict older images: forget their marks so the owners
+        // pass writes those conversations again instead of trusting them.
+        forget_failed_store_writes();
+        forget_removed_store_images();
         auto owners = resources_.retained_owners(program);
         std::sort(owners.begin(), owners.end(), [&](const auto& a, const auto& b) {
             return mark(a.token).last_used > mark(b.token).last_used;
