@@ -221,6 +221,13 @@ int test_budgets_and_nonsemantic_hints() {
     failures += check(accepted.max_tool_calls == 0,
                       "typed nonsemantic hints are accepted without changing generation");
 
+    hints["safety_identifier"] = std::string(129, 'x');
+    failures += check(api_error([&] {
+                          (void)parse_openai_responses_create_request(hints, limits());
+                      }).param == "safety_identifier",
+                      "a safety_identifier over 128 characters is rejected, not thrown past the parser");
+    hints["safety_identifier"] = std::string(128, 'x');
+
     hints["client_metadata"] = nullptr;
     failures += check(parse_openai_responses_create_request(hints, limits()).prompt.model == "m",
                       "null client_metadata is neutral");

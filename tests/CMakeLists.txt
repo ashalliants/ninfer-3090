@@ -11,3 +11,6 @@ include(models/qwen4_exp/tests.cmake)
 include(ops/tests.cmake)
 
 ninfer_finalize_bundle(ninfer_tests)
+
+# After every test above exists: label each one cpu or gpu (see the file for what that means).
+include(cmake/TestGpuClasses.cmake)

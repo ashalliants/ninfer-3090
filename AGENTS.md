@@ -234,7 +234,12 @@ cmake --build .                                  # everything
 cmake --build . --target <name>                  # one target
 ctest -j2                                        # full suite, ~13 min (159 tests, see below)
 ctest -R <regex> --output-on-failure             # one test
+pwsh tools/run-tests.ps1 [-CpuOnly|-GpuOnly]     # the suite on this shared machine (see CLAUDE.md)
 ```
+
+On this machine run tests through `tools/run-tests.ps1` rather than bare `ctest`: tests labelled
+`cpu` need no GPU lock, and the `gpu` ones take the lock one test at a time instead of for the whole
+suite.
 
 Full-suite timing, measured 2026-10-06 on the RTX 3090 with the GPU otherwise idle: 159 tests, 768 s
 wall at `-j2`, 8 of them skipped without `NINFER_TEST_ARTIFACT` (the `*_real_test` family). The

@@ -124,7 +124,7 @@ OpenAIPromptCachePolicy parse_openai_prompt_cache_policy(const RequestJson& body
         }
     };
     require_string_hint("prompt_cache_key", 64U);
-    require_string_hint("safety_identifier", 64U);
+    require_string_hint("safety_identifier", 128U);
     require_string_hint("user");
 
     if (body.contains("prompt_cache_retention") && !body.at("prompt_cache_retention").is_null()) {
