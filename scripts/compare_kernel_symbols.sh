@@ -20,9 +20,12 @@ PATTERN="${3:-small_t_i8_tiled_kernel|small_t_reduce_output_kernel}"
 # in every ninfer_ops object file under the build dir, sorted.
 dump() {
     local build="$1"
-    local objdir="$build/src/CMakeFiles/ninfer_ops.dir"
-    [ -d "$objdir" ] || { echo "no ninfer_ops objects under $build" >&2; exit 2; }
-    find "$objdir" -name '*.o' -print0 |
+    # The target lives in src/ops, so its objects are under src/ops/CMakeFiles/ninfer_ops.dir.
+    # Search for the directory rather than hardcoding it; Linux builds emit .o, Windows .obj.
+    local objdir
+    objdir="$(find "$build" -type d -name ninfer_ops.dir -path '*CMakeFiles*' -print -quit)"
+    [ -n "$objdir" ] || { echo "no ninfer_ops.dir under $build" >&2; exit 2; }
+    find "$objdir" \( -name '*.o' -o -name '*.obj' \) -print0 |
         xargs -0 -n1 cuobjdump --dump-resource-usage 2>/dev/null |
         awk -v pat="$PATTERN" '
             /^ *Function / { name = $2; sub(/:$/, "", name); next }
