@@ -138,10 +138,20 @@ def main() -> int:
             words = t.rng.randint(args.turn_words_min, args.turn_words_max)
             t.messages.append({"role": "user", "content": f"Tenant {t.index} visit {t.visits}. Tool result:\n" + filler(t.rng, words)})
             request = chat_request(model, t.messages, args.reply_tokens)
-            ex = client.prepare(request)
-            sent: list[int] = []
             started = time.perf_counter() - t0
-            res = ex.execute(on_sent=sent.append)
+            try:
+                ex = client.prepare(request)
+                sent: list[int] = []
+                res = ex.execute(on_sent=sent.append)
+            except Exception as exc:  # a failed request is a failed sample, never a missing one
+                s = Sample(t.index, t.visits, started, 0, 0, 0, None, 0.0, f"{type(exc).__name__}: {exc}")
+                with lock:
+                    samples.append(s)
+                    t.visits += 1
+                    t.messages.pop()
+                    t.busy = False
+                print(f"t={t.index} v={s.visit} err={s.error}", file=sys.stderr, flush=True)
+                continue
             first = next((e.received_ns for e in res.events if e.kind == "model_output"), None)
             text = "".join(e.output for e in res.events if e.kind == "model_output")
             usage: dict[str, Any] = {}
@@ -201,6 +211,9 @@ def main() -> int:
         json.dump({"summary": summary, "args": {k: str(v) for k, v in vars(args).items()},
                    "samples": [asdict(s) for s in samples]}, f, indent=1)
     print(json.dumps(summary, indent=1))
+    if len(samples) != args.requests:
+        print(f"incomplete run: {len(samples)} samples recorded, {args.requests} requested", file=sys.stderr)
+        return 1
     return 0
 
 

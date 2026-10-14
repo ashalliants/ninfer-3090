@@ -2860,7 +2860,8 @@ private:
         if (store_.store == nullptr) { return 0; }
         try {
             const auto stats = store_.store->stats();
-            return stats.evicted_for_space + stats.expired + stats.corrupt_removed;
+            return stats.evicted_for_space + stats.expired + stats.corrupt_removed +
+                   stats.remote_removed;
         } catch (...) { return store_removals_seen_; }
     }
 
@@ -2887,17 +2888,21 @@ private:
     // units, never while a request waits for admission, binds, prefills or replays, so keeping
     // the store current does not delay a request already waiting; at least a second apart.
     void persist_idle_session() noexcept {
-        if (!store_.sink || store_.idle_persist.count() <= 0) { return; }
+        if (!store_.sink) { return; }
         const auto now = Clock::now();
         if (now < next_persist_scan_) { return; }
         next_persist_scan_ = now + std::chrono::seconds(1);
         try {
-            if (forget_failed_store_writes()) {
+            // Marks are reconciled even with idle writes off: eviction pricing and
+            // write-on-evict read them whether or not this worker ever writes.
+            const bool failing = forget_failed_store_writes();
+            forget_removed_store_images();
+            if (store_.idle_persist.count() <= 0) { return; }
+            if (failing) {
                 // A failing disk: do not export deep sessions over and over.
                 next_persist_scan_ = now + std::chrono::seconds(30);
                 return;
             }
-            forget_removed_store_images();
             auto& program = *instance_.program;
             if (materializing_ || context_owner_ || program.has_context_transaction() ||
                 (store_.ready && !store_.ready())) {

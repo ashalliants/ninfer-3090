@@ -1417,6 +1417,7 @@ std::size_t ContextStore::refresh_remote(std::chrono::steady_clock::time_point d
             }
         }
         for (const std::string& id : gone) { remove_entry_locked(id, false); }
+        stats_.remote_removed += gone.size();
         ++stats_.remote_refreshes;
     } catch (const std::exception&) {
         std::scoped_lock lock(mutex_);

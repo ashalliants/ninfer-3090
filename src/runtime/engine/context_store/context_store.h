@@ -132,6 +132,7 @@ public:
         std::uint64_t evicted_for_space = 0;
         std::uint64_t expired           = 0;
         std::uint64_t superseded        = 0;
+        std::uint64_t remote_removed    = 0; // images a remote refresh found gone
         // With a remote: images only the remote holds, and the traffic to it.
         std::uint64_t remote_images          = 0;
         std::uint64_t remote_uploads         = 0; // objects uploaded (chunks and manifests)

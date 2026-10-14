@@ -137,8 +137,9 @@ std::string context_store_binding(const EngineOptions& options, const LoadSummar
 // beyond the bound an idle continuation is simply written later.
 constexpr std::size_t kMaximumPendingStoreWrites = 2;
 // A conversation the cache is evicting has no later chance: its image is queued while the queue
-// holds less than this many bytes (always when it is empty), on top of the idle bound. Host RAM,
-// not pinned memory; it drains at the store's write rate.
+// holds less than this many bytes (always when it is empty), on top of the idle bound: it queues
+// behind idle writes rather than being dropped, because a dropped eviction is a recompute. Host
+// RAM, not pinned memory; it drains at the store's write rate.
 constexpr std::size_t kMaximumPendingEvictionBytes = std::size_t{4} << 30U;
 
 // The store keeps up to this share of the volume's free space when no limit is configured.
@@ -706,6 +707,11 @@ private:
         writer_cv.notify_all();
         if (writer.joinable()) { writer.join(); }
         std::scoped_lock lock(writer_mutex);
+        // Images abandoned at the deadline were marked stored when they were queued; count them
+        // as failed writes so the final flush clears those marks and writes them again.
+        if (!pending_writes.empty()) {
+            store_write_failures.fetch_add(pending_writes.size(), std::memory_order_relaxed);
+        }
         pending_writes.clear();
     }
 };
