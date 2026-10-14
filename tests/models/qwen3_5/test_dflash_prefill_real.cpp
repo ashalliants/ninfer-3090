@@ -1,3 +1,10 @@
+// Real-artifact check of DFlash/DFlash2 prefill state handling. NINFER_TEST_ARTIFACT must be a Qwen3.8-27B
+// artifact with the DFlash2 component AND a Q8 (q8_g32_fp16) or FP8 output head: the fixture calls
+// linear_topk on the full head directly, which accepts only those layouts. neroued/Qwen3.8-27B-NInfer
+// at 1cbd84e7 (20,437,521,664 bytes, sha256 81f924d4...) qualifies; this fork's own 27B conversion, with
+// a 6-bit head, fails here with "linear_topk: unsupported head profile" (the server itself runs it, since
+// the serving route does not use that fixture). Argument "dflash" instead needs a DFlash (v1) artifact.
+
 #include "core/device.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/program/execution_context.h"

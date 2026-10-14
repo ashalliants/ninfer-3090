@@ -110,6 +110,18 @@ ninfer::PromptInput media_followup(const ninfer::GenerationResult& first) {
     return input;
 }
 
+// A restore is kept only when reading the checkpoint back costs less than prefilling the prefix again
+// (the context cost model), so the boundary fixtures need a prompt long enough to be worth restoring:
+// this one is about 200 tokens, and the 4,100-token fixture below still fits the 4,352-token context.
+std::string boundary_prompt_text() {
+    std::string text = "Here are some primes:";
+    for (const int prime : {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97,
+                            101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157, 163, 167, 173, 179, 181, 191, 193}) {
+        text += " " + std::to_string(prime);
+    }
+    return text + ". Name one prime number.";
+}
+
 ninfer::PromptInput initial_conversation() {
     ninfer::PromptInput input;
     input.options.enable_thinking   = false;
@@ -118,7 +130,7 @@ ninfer::PromptInput initial_conversation() {
     ninfer::ChatMessage user;
     user.role = ninfer::ChatRole::User;
     user.parts.push_back(ninfer::MessagePart{
-        .kind = ninfer::MessagePartKind::Text, .text = "Name one prime number.", .media = {}});
+        .kind = ninfer::MessagePartKind::Text, .text = boundary_prompt_text(), .media = {}});
     input.messages.push_back(std::move(user));
     return input;
 }
