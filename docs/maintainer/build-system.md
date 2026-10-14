@@ -154,16 +154,29 @@ dispatch remain in C++; CMake only selects translation units.
 
 ## CUDA compilation boundaries
 
-`ninfer_core` and `ninfer_ops` enable separable compilation (RDC) and resolve device symbols in
-the static archive build. Keep this device-link boundary explicit.
+`ninfer_core` and `ninfer_ops` build whole-program by default. `-DNINFER_CUDA_RDC=ON` switches
+both to separable compilation (RDC) with device symbols resolved in the static archive build; that
+device-link boundary is then explicit.
 
-Nothing in `src/` currently needs RDC (no `extern __device__`/`__constant__`, no cross-TU device
-declarations, no device function pointers or dynamic parallelism), so whole-program compilation is
-a supported alternative. It was measured on the RTX 3090 (sm_86, CUDA 12.8, 27B DFlash2 bundle,
-rk4v4 KV, three interleaved rounds) and bought nothing: pp512/pp2048/pp8192 +0.4/-0.6/-1.4% and
-decode within +-0.3%, all inside run-to-run spread; kernels with a stack frame went 839 -> 855 and
-`ninfer_bench.exe` shrank 0.7%. The sm_89 fork reported +2.7-4.9% prefill from the same switch;
-re-measure before adopting it on a new architecture or toolchain.
+Nothing in `src/` needs RDC (no `extern __device__`/`__constant__`, no cross-TU device
+declarations, no device function pointers or dynamic parallelism). RDC costs a single-threaded
+`nvcc -dlink` over every `ninfer_ops` object at the end of each build: about 90 s on the RTX 3090
+box (nvlink 53 s, fatbinary 14 s, cl.exe compiling the embedded-fatbin wrapper 23 s), with every
+other core idle. Whole-program compilation removes it and takes a cold `ninfer_ops` plus
+`ninfer_tests` build from 8m40s to 7m42s (the compile phase itself is about 28 s slower without
+RDC).
+
+Performance was measured on the RTX 3090 (sm_86, CUDA 12.8, 27B, int8-group64 KV, `ninfer_bench`
+pp512/pp2048/tg128, two interleaved ABBA sets, four runs per variant): whole-program vs RDC was
++0.4%, +0.5% and +1.0%, inside the ~1% run-to-run spread. An earlier upstream measurement of the
+same switch (three interleaved rounds, DFlash2 bundle) gave pp512/pp2048/pp8192 +0.4/-0.6/-1.4% and
+decode within +-0.3%; the sm_89 fork reported +2.7-4.9% prefill. The switch does change `ptxas`
+resource usage: of 4,526 kernels, 1,531 differ in registers, stack or shared memory (771 use fewer
+registers, 211 more; for example the decode `q8_a16_gemv_kernel` goes from 35 to 90 registers), so
+re-measure before relying on it on a new architecture or toolchain. When comparing builds, compare
+the device-linked kernels of the RDC build (`cuobjdump --dump-resource-usage` on
+`cmake_device_link.obj`) with the per-object kernels of the whole-program build: per-object RDC
+numbers carry the calling-convention ABI and no static shared memory yet.
 
 `ninfer_nvfp4_non_rdc` disables separable compilation and device-symbol resolution. It contains
 the warp-specialized Linear, LinearSwiGLU and causal-attention NVFP4 sources that depend on

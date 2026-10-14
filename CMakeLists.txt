@@ -31,6 +31,11 @@ endif()
 option(NINFER_BUILD_APPS "Build the NInfer CLI, server and perplexity evaluator" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)
 option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
+# ninfer_core and ninfer_ops used to build with relocatable device code (RDC), which adds a
+# single-threaded nvcc -dlink step (about 90 s on the 3090 box) over every ninfer_ops object to each
+# build. Nothing in src/ needs RDC, so the default is whole-program compilation. Turn it back on
+# with -DNINFER_CUDA_RDC=ON; see "CUDA compilation boundaries" in docs/maintainer/build-system.md.
+option(NINFER_CUDA_RDC "Build ninfer_core and ninfer_ops with relocatable device code" OFF)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

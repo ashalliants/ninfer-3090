@@ -8,8 +8,8 @@ endfunction()
 
 function(ninfer_cuda_archive target)
   set_target_properties(${target} PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-    CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+    CUDA_SEPARABLE_COMPILATION ${NINFER_CUDA_RDC}
+    CUDA_RESOLVE_DEVICE_SYMBOLS ${NINFER_CUDA_RDC})
   if(WIN32)
     set_target_properties(${target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
   endif()
