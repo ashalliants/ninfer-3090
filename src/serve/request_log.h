@@ -25,8 +25,10 @@ namespace ninfer::serve {
 // Upstream 24 adds the request_scheduling event; 25 was the fork on top of upstream 24. Upstream
 // 25 adds constraint observations and admission stats; 26 is the fork on top of upstream 25;
 // 27 adds the reasoning-loop fields; 28 adds tool_call_parse.duplicate_parameters_repaired;
-// 29 adds tool_call_parse.recovered_from_reasoning.
-inline constexpr int kRequestLogSchemaVersion        = 29;
+// 29 adds tool_call_parse.recovered_from_reasoning; 30 adds the Host allocator failure counters
+// and free-run gauge to throughput records (context_cache.pressure.host_geometry_failures,
+// host_shortage_failures, occupancy.host_context_free_extents).
+inline constexpr int kRequestLogSchemaVersion        = 30;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct ServerLogEnvironment {
