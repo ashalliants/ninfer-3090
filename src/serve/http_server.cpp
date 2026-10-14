@@ -102,6 +102,11 @@ bool report_has_activity(const ThroughputReport& report) {
                report.previous.host_context_occupied_bytes ||
            report.current.host_context_reserved_bytes !=
                report.previous.host_context_reserved_bytes ||
+           report.current.host_context_free_extents != report.previous.host_context_free_extents ||
+           report.current.host_context_geometry_failures !=
+               report.previous.host_context_geometry_failures ||
+           report.current.host_context_shortage_failures !=
+               report.previous.host_context_shortage_failures ||
            report.current.host_work.engine_boundary_ns !=
                report.previous.host_work.engine_boundary_ns ||
            report.current.host_work.program_submit_ns !=
