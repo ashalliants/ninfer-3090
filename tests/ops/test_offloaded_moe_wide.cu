@@ -34,6 +34,7 @@
 #include <memory>
 #include <numeric>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -340,6 +341,33 @@ void test_all_wide_threshold() {
     }
 }
 
+// The MTP drafter's Q2_0+Q2_0 records are served on the narrow route only (offloaded_sparse_moe.h,
+// "Supported domain"). A call that gives such an expert more than kMaxColumns columns must be refused
+// with a clear error, not served wrongly.
+void test_wide_rejects_narrow_only_format() {
+    std::mt19937 rng(909);
+    constexpr int kExperts = 64, kTopK = 10, kColumns = 64;
+    const QType format = QType::GGML_REC_Q2_0_Q2_0;
+    std::vector<std::vector<std::uint8_t>> records;
+    for (int e = 0; e < kExperts; ++e) { records.push_back(random_record(format, rng)); }
+    const auto bank   = make_bank(format, records, align256(om::record_geometry(format).bytes));
+    const auto logits = logits_with_hot(kExperts, kColumns, 4, rng);
+    DeviceRouting r(logits, kExperts, kTopK, kColumns);
+    const auto ids = download<std::int32_t>(r.ids.p, static_cast<std::size_t>(kTopK) * kColumns);
+    const auto x   = random_x(kColumns, rng);
+    DeviceBuffer x_dev(x.size() * 2);
+    x_dev.copy_from_host(x.data(), x.size() * 2);
+    check(job_mix(ids, kExperts).first > 0, "the call routes no wide expert");
+    bool rejected = false;
+    try {
+        (void)run_experts(bank, {"device", 1, 0}, r, x_dev, kColumns);
+    } catch (const std::invalid_argument& e) {
+        rejected = std::string(e.what()).find("unsupported gate/up format") != std::string::npos;
+    }
+    check(rejected, "the wide route must refuse the narrow-only q2_0+q2_0 format with std::invalid_argument");
+    std::printf("q2_0+q2_0     T=%-4d the wide route refuses the narrow-only drafter format\n", kColumns);
+}
+
 void test_real_banks(const char* path) {
     artifact::Reader reader(path);
     std::mt19937 rng(606);
@@ -348,6 +376,13 @@ void test_real_banks(const char* path) {
         const auto* object = std::get_if<artifact::TensorObject>(&reader.directory().objects[i]);
         if (object == nullptr || !is_ggml_record(reader.geometry({i}).format)) { continue; }
         const auto& g = reader.geometry({i});
+        if (g.format == QType::GGML_REC_Q2_0_Q2_0) {
+            // The MTP drafter's bank: the narrow route only (offloaded_sparse_moe.h, "Supported domain"),
+            // and the wide route rejects it. ninfer_offloaded_moe_layer_test checks it at 1-8 columns.
+            std::printf("real bank %s (%s): narrow route only, covered by the layer test\n", object->id.c_str(),
+                        format_name(g.format));
+            continue;
+        }
         std::vector<std::vector<std::uint8_t>> records;
         for (int e = 0; e < 32; ++e) {
             const auto bytes = reader.read_range(object->offset + static_cast<std::uint64_t>(16 * e) * g.record_stride, g.record_bytes);
@@ -405,12 +440,19 @@ int main(int argc, char** argv) {
         bench();
         return 0;
     }
-    test_synthetic_banks();
-    if (!g_small) { test_all_wide_threshold(); }
-    if (const char* path = std::getenv("NINFER_TEST_ARTIFACT"); path != nullptr && *path != 0) {
-        test_real_banks(path);
-    } else {
-        std::printf("NINFER_TEST_ARTIFACT not set: real expert banks not checked\n");
+    try {
+        test_synthetic_banks();
+        if (!g_small) { test_all_wide_threshold(); }
+        test_wide_rejects_narrow_only_format();
+        if (const char* path = std::getenv("NINFER_TEST_ARTIFACT"); path != nullptr && *path != 0) {
+            test_real_banks(path);
+        } else {
+            std::printf("NINFER_TEST_ARTIFACT not set: real expert banks not checked\n");
+        }
+    } catch (const std::exception& e) {
+        // An uncaught exception ends the process with 0xc0000409 and no message on Windows.
+        std::fprintf(stderr, "FAIL: uncaught exception: %s\n", e.what());
+        return 1;
     }
     std::printf("offloaded_moe_wide: passed\n");
     return 0;
