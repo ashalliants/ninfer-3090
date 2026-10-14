@@ -70,6 +70,41 @@ Two routes, which answer different questions and must not be read against each o
 - Flash-Next prefill climbs with prompt length (1,281 to 2,328 tok/s) because short prompts are
   dominated by loading experts into the cache, which a long prompt amortises.
 
+**Forking a conversation and continuing both branches (prefix reuse), HTTP route, one run.** Sections of
+9,000 characters of this repository's markdown (2,400-3,300 tokens each) form a conversation as user
+messages with a fixed assistant reply ("Noted.") between them, so branches share an exact token prefix.
+Steps run in this order against one fresh server, with `cached` read from the response's
+`prompt_tokens_details.cached_tokens` and 24 output tokens per request. Flash-Next ran with MTP and
+INT8 KV at 32K context, the 27B with DFlash2 + n-gram copies and rk4v4 at 64K. Both models tokenize
+the prompts identically, so the token counts are the same.
+
+| Step (sections sent) | Prompt tokens | Cached | New tokens | First word, 27B | First word, Flash-Next |
+|---|---:|---:|---:|---:|---:|
+| 1+2 (new conversation) | 5,161 | 0 | 5,161 | 2.05 s | 2.41 s |
+| 1+2+3 (continue) | 7,599 | 5,164 | 2,435 | 0.94 s | 1.32 s |
+| 1+2+4 (fork from 1+2) | 8,144 | 5,152 | 2,992 | 1.23 s | 1.53 s |
+| 1+2+3+5 (continue branch A) | 10,881 | 7,602 | 3,279 | 1.27 s | 1.61 s |
+| 1+2+4+6 (continue branch B) | 11,094 | 8,147 | 2,947 | 1.16 s | 1.48 s |
+| 1+2+3+5+7 (branch A again) | 14,051 | 10,884 | 3,167 | 1.30 s | 1.56 s |
+| 1+2+4+6+8 (branch B again) | 14,284 | 11,097 | 3,187 | 1.32 s | 1.56 s |
+| 1+2+3+5 (exact repeat) | 10,881 | 10,872 | 9 | 0.11 s | 0.11 s |
+| 1+2+3+9 (late fork from 1+2+3) | 10,746 | 7,590 | 3,156 | 1.32 s | 1.51 s |
+| control: the 14,052-token 1+2+3+5+7, different first line | 14,052 | 0 | 14,052 | 5.69 s | 6.47 s |
+| control: the 14,285-token 1+2+4+6+8, different first line | 14,285 | 0 | 14,285 | 5.76 s | 6.56 s |
+
+- **Every step reused its parent's prefix.** The cached count equals the parent's prompt (a few tokens
+  more or fewer at the reply boundary), and the new tokens are the new section plus a handful. Both
+  branches stayed cached side by side: branch A continued after branch B had been created, and a late
+  fork from 1+2+3 still found 7,590 tokens after the 1+2+4 branches existed.
+- **Cost of a branch step against a cold prompt of the same length:** about 1.3 s against 5.7 s on the
+  27B and 1.6 s against 6.5 s on Flash-Next, at 14K tokens, so 4.4x and 4.1x faster to the first word.
+- The "cached" percentage rises with depth (68% to 78%) only because the shared prefix grows while each
+  step adds one section of similar size.
+- **Limits:** one run, one request per step, no thinking, 24 output tokens, one server per model so
+  the cache never had to evict, 32K and 64K contexts, and a generated reply that is the same each turn.
+  A real agent's changing tool output, edits to earlier turns, and many concurrent conversations are not
+  covered here; the agent-rotation and hosted-workload benchmarks in `tools/bench` measure those.
+
 **KV format for the 27B with MTP3.** The launcher's `tuned` profile uses rk4v4 and the C8 profile INT8.
 An interleaved INT8 / rk4v4 / rk4v4 / INT8 run (identical flags otherwise) shows:
 

@@ -35,7 +35,10 @@ text, medians of four requests): **112 / 113 / 104 tok/s decode with MTP** after
 29K-token prompt against 84 / 82 / 83 without (1.34x to 1.38x at the shorter two, 1.26x at 29K), at
 1,281 to 2,328 tok/s prefill, and a repeated 29K prompt answers its first word in 0.14 s. Measure
 only after the model and `.ngram` volume have been read from disk once: a first run after clearing
-RAM read 93 tok/s decode and a third of the prefill speed.
+RAM read 93 tok/s decode and a third of the prefill speed. Prefix reuse also works across forked
+conversations on both Flash-Next and the 27B: after a 1+2 conversation was continued as 1+2+3 and
+forked as 1+2+4, each branch could be continued again and reused its whole shared prefix, so a
+14K-token branch step reached its first word in about 1.3-1.6 s against 5.7-6.5 s cold.
 [Details](docs/performance.md#v0160-release-binaries-all-three-models-2026-10-14).
 
 ![Qwen3.8-Flash-Next on one RTX 3090: NInfer-3090 against Strata 0.1.38 on the same GGUF](docs/assets/flash-next-speed.svg)
