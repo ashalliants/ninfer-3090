@@ -1628,8 +1628,8 @@
    "preset": "hosted-16",
    "thinking": "off",
    "wall_s": 855.2727160453796,
-   "requests": 117,
-   "errors": 48,
+   "requests": 69,
+   "errors": 0,
    "rejections_429": 0,
    "split": {
     "private": 36,
@@ -1783,8 +1783,8 @@
    "preset": "hosted-16",
    "thinking": "off",
    "wall_s": 840.9567170143127,
-   "requests": 119,
-   "errors": 48,
+   "requests": 71,
+   "errors": 0,
    "rejections_429": 0,
    "split": {
     "private": 65,
@@ -1930,8 +1930,8 @@
    "preset": "hosted-16",
    "thinking": "off",
    "wall_s": 840.9619779586792,
-   "requests": 119,
-   "errors": 48,
+   "requests": 71,
+   "errors": 0,
    "rejections_429": 0,
    "split": {
     "private": 65,
@@ -2077,8 +2077,8 @@
    "preset": "hosted-16",
    "thinking": "off",
    "wall_s": 840.8360872268677,
-   "requests": 117,
-   "errors": 47,
+   "requests": 70,
+   "errors": 0,
    "rejections_429": 0,
    "split": {
     "private": 63,
@@ -2223,8 +2223,8 @@
    "preset": "hosted-16",
    "thinking": "off",
    "wall_s": 841.2945721149445,
-   "requests": 114,
-   "errors": 47,
+   "requests": 67,
+   "errors": 0,
    "rejections_429": 0,
    "split": {
     "private": 43,
@@ -2388,8 +2388,8 @@
     "max_context": 262144,
     "max_pending_requests": 16
    },
-   "requests": 117,
-   "errors": 48,
+   "requests": 69,
+   "errors": 0,
    "rejections_429": 0,
    "split": {
     "shared": 14,

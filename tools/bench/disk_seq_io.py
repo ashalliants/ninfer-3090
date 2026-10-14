@@ -152,17 +152,20 @@ def read_all(path: Path, buffer: mmap.mmap, block: int, unbuffered: bool) -> tup
 
 def one_pass(path: Path, size: int, block: int, buffered: bool) -> dict[str, float]:
     buffer = mmap.mmap(-1, block)  # page aligned, as unbuffered I/O requires
-    buffer.write(os.urandom(block))
     blocks = size // block
     result: dict[str, float] = {}
+    owned = False  # only unlink a file our own exclusive create made
     try:
         handle = open_file(path, write=True, unbuffered=True)
+        owned = True
         try:
-            start = time.perf_counter()
-            for index in range(blocks):
-                buffer[0:8] = index.to_bytes(8, "little")  # no two blocks identical
+            elapsed = 0.0
+            for _ in range(blocks):
+                buffer[:] = os.urandom(block)  # fresh incompressible block, outside the timing
+                start = time.perf_counter()
                 handle.write(buffer, block)
-            result["write_gbps"] = blocks * block / (time.perf_counter() - start) / 1e9
+                elapsed += time.perf_counter() - start
+            result["write_gbps"] = blocks * block / elapsed / 1e9
         finally:
             handle.close()
         drop_cache_hint(path)
@@ -176,7 +179,8 @@ def one_pass(path: Path, size: int, block: int, buffered: bool) -> dict[str, flo
                 result[label] = total / seconds / 1e9
     finally:
         buffer.close()
-        path.unlink(missing_ok=True)
+        if owned:
+            path.unlink(missing_ok=True)
     return result
 
 

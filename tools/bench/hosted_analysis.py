@@ -112,7 +112,8 @@ def analyse(run: Path, tolerance: int, kv_bytes: float, state_bytes: float,
     dropped_host = lru_ceiling(records, host_bytes, kv_bytes, state_bytes)
 
     # The LRU model sees every request; the statistics only those submitted after warm-up.
-    ok = [r for r in records if r["error"] is None and r["submit_s"] >= warmup_s]
+    measured = [r for r in records if r["submit_s"] >= warmup_s]
+    ok = [r for r in measured if r["error"] is None]
     split: dict[str, int] = defaultdict(int)
     by_kind: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     lost: dict[str, float] = defaultdict(float)
@@ -204,7 +205,7 @@ def analyse(run: Path, tolerance: int, kv_bytes: float, state_bytes: float,
         "run": run.name, "warmup_s": warmup_s,
         "preset": summary["preset"], "thinking": summary["thinking"], "wall_s": wall,
         "capacity": capacity,
-        "requests": len(records), "errors": len(records) - len(ok),
+        "requests": len(measured), "errors": len(measured) - len(ok),
         "rejections_429": sum(r.get("rejections", 0) for r in records),
         "split": dict(split),
         "tokens": {"prompt": total_prompt, "cached": total_cached, "ideal": total_ideal,
