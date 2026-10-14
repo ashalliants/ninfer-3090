@@ -431,6 +431,11 @@ struct PhysicalUsageSnapshot {
     std::size_t host_peak_occupied_bytes = 0;
     std::uint32_t host_state_slots       = 0;
     std::size_t host_kv_bytes            = 0;
+    // Host allocator health: free runs now, and allocations that found none (monotonic), split
+    // into runs too small although enough bytes were free (geometry) and not enough bytes.
+    std::size_t host_free_extents          = 0;
+    std::uint64_t host_geometry_failures   = 0;
+    std::uint64_t host_shortage_failures   = 0;
 };
 
 class Program {

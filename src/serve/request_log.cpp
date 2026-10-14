@@ -1131,7 +1131,11 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
          Json{{"spill_pages",
                monotonic_delta(previous.pressure_spill_pages, current.pressure_spill_pages)},
               {"partial_tail_cow_pages",
-               monotonic_delta(previous.partial_tail_cow_pages, current.partial_tail_cow_pages)}}},
+               monotonic_delta(previous.partial_tail_cow_pages, current.partial_tail_cow_pages)},
+              {"host_geometry_failures", monotonic_delta(previous.host_context_geometry_failures,
+                                                         current.host_context_geometry_failures)},
+              {"host_shortage_failures", monotonic_delta(previous.host_context_shortage_failures,
+                                                         current.host_context_shortage_failures)}}},
         {"occupancy",
          Json{{"device_state_slots", current.device_state_occupied_slots},
               {"host_state_slots", current.host_state_occupied_slots},
@@ -1140,7 +1144,8 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
               {"host_kv_bytes", current.host_kv_occupied_bytes},
               {"host_context_occupied_bytes", current.host_context_occupied_bytes},
               {"host_context_peak_occupied_bytes", current.host_context_peak_occupied_bytes},
-              {"host_context_reserved_bytes", current.host_context_reserved_bytes}}},
+              {"host_context_reserved_bytes", current.host_context_reserved_bytes},
+              {"host_context_free_extents", current.host_context_free_extents}}},
         {"actual_transfer_seconds", monotonic_delta(previous.actual_context_transfer_seconds,
                                                     current.actual_context_transfer_seconds)}};
     record["engine_recoveries"] =

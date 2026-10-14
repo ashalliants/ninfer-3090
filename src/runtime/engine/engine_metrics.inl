@@ -180,6 +180,9 @@ void EngineCore<Instance>::publish_runtime_stats() {
     snapshot.host_kv_occupied_bytes           = physical.host_kv_bytes;
     snapshot.host_context_reserved_bytes      = physical.host_reserved_bytes;
     snapshot.host_context_peak_occupied_bytes = physical.host_peak_occupied_bytes;
+    snapshot.host_context_free_extents        = physical.host_free_extents;
+    snapshot.host_context_geometry_failures   = physical.host_geometry_failures;
+    snapshot.host_context_shortage_failures   = physical.host_shortage_failures;
     snapshot.materializing_requests           = materializing_.has_value() ? 1U : 0U;
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
         if (slots_[lane] == nullptr) { continue; }

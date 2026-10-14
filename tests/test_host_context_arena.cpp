@@ -90,6 +90,36 @@ void test_fragmentation_and_split() {
     expect(!disabled.allocate(256) && disabled.capacity_bytes() == 0,
            "Host zero has no backing or allocations");
 }
+
+void test_failures_are_counted_by_cause() {
+    constexpr std::size_t unit = ninfer::HostContextArena::alignment;
+    ninfer::HostContextArena arena(4 * unit, unit);
+    expect(arena.geometry_failures() == 0 && arena.shortage_failures() == 0 &&
+               arena.free_extent_count() == 1,
+           "a fresh arena has one free run and no failures");
+    auto first  = arena.allocate(unit);
+    auto second = arena.allocate(unit);
+    auto third  = arena.allocate(unit);
+    auto fourth = arena.allocate(unit);
+    expect(first && second && third && fourth && !arena.allocate(unit),
+           "a full arena refuses another allocation");
+    expect(arena.shortage_failures() == 1 && arena.geometry_failures() == 0,
+           "no free bytes is a shortage, not a geometry failure");
+    (void)first->release();
+    (void)third->release();
+    expect(arena.free_bytes() == 2 * unit && arena.free_extent_count() == 2 &&
+               !arena.allocate(2 * unit),
+           "two separated free units cannot satisfy a two-unit request");
+    expect(arena.geometry_failures() == 1 && arena.shortage_failures() == 1,
+           "enough total bytes but no single run is a geometry failure");
+    expect(!arena.allocate(3 * unit) && arena.shortage_failures() == 2,
+           "a request larger than all free bytes is a shortage");
+    (void)arena.can_allocate(2 * unit);
+    expect(arena.geometry_failures() == 1, "asking whether an allocation would fit never counts");
+    expect(arena.allocate(unit) && arena.geometry_failures() == 1 && arena.shortage_failures() == 2,
+           "a successful allocation changes no counter");
+}
+
 } // namespace
 
 int main() {
@@ -103,6 +133,7 @@ int main() {
     try {
         test_reserve_publish_and_rollback();
         test_fragmentation_and_split();
+        test_failures_are_counted_by_cause();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

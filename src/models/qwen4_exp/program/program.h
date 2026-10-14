@@ -302,6 +302,10 @@ struct PhysicalUsageSnapshot {
     std::size_t host_peak_occupied_bytes = 0;
     std::uint32_t host_state_slots       = 0;
     std::size_t host_kv_bytes            = 0;
+    // The Flash-Next cache is a slab pool with no extents to fragment; these stay zero.
+    std::size_t host_free_extents          = 0;
+    std::uint64_t host_geometry_failures   = 0;
+    std::uint64_t host_shortage_failures   = 0;
 };
 
 // Device memory a Program allocates besides its expert frames, from the options and the model's

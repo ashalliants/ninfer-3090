@@ -3,6 +3,7 @@
 #include "core/arena.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -81,6 +82,15 @@ public:
 
     [[nodiscard]] std::size_t allocation_count() const noexcept { return allocation_count_; }
 
+    // How many separate free runs there are. Many small runs mean the backing is fragmented.
+    [[nodiscard]] std::size_t free_extent_count() const noexcept { return free_extents_.size(); }
+
+    // Allocations that found no extent, split by why: `geometry` when enough bytes were free in
+    // total but no single run fit, `shortage` when the bytes were simply not there. Monotonic.
+    [[nodiscard]] std::uint64_t geometry_failures() const noexcept { return geometry_failures_; }
+
+    [[nodiscard]] std::uint64_t shortage_failures() const noexcept { return shortage_failures_; }
+
     [[nodiscard]] bool can_allocate(std::size_t bytes) const noexcept;
     [[nodiscard]] std::optional<HostContextAllocation> allocate(std::size_t bytes) noexcept;
     [[nodiscard]] std::pair<HostContextAllocation, HostContextAllocation>
@@ -106,6 +116,8 @@ private:
     std::size_t reserved_bytes_      = 0;
     std::size_t peak_occupied_bytes_ = 0;
     std::size_t allocation_count_    = 0;
+    std::uint64_t geometry_failures_ = 0;
+    std::uint64_t shortage_failures_ = 0;
     std::vector<FreeExtent> free_extents_;
 };
 
