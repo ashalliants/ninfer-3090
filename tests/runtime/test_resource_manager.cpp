@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <iostream>
 #include <optional>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <utility>
@@ -115,6 +117,10 @@ struct Program {
     std::uint32_t main_capacity    = 1024;
     bool transfer_in_progress      = false;
     bool combined_demotion_blocked = false;
+    // Calls into the operations whose cost grows with the number of checkpoints. The real Program
+    // pays O(checkpoints) for each, so a drop in these counts is a drop in Engine-thread time.
+    mutable std::uint64_t host_bytes_released_calls = 0;
+    mutable std::uint64_t recovery_loss_calls       = 0;
 
     std::size_t host_block(std::size_t bytes, bool external_reference = false) {
         blocks.push_back({bytes, external_reference});
@@ -193,6 +199,7 @@ struct Program {
     }
 
     [[nodiscard]] std::size_t host_bytes_released(std::span<const Handle> victims) const {
+        ++host_bytes_released_calls;
         std::size_t bytes = 0;
         for (std::size_t block = 0; block < blocks.size(); ++block) {
             if (blocks[block].external_reference) { continue; }
@@ -454,6 +461,7 @@ struct Program {
 
     [[nodiscard]] std::uint64_t checkpoint_recovery_loss(std::span<const Handle> removed,
                                                          std::span<const Handle> surviving) const {
+        ++recovery_loss_calls;
         std::vector<Handle> deepest;
         for (const auto handle : removed) {
             const auto deeper = std::any_of(removed.begin(), removed.end(), [&](auto other) {
@@ -2034,10 +2042,201 @@ void test_delayed_older_rewrite_does_not_supersede_a_newer_owner() {
             "an older request superseded a newer published owner");
 }
 
+// A full Host tier of `residents` checkpoints, each holding one block, and `demotable` Device-only
+// checkpoints that a state-slot shortage would demote into it. Every demotion plan then needs Host
+// victims, which is what the saturated hosted workload does on every reclaim.
+struct ScaleOutcome {
+    ninfer::runtime::ReclaimProgress progress;
+    std::vector<Handle> released;
+    std::vector<Handle> demoted;
+    std::uint64_t host_bytes_released_calls = 0;
+    std::uint64_t recovery_loss_calls       = 0;
+    double seconds                          = 0.0;
+};
+
+ScaleOutcome run_scale(std::size_t residents, std::size_t demotable, bool memoize) {
+    constexpr std::size_t block = 16;
+    Fixture f(residents * block + 8);
+    f.cache.set_candidate_memo(memoize);
+    std::uint32_t next_token = 1;
+    for (std::size_t i = 0; i < residents; ++i) {
+        const auto key = tokens(6 + static_cast<std::uint32_t>(i % 5), next_token);
+        next_token += 40;
+        f.publish(f.program.add(key, {f.program.host_block(block)}));
+    }
+    for (std::size_t j = 0; j < demotable; ++j) {
+        const auto key = tokens(6 + static_cast<std::uint32_t>(j % 5), next_token);
+        next_token += 40;
+        const auto handle = f.program.add(key);
+        f.program.contents[handle.index].demotion_bytes = block;
+        f.publish(handle);
+    }
+    f.program.host_bytes_released_calls = 0;
+    f.program.recovery_loss_calls       = 0;
+    const auto begin    = std::chrono::steady_clock::now();
+    const auto progress = f.cache.reclaim(f.program, {.state_slots = 1});
+    const auto end      = std::chrono::steady_clock::now();
+    return {progress,
+            f.program.released,
+            f.program.demoted,
+            f.program.host_bytes_released_calls,
+            f.program.recovery_loss_calls,
+            std::chrono::duration<double>(end - begin).count()};
+}
+
+// Victim selection used to redo every candidate's work for every demotion plan, so a reclaim cost
+// about plans x candidates Program calls (1.4 s at 160 checkpoints and 32 plans here, and seconds on
+// the real engine with a full Host tier). The memo must make the same decisions with fewer calls.
+void test_candidate_memo_cuts_victim_selection_work() {
+    for (const auto [residents, demotable] : {std::pair{40, 8}, std::pair{80, 16}, std::pair{160, 32}}) {
+        const auto plain = run_scale(residents, demotable, false);
+        const auto memo  = run_scale(residents, demotable, true);
+        require(plain.progress == memo.progress && plain.released == memo.released &&
+                    plain.demoted == memo.demoted,
+                "the candidate memo changed the outcome of a full-Host reclaim");
+        require(memo.host_bytes_released_calls < plain.host_bytes_released_calls &&
+                    memo.recovery_loss_calls < plain.recovery_loss_calls,
+                "the candidate memo saved no Program calls");
+        if (residents == 160) {
+            // Measured 16,544 -> 11,584 and 10,457 -> 5,497. The rest is the per-plan Program
+            // inventory (plan_releases), which this change leaves alone.
+            require(memo.host_bytes_released_calls * 4 <= plain.host_bytes_released_calls * 3,
+                    "the memo no longer cuts Host-release queries by a quarter at 160 checkpoints");
+            require(memo.recovery_loss_calls * 5 <= plain.recovery_loss_calls * 3,
+                    "the memo no longer cuts recovery-loss queries by two fifths at 160 checkpoints");
+        }
+    }
+}
+
+// What a randomized scenario decided: every reclaim's outcome and the Host victims it would pick.
+struct Decisions {
+    std::vector<int> progress;
+    std::vector<Handle> released;
+    std::vector<Handle> demoted;
+    std::vector<std::vector<Handle>> submissions;
+    std::vector<std::optional<std::vector<Handle>>> victims;
+    friend bool operator==(const Decisions&, const Decisions&) = default;
+};
+
+// A reproducible random cache: contents that share prefixes and Host blocks (aliases), some not
+// evictable, some Device-only and demotable, some hot from reuse. `seed` fixes everything.
+Decisions decide(std::uint32_t seed, bool memoize) {
+    std::mt19937 rng(seed);
+    const auto pick = [&](std::uint32_t low, std::uint32_t high) {
+        return std::uniform_int_distribution<std::uint32_t>(low, high)(rng);
+    };
+    struct Spec {
+        Key key;
+        Role role;
+        std::optional<std::size_t> block; // an index into the shared block list
+        bool device_state;
+        std::optional<std::size_t> demotion_bytes;
+        bool evictable;
+        bool hot;
+    };
+    const std::size_t count = pick(6, 36);
+    std::vector<std::size_t> block_bytes;
+    std::vector<Spec> specs;
+    constexpr std::array roles{Role::InputReplay, Role::LongAnchor, Role::SharedPrefix,
+                               Role::Continuation};
+    for (std::size_t i = 0; i < count; ++i) {
+        Spec spec{.key          = tokens(pick(3, 20), 1 + pick(0, 4) * 100),
+                  .role         = roles[pick(0, 3)],
+                  .device_state = pick(0, 2) != 0,
+                  .evictable    = pick(0, 19) != 0,
+                  .hot          = pick(0, 4) == 0};
+        if (pick(0, 9) < 7) {
+            if (!block_bytes.empty() && pick(0, 4) == 0) {
+                spec.block = pick(0, static_cast<std::uint32_t>(block_bytes.size() - 1)); // alias
+            } else {
+                block_bytes.push_back(pick(8, 40));
+                spec.block = block_bytes.size() - 1;
+            }
+        }
+        if (pick(0, 9) < 4) { spec.demotion_bytes = pick(8, 40); }
+        specs.push_back(std::move(spec));
+    }
+    std::size_t total = 0;
+    for (const auto bytes : block_bytes) { total += bytes; }
+    const std::size_t slack = pick(0, 24);
+    Fixture f(total + slack);
+    f.cache.set_candidate_memo(memoize);
+    std::vector<std::size_t> block_ids;
+    for (const auto bytes : block_bytes) { block_ids.push_back(f.program.host_block(bytes)); }
+    std::vector<Handle> handles;
+    for (const auto& spec : specs) {
+        std::vector<std::size_t> blocks;
+        if (spec.block) { blocks.push_back(block_ids[*spec.block]); }
+        const auto handle = f.program.add(spec.key, blocks, spec.role);
+        auto& content = f.program.contents[handle.index];
+        content.device_state    = spec.device_state;
+        content.evictable       = spec.evictable;
+        content.demotion_bytes  = spec.demotion_bytes;
+        handles.push_back(handle);
+        f.publish(handle);
+    }
+    for (std::size_t i = 0; i < handles.size(); ++i) {
+        if (!specs[i].hot || specs[i].role != Role::SharedPrefix) { continue; }
+        try {
+            f.use_shared(handles[i]);
+        } catch (const std::exception&) { // the fixture refused this reuse; both modes see the same
+        }
+    }
+
+    Decisions out;
+    const auto record = [&](Usage shortage) {
+        try {
+            out.progress.push_back(static_cast<int>(f.cache.reclaim(f.program, shortage)));
+        } catch (const std::exception&) {
+            out.progress.push_back(-1); // an invalid scenario is an outcome too: both modes must agree
+        }
+    };
+    record({.state_slots = 1});
+    record({.main_kv_pages = pick(1, 4)});
+    record({.host_bytes = total / 3 + 1});
+    record({.state_slots = 1});
+    out.released    = f.program.released;
+    out.demoted     = f.program.demoted;
+    out.submissions = f.program.demotion_submissions;
+    for (const std::size_t bytes : {std::size_t{1}, total / 4 + 1, total / 2 + 1, total + slack}) {
+        std::optional<Handle> incoming;
+        for (const auto handle : handles) {
+            if (f.program.valid_checkpoint(handle)) {
+                incoming = handle;
+                break;
+            }
+        }
+        out.victims.push_back(f.cache.host_victims(f.program, bytes, incoming));
+    }
+    return out;
+}
+
+void test_candidate_memo_changes_no_decision() {
+    std::size_t reclaimed = 0, demoted = 0, with_victims = 0;
+    for (std::uint32_t seed = 1; seed <= 600; ++seed) {
+        const auto plain = decide(seed, false);
+        const auto memo  = decide(seed, true);
+        if (!(plain == memo)) {
+            std::cerr << "decisions differ for seed " << seed << '\n';
+            throw std::runtime_error("the candidate memo changed a cache decision");
+        }
+        reclaimed += plain.released.size();
+        demoted += plain.demoted.size();
+        for (const auto& victims : plain.victims) { with_victims += victims && !victims->empty(); }
+    }
+    // The comparison is only worth anything if the scenarios actually exercise the code.
+    std::cout << "memo equivalence: 600 seeds, " << reclaimed << " releases, " << demoted
+              << " demotions, " << with_victims << " non-empty victim sets\n";
+    require(reclaimed > 200 && demoted > 100 && with_victims > 100,
+            "randomized scenarios did not exercise release, demotion and Host victims");
+}
+
 } // namespace
 
 int main() {
     try {
+        test_candidate_memo_cuts_victim_selection_work();
+        test_candidate_memo_changes_no_decision();
         test_pinned_shared_prefix_survives_reclaim_and_cache_clear();
         test_demotion_competes_with_its_actual_host_recovery_loss();
         test_adjacent_kv_demotions_share_one_submission();

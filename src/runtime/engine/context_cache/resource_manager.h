@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -591,6 +592,10 @@ public:
         prune(program);
         return true;
     }
+
+    // Victim selection reuses each candidate's facts across the plans of one reclaim. The tests turn
+    // this off to prove the answers are identical either way; production never does.
+    void set_candidate_memo(bool enabled) noexcept { candidate_memo_ = enabled; }
 
     [[nodiscard]] ReclaimProgress reclaim(Program& program, ContextResourceUsage shortage,
                                           std::span<const Handle> excluded = {}) {
@@ -1306,13 +1311,6 @@ private:
     using NativeReclaimPlan = decltype(std::declval<Program&>().plan_reclaim(
         std::span<const Handle>{}, std::span<const Handle>{}, ContextResourceUsage{}));
 
-    // These facts live only until this synchronous evaluation mutates resources or yields.
-    // The fixed victim cursor may outlive them; newly published points still count as fallback.
-    struct Evaluation {
-        const NativeReclaimPlan* native = nullptr;
-        std::optional<std::vector<Handle>> retained;
-    };
-
     struct ActionFacts {
         CacheRetentionPriority priority;
         bool superseded   = false;
@@ -1320,6 +1318,38 @@ private:
         std::optional<std::vector<Handle>> kept;
         std::optional<std::uint64_t> loss;
     };
+
+    // What one candidate release (a set of checkpoints) costs, which does not depend on which plan
+    // is asking: the Host bytes it frees and its facts. A reclaim evaluates the same candidates for
+    // every demotion plan, and recomputing them per plan made victim selection quadratic in the
+    // number of checkpoints (seconds on a full Host tier). Handles only compare for equality, so
+    // the set is found by a linear scan, which is cheap next to the Program calls it saves.
+    struct CandidateMemo {
+        std::vector<Handle> sources;
+        std::optional<std::size_t> host_bytes;
+        std::optional<ActionFacts> facts;
+    };
+
+    // These facts live only until this synchronous evaluation mutates resources or yields.
+    // The fixed victim cursor may outlive them; newly published points still count as fallback.
+    struct Evaluation {
+        const NativeReclaimPlan* native = nullptr;
+        std::optional<std::vector<Handle>> retained;
+        std::deque<CandidateMemo> candidates; // stable references while the deque grows
+    };
+
+    [[nodiscard]] static CandidateMemo& candidate_memo(Evaluation& evaluation,
+                                                       std::span<const Handle> sources) {
+        for (auto& memo : evaluation.candidates) {
+            if (memo.sources.size() == sources.size() &&
+                std::all_of(sources.begin(), sources.end(),
+                            [&](Handle handle) { return contains(memo.sources, handle); })) {
+                return memo;
+            }
+        }
+        evaluation.candidates.push_back({.sources = {sources.begin(), sources.end()}});
+        return evaluation.candidates.back();
+    }
 
     [[nodiscard]] std::span<const Handle> retained(Program& program, Evaluation& evaluation) const {
         if (!evaluation.retained) { evaluation.retained = surviving(program, {}); }
@@ -1611,18 +1641,41 @@ private:
                 for (const auto handle : actions[i].sources) {
                     if (!contains(combined, handle)) { combined.push_back(handle); }
                 }
-                const auto amount = program.host_bytes_released(combined);
+                // The same candidate comes up for every plan of one reclaim: what it frees and its
+                // facts are computed once per evaluation. Only the cheap facts stay cached (the
+                // survivor list is rebuilt per use), so the cache does not grow with the square of
+                // the checkpoint count.
+                CandidateMemo* const memo =
+                    candidate_memo_ ? &candidate_memo(evaluation, combined) : nullptr;
+                std::size_t amount;
+                if (memo) {
+                    if (!memo->host_bytes) { memo->host_bytes = program.host_bytes_released(combined); }
+                    amount = *memo->host_bytes;
+                } else {
+                    amount = program.host_bytes_released(combined);
+                }
                 if (amount <= released) { continue; }
-                auto facts = action_facts(program, combined, cursor, evaluation);
+                ActionFacts uncached;
+                if (memo) {
+                    if (!memo->facts) { memo->facts = action_facts(program, combined, cursor, evaluation); }
+                } else {
+                    uncached = action_facts(program, combined, cursor, evaluation);
+                }
+                ActionFacts& facts        = memo ? *memo->facts : uncached;
+                const auto drop_survivors = [&] {
+                    if (memo) { memo->facts->kept.reset(); }
+                };
                 // A migration must satisfy both its own preservation rights and the
                 // optional capture that requested space. Source heat cannot grant the
                 // outer capture permission to erase unrelated hot Host history.
                 if (!admits(program, combined, facts, admission, cursor, evaluation) ||
                     !admits(program, combined, facts, cursor.admission, cursor, evaluation)) {
+                    drop_survivors();
                     continue;
                 }
                 const auto rank            = rank_action(program, combined, facts,
                                                          std::min<std::size_t>(amount, required), evaluation);
+                drop_survivors();
                 std::size_t snapshot_order = 0;
                 for (std::size_t snapshot = 0; snapshot < later_snapshots.size(); ++snapshot) {
                     if (contains(combined, later_snapshots[snapshot])) {
@@ -1725,6 +1778,7 @@ private:
     bool enabled_;
     ContextMachineCostModel costs_;
     PrefixIndex<Model> index_;
+    bool candidate_memo_ = true;
     std::vector<Owner> owners_;
     std::vector<Shared> shared_;
     std::vector<WaitingSource> waiting_;
