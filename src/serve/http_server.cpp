@@ -718,6 +718,11 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
 
 bool HttpServer::bind() { return server_.bind_to_port(options_.host, options_.port); }
 
+int HttpServer::bind_any_port() {
+    const int port = server_.bind_to_any_port(options_.host);
+    return port > 0 ? port : 0;
+}
+
 void HttpServer::start_serving_during_startup() {
     if (startup_listener_.joinable()) {
         throw std::logic_error("HTTP startup listener is already running");

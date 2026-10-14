@@ -166,6 +166,8 @@ public:
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
 
     [[nodiscard]] bool is_available() const { return engine_->is_available(); }
+    // The Engine failed Engine-wide and never recovers.
+    [[nodiscard]] bool has_failed() const { return engine_->has_failed(); }
 
     // Model suspend (--model-suspend): see Engine::suspend. Throws std::invalid_argument when the
     // service was started without it.

@@ -1,0 +1,70 @@
+#pragma once
+
+// A model served behind a router: one Engine behind a GenerationService, answered by an ordinary
+// single-model HttpServer that listens on loopback at a port of its own. The router front-end
+// (RouterServer) forwards a request to that server once the model registry has loaded or woken the
+// model, so every endpoint, log and metric of single-model mode works per model unchanged.
+//
+// Sleep is the Engine's suspend (the model must be started with --model-suspend); the server and its
+// port stay up while the model sleeps, so the status endpoints still answer.
+
+#include "serve/http_server.h"
+#include "serve/model_registry.h"
+
+#include <spdlog/logger.h>
+
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <thread>
+
+namespace ninfer::serve {
+
+// The loopback port each loaded model's server listens on, by model id.
+class RoutedPorts {
+public:
+    void set(const std::string& model, int port);
+    void erase(const std::string& model);
+    [[nodiscard]] std::optional<int> get(const std::string& model) const;
+
+private:
+    mutable std::mutex mutex_;
+    std::map<std::string, int> ports_;
+};
+
+class RoutedModelService final : public ModelService {
+public:
+    // Starts the model's server on a free loopback port and attaches `service` to it. The service
+    // is loaded and warmed up already.
+    RoutedModelService(std::string id, std::unique_ptr<GenerationService> service,
+                       std::shared_ptr<spdlog::logger> logger, std::shared_ptr<RoutedPorts> ports);
+    ~RoutedModelService() override;
+
+    RoutedModelService(const RoutedModelService&)            = delete;
+    RoutedModelService& operator=(const RoutedModelService&) = delete;
+
+    [[nodiscard]] GenerationService& service() override { return *service_; }
+
+    [[nodiscard]] bool suspendable() const override {
+        return service_->engine_options().suspend.enabled;
+    }
+
+    void suspend() override { (void)service_->suspend(true); }
+    void resume() override { (void)service_->resume(); }
+    [[nodiscard]] bool failed() const override { return service_->has_failed(); }
+
+    [[nodiscard]] int port() const noexcept { return port_; }
+
+private:
+    std::string id_;
+    // The server holds a pointer to the service: destroyed first.
+    std::unique_ptr<GenerationService> service_;
+    std::unique_ptr<HttpServer> server_;
+    std::shared_ptr<RoutedPorts> ports_;
+    std::thread listener_;
+    int port_ = 0;
+};
+
+} // namespace ninfer::serve

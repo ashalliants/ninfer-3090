@@ -52,6 +52,9 @@ public:
     // Reserves the configured address before model loading. The service is attached only after its
     // Engine is ready, then listen() enters the blocking accept loop on the already-bound socket.
     bool bind();
+    // Binds any free port on options.host and returns it (0 on failure): a model behind a router
+    // listens on loopback at a port of its own.
+    int bind_any_port();
     void attach(GenerationService& service);
     bool listen();
     void stop();
