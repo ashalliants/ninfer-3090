@@ -33,6 +33,33 @@ confirmation point. Everything before that is local.
 Work from the merged PRs and the diff, not commit subjects. Read the PR bodies for measured numbers.
 Use `RELEASE_NOTES_0.14.2.md` (or the newest one) as the shape template.
 
+### Audit for breaking changes (do this before drafting, every release)
+
+Commit subjects and PR titles do not say "breaking". v0.16.0 removed about 15 serving flags, `/slots`,
+launcher variables and renamed every `/metrics` series, and none of it was in a subject line. Diff the
+tag against `origin/master` mechanically, and put everything found in a "Breaking changes" section
+right after the opening sentence, with the replacement for each item:
+
+- **Serve and CLI flags:** `git diff <tag> origin/master -- apps src/serve | grep -E '^[-+].*arg == "--'`
+  (minus lines are removed flags; also check changed defaults in `docs/serving.md`). A removed flag makes
+  `ninfer-serve` exit with `unknown argument`, so say so.
+- **Launcher variables:** for each `NINFER_*` the diff of `scripts/run.sh` and `scripts/run.bat` removes,
+  `grep -c` it in the new scripts. Reflowed comment lines show up as false removals, and some
+  variables survive (`NINFER_HOST_CACHE_*` did); never list one as removed without checking.
+- **Endpoints, `/metrics` names, request-log schema version, request parser limits and rejections:**
+  `git diff <tag> origin/master --stat` on `src/serve`, then read the PR bodies that touch them. The PR
+  that renamed the metrics carries the old-to-new table; link it.
+- **Defaults that moved** (n-gram copies on, tool constraints, context sizing) and **build defaults**
+  (`NINFER_CUDA_RDC`): call them out even when speed did not change.
+- Ask the user if they know of breaking changes the diff does not show (they did in v0.16.0).
+
+Use `gh pr list ... --search "merged:>=<date>"` for the list of what shipped, not
+`git log <tag>..origin/master`: after an upstream merge the commit list is hundreds of unrelated
+upstream commits.
+
+Check every factual claim against the tree before it goes in (flag names, defaults, archive names). The
+archives are named `ninfer-rtx3090-{windows,linux}-x64-<VERSION>.{zip,tar.gz}`, not `NInfer-3090-...`.
+
 ### Who the notes are for
 
 The reader runs NInfer, or buys access to it, to drive coding agents. They are not an inference
@@ -192,3 +219,30 @@ hit, and clean `dist/` and the `~/ninfer-rel-*` export only after the release is
 - The notes must say which tests were not run (this time: the full suite and all real-model tests, since
   the release only builds the three products).
 
+
+## Traps hit in v0.16.0
+
+- **Breaking changes were found late, by the user.** Run the "Audit for breaking changes" step in
+  section 2 before drafting, not after.
+- **No `python3` in Git Bash.** Edit the notes with the Edit tool, not a Python one-liner.
+- **The shell's working directory drifts** into `dist/` after a command that ends there. Use absolute
+  paths or `cd` at the start of each command.
+- **Windows build in the main checkout works:** after `git checkout -b release/vX.Y.Z origin/master`
+  (clean tree), the existing `build-ninja` tree compiles the release commit; `--version` should read
+  `<VERSION>+<commit>`. Run the build and the WSL build as two background tasks and keep writing the
+  notes meanwhile; both finished in about 25 minutes on a cold-ish ccache (43% hit rate).
+- **Packaging the Windows zip in the same session as the build** needs the vcvars import repeated in
+  that PowerShell call. The packager prints only the archive name and size; verify the checksum and run the
+  stripped-`PATH` check yourself.
+- **Smoke test as one script under the GPU lock:** `. tools/gpu-lock.ps1` then
+  `Invoke-WithGpuLock { launch run.bat; poll /v1/models; one chat request; stop }`, all in one
+  `pwsh -File`. Port is 8080, the served model id is `qwen3.8-27b`, and the stop step matches process
+  command lines containing the extracted directory. The model answers with `reasoning_content`, so a
+  reply of five words is not expected in `content` within a small `max_tokens`; give it 200.
+- **The release PR has no CI checks** (`gh pr checks` says "no checks reported"); merge with
+  `gh pr merge <n> -R ashalliants/ninfer-3090 --merge` after the user's publish approval.
+- **Repackage after filling in Verification:** delete `dist/*X.Y.Z*` and the WSL export's `dist/*X.Y.Z*`,
+  copy the final notes into the export, run both packagers, and re-check both checksums. The Windows zip
+  hash changes, so do not reuse the first `SHA256SUMS`.
+- **Do not compare the Linux `ldd` list by eye.** Save the previous release's list and `diff` it, or say
+  in the report that it was not compared.
