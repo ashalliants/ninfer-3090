@@ -603,7 +603,9 @@ host memory. A resume takes 3.3 s with `--suspend-weights artifact` (the file wa
 system's cache; a cold read takes as long as a cold load) or 1.9 s with `--suspend-weights host`,
 which holds 15 GiB of host memory while suspended. A conversation retained before the suspend still
 reuses all 1,324 prompt tokens of its prefix afterwards, and greedy output is identical. The CUDA
-context itself and anything allocated outside the model's regions stay resident.
+context itself and anything allocated outside the model's regions stay resident: a suspended
+`ninfer-serve` showed about 230 MiB more in `nvidia-smi` than the idle desktop, against 15.8 GiB
+more while resident.
 
 
 ### Metrics
