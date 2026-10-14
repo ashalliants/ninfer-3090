@@ -161,16 +161,19 @@ Strata figures in the README are from the earlier campaign).
 - Failed because the run's artifact is the wrong one for the test, not because of the engine:
   `qwen3_5_dflash_real` ("missing component dflash") and `qwen3_5_dflash_prefill_real`
   ("linear_topk: unsupported head profile") need a DFlash artifact that is not in `models\`.
-- Failed, pre-existing and unrelated to the artifact: `artifact_writer_interop` ("writer fixture lost a
-  GGML format or layout"). #307 recorded the same failure with RDC on.
-- **`offloaded_moe_wide` crashes on the real Flash-Next artifact** (exit `0xc0000409`, an uncaught C++
-  exception) while checking the last bank, weight 48 (`q2_0+q2_0`, stride 1,382,400), after passing the
-  other 48. `offloaded_moe_layer`, which reads the same banks, passes on the same artifact. The cause
-  is not found: a debugger shows an uncaught throw on a worker thread in the test, with no message.
-  This is a test of an op in isolation; the same op serves Flash-Next requests, and the HTTP runs above
-  did not hit it. Open.
-- `qwen3_5_moe_real` was re-run with the 35B artifact: ctest reports it both passed and skipped after
-  80 s. Treat it as not demonstrated.
+- `artifact_writer_interop` failed on a stale constant: the writer fixture gained a 13th GGML object
+  (the MTP drafter's record format, #262) and the C++ test still required 12. It is a test bug, not a
+  product one, and is fixed in #312.
+- `offloaded_moe_wide` crashed on the real Flash-Next artifact (exit `0xc0000409`) while checking the
+  last bank, weight 48, the MTP drafter's `q2_0+q2_0`. That format is narrow-route only by contract
+  (`offloaded_sparse_moe.h`), the wide route correctly throws `std::invalid_argument`, and the test
+  had no handler, so the throw ended the process without a message. The test sent a bank to a route
+  that does not support it; the engine is not at fault, and the drafter runs on the narrow route.
+  Fixed in #312 (the wide test now skips that bank, asserts the refusal, and reports exceptions).
+- `qwen3_5_moe_real` is environmental: its last stage reserves a 262,144-token context and the test
+  harness turns a device-memory shortfall into a skip, which is why ctest listed it as passed and
+  skipped. With `NINFER_REAL_TEST_MAX_CONTEXT=32768` and the 35B artifact it runs to `ok`; 65,536 still
+  lacks 94 MB beside the desktop.
 
 **DFlash2 measured on this fork (RTX 3090, Qwen3.8-27B groupwise-int, `--kv-dtype int8`,
 `--draft-tokens 7`, greedy, 96 new tokens).** Text: 20.0% acceptance, 2.38 tok/round.
