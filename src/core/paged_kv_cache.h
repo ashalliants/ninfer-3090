@@ -255,6 +255,16 @@ public:
     [[nodiscard]] KVPlaneByteRange plane_page_range(std::size_t plane, std::int32_t first_page,
                                                     std::uint32_t count) const;
 
+    // Device bytes the free pages occupy: one extent per plane and free run on page-major planes,
+    // one per plane, run and head on head-major ones. A free page is written before it is ever
+    // read, so a model suspend copies everything in its arena except these.
+    struct FreeExtent {
+        std::size_t rank  = 0;
+        const void* base  = nullptr;
+        std::size_t bytes = 0;
+    };
+    [[nodiscard]] std::vector<FreeExtent> free_extents() const;
+
     // Removes a wholly free run from circulation so its device memory can be lent elsewhere, and
     // puts it back. The caller owns the memory only between these two calls.
     void lend_pages(std::int32_t begin, std::uint32_t count);

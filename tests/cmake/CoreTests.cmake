@@ -27,6 +27,10 @@ ninfer_add_test(ninfer_vmm_graph_remap_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_vmm_graph_remap.cu"
   LIBRARIES ninfer_core CUDA::cuda_driver)
 
+ninfer_add_test(ninfer_suspend_memory_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_suspend_memory.cu"
+  LIBRARIES ninfer_core CUDA::cuda_driver)
+
 ninfer_add_test(ninfer_evictable_kv_pool_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_evictable_kv_pool.cu"
   LIBRARIES ninfer_core CUDA::cuda_driver)
@@ -39,6 +43,7 @@ set_tests_properties(
   ninfer_arena_ranks_test
   ninfer_device_buffer_visibility_test
   ninfer_vmm_graph_remap_test
+  ninfer_suspend_memory_test
   ninfer_evictable_kv_pool_test
   ninfer_evictable_weight_pool_test
   PROPERTIES SKIP_RETURN_CODE 77)

@@ -240,7 +240,8 @@ std::vector<std::uint32_t> default_stage_layers(const artifact::Reader& reader,
 }
 
 std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
-                                         const StartupObserver* observer) {
+                                         const StartupObserver* observer,
+                                         const artifact::MaterializeOptions& materialize) {
     if (!plan.impl_) { throw artifact::ArtifactError("load plan was already consumed"); }
     auto data = std::move(plan.impl_);
     std::unique_ptr<EvictableWeightPool> pool;
@@ -265,7 +266,7 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     }
     auto backing = artifact::materialize(*data->materialization.source,
                                          std::move(data->materialization), device, observer,
-                                         std::move(pool));
+                                         std::move(pool), materialize);
     auto bound   = loading::resolve_weights(std::move(data->pending), backing);
     std::optional<VisionOverlayLayout> vision_overlay;
     if (data->options.overlay_vision()) {

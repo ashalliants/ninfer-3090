@@ -4,6 +4,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/evictable_weight_pool.h"
+#include "core/vmm_region.h"
 #include "core/weight_view.h"
 #include "ninfer/types.h"
 
@@ -84,6 +85,15 @@ struct MaterializationStats {
     double upload_seconds               = 0;
 };
 
+struct MaterializeOptions {
+    // Device arenas at fixed addresses whose physical memory a model suspend can release; the
+    // device objects are then uploaded again from `retained_reader` when the model resumes. The
+    // reader keeps the artifact's files open, so the bytes it restores are the ones it loaded even
+    // if a path is replaced meanwhile.
+    bool suspendable = false;
+    std::shared_ptr<const Reader> retained_reader;
+};
+
 class MaterializedArtifact {
 public:
     MaterializedArtifact()                                           = default;
@@ -104,10 +114,34 @@ public:
 
     [[nodiscard]] const MaterializationStats& stats() const noexcept { return stats_; }
 
+    // Model suspend. Only a suspendable materialization supports these.
+    [[nodiscard]] bool suspendable() const noexcept;
+    [[nodiscard]] bool device_backed() const noexcept;
+    // Device bytes the release gives back: every rank's reserved weight arena.
+    [[nodiscard]] std::uint64_t device_backing_bytes() const noexcept;
+    struct RankArena {
+        std::size_t rank = 0;
+        DeviceSpan span;
+    };
+    // Every rank's weight arena, the bytes a host copy of the weights would hold.
+    [[nodiscard]] std::vector<RankArena> device_arenas() const;
+    // Releases the physical memory behind every rank's weight arena; the caller has drained every
+    // stream that reads the weights.
+    void release_device_backing();
+    // Maps fresh memory at the same addresses; the bytes are undefined until uploaded. A failure
+    // leaves the arenas released, so the call may be retried.
+    void restore_device_backing(DeviceContext& device);
+    // Uploads every device object again from the retained artifact, through the same direct-I/O
+    // staging the load used.
+    MaterializationStats upload_device_objects_again(DeviceContext& device);
+
 private:
     friend MaterializedArtifact materialize(const Reader&, MaterializationPlan&&, DeviceContext&,
                                             const StartupObserver*,
-                                            std::unique_ptr<EvictableWeightPool>);
+                                            std::unique_ptr<EvictableWeightPool>,
+                                            const MaterializeOptions&);
+
+    [[nodiscard]] std::vector<std::byte*> arena_bases() const;
 
     struct ObjectStorage {
         std::optional<WeightParent> device;
@@ -118,6 +152,13 @@ private:
 
     // The pool owns the physical memory behind a pool-backed arena; destroy the arena first.
     std::unique_ptr<EvictableWeightPool> pool_;
+    // Suspendable materializations: the fixed-address memory behind each rank's arena, the reader
+    // the weights are restored from and where each device object goes. Declared before the arenas,
+    // which only view this memory.
+    std::vector<VmmRegion> regions_;
+    std::shared_ptr<const Reader> reader_;
+    std::vector<DevicePlacement> device_placements_;
+    std::uint64_t device_payload_ = 0;
     // One arena per pipeline rank, allocated on that rank's device. Index 0 is the primary device;
     // a single-device load holds exactly one entry, which is the only one an offload-free model
     // ever touches.
@@ -132,6 +173,7 @@ private:
 [[nodiscard]] MaterializedArtifact
 materialize(const Reader& reader, MaterializationPlan&& plan, DeviceContext& device,
             const StartupObserver* startup_observer      = nullptr,
-            std::unique_ptr<EvictableWeightPool> backing = nullptr);
+            std::unique_ptr<EvictableWeightPool> backing = nullptr,
+            const MaterializeOptions& options            = {});
 
 } // namespace ninfer::artifact

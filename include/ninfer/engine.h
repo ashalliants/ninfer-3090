@@ -110,6 +110,16 @@ public:
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] bool is_available() const;
 
+    // Model residency (EngineOptions::suspend; throws std::invalid_argument when it is off). A
+    // suspend gives the model's device memory back to the GPU while the Engine is idle and refuses
+    // (RequestError Overloaded) otherwise; it never cancels work. A resume maps the memory again at
+    // the same addresses and restores weights and retained state. A generation request that
+    // arrives while suspended resumes the model first, unless `auto_resume` is false (then it fails
+    // as Unavailable). `auto_resume` left empty takes EngineOptions::suspend.auto_resume.
+    ResidencyStatus suspend(std::optional<bool> auto_resume = std::nullopt);
+    ResidencyStatus resume();
+    [[nodiscard]] ResidencyStatus residency() const;
+
     void reset_memory_peaks() noexcept;
 
 private:

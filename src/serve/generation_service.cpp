@@ -340,6 +340,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.embedding_q6             = options.embedding_q6;
     engine_options.mtp_experts_q4           = options.mtp_experts_q4;
     engine_options.gdn_state_fp16           = options.gdn_state_fp16;
+    engine_options.suspend                  = options.suspend;
     engine_options.mlp_a8_decode            = options.mlp_a8_decode;
     engine_options.prefill_a8               = options.prefill_a8;
     engine_options.prefill_cublas           = options.prefill_cublas;
@@ -424,6 +425,56 @@ GenerationService::GenerationService(
     options_.kv_capacity = engine_->options().kv_capacity;
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
+    if (options_.sleep_idle_seconds != 0) {
+        idle_sleeper_ = std::thread([this] { idle_sleep_loop(); });
+    }
+}
+
+GenerationService::~GenerationService() {
+    {
+        std::lock_guard lock(idle_mutex_);
+        idle_stop_ = true;
+    }
+    idle_cv_.notify_all();
+    if (idle_sleeper_.joinable()) { idle_sleeper_.join(); }
+}
+
+ninfer::ResidencyStatus GenerationService::suspend(std::optional<bool> auto_resume) {
+    return engine_->suspend(auto_resume);
+}
+
+ninfer::ResidencyStatus GenerationService::resume() { return engine_->resume(); }
+
+ninfer::ResidencyStatus GenerationService::residency() const { return engine_->residency(); }
+
+// --sleep-idle-seconds: gives the model's device memory back once no request has been admitted for
+// that long. A request that slips in between the check and the suspend makes the Engine refuse it
+// (it is not idle), and the next poll tries again.
+void GenerationService::idle_sleep_loop() {
+    const auto idle_for = std::chrono::seconds(options_.sleep_idle_seconds);
+    auto idle_since     = Clock::now();
+    std::unique_lock lock(idle_mutex_);
+    while (!idle_stop_) {
+        idle_cv_.wait_for(lock, std::chrono::milliseconds(250), [this] { return idle_stop_; });
+        if (idle_stop_) { break; }
+        if (admitted_requests() != 0) {
+            idle_since = Clock::now();
+            continue;
+        }
+        if (Clock::now() - idle_since < idle_for) { continue; }
+        lock.unlock();
+        try {
+            if (engine_->residency().state != ninfer::ModelResidency::Suspended) {
+                (void)engine_->suspend(std::nullopt);
+            }
+        } catch (const ninfer::RequestError&) {
+            // Not idle after all: wait for the next quiet period.
+        } catch (const std::exception&) {
+            // A suspend that failed leaves the model resident; try again later.
+        }
+        lock.lock();
+        idle_since = Clock::now();
+    }
 }
 
 std::size_t GenerationService::admitted_requests() const {

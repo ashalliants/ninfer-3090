@@ -3,6 +3,7 @@
 // Small fixed-capacity request execution for every backend.
 
 #include "core/device.h"
+#include "core/device_snapshot.h"
 #include "core/nvtx.h"
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
@@ -62,6 +63,13 @@ public:
     using ResourceManagement = ResourceManager<ModelContract>;
     using Clock              = std::chrono::steady_clock;
 
+    // Model suspend is implemented by the instance that owns suspendable device memory (the
+    // Qwen3.5 ModelInstance). For any other, enabling it is refused at construction.
+    static constexpr bool kInstanceSuspendable =
+        requires(Instance& instance, DeviceContext& device, DeviceSnapshot& snapshot) {
+            instance.suspend(device, snapshot, &snapshot);
+        };
+
     class RoundMasks final : public TokenMaskProvider {
     public:
         std::array<decltype(&std::declval<Request&>().output), kMaximumConcurrency> outputs{};
@@ -93,6 +101,28 @@ public:
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("Engine core bounds are invalid");
         }
+        suspend_options_ = options.suspend;
+        if (options.suspend.enabled) {
+            if constexpr (kInstanceSuspendable) {
+                if (!instance_.suspendable()) {
+                    throw std::logic_error(
+                        "model suspend is enabled but the instance is not suspendable");
+                }
+                const bool pinned = options.suspend.snapshot_memory == SuspendSnapshotMemory::Pinned;
+                const auto memory = pinned ? DeviceSnapshot::Memory::Pinned
+                                           : DeviceSnapshot::Memory::Pageable;
+                state_snapshot_.emplace(
+                    memory, pinned ? instance_.program->persistent_capacity_bytes() : 0);
+                if (options.suspend.weights == SuspendWeightSource::Host) {
+                    weight_snapshot_.emplace(memory,
+                                             pinned ? instance_.weight_host_copy_bytes() : 0);
+                }
+                auto_resume_.store(options.suspend.auto_resume, std::memory_order_release);
+            } else {
+                throw std::invalid_argument("this model does not support model suspend");
+            }
+        }
+        publish_residency();
         restore_external_sources();
         paused_.reserve(max_outstanding_);
         std::promise<void> startup;
@@ -213,6 +243,10 @@ public:
                 throw RequestError(RequestErrorKind::Unavailable,
                                    "inference engine is unavailable");
             }
+            if (suspended_.load(std::memory_order_acquire) &&
+                !auto_resume_.load(std::memory_order_acquire)) {
+                throw RequestError(RequestErrorKind::Unavailable, "model is suspended");
+            }
             if (outstanding_ >= max_outstanding_) {
                 throw RequestError(RequestErrorKind::Overloaded, "inference request queue is full");
             }
@@ -298,7 +332,77 @@ public:
 
     [[nodiscard]] bool is_available() const {
         std::lock_guard lock(queue_mutex_);
-        return !stopping_ && !failed_;
+        // A suspended model that resumes on demand still serves; one held suspended does not.
+        const bool held_suspended = suspended_.load(std::memory_order_acquire) &&
+                                    !auto_resume_.load(std::memory_order_acquire);
+        return !stopping_ && !failed_ && !held_suspended;
+    }
+
+    // Model residency (EngineOptions::suspend). A suspend runs between units while the Engine is
+    // idle -- nothing queued, admitted, paused or running, no context transaction -- and refuses
+    // (Overloaded) otherwise; it never cancels work. While suspended nothing executes: a queued
+    // generation request resumes the model first when auto_resume is set and fails as Unavailable
+    // when it is not. A failed resume leaves the model suspended with its state intact, fails the
+    // requests that were waiting on it and is retried by the next request or an explicit resume.
+    // Adapted from NInfer-all 0dcb1da9 src/runtime/engine/engine_core.h (Apache-2.0).
+    ResidencyStatus suspend(std::optional<bool> auto_resume) {
+        require_suspend_enabled();
+        std::scoped_lock lock(execution_mutex_);
+        device_.bind_to_current_thread();
+        if (suspended_.load(std::memory_order_acquire)) {
+            auto_resume_.store(auto_resume.value_or(suspend_options_.auto_resume),
+                               std::memory_order_release);
+            publish_residency();
+            return residency();
+        }
+        if constexpr (kInstanceSuspendable) {
+            {
+                std::lock_guard queue_lock(queue_mutex_);
+                bool busy = !pending_.empty() || materializing_.has_value() ||
+                            !paused_.empty() || context_owner_ != nullptr ||
+                            !sibling_waits_.empty() || admission_decision_.has_value() ||
+                            instance_.program->has_context_transaction();
+                for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                    busy = busy || slots_[lane] != nullptr;
+                }
+                if (busy) {
+                    throw RequestError(RequestErrorKind::Overloaded,
+                                       "model suspend requires an idle engine");
+                }
+                // Set before the queue lock is released: a request submitted from here on waits
+                // for the resume (or is refused) instead of racing the release of the memory it
+                // would use.
+                auto_resume_.store(auto_resume.value_or(suspend_options_.auto_resume),
+                                   std::memory_order_release);
+                suspended_.store(true, std::memory_order_release);
+            }
+            try {
+                last_suspend_ = instance_.suspend(device_, *state_snapshot_,
+                                                  weight_snapshot_ ? &*weight_snapshot_ : nullptr);
+            } catch (...) {
+                suspended_.store(false, std::memory_order_release);
+                queue_cv_.notify_all();
+                publish_residency();
+                throw;
+            }
+            ++suspend_count_;
+            publish_residency();
+            publish_runtime_stats();
+        }
+        return residency();
+    }
+
+    ResidencyStatus resume() {
+        require_suspend_enabled();
+        std::scoped_lock lock(execution_mutex_);
+        device_.bind_to_current_thread();
+        resume_locked();
+        return residency();
+    }
+
+    [[nodiscard]] ResidencyStatus residency() const {
+        std::lock_guard lock(stats_mutex_);
+        return published_residency_;
     }
 
     void reset_memory_peaks() noexcept {
@@ -390,7 +494,9 @@ public:
         std::scoped_lock lock(execution_mutex_);
         device_.bind_to_current_thread();
         auto& program = *instance_.program;
-        if (program.has_context_transaction()) { return false; }
+        if (program.has_context_transaction() || suspended_.load(std::memory_order_acquire)) {
+            return false;
+        }
         const auto started = Clock::now();
         try {
             const auto needed = program.checkpoint_image_host_bytes(image, store_.binding);
@@ -417,6 +523,17 @@ public:
         std::scoped_lock lock(execution_mutex_);
         device_.bind_to_current_thread();
         auto& program = *instance_.program;
+        if (suspended_.load(std::memory_order_acquire)) {
+            // Persisting copies device state out, so a model that resumes on demand comes back
+            // for it; one held suspended (or whose resume fails) loses only what the device
+            // alone held.
+            if (!auto_resume_.load(std::memory_order_acquire)) { return 0; }
+            try {
+                resume_locked();
+            } catch (...) {
+                return 0;
+            }
+        }
         if (program.has_context_transaction()) { return 0; }
         forget_failed_store_writes();
         forget_removed_store_images();
@@ -3378,6 +3495,95 @@ private:
         }
     }
 
+    void require_suspend_enabled() const {
+        if (!state_snapshot_) {
+            throw std::invalid_argument(
+                "model suspend is disabled; start the Engine with suspend enabled");
+        }
+    }
+
+    // Under the execution mutex.
+    void resume_locked() {
+        if (!suspended_.load(std::memory_order_acquire)) { return; }
+        if constexpr (kInstanceSuspendable) {
+            try {
+                last_resume_ = instance_.resume(device_, *state_snapshot_,
+                                                weight_snapshot_ ? &*weight_snapshot_ : nullptr);
+            } catch (const std::exception& error) {
+                last_residency_error_ = error.what();
+                publish_residency();
+                throw;
+            }
+            last_residency_error_.clear();
+            ++resume_count_;
+            suspended_.store(false, std::memory_order_release);
+            publish_residency();
+            publish_runtime_stats();
+            queue_cv_.notify_all();
+        }
+    }
+
+    // Under the execution mutex, while suspended, from the worker: work was queued.
+    void serve_suspended_queue_locked() {
+        bool queued = false;
+        {
+            std::lock_guard lock(queue_mutex_);
+            queued = !pending_.empty();
+        }
+        if (!queued) { return; }
+        if (auto_resume_.load(std::memory_order_acquire)) {
+            try {
+                resume_locked();
+                return;
+            } catch (const std::exception& error) {
+                fail_pending_locked(std::make_exception_ptr(RequestError(
+                    RequestErrorKind::Unavailable,
+                    std::string("model resume failed: ") + error.what())));
+                return;
+            }
+        }
+        fail_pending_locked(std::make_exception_ptr(
+            RequestError(RequestErrorKind::Unavailable, "model is suspended")));
+    }
+
+    // Ends every queued request with `error`; nothing is admitted or running when this is called,
+    // so no Program state is touched (the device memory may be released).
+    void fail_pending_locked(const std::exception_ptr& error) noexcept {
+        std::vector<std::shared_ptr<Request>> failed;
+        {
+            std::lock_guard lock(queue_mutex_);
+            failed.assign(pending_.begin(), pending_.end());
+            pending_.clear();
+        }
+        for (const auto& request : failed) { complete_error(request, error); }
+        if (!failed.empty()) { publish_runtime_stats(); }
+    }
+
+    void publish_residency() {
+        ResidencyStatus status;
+        status.enabled     = state_snapshot_.has_value();
+        status.state       = suspended_.load(std::memory_order_acquire) ? ModelResidency::Suspended
+                                                                        : ModelResidency::Resident;
+        status.auto_resume = auto_resume_.load(std::memory_order_acquire);
+        if constexpr (kInstanceSuspendable) {
+            if (status.enabled) {
+                status.releasable_device_bytes = instance_.releasable_device_bytes();
+                status.host_snapshot_bytes =
+                    state_snapshot_->bytes() + (weight_snapshot_ ? weight_snapshot_->bytes() : 0);
+                status.host_reserved_bytes =
+                    state_snapshot_->host_capacity_bytes() +
+                    (weight_snapshot_ ? weight_snapshot_->host_capacity_bytes() : 0);
+            }
+        }
+        status.suspend_count = suspend_count_;
+        status.resume_count  = resume_count_;
+        status.last_suspend  = last_suspend_;
+        status.last_resume   = last_resume_;
+        status.last_error    = last_residency_error_;
+        std::lock_guard lock(stats_mutex_);
+        published_residency_ = std::move(status);
+    }
+
     void worker_loop() noexcept {
         for (;;) {
             {
@@ -3395,12 +3601,29 @@ private:
                 if (stopping_) {
                     lock.unlock();
                     std::scoped_lock execution_lock(execution_mutex_);
-                    fail_all_locked(std::make_exception_ptr(RequestError(
-                        RequestErrorKind::Unavailable, "inference engine is shutting down")));
+                    const auto error = std::make_exception_ptr(RequestError(
+                        RequestErrorKind::Unavailable, "inference engine is shutting down"));
+                    if (suspended_.load(std::memory_order_acquire)) {
+                        // Nothing is admitted and the device memory is released: only the queue
+                        // has anything to fail, and the Program is not touched.
+                        {
+                            std::lock_guard queue_lock(queue_mutex_);
+                            failed_ = true;
+                        }
+                        fail_pending_locked(error);
+                        return;
+                    }
+                    fail_all_locked(error);
                     return;
                 }
             }
             std::unique_lock execution_lock(execution_mutex_);
+            if (suspended_.load(std::memory_order_acquire)) {
+                // Nothing executes while suspended. The wait above returned because work was
+                // queued: resume for it, or refuse it when the model is held suspended.
+                serve_suspended_queue_locked();
+                continue;
+            }
             bool executed = false;
             // The execution unit in progress, for the fault event.
             const char* unit = "boundary";
@@ -3690,6 +3913,21 @@ private:
     std::deque<HydrationTask> hydration_done_;
     bool hydration_stop_ = false;
     std::thread hydration_reader_;
+
+    // Model residency. The snapshots exist only when suspend is enabled and are touched under the
+    // execution mutex; the flags are also read by submit and is_available without it.
+    ModelSuspendOptions suspend_options_;
+    std::optional<DeviceSnapshot> state_snapshot_;
+    std::optional<DeviceSnapshot> weight_snapshot_;
+    std::atomic<bool> suspended_{false};
+    std::atomic<bool> auto_resume_{true};
+    std::uint64_t suspend_count_ = 0;
+    std::uint64_t resume_count_  = 0;
+    std::optional<ResidencyTransition> last_suspend_;
+    std::optional<ResidencyTransition> last_resume_;
+    std::string last_residency_error_;
+    // Guarded by stats_mutex_.
+    ResidencyStatus published_residency_;
 
     std::thread worker_;
 };

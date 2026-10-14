@@ -170,6 +170,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--chat-template FILE] "
            "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
            "[--gdn-state-fp16] "
+           "[--model-suspend [--suspend-snapshot pageable|pinned] "
+           "[--suspend-weights artifact|host] [--no-auto-resume] [--sleep-idle-seconds N]] "
            "[--mlp-a8-decode] [--no-prefill-a8] "
            "[--prefill-cublas [--no-prefill-cublas-projections]] "
            "[--no-thinking] [--preserve-thinking] [--tolerant-tool-calls] "
@@ -641,6 +643,31 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.mtp_experts_q4 = true;
         } else if (arg == "--gdn-state-fp16") {
             options.gdn_state_fp16 = true;
+        } else if (arg == "--model-suspend") {
+            options.suspend.enabled = true;
+        } else if (arg == "--suspend-snapshot") {
+            const std::string value = require_value("--suspend-snapshot");
+            if (value == "pageable") {
+                options.suspend.snapshot_memory = SuspendSnapshotMemory::Pageable;
+            } else if (value == "pinned") {
+                options.suspend.snapshot_memory = SuspendSnapshotMemory::Pinned;
+            } else {
+                throw std::invalid_argument("--suspend-snapshot must be pageable or pinned");
+            }
+        } else if (arg == "--suspend-weights") {
+            const std::string value = require_value("--suspend-weights");
+            if (value == "artifact") {
+                options.suspend.weights = SuspendWeightSource::Artifact;
+            } else if (value == "host") {
+                options.suspend.weights = SuspendWeightSource::Host;
+            } else {
+                throw std::invalid_argument("--suspend-weights must be artifact or host");
+            }
+        } else if (arg == "--no-auto-resume") {
+            options.suspend.auto_resume = false;
+        } else if (arg == "--sleep-idle-seconds") {
+            options.sleep_idle_seconds = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--sleep-idle-seconds"), "sleep-idle-seconds"));
         } else if (arg == "--mlp-a8-decode") {
             options.mlp_a8_decode = true;
         } else if (arg == "--no-prefill-a8") {
@@ -824,6 +851,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.default_max_tokens && *options.default_max_tokens <= 0) {
         throw std::invalid_argument("--default-max-tokens must be positive");
+    }
+    if (options.sleep_idle_seconds != 0 && !options.suspend.enabled) {
+        throw std::invalid_argument("--sleep-idle-seconds requires --model-suspend");
+    }
+    if (options.suspend.enabled && options.vision_residency == VisionResidency::Overlay) {
+        throw std::invalid_argument(
+            "--model-suspend cannot be combined with --vision-residency overlay");
     }
     return options;
 }

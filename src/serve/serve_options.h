@@ -75,6 +75,12 @@ struct ServeOptions {
     bool prefill_cublas     = false;
     bool prefill_cublas_projections = true;
     bool allow_prefix_reuse = true;
+    // --model-suspend and its options: the residency API (suspend, resume) over fixed-address device
+    // memory that a suspend gives back to the GPU. Needs CUDA virtual memory management.
+    ModelSuspendOptions suspend;
+    // --sleep-idle-seconds N: suspend the model after N seconds with no request (needs
+    // --model-suspend). 0 leaves suspending to the HTTP API.
+    std::uint32_t sleep_idle_seconds = 0;
     // --context-store DIR: keep retained sessions on disk so a restart or crash does not lose the
     // context cache. Empty disables it.
     std::filesystem::path context_store_path;

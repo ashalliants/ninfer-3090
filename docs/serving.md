@@ -556,6 +556,56 @@ The local directory becomes a cache of the bucket.
   minutes) and then interrupts the transfer in progress, so it never waits out a stalled connection.
 
 
+### Model suspend
+
+With `--model-suspend`, an idle server can give its device memory back to the GPU without exiting,
+for instance to let a game or another program use the card for a while, and take it again on the
+next request. Every device allocation the model owns (weights, KV cache and recurrent state,
+workspace, on every device of a `--devices` split) sits at a fixed address whose physical memory a
+suspend releases; the CUDA Graphs, block tables and Host caches stay as they are. A resume maps fresh
+memory at the same addresses, restores the weights and copies the retained state back, so
+conversations retained before the suspend reuse their prefixes afterwards exactly as before. It
+needs CUDA virtual memory management on every device, and it is refused with
+`--vision-residency overlay` (the overlay borrows memory that a suspend releases) and for
+Qwen3.8-Flash-Next.
+
+A suspend runs between units and only while the server is idle: nothing queued, admitted, paused or
+running, no context transaction. Otherwise it answers `409 model_busy`; it never cancels work. A
+generation request that arrives while the model is suspended resumes it first, then runs. With
+`--no-auto-resume` (or `{"auto_resume": false}` in the suspend request) it fails with `503`
+instead and `/health` reports the server unavailable until an explicit resume.
+
+| Endpoint | |
+|---|---|
+| `POST /v1/models/{id}/suspend` | give the device memory back. Optional body `{"auto_resume": false}` |
+| `POST /v1/models/{id}/resume` | map the memory again and restore the weights and state |
+| `GET /v1/models/{id}/residency` | `state` (`resident` or `suspended`), `releasable_device_bytes`, `host_snapshot_bytes`, the suspend and resume counts, how long the last of each took and, after a failed resume, `last_error` |
+
+`GET /props` carries `is_sleeping` for the same state. `--sleep-idle-seconds N` suspends the model
+by itself after N seconds with no admitted request.
+
+Where the weights come from on a resume is the trade between host memory and wake time
+(`--suspend-weights`):
+
+- `artifact` (default) reads them again from the artifact the server loaded, whose files stay open.
+  No extra host memory, but a wake costs about what the load did.
+- `host` keeps a host copy taken at suspend, as much memory as the weights while suspended, and wakes
+  at bus speed.
+
+`--suspend-snapshot` picks where the retained state waits: `pageable` (default) allocates host
+memory at suspend and frees it after the resume; `pinned` reserves one page-locked block at startup
+for the largest snapshot, which transfers faster and holds that memory for the life of the server.
+A failed resume leaves the model suspended with its state intact and the next request retries it.
+
+Measured on an RTX 3090 with the Qwen3.8-27B artifact (4,096 tokens of context, one lane): a suspend
+gives back all 15.4 GiB the model's regions held in about 0.15 s, copying 343 MiB of retained state to
+host memory. A resume takes 3.3 s with `--suspend-weights artifact` (the file was in the operating
+system's cache; a cold read takes as long as a cold load) or 1.9 s with `--suspend-weights host`,
+which holds 15 GiB of host memory while suspended. A conversation retained before the suspend still
+reuses all 1,324 prompt tokens of its prefix afterwards, and greedy output is identical. The CUDA
+context itself and anything allocated outside the model's regions stay resident.
+
+
 ### Metrics
 
 `GET /metrics` serves Prometheus text format 0.0.4 on the same port. Like `/v1/load` it requires
@@ -1720,6 +1770,11 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--vision-max-merged N` | merged-token budget of one media item, `[64, 16384]`; larger images and video frame pairs are downscaled at preprocessing instead of being rejected, and the overlay window is sized for it | 16384 |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
+| `--model-suspend` | enable [model suspend](#model-suspend): the suspend, resume and residency endpoints. Needs CUDA virtual memory management; refused with `--vision-residency overlay` | off |
+| `--suspend-snapshot pageable\|pinned` | where the retained state waits in host memory while suspended | `pageable` |
+| `--suspend-weights artifact\|host` | where a resume takes the weights from: the artifact again, or a host copy taken at suspend (weight-sized host memory, faster wake) | `artifact` |
+| `--no-auto-resume` | a request while suspended fails (503) instead of resuming the model | requests resume it |
+| `--sleep-idle-seconds N` | suspend the model after N seconds with no request; needs `--model-suspend` | off |
 | `--device-state-slots N` | extra Device StateImages beyond `max-concurrency` | `max-concurrency` |
 | `--host-context-mib N` | shared pinned Host budget for StateImages, KV and pause snapshots, including in-flight destinations; refused together with `--auto-host-cache` | `8192 MiB + 8 native StateImages` |
 | `--auto-host-cache` | size the Host context budget from the host memory still free once the model has loaded, for a machine that exists to serve; see [automatic host cache](#automatic-host-cache). Refuses an explicit `--host-context-mib` | off |

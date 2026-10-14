@@ -426,6 +426,34 @@ KVPlaneByteRange DeviceKVPagePool::plane_page_range(std::size_t plane_index,
                             .bytes = page_bytes * count};
 }
 
+// Adapted from NInfer-all 0dcb1da9 src/core/paged_kv_cache.cpp (Apache-2.0).
+std::vector<DeviceKVPagePool::FreeExtent> DeviceKVPagePool::free_extents() const {
+    std::vector<FreeExtent> out;
+    for (std::size_t plane_index = 0; plane_index < planes_.size(); ++plane_index) {
+        const Tensor& plane     = planes_[plane_index];
+        const std::size_t rank  = plane_ranks_[plane_index];
+        const auto* const base  = static_cast<const std::byte*>(plane.data);
+        const bool page_major   = spec_.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor;
+        const std::size_t heads = page_major ? 1 : static_cast<std::size_t>(plane.ne[3]);
+        for (const KVPageRun& run : free_page_runs_) {
+            for (std::size_t head = 0; head < heads; ++head) {
+                if (page_major) {
+                    const auto page = static_cast<std::size_t>(plane.nb[3]);
+                    out.push_back({rank, base + static_cast<std::size_t>(run.begin) * page,
+                                   static_cast<std::size_t>(run.count) * page});
+                } else {
+                    const auto page = static_cast<std::size_t>(plane.nb[2]);
+                    out.push_back({rank,
+                                   base + head * static_cast<std::size_t>(plane.nb[3]) +
+                                       static_cast<std::size_t>(run.begin) * page,
+                                   static_cast<std::size_t>(run.count) * page});
+                }
+            }
+        }
+    }
+    return out;
+}
+
 void DeviceKVPagePool::lend_pages(std::int32_t begin, std::uint32_t count) {
     if (count == 0 || begin < 0 || static_cast<std::int64_t>(begin) + count > capacity_pages()) {
         throw std::out_of_range("Paged KV loan is outside the pool");

@@ -13,6 +13,8 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <span>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 
@@ -126,6 +128,173 @@ float read_divisor(const Reader& reader, ObjectHandle handle, const WeightGeomet
     return value;
 }
 
+struct UploadTotals {
+    std::uint64_t read_bytes         = 0;
+    std::uint64_t h2d_bytes          = 0;
+    std::uint64_t peak_staging_bytes = 0;
+    double seconds                   = 0;
+};
+
+// Writes every device object's bytes to `bases[placement.rank] + placement.offset`: transcoded
+// objects whole through the host, the rest through direct-I/O staging, one pass per rank. Loading
+// and a resume after a model suspend upload through here alike. `progress_base` is the part of the
+// phase's `total` that earlier steps already counted (the pinned objects).
+UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePlacement> placements,
+                                 std::span<std::byte* const> bases, DeviceContext& device,
+                                 const StartupObserver& observer, StartupPhaseScope& phase,
+                                 std::uint64_t total, std::uint64_t progress_base) {
+    UploadTotals totals;
+    const std::size_t rank_count = bases.size();
+    std::vector<std::vector<CopyRange>> ranges_by_rank(rank_count);
+    std::vector<const DevicePlacement*> transcoded;
+    for (const auto& placement : placements) {
+        if (placement.rank >= rank_count || bases[placement.rank] == nullptr) {
+            throw ArtifactError("device placement names a rank the plan has no arena for");
+        }
+        std::byte* const destination = bases[placement.rank] + placement.offset;
+        if (placement.transcode) {
+            transcoded.push_back(&placement);
+            continue;
+        }
+        const auto& descriptor = reader.directory().tensor(placement.object);
+        for (const auto& segment : reader.segments(descriptor.offset, descriptor.bytes)) {
+            ranges_by_rank[placement.rank].push_back(
+                {segment.file_index, segment.file_offset,
+                 checked_add(segment.file_offset, segment.bytes, "copy range"),
+                 destination + segment.destination_offset});
+        }
+    }
+    // Transcoded objects are read whole, requantized on the host and uploaded synchronously.
+    // They are the vocabulary-sized exceptions a startup option asked for, so bounded extra Host
+    // memory (one object at a time) is acceptable and the direct-I/O pipeline stays unchanged.
+    std::uint64_t transcoded_bytes = 0;
+    for (const DevicePlacement* placement : transcoded) {
+        const auto source = reader.read_object(placement->object);
+        totals.read_bytes = checked_add(totals.read_bytes, source.size(), "transcode read bytes");
+        std::vector<std::byte> encoded(static_cast<std::size_t>(placement->bytes));
+        transcode_row_split(*placement->transcode,
+                            reader.directory().tensor(placement->object).shape, source, encoded);
+        const ScopedRank bound(device, placement->rank);
+        check_cuda(cudaMemcpy(bases[placement->rank] + placement->offset, encoded.data(),
+                              encoded.size(), cudaMemcpyHostToDevice),
+                   "upload transcoded weight bytes");
+        transcoded_bytes = checked_add(transcoded_bytes, encoded.size(), "transcoded bytes");
+        phase.progress(checked_add(progress_base, transcoded_bytes, "progress bytes"), total);
+    }
+    totals.h2d_bytes     = transcoded_bytes;
+    std::uint64_t copied = 0;
+    const auto start     = std::chrono::steady_clock::now();
+    bool uploaded_any    = false;
+    // One staging pass per rank, each on its own device: a host-to-device copy and the event that
+    // retires its slot both belong to the destination device, so they cannot be shared across
+    // ranks. The ranks hold disjoint objects, so no payload is read twice. With one rank this is
+    // the original single pass, on the original stream, with the original slot pool.
+    for (std::size_t rank = 0; rank < rank_count; ++rank) {
+        auto& ranges = ranges_by_rank[rank];
+        if (ranges.empty()) { continue; }
+        uploaded_any = true;
+        const ScopedRank bound(device, rank);
+        const cudaStream_t transfer_stream = device.transfer_stream_for_rank(rank);
+        std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) {
+            return std::tie(a.file, a.begin) < std::tie(b.file, b.begin);
+        });
+        std::vector<ReadSpan> spans;
+        std::uint64_t aligned_bytes = 0;
+        for (std::size_t i = 0; i < ranges.size(); ++i) {
+            const auto& range = ranges[i];
+            if (i && ranges[i - 1].file == range.file && ranges[i - 1].end > range.begin) {
+                throw ArtifactError("device source ranges overlap");
+            }
+            const auto begin = range.begin / kPayloadAlignment * kPayloadAlignment;
+            if (spans.empty() || spans.back().file != range.file ||
+                begin > align_up(spans.back().end, kPayloadAlignment, "direct range")) {
+                spans.push_back({range.file, begin, range.end});
+            } else {
+                spans.back().end = std::max(spans.back().end, range.end);
+            }
+        }
+        for (const auto& span : spans) {
+            aligned_bytes =
+                checked_add(aligned_bytes,
+                            align_up(span.end - span.begin, kPayloadAlignment, "direct range bytes"),
+                            "direct bytes");
+        }
+        const auto slot_bytes =
+            static_cast<std::size_t>(std::min<std::uint64_t>(kSlotBytes, aligned_bytes));
+        const auto slot_count = static_cast<std::size_t>(
+            std::min<std::uint64_t>(kMaximumSlotCount, 1 + (aligned_bytes - 1) / slot_bytes));
+        std::vector<std::unique_ptr<Slot>> slots;
+        // Passes run one after another and free their slots in between, so the process high-water
+        // mark is the largest pass, not their sum.
+        totals.peak_staging_bytes =
+            std::max<std::uint64_t>(totals.peak_staging_bytes, slot_bytes * slot_count);
+        StartupPhaseScope pin_phase(observer, StartupPhase::WeightsStagingPin,
+                                    StartupProgressUnit::Bytes, slot_bytes * slot_count);
+        for (std::size_t i = 0; i < slot_count; ++i) {
+            slots.push_back(std::make_unique<Slot>(slot_bytes));
+        }
+        pin_phase.complete();
+        TransferCompletion completion{transfer_stream};
+        std::size_t next_slot  = 0;
+        std::size_t next_range = 0;
+        for (const auto& span : spans) {
+            for (auto source = span.begin; source < span.end; source += slot_bytes) {
+                auto& slot = *slots[next_slot++ % slot_count];
+                slot.wait();
+                const auto remaining = span.end - source;
+                const auto request   = static_cast<std::size_t>(std::min<std::uint64_t>(
+                    slot_bytes, align_up(remaining, kPayloadAlignment, "direct block bytes")));
+                const auto received  = reader.read_direct(
+                    span.file, source, {slot.data(), request});
+                if (received < std::min<std::uint64_t>(request, remaining)) {
+                    throw ArtifactError("direct read ended before the required payload");
+                }
+                totals.read_bytes    = checked_add(totals.read_bytes, received, "read bytes");
+                const auto chunk_end  = checked_add(source, received, "read block end");
+                while (next_range < ranges.size() && ranges[next_range].file == span.file &&
+                       ranges[next_range].begin < chunk_end) {
+                    const auto& range = ranges[next_range];
+                    const auto begin  = std::max(source, range.begin);
+                    const auto end    = std::min(chunk_end, range.end);
+                    if (begin < end) {
+                        check_cuda(cudaMemcpyAsync(range.destination + (begin - range.begin),
+                                                   slot.data() +
+                                                       (begin - source),
+                                                   static_cast<std::size_t>(end - begin),
+                                                   cudaMemcpyHostToDevice, transfer_stream),
+                                   "upload weight bytes");
+                        copied = checked_add(copied, end - begin, "copied bytes");
+                    }
+                    if (range.end > chunk_end) { break; }
+                    ++next_range;
+                }
+                check_cuda(cudaEventRecord(slot.event, transfer_stream),
+                           "record weight staging completion");
+                slot.pending = true;
+                phase.progress(checked_add(progress_base, checked_add(copied, transcoded_bytes, "uploaded bytes"),
+                                           "progress bytes"),
+                               total);
+            }
+        }
+        for (const auto& slot : slots) { slot->wait(); }
+        completion.finish();
+        if (next_range != ranges.size()) { throw ArtifactError("incomplete device upload"); }
+    }
+    if (!uploaded_any) {
+        phase.complete(checked_add(progress_base, transcoded_bytes, "progress bytes"), total);
+        return totals;
+    }
+    if (checked_add(progress_base, checked_add(copied, transcoded_bytes, "uploaded bytes"),
+                    "progress bytes") != total) {
+        throw ArtifactError("incomplete device upload");
+    }
+    totals.h2d_bytes = checked_add(copied, transcoded_bytes, "uploaded bytes");
+    totals.seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    phase.complete(checked_add(progress_base, totals.h2d_bytes, "progress bytes"), total);
+    return totals;
+}
+
 } // namespace
 
 const WeightParent& MaterializedArtifact::device_parent(ObjectHandle handle) const {
@@ -165,7 +334,8 @@ std::span<const std::byte> MaterializedArtifact::pinned_block() const noexcept {
 
 MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& plan,
                                  DeviceContext& device, const StartupObserver* startup_observer,
-                                 std::unique_ptr<EvictableWeightPool> backing) {
+                                 std::unique_ptr<EvictableWeightPool> backing,
+                                 const MaterializeOptions& options) {
     if (plan.source != &reader || plan.object_count != reader.directory().objects.size()) {
         throw ArtifactError("materialization plan belongs to another load session");
     }
@@ -193,7 +363,13 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     // The pool backs rank 0's arena alone: its window is borrowed by a Vision encode on the primary
     // device, and later ranks get ordinary arenas below. The planner already refuses an evictable
     // placement anywhere but rank 0.
+    if (options.suspendable && backing) {
+        // The pool's window is borrowed by a Vision encode that runs on the primary device, and its
+        // arena cannot be released with the rest of the model.
+        throw ArtifactError("model suspend cannot be combined with an eviction pool");
+    }
     out.arenas_.resize(rank_count);
+    if (options.suspendable) { out.regions_.resize(rank_count); }
     for (std::size_t rank = 0; rank < rank_count; ++rank) {
         const auto capacity = plan.device_capacity(rank);
         if (capacity > std::numeric_limits<std::size_t>::max()) {
@@ -205,6 +381,14 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             }
             out.pool_      = std::move(backing);
             out.arenas_[0] = std::make_unique<DeviceArena>(out.pool_->arena());
+        } else if (capacity && options.suspendable) {
+            // Fixed addresses whose memory a model suspend gives back; the weights are uploaded
+            // again from the retained artifact when it resumes.
+            const ScopedRank bound(device, rank);
+            out.regions_[rank] = VmmRegion(
+                static_cast<std::size_t>(capacity),
+                VmmRegion::Options{.device = device.rank(rank).device, .peers = {}});
+            out.arenas_[rank] = std::make_unique<DeviceArena>(out.regions_[rank].span());
         } else if (capacity) {
             // Each rank's arena must live in that rank's memory, so it is allocated while that
             // device is current.
@@ -276,8 +460,6 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             storage.host = WeightParent{geometry, storage.host_data.data(), divisor};
         }
     }
-    std::vector<std::vector<CopyRange>> ranges_by_rank(rank_count);
-    std::vector<const DevicePlacement*> transcoded;
     std::vector<std::uint64_t> previous_device_end(rank_count, 0);
     for (const auto& placement : plan.device_objects) {
         const auto& stored_geometry = reader.geometry(placement.object);
@@ -309,148 +491,111 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                                  : read_divisor(reader, placement.object, geometry, {}, out.stats_);
         object.device = WeightParent{geometry, static_cast<const std::byte*>(storage.data),
                                      divisor, stored_geometry.format};
-        if (placement.transcode) {
-            transcoded.push_back(&placement);
-            continue;
-        }
-        const auto& descriptor = reader.directory().tensor(placement.object);
-        for (const auto& segment : reader.segments(descriptor.offset, descriptor.bytes)) {
-            ranges_by_rank[placement.rank].push_back(
-                {segment.file_index, segment.file_offset,
-                 checked_add(segment.file_offset, segment.bytes, "copy range"),
-                 static_cast<std::byte*>(storage.data) + segment.destination_offset});
-        }
     }
-    // Transcoded objects are read whole, requantized on the host and uploaded synchronously.
-    // They are the vocabulary-sized exceptions a startup option asked for, so bounded extra Host
-    // memory (one object at a time) is acceptable and the direct-I/O pipeline stays unchanged.
-    std::uint64_t transcoded_bytes = 0;
-    for (const DevicePlacement* placement : transcoded) {
-        const auto source = reader.read_object(placement->object);
-        out.stats_.read_bytes =
-            checked_add(out.stats_.read_bytes, source.size(), "transcode read bytes");
-        std::vector<std::byte> encoded(static_cast<std::size_t>(placement->bytes));
-        transcode_row_split(*placement->transcode,
-                            reader.directory().tensor(placement->object).shape, source, encoded);
-        const auto& parent = *out.objects_.at(placement->object.index).device;
-        const ScopedRank bound(device, placement->rank);
-        check_cuda(cudaMemcpy(const_cast<std::byte*>(parent.data), encoded.data(), encoded.size(),
-                              cudaMemcpyHostToDevice),
-                   "upload transcoded weight bytes");
-        transcoded_bytes = checked_add(transcoded_bytes, encoded.size(), "transcoded bytes");
-        phase.progress(checked_add(pinned_total, transcoded_bytes, "progress bytes"), total);
-    }
-    out.stats_.h2d_bytes = transcoded_bytes;
-    std::uint64_t copied = 0;
-    const auto start     = std::chrono::steady_clock::now();
-    bool uploaded_any    = false;
-    // One staging pass per rank, each on its own device: a host-to-device copy and the event that
-    // retires its slot both belong to the destination device, so they cannot be shared across
-    // ranks. The ranks hold disjoint objects, so no payload is read twice. With one rank this is
-    // the original single pass, on the original stream, with the original slot pool.
-    for (std::size_t rank = 0; rank < rank_count; ++rank) {
-        auto& ranges = ranges_by_rank[rank];
-        if (ranges.empty()) { continue; }
-        uploaded_any = true;
-        const ScopedRank bound(device, rank);
-        const cudaStream_t transfer_stream = device.transfer_stream_for_rank(rank);
-        std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) {
-            return std::tie(a.file, a.begin) < std::tie(b.file, b.begin);
-        });
-        std::vector<ReadSpan> spans;
-        std::uint64_t aligned_bytes = 0;
-        for (std::size_t i = 0; i < ranges.size(); ++i) {
-            const auto& range = ranges[i];
-            if (i && ranges[i - 1].file == range.file && ranges[i - 1].end > range.begin) {
-                throw ArtifactError("device source ranges overlap");
-            }
-            const auto begin = range.begin / kPayloadAlignment * kPayloadAlignment;
-            if (spans.empty() || spans.back().file != range.file ||
-                begin > align_up(spans.back().end, kPayloadAlignment, "direct range")) {
-                spans.push_back({range.file, begin, range.end});
-            } else {
-                spans.back().end = std::max(spans.back().end, range.end);
-            }
+    // Rank r's arena base: the byte a placement's offset is relative to.
+    const std::vector<std::byte*> bases = out.arena_bases();
+    const UploadTotals upload =
+        upload_device_bytes(reader, plan.device_objects, bases, device, observer, phase, total,
+                            pinned_total);
+    out.stats_.read_bytes = checked_add(out.stats_.read_bytes, upload.read_bytes, "read bytes");
+    out.stats_.h2d_bytes  = upload.h2d_bytes;
+    out.stats_.peak_staging_bytes =
+        std::max<std::uint64_t>(out.stats_.peak_staging_bytes, upload.peak_staging_bytes);
+    out.stats_.upload_seconds = upload.seconds;
+    if (options.suspendable) {
+        // A resume uploads the same objects again from the artifact it was loaded from.
+        if (!options.retained_reader || options.retained_reader.get() != &reader) {
+            throw ArtifactError("a suspendable materialization must retain its own reader");
         }
-        for (const auto& span : spans) {
-            aligned_bytes =
-                checked_add(aligned_bytes,
-                            align_up(span.end - span.begin, kPayloadAlignment, "direct range bytes"),
-                            "direct bytes");
-        }
-        const auto slot_bytes =
-            static_cast<std::size_t>(std::min<std::uint64_t>(kSlotBytes, aligned_bytes));
-        const auto slot_count = static_cast<std::size_t>(
-            std::min<std::uint64_t>(kMaximumSlotCount, 1 + (aligned_bytes - 1) / slot_bytes));
-        std::vector<std::unique_ptr<Slot>> slots;
-        // Passes run one after another and free their slots in between, so the process high-water
-        // mark is the largest pass, not their sum.
-        out.stats_.peak_staging_bytes =
-            std::max<std::uint64_t>(out.stats_.peak_staging_bytes, slot_bytes * slot_count);
-        StartupPhaseScope pin_phase(observer, StartupPhase::WeightsStagingPin,
-                                    StartupProgressUnit::Bytes, slot_bytes * slot_count);
-        for (std::size_t i = 0; i < slot_count; ++i) {
-            slots.push_back(std::make_unique<Slot>(slot_bytes));
-        }
-        pin_phase.complete();
-        TransferCompletion completion{transfer_stream};
-        std::size_t next_slot  = 0;
-        std::size_t next_range = 0;
-        for (const auto& span : spans) {
-            for (auto source = span.begin; source < span.end; source += slot_bytes) {
-                auto& slot = *slots[next_slot++ % slot_count];
-                slot.wait();
-                const auto remaining = span.end - source;
-                const auto request   = static_cast<std::size_t>(std::min<std::uint64_t>(
-                    slot_bytes, align_up(remaining, kPayloadAlignment, "direct block bytes")));
-                const auto received  = reader.read_direct(
-                    span.file, source, {slot.data(), request});
-                if (received < std::min<std::uint64_t>(request, remaining)) {
-                    throw ArtifactError("direct read ended before the required payload");
-                }
-                out.stats_.read_bytes = checked_add(out.stats_.read_bytes, received, "read bytes");
-                const auto chunk_end  = checked_add(source, received, "read block end");
-                while (next_range < ranges.size() && ranges[next_range].file == span.file &&
-                       ranges[next_range].begin < chunk_end) {
-                    const auto& range = ranges[next_range];
-                    const auto begin  = std::max(source, range.begin);
-                    const auto end    = std::min(chunk_end, range.end);
-                    if (begin < end) {
-                        check_cuda(cudaMemcpyAsync(range.destination + (begin - range.begin),
-                                                   slot.data() +
-                                                       (begin - source),
-                                                   static_cast<std::size_t>(end - begin),
-                                                   cudaMemcpyHostToDevice, transfer_stream),
-                                   "upload weight bytes");
-                        copied = checked_add(copied, end - begin, "copied bytes");
-                    }
-                    if (range.end > chunk_end) { break; }
-                    ++next_range;
-                }
-                check_cuda(cudaEventRecord(slot.event, transfer_stream),
-                           "record weight staging completion");
-                slot.pending = true;
-                phase.progress(checked_add(pinned_total, checked_add(copied, transcoded_bytes, "uploaded bytes"),
-                                           "progress bytes"),
-                               total);
-            }
-        }
-        for (const auto& slot : slots) { slot->wait(); }
-        completion.finish();
-        if (next_range != ranges.size()) { throw ArtifactError("incomplete device upload"); }
+        out.reader_            = options.retained_reader;
+        out.device_placements_ = std::move(plan.device_objects);
+        out.device_payload_    = total - pinned_total;
     }
-    if (!uploaded_any) {
-        phase.complete(checked_add(pinned_total, transcoded_bytes, "progress bytes"), total);
-        return out;
-    }
-    if (checked_add(pinned_total, checked_add(copied, transcoded_bytes, "uploaded bytes"), "progress bytes") != total) {
-        throw ArtifactError("incomplete device upload");
-    }
-    out.stats_.h2d_bytes = checked_add(copied, transcoded_bytes, "uploaded bytes");
-    out.stats_.upload_seconds =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    phase.complete(checked_add(pinned_total, checked_add(copied, transcoded_bytes, "uploaded bytes"), "progress bytes"), total);
     return out;
+}
+
+} // namespace ninfer::artifact
+
+namespace ninfer::artifact {
+
+std::vector<std::byte*> MaterializedArtifact::arena_bases() const {
+    std::vector<std::byte*> bases(arenas_.size(), nullptr);
+    for (std::size_t rank = 0; rank < arenas_.size(); ++rank) {
+        if (arenas_[rank]) { bases[rank] = static_cast<std::byte*>(arenas_[rank]->base()); }
+    }
+    return bases;
+}
+
+bool MaterializedArtifact::suspendable() const noexcept { return reader_ != nullptr; }
+
+bool MaterializedArtifact::device_backed() const noexcept {
+    for (const VmmRegion& region : regions_) {
+        if (region && !region.backed()) { return false; }
+    }
+    return true;
+}
+
+std::uint64_t MaterializedArtifact::device_backing_bytes() const noexcept {
+    std::uint64_t bytes = 0;
+    for (const VmmRegion& region : regions_) {
+        if (region) { bytes += region.reserved_bytes(); }
+    }
+    return bytes;
+}
+
+void MaterializedArtifact::release_device_backing() {
+    if (!suspendable()) {
+        throw std::logic_error("this materialization was not made suspendable");
+    }
+    for (VmmRegion& region : regions_) {
+        if (region) { region.release_backing(); }
+    }
+}
+
+std::vector<MaterializedArtifact::RankArena> MaterializedArtifact::device_arenas() const {
+    std::vector<RankArena> out;
+    for (std::size_t rank = 0; rank < arenas_.size(); ++rank) {
+        if (arenas_[rank] && arenas_[rank]->capacity() != 0) {
+            out.push_back({rank, DeviceSpan{arenas_[rank]->base(), arenas_[rank]->capacity()}});
+        }
+    }
+    return out;
+}
+
+void MaterializedArtifact::restore_device_backing(DeviceContext& device) {
+    if (!suspendable()) {
+        throw std::logic_error("this materialization was not made suspendable");
+    }
+    try {
+        for (std::size_t rank = 0; rank < regions_.size(); ++rank) {
+            if (!regions_[rank]) { continue; }
+            const ScopedRank bound(device, rank);
+            regions_[rank].restore_backing();
+        }
+    } catch (...) {
+        // Leave nothing half mapped: a later retry starts from a fully released arena.
+        try {
+            release_device_backing();
+        } catch (...) {}
+        throw;
+    }
+}
+
+MaterializationStats MaterializedArtifact::upload_device_objects_again(DeviceContext& device) {
+    if (!suspendable()) {
+        throw std::logic_error("this materialization was not made suspendable");
+    }
+    const StartupObserver no_observer;
+    StartupPhaseScope phase(no_observer, StartupPhase::WeightsMaterialize,
+                            StartupProgressUnit::Bytes, device_payload_);
+    const UploadTotals upload = upload_device_bytes(*reader_, device_placements_, arena_bases(),
+                                                    device, no_observer, phase, device_payload_, 0);
+    MaterializationStats stats;
+    stats.read_bytes         = upload.read_bytes;
+    stats.h2d_bytes          = upload.h2d_bytes;
+    stats.peak_staging_bytes = upload.peak_staging_bytes;
+    stats.upload_seconds     = upload.seconds;
+    return stats;
 }
 
 } // namespace ninfer::artifact

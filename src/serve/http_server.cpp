@@ -500,6 +500,18 @@ void HttpServer::register_routes() {
             metrics_.render(stats, service_->is_available(), service_->admitted_requests()),
             "text/plain; version=0.0.4; charset=utf-8");
     });
+    server_.Get(R"(/v1/models/([^/]+)/residency)",
+                [this](const httplib::Request& req, httplib::Response& res) {
+                    handle_model_residency(req, res);
+                });
+    server_.Post(R"(/v1/models/([^/]+)/suspend)",
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_model_suspend(req, res);
+                 });
+    server_.Post(R"(/v1/models/([^/]+)/resume)",
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_model_resume(req, res);
+                 });
     server_.Get(R"(/v1/models/(.+))", [this](const httplib::Request& req, httplib::Response& res) {
         handle_model(req, res);
     });
@@ -555,14 +567,135 @@ void HttpServer::handle_load(const httplib::Request&, httplib::Response& res) co
 }
 
 void HttpServer::handle_props(const httplib::Request&, httplib::Response& res) const {
-    res.set_content(make_props(options_, model_description(), service_->sampling_defaults()),
-                    "application/json");
+    // llama.cpp's /props reports a sleeping server the same way.
+    auto props = nlohmann::json::parse(
+        make_props(options_, model_description(), service_->sampling_defaults()));
+    props["is_sleeping"] =
+        service_->residency().state == ninfer::ModelResidency::Suspended;
+    res.set_content(props.dump(), "application/json");
 }
 
 ModelDescription HttpServer::model_description() const {
     return ModelDescription{.id            = public_model_id_,
                             .max_model_len = options_.max_context,
                             .vision        = service_->engine_options().enable_vision};
+}
+
+namespace {
+
+nlohmann::json residency_transition_json(const ninfer::ResidencyTransition& transition) {
+    return nlohmann::json{{"ms", transition.seconds * 1000.0},
+                          {"state_bytes", transition.state_bytes},
+                          {"state_ms", transition.state_seconds * 1000.0},
+                          {"weight_bytes", transition.weight_bytes},
+                          {"weight_ms", transition.weight_seconds * 1000.0},
+                          {"artifact_read_bytes", transition.artifact_read_bytes}};
+}
+
+// Adapted from NInfer-all 0dcb1da9 src/serve/http_server.cpp (Apache-2.0).
+nlohmann::json residency_json(const std::string& model, const ninfer::ResidencyStatus& status) {
+    return nlohmann::json{
+        {"object", "model.residency"},
+        {"model", model},
+        {"enabled", status.enabled},
+        {"state", status.state == ninfer::ModelResidency::Suspended ? "suspended" : "resident"},
+        {"auto_resume", status.auto_resume},
+        {"releasable_device_bytes", status.releasable_device_bytes},
+        {"host_snapshot_bytes", status.host_snapshot_bytes},
+        {"host_reserved_bytes", status.host_reserved_bytes},
+        {"suspend_count", status.suspend_count},
+        {"resume_count", status.resume_count},
+        {"last_suspend", status.last_suspend ? residency_transition_json(*status.last_suspend)
+                                             : nlohmann::json(nullptr)},
+        {"last_resume", status.last_resume ? residency_transition_json(*status.last_resume)
+                                           : nlohmann::json(nullptr)},
+        {"last_error", status.last_error.empty() ? nlohmann::json(nullptr)
+                                                 : nlohmann::json(status.last_error)}};
+}
+
+void fail_residency(httplib::Response& res, int status, std::string code, std::string message) {
+    ApiError error;
+    error.status  = status;
+    error.type    = status >= 500 ? "server_error" : "invalid_request_error";
+    error.code    = std::move(code);
+    error.message = std::move(message);
+    write_openai_error(res, error);
+}
+
+} // namespace
+
+void HttpServer::handle_model_residency(const httplib::Request& req,
+                                        httplib::Response& res) const {
+    const std::string id = req.matches.size() > 1 ? req.matches[1].str() : std::string();
+    if (id != public_model_id_) {
+        fail_residency(res, 404, "model_not_found", "model '" + id + "' not found");
+        return;
+    }
+    res.set_content(residency_json(id, service_->residency()).dump(), "application/json");
+}
+
+void HttpServer::handle_model_suspend(const httplib::Request& req, httplib::Response& res) {
+    const std::string id = req.matches.size() > 1 ? req.matches[1].str() : std::string();
+    if (id != public_model_id_) {
+        fail_residency(res, 404, "model_not_found", "model '" + id + "' not found");
+        return;
+    }
+    std::optional<bool> auto_resume;
+    try {
+        const nlohmann::json body =
+            req.body.empty() ? nlohmann::json::object() : nlohmann::json::parse(req.body);
+        if (!body.is_object()) { throw std::invalid_argument("body is not an object"); }
+        for (const auto& [key, value] : body.items()) {
+            if (key != "auto_resume" || !value.is_boolean()) {
+                throw std::invalid_argument("unexpected field");
+            }
+            auto_resume = value.get<bool>();
+        }
+    } catch (const std::exception&) {
+        fail_residency(res, 400, "invalid_request",
+                       "request body must be a JSON object with at most a boolean auto_resume");
+        return;
+    }
+    try {
+        res.set_content(residency_json(id, service_->suspend(auto_resume)).dump(),
+                        "application/json");
+    } catch (const ninfer::RequestError& error) {
+        if (error.kind() == ninfer::RequestErrorKind::Overloaded) {
+            fail_residency(res, 409, "model_busy", error.what());
+        } else {
+            fail_residency(res, 503, "model_unavailable", error.what());
+        }
+    } catch (const std::invalid_argument& error) {
+        fail_residency(res, 400, "model_suspend_disabled", error.what());
+    } catch (const std::exception& error) {
+        fail_residency(res, 500, "model_residency_error", error.what());
+    }
+}
+
+void HttpServer::handle_model_resume(const httplib::Request& req, httplib::Response& res) {
+    const std::string id = req.matches.size() > 1 ? req.matches[1].str() : std::string();
+    if (id != public_model_id_) {
+        fail_residency(res, 404, "model_not_found", "model '" + id + "' not found");
+        return;
+    }
+    if (!req.body.empty()) {
+        try {
+            const nlohmann::json body = nlohmann::json::parse(req.body);
+            if (!body.is_object() || !body.empty()) {
+                throw std::invalid_argument("unexpected body");
+            }
+        } catch (const std::exception&) {
+            fail_residency(res, 400, "invalid_request", "request body must be empty or {}");
+            return;
+        }
+    }
+    try {
+        res.set_content(residency_json(id, service_->resume()).dump(), "application/json");
+    } catch (const std::invalid_argument& error) {
+        fail_residency(res, 400, "model_suspend_disabled", error.what());
+    } catch (const std::exception& error) {
+        fail_residency(res, 500, "model_residency_error", error.what());
+    }
 }
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {

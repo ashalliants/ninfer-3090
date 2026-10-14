@@ -310,6 +310,37 @@ struct FlashNextOptions {
     std::filesystem::path context_nvme_dir;
 };
 
+// Where a suspended model's retained device state waits in host memory.
+enum class SuspendSnapshotMemory : std::uint8_t {
+    // Ordinary memory allocated at suspend, sized to the live bytes, freed after the resume.
+    Pageable,
+    // One page-locked block reserved at startup for the largest snapshot: transfers at bus speed,
+    // at the cost of that much host memory for the life of the Engine.
+    Pinned,
+};
+
+// Where a resume takes the weights from.
+enum class SuspendWeightSource : std::uint8_t {
+    // Read again from the artifact the Engine loaded, whose files stay open while it runs.
+    Artifact,
+    // A host copy taken at suspend, kept in the snapshot memory: as much host memory as the device
+    // weights while suspended, in exchange for a resume at bus speed.
+    Host,
+};
+
+// Adapted from NInfer-all 0dcb1da9 include/ninfer/types.h (Apache-2.0).
+struct ModelSuspendOptions {
+    // Engine::suspend and Engine::resume: every device allocation the model owns sits at fixed
+    // addresses whose physical memory a suspend gives back to the device while captured graphs and
+    // tensor views stay valid. Needs CUDA virtual memory management on every device.
+    bool enabled                          = false;
+    SuspendSnapshotMemory snapshot_memory = SuspendSnapshotMemory::Pageable;
+    SuspendWeightSource weights           = SuspendWeightSource::Artifact;
+    // Default for a suspend that does not say: a generation request arriving while suspended
+    // resumes the model and then runs, instead of failing as Unavailable.
+    bool auto_resume = true;
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
@@ -392,6 +423,9 @@ struct EngineOptions {
     // Prompt grafts a request may select by name through PromptOptions::graft. Each is loaded and
     // validated against the resident model at construction.
     std::vector<GraftSource> grafts;
+    // Model suspend (Engine::suspend / Engine::resume). Off by default: a model that never suspends
+    // keeps its ordinary device allocations.
+    ModelSuspendOptions suspend;
     StartupObserver startup_observer;
     ContextStoreOptions context_store;
     FlashNextOptions flash_next;
@@ -1199,6 +1233,43 @@ struct GenerationResult {
     SpeculativeStats speculative;
     ThinkingBudgetStats thinking;
     std::optional<ConstraintObservation> constraint;
+};
+
+enum class ModelResidency : std::uint8_t {
+    Resident,
+    Suspended,
+};
+
+// One suspend or resume, as it was carried out.
+struct ResidencyTransition {
+    double seconds = 0.0;
+    // Device state copied to host memory (suspend) or back (resume).
+    std::uint64_t state_bytes = 0;
+    double state_seconds      = 0.0;
+    // Weight bytes copied to host memory (suspend, Host weights), or uploaded again (resume).
+    std::uint64_t weight_bytes = 0;
+    double weight_seconds      = 0.0;
+    // Payload read from the artifact by a resume.
+    std::uint64_t artifact_read_bytes = 0;
+};
+
+struct ResidencyStatus {
+    bool enabled         = false;
+    ModelResidency state = ModelResidency::Resident;
+    bool auto_resume     = true;
+    // Device memory a suspend gives back: the model's fixed-address regions on every device.
+    std::uint64_t releasable_device_bytes = 0;
+    // Host memory held for the suspended model now: the retained state and any weight copy (the
+    // pinned reservation counts while it exists, suspended or not).
+    std::uint64_t host_snapshot_bytes = 0;
+    std::uint64_t host_reserved_bytes = 0;
+    std::uint64_t suspend_count       = 0;
+    std::uint64_t resume_count        = 0;
+    std::optional<ResidencyTransition> last_suspend;
+    std::optional<ResidencyTransition> last_resume;
+    // The last failed resume; cleared by the next successful one. The model stays suspended and a
+    // later resume retries.
+    std::string last_error;
 };
 
 struct ArenaMemorySummary {

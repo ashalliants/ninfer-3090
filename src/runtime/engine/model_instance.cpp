@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdio>
 #include <limits>
+#include <memory>
 #include <set>
 #include <span>
 #include <stdexcept>
@@ -80,6 +81,14 @@ void validate_engine_options(const EngineOptions& options) {
                     std::to_string(item_bound) + " tokens, one media item's bound");
             }
         }
+    }
+    if (options.suspend.enabled && models::load_options(options).overlay_vision()) {
+        throw std::invalid_argument(
+            "model suspend cannot be combined with --vision-residency overlay: the overlay borrows "
+            "weight and KV memory that a suspend releases");
+    }
+    if (options.suspend.enabled && options.purpose != EnginePurpose::Generation) {
+        throw std::invalid_argument("model suspend applies to Generation only");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
@@ -336,11 +345,102 @@ void ModelInstance::install_external_checkpoints() {
     }
 }
 
+bool ModelInstance::suspendable() const noexcept {
+    return model->weights_suspendable() && program->device_state_suspendable();
+}
+
+std::uint64_t ModelInstance::releasable_device_bytes() const noexcept {
+    return model->weight_backing_bytes() + program->device_state_backing_bytes();
+}
+
+std::uint64_t ModelInstance::weight_host_copy_bytes() const noexcept {
+    std::uint64_t bytes = 0;
+    for (const auto& arena : model->device_weight_arenas()) { bytes += arena.span.bytes; }
+    return bytes;
+}
+
+namespace {
+
+std::vector<DeviceSnapshot::Range>
+weight_ranges(const std::vector<artifact::MaterializedArtifact::RankArena>& arenas) {
+    std::vector<DeviceSnapshot::Range> out;
+    for (const auto& arena : arenas) {
+        out.push_back({arena.rank, arena.span.data, arena.span.bytes});
+    }
+    return out;
+}
+
+double seconds_between(Clock::time_point start, Clock::time_point end) {
+    return std::chrono::duration<double>(end - start).count();
+}
+
+} // namespace
+
+// Adapted from NInfer-all 0dcb1da9 src/runtime/engine/model_instance.cpp (Apache-2.0).
+ResidencyTransition ModelInstance::suspend(DeviceContext& device, DeviceSnapshot& state,
+                                           DeviceSnapshot* weights) {
+    if (!suspendable()) { throw std::logic_error("model instance is not suspendable"); }
+    const auto start = Clock::now();
+    ResidencyTransition out;
+    const DeviceSnapshot::Stats state_stats = program->suspend_device_state(state);
+    out.state_bytes                         = state_stats.bytes;
+    out.state_seconds                       = state_stats.seconds;
+    try {
+        if (weights != nullptr) {
+            const auto ranges                        = weight_ranges(model->device_weight_arenas());
+            const DeviceSnapshot::Stats weight_stats = weights->capture(device, ranges);
+            out.weight_bytes                         = weight_stats.bytes;
+            out.weight_seconds                       = weight_stats.seconds;
+        }
+        model->release_device_weights();
+    } catch (...) {
+        // Put the Program back: its memory is free again and its state is in `state`.
+        if (weights != nullptr) { weights->clear(); }
+        (void)program->resume_device_state(state);
+        throw;
+    }
+    out.seconds = seconds_between(start, Clock::now());
+    return out;
+}
+
+ResidencyTransition ModelInstance::resume(DeviceContext& device, DeviceSnapshot& state,
+                                          DeviceSnapshot* weights) {
+    if (!suspendable()) { throw std::logic_error("model instance is not suspendable"); }
+    const auto start = Clock::now();
+    ResidencyTransition out;
+    model->restore_device_weight_backing(device);
+    try {
+        if (weights != nullptr && !weights->empty()) {
+            const DeviceSnapshot::Stats weight_stats = weights->restore(device);
+            out.weight_bytes                         = weight_stats.bytes;
+            out.weight_seconds                       = weight_stats.seconds;
+        } else {
+            const auto reload       = model->reload_device_weights(device);
+            out.weight_bytes        = reload.h2d_bytes;
+            out.weight_seconds      = reload.upload_seconds;
+            out.artifact_read_bytes = reload.read_bytes;
+        }
+        const DeviceSnapshot::Stats state_stats = program->resume_device_state(state);
+        out.state_bytes                         = state_stats.bytes;
+        out.state_seconds                       = state_stats.seconds;
+    } catch (...) {
+        try {
+            model->release_device_weights();
+        } catch (...) {}
+        throw;
+    }
+    if (weights != nullptr) { weights->clear(); }
+    out.seconds = seconds_between(start, Clock::now());
+    return out;
+}
+
 ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) {
     validate_engine_options(options);
     const auto start = Clock::now();
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
-    artifact::Reader reader(options.artifact_path);
+    // Shared so a suspendable model can keep its files open and upload the weights again on resume.
+    const auto retained_reader = std::make_shared<artifact::Reader>(options.artifact_path);
+    const artifact::Reader& reader = *retained_reader;
     inspect.complete();
     // Every later stage of startup checks its options against the ones the model was loaded with,
     // so the stage split is decided once, here, and carried in the options from then on.
@@ -357,8 +457,13 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
     auto plan = models::qwen3_5::plan_load(reader, models::load_options(options));
     binding.complete();
-    auto model =
-        models::qwen3_5::materialize_model(std::move(plan), device, &options.startup_observer);
+    artifact::MaterializeOptions materialize_options;
+    if (options.suspend.enabled) {
+        materialize_options.suspendable      = true;
+        materialize_options.retained_reader = retained_reader;
+    }
+    auto model = models::qwen3_5::materialize_model(std::move(plan), device,
+                                                    &options.startup_observer, materialize_options);
     device.synchronize();
     StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
     auto instance = std::make_unique<ModelInstance>(std::move(model), options);

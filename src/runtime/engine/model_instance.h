@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/device_snapshot.h"
 #include "models/qwen3_5/model.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/program/runtime_types.h"
@@ -32,6 +33,23 @@ struct ModelInstance {
     // Installs every direct graft as a pinned checkpoint, or, once installed, reinstalls any the
     // Program no longer holds. Requires an idle Program.
     void install_external_checkpoints();
+
+    // Model suspend (EngineOptions::suspend). The caller holds the instance idle and owns the
+    // snapshots. Suspend copies the Program's live device state into `state` (and, when `weights`
+    // is given, the weight arenas into it), then gives every fixed-address region back to the
+    // device; resume maps fresh memory at the same addresses and fills it again, from the host
+    // copy or, without one, from the artifact. A failure part-way through a suspend restores what
+    // was released before it throws, so the instance stays resident; a failed resume leaves it
+    // released with the snapshots intact, so the call may be retried.
+    [[nodiscard]] bool suspendable() const noexcept;
+    // Device bytes a suspend gives back.
+    [[nodiscard]] std::uint64_t releasable_device_bytes() const noexcept;
+    // Host bytes a copy of the weight arenas takes.
+    [[nodiscard]] std::uint64_t weight_host_copy_bytes() const noexcept;
+    ResidencyTransition suspend(DeviceContext& device, DeviceSnapshot& state,
+                                DeviceSnapshot* weights);
+    ResidencyTransition resume(DeviceContext& device, DeviceSnapshot& state,
+                               DeviceSnapshot* weights);
     ~ModelInstance();
     ModelInstance(const ModelInstance&)            = delete;
     ModelInstance& operator=(const ModelInstance&) = delete;

@@ -8,15 +8,18 @@
 #include "serve/serve_options.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace ninfer::serve {
@@ -146,6 +149,9 @@ public:
         ServeOptions options, StartupObserver startup_observer = {},
         std::function<void(const ninfer::ContextStoreWriteEvent&)> store_listener = {},
         std::function<void(const ninfer::EngineFaultEvent&)> fault_listener      = {});
+    ~GenerationService();
+    GenerationService(const GenerationService&)            = delete;
+    GenerationService& operator=(const GenerationService&) = delete;
 
     [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
 
@@ -160,6 +166,12 @@ public:
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
 
     [[nodiscard]] bool is_available() const { return engine_->is_available(); }
+
+    // Model suspend (--model-suspend): see Engine::suspend. Throws std::invalid_argument when the
+    // service was started without it.
+    ninfer::ResidencyStatus suspend(std::optional<bool> auto_resume = std::nullopt);
+    ninfer::ResidencyStatus resume();
+    [[nodiscard]] ninfer::ResidencyStatus residency() const;
 
     // Requests currently holding ingress capacity (max_concurrency + max_pending_requests).
     [[nodiscard]] std::size_t admitted_requests() const;
@@ -205,9 +217,16 @@ private:
     [[nodiscard]] std::shared_ptr<RequestLifetime>
     acquire_request_lifetime(DeadlinePolicy deadline_policy) const;
 
+    void idle_sleep_loop();
+
     ServeOptions options_;
     std::unique_ptr<ninfer::Engine> engine_;
     std::shared_ptr<RequestCapacity> request_capacity_;
+    // --sleep-idle-seconds: the thread that suspends an idle model.
+    std::mutex idle_mutex_;
+    std::condition_variable idle_cv_;
+    bool idle_stop_ = false;
+    std::thread idle_sleeper_;
 };
 
 } // namespace ninfer::serve

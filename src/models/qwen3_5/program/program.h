@@ -1,4 +1,5 @@
 #pragma once
+#include "core/device_snapshot.h"
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
@@ -514,6 +515,18 @@ public:
                                    runtime::ExecutionTiming* timing = nullptr);
     [[nodiscard]] ContextProgress poll_context(runtime::CancellationFlagView cancellation);
     [[nodiscard]] bool has_context_transaction() const noexcept;
+    // Model suspend, for a Program over a Model materialized suspendable. The Program must be idle:
+    // no admitted sequence and no context transaction. Suspend copies the live part of every
+    // rank's persistent state into `snapshot` and releases the device memory behind persistent
+    // state and workspace; resume maps fresh memory at the same addresses and copies the state
+    // back, emptying the snapshot. Captured CUDA Graphs stay valid throughout. A failed resume
+    // leaves the memory released and the snapshot intact, so it may be retried.
+    [[nodiscard]] bool device_state_suspendable() const noexcept;
+    [[nodiscard]] std::uint64_t device_state_backing_bytes() const noexcept;
+    // Every rank's persistent state: the largest snapshot a suspend can take.
+    [[nodiscard]] std::uint64_t persistent_capacity_bytes() const noexcept;
+    DeviceSnapshot::Stats suspend_device_state(DeviceSnapshot& snapshot);
+    DeviceSnapshot::Stats resume_device_state(DeviceSnapshot& snapshot);
     [[nodiscard]] bool context_blocks(SequenceHandle sequence) const noexcept;
     // A resumed binding retains its complete recovery capacity until committed new progress.
     [[nodiscard]] bool recovery_pending(SequenceHandle sequence) const noexcept;

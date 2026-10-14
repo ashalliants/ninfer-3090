@@ -290,6 +290,24 @@ bool Program::recovery_pending(SequenceHandle sequence) const noexcept {
 
 bool Program::has_context_transaction() const noexcept { return impl_->has_context_transaction(); }
 
+bool Program::device_state_suspendable() const noexcept { return impl_->suspendable.enabled; }
+
+std::uint64_t Program::device_state_backing_bytes() const noexcept {
+    return impl_->device_state_backing_bytes();
+}
+
+std::uint64_t Program::persistent_capacity_bytes() const noexcept {
+    return impl_->persistent_capacity_bytes();
+}
+
+DeviceSnapshot::Stats Program::suspend_device_state(DeviceSnapshot& snapshot) {
+    return impl_->suspend_device_state(snapshot);
+}
+
+DeviceSnapshot::Stats Program::resume_device_state(DeviceSnapshot& snapshot) {
+    return impl_->resume_device_state(snapshot);
+}
+
 PrefillProgress Program::advance_prefill(SequenceHandle h, runtime::ExecutionTiming* t,
                                          runtime::TokenMaskProvider* m) {
     // Landings complete inside this call (each lane's first prefill pass), so the list is empty on

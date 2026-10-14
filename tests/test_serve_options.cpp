@@ -598,6 +598,30 @@ int main() {
     failures += check(serve_usage_text("ninfer-serve").find("--context-store DIR") !=
                           std::string::npos,
                       "serve help omits --context-store");
+
+    // Model suspend.
+    failures += check(!defaults.suspend.enabled && defaults.sleep_idle_seconds == 0 &&
+                          defaults.suspend.auto_resume,
+                      "model suspend must be off by default");
+    const ServeOptions suspended = parse({"ninfer-serve", "model.ninfer", "--model-suspend",
+                                          "--suspend-snapshot", "pinned", "--suspend-weights",
+                                          "host", "--no-auto-resume", "--sleep-idle-seconds", "90"});
+    failures += check(suspended.suspend.enabled &&
+                          suspended.suspend.snapshot_memory == ninfer::SuspendSnapshotMemory::Pinned &&
+                          suspended.suspend.weights == ninfer::SuspendWeightSource::Host &&
+                          !suspended.suspend.auto_resume && suspended.sleep_idle_seconds == 90,
+                      "the model suspend flags were not parsed");
+    failures += check(rejected({"ninfer-serve", "model.ninfer", "--sleep-idle-seconds", "30"}),
+                      "--sleep-idle-seconds was accepted without --model-suspend");
+    failures += check(rejected({"ninfer-serve", "model.ninfer", "--model-suspend",
+                                "--suspend-weights", "disk"}),
+                      "an unknown --suspend-weights value was accepted");
+    failures += check(rejected({"ninfer-serve", "model.ninfer", "--model-suspend",
+                                "--suspend-snapshot", "mapped"}),
+                      "an unknown --suspend-snapshot value was accepted");
+    failures += check(rejected({"ninfer-serve", "model.ninfer", "--model-suspend", "--vision",
+                                "--vision-residency", "overlay"}),
+                      "--model-suspend was accepted with overlay Vision");
     // The S3 copy of the context store is off unless both the endpoint and the bucket are given,
     // needs the store, and normalises its key prefix.
     const ServeOptions s3 = parse({"ninfer-serve", "model.ninfer", "--context-store", "dir",

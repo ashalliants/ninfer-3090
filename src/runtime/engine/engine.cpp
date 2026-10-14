@@ -961,6 +961,51 @@ bool Engine::is_available() const {
         impl_->core);
 }
 
+ResidencyStatus Engine::suspend(std::optional<bool> auto_resume) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [&](const auto& core) -> ResidencyStatus {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate> ||
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
+                throw std::invalid_argument("model suspend is not available for this Engine");
+            } else {
+                return core->suspend(auto_resume);
+            }
+        },
+        impl_->core);
+}
+
+ResidencyStatus Engine::resume() {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [&](const auto& core) -> ResidencyStatus {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate> ||
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
+                throw std::invalid_argument("model suspend is not available for this Engine");
+            } else {
+                return core->resume();
+            }
+        },
+        impl_->core);
+}
+
+ResidencyStatus Engine::residency() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [&](const auto& core) -> ResidencyStatus {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate> ||
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
+                return ResidencyStatus{};
+            } else {
+                return core->residency();
+            }
+        },
+        impl_->core);
+}
+
 void Engine::reset_memory_peaks() noexcept {
     if (impl_ == nullptr) { return; }
     std::visit(

@@ -18,6 +18,8 @@ add_library(ninfer_core STATIC
   evictable_kv_pool.cu
   evictable_weight_pool.cu
   vmm_arena.cu
+  vmm_region.cu
+  device_snapshot.cu
   pinned_upload.cu
   copy_batch.cpp
   cgroup_memory.cpp

@@ -117,6 +117,10 @@ private:
     void handle_props(const httplib::Request& req, httplib::Response& res) const;
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
+    // Model suspend (--model-suspend): residency of the served model, and suspend and resume.
+    void handle_model_residency(const httplib::Request& req, httplib::Response& res) const;
+    void handle_model_suspend(const httplib::Request& req, httplib::Response& res);
+    void handle_model_resume(const httplib::Request& req, httplib::Response& res);
 
     void record_request_start(const RequestLogContext& context);
     [[nodiscard]] ninfer::GenerationSchedulingObserver

@@ -3,7 +3,9 @@
 
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
+#include "core/device_snapshot.h"
 #include "core/host_kv_arena.h"
+#include "core/vmm_region.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
@@ -349,6 +351,15 @@ public:
         return context_transaction_.has_value();
     }
 
+    // Model suspend (see Program::suspend_device_state).
+    [[nodiscard]] std::uint64_t device_state_backing_bytes() const noexcept;
+    [[nodiscard]] std::uint64_t persistent_capacity_bytes() const noexcept;
+    DeviceSnapshot::Stats suspend_device_state(DeviceSnapshot& snapshot);
+    DeviceSnapshot::Stats resume_device_state(DeviceSnapshot& snapshot);
+    [[nodiscard]] std::vector<DeviceSnapshot::Range> live_persistent_ranges() const;
+    void release_device_state_backing();
+    void restore_device_state_backing();
+
     [[nodiscard]] bool context_blocks(SequenceHandle) const noexcept;
     [[nodiscard]] bool recovery_pending(SequenceHandle) const noexcept;
     // Overlay Vision residency (no-ops otherwise); see Program.
@@ -412,6 +423,18 @@ public:
     // Overlay Vision residency only: the persistent arena is VMM-backed so free Main KV granules
     // can fund an encode window. Declared before `persistent`, which borrows its mapping.
     std::unique_ptr<EvictableKVPool> kv_arena;
+    // Model suspend only (the Model was materialized suspendable): fixed-address memory behind the
+    // persistent state and workspace of every rank, which a suspend releases and a resume maps
+    // again. Empty otherwise, where the arenas below own plain allocations; declared before them,
+    // which only view it.
+    struct SuspendableStorage {
+        std::optional<VmmRegion> persistent;
+        std::vector<VmmRegion> persistent_by_rank; // ranks 1..
+        std::optional<VmmRegion> workspace;
+        std::vector<VmmRegion> workspace_by_rank; // ranks 1..
+        bool enabled = false;
+    };
+    SuspendableStorage suspendable;
     DeviceArena persistent;
     // Pipeline stages only: the persistent state of each further device -- its layers' KV planes,
     // block-table copy, recurrent state and replay records -- allocated in that device's memory.

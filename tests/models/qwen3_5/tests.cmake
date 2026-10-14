@@ -115,6 +115,13 @@ ninfer_add_test(ninfer_qwen3_5_stages_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_stages_real.cpp"
   LIBRARIES ninfer_engine)
 
+# Model suspend: greedy output must be identical across a suspend and resume (plain, pinned snapshot,
+# host weight copy, two stages, MTP), prefix reuse must survive it, and a model held suspended must
+# refuse requests. Reads device memory back to the card before and after, so it needs the GPU alone.
+ninfer_add_test(ninfer_qwen3_5_suspend_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_suspend_real.cpp"
+  LIBRARIES ninfer_engine ${NINFER_CUDART_TARGET})
+
 ninfer_add_test(ninfer_tool_call_parser_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../../test_tool_call_parser.cpp"
   LIBRARIES ninfer_engine ninfer::json)
@@ -166,7 +173,8 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_moe_real_test
   ninfer_qwen3_5_dflash_real_test
   ninfer_qwen3_5_graft_real_test
-  ninfer_qwen3_5_stages_real_test)
+  ninfer_qwen3_5_stages_real_test
+  ninfer_qwen3_5_suspend_real_test)
 set_tests_properties(${ninfer_qwen3_5_real_tests} PROPERTIES
   SKIP_RETURN_CODE 77
   RUN_SERIAL TRUE
