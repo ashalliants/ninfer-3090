@@ -158,9 +158,15 @@ Strata figures in the README are from the earlier campaign).
 
 - Skipped: `s3_object_store` (needs a MinIO server), `artifact_ggml_real`, `qwen3_5_loading_real` and
   `qwen4_exp_forward_real` (each needs its own artifact or an explicit argument).
-- Failed because the run's artifact is the wrong one for the test, not because of the engine:
-  `qwen3_5_dflash_real` ("missing component dflash") and `qwen3_5_dflash_prefill_real`
-  ("linear_topk: unsupported head profile") need a DFlash artifact that is not in `models\`.
+- `qwen3_5_dflash_real` failed first for the wrong artifact ("missing component dflash": it needs the
+  35B, which has DFlash v1). With the 35B it failed on "did not reuse its cache snapshot: reused=0"
+  because its fixture is a 17-token conversation, too short for the cost-priced cache to restore; with
+  a ~200-token prompt the whole test passes, and forked-conversation reuse with `--spec dflash` works
+  over HTTP exactly as with MTP. Fixed in #313.
+- `qwen3_5_dflash_prefill_real` ("linear_topk: unsupported head profile") needs a 27B whose output head
+  is Q8 or FP8; this fork's 27B conversion has a 6-bit head. With upstream's artifact
+  (`neroued/Qwen3.8-27B-NInfer` at `1cbd84e7`) it passes, and `ninfer-serve --spec dflash2` without
+  `--lm-head-draft` runs on the fork's 27B, so serving is not affected. Documented in #313.
 - `artifact_writer_interop` failed on a stale constant: the writer fixture gained a 13th GGML object
   (the MTP drafter's record format, #262) and the C++ test still required 12. It is a test bug, not a
   product one, and is fixed in #312.
