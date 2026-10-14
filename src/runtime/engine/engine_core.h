@@ -444,6 +444,10 @@ public:
         });
         for (const auto& owner : owners) {
             if (Clock::now() >= deadline) { break; }
+            // The write before this one ran synchronously and can have made the store evict this
+            // owner's image; with the worker stopped nothing else would repair its mark.
+            forget_failed_store_writes();
+            forget_removed_store_images();
             if (owner.active || holds(mark(owner.token), owner.points)) { continue; }
             try {
                 auto image        = program.export_checkpoints(owner.points, owner.session,
@@ -2816,8 +2820,10 @@ private:
     void admit_or_contain(bool restoring, std::optional<std::string>& device_fault) {
         admission_subject_.reset();
         // A queued write that failed since the last scan left its marks standing; clear them
-        // before admission prices eviction, or the failed image is counted as durable.
+        // before admission prices eviction, or the failed image is counted as durable. Images the
+        // store removed on its own while the worker slept are forgotten the same way.
         (void)forget_failed_store_writes();
+        forget_removed_store_images();
         try {
             (void)try_admit_one(restoring);
         } catch (...) {
@@ -3069,6 +3075,7 @@ private:
         auto& program = *instance_.program;
         if (program.has_context_transaction()) { return; }
         (void)forget_failed_store_writes();
+        forget_removed_store_images();
         for (const auto& owner : owners) {
             try {
                 if (holds(mark(owner.token), owner.points)) { continue; }

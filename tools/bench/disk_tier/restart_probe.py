@@ -75,6 +75,10 @@ def main() -> int:
         time.sleep(0.5)
     if args.out:
         args.out.write_text(json.dumps(rows, indent=1))
+    failed = [r for r in rows if r["error"]]
+    if failed:
+        print(f"continue error: {len(failed)} of {len(rows)} continuations failed")
+        return 1
     return 0
 
 
