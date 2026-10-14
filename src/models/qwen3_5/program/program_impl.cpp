@@ -334,7 +334,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             host_kv_extents = std::make_unique<HostKVExtentStore>(*host_kv_arena, extents);
             // A layered restore's gather kernels read Host extents until it has landed.
             host_kv_extents->set_release_fence(
-                [](void* program) noexcept { static_cast<ProgramImpl*>(program)->land_restores_quietly(); },
+                [](void* program, HostRange range) noexcept {
+                    static_cast<ProgramImpl*>(program)->land_restores_overlapping(range);
+                },
                 this);
         }
         phase.complete(host_bytes, host_bytes);

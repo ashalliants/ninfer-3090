@@ -8,7 +8,11 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <deque>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -592,6 +596,10 @@ public:
         return true;
     }
 
+    // Victim selection reuses each candidate's facts across the plans of one reclaim. The tests turn
+    // this off to prove the answers are identical either way; production never does.
+    void set_candidate_memo(bool enabled) noexcept { candidate_memo_ = enabled; }
+
     [[nodiscard]] ReclaimProgress reclaim(Program& program, ContextResourceUsage shortage,
                                           std::span<const Handle> excluded = {}) {
         if (program.has_context_transaction()) { return ReclaimProgress::Transferring; }
@@ -602,8 +610,82 @@ public:
     [[nodiscard]] ReclaimProgress reclaim(Program& program, ContextResourceUsage shortage,
                                           std::span<const Handle> excluded, ReclaimCursor& cursor) {
         if (program.has_context_transaction()) { return ReclaimProgress::Transferring; }
-        prune(program);
-        if (shortage.host_bytes && program.release_redundant_host(excluded)) {
+        using InstrClock = std::chrono::steady_clock;
+        struct InstrTimes {
+            InstrClock::time_point begin = InstrClock::now();
+            long long plan_us            = 0;
+            long long demote_us          = 0;
+            int demote_calls             = 0;
+            int demote_fail              = 0;
+            long long prune_us           = 0;
+            long long redundant_us       = 0;
+            long long victims_us         = 0;
+            long long commit_us          = 0;
+            long long superseded_us      = 0;
+            int victims_calls            = 0;
+            int commits                  = 0;
+            const ResourceManager* self  = nullptr;
+            ~InstrTimes() {
+                const auto total = std::chrono::duration_cast<std::chrono::microseconds>(
+                                       InstrClock::now() - begin).count();
+                if (total > 20000 && self != nullptr) {
+                    std::fprintf(stderr,
+                                 "[instr] vic memo=%d selections=%lld candidates=%lld plan_us=%lld "
+                                 "bytes_us=%lld facts_us=%lld admits_us=%lld rank_us=%lld "
+                                 "memo_hits=%lld memo_misses=%lld\n",
+                                 self->candidate_memo_ ? 1 : 0, self->instr_selections_,
+                                 self->instr_candidates_, self->instr_plan_us_,
+                                 self->instr_bytes_us_, self->instr_facts_us_,
+                                 self->instr_admits_us_, self->instr_rank_us_,
+                                 self->instr_memo_hits_, self->instr_memo_misses_);
+                }
+                if (total > 20000) {
+                    std::fprintf(stderr,
+                                 "[instr] reclaim t=%lld total_us=%lld plan_us=%lld demote_us=%lld "
+                                 "demote_calls=%d demote_fail=%d prune_us=%lld redundant_us=%lld "
+                                 "victims_us=%lld victims_calls=%d commit_us=%lld commits=%d "
+                                 "superseded_us=%lld\n",
+                                 static_cast<long long>(
+                                     std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         InstrClock::now().time_since_epoch()).count()),
+                                 static_cast<long long>(total), plan_us, demote_us, demote_calls,
+                                 demote_fail, prune_us, redundant_us, victims_us, victims_calls,
+                                 commit_us, commits, superseded_us);
+                }
+            }
+        } instr;
+        instr.self = this;
+        // MEASUREMENT BUILD: NINFER_CANDIDATE_MEMO=0 turns the memo off for an A/B in one binary.
+        static const bool instr_memo_forced_off = [] {
+            const char* v = std::getenv("NINFER_CANDIDATE_MEMO");
+            return v != nullptr && v[0] == '0';
+        }();
+        if (instr_memo_forced_off) { candidate_memo_ = false; }
+        instr_plan_us_ = instr_bytes_us_ = instr_facts_us_ = instr_admits_us_ = instr_rank_us_ = 0;
+        instr_memo_hits_ = instr_memo_misses_ = instr_candidates_ = instr_selections_ = 0;
+        const auto timed = [&](long long& accumulator, auto&& work) -> decltype(auto) {
+            struct Guard {
+                long long& sum;
+                InstrClock::time_point start = InstrClock::now();
+                ~Guard() {
+                    sum += std::chrono::duration_cast<std::chrono::microseconds>(
+                               InstrClock::now() - start).count();
+                }
+            } guard{accumulator};
+            return work();
+        };
+        const auto instr_demote = [&](const auto& plan) {
+            const auto t0 = InstrClock::now();
+            const bool ok = program.start_demote(plan);
+            instr.demote_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                                   InstrClock::now() - t0).count();
+            ++instr.demote_calls;
+            if (!ok) { ++instr.demote_fail; }
+            return ok;
+        };
+        timed(instr.prune_us, [&] { prune(program); });
+        if (shortage.host_bytes &&
+            timed(instr.redundant_us, [&] { return program.release_redundant_host(excluded); })) {
             return ReclaimProgress::Changed;
         }
         std::vector<Handle> allowed;
@@ -615,14 +697,20 @@ public:
         }
         if (shortage.host_bytes) {
             Evaluation evaluation;
-            const auto victims =
-                host_victims_in_order(program, shortage.host_bytes, std::nullopt, {}, excluded,
-                                      cursor.admission, cursor, evaluation, true);
+            ++instr.victims_calls;
+            const auto victims = timed(instr.victims_us, [&] {
+                return host_victims_in_order(program, shortage.host_bytes, std::nullopt, {},
+                                             excluded, cursor.admission, cursor, evaluation, true);
+            });
             if (!victims) { return ReclaimProgress::Blocked; }
-            commit_release(program, *victims, cursor);
+            ++instr.commits;
+            timed(instr.commit_us, [&] { commit_release(program, *victims, cursor); });
             return victims->empty() ? ReclaimProgress::Blocked : ReclaimProgress::Changed;
         }
+        const auto instr_plan_begin = InstrClock::now();
         auto plans = program.plan_reclaim(allowed, excluded, shortage);
+        instr.plan_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            InstrClock::now() - instr_plan_begin).count();
         Evaluation evaluation{.native = &plans};
         using Demotion = typename decltype(plans.demotions)::value_type;
         using Release  = typename decltype(plans.releases)::value_type;
@@ -646,7 +734,7 @@ public:
         // Redundant-replica cleanup is a distinct capacity change. Quotes below are read
         // only and never observe side effects from evaluating another candidate.
         if (needs_host_cleanup && !existing_host_destination &&
-            program.release_redundant_host(excluded)) {
+            timed(instr.redundant_us, [&] { return program.release_redundant_host(excluded); })) {
             return ReclaimProgress::Changed;
         }
 
@@ -664,9 +752,11 @@ public:
                                      plan.sources.end());
             auto preservation =
                 preservation_admission(program, plan.sources, cursor, facts.priority);
-            auto victims =
-                host_victims_in_order(program, plan.host_bytes, preservation.checkpoint, {},
-                                      protected_sources, preservation, cursor, evaluation);
+            ++instr.victims_calls;
+            auto victims = timed(instr.victims_us, [&] {
+                return host_victims_in_order(program, plan.host_bytes, preservation.checkpoint, {},
+                                             protected_sources, preservation, cursor, evaluation);
+            });
             if (!victims) { continue; }
             auto rank       = rank_action(program, plan.sources, facts, units, evaluation, true);
             auto host_facts = action_facts(program, *victims, cursor, evaluation);
@@ -730,7 +820,7 @@ public:
                             auto facts = action_facts(program, batch->sources, cursor, evaluation);
                             if (admits(program, batch->sources, facts, cursor.admission, cursor,
                                        evaluation, true) &&
-                                program.start_demote(*batch)) {
+                                instr_demote(*batch)) {
                                 return program.has_context_transaction()
                                            ? ReclaimProgress::Transferring
                                            : ReclaimProgress::Changed;
@@ -744,12 +834,18 @@ public:
                 auto protected_sources = std::vector<Handle>(excluded.begin(), excluded.end());
                 protected_sources.insert(protected_sources.end(), plan.sources.begin(),
                                          plan.sources.end());
-                const auto current = host_victims_in_order(
-                    program, plan.host_bytes, action.preservation->checkpoint, {},
-                    protected_sources, action.preservation, cursor, evaluation);
+                ++instr.victims_calls;
+                const auto current = timed(instr.victims_us, [&] {
+                    return host_victims_in_order(program, plan.host_bytes,
+                                                 action.preservation->checkpoint, {},
+                                                 protected_sources, action.preservation, cursor,
+                                                 evaluation);
+                });
                 if (!current || *current != action.host_victims) { continue; }
-                commit_release(program, action.host_victims, cursor, action.rank.loss);
-                if (program.start_demote(plan)) {
+                ++instr.commits;
+                timed(instr.commit_us,
+                      [&] { commit_release(program, action.host_victims, cursor, action.rank.loss); });
+                if (instr_demote(plan)) {
                     return program.has_context_transaction() ? ReclaimProgress::Transferring
                                                              : ReclaimProgress::Changed;
                 }
@@ -757,13 +853,19 @@ public:
                 // The Host destination can fail on allocation geometry although the byte
                 // quote fit. Superseded Host history goes before a live source is deleted;
                 // the demotion is quoted again on the next pass.
-                if (release_superseded_host(program, plan.host_bytes, protected_sources, cursor)) {
+                if (timed(instr.superseded_us, [&] {
+                        return release_superseded_host(program, plan.host_bytes, protected_sources,
+                                                       cursor);
+                    })) {
                     return ReclaimProgress::Changed;
                 }
                 continue;
             }
             // Native quoted every holder required for this actual physical release.
-            commit_release(program, action.release->sources, cursor, action.rank.loss);
+            ++instr.commits;
+            timed(instr.commit_us, [&] {
+                commit_release(program, action.release->sources, cursor, action.rank.loss);
+            });
             return ReclaimProgress::Changed;
         }
         return ReclaimProgress::Blocked;
@@ -1306,13 +1408,6 @@ private:
     using NativeReclaimPlan = decltype(std::declval<Program&>().plan_reclaim(
         std::span<const Handle>{}, std::span<const Handle>{}, ContextResourceUsage{}));
 
-    // These facts live only until this synchronous evaluation mutates resources or yields.
-    // The fixed victim cursor may outlive them; newly published points still count as fallback.
-    struct Evaluation {
-        const NativeReclaimPlan* native = nullptr;
-        std::optional<std::vector<Handle>> retained;
-    };
-
     struct ActionFacts {
         CacheRetentionPriority priority;
         bool superseded   = false;
@@ -1320,6 +1415,38 @@ private:
         std::optional<std::vector<Handle>> kept;
         std::optional<std::uint64_t> loss;
     };
+
+    // What one candidate release (a set of checkpoints) costs, which does not depend on which plan
+    // is asking: the Host bytes it frees and its facts. A reclaim evaluates the same candidates for
+    // every demotion plan, and recomputing them per plan made victim selection quadratic in the
+    // number of checkpoints (seconds on a full Host tier). Handles only compare for equality, so
+    // the set is found by a linear scan, which is cheap next to the Program calls it saves.
+    struct CandidateMemo {
+        std::vector<Handle> sources;
+        std::optional<std::size_t> host_bytes;
+        std::optional<ActionFacts> facts;
+    };
+
+    // These facts live only until this synchronous evaluation mutates resources or yields.
+    // The fixed victim cursor may outlive them; newly published points still count as fallback.
+    struct Evaluation {
+        const NativeReclaimPlan* native = nullptr;
+        std::optional<std::vector<Handle>> retained;
+        std::deque<CandidateMemo> candidates; // stable references while the deque grows
+    };
+
+    [[nodiscard]] static CandidateMemo& candidate_memo(Evaluation& evaluation,
+                                                       std::span<const Handle> sources) {
+        for (auto& memo : evaluation.candidates) {
+            if (memo.sources.size() == sources.size() &&
+                std::all_of(sources.begin(), sources.end(),
+                            [&](Handle handle) { return contains(memo.sources, handle); })) {
+                return memo;
+            }
+        }
+        evaluation.candidates.push_back({.sources = {sources.begin(), sources.end()}});
+        return evaluation.candidates.back();
+    }
 
     [[nodiscard]] std::span<const Handle> retained(Program& program, Evaluation& evaluation) const {
         if (!evaluation.retained) { evaluation.retained = surviving(program, {}); }
@@ -1597,7 +1724,10 @@ private:
                 }
             }
         }
-        auto actions = program.plan_releases(allowed, excluded, {.host_bytes = required});
+        ++instr_selections_;
+        auto actions = instr_time(instr_plan_us_, [&] {
+            return program.plan_releases(allowed, excluded, {.host_bytes = required});
+        });
         std::vector<Handle> selected;
         std::size_t released = 0;
         while (released < required) {
@@ -1611,18 +1741,61 @@ private:
                 for (const auto handle : actions[i].sources) {
                     if (!contains(combined, handle)) { combined.push_back(handle); }
                 }
-                const auto amount = program.host_bytes_released(combined);
+                // The same candidate comes up for every plan of one reclaim: what it frees and its
+                // facts are computed once per evaluation. Only the cheap facts stay cached (the
+                // survivor list is rebuilt per use), so the cache does not grow with the square of
+                // the checkpoint count.
+                ++instr_candidates_;
+                CandidateMemo* const memo =
+                    candidate_memo_ ? &candidate_memo(evaluation, combined) : nullptr;
+                std::size_t amount;
+                if (memo) {
+                    if (!memo->host_bytes) {
+                        ++instr_memo_misses_;
+                        memo->host_bytes = instr_time(instr_bytes_us_, [&] {
+                            return program.host_bytes_released(combined);
+                        });
+                    } else {
+                        ++instr_memo_hits_;
+                    }
+                    amount = *memo->host_bytes;
+                } else {
+                    amount = instr_time(instr_bytes_us_,
+                                        [&] { return program.host_bytes_released(combined); });
+                }
                 if (amount <= released) { continue; }
-                auto facts = action_facts(program, combined, cursor, evaluation);
+                ActionFacts uncached;
+                if (memo) {
+                    if (!memo->facts) {
+                        memo->facts = instr_time(instr_facts_us_, [&] {
+                            return action_facts(program, combined, cursor, evaluation);
+                        });
+                    }
+                } else {
+                    uncached = instr_time(instr_facts_us_, [&] {
+                        return action_facts(program, combined, cursor, evaluation);
+                    });
+                }
+                ActionFacts& facts = memo ? *memo->facts : uncached;
+                const auto drop_survivors = [&] {
+                    if (memo) { memo->facts->kept.reset(); }
+                };
                 // A migration must satisfy both its own preservation rights and the
                 // optional capture that requested space. Source heat cannot grant the
                 // outer capture permission to erase unrelated hot Host history.
-                if (!admits(program, combined, facts, admission, cursor, evaluation) ||
-                    !admits(program, combined, facts, cursor.admission, cursor, evaluation)) {
+                const bool admitted = instr_time(instr_admits_us_, [&] {
+                    return admits(program, combined, facts, admission, cursor, evaluation) &&
+                           admits(program, combined, facts, cursor.admission, cursor, evaluation);
+                });
+                if (!admitted) {
+                    drop_survivors();
                     continue;
                 }
-                const auto rank            = rank_action(program, combined, facts,
-                                                         std::min<std::size_t>(amount, required), evaluation);
+                const auto rank = instr_time(instr_rank_us_, [&] {
+                    return rank_action(program, combined, facts,
+                                       std::min<std::size_t>(amount, required), evaluation);
+                });
+                drop_survivors();
                 std::size_t snapshot_order = 0;
                 for (std::size_t snapshot = 0; snapshot < later_snapshots.size(); ++snapshot) {
                     if (contains(combined, later_snapshots[snapshot])) {
@@ -1725,6 +1898,24 @@ private:
     bool enabled_;
     ContextMachineCostModel costs_;
     PrefixIndex<Model> index_;
+    bool candidate_memo_ = true;
+    // MEASUREMENT BUILD: where host_victims_in_order spends its time (microseconds, per reclaim).
+    mutable long long instr_plan_us_ = 0, instr_bytes_us_ = 0, instr_facts_us_ = 0,
+                      instr_admits_us_ = 0, instr_rank_us_ = 0, instr_memo_hits_ = 0,
+                      instr_memo_misses_ = 0, instr_candidates_ = 0, instr_selections_ = 0;
+    template <class Work>
+    static decltype(auto) instr_time(long long& accumulator, Work&& work) {
+        const auto start = std::chrono::steady_clock::now();
+        struct Guard {
+            long long& sum;
+            std::chrono::steady_clock::time_point begin;
+            ~Guard() {
+                sum += std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - begin).count();
+            }
+        } guard{accumulator, start};
+        return work();
+    }
     std::vector<Owner> owners_;
     std::vector<Shared> shared_;
     std::vector<WaitingSource> waiting_;

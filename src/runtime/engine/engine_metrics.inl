@@ -183,6 +183,10 @@ void EngineCore<Instance>::publish_runtime_stats() {
     snapshot.host_context_free_extents        = physical.host_free_extents;
     snapshot.host_context_geometry_failures   = physical.host_geometry_failures;
     snapshot.host_context_shortage_failures   = physical.host_shortage_failures;
+    snapshot.host_release_fence_waits         = physical.host_release_fence_waits;
+    snapshot.host_release_fence_skips         = physical.host_release_fence_skips;
+    snapshot.host_release_fence_wait_seconds =
+        static_cast<double>(physical.host_release_fence_wait_ns) * 1.0e-9;
     snapshot.materializing_requests           = materializing_.has_value() ? 1U : 0U;
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
         if (slots_[lane] == nullptr) { continue; }

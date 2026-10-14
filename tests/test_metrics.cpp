@@ -50,6 +50,9 @@ int main() {
     running.host_context_free_extents        = 5;
     running.host_context_geometry_failures   = 7;
     running.host_context_shortage_failures   = 2;
+    running.host_release_fence_waits         = 3;
+    running.host_release_fence_skips         = 9;
+    running.host_release_fence_wait_seconds  = 0.25;
     metrics.first_token({.prepare_seconds = 0.05, .elapsed_since_submit_seconds = 0.2});
     const auto live = metrics.render(running, true, 0);
     check(live.find("ninfer_generation_tokens_total 5\n") != std::string::npos,
@@ -75,6 +78,10 @@ int main() {
               live.find("ninfer_host_context_geometry_failures_total 7\n") != std::string::npos &&
               live.find("ninfer_host_context_shortage_failures_total 2\n") != std::string::npos,
           "Host allocator failures must be exported, split by geometry and shortage");
+    check(live.find("ninfer_host_release_fence_waits_total 3\n") != std::string::npos &&
+              live.find("ninfer_host_release_fence_skips_total 9\n") != std::string::npos &&
+              live.find("ninfer_host_release_fence_wait_seconds_total 0.25\n") != std::string::npos,
+          "Host release fence waits, skips and blocked time must be exported");
 
     GenerationOutcome outcome;
     outcome.finish_reason                            = FinishReason::OutputLimit;

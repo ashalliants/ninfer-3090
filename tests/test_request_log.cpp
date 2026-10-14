@@ -915,6 +915,9 @@ int main() {
     throughput.current.host_context_free_extents        = 6;
     throughput.current.host_context_geometry_failures   = 9;
     throughput.current.host_context_shortage_failures   = 4;
+    throughput.current.host_release_fence_waits         = 5;
+    throughput.current.host_release_fence_skips         = 7;
+    throughput.current.host_release_fence_wait_seconds  = 0.5;
     throughput.current.last_selected_frontier_tokens    = 64;
     throughput.current.pressure_spill_pages             = 4;
     throughput.current.engine_recoveries                = 3;
@@ -1001,6 +1004,9 @@ int main() {
             throughput_json.at("context_cache").at("pressure").at("host_geometry_failures") == 9 &&
             throughput_json.at("context_cache").at("pressure").at("host_shortage_failures") == 4,
         "Host allocator failures must be reported as interval deltas with the free-run gauge");
+    failures += check(throughput_json.at("context_cache").at("pressure").at("host_release_fence") ==
+                          Json{{"waits", 5}, {"skips", 7}, {"wait_seconds", 0.5}},
+                      "Host release fence waits, skips and blocked time must be interval deltas");
     failures += check(throughput_json.at("engine_recoveries") == 2 &&
                           !throughput_json.at("context_cache").contains("engine_recoveries"),
                       "engine_recoveries must be a top-level interval delta, not nested under "

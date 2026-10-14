@@ -592,6 +592,9 @@ public:
         bool ordered             = false;
         // The layers' gather descriptors, read by the kernels until the restore has landed.
         std::optional<PinnedHostBuffer> descriptors;
+        // The Host bytes the gather kernels read (one range per restored run). A release of Host
+        // memory outside these needs no wait; an unknown range is treated as overlapping everything.
+        std::vector<HostRange> host_ranges;
         // The history a consuming Bind restored from. Its Host pages are the gather kernels'
         // source, so it outlives the binding transaction and is released only after the landing
         // has landed (the binding then never waits for the restore to reclaim it).
@@ -605,8 +608,14 @@ public:
     [[nodiscard]] std::span<const cudaEvent_t> take_restore_layers(std::uint32_t lane);
     void order_after_restores();
     void land_restores();
-    // Waits for every in-flight landing, ignoring errors: the Host extent release fence.
-    void land_restores_quietly() noexcept;
+    // The Host extent release fence: waits, ignoring errors, for the in-flight landings whose
+    // gather kernels read `range`. An unknown range waits for all of them.
+    void land_restores_overlapping(HostRange range) noexcept;
+
+    // Release-fence activity, for the Engine's stall metrics (Engine worker thread only).
+    std::uint64_t release_fence_waits_   = 0; // landings a release had to wait for
+    std::uint64_t release_fence_skips_   = 0; // landings in flight that the release did not touch
+    std::uint64_t release_fence_wait_ns_ = 0; // time spent in those waits
     void complete_landing(std::uint32_t lane);
     void retire_landing(std::uint32_t lane) noexcept;
     // Returns a landing's events and descriptor buffer to the spare pools, or destroys them if the

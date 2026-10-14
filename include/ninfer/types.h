@@ -1396,6 +1396,11 @@ struct RuntimeStats {
     std::size_t host_context_free_extents          = 0;
     std::uint64_t host_context_geometry_failures   = 0;
     std::uint64_t host_context_shortage_failures   = 0;
+    // Freeing Host KV waits for in-flight restores that read it: restores waited for, restores in
+    // flight that the release did not touch, and the Engine worker's time blocked on the waits.
+    std::uint64_t host_release_fence_waits   = 0;
+    std::uint64_t host_release_fence_skips   = 0;
+    double host_release_fence_wait_seconds   = 0.0;
     double actual_context_transfer_seconds       = 0.0;
     // Host-side failures the worker survived by failing the in-flight requests and clearing the
     // context cache instead of latching the Engine unavailable.

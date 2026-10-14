@@ -296,6 +296,12 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
             "single run was large enough.");
     COUNTER(host_context_shortage_failures, "host_context_shortage_failures_total",
             "Host allocations that failed because too few bytes were free.");
+    COUNTER(host_release_fence_waits, "host_release_fence_waits_total",
+            "In-flight restores the Engine waited for before freeing Host KV they read.");
+    COUNTER(host_release_fence_skips, "host_release_fence_skips_total",
+            "In-flight restores a Host KV release did not need to wait for.");
+    COUNTER(host_release_fence_wait_seconds, "host_release_fence_wait_seconds_total",
+            "Engine worker time blocked waiting for restores before freeing Host KV.");
     COUNTER(pressure_spill_pages, "context_pressure_spill_pages_total",
             "KV pages spilled to the Host to make room under capacity pressure.");
 

@@ -20,6 +20,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -1944,6 +1945,22 @@ private:
     }
 
     bool try_admit_one(bool restoring) {
+        const auto instr_begin  = std::chrono::steady_clock::now();
+        const bool instr_result = try_admit_one_impl(restoring);
+        const auto instr_us     = std::chrono::duration_cast<std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now() - instr_begin).count();
+        if (instr_us > 20000) {
+            std::fprintf(stderr, "[instr] admit t=%lld result=%d restoring=%d us=%lld\n",
+                         static_cast<long long>(
+                             std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch()).count()),
+                         instr_result ? 1 : 0, restoring ? 1 : 0,
+                         static_cast<long long>(instr_us));
+        }
+        return instr_result;
+    }
+
+    bool try_admit_one_impl(bool restoring) {
         if (instance_.program->has_context_transaction()) { return false; }
         const auto lane = free_lane();
         if (!lane && restoring) {

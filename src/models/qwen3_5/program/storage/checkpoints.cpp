@@ -157,6 +157,9 @@ PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {
         out.host_geometry_failures   = host_context_arena->geometry_failures();
         out.host_shortage_failures   = host_context_arena->shortage_failures();
     }
+    out.host_release_fence_waits   = release_fence_waits_;
+    out.host_release_fence_skips   = release_fence_skips_;
+    out.host_release_fence_wait_ns = release_fence_wait_ns_;
     return out;
 }
 

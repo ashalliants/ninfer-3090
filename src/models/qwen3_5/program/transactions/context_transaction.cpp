@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdio>
 #include <stdexcept>
 
 namespace ninfer::models::qwen3_5::detail {
@@ -161,6 +163,19 @@ void ProgramImpl::enqueue_layered_restore(ContextTransaction& tx) {
     LandingRestore landing{.lane = tx.lane, .timer = CudaEventTimer(device, transfer_streams[0])};
     landing.page_count = tx.layered_pages;
     if (tx.source_history) { landing.sources.push_back(tx.source_history); }
+    // Every Host byte the gather kernels will read, for the release fence. A run whose view cannot
+    // be measured is recorded as unknown, which makes any release wait for this landing.
+    landing.host_ranges.reserve(tx.layered_runs.size());
+    for (const auto& run : tx.layered_runs) {
+        HostRange read;
+        if (run.host.valid()) {
+            try {
+                read = {run.host.data(), static_cast<std::size_t>(run.host.page_count()) *
+                                             run.host.layout().page_stride};
+            } catch (...) { read = {}; }
+        }
+        landing.host_ranges.push_back(read);
+    }
     landing.events.reserve(layers);
     try {
         for (std::uint32_t layer = 0; layer < layers; ++layer) {
@@ -301,9 +316,23 @@ void ProgramImpl::land_restores() {
     }
 }
 
-void ProgramImpl::land_restores_quietly() noexcept {
+void ProgramImpl::land_restores_overlapping(HostRange range) noexcept {
+    // Only a landing that reads the bytes being released can be hurt by their release. Waiting
+    // for the rest stalls the Engine on the GPU's current prefill chunk for nothing (a landing
+    // completes as its lane's first prefill pass advances, which is about a second per chunk).
+    // A landing with no recorded range, or a release of unknown bytes, still waits.
     for (const auto& landing : landing_restores_) {
-        if (!landing.events.empty()) { (void)cudaEventSynchronize(landing.events.back()); }
+        if (landing.events.empty()) { continue; }
+        if (!release_must_wait_for(landing.host_ranges, range)) {
+            ++release_fence_skips_;
+            continue;
+        }
+        const auto begin = std::chrono::steady_clock::now();
+        (void)cudaEventSynchronize(landing.events.back());
+        release_fence_wait_ns_ += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - begin).count());
+        ++release_fence_waits_;
     }
 }
 

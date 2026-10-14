@@ -1,10 +1,22 @@
 #include "core/host_context_arena.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
+#include <string_view>
 
 namespace ninfer {
+
+namespace {
+// MEASUREMENT BUILD only: monotonic milliseconds shared by every trace line in this process.
+long long instr_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+} // namespace
 
 HostContextAllocation::~HostContextAllocation() { (void)release(); }
 
@@ -102,10 +114,20 @@ std::optional<HostContextAllocation>
 HostContextArena::allocate(std::size_t bytes, HostPlacement placement) noexcept {
     const std::size_t rounded = allocation_bytes(bytes);
     if (rounded == 0) { return std::nullopt; }
-    const bool high       = placement == HostPlacement::High;
+    // MEASUREMENT BUILD: NINFER_HOST_PLACEMENT=legacy forces the old single-ended first-fit.
+    static const bool instr_legacy = [] {
+        const char* v = std::getenv("NINFER_HOST_PLACEMENT");
+        return v != nullptr && std::string_view(v) == "legacy";
+    }();
+    const char kind       = placement == HostPlacement::High ? 'K' : 'S';
+    const bool high       = placement == HostPlacement::High && !instr_legacy;
     const auto free_index = high ? find_free_extent_high(rounded) : find_free_extent(rounded);
     if (!free_index) {
-        ++(free_bytes() >= rounded ? geometry_failures_ : shortage_failures_);
+        const bool geometry = free_bytes() >= rounded;
+        ++(geometry ? geometry_failures_ : shortage_failures_);
+        std::fprintf(stderr, "[trace] F t=%lld bytes=%zu kind=%c free=%zu largest=%zu extents=%zu %s\n",
+                     instr_now_ms(), rounded, kind, free_bytes(), largest_free_extent_bytes(),
+                     free_extents_.size(), geometry ? "geometry" : "shortage");
         return std::nullopt;
     }
     FreeExtent& free = free_extents_[*free_index];
@@ -120,6 +142,8 @@ HostContextArena::allocate(std::size_t bytes, HostPlacement placement) noexcept 
     reserved_bytes_ += rounded;
     peak_occupied_bytes_ = std::max(peak_occupied_bytes_, occupied_bytes_);
     ++allocation_count_;
+    std::fprintf(stderr, "[trace] A t=%lld off=%zu bytes=%zu kind=%c\n", instr_now_ms(), offset,
+                 rounded, kind);
     return HostContextAllocation(*this, offset, rounded);
 }
 
@@ -137,10 +161,13 @@ HostContextArena::split(HostContextAllocation&& allocation, std::size_t byte_off
                                 allocation.bytes_ - byte_offset, allocation.reserved_);
     allocation.disarm();
     ++allocation_count_;
+    std::fprintf(stderr, "[trace] P t=%lld off=%zu left=%zu right=%zu\n", instr_now_ms(),
+                 left.offset_, left.bytes_, right.bytes_);
     return {std::move(left), std::move(right)};
 }
 
 void HostContextArena::release(std::size_t offset, std::size_t bytes, bool reserved) noexcept {
+    std::fprintf(stderr, "[trace] R t=%lld off=%zu bytes=%zu\n", instr_now_ms(), offset, bytes);
     occupied_bytes_ -= bytes;
     if (reserved) { reserved_bytes_ -= bytes; }
     --allocation_count_;

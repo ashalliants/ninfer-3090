@@ -286,6 +286,47 @@ void test_kv_store(ninfer::DeviceContext& device) {
     store::HostKVExtentStore extents(host_arena, 8);
     store::KVAddressSpaceStore addresses(pages, physical_tables, 4, 4);
 
+    // The release fence is told exactly which Host bytes are about to be freed.
+    struct FenceLog {
+        std::vector<store::HostRange> ranges;
+    } fence_log;
+    extents.set_release_fence(
+        [](void* log, store::HostRange range) noexcept {
+            static_cast<FenceLog*>(log)->ranges.push_back(range);
+        },
+        &fence_log);
+    {
+        std::array<std::byte, 64> bytes{};
+        const store::HostRange low{bytes.data(), 32}, high{bytes.data() + 32, 32},
+            whole{bytes.data(), 64}, none{};
+        expect(store::host_ranges_overlap(low, whole) && store::host_ranges_overlap(whole, high) &&
+                   store::host_ranges_overlap(low, low),
+               "ranges that share a byte overlap");
+        expect(!store::host_ranges_overlap(low, high) && !store::host_ranges_overlap(high, low),
+               "adjacent ranges that share no byte do not overlap");
+        expect(store::host_ranges_overlap(none, low) && store::host_ranges_overlap(low, none) &&
+                   store::host_ranges_overlap(none, none),
+               "an unknown range is treated as overlapping everything");
+
+        // When does a release wait for an in-flight restore? Only when it could be hurt.
+        const std::array reads_low{low};
+        const std::array reads_both{low, high};
+        const std::array reads_unknown{low, none};
+        expect(!store::release_must_wait_for(reads_low, high) &&
+                   !store::release_must_wait_for(reads_both, store::HostRange{bytes.data() + 64, 8}),
+               "a release of bytes no recorded read touches does not wait");
+        expect(store::release_must_wait_for(reads_low, low) &&
+                   store::release_must_wait_for(reads_low, whole) &&
+                   store::release_must_wait_for(reads_both, high),
+               "a release that overlaps any recorded read waits");
+        expect(store::release_must_wait_for(reads_low, none),
+               "a release of unknown bytes waits for every restore");
+        expect(store::release_must_wait_for(std::span<const store::HostRange>{}, high),
+               "a restore with no recorded reads is always waited for");
+        expect(store::release_must_wait_for(reads_unknown, high),
+               "a restore with one unmeasurable read is always waited for");
+    }
+
     const auto address = addresses.create_active(3, 0, device.stream);
     expect(address.has_value(), "active KV address allocation");
     addresses.ensure_mapped_to_tokens(*address, 65, device.stream);
@@ -349,6 +390,9 @@ void test_kv_store(ninfer::DeviceContext& device) {
                pages.source_pins(logical_pages[1]) == 0 && !pages.host_resident(logical_pages[0]) &&
                !pages.host_resident(logical_pages[1]),
            "cancelled KV reservation releases destination bytes without publishing replicas");
+    expect(fence_log.ranges.size() == 1 && fence_log.ranges[0].known() &&
+               fence_log.ranges[0].bytes == host_layout.page_stride * 2,
+           "a cancelled reservation fences exactly its two-page destination before freeing it");
     auto host_backup = extents.prepare(pages, logical_pages);
     expect(host_backup.has_value(), "Host KV extent reservation");
     const std::vector<ninfer::DeviceKVPageHandle> sources = extents.device_sources(*host_backup);
@@ -362,9 +406,15 @@ void test_kv_store(ninfer::DeviceContext& device) {
                host_backing.reserved_bytes() == 0 &&
                host_backing.live_bytes() == host_layout.page_stride * 2,
            "KV extent publication attaches every logical Host replica");
+    const std::byte* const published_begin = extents.view(host_extent).data();
+    const std::size_t fences_before        = fence_log.ranges.size();
     const std::array first_host_release{logical_pages[0]};
     expect(extents.release_page_replicas(pages, first_host_release),
            "first Host page release transaction");
+    expect(fence_log.ranges.size() == fences_before + 1 &&
+               fence_log.ranges.back().begin == published_begin &&
+               fence_log.ranges.back().bytes == host_layout.page_stride * 2,
+           "a partial release fences the whole extent it repartitions");
     const auto retained_host_extent = pages.host_replica(logical_pages[1]).extent;
     expect(!extents.valid(host_extent) && !pages.host_resident(logical_pages[0]) &&
                extents.valid(retained_host_extent) &&
@@ -375,6 +425,10 @@ void test_kv_store(ninfer::DeviceContext& device) {
            "second Host page release transaction");
     expect(!pages.host_resident(logical_pages[1]) && host_arena.occupied_bytes() == 0,
            "partitioned Host replicas release while Device replicas survive");
+    expect(fence_log.ranges.size() == fences_before + 2 &&
+               fence_log.ranges.back().begin == published_begin + host_layout.page_stride &&
+               fence_log.ranges.back().bytes == host_layout.page_stride,
+           "releasing the retained run fences just that one page");
 
     auto second_host_backup = extents.prepare(pages, logical_pages);
     expect(second_host_backup.has_value(), "second Host KV extent reservation");
@@ -402,8 +456,14 @@ void test_kv_store(ninfer::DeviceContext& device) {
     CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
     pages.publish_device_replica(logical_pages[0]);
     pages.publish_device_replica(logical_pages[1]);
+    const std::byte* const second_begin = extents.view(second_host_extent).data();
+    const std::size_t fences_final      = fence_log.ranges.size();
     expect(extents.release(second_host_extent) && host_arena.occupied_bytes() == 0,
            "KV Host restore republishes Device replicas before releasing the extent");
+    expect(fence_log.ranges.size() == fences_final + 1 &&
+               fence_log.ranges.back().begin == second_begin &&
+               fence_log.ranges.back().bytes == host_layout.page_stride * 2,
+           "releasing a whole extent fences exactly that extent");
     auto activation = addresses.prepare_activation(*address, 1, 1);
     expect(addresses.bound_row(*address) == -1 && addresses.reserved_growth_pages(*address) == 0 &&
                physical_pages.reserved_pages() == 1,

@@ -4,6 +4,7 @@
 #include "models/qwen3_5/program/context_work.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <iterator>
 #include <limits>
 #include <map>
@@ -1097,7 +1098,10 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
             return state_store->drop_device_replica(plan.state->handle);
         }
         auto transfer = state_store->reserve_device_to_host(plan.state->handle);
-        if (!transfer) { return false; }
+        if (!transfer) {
+            std::fprintf(stderr, "[instr] demote_fail state\n");
+            return false;
+        }
         transaction.state_transfer.emplace(std::move(*transfer));
     } else {
         auto& pages = plan.resource == runtime::ContextResourceClass::MainKV ? *text_kv_pages
@@ -1132,7 +1136,15 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
             }
             // All destinations and source leases belong to this local transaction until
             // every component is ready. A failed reservation unwinds without dropping pages.
-            if (!destination) { return false; }
+            if (!destination) {
+                std::fprintf(stderr, "[instr] demote_fail kv missing=%zu offset=%zu\n",
+                             missing.size(), offset);
+                return false;
+            }
+            if (count != missing.size() - offset) {
+                std::fprintf(stderr, "[instr] demote_split kv count=%zu of=%zu\n", count,
+                             missing.size() - offset);
+            }
             KVTransfer transfer;
             transfer.pages       = &pages;
             transfer.resource    = plan.resource;

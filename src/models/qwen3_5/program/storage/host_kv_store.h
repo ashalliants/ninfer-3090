@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <limits>
@@ -23,6 +24,34 @@ struct HostKVPageReplicaRelease {
     LogicalKVPageStore* pages = nullptr;
     LogicalKVPageHandle page;
 };
+
+// A span of Host bytes. The default (null, 0) is "unknown", which a reader of Host memory must treat
+// as overlapping everything: a caller that cannot say which bytes it is releasing waits for all.
+struct HostRange {
+    const std::byte* begin = nullptr;
+    std::size_t bytes      = 0;
+
+    [[nodiscard]] bool known() const noexcept { return begin != nullptr && bytes != 0; }
+};
+
+// True when the two spans share a byte, or when either is unknown.
+[[nodiscard]] inline bool host_ranges_overlap(HostRange a, HostRange b) noexcept {
+    if (!a.known() || !b.known()) { return true; }
+    const auto a_begin = reinterpret_cast<std::uintptr_t>(a.begin);
+    const auto b_begin = reinterpret_cast<std::uintptr_t>(b.begin);
+    return a_begin < b_begin + b.bytes && b_begin < a_begin + a.bytes;
+}
+
+// Whether releasing `release` must wait for an in-flight restore that reads `reads`. A restore whose
+// reads were not recorded (an empty list) cannot be ruled out, so it is waited for.
+[[nodiscard]] inline bool release_must_wait_for(std::span<const HostRange> reads,
+                                                HostRange release) noexcept {
+    if (reads.empty()) { return true; }
+    for (const HostRange& read : reads) {
+        if (host_ranges_overlap(release, read)) { return true; }
+    }
+    return false;
+}
 
 class HostKVExtentReservation {
 public:
@@ -74,10 +103,11 @@ public:
     HostKVExtentStore(HostKVExtentStore&&)                 = delete;
     HostKVExtentStore& operator=(HostKVExtentStore&&)      = delete;
 
-    // Called before any extent's Host memory returns to the arena or is repartitioned. A consumer
-    // with asynchronous reads of that memory (a layered restore's gather kernels) waits for them
-    // there, so no release path has to know about it.
-    using ReleaseFence = void (*)(void*) noexcept;
+    // Called before any extent's Host memory returns to the arena or is repartitioned, with the
+    // bytes about to be released. A consumer with asynchronous reads of that memory (a layered
+    // restore's gather kernels) waits there for the reads that touch the range, so no release path
+    // has to know about it. An empty range means "unknown": wait for everything.
+    using ReleaseFence = void (*)(void*, HostRange) noexcept;
     void set_release_fence(ReleaseFence fence, void* context) noexcept {
         release_fence_         = fence;
         release_fence_context_ = context;
@@ -100,16 +130,28 @@ public:
     [[nodiscard]] std::optional<HostKVExtentReservation>
     prepare(LogicalKVPageStore& pages, std::span<const LogicalKVPageHandle> membership) {
         if (membership.empty() || free_count_ == 0 || membership.size() > free_membership_count_) {
+            std::fprintf(stderr,
+                         "[instr] prepare_fail cause=descriptors n=%zu free_desc=%u free_member=%u\n",
+                         membership.size(), static_cast<unsigned>(free_count_),
+                         static_cast<unsigned>(free_membership_count_));
             return std::nullopt;
         }
         for (const LogicalKVPageHandle page : membership) {
-            if (!pages.can_pin_source(page) || pages.host_resident(page)) { return std::nullopt; }
+            if (!pages.can_pin_source(page) || pages.host_resident(page)) {
+                std::fprintf(stderr, "[instr] prepare_fail cause=page_state pin=%d host=%d\n",
+                             pages.can_pin_source(page) ? 1 : 0, pages.host_resident(page) ? 1 : 0);
+                return std::nullopt;
+            }
         }
 
         const HostKVPageLayout& layout = page_layout(pages);
         std::optional<HostKVAllocation> allocation =
             arena_->allocate(layout, static_cast<std::uint32_t>(membership.size()));
-        if (!allocation) { return std::nullopt; }
+        if (!allocation) {
+            std::fprintf(stderr, "[instr] prepare_fail cause=arena n=%zu free_desc=%u\n",
+                         membership.size(), static_cast<unsigned>(free_count_));
+            return std::nullopt;
+        }
 
         const std::uint32_t descriptor = free_[--free_count_];
         Extent& extent                 = extents_[descriptor];
@@ -621,7 +663,7 @@ private:
         }
         const std::size_t released_bytes = stride * static_cast<std::size_t>(released_pages);
 
-        fence_release();
+        fence_release(original);
         HostKVAllocation remaining = std::move(*original.allocation);
         original.allocation.reset();
         increment_generation(original.generation);
@@ -699,12 +741,23 @@ private:
         return released_bytes;
     }
 
-    void fence_release() const noexcept {
-        if (release_fence_ != nullptr) { release_fence_(release_fence_context_); }
+    // The Host bytes of `extent` as the fence needs them. Anything that cannot be resolved is
+    // reported as unknown, which makes the consumer wait for every in-flight read, as before.
+    void fence_release(const Extent& extent) const noexcept {
+        if (release_fence_ == nullptr) { return; }
+        HostRange range;
+        if (extent.allocation) {
+            try {
+                const HostKVAllocationConstView view = arena_->view(*extent.allocation);
+                range = {view.data(),
+                         static_cast<std::size_t>(view.page_count()) * view.layout().page_stride};
+            } catch (...) { range = {}; }
+        }
+        release_fence_(release_fence_context_, range);
     }
 
     void release_descriptor(std::uint32_t index, Extent& extent) noexcept {
-        fence_release();
+        fence_release(extent);
         std::uint32_t node = extent.head;
         for (std::uint32_t offset = 0; offset < extent.page_count; ++offset) {
             if (node == kInvalidIndex) { std::terminate(); }

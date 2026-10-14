@@ -306,6 +306,9 @@ struct PhysicalUsageSnapshot {
     std::size_t host_free_extents          = 0;
     std::uint64_t host_geometry_failures   = 0;
     std::uint64_t host_shortage_failures   = 0;
+    std::uint64_t host_release_fence_waits   = 0;
+    std::uint64_t host_release_fence_skips   = 0;
+    std::uint64_t host_release_fence_wait_ns = 0;
 };
 
 // Device memory a Program allocates besides its expert frames, from the options and the model's
