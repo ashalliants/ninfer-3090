@@ -192,3 +192,33 @@ device links and CTest commands/properties; check the relevant option combinatio
 affected targets and run their behavioral tests. A shape-source edit should rebuild its own
 translation unit plus necessary downstream links. Build-time or inference-speed claims require
 measurements at that scope.
+
+## Cold build time
+
+Measured on the RTX 3090 box (sm_86, CUDA 12.8, MSVC 14.44, `ninfer_ops` only, ccache OFF, fresh
+build directories, 32 logical cores, idle machine):
+
+| Build | Cold wall time | Compile phase ends | Longest translation unit |
+|---|---|---|---|
+| Before the INT8 small-T split | 14m38s | 784 s | `small_t.cu`, 640 s |
+| INT8 small-T split into 10 slices | 6m18s | 292 s | `q8_attn_input_gemm_splitk.cu`, 201 s |
+
+`causal_cache/small_t.cu` used to instantiate about 784 INT8-family partial kernels in one
+translation unit, one single-threaded `cicc` + `ptxas` run that decided the length of the whole
+build. It now only holds the route policy and the reducer launch; `small_t_i8_g*_t*.cu` each
+instantiate one (geometry, query-row tile) slice through the function pointers in
+`small_t_i8_slices.h`. `scripts/compare_kernel_symbols.sh` shows the split moved code without
+changing it (same 784 kernel entries, same register/stack/shared/local usage), and
+`scripts/ninja_tu_times.py` ranks translation units by compile time from `.ninja_log`.
+
+Splitting further does not help once no single unit is the long pole. After the INT8 split the
+compile phase is limited by total CPU work (about 25 effective cores on this machine), and every
+extra slice re-parses the heavy kernel headers, so splitting more raises the summed compile time
+and the wall time with it. Measured on top of the INT8 split: slicing `small_t_{fp8,nvfp4,k8v4}.cu`
+into 15 units took 6m55s (summed compile time for those three files 411 s to 1059 s), and slicing
+the `q8_*_gemm_splitk.cu` launchers took 6m55s as well. Before slicing another unit, check the
+`.ninja_log` concurrency: if the build keeps all cores busy until the last minute, a split cannot
+shorten it.
+
+The other fixed cost is the single-threaded RDC device link at the end of the build; see
+"CUDA compilation boundaries".
