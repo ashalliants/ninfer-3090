@@ -18,6 +18,125 @@
 
 ## RTX 3090 (`sm_86`) findings — this fork
 
+### v0.16.0 release binaries, all three models (2026-10-14)
+
+Measured on the **published v0.16.0 Windows zip** (`ninfer-serve.exe` and `ninfer_bench.exe` from the
+release asset, checksum verified), RTX 3090 (`sm_86`), CUDA 12.8, driver 13.4, Windows 11, models from
+`models\`. The desktop was attached (1.1-1.9 GiB of VRAM in use) and each block held the GPU lock for
+its whole run. 64 GiB of RAM, about 50 GiB free.
+
+Two routes, which answer different questions and must not be read against each other:
+
+- **HTTP route** (`ninfer-serve`, streaming, greedy, thinking off, 512 new tokens, launcher flags, four
+  requests per prompt size, medians). Prompts are this repository's markdown, each request with a unique
+  first line so the prefix cache cannot answer. "Prefill" is prompt tokens over time to first token, so
+  it includes HTTP and scheduling. This is what a user sees.
+- **`ninfer_bench`** (Engine route). Decode starts from a **one-token seed on the bundled token corpus**,
+  not from a chat prompt, so speculative acceptance is far lower than on real text. These rows
+  compare builds and settings, and are not a statement of decode speed in use.
+
+**HTTP route, launcher settings**
+
+| Model and flags | Prompt tokens | Prefill tok/s | First word | Decode tok/s |
+|---|---:|---:|---:|---:|
+| **Qwen3.8-27B**, DFlash2 K=7 + n-gram copies, rk4v4 KV, cuBLAS prefill (chunk 4096) | 1,268 | 2,101 | 0.55 s | 126.3 |
+| | 8,751 | 2,798 | 3.14 s | 125.6 |
+| | 29,454 | 2,581 | 11.44 s | 110.2 |
+| **Qwen3.8-27B**, MTP3 + draft head, rk4v4 KV | 1,268 | 2,149 | 0.55 s | 115.9 |
+| | 8,751 | 2,871 | 3.05 s | 119.4 |
+| | 29,454 | 2,628 | 11.23 s | 114.2 |
+| **Qwen3.6-35B-A3B**, MTP3 + draft head + Q4 MTP experts, rk4v4 KV, cuBLAS prefill | 1,268 | 5,351 | 0.21 s | 286.2 |
+| | 8,751 | 7,481 | 1.17 s | 271.6 |
+| | 29,454 | 6,708 | 4.42 s | 281.9 |
+| **Qwen3.8-Flash-Next** (preview), MTP 3 drafts, INT8 KV, 32K context | 1,268 | 1,281 | 0.90 s | 112.0 |
+| | 8,751 | 2,057 | 4.27 s | 113.2 |
+| | 29,454 | 2,328 | 12.69 s | 103.7 |
+| **Qwen3.8-Flash-Next**, no speculation | 1,268 | 1,334 | 0.86 s | 83.6 |
+| | 8,751 | 2,098 | 4.18 s | 82.1 |
+| | 29,454 | 2,355 | 12.53 s | 82.6 |
+
+- The 27B ran with a 131,072-token context and the 35B with 65,536, because these runs were not meant
+  to find the largest context that fits.
+- **Flash-Next with MTP is 1.34x to 1.38x plain decode** at 1.3K and 8.8K tokens and 1.26x at 29K, with the same
+  prefill speed as plain (the drafter costs no measurable prefill here). MTP decode ranges over the four
+  requests of a size by about +-10%: 98.9-119.6 at 1.3K, 97.6-122.2 at 8.8K.
+- **An exact repeat of the 29K prompt answers its first word in 0.05-0.14 s** on all three models
+  (cache hit of 29,445 of 29,454 tokens).
+- **A first Flash-Next MTP run measured 584 / 740 / 776 tok/s prefill and 93 / 94 / 87 tok/s decode.
+  Do not quote it.** It was the first server started after the machine's RAM had been cleared, so the
+  model and n-gram volume files were read from disk; a repeat on a warm file cache gave the rows above.
+  The warm-up requests inside the run did not hide it. Measure Flash-Next only after the model and
+  `.ngram` volume have been read once.
+- Flash-Next prefill climbs with prompt length (1,281 to 2,328 tok/s) because short prompts are
+  dominated by loading experts into the cache, which a long prompt amortises.
+
+**KV format for the 27B with MTP3.** The launcher's `tuned` profile uses rk4v4 and the C8 profile INT8.
+An interleaved INT8 / rk4v4 / rk4v4 / INT8 run (identical flags otherwise) shows:
+
+| Route | INT8 | rk4v4 |
+|---|---:|---:|
+| HTTP, 1,268-token prompt, decode tok/s | 120.5, 119.5 | 113.1, 112.9 |
+| HTTP, 8,751-token prompt, decode tok/s | 118.5, 118.1 | 121.2, 121.1 |
+| `ninfer_bench` tg128 (one-token seed), decode tok/s | 107.1, 105.6 (acceptance 55.6%) | 71.5, 71.3 (acceptance 27.5%) |
+| `ninfer_bench` tg512, decode tok/s | 128.3, 127.0 (acceptance 74.2%) | 82.4, 82.2 (acceptance 36.4%) |
+
+On real text over HTTP the two formats decode within a few percent of each other (rk4v4 6% slower at
+1.3K tokens, 2% faster at 8.8K, with three requests per cell, so this is not a ranking); rk4v4's gain is
+memory, which is what lets the launcher offer a larger context. On the `ninfer_bench` corpus rk4v4
+is about 33% slower with MTP3, because acceptance halves: the rk4v4 numerics send that synthetic
+greedy stream somewhere the draft model predicts worse. Rounds cost the same. We did not look for the
+cause. Treat `ninfer_bench` MTP rows as comparable only between runs that use the same KV format.
+
+**`ninfer_bench`, Engine route** (mean of 5 repetitions after one warm-up; model flags as noted)
+
+| Model | Test | Setting | Result |
+|---|---|---|---|
+| Qwen3.8-27B | prefill 512 / 4,096 / 16,384 | rk4v4, cuBLAS prefill, chunk 4096 | 2,057 / 3,143 / 2,893 tok/s |
+| Qwen3.8-27B | decode 128 / 512 from a one-token seed | DFlash2 K=7 + draft head, rk4v4 | 52.9 / 61.3 tok/s (acceptance 7% / 11%) |
+| Qwen3.8-27B | decode 128, no speculation | rk4v4 | 49.0 tok/s |
+| Qwen3.8-27B | decode 128 / 512 | MTP3 + draft head, INT8 KV | 107.1 / 128.3 tok/s (the ABBA rows above) |
+| Qwen3.8-27B | decode 128, C1 / C8 aggregate | MTP3 + draft head, INT8 KV | 105.7 / 280.0 tok/s |
+| Qwen3.8-27B | prefill 4,096; decode 128 / 512 | MTP3 + draft head, rk4v4 | 3,190 tok/s; 73.1 / 84.2 tok/s |
+| Qwen3.6-35B-A3B | prefill 512 / 4,096 / 16,384 | rk8v4, cuBLAS prefill, chunk 4096 | 5,479 / 8,468 / 7,749 tok/s |
+| Qwen3.6-35B-A3B | decode 128 / 512 | MTP3 + draft head, rk8v4 | 266.3 / 312.7 tok/s |
+| Qwen3.6-35B-A3B | decode 512, no speculation | rk8v4 | 204.5 tok/s |
+| Qwen3.6-35B-A3B | decode 128, C2 / C4 / C6 aggregate | MTP3 + draft head, INT8, 4K context | 362.4 / 436.1 / 464.3 tok/s |
+
+- `ninfer_bench` has no `--mtp-experts-q4` or `--gdn-state-fp16`, so the 35B rows above run without
+  those two launcher flags; the HTTP table runs with them. Both flags are in the HTTP row.
+- 27B prefill at 4,096 tokens (3,143 tok/s) sits between the 3,044 of the v0.15.1 comparison
+  (master, 2026-10-13) and the 3,185 of the README headline table. Prefill at 16,384 (2,893) is 2.8%
+  above the 2,815 recorded for master on 2026-10-13.
+- 35B prefill at 4K is 8,468 tok/s here against 8,848 in the README headline table (4.3% lower); the
+  README's 35B section said no 3090 prefill figure had been measured.
+- `ninfer_bench` on **Flash-Next is not a good measure**: the expert cache is cold at the start, and
+  decode rose from 49 to 75 tok/s over three consecutive 128-token requests in a probe. The HTTP
+  table above, with warm-up requests, is the Flash-Next measurement.
+
+**Not measured:** Qwen3.8-27B or 35B at C2-C8 over HTTP, any model with thinking enabled, Flash-Next at
+128K context, and a comparison against Strata on the same GGUF (its tools are not on this machine; the
+Strata figures in the README are from the earlier campaign).
+
+**Test suite on the same commit** (`master` `50a337e1`, built with `NINFER_CUDA_RDC=OFF`, run with
+`tools/run-tests.ps1`, the 27B artifact as `NINFER_TEST_ARTIFACT` and the Flash-Next artifact as
+`NINFER_TEST_QWEN4EXP_ARTIFACT`): 207 tests, **197 passed, 6 failed, 4 skipped**, in 57 minutes.
+
+- Skipped: `s3_object_store` (needs a MinIO server), `artifact_ggml_real`, `qwen3_5_loading_real` and
+  `qwen4_exp_forward_real` (each needs its own artifact or an explicit argument).
+- Failed because the run's artifact is the wrong one for the test, not because of the engine:
+  `qwen3_5_dflash_real` ("missing component dflash") and `qwen3_5_dflash_prefill_real`
+  ("linear_topk: unsupported head profile") need a DFlash artifact that is not in `models\`.
+- Failed, pre-existing and unrelated to the artifact: `artifact_writer_interop` ("writer fixture lost a
+  GGML format or layout"). #307 recorded the same failure with RDC on.
+- **`offloaded_moe_wide` crashes on the real Flash-Next artifact** (exit `0xc0000409`, an uncaught C++
+  exception) while checking the last bank, weight 48 (`q2_0+q2_0`, stride 1,382,400), after passing the
+  other 48. `offloaded_moe_layer`, which reads the same banks, passes on the same artifact. The cause
+  is not found: a debugger shows an uncaught throw on a worker thread in the test, with no message.
+  This is a test of an op in isolation; the same op serves Flash-Next requests, and the HTTP runs above
+  did not hit it. Open.
+- `qwen3_5_moe_real` was re-run with the 35B artifact: ctest reports it both passed and skipped after
+  80 s. Treat it as not demonstrated.
+
 **DFlash2 measured on this fork (RTX 3090, Qwen3.8-27B groupwise-int, `--kv-dtype int8`,
 `--draft-tokens 7`, greedy, 96 new tokens).** Text: 20.0% acceptance, 2.38 tok/round.
 Vision (`--vision`, the committed `image_chart` fixture): 85.7% acceptance, 7.00 tok/round,

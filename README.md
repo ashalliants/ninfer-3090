@@ -30,6 +30,14 @@ tokens as plain decoding; 102.6 after a 128K prompt, in a separate run with the 
 when the n-gram volume sits on NVMe. One request at a time, 32K context in this release. Details
 [below](#qwen38-flash-next-preview).
 
+Re-measured on the v0.16.0 release binaries through `ninfer-serve` (2026-10-14, launcher flags, real
+text, medians of four requests): **112 / 113 / 104 tok/s decode with MTP** after a 1.3K / 8.8K /
+29K-token prompt against 84 / 82 / 83 without (1.34x to 1.38x at the shorter two, 1.26x at 29K), at
+1,281 to 2,328 tok/s prefill, and a repeated 29K prompt answers its first word in 0.14 s. Measure
+only after the model and `.ngram` volume have been read from disk once: a first run after clearing
+RAM read 93 tok/s decode and a third of the prefill speed.
+[Details](docs/performance.md#v0160-release-binaries-all-three-models-2026-10-14).
+
 ![Qwen3.8-Flash-Next on one RTX 3090: NInfer-3090 against Strata 0.1.38 on the same GGUF](docs/assets/flash-next-speed.svg)
 
 The 27B speed rows were re-measured on 2026-10-02 for the 3090 conversion `download-model` now
@@ -548,6 +556,14 @@ recorded (the headline table above is the reproducible re-measurement):
 perplexity) and 1,649 tok/s on the default route. NInfer processes one long prefill at a time, so
 cohort batching speeds up decode but not prompt ingestion.
 
+**Re-measured on the v0.16.0 release binaries (2026-10-14, the launcher's `tuned` settings, rk4v4
+KV).** Prefill is 3,143 tok/s at 4K and 2,893 at 16K in `ninfer_bench`. Through `ninfer-serve` on real
+text, DFlash2 K=7 with n-gram copies decodes **126 tok/s** after a 1.3K-token prompt, 126 after 8.8K
+and 110 after 29K; MTP3 gives 116, 119 and 114. `ninfer_bench` decodes from a one-token seed, so its
+speculative rows (for example DFlash2 at 61 tok/s) are far below chat speed and only compare builds.
+Method, the KV-format comparison and the tests run:
+[performance](docs/performance.md#v0160-release-binaries-all-three-models-2026-10-14).
+
 **Against vLLM on the same card.** On the eight thinking-off prompts of
 [syv-ai/qwen38-27b-rtx3090](https://github.com/syv-ai/qwen38-27b-rtx3090) with MTP3 and INT8 KV,
 NInfer decodes 118.9 tok/s at C1 and 477 at C8 with the default 27B artifact (2026-10-02;
@@ -576,7 +592,11 @@ MTP3, greedy decoding, and no competing GPU workload:
 Single-stream decode with the launcher's speculation (MTP3, draft head, `--mtp-experts-q4
 --gdn-state-fp16`) measures **294.9 tok/s** in `ninfer_bench` tg512 with `rk8v4` KV, against 183.5
 without speculation ([launcher profiles](docs/maintainer/launcher-profiles.md#qwen36-35b-a3b-tuned)).
-No prefill figure for the 35B-A3B has been measured on a 3090 yet.
+Re-measured on the v0.16.0 release binaries (2026-10-14): prefill **8,468 tok/s at 4K** and 7,749 at
+16K (`ninfer_bench`, `rk8v4`, cuBLAS route); through `ninfer-serve` with the launcher's settings, 5,351
+to 7,481 tok/s prefill and **272-286 tok/s decode** at 1.3K to 29K-token prompts, and 312.7 tok/s in
+`ninfer_bench` tg512 with MTP3 against 204.5 without
+([method and caveats](docs/performance.md#v0160-release-binaries-all-three-models-2026-10-14)).
 
 A longer 512-token-per-request check reached **286.8 tok/s at C1** and **399.1 aggregate tok/s at
 C2**. Compatible-prefix reuse was validated end to end: a repeated 26-token prompt reused 24 tokens,
