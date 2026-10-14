@@ -2867,14 +2867,16 @@ private:
     }
 
 
-    // Images the store removed on its own (space, age, damage). A continuation marked as stored
-    // whose image is gone would never be written again, so every mark is cleared when it grows.
+    // Images the store removed on its own (space, age, damage, or superseded by a longer image of
+    // another conversation). A continuation marked as stored whose image is gone would never be
+    // written again, so every mark is cleared when it grows. A superseding image covers the old
+    // one's prefix, but only down to its own checkpoints: it may not hold the old resume point.
     [[nodiscard]] std::uint64_t store_removal_count() const noexcept {
         if (store_.store == nullptr) { return 0; }
         try {
             const auto stats = store_.store->stats();
             return stats.evicted_for_space + stats.expired + stats.corrupt_removed +
-                   stats.remote_removed;
+                   stats.remote_removed + stats.superseded;
         } catch (...) { return store_removals_seen_; }
     }
 
