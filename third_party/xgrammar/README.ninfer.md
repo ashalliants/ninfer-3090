@@ -17,6 +17,10 @@ JSON adaptations preserve literal data in cache keys, reject unsupported unions,
 JSON Pointers and carry typed errors with schema locations. String grammars constrain decoded
 Unicode values before JSON encoding; property-name exclusion also covers escaped spellings.
 String intersections combine patterns, Unicode length and tool-delimiter exclusion in one automaton.
+Pure JSON length bounds use counted repetitions of JSON-encoded Unicode scalars. Prefix-free
+terminal units share count-independent token masks, including partial UTF-8 and escape states;
+tokens crossing into a parent's continuation retain exact parser matching. Derived repeat masks
+are rebuilt on deserialization and charged to the compiled grammar's cache budget.
 General schema conjunction reduction and source diagnostics belong to NInfer's text adapter.
 Positional arrays preserve optional prefix positions and impossible-position length caps.
 Bounded numbers use decimal interval compilation and the product JSON serializer's binary64
