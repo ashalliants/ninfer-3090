@@ -382,6 +382,8 @@ std::optional<qwen3_5::ImportedCheckpoints> import_checkpoint_image(HostCheckpoi
 
     qwen3_5::ImportedCheckpoints out;
     out.session = parsed.session;
+    // Reserved up front so publishing a record can never fail on the vector's growth afterwards.
+    out.points.reserve(parsed.points.size());
     try {
         for (const PointRecord& point : parsed.points) {
             HostCheckpoint r;
@@ -410,6 +412,10 @@ std::optional<qwen3_5::ImportedCheckpoints> import_checkpoint_image(HostCheckpoi
     } catch (const std::logic_error& error) {
         for (const auto handle : out.points) { (void)store.erase(handle); }
         throw std::invalid_argument(std::string("checkpoint image is inconsistent: ") + error.what());
+    } catch (...) {
+        // An allocation failure while inserting: no earlier point stays resident.
+        for (const auto handle : out.points) { (void)store.erase(handle); }
+        throw;
     }
     return out;
 }

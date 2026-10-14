@@ -58,6 +58,9 @@ constexpr std::uint64_t kHostContextGranule      = 64ULL << 20;
 // The context cache's NVMe tier: its pinned bounce buffer (both halves), and the share of the
 // volume's free space it may take at most.
 constexpr std::uint64_t kNvmeBounceBytes      = 128ULL << 20;
+// An NVMe tier smaller than this is not worth opening: setup keeps checkpoints in RAM and never
+// allocates the bounce buffer, so the ledger charges neither for it.
+constexpr std::uint64_t kMinimumNvmeTierBytes = kMinimumHostContextBytes;
 constexpr std::uint64_t kNvmeFreeSpaceDivisor = 2;
 
 unsigned long long mib(std::uint64_t bytes) { return static_cast<unsigned long long>(bytes >> 20); }
@@ -240,12 +243,15 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // The context cache's NVMe tier (--context-nvme-mib): checkpoints in a scratch file, the Host tier
     // below as its RAM cache, moved through a pinned bounce buffer.
     const auto [nvme_path, nvme_bytes] = plan_nvme_tier(options);
-    if (nvme_bytes != 0) { demand.later_pinned += kNvmeBounceBytes; }
+    const bool nvme_tier               = nvme_bytes >= kMinimumNvmeTierBytes;
+    if (nvme_tier) { demand.later_pinned += kNvmeBounceBytes; }
     // The context cache's Host tier (prefix reuse) is pinned beside the experts: it gets what the
     // ledger can spare above the reserve, up to the requested size, and is off below a minimum.
     const auto snapshot = host_memory_snapshot();
-    const std::uint64_t requested_cache =
+    std::uint64_t requested_cache =
         options.context_cache.enabled ? options.context_cache.host_capacity_bytes.value_or(kDefaultHostContextBytes) : 0;
+    // The tier's RAM frames address only the file's slabs: RAM beyond the NVMe size would be pinned for nothing.
+    if (nvme_tier) { requested_cache = std::min(requested_cache, nvme_bytes); }
     const auto cache_fit = models::qwen4_exp::fit_context_cache(snapshot, demand, requested_cache, kMinimumHostContextBytes,
                                                                 kHostContextGranule);
     demand.context_cache = cache_fit.bytes;

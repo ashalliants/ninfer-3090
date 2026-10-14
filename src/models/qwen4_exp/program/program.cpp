@@ -2253,7 +2253,7 @@ private:
                 NvmeTier::Options tier;
                 tier.slabs        = disk_slabs;
                 tier.slab_bytes   = record;
-                tier.frames       = ram_slabs;
+                tier.frames       = std::min(ram_slabs, disk_slabs); // frames past the file's slabs are unaddressable
                 tier.bounce_slabs = static_cast<std::uint32_t>(std::max<std::uint64_t>(1, options_.context_bounce_bytes / 2 / record));
                 auto file =
                     open_scratch_tier_file(options_.context_nvme_path, static_cast<std::uint64_t>(disk_slabs) * record);
@@ -2264,7 +2264,7 @@ private:
                 char line[400];
                 std::snprintf(line, sizeof(line), "an NVMe tier of %.1f GiB (%s, removed at exit) behind %.2f GiB of pinned RAM",
                               static_cast<double>(disk_slabs) * record / (1ULL << 30), options_.context_nvme_path.string().c_str(),
-                              static_cast<double>(ram_slabs) * record / (1ULL << 30));
+                              static_cast<double>(tier.frames) * record / (1ULL << 30));
                 where = line;
             } catch (const std::exception& error) {
                 diagnostic(std::string("context cache: could not open its NVMe tier (") + error.what() +
