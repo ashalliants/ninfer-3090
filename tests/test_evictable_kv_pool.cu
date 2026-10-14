@@ -306,6 +306,41 @@ int main() {
             pending.reset();
         }
 
+        // The same loan over a pool whose planes span two ranks (--devices): only rank 0's planes are
+        // lent, because the arena is rank 0's. Overlay Vision under a split failed here with "Paged KV
+        // page ranges are only defined for a single-rank pool" until a plane's range was defined for
+        // ranked pools.
+        {
+            const auto page_stride = static_cast<std::int32_t>(granule / 8 / 64 / 2);
+            ninfer::KVPageGeometry geometry{
+                .planes = {{ninfer::DType::I8, page_stride, 2, 256},
+                           {ninfer::DType::I8, page_stride, 2, 256},
+                           {ninfer::DType::FP16, 1, 2, 256}},
+            };
+            ninfer::LayoutBuilder rank0_builder, rank1_builder;
+            ninfer::LayoutBuilder* builders[]            = {&rank0_builder, &rank1_builder};
+            const std::vector<std::size_t> plane_rank    = {0, 1, 0};
+            const ninfer::DeviceKVPagePoolLayout layout  = ninfer::plan_device_kv_page_pool(
+                builders, plane_rank, {.page_group_count = 512, .geometry = geometry});
+            const std::size_t rank0_bytes = rank0_builder.finish(256, "ranked loan fixture, rank 0");
+            const std::size_t rank1_bytes = rank1_builder.finish(256, "ranked loan fixture, rank 1");
+            ninfer::EvictableKVPool fixture(device, ninfer::EvictableKVPool::Config{
+                                                        .arena_bytes           = rank0_bytes,
+                                                        .lendable_prefix_bytes = rank0_bytes,
+                                                        .window_capacity_bytes = 4 * granule,
+                                                    });
+            ninfer::DeviceArena rank1_backing(rank1_bytes);
+            const std::vector<ninfer::DeviceSpan> backings = {
+                fixture.arena(), {rank1_backing.base(), rank1_backing.capacity()}};
+            ninfer::DeviceKVPagePool pages(backings, layout);
+            failures += expect(pages.rank_count() == 2, "the loan fixture pool spans two ranks");
+            failures += expect(ninfer::kv_loan_plane(pages, 0) && !ninfer::kv_loan_plane(pages, 1),
+                               "only rank 0's planes are lendable");
+            const ninfer::KVLoanPlan plan = ninfer::plan_kv_loan(fixture, pages, 2 * granule);
+            failures += expect(plan.bytes >= 2 * granule && !plan.runs.empty(),
+                               "a ranked pool funds a loan from rank 0's planes");
+        }
+
         if (failures != 0) {
             std::cerr << failures << " expectation(s) failed\n";
             return 1;

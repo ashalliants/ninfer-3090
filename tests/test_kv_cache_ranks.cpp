@@ -294,11 +294,24 @@ int exercise(const ninfer::DeviceContext& context, ninfer::PagedKVPlaneOrder ord
     // 5. Misuse is refused rather than putting a rank's copy on another rank's stream.
     failures += expect_throws([&] { ranked.zero_pages(rk_handles, context.rank(0).stream); },
                               label + ": one stream for a two-rank pool is rejected");
-    failures += expect_throws([&] { (void)ranked.plane_page_range(0, 0, 1); },
-                              label + ": page ranges are refused on a multi-rank pool");
     if (order == ninfer::PagedKVPlaneOrder::PageMajor) {
+        // A plane's page range is defined on a ranked pool too: it lies in that plane's own backing, on
+        // the plane's rank. Overlay Vision under --devices lends rank 0's planes through it.
         failures += expect(reference.plane_page_range(0, 0, 1).bytes != 0,
-                           label + ": a single-rank pool still serves page ranges");
+                           label + ": a single-rank pool serves page ranges");
+        for (std::size_t plane = 0; plane < ranked.plane_count(); ++plane) {
+            const ninfer::KVPlaneByteRange range = ranked.plane_page_range(plane, 2, 3);
+            const auto page_bytes                = static_cast<std::size_t>(ranked.plane(plane).nb[3]);
+            failures += expect(range.base == static_cast<const std::byte*>(ranked.plane(plane).data) + 2 * page_bytes &&
+                                   range.bytes == 3 * page_bytes,
+                               label + ": plane " + std::to_string(plane) + " (rank " +
+                                   std::to_string(ranked.plane_rank(plane)) + ") serves a page range inside its own backing");
+        }
+        failures += expect_throws([&] { (void)ranked.plane_page_range(0, kPages - 1, 2); },
+                                  label + ": a page range past the pool is refused");
+    } else {
+        failures += expect_throws([&] { (void)ranked.plane_page_range(0, 0, 1); },
+                                  label + ": page ranges need page-major planes");
     }
     return failures;
 }

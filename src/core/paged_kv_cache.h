@@ -250,8 +250,9 @@ public:
     [[nodiscard]] std::size_t plane_rank(std::size_t index) const;
     [[nodiscard]] std::span<const KVPageRun> free_runs() const noexcept;
     // Device bytes one plane devotes to a run of consecutive pages. Page-major geometry only:
-    // a run is one contiguous block there, which is what makes a run lendable. Lending exists for a
-    // single device, so a pool spanning several ranks refuses it.
+    // a run is one contiguous block there, which is what makes a run lendable. In a pool spanning
+    // several ranks a plane's range lies in that plane's rank's memory (plane_rank); a loan uses only
+    // rank 0's planes, since the arena it draws on is rank 0's.
     [[nodiscard]] KVPlaneByteRange plane_page_range(std::size_t plane, std::int32_t first_page,
                                                     std::uint32_t count) const;
 

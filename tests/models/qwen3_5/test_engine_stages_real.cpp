@@ -56,6 +56,10 @@ struct Configuration {
     ninfer::KvCacheStorage kv_cache    = ninfer::KvCacheStorage::Int8Group64;
     // Vision tower on rank 0 with this residency; unset leaves vision off.
     std::optional<ninfer::VisionResidency> vision;
+    // KV pages in the pool. The default leaves a 2,048-token context no free pages, so overlay Vision
+    // takes its window from the weight tail; a larger pool leaves free pages that the window borrows
+    // (the KV loan), which is the path a server with a real context takes.
+    std::uint32_t kv_capacity = 2048;
 };
 
 // Stage i of a configuration sits on the i-th id of NINFER_TEST_DEVICE_IDS, wrapping around; without
@@ -91,7 +95,9 @@ ninfer::EngineOptions engine_options(const char* artifact, const Configuration& 
     ninfer::EngineOptions options;
     options.artifact_path  = artifact;
     options.max_context    = 2048;
-    options.kv_capacity    = ninfer::KvCapacityPolicy::explicit_capacity(2048);
+    options.kv_capacity    = ninfer::KvCapacityPolicy::explicit_capacity(configuration.kv_capacity);
+    // A pool larger than one context needs the lanes that would use it (kv_capacity <= context x lanes).
+    options.max_concurrency = configuration.kv_capacity / 2048;
     options.prefill_chunk  = 512;
     options.kv_cache       = configuration.kv_cache;
     options.use_cuda_graph = configuration.cuda_graph;
@@ -479,6 +485,17 @@ int run() {
         {{.label   = "two stages, vision overlay",
           .devices = {0, 0},
           .vision  = ninfer::VisionResidency::Overlay},
+         &vision},
+        // Free KV pages beside the window: overlay Vision borrows them, on one device and across stages
+        // (it failed with "Paged KV page ranges are only defined for a single-rank pool" on stages).
+        {{.label       = "single device, vision overlay, KV loan",
+          .vision      = ninfer::VisionResidency::Overlay,
+          .kv_capacity = 16384},
+         &vision},
+        {{.label       = "two stages, vision overlay, KV loan",
+          .devices     = {0, 0},
+          .vision      = ninfer::VisionResidency::Overlay,
+          .kv_capacity = 16384},
          &vision},
         {{.label        = "three stages, vision overlay, uneven layers",
           .devices      = {0, 0, 0},

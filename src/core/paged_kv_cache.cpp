@@ -412,9 +412,9 @@ KVPlaneByteRange DeviceKVPagePool::plane_page_range(std::size_t plane_index,
     if (spec_.geometry.device_plane_order != PagedKVPlaneOrder::PageMajor) {
         throw std::logic_error("Paged KV page ranges require page-major planes");
     }
-    if (rank_count_ != 1) {
-        throw std::logic_error("Paged KV page ranges are only defined for a single-rank pool");
-    }
+    // A range is one plane's bytes, in that plane's own backing, so it is defined for any rank count;
+    // the bytes sit on plane_rank(plane_index)'s device. The caller picks the planes it may touch
+    // (a KV loan takes rank 0's only, kv_loan_plane).
     if (count == 0 || first_page < 0 ||
         static_cast<std::int64_t>(first_page) + count > capacity_pages()) {
         throw std::out_of_range("Paged KV page range is outside the pool");
