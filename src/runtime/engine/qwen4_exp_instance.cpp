@@ -58,8 +58,8 @@ constexpr std::uint64_t kHostContextGranule      = 64ULL << 20;
 // The context cache's NVMe tier: its pinned bounce buffer (both halves), and the share of the
 // volume's free space it may take at most.
 constexpr std::uint64_t kNvmeBounceBytes      = 128ULL << 20;
-// An NVMe tier smaller than this is not worth opening: setup keeps checkpoints in RAM and never
-// allocates the bounce buffer, so the ledger charges neither for it.
+// An NVMe tier smaller than this is not worth opening: plan_nvme_tier declines it, so checkpoints stay in
+// RAM and neither the bounce buffer nor the tier is ever allocated.
 constexpr std::uint64_t kMinimumNvmeTierBytes = kMinimumHostContextBytes;
 constexpr std::uint64_t kNvmeFreeSpaceDivisor = 2;
 
@@ -91,10 +91,22 @@ std::pair<std::filesystem::path, std::uint64_t> plan_nvme_tier(const EngineOptio
     }
     std::uint64_t bytes = next.context_nvme_bytes;
     const auto space    = std::filesystem::space(dir, error);
-    if (!error && space.available / kNvmeFreeSpaceDivisor < bytes) {
+    if (error) {
+        // Without the free space there is no cap to apply, and an uncapped scratch file could fill the volume.
+        report("context cache: no NVMe tier: the free space on " + dir.string() + " could not be read (" + error.message() +
+               "); checkpoints stay in RAM only");
+        return {{}, 0};
+    }
+    if (space.available / kNvmeFreeSpaceDivisor < bytes) {
         bytes = space.available / kNvmeFreeSpaceDivisor;
         report("context cache: NVMe tier capped at " + std::to_string(mib(bytes)) + " MiB (asked " +
                std::to_string(mib(next.context_nvme_bytes)) + "), half the free space on " + dir.string());
+    }
+    if (bytes < kMinimumNvmeTierBytes) {
+        // Too small to open: the ledger would charge nothing for it, so none may be built.
+        report("context cache: no NVMe tier: " + std::to_string(mib(bytes)) + " MiB is below the " +
+               std::to_string(mib(kMinimumNvmeTierBytes)) + " MiB minimum; checkpoints stay in RAM only");
+        return {{}, 0};
     }
     return {dir / (artifact.filename().string() + ".context-" + std::to_string(process_id()) + ".tier"), bytes};
 }
@@ -243,7 +255,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // The context cache's NVMe tier (--context-nvme-mib): checkpoints in a scratch file, the Host tier
     // below as its RAM cache, moved through a pinned bounce buffer.
     const auto [nvme_path, nvme_bytes] = plan_nvme_tier(options);
-    const bool nvme_tier               = nvme_bytes >= kMinimumNvmeTierBytes;
+    const bool nvme_tier               = nvme_bytes != 0; // plan_nvme_tier returns zero below the minimum
     if (nvme_tier) { demand.later_pinned += kNvmeBounceBytes; }
     // The context cache's Host tier (prefix reuse) is pinned beside the experts: it gets what the
     // ledger can spare above the reserve, up to the requested size, and is off below a minimum.

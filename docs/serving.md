@@ -103,7 +103,8 @@ the Qwen3.5 models:
 - **Checkpoints on disk** (`--context-nvme-mib N`): a scratch file of up to N MiB holds the
   checkpoints, in `--context-nvme-dir DIR` or beside the model (put it on NVMe). It is created at
   startup, grows only with what is written, is capped at half the drive's free space, and is
-  deleted when the server exits (also when it is killed). The host tier above becomes its RAM cache:
+  deleted when the server exits (also when it is killed). A tier under 512 MiB, or on a drive whose
+  free space cannot be read, is not opened and checkpoints stay in RAM. The host tier above becomes its RAM cache:
   recent checkpoints restore from RAM, older ones from the file. With `--host-context-mib 0` every
   checkpoint lives on disk (disk-only reuse, for a machine with no RAM to spare). A full or failing
   disk turns the affected checkpoints into cache misses, never into wrong output.
