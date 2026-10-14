@@ -1820,7 +1820,7 @@ private:
                 for (const auto handle : *victims) {
                     const auto usage = instance_.program->physical_usage();
                     if (usage.capacity.host_bytes - usage.occupied.host_bytes >= *bytes) { break; }
-                    if (resources_.erase(*instance_.program, handle)) { continue; }
+                    if (resources_.release_victim(*instance_.program, handle)) { continue; }
                     const auto owner =
                         std::find_if(paused_.begin(), paused_.end(), [&](const auto& other) {
                             return other->suspended &&
@@ -3282,6 +3282,17 @@ private:
         return true;
     }
 
+    // True when the cache now offers this request a source at least as deep as the stored image it
+    // was waiting for.
+    [[nodiscard]] bool cache_covers_hydration(const std::shared_ptr<Request>& request) {
+        const auto sources = resources_.candidates(*instance_.program, *request->base_plan,
+                                                   UINT32_MAX, std::nullopt, request->id,
+                                                   request->publication_order);
+        return std::any_of(sources.begin(), sources.end(), [&](const auto& choice) {
+            return choice.source.reused_tokens >= request->hydration_frontier;
+        });
+    }
+
     // Settles finished reads and expired waits. Imports wait for a boundary without a context
     // transaction, since they may give up cached checkpoints.
     void process_hydrations() {
@@ -3313,6 +3324,12 @@ private:
             }
             if (!waiting) {
                 request->hydrating = false;
+                continue;
+            }
+            if (task.bytes && cache_covers_hydration(request)) {
+                // Another waiter's read-back of the same image (or anything else) has already
+                // brought this prefix in: importing it again would catalogue a second copy.
+                finish_hydration(request, false);
                 continue;
             }
             bool imported = false;

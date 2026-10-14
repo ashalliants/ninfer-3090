@@ -594,6 +594,17 @@ public:
         return true;
     }
 
+    // Releases one Host victim the way commit_release does: its continuation is offered to the
+    // durable store first, while every point is still valid. False, with nothing offered, when the
+    // handle is not a catalogued point or may not be released now.
+    bool release_victim(Program& program, Handle handle, ReclaimRights rights = {}) {
+        if (!references(handle) || pinned(handle) || !may_revoke({&handle, 1}, rights)) {
+            return false;
+        }
+        notify_releasing(program, {&handle, 1});
+        return erase(program, handle, rights);
+    }
+
     // Victim selection reuses each candidate's facts across the plans of one reclaim. The tests turn
     // this off to prove the answers are identical either way; production never does.
     void set_candidate_memo(bool enabled) noexcept { candidate_memo_ = enabled; }

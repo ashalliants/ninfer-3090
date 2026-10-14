@@ -2338,8 +2338,35 @@ void test_release_of_a_shallower_point_is_not_offered() {
             "losing the resume point did not offer the conversation");
 }
 
+// A pause that frees Host by releasing a victim directly (not through a committed reclaim) still
+// shows the store the continuation that loses its resume point, with every point still valid.
+void test_direct_victim_release_offers_the_continuation_first() {
+    Fixture f(32);
+    const auto cold       = f.program.add({1, 2}, {f.program.host_block(16)}, Role::Continuation);
+    const auto stray      = f.program.add({7, 8}, {f.program.host_block(16)}, Role::Continuation);
+    const auto cold_owner = f.publish(cold);
+    std::vector<Fixture::Token> offered;
+    bool valid_when_offered = true;
+    f.cache.set_durability(
+        {.releasing = [&](std::span<const Fixture::Cache::RetainedOwner> owners) {
+            for (const auto& owner : owners) {
+                offered.push_back(owner.token);
+                for (const auto point : owner.points) {
+                    valid_when_offered = valid_when_offered && f.program.valid_checkpoint(point);
+                }
+            }
+        }});
+    require(!f.cache.release_victim(f.program, stray) && offered.empty(),
+            "an uncatalogued handle was released or offered");
+    require(f.cache.release_victim(f.program, cold), "the direct victim release did not happen");
+    require(offered == std::vector<Fixture::Token>{cold_owner} && valid_when_offered &&
+                !f.program.valid_checkpoint(cold),
+            "the directly released continuation was not offered before its release");
+}
+
 int main() {
     try {
+        test_direct_victim_release_offers_the_continuation_first();
         test_candidate_memo_cuts_victim_selection_work();
         test_candidate_memo_changes_no_decision();
         test_pinned_shared_prefix_survives_reclaim_and_cache_clear();
