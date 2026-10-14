@@ -736,6 +736,12 @@ ninfer model.ninfer --devices 0,1,2 --stage-layers 20,22,22 --prompt "..."
   and its encode stay on the first device, so the first stage's layer budget carries it),
   `--vision-residency overlay` (its window borrows only the first device's memory), prompt grafts,
   and worker failure recovery.
+- **Check vision on a split with `tools/vision_smoke.py`.** It starts `ninfer-serve` with the flags you give
+  it, sends a single image and concurrent multi-image requests, and exits 1 on any failure, for example
+  `python tools/vision_smoke.py --exe ./ninfer-serve --model models/qwen3_8_27b.ninfer -- --devices 0,1
+  --vision-residency overlay --max-concurrency 2 --max-context 24576 --kv-capacity 49152 --kv-dtype int8`.
+  (Releases up to v0.16.0 fail overlay vision on a split with "Paged KV page ranges are only defined for a
+  single-rank pool"; resident vision is not affected.)
 - **Boundary transfers stage through pinned host memory.** Peer access is not needed, and no
   consumer PCIe pair measured so far offers it. Measured with `tools/tp_probe.cu` on rented 2x A4000
   and 2x 3090 PCIe boxes, a staged transfer took about 0.03 ms at a decode-sized payload and several
