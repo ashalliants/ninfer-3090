@@ -37,6 +37,7 @@ try {
   $p = Start-Server $SeedBin $seedStore 8192 'seed'
   try {
     & python -I "$s\restart_probe.py" seed --base-url "http://127.0.0.1:$port" --sizes $Sizes --state "$out\state.json" 2>&1 | Tee-Object -FilePath "$out\seed.txt"
+    if ($LASTEXITCODE -ne 0) { throw "seed probe exited $LASTEXITCODE (incomplete run, see $out\seed.txt)" }
     $n = ($Sizes -split ',').Count
     for ($t = 0; $t -lt 120; $t++) { if ((Metric 'ninfer_context_store_writes_total') -ge $n) { break }; Start-Sleep -Seconds 1 }
     Start-Sleep -Seconds 3
@@ -52,6 +53,7 @@ try {
     $p = Start-Server $bin $store $HostMib "$i$arm"
     try {
       & python -I "$s\restart_probe.py" continue --base-url "http://127.0.0.1:$port" --state "$out\state.json" --out "$out\cont-$i$arm.json" 2>&1 | Tee-Object -FilePath "$out\cont-$i$arm.txt"
+      if ($LASTEXITCODE -ne 0) { throw "continue probe $i$arm exited $LASTEXITCODE (incomplete run, see $out\cont-$i$arm.txt)" }
       "run $i$arm restored=$(Metric 'ninfer_context_store_restored_sessions') hydrations=$(Metric 'ninfer_context_store_hydrations_total') hydrated_tokens=$(Metric 'ninfer_context_store_hydrated_tokens_total') failures=$(Metric 'ninfer_context_store_hydration_failures_total') hyd_s=$(Metric 'ninfer_context_store_hydration_seconds_total') rate=$(Metric 'ninfer_context_store_read_bytes_per_second')" | Tee-Object -Append -FilePath "$out\lock.txt"
     } finally { Stop-Process -Id $p.Id -Force; $p.WaitForExit() }
     Remove-Item -Recurse -Force $store

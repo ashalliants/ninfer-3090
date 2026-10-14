@@ -58,6 +58,7 @@ try {
         '--requests', "$Requests", '--tenants', "$Tenants", '--out', "$out\result-$i$arm.json")
       if ($DriverArgs) { $dargs += $DriverArgs.Split(' ') }
       & python -I @dargs 2> "$out\driver-$i$arm.log" | Out-File "$out\summary-$i$arm.json"
+      if ($LASTEXITCODE -ne 0) { throw "driver $i$arm exited $LASTEXITCODE (incomplete run, see $out\driver-$i$arm.log)" }
     } finally {
       if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force; $p.WaitForExit() }
     }

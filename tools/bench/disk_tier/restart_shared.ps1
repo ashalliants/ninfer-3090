@@ -40,6 +40,7 @@ try {
     $p = Start-Server $bin $store "$i$arm-seed"
     try {
       & python -I "$s\hosted_rotation.py" --base-url "http://127.0.0.1:$port" --workers 4 --requests $SeedRequests --seed 1 --system-seed 1 --out "$out\seed-$i$arm.json" 2> "$out\seed-$i$arm.log" | Out-File "$out\seed-summary-$i$arm.json"
+      if ($LASTEXITCODE -ne 0) { throw "seed driver $i$arm exited $LASTEXITCODE (incomplete run, see $out\seed-$i$arm.log)" }
       Start-Sleep -Seconds 5
     } finally { Stop-Process -Id $p.Id -Force; $p.WaitForExit() }
     $bytes = (Get-ChildItem -Recurse -File $store | Measure-Object -Sum Length).Sum
@@ -49,6 +50,7 @@ try {
       $restored = ((Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$port/metrics").Content -split "`n" | Where-Object { $_ -match '^ninfer_context_store_restored_sessions ' })
       "warm $i$arm $restored" | Tee-Object -Append -FilePath "$out\lock.txt"
       & python -I "$s\hosted_rotation.py" --base-url "http://127.0.0.1:$port" --workers 4 --requests $Requests --seed 2 --system-seed 1 --out "$out\warm-$i$arm.json" 2> "$out\warm-$i$arm.log" | Out-File "$out\warm-summary-$i$arm.json"
+      if ($LASTEXITCODE -ne 0) { throw "warm driver $i$arm exited $LASTEXITCODE (incomplete run, see $out\warm-$i$arm.log)" }
     } finally { Stop-Process -Id $p.Id -Force; $p.WaitForExit() }
     Remove-Item -Recurse -Force $store
   }

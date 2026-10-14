@@ -2815,6 +2815,9 @@ private:
     // One admission attempt; a failure confined to its request is contained, any other rethrown.
     void admit_or_contain(bool restoring, std::optional<std::string>& device_fault) {
         admission_subject_.reset();
+        // A queued write that failed since the last scan left its marks standing; clear them
+        // before admission prices eviction, or the failed image is counted as durable.
+        (void)forget_failed_store_writes();
         try {
             (void)try_admit_one(restoring);
         } catch (...) {
@@ -3065,6 +3068,7 @@ private:
         if (!store_.evict_sink) { return; }
         auto& program = *instance_.program;
         if (program.has_context_transaction()) { return; }
+        (void)forget_failed_store_writes();
         for (const auto& owner : owners) {
             try {
                 if (holds(mark(owner.token), owner.points)) { continue; }
