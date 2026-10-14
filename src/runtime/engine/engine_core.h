@@ -3042,7 +3042,7 @@ private:
         try {
             auto& program = *instance_.program;
             if (program.has_context_transaction() || (store_.ready && !store_.ready())) { return; }
-            std::optional<Checkpoint> pending;
+            bool failed = false;
             for (const auto handle : unstored_shared(program)) {
                 // A prefix captured again after an eviction has the key of the image the store
                 // already holds: that image serves it, so it is not exported a second time.
@@ -3050,21 +3050,25 @@ private:
                     shared_stored_.emplace_back(handle, *bytes);
                     continue;
                 }
-                pending = handle;
-                break;
+                // One prefix that cannot be exported (the Program refuses it, or a transient
+                // failure) must not keep the others from being tried: each candidate is isolated,
+                // as in the shutdown flush. One export per scan.
+                try {
+                    const auto started = Clock::now();
+                    auto image         = program.export_checkpoints({&handle, 1}, std::nullopt,
+                                                                    store_.binding);
+                    const auto bytes   = image.bytes.size();
+                    cumulative_stats_.context_store_shared_export_seconds +=
+                        std::chrono::duration<double>(Clock::now() - started).count();
+                    if (store_.shared_sink(std::move(image))) {
+                        shared_stored_.emplace_back(handle, bytes);
+                        ++cumulative_stats_.context_store_shared_writes;
+                    }
+                    return;
+                } catch (...) { failed = true; }
             }
-            if (!pending) { return; }
-            const auto handle  = *pending;
-            const auto started = Clock::now();
-            auto image         = program.export_checkpoints({&handle, 1}, std::nullopt,
-                                                            store_.binding);
-            const auto bytes   = image.bytes.size();
-            cumulative_stats_.context_store_shared_export_seconds +=
-                std::chrono::duration<double>(Clock::now() - started).count();
-            if (store_.shared_sink(std::move(image))) {
-                shared_stored_.emplace_back(handle, bytes);
-                ++cumulative_stats_.context_store_shared_writes;
-            }
+            // Every candidate failed: back off instead of retrying them each second.
+            if (failed) { next_shared_scan_ = now + std::chrono::seconds(4); }
         } catch (...) { next_shared_scan_ = now + std::chrono::seconds(4); }
     }
 

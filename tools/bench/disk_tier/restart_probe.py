@@ -54,8 +54,9 @@ def main() -> int:
             messages = [{"role": "system", "content": f"You are reviewer {i}."},
                         {"role": "user", "content": f"Log {i}:\n{body}\nSummarise it in one line."}]
             text, usage, ttft, err = run(client, model, messages, 32)
-            if err:
-                print("seed error", err)
+            if err or ttft is None:
+                # No first output is as invalid as an error, as in continue mode.
+                print("seed error", err or "no first output")
                 return 1
             messages.append({"role": "assistant", "content": text})
             convs.append({"words": words, "messages": messages, "prompt": usage.get("prompt_tokens")})
