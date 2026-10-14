@@ -1338,17 +1338,23 @@ private:
         std::deque<CandidateMemo> candidates; // stable references while the deque grows
     };
 
-    [[nodiscard]] static CandidateMemo& candidate_memo(Evaluation& evaluation,
+    // Each entry holds a copy of its source set, and the greedy loop offers a new union for every
+    // plan at every step, so the set count is capped: once it is full a candidate is simply
+    // evaluated without the memo (nullptr), which is what the unmemoised path already does.
+    static constexpr std::size_t kMaxCandidateMemos = 1024;
+
+    [[nodiscard]] static CandidateMemo* candidate_memo(Evaluation& evaluation,
                                                        std::span<const Handle> sources) {
         for (auto& memo : evaluation.candidates) {
             if (memo.sources.size() == sources.size() &&
                 std::all_of(sources.begin(), sources.end(),
                             [&](Handle handle) { return contains(memo.sources, handle); })) {
-                return memo;
+                return &memo;
             }
         }
+        if (evaluation.candidates.size() >= kMaxCandidateMemos) { return nullptr; }
         evaluation.candidates.push_back({.sources = {sources.begin(), sources.end()}});
-        return evaluation.candidates.back();
+        return &evaluation.candidates.back();
     }
 
     [[nodiscard]] std::span<const Handle> retained(Program& program, Evaluation& evaluation) const {
@@ -1646,7 +1652,7 @@ private:
                 // survivor list is rebuilt per use), so the cache does not grow with the square of
                 // the checkpoint count.
                 CandidateMemo* const memo =
-                    candidate_memo_ ? &candidate_memo(evaluation, combined) : nullptr;
+                    candidate_memo_ ? candidate_memo(evaluation, combined) : nullptr;
                 std::size_t amount;
                 if (memo) {
                     if (!memo->host_bytes) { memo->host_bytes = program.host_bytes_released(combined); }
