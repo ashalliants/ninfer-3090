@@ -18,3 +18,8 @@ target_include_directories(ninfer_context_cost_measure_test PRIVATE
   ${PROJECT_SOURCE_DIR}/bench/context_cost)
 
 add_test(NAME ninfer_context_cost_measure_test COMMAND ninfer_context_cost_measure_test)
+
+# The Host arena replay tool's self-test (tools/bench/replay_host_arena.py). Pure Python, no GPU: the
+# replay of a known allocator run must reproduce it exactly, or the tool's predictions mean nothing.
+add_test(NAME ninfer_host_arena_replay_test
+  COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/bench/test_replay_host_arena.py)

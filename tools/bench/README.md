@@ -371,3 +371,41 @@ python3 tools/bench/run_serve_concurrency.py \
 Use `--kv-capacity auto` when the fixed corpus needs more shared KV than the default 262,144-token
 pool. A point is intentionally not resumable: combining fragments from separate server processes
 would not preserve either a steady interval or one continuous makespan.
+
+## Host arena allocation replay (`replay_host_arena.py`)
+
+When the Host context tier is full, an allocation can fail because too few bytes are free or because
+enough bytes are free in total but no single run is large enough. `ninfer_host_context_geometry_failures_total`
+and `ninfer_host_context_shortage_failures_total` count the two on a live server. This tool asks a
+different question offline: **given the exact allocate / release / split sequence of a real run, how many
+refusals would another placement policy have had?** It needs no GPU and no new server run.
+
+It reads a trace printed by a *measurement build*. The shipped server does not print one. To make one, add
+these lines to `HostContextArena` (`src/core/host_context_arena.cpp`) and keep them out of the commit; kind is
+`S` for a state image allocation and `K` for a KV run (the arena does not know the kind, so pass it from the
+two call sites, `HostStatePool::allocate` and `HostKVArena::allocate`):
+
+```cpp
+// allocate(), on success:  std::fprintf(stderr, "[trace] A t=%lld off=%zu bytes=%zu kind=%c\n", now_ms(), offset, rounded, kind);
+// allocate(), on failure:  std::fprintf(stderr, "[trace] F t=%lld bytes=%zu kind=%c free=%zu largest=%zu extents=%zu %s\n",
+//                                        now_ms(), rounded, kind, free_bytes(), largest, free_extents_.size(),
+//                                        free_bytes() >= rounded ? "geometry" : "shortage");
+// release():               std::fprintf(stderr, "[trace] R t=%lld off=%zu bytes=%zu\n", now_ms(), offset, bytes);
+// split():                 std::fprintf(stderr, "[trace] P t=%lld off=%zu left=%zu right=%zu\n", now_ms(), left_offset, left_bytes, right_bytes);
+```
+
+```powershell
+# a hosted run with the trace build (see "Concurrent serving benchmark" and the hosted workload), then:
+python tools/bench/replay_host_arena.py runs/c8-h8/server.err --capacity-mib 8192
+python tools/bench/replay_host_arena.py runs/c8-h8/server.err --capacity-mib 8192 --policies legacy,bestfit,twoended_best
+```
+
+The first thing it prints is a validation: replaying the trace under `legacy` (first-fit by address, what
+the arena does today) must reproduce the real run exactly. If it does not, the script exits without
+reporting any other policy; `--force` overrides that for a trace taken under another placement.
+
+Read the result as a hypothesis, not a measurement. An F event is replayed as a probe (would the policy
+have placed it right now?) and the live set stays the real run's, so the engine's reaction to a successful
+placement, which would change every later event, is not modelled. A live A/B of plain two-ended placement did
+not show what the replay predicted for it. `python -I tools/bench/test_replay_host_arena.py` checks the tool
+itself and runs as `ninfer_host_arena_replay_test`.
