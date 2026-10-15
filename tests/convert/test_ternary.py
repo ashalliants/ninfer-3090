@@ -94,6 +94,22 @@ def test_sign_metadata_must_be_exact_integers_before_any_cast():
     gguf = types.SimpleNamespace(path="x.gguf")
     assert ternary._exact_integers(gguf, "k", [1, -1]).tolist() == [1, -1]
     assert ternary._exact_integers(gguf, "k", [1.0, -1.0]).tolist() == [1, -1]
-    for bad in ([1.5, 1], [float("nan")], [1e30], ["1"], [True]):
+    int64_max = np.iinfo(np.int64).max
+    exact = ternary._exact_integers(gguf, "k", np.array([int64_max], dtype=np.uint64))
+    assert exact.tolist() == [int64_max]
+    assert ternary._exact_integers(gguf, "k", np.array([-1, 1], dtype=np.int8)).tolist() == [-1, 1]
+    for bad in (
+        np.array([2**64 - 1], dtype=np.uint64),
+        np.array([int64_max + 1], dtype=np.uint64),
+        np.array([1, 2**63 + 1], dtype=np.uint64),
+        [1.5, 1],
+        [-1.5],
+        [float("inf")],
+        [float("nan")],
+        [1e30],
+        ["1"],
+        [True],
+        np.array([True, False]),
+    ):
         with pytest.raises(ValueError):
             ternary._exact_integers(gguf, "k", bad)

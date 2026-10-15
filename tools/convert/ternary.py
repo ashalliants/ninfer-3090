@@ -134,6 +134,9 @@ def _exact_integers(gguf: GGUFFile, key: str, raw) -> np.ndarray:
         and np.all(values == np.rint(values))
     ):
         raise ValueError(f"{gguf.path}: {key} must hold exact integers")
+    if values.dtype.kind == "u" and values.size and int(values.max()) > np.iinfo(np.int64).max:
+        # A uint64 above INT64_MAX would wrap negative in the cast (2**64 - 1 becomes -1).
+        raise ValueError(f"{gguf.path}: {key} holds a value beyond the signed 64-bit range")
     return values.astype(np.int64)
 
 
