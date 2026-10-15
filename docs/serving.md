@@ -522,6 +522,22 @@ being evicted, is lost to the store and prefilled on its next turn as without on
 a conversation stored when its image is queued; a write that then fails, or an image the store
 later removes for space or age, clears every mark, so everything is written again.
 
+`--context-store-compress` (off by default) writes new chunks zstd-compressed (level 3), in the
+directory and in the bucket, when that makes the chunk at least 3 % smaller (otherwise it is kept
+raw). The saving is modest because the KV is already 4-bit: measured on stores written with
+`--kv-dtype rk4v4` and 40-60k-token conversations, KV pages shrank by about 5-10 %, recurrent state
+by 13-17 % (17 % with `--gdn-state-fp16`), and the whole store 8 % (3.75 GB raw, 3.45 GB compressed, same workload); it only saves disk
+space and upload time, not VRAM or Host memory, which always hold raw bytes. A compressed chunk is a
+`<hash>.chunk.zst` file (`.chunk.zst` object in the bucket) beside the raw `<hash>.chunk` form, still
+named by the hash of its raw content, so manifests are unchanged and a store can hold both forms.
+Chunks of either form are always read, whatever the flag says, and the store's size limit counts
+what the files take on disk. Compression is a stream in both directions: a chunk is compressed into
+its file, and a stored chunk is decompressed straight into the image being read, with no second copy
+of either form (decompression runs on the same threads that read the chunks, at several hundred MB/s
+each), which is not free: restoring the 3.75 GB store above at start-up took 4.2-4.4 s from
+compressed chunks against 3.3-3.7 s from raw ones (file cache warm, RTX 3090 host), about 0.25 s
+more per GB read. A chunk that does not decode to its hash is a miss like any other damaged chunk.
+
 
 #### Keeping a copy in a bucket
 
@@ -679,7 +695,7 @@ server restarts.
 | `ninfer_request_duration_seconds`, `ninfer_request_queue_seconds` | histograms for settled generation outcomes, including cancellation; exceptional failures have separate counts |
 | `ninfer_context_store_images`, `ninfer_context_store_used_bytes` | gauges: sessions and bytes held by the [context store](#context-store) (zero when it is off) |
 | `ninfer_context_store_writes_total`, `_write_failures_total`, `_dropped_total` | sessions written, writes that failed, sessions not queued because the write queue was full |
-| `ninfer_context_store_bytes_written_total`, `_bytes_reused_total` | new chunk bytes written, and chunk bytes a write found already stored |
+| `ninfer_context_store_bytes_written_total`, `_bytes_stored_total`, `_bytes_reused_total` | new chunk bytes written (raw size), what they took on disk after [compression](#context-store), and chunk bytes a write found already stored |
 | `ninfer_context_store_evicted_total`, `_corrupt_total` | sessions removed for space, age or supersession, and because they could not be read back intact |
 | `ninfer_context_store_restored_sessions`, `_restored_bytes`, `_restore_seconds` | gauges: what start-up restored into the cache, and how long it took |
 | `ninfer_context_store_hydrations_total`, `_hydrated_tokens_total`, `_hydration_failures_total`, `_hydration_seconds_total` | stored sessions read back for a request, the prompt tokens that saved, failures (the request was prefilled, or its admission did not use what was read) and the time requests waited for the reads, failed ones included |
@@ -1800,6 +1816,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--context-store-idle-seconds N` | write a session unused this long, and changed since it was last written, in the background; `0` writes only at shutdown | `30` |
 | `--context-store-restore-seconds N` | time budget for restoring sessions at start-up, and the longest a request waits for its stored session to be read back | `120` |
 | `--context-store-flush-seconds N` | time budget for writing sessions that are not yet stored at shutdown | `60` |
+| `--context-store-compress` | write new chunks zstd-compressed, in the directory and the bucket (about 8 % smaller; chunks of both forms are always read); see [Context store](#context-store). Requires `--context-store` | off |
 | `--context-store-s3-endpoint URL`, `--context-store-s3-bucket NAME` | keep a copy of the store in an S3-compatible bucket (both required together; credentials from `NINFER_S3_ACCESS_KEY_ID` / `NINFER_S3_SECRET_ACCESS_KEY` or the `AWS_` equivalents); see [Keeping a copy in a bucket](#keeping-a-copy-in-a-bucket). Requires `--context-store` | off |
 | `--context-store-s3-prefix P`, `--context-store-s3-region R` | key prefix inside the bucket, and the signing region | none, `us-east-1` |
 | `--no-exit-on-engine-failure` | stay alive (answering 503) when the engine latches unavailable, instead of logging FATAL and exiting with status 3 after 5 s | exit |

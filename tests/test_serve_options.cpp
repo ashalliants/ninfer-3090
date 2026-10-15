@@ -583,6 +583,14 @@ int main() {
                           store.context_store_restore_seconds == 0 &&
                           store.context_store_flush_seconds == 7,
                       "context store options did not reach serving options");
+    failures += check(!no_store.context_store_compress && !store.context_store_compress,
+                      "context store compression was on by default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--context-store", "cache",
+                             "--context-store-compress"})
+                          .context_store_compress,
+                      "--context-store-compress did not reach serving options");
+    failures += check(rejected({"ninfer-serve", "model.ninfer", "--context-store-compress"}),
+                      "--context-store-compress was accepted without --context-store");
     failures += check(rejected({"ninfer-serve", "model.ninfer", "--context-store-max-gib", "4"}),
                       "--context-store-max-gib was accepted without --context-store");
     failures += check(rejected({"ninfer-serve", "model.ninfer", "--context-store-idle-seconds", "5"}),

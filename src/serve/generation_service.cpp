@@ -357,6 +357,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
         std::chrono::seconds(options.context_store_restore_seconds);
     engine_options.context_store.flush_budget =
         std::chrono::seconds(options.context_store_flush_seconds);
+    engine_options.context_store.compress_chunks = options.context_store_compress;
     if (!options.context_store_s3_endpoint.empty()) {
         const auto environment = [](const char* primary, const char* fallback) {
             for (const char* name : {primary, fallback}) {

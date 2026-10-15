@@ -153,7 +153,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--request-log-jsonl FILE] "
            "[--context-store DIR [--context-store-max-gib N] [--context-store-ttl-hours N] "
            "[--context-store-idle-seconds N] [--context-store-restore-seconds N] "
-           "[--context-store-flush-seconds N] "
+           "[--context-store-flush-seconds N] [--context-store-compress] "
            "[--context-store-s3-endpoint URL --context-store-s3-bucket NAME "
            "[--context-store-s3-prefix P] [--context-store-s3-region R]]] "
            "[--no-exit-on-engine-failure] "
@@ -244,7 +244,9 @@ std::string serve_usage_text(const char* argv0) {
            "unused that long in the background (default 30, 0 writes only at shutdown); "
            "--context-store-restore-seconds N bounds start-up restoring and a request's wait for "
            "its stored session (default 120); "
-           "--context-store-flush-seconds N bounds the write at shutdown (default 60)\n"
+           "--context-store-flush-seconds N bounds the write at shutdown (default 60); "
+           "--context-store-compress writes new chunks zstd-compressed (about 8% smaller; "
+           "off by default), on disk and in the bucket; chunks of both kinds are always read\n"
            "       --context-store-s3-endpoint URL and --context-store-s3-bucket NAME keep a copy of "
            "the store in an S3-compatible bucket (off by default): sessions are uploaded in the "
            "background, sessions other engines wrote become visible and are fetched when needed, "
@@ -615,6 +617,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.context_store_flush_seconds = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--context-store-flush-seconds"), "context-store-flush-seconds"));
             context_store_tuning = true;
+        } else if (arg == "--context-store-compress") {
+            options.context_store_compress = true;
+            context_store_tuning           = true;
         } else if (arg == "--context-store-s3-endpoint") {
             options.context_store_s3_endpoint = require_value("--context-store-s3-endpoint");
             context_store_tuning              = true;
