@@ -13,12 +13,15 @@
 
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <csignal>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -92,7 +95,11 @@ int run_router(const char* argv0, const ninfer::serve::ServeOptions& options,
         // One model's service: its Engine loaded and warmed up. A fault is logged, never fatal to
         // the process: the registry unloads a model whose Engine failed and the next request loads
         // it again.
+        // The startup renderer keeps one set of phase and progress state, and the registry builds
+        // models outside its own lock: loads take turns.
+        std::mutex load_mutex;
         const auto make_service = [&](const ninfer::serve::ServeOptions& model_options) {
+            std::lock_guard load_turn(load_mutex);
             auto service = std::make_unique<ninfer::serve::GenerationService>(
                 model_options, startup_log.observer(),
                 [operational_log](const ninfer::ContextStoreWriteEvent& event) {
@@ -148,12 +155,44 @@ int run_router(const char* argv0, const ninfer::serve::ServeOptions& options,
             model_options.port              = options.port;
             model_options.api_key           = options.api_key;
             model_options.model_id_override = model.id;
+            // Every model's Engine keeps its own store: a shared one would be scanned, evicted and
+            // rewritten by several Engines that do not know of each other.
+            std::string store_name = model.id;
+            for (char& c : store_name) {
+                if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_' &&
+                    c != '.') {
+                    c = '_';
+                }
+            }
+            if (store_name.front() == '.') { store_name.insert(store_name.begin(), '_'); }
+            if (!model_options.context_store_path.empty()) {
+                model_options.context_store_path /= store_name;
+            }
+            if (!model_options.context_store_s3_bucket.empty()) {
+                model_options.context_store_s3_prefix += store_name + "/";
+            }
             definitions.push_back(
                 ninfer::serve::ModelDefinition{.id              = model.id,
                                                .aliases         = model.aliases,
                                                .options         = std::move(model_options),
                                                .arguments       = model.arguments,
                                                .load_on_startup = model.load_on_startup});
+        }
+        // Each model's server only checks the request log against its own artifact; the log is
+        // shared, so check it against all of them before any model opens it.
+        const auto same_file = [](const std::filesystem::path& a, const std::filesystem::path& b) {
+            std::error_code error;
+            return std::filesystem::weakly_canonical(a, error) ==
+                   std::filesystem::weakly_canonical(b, error);
+        };
+        for (const ninfer::serve::ModelDefinition& owner : definitions) {
+            if (owner.options.request_log_jsonl.empty()) { continue; }
+            for (const ninfer::serve::ModelDefinition& other : definitions) {
+                if (same_file(owner.options.request_log_jsonl, other.options.artifact_path)) {
+                    throw std::invalid_argument("--request-log-jsonl names the artifact of model '" +
+                                                other.id + "'");
+                }
+            }
         }
         const auto ports = std::make_shared<ninfer::serve::RoutedPorts>();
         ninfer::serve::ModelRegistry registry(

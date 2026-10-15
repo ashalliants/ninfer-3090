@@ -201,7 +201,8 @@ bool ModelRegistry::make_room_locked(std::unique_lock<std::mutex>& lock, std::si
     }
 }
 
-void ModelRegistry::make_loaded_locked(std::unique_lock<std::mutex>& lock, std::size_t index) {
+void ModelRegistry::make_loaded_locked(std::unique_lock<std::mutex>& lock, std::size_t index,
+                                       bool honor_hold) {
     const Clock::time_point deadline = Clock::now() + policy_.room_timeout;
     for (;;) {
         Slot& slot = models_[index];
@@ -213,12 +214,16 @@ void ModelRegistry::make_loaded_locked(std::unique_lock<std::mutex>& lock, std::
             }
             continue;
         }
-        const bool waking = slot.state == ModelState::Sleeping;
         if (!make_room_locked(lock, index, deadline)) {
             throw ModelLoadFailed("no room to load model '" + slot.definition.id +
                                   "': every loaded model is busy");
         }
         if (slot.state != ModelState::Unloaded && slot.state != ModelState::Sleeping) { continue; }
+        // Room-making released the mutex: a hold set meanwhile still applies to a request.
+        if (honor_hold && slot.held) {
+            throw ModelNotLoaded("model '" + slot.definition.id + "' is suspended");
+        }
+        const bool waking = slot.state == ModelState::Sleeping;
         slot.state = ModelState::Loading;
         publish_locked(index);
         ModelService* const sleeping     = waking ? slot.service.get() : nullptr;
@@ -285,7 +290,7 @@ ModelRegistry::Lease ModelRegistry::acquire(std::string_view model, std::optiona
             throw ModelNotLoaded("model '" + slot.definition.id + "' is " +
                                  model_state_name(slot.state) + " and autoload is off");
         }
-        make_loaded_locked(lock, index);
+        make_loaded_locked(lock, index, /*honor_hold=*/true);
     }
     Slot& ready = models_[index];
     ++ready.leases;
@@ -305,6 +310,8 @@ void ModelRegistry::release(std::size_t index, bool use) noexcept {
 
 std::optional<ModelRegistry::Lease> ModelRegistry::observe(std::string_view model) {
     std::lock_guard lock(mutex_);
+    // No selector and nothing loaded to default to: nothing to observe (an unknown id still throws).
+    if (model.empty() && !find_locked(model)) { return std::nullopt; }
     const std::size_t index = require_locked(model);
     Slot& slot              = models_[index];
     if (slot.state != ModelState::Loaded && slot.state != ModelState::Sleeping) {
@@ -318,7 +325,7 @@ void ModelRegistry::load(std::string_view model) {
     std::unique_lock lock(mutex_);
     const std::size_t index = require_locked(model);
     models_[index].held     = false;
-    make_loaded_locked(lock, index);
+    make_loaded_locked(lock, index, /*honor_hold=*/false);
 }
 
 void ModelRegistry::unload(std::string_view model) {

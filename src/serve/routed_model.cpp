@@ -40,14 +40,18 @@ RoutedModelService::RoutedModelService(std::string id, std::unique_ptr<Generatio
     server_->attach(*service_);
     // listen() runs the model's periodic statistics beside the accept loop that is already live.
     listener_ = std::thread([this] {
+        bool listened = false;
         try {
-            (void)server_->listen();
+            listened = server_->listen();
         } catch (...) {}
+        // listen() returns when stop() is called too; only an unrequested end is a failure.
+        if (!listened && !stopping_.load()) { listener_failed_ = true; }
     });
     ports_->set(id_, port_);
 }
 
 RoutedModelService::~RoutedModelService() {
+    stopping_ = true;
     ports_->erase(id_);
     if (server_) { server_->stop(); }
     if (listener_.joinable()) { listener_.join(); }

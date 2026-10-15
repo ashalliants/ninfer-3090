@@ -214,7 +214,7 @@ private:
     [[nodiscard]] std::optional<std::size_t> find_locked(std::string_view model) const;
     [[nodiscard]] std::size_t require_locked(std::string_view model) const;
     // Brings `index` to Loaded, releasing the lock while the service loads or wakes.
-    void make_loaded_locked(std::unique_lock<std::mutex>& lock, std::size_t index);
+    void make_loaded_locked(std::unique_lock<std::mutex>& lock, std::size_t index, bool honor_hold);
     // Frees one loaded slot other than `keep`, waiting for one to become idle; false on timeout.
     bool make_room_locked(std::unique_lock<std::mutex>& lock, std::size_t keep,
                           std::chrono::steady_clock::time_point deadline);

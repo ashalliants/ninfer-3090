@@ -13,6 +13,7 @@
 
 #include <spdlog/logger.h>
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -53,7 +54,11 @@ public:
 
     void suspend() override { (void)service_->suspend(true); }
     void resume() override { (void)service_->resume(); }
-    [[nodiscard]] bool failed() const override { return service_->has_failed(); }
+    // A dead accept loop counts as a failure: the registry unloads the model and the next request
+    // loads it afresh, instead of relaying to a port nobody serves.
+    [[nodiscard]] bool failed() const override {
+        return service_->has_failed() || listener_failed_.load();
+    }
 
     [[nodiscard]] int port() const noexcept { return port_; }
 
@@ -64,6 +69,8 @@ private:
     std::unique_ptr<HttpServer> server_;
     std::shared_ptr<RoutedPorts> ports_;
     std::thread listener_;
+    std::atomic<bool> stopping_{false};
+    std::atomic<bool> listener_failed_{false};
     int port_ = 0;
 };
 

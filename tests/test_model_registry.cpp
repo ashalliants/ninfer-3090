@@ -255,6 +255,17 @@ void a_hold_outlives_the_first_load() {
     expect(state_of(registry, "a") == ModelState::Loaded, "an explicit load clears the hold");
 }
 
+void observing_with_nothing_loaded() {
+    Journal journal;
+    ModelRegistry registry({model("a"), model("b")}, RegistryPolicy{}, factory(journal), true);
+    expect(!registry.observe("").has_value(), "no selector and nothing loaded observes nothing");
+    bool unknown = false;
+    try {
+        (void)registry.observe("nope");
+    } catch (const ModelUnknown&) { unknown = true; }
+    expect(unknown, "an unknown explicit id is still refused");
+}
+
 void single_model_mode() {
     Journal journal;
     ModelRegistry registry({model("only")}, RegistryPolicy{}, factory(journal), false);
@@ -335,6 +346,7 @@ int main() {
         failed_model_reloads();
         acquire_does_not_route_to_a_failed_engine();
         a_hold_outlives_the_first_load();
+        observing_with_nothing_loaded();
         single_model_mode();
         catalog();
     } catch (const std::exception& error) {

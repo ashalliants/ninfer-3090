@@ -100,6 +100,8 @@ std::string requested_model(const httplib::Request& req, std::optional<Json>& bo
                     body = std::move(parsed);
                     return name;
                 }
+                // The selector may be in the query; the body is still the one to rewrite.
+                body = std::move(parsed);
             }
         } catch (const EmptySelector&) {
             throw;
@@ -113,6 +115,24 @@ std::string requested_model(const httplib::Request& req, std::optional<Json>& bo
         return name;
     }
     return {};
+}
+
+// The target without its `model` query parameter: the router consumed it, and the model's own
+// endpoints reject query keys they do not know.
+std::string without_model_param(const std::string& target) {
+    const auto question = target.find('?');
+    if (question == std::string::npos) { return target; }
+    std::string kept;
+    std::size_t start = question + 1;
+    while (start <= target.size()) {
+        std::size_t end = target.find('&', start);
+        if (end == std::string::npos) { end = target.size(); }
+        const std::string piece = target.substr(start, end - start);
+        const std::string key   = httplib::decode_query_component(piece.substr(0, piece.find('=')));
+        if (!piece.empty() && key != "model") { kept += (kept.empty() ? "" : "&") + piece; }
+        start = end + 1;
+    }
+    return target.substr(0, question) + (kept.empty() ? "" : "?" + kept);
 }
 
 bool hop_by_hop(const std::string& name) {
@@ -472,11 +492,17 @@ void RouterServer::route(const httplib::Request& req, httplib::Response& res) {
     ModelRegistry::Lease lease = registry_.acquire(name);
     std::string payload        = req.body;
     // The model knows itself by its id, not by an alias the client used.
-    if (body && (*body)["model"].get<std::string>() != lease.model()) {
-        (*body)["model"] = lease.model();
-        payload          = body->dump();
+    // A selector given in the query is carried into the body, which the models require.
+    if (body) {
+        const auto found = body->find("model");
+        const bool named = found != body->end() && found->is_string();
+        if ((named && found->get<std::string>() != lease.model()) || (!named && !name.empty())) {
+            (*body)["model"] = lease.model();
+            payload          = body->dump();
+        }
     }
-    relay(req, res, std::move(lease), req.method, req.target, std::move(payload));
+    relay(req, res, std::move(lease), req.method, without_model_param(req.target),
+          std::move(payload));
 }
 
 void RouterServer::route_status(const httplib::Request& req, httplib::Response& res) {
@@ -489,7 +515,7 @@ void RouterServer::route_status(const httplib::Request& req, httplib::Response& 
         }
         return;
     }
-    relay(req, res, std::move(*lease), req.method, req.target, {});
+    relay(req, res, std::move(*lease), req.method, without_model_param(req.target), {});
 }
 
 void RouterServer::relay(const httplib::Request& req, httplib::Response& res,

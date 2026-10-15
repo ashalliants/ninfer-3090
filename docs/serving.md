@@ -649,7 +649,9 @@ path, `alias` a comma-separated list, `load-on-startup` a boolean, every other k
 without its leading dashes). A section named after a model found in `--models-dir` needs no path.
 The command line wins over a preset where they repeat an option. Comments sit on lines of their own
 (`;` or `#` first). The router's own options (`models-max`, `models-autoload`, `sleep-idle-seconds`,
-`unload-idle-seconds`) are command-line only: a preset that sets one is rejected at startup.
+`unload-idle-seconds`) are command-line only: a preset that sets one is rejected at startup. With
+`--context-store DIR` each model keeps its store in `DIR/<model id>` (and under `<prefix><model id>/`
+in S3), and `--request-log-jsonl` may not name any model's artifact.
 
 `--models-max N` (default 1, 0 for no limit) bounds how many models are loaded at once. To make room
 the least recently used model without a request in flight **sleeps** when it was started with
