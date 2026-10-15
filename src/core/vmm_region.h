@@ -60,7 +60,7 @@ public:
 
 private:
     void reset() noexcept;
-    void release_pieces() noexcept;
+    CUresult release_pieces() noexcept;
 
     CUdeviceptr base_     = 0;
     std::size_t bytes_    = 0;

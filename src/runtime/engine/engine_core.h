@@ -358,7 +358,9 @@ public:
         if constexpr (kInstanceSuspendable) {
             {
                 std::lock_guard queue_lock(queue_mutex_);
-                bool busy = !pending_.empty() || materializing_.has_value() ||
+                // outstanding_ counts a request from the moment submit() reserves it, so one
+                // still preparing its prompt (not yet in pending_) also keeps the engine busy.
+                bool busy = outstanding_ != 0 || !pending_.empty() || materializing_.has_value() ||
                             !paused_.empty() || context_owner_ != nullptr ||
                             !sibling_waits_.empty() || admission_decision_.has_value() ||
                             instance_.program->has_context_transaction();

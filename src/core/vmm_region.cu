@@ -7,6 +7,8 @@
 
 #include "core/cuda_vmm.h"
 
+#include <cuda_runtime.h>
+
 #include <algorithm>
 #include <stdexcept>
 #include <string>
@@ -39,6 +41,27 @@ void map_piece(CUdeviceptr va, std::size_t bytes, CUmemGenericAllocationHandle h
         vmm::check(result, "cuMemSetAccess");
     }
 }
+
+// Makes `device` the calling thread's current device for its lifetime. Releasing a region's pieces
+// must not depend on whichever rank the caller happened to leave bound.
+class DeviceScope {
+public:
+    explicit DeviceScope(int device) noexcept {
+        if (cudaGetDevice(&previous_) == cudaSuccess && previous_ != device &&
+            cudaSetDevice(device) == cudaSuccess) {
+            switched_ = true;
+        }
+    }
+    ~DeviceScope() {
+        if (switched_) { (void)cudaSetDevice(previous_); }
+    }
+    DeviceScope(const DeviceScope&)            = delete;
+    DeviceScope& operator=(const DeviceScope&) = delete;
+
+private:
+    int previous_  = 0;
+    bool switched_ = false;
+};
 
 } // namespace
 
@@ -99,6 +122,7 @@ VmmRegion& VmmRegion::operator=(VmmRegion&& other) noexcept {
 
 void VmmRegion::reset() noexcept {
     if (base_ == 0) { return; }
+    const DeviceScope bound(options_.device);
     release_pieces();
     (void)cuMemAddressFree(base_, reserved_);
     base_ = 0;
@@ -108,25 +132,42 @@ DeviceSpan VmmRegion::span() const noexcept {
     return DeviceSpan{reinterpret_cast<void*>(base_), bytes_};
 }
 
-void VmmRegion::release_pieces() noexcept {
+// Releases every piece it can and returns the first driver error. A piece whose unmap failed keeps
+// its handle (still mapped), so the region stays backed and a retry releases only what is left.
+CUresult VmmRegion::release_pieces() noexcept {
+    const DeviceScope bound(options_.device);
+    CUresult first = CUDA_SUCCESS;
     std::size_t offset = 0;
-    for (const CUmemGenericAllocationHandle handle : handles_) {
+    for (CUmemGenericAllocationHandle& handle : handles_) {
         const std::size_t size = std::min(piece_, reserved_ - offset);
-        (void)cuMemUnmap(base_ + offset, size);
-        (void)cuMemRelease(handle);
+        const std::size_t at   = offset;
         offset += size;
+        if (handle == 0) { continue; }
+        const CUresult unmapped = cuMemUnmap(base_ + at, size);
+        if (unmapped != CUDA_SUCCESS) {
+            if (first == CUDA_SUCCESS) { first = unmapped; }
+            continue;
+        }
+        const CUresult released = cuMemRelease(handle);
+        if (released != CUDA_SUCCESS && first == CUDA_SUCCESS) { first = released; }
+        handle = 0;
     }
-    handles_.clear();
-    backed_ = false;
+    if (first == CUDA_SUCCESS) {
+        handles_.clear();
+        backed_ = false;
+    }
+    return first;
 }
 
 void VmmRegion::release_backing() {
     if (!backed_) { return; }
-    release_pieces();
+    vmm::check(release_pieces(), "cuMemUnmap/cuMemRelease");
 }
 
 void VmmRegion::restore_backing() {
     if (backed_) { return; }
+    // A release that failed part way leaves mapped pieces behind; free them before starting over.
+    vmm::check(release_pieces(), "cuMemUnmap/cuMemRelease");
     handles_.clear();
     try {
         std::size_t offset = 0;
@@ -152,7 +193,7 @@ void VmmRegion::restore_backing() {
             offset += size;
         }
     } catch (...) {
-        release_pieces();
+        (void)release_pieces();
         throw;
     }
     backed_ = true;
