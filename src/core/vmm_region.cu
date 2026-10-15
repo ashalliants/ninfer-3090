@@ -103,7 +103,7 @@ VmmRegion::VmmRegion(VmmRegion&& other) noexcept
     : base_(std::exchange(other.base_, 0)), bytes_(std::exchange(other.bytes_, 0)),
       reserved_(std::exchange(other.reserved_, 0)), piece_(std::exchange(other.piece_, 0)),
       options_(std::move(other.options_)), access_(std::move(other.access_)),
-      handles_(std::move(other.handles_)), backed_(std::exchange(other.backed_, false)) {}
+      pieces_(std::move(other.pieces_)), backed_(std::exchange(other.backed_, false)) {}
 
 VmmRegion& VmmRegion::operator=(VmmRegion&& other) noexcept {
     if (this != &other) {
@@ -114,7 +114,7 @@ VmmRegion& VmmRegion::operator=(VmmRegion&& other) noexcept {
         piece_    = std::exchange(other.piece_, 0);
         options_  = std::move(other.options_);
         access_   = std::move(other.access_);
-        handles_  = std::move(other.handles_);
+        pieces_   = std::move(other.pieces_);
         backed_   = std::exchange(other.backed_, false);
     }
     return *this;
@@ -132,64 +132,69 @@ DeviceSpan VmmRegion::span() const noexcept {
     return DeviceSpan{reinterpret_cast<void*>(base_), bytes_};
 }
 
-// Releases every piece it can and returns the first driver error. A piece whose unmap failed keeps
-// its handle (still mapped), so the region stays backed and a retry releases only what is left.
+// Releases every piece it can and returns the first driver error. Each piece moves mapped ->
+// unmapped -> released independently, so after a failure the next call only repeats what is left.
 CUresult VmmRegion::release_pieces() noexcept {
     const DeviceScope bound(options_.device);
-    CUresult first = CUDA_SUCCESS;
+    CUresult first     = CUDA_SUCCESS;
     std::size_t offset = 0;
-    for (CUmemGenericAllocationHandle& handle : handles_) {
+    for (Piece& piece : pieces_) {
         const std::size_t size = std::min(piece_, reserved_ - offset);
         const std::size_t at   = offset;
         offset += size;
-        if (handle == 0) { continue; }
-        const CUresult unmapped = cuMemUnmap(base_ + at, size);
-        if (unmapped != CUDA_SUCCESS) {
-            if (first == CUDA_SUCCESS) { first = unmapped; }
-            continue;
+        if (piece.mapped) {
+            const CUresult unmapped = cuMemUnmap(base_ + at, size);
+            if (unmapped != CUDA_SUCCESS) {
+                if (first == CUDA_SUCCESS) { first = unmapped; }
+                continue; // still mapped: its handle must stay alive
+            }
+            piece.mapped = false;
         }
-        const CUresult released = cuMemRelease(handle);
-        if (released != CUDA_SUCCESS && first == CUDA_SUCCESS) { first = released; }
-        handle = 0;
+        if (piece.handle != 0) {
+            const CUresult released = cuMemRelease(piece.handle);
+            if (released != CUDA_SUCCESS) {
+                if (first == CUDA_SUCCESS) { first = released; }
+                continue;
+            }
+            piece.handle = 0;
+        }
     }
-    if (first == CUDA_SUCCESS) {
-        handles_.clear();
-        backed_ = false;
-    }
+    backed_ = false;
     return first;
 }
 
 void VmmRegion::release_backing() {
-    if (!backed_) { return; }
+    const bool holds = std::any_of(pieces_.begin(), pieces_.end(), [](const Piece& piece) {
+        return piece.mapped || piece.handle != 0;
+    });
+    if (!holds) { return; }
     vmm::check(release_pieces(), "cuMemUnmap/cuMemRelease");
 }
 
 void VmmRegion::restore_backing() {
     if (backed_) { return; }
-    // A release that failed part way leaves mapped pieces behind; free them before starting over.
-    vmm::check(release_pieces(), "cuMemUnmap/cuMemRelease");
-    handles_.clear();
+    const DeviceScope bound(options_.device);
+    if (pieces_.empty()) { pieces_.resize((reserved_ + piece_ - 1) / piece_); }
     try {
         std::size_t offset = 0;
-        while (offset < reserved_) {
+        for (Piece& piece : pieces_) {
             const std::size_t size = std::min(piece_, reserved_ - offset);
-            CUmemGenericAllocationHandle handle{};
-            const CUmemAllocationProp prop = vmm::device_prop(options_.device);
-            const CUresult created         = cuMemCreate(&handle, size, &prop, 0);
-            if (created != CUDA_SUCCESS) {
-                if (vmm::grow_refused(created)) {
-                    throw std::runtime_error(
-                        "the device has no free memory to restore a suspended region");
+            if (!piece.mapped) {
+                if (piece.handle == 0) {
+                    const CUmemAllocationProp prop = vmm::device_prop(options_.device);
+                    const CUresult created         = cuMemCreate(&piece.handle, size, &prop, 0);
+                    if (created != CUDA_SUCCESS) {
+                        piece.handle = 0;
+                        if (vmm::grow_refused(created)) {
+                            throw std::runtime_error(
+                                "the device has no free memory to restore a suspended region");
+                        }
+                        vmm::check(created, "cuMemCreate");
+                    }
                 }
-                vmm::check(created, "cuMemCreate");
+                map_piece(base_ + offset, size, piece.handle, access_);
+                piece.mapped = true;
             }
-            try {
-                map_piece(base_ + offset, size, handle, access_);
-            } catch (...) {
-                (void)cuMemRelease(handle);
-                throw;
-            }
-            handles_.push_back(handle);
             offset += size;
         }
     } catch (...) {

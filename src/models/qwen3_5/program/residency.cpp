@@ -144,7 +144,19 @@ DeviceSnapshot::Stats ProgramImpl::suspend_device_state(DeviceSnapshot& snapshot
     }
     const std::vector<DeviceSnapshot::Range> ranges = live_persistent_ranges();
     const DeviceSnapshot::Stats stats               = snapshot.capture(device, ranges);
-    release_device_state_backing();
+    try {
+        release_device_state_backing();
+    } catch (...) {
+        // Some regions may be released already: map them again and copy the state back, so the
+        // Program is whole before the failure is reported.
+        try {
+            (void)resume_device_state(snapshot);
+        } catch (...) {
+            throw ResidencyRollbackError(
+                "model suspend failed part way and the device state could not be restored");
+        }
+        throw;
+    }
     return stats;
 }
 

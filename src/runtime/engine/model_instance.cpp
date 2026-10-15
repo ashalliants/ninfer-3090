@@ -380,6 +380,7 @@ ResidencyTransition ModelInstance::suspend(DeviceContext& device, DeviceSnapshot
     const DeviceSnapshot::Stats state_stats = program->suspend_device_state(state);
     out.state_bytes                         = state_stats.bytes;
     out.state_seconds                       = state_stats.seconds;
+    bool weights_release_started            = false;
     try {
         if (weights != nullptr) {
             const auto ranges                        = weight_ranges(model->device_weight_arenas());
@@ -387,11 +388,28 @@ ResidencyTransition ModelInstance::suspend(DeviceContext& device, DeviceSnapshot
             out.weight_bytes                         = weight_stats.bytes;
             out.weight_seconds                       = weight_stats.seconds;
         }
+        weights_release_started = true;
         model->release_device_weights();
     } catch (...) {
-        // Put the Program back: its memory is free again and its state is in `state`.
-        if (weights != nullptr) { weights->clear(); }
-        (void)program->resume_device_state(state);
+        // Put the instance back whole: weights first if their release began (some may be gone),
+        // then the Program, whose memory is free again and whose state is in `state`.
+        try {
+            if (weights_release_started) {
+                model->restore_device_weight_backing(device);
+                if (weights != nullptr && !weights->empty()) {
+                    (void)weights->restore(device);
+                } else {
+                    (void)model->reload_device_weights(device);
+                }
+            }
+            if (weights != nullptr) { weights->clear(); }
+            (void)program->resume_device_state(state);
+        } catch (...) {
+            // The weights snapshot may be gone; resume reloads them from the artifact.
+            if (weights != nullptr) { weights->clear(); }
+            throw ResidencyRollbackError(
+                "model suspend failed part way and the model could not be restored");
+        }
         throw;
     }
     out.seconds = seconds_between(start, Clock::now());

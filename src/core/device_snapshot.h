@@ -9,9 +9,18 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace ninfer {
+
+// A suspend failed part way and the memory it had already released could not be put back. The
+// model is left suspended, its contents still held in the snapshots, so a resume can retry the
+// restore; it must not be treated as resident.
+class ResidencyRollbackError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 // Device bytes copied out to host memory and back to the same addresses: what a suspended model
 // keeps of its device state while the physical memory behind it is released.

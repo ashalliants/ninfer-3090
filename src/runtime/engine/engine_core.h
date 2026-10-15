@@ -381,6 +381,12 @@ public:
             try {
                 last_suspend_ = instance_.suspend(device_, *state_snapshot_,
                                                   weight_snapshot_ ? &*weight_snapshot_ : nullptr);
+            } catch (const ResidencyRollbackError& error) {
+                // Released memory could not be put back: stay suspended (state is held in the
+                // snapshots) so the next request or an explicit resume retries the restore.
+                last_residency_error_ = error.what();
+                publish_residency();
+                throw;
             } catch (...) {
                 suspended_.store(false, std::memory_order_release);
                 queue_cv_.notify_all();

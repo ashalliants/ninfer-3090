@@ -50,7 +50,9 @@ public:
     [[nodiscard]] explicit operator bool() const noexcept { return base_ != 0; }
 
     // Unmaps and frees every physical piece. The caller has drained all work that addresses the
-    // region. Idempotent.
+    // region. Idempotent. If the driver refuses part of it, it throws after releasing everything it
+    // could; the region is then not backed, restore_backing() maps what is missing, and a repeated
+    // release only retries the pieces still held.
     void release_backing();
 
     // Maps fresh physical pieces at the same addresses; their contents are undefined. When the
@@ -68,8 +70,14 @@ private:
     std::size_t piece_    = 0;
     Options options_{};
     std::vector<int> access_; // owner first, then peers
-    std::vector<CUmemGenericAllocationHandle> handles_;
-    bool backed_ = false;
+    // One entry per piece. A piece can be created but unmapped (its release failed part way), so
+    // mapping and handle ownership are tracked separately and a retry repeats only what is left.
+    struct Piece {
+        CUmemGenericAllocationHandle handle = 0; // 0: no physical allocation held
+        bool mapped                         = false;
+    };
+    std::vector<Piece> pieces_;
+    bool backed_ = false; // every piece is mapped
 };
 
 } // namespace ninfer
