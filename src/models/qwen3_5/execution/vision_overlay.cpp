@@ -123,6 +123,7 @@ std::uint32_t VisionResidencyBroker::kv_loan_minimum_pages(std::size_t bytes) co
     const std::size_t granularity = kv_arena_->granularity();
     std::size_t page_bytes        = 0;
     for (std::size_t index = 0; index < kv_pages_->plane_count(); ++index) {
+        if (!kv_loan_plane(*kv_pages_, index)) { continue; }  // same predicate as the loan itself
         const auto stride = static_cast<std::size_t>(kv_pages_->plane(index).nb[3]);
         if (stride == 0 || granularity % stride != 0 || granularity / stride > kMaxLoanUnitPages) {
             continue;

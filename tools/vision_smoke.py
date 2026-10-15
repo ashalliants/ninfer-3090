@@ -78,17 +78,19 @@ def main():
     failures = []
     model_id = None
 
-    def pick_size():
+    def pick_size(source):
         if not args.random_sizes:
             return args.width, args.height
-        return rng.randrange(56, args.width + 1), rng.randrange(56, args.height + 1)
+        return source.randrange(56, args.width + 1), source.randrange(56, args.height + 1)
 
     def ask(images, tag, results, key):
         content = [{"type": "text", "text": "Briefly: what is the text written in the top-left corner of each image?"}]
+        # A shared image takes pixels and size from its own seed, so every request sees identical bytes.
+        sources = [random.Random(1000 + i) if args.shared_images else rng for i in range(images)]
         content += [{"type": "image_url",
-                     "image_url": {"url": make_image(random.Random(1000 + i) if args.shared_images else rng,
+                     "image_url": {"url": make_image(sources[i],
                                                      f"s-{i}" if args.shared_images else f"{tag}-{i}",
-                                                     *pick_size())}}
+                                                     *pick_size(sources[i]))}}
                     for i in range(images)]
         body = {"model": model_id, "messages": [{"role": "user", "content": content}], "max_tokens": args.max_tokens,
                 "temperature": 0, "reasoning_effort": args.effort}
