@@ -15,8 +15,9 @@ confirmation point. Everything before that is local.
 ## 1. Pick the version
 
 1. `git fetch origin --tags`, then find the latest tag (`git tag --sort=-creatordate | head`) and read
-   `git log <latest>..origin/master --oneline` plus `gh pr list -R ashalliants/ninfer-3090 --state merged
-   --search "merged:>=<last release date>"` to see what is shipping.
+   `gh pr list -R ashalliants/ninfer-3090 --state merged --search "merged:>=<last release date>"` to see
+   what is shipping. Do not use `git log <latest>..origin/master`: after an upstream merge it lists
+   hundreds of unrelated upstream commits.
 2. Suggest a version and say why in one line. Tags are `vX.Y.Z-rtx3090`; `VERSION` holds the full tag
    without the `v` (`0.14.3-rtx3090`).
    - Patch bump: only fixes, docs, internal changes.
@@ -40,9 +41,13 @@ launcher variables and renamed every `/metrics` series, and none of it was in a 
 tag against `origin/master` mechanically, and put everything found in a "Breaking changes" section
 right after the opening sentence, with the replacement for each item:
 
-- **Serve and CLI flags:** `git diff <tag> origin/master -- apps src/serve | grep -E '^[-+].*arg == "--'`
-  (minus lines are removed flags; also check changed defaults in `docs/serving.md`). A removed flag makes
-  `ninfer-serve` exit with `unknown argument`, so say so.
+- **Serve and CLI flags:** the parsers spell options several ways (`arg == "--x"`, `option == "--x"`,
+  table entries), so do not grep for one spelling. Compare every `"--flag"` string literal in the parser
+  files at the tag and at `origin/master`: `git grep -hoE '"--[a-z][a-z0-9-]*"' <ref> -- apps/serve apps/cli
+  src/serve/serve_options.cpp | sort -u`, run once per ref, then `diff` the two lists. Only in the old list
+  is a removed or renamed flag; only in the new one is an added flag. Literals in error and help text add
+  noise, so confirm each hit in the parser before listing it. Also check changed defaults in
+  `docs/serving.md`. A removed flag makes `ninfer-serve` exit with `unknown argument`, so say so.
 - **Launcher variables:** for each `NINFER_*` the diff of `scripts/run.sh` and `scripts/run.bat` removes,
   `grep -c` it in the new scripts. Reflowed comment lines show up as false removals, and some
   variables survive (`NINFER_HOST_CACHE_*` did); never list one as removed without checking.
