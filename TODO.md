@@ -4797,6 +4797,7 @@ Kept because the reasoning is what stops the same investigation being repeated.
 | #52 | `SmallTMaximumSplits` | section 2c proposed extending the bump to nvfp4 and k8v4; measured, it made them 2.3-3.1% slower, and removing it from fp8 too gained 0.4-1.2%. The host was right and the device policy was wrong |
 | #53 | where the MoE's bandwidth goes | the expert gather runs at 40-45% of achievable while contiguous weight kernels on the same step reach 78-82% |
 | #50, #51 | the decode roofline | both terms were wrong: the ceiling is measured at 854 GB/s not 936, and the numerator is the read set not the resident set. Gave the MoE its first denominator |
+| — | adaptive draft count (`--adaptive-mtp`) at C4 | **not built, measured.** One width per round for all lanes, and a 16-column round costs 2.4x at 3-4 lanes, so a controller can only widen when every lane wants it. Mixed load: MTP K=3 341 tok/s is best, K=7 256; only code edits want wider (+11% MTP K=7). Same at 8k cached context. Numbers in `docs/performance.md`. Open: the live 2-GPU box, K varying inside a request |
 | — | `--vision-residency overlay` + DFlash2 | **was never blocked** — it runs on this one 3090 and always could have. See below |
 
 ### `--vision-residency overlay` + DFlash2 — verified working, 2026-09-08

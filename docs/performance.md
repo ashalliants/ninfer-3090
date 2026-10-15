@@ -548,6 +548,54 @@ best mean on this card; the sweep behind it is in
 [Choosing a speculative backend by concurrency](#choosing-a-speculative-backend-by-concurrency-rtx-3090-qwen38-27b).
 DFlash2's `--lm-head-draft` is within noise of unset at every count and can be left off.
 
+### Per-round draft count at concurrency 4: measured, not built (RTX 3090, Qwen3.8-27B)
+
+The question was whether a controller that picks each round's draft count from measured draft
+survival (upstream's `--adaptive-mtp`) would beat a fixed count under mixed traffic. At C4 it would
+not, by much. RTX 3090, greedy, 512 tokens, two prompts of each type, decode tok/s from the request
+log (C x 1000 / mean TPOT), one run per cell, so differences under about 5% are noise.
+
+Four lanes of four different content types at once (two rounds of the set), 8,192 context:
+
+| backend | K=2 | K=3 | K=4 | K=5 | K=7 | K=10 |
+|---|---:|---:|---:|---:|---:|---:|
+| MTP | 294 | **341** | 268 | 276 | 256 | |
+| DFlash2 | | 308 | | 285 | 286 | 157 |
+
+Four lanes of one type each (so each cell is that type's own best case):
+
+| content | MTP K=3 | MTP K=7 | DFlash2 K=3 | DFlash2 K=7 | DFlash2 K=15 |
+|---|---:|---:|---:|---:|---:|
+| edit code (copies the prompt) | 410 | 469 | 395 | **502** | 408 |
+| write new code | **367** | 317 | 342 | 355 | 188 |
+| explain a concept | **302** | 212 | 281 | 222 | 104 |
+| short story | **229** | 150 | 201 | 157 | 65 |
+
+The same shape holds with an 8.4k-token shared source-file prefix and every prompt primed into the
+prefix cache (100% checkpoint hits, so the four lanes start together), MTP only: mixed K=2/3/5/7 =
+286/**335**/294/296; edit code 401/424/445 at K=3/5/7, and K=3 best for new code (356 against 303 at
+K=7), explanation (282 against 208) and story (256 against 161).
+
+What this says:
+
+- **K=3 is right for everything but code edits, at any context length tried.** Wider K stops paying
+  at C4 even for copy-heavy output, where one stream preferred K=15 (381 against 272 at K=7, DFlash2).
+- **A round verifies one width for every lane**, and a 16-column round costs 2.4x a neural one at
+  three or four lanes (table below), so one lane's wide round is paid for by all of them. A
+  controller can only widen when every lane wants it. That is worth about +11% (MTP K=7) to +27%
+  (DFlash2 K=7) on four copy-heavy lanes and about 1-3% on the mixed load above, where K=3 is
+  already the best fixed count.
+- **MTP K=3 beats DFlash2 K=3 by 11% on the mixed load** (341 against 308), and DFlash2 does not
+  start at C4 with four 8k contexts on this card (a 5.5 GiB runtime reservation that does not
+  shrink with context). At 23k tokens of context even MTP keeps only two of four lanes running on
+  24 GB (`paused 2` in the log).
+- Not measured: the live two-GPU box (a larger fixed cost per round may favour a wider K there),
+  and K changing inside one request.
+
+Not built for these reasons. The n-gram copy rounds below are the content-triggered version of the
+same idea and already cover one and two lanes; they are DFlash2-only (`--ngram-draft-tokens`
+refuses MTP). A former MTP-only context lookup added nothing, see the draft count section above.
+
 ### N-gram copy drafting (RTX 3090, Qwen3.8-27B)
 
 `--ngram-draft-tokens 15` beside DFlash2 K=7 (draft head, `rk4v4`). A copy round verifies 16
