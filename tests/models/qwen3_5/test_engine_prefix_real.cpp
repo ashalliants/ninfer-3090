@@ -146,6 +146,8 @@ int exercise_artifact_frontend(const ninfer::Engine& engine) {
     constexpr Golden kGoldens[] = {
         {"qwen3.6", 16, 18},
         {"qwen3.8", 58, 18},
+        // Ternary Bonsai 2 27B is a Qwen3.8-27B: the same tokenizer and chat template.
+        {"bonsai2", 58, 18},
     };
     const std::string model          = engine.load_summary().model_name;
     const std::uint32_t thinking     = engine.count_tokens(chinese_chat(true));
