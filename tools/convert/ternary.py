@@ -7,9 +7,10 @@ and `ssm_a = -exp(A_log)`. This module restores the grouped value-head order and
 norm and A_log values, and exposes the rotated projections as encoded T2 rows whose Uses carry
 the sign vector of their input width, so the recipe stores them without rounding. The token table
 is stored the same way, inverse-rotated; the runtime restores each gathered row with the
-hidden-width signs. MTP, Vision, the frontend resources and the DFlash2 adapter come from the
-companions given to `--model` and `--source dflash2`, which share the geometry; `--source mtp`
-replaces the checkpoint's MTP head.
+hidden-width signs. Vision and the frontend resources come from the
+checkpoint given to `--model`, which shares the geometry, except that the published artifact's MTP
+head and DFlash2 adapter are the Bonsai-trained ones: `--source mtp` and `--source dflash2` are both
+required to reproduce it.
 """
 
 from __future__ import annotations
@@ -117,6 +118,25 @@ def expected_tensors() -> dict[str, tuple[tuple[int, ...], str]]:
     return out
 
 
+def _exact_integers(gguf: GGUFFile, key: str, raw) -> np.ndarray:
+    """Metadata values as int64, refusing anything that is not already an exact integer.
+
+    Casting first would turn 1.5 into 1 and pass the +-1 check while `sign_vectors` later rereads
+    the untouched float, so the check has to see the raw values.
+    """
+
+    values = np.asarray(raw)
+    if values.dtype.kind == "b" or values.dtype.kind not in "iuf":
+        raise ValueError(f"{gguf.path}: {key} must be a list of integers")
+    if values.dtype.kind == "f" and not (
+        np.all(np.isfinite(values))
+        and np.all(np.abs(values) < 2.0**53)
+        and np.all(values == np.rint(values))
+    ):
+        raise ValueError(f"{gguf.path}: {key} must hold exact integers")
+    return values.astype(np.int64)
+
+
 def validate(gguf: GGUFFile) -> None:
     """Refuse any GGUF that is not the registered ternary Bonsai 2 27B layout."""
 
@@ -126,11 +146,16 @@ def validate(gguf: GGUFFile) -> None:
                 f"{gguf.path}: {key} = {gguf.kv.get(key)!r}, expected {expected!r}"
             )
     widths = tuple(
-        int(width) for width in gguf.kv.get("prism.hadamard.sign_widths", ())
+        int(width)
+        for width in _exact_integers(
+            gguf, "prism.hadamard.sign_widths", gguf.kv.get("prism.hadamard.sign_widths", ())
+        )
     )
     if widths != SIGN_WIDTHS:
         raise ValueError(f"{gguf.path}: sign widths {widths}, expected {SIGN_WIDTHS}")
-    values = np.asarray(gguf.kv.get("prism.hadamard.sign_values", ()), dtype=np.int64)
+    values = _exact_integers(
+        gguf, "prism.hadamard.sign_values", gguf.kv.get("prism.hadamard.sign_values", ())
+    )
     if values.size != sum(SIGN_WIDTHS) or not np.all(np.abs(values) == 1):
         raise ValueError(
             f"{gguf.path}: sign values must be {sum(SIGN_WIDTHS)} entries of +-1"
@@ -167,7 +192,9 @@ def validate(gguf: GGUFFile) -> None:
 def sign_vectors(gguf: GGUFFile) -> dict[int, torch.Tensor]:
     """The +-1 sign vector of every rotated input width."""
 
-    values = np.asarray(gguf.kv["prism.hadamard.sign_values"], dtype=np.float32)
+    values = _exact_integers(
+        gguf, "prism.hadamard.sign_values", gguf.kv["prism.hadamard.sign_values"]
+    ).astype(np.float32)
     out, offset = {}, 0
     for width in SIGN_WIDTHS:
         out[width] = torch.from_numpy(

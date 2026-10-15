@@ -82,8 +82,27 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& config, const std::string& pr
 // A stage owns its layers whole: norms, the attention or GDN projections, and the FFN or experts all
 // live on the stage's device, next to the KV cache and recurrent state that layer reads and writes.
 // That is what lets the stage run its layers with the same kernels as a single GPU.
+//
+// A Hadamard rotation's sign vector is one device weight shared by every layer that rotates that
+// width, and it is not part of `layer_weights`, so it would stay on rank 0 while a later stage's
+// kernels read it. Giving each stage its own copy needs the binder to materialize one object on
+// several ranks, which it does not do (it refuses an object placed on two ranks). Until it does, a
+// rotated layer on a nonzero stage fails here, at plan time, rather than reading another device's
+// memory. Single-device and rank-0 stages are untouched.
 void place_layer(Bindings& b, const BlockWeights& block, std::size_t rank) {
-    for (const WeightId id : layer_weights(block)) { b.place(id, rank); }
+    for (const WeightId id : layer_weights(block)) {
+        if (rank != 0) {
+            for (const auto& use : b.at(id).uses) {
+                if (use.hadamard_signs) {
+                    throw artifact::ArtifactError(
+                        b.at(id).reference.name +
+                        ": Hadamard-rotated weights cannot run on a pipeline stage past rank 0 yet "
+                        "(the shared sign vectors live on rank 0); load this model on one device");
+                }
+            }
+        }
+        b.place(id, rank);
+    }
 }
 
 } // namespace

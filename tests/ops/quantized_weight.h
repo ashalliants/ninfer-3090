@@ -594,9 +594,10 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
             }
         }
     }
+    // Sized from the format's own group (T2 has 128 lanes, the others 32 or 64).
+    std::vector<std::int8_t> codes(static_cast<std::size_t>(spec.group_size));
     const std::int32_t partial_group_lanes = k % spec.group_size;
     if (partial_group_lanes != 0) {
-        std::int8_t codes[64]{};
         const std::int32_t group = logical_groups - 1;
         for (std::int32_t row = 0; row < n; ++row) {
             const std::size_t group_index = static_cast<std::size_t>(row) * kg + group;
@@ -609,9 +610,9 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
                 codes[lane] =
                     static_cast<std::int8_t>(detail::unpack_lowbit_code(nibble, high, spec, lane));
             }
-            std::fill(codes + partial_group_lanes, codes + spec.group_size,
+            std::fill(codes.begin() + partial_group_lanes, codes.end(),
                       static_cast<std::int8_t>(0));
-            detail::pack_lowbit_group(codes, spec, nibble, high);
+            detail::pack_lowbit_group(codes.data(), spec, nibble, high);
         }
     }
     constexpr std::uint16_t kUnitScales[]  = {0x3800u, 0x3a00u, 0x3c00u, 0x3d00u};
@@ -649,12 +650,11 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
                                        ? nullptr
                                        : packed.payload.data() + packed.high_plane_offset +
                                            i * high_bytes_per_group;
-            std::int8_t codes[64]{};
             for (std::int32_t lane = 0; lane < spec.group_size; ++lane) {
                 const int code = detail::unpack_lowbit_code(nibble, high, spec, lane);
                 codes[lane]    = static_cast<std::int8_t>(code == spec.qmin ? spec.qmax : -code);
             }
-            detail::pack_lowbit_group(codes, spec, nibble, high);
+            detail::pack_lowbit_group(codes.data(), spec, nibble, high);
             scale = static_cast<std::uint16_t>(scale | 0x8000u);
         }
         detail::store_u16_le(packed.payload,
@@ -864,8 +864,8 @@ inline PackedWeight pack_row_split_lowbit(const std::vector<float>& source, std:
     out.scale_plane_bytes = static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(kg) * 2ULL;
     out.payload.assign(static_cast<std::size_t>(out.scale_plane_offset + out.scale_plane_bytes), 0);
 
-    std::int8_t codes[64];
-    float vals[64];
+    std::vector<std::int8_t> codes(static_cast<std::size_t>(spec.group_size));
+    std::vector<float> vals(static_cast<std::size_t>(spec.group_size));
     for (std::int32_t row = 0; row < n; ++row) {
         for (std::int32_t g = 0; g < kg; ++g) {
             float maxabs = 0.0f;
@@ -887,7 +887,7 @@ inline PackedWeight pack_row_split_lowbit(const std::vector<float>& source, std:
             }
 
             const std::size_t group_index = static_cast<std::size_t>(row) * kg + g;
-            detail::pack_lowbit_group(codes, spec, out.payload.data() + group_index * nib,
+            detail::pack_lowbit_group(codes.data(), spec, out.payload.data() + group_index * nib,
                                       high_bpr == 0 ? nullptr
                                                     : out.payload.data() + out.high_plane_offset +
                                                           group_index * high_bpr);

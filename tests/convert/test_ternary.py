@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import types
+
 import numpy as np
+import pytest
 import torch
 
 from tools.artifact.codecs.row_split import decode_row_split_codes, encode_row_split
@@ -85,3 +88,12 @@ def test_sign_auxiliary_is_a_bf16_vector():
     assert value.format == "bf16" and value.shape == (1024,)
     words = np.frombuffer(value.data, dtype="<u2")
     assert words[0] == 0x3F80 and words[1] == 0xBF80
+
+
+def test_sign_metadata_must_be_exact_integers_before_any_cast():
+    gguf = types.SimpleNamespace(path="x.gguf")
+    assert ternary._exact_integers(gguf, "k", [1, -1]).tolist() == [1, -1]
+    assert ternary._exact_integers(gguf, "k", [1.0, -1.0]).tolist() == [1, -1]
+    for bad in ([1.5, 1], [float("nan")], [1e30], ["1"], [True]):
+        with pytest.raises(ValueError):
+            ternary._exact_integers(gguf, "k", bad)

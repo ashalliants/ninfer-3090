@@ -237,7 +237,9 @@ can share it:
   primal hidden is read again (the DFlash2 candidate selector).
 
 A rotated Use anywhere else, including MoE experts, is refused at load time. A token embedding
-stored rotated is converted back to the primal basis by the converter.
+stored rotated is not converted by the converter: it stays T2, inverse-rotated, and the runtime
+gathers each row and restores it to the primal basis with the hidden-width signs that the output head
+carries.
 
 ## Prefill, decode and MTP
 

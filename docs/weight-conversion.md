@@ -65,7 +65,7 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_6_35b_a3b` | Q4 experts, Q5/Q6 expert down, Q8 shared/projection weights | None |
 | `qwen3_6_27b_nvfp4` | Imported NVFP4, selected BF16 projections, Q8 vocabulary weights | `quantized` |
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
-| `bonsai2_27b_ternary` | Imported ternary T2 text tower with Hadamard-rotated Uses, Q8 primal embedding | `ternary` (GGUF) |
+| `bonsai2_27b_ternary` | Imported ternary T2 text tower with Hadamard-rotated Uses; the embedding is T2 too, stored inverse-rotated and restored to the primal basis by the runtime on gather | `ternary` (GGUF) |
 
 These names select conversion choices. Runtime execution is selected from the architecture,
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;
@@ -103,16 +103,22 @@ matrices are Hadamard-rotated in the checkpoint, so each projection's Uses carry
 rotates the matching activations. The token table has no Use of its own: the runtime restores each
 gathered row to the primal basis with the hidden-width signs that the output head carries. The
 recipe also undoes llama.cpp's exporter conventions: GDN value heads return from the tiled to the
-grouped order, norms from `1 + w` to `w`, and `ssm_a` to `A_log`. MTP, Vision, the frontend
-resources and DFlash2 come from the vanilla Qwen3.8-27B checkpoint and adapter, which share the
-geometry. A `--proposal` head gathered from the rotated output head inherits its rotation.
+grouped order, norms from `1 + w` to `w`, and `ssm_a` to `A_log`. Vision and the frontend
+resources come from the vanilla Qwen3.8-27B checkpoint, which shares the geometry. The published
+artifact's MTP head and DFlash2 adapter are the ones trained against Bonsai 2 itself
+(`ProCreations/Ternary-Bonsai-2-27B-MTP` and `-DFlash2`), so both `--source mtp=` and
+`--source dflash2=` are required to reproduce it: without `--source mtp`, MTP falls back to the
+vanilla checkpoint's head, and a vanilla DFlash2 adapter is not the one the artifact carries. The
+exact revisions are in the model card's `artifact-manifest.json`.
+A `--proposal` head gathered from the rotated output head inherits its rotation.
 
 ```bash
 python3 -m tools.convert \
   --model /path/to/Qwen3.8-27B \
   --recipe bonsai2_27b_ternary \
   --source ternary=/path/to/Ternary-Bonsai-2-27B-PQ2_0.gguf \
-  --source dflash2=/path/to/Qwen3.8-27B-DFlash2 \
+  --source mtp=/path/to/Ternary-Bonsai-2-27B-MTP/model_mtp.safetensors \
+  --source dflash2=/path/to/Ternary-Bonsai-2-27B-DFlash2 \
   --components text,vision,mtp,dflash2 \
   --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja \
   --proposal \
