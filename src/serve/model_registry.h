@@ -121,6 +121,12 @@ struct ModelEvent {
     std::string error;
 };
 
+// Rejects model definitions whose Engines would write the same file: the artifact (so its default
+// `.ngram`, `.expert-state` and NVMe scratch names are the model's alone), an explicit
+// --ngram-volume or --expert-state (or the default one of another model), and the shared request log
+// landing on any of them. Throws std::invalid_argument naming the models.
+void check_model_state_paths(const std::vector<ModelDefinition>& models);
+
 class ModelRegistry {
 public:
     // `router` is router mode (several models, GET /models lists them all); single-model mode has

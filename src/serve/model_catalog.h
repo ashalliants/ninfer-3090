@@ -52,4 +52,9 @@ build_catalog(const std::optional<std::filesystem::path>& models_dir,
               const std::optional<PresetFile>& preset,
               const std::vector<std::string>& command_line);
 
+// A directory (or object-key prefix) name for a model id. Every byte outside [A-Za-z0-9_-] becomes
+// %XX, and '%' is one of them, so two ids never share a name. `escape_capitals` also escapes A-Z, for
+// volumes that ignore case.
+[[nodiscard]] std::string store_directory_name(const std::string& id, bool escape_capitals);
+
 } // namespace ninfer::serve

@@ -249,4 +249,22 @@ std::vector<CatalogModel> build_catalog(const std::optional<std::filesystem::pat
     return models;
 }
 
+std::string store_directory_name(const std::string& id, bool escape_capitals) {
+    std::string out;
+    for (const char raw : id) {
+        const unsigned char c = static_cast<unsigned char>(raw);
+        const bool plain = (std::isalnum(c) != 0 && !(escape_capitals && std::isupper(c) != 0)) ||
+                           c == '-' || c == '_';
+        if (plain) {
+            out.push_back(raw);
+        } else {
+            constexpr char kHex[] = "0123456789ABCDEF";
+            out.push_back('%');
+            out.push_back(kHex[c >> 4]);
+            out.push_back(kHex[c & 15]);
+        }
+    }
+    return out;
+}
+
 } // namespace ninfer::serve

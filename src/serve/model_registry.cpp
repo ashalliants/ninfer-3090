@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <exception>
+#include <filesystem>
 #include <stdexcept>
 #include <utility>
 
@@ -29,6 +30,54 @@ const char* model_state_name(ModelState state) noexcept {
         return "unloading";
     }
     return "unloaded";
+}
+
+void check_model_state_paths(const std::vector<ModelDefinition>& models) {
+    struct Entry {
+        std::string what;
+        std::string owner; // "" for the shared request log
+        std::filesystem::path path;
+    };
+    const auto normal = [](const std::filesystem::path& path) {
+        std::error_code error;
+        auto out = std::filesystem::weakly_canonical(path, error);
+        return error ? std::filesystem::absolute(path, error).lexically_normal() : out;
+    };
+    std::vector<Entry> entries;
+    for (const ModelDefinition& model : models) {
+        const std::filesystem::path artifact = normal(model.options.artifact_path);
+        const auto& next                     = model.options.flash_next;
+        entries.push_back({"its artifact", model.id, artifact});
+        entries.push_back({"its n-gram volume", model.id,
+                           next.ngram_volume_path.empty()
+                               ? std::filesystem::path(artifact.string() + ".ngram")
+                               : normal(next.ngram_volume_path)});
+        if (next.save_expert_state) {
+            entries.push_back({"its expert state", model.id,
+                               next.expert_state_path.empty()
+                                   ? std::filesystem::path(artifact.string() + ".expert-state")
+                                   : normal(next.expert_state_path)});
+        }
+    }
+    for (const ModelDefinition& model : models) {
+        if (!model.options.request_log_jsonl.empty()) {
+            entries.push_back({"the request log", "", normal(model.options.request_log_jsonl)});
+            break; // one log, shared by every model (options come from one command line)
+        }
+    }
+    for (std::size_t first = 0; first < entries.size(); ++first) {
+        for (std::size_t second = first + 1; second < entries.size(); ++second) {
+            const Entry& a = entries[first];
+            const Entry& b = entries[second];
+            if (a.owner == b.owner || a.path != b.path) { continue; }
+            const auto who = [](const Entry& e) {
+                return e.what + (e.owner.empty() ? std::string() : " (model '" + e.owner + "')");
+            };
+            throw std::invalid_argument(who(a) + " and " + who(b) + " are the same file: " +
+                                        a.path.string() +
+                                        "; give each model its own (an alias shares one model)");
+        }
+    }
 }
 
 ModelRegistry::ModelRegistry(std::vector<ModelDefinition> models, RegistryPolicy policy,

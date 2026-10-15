@@ -14,6 +14,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -266,6 +267,58 @@ void observing_with_nothing_loaded() {
     expect(unknown, "an unknown explicit id is still refused");
 }
 
+void store_names_never_collide() {
+    const std::vector<std::string> ids{"a/b", "a_b", "a%2Fb", "a.b", "a b", "A", "a", "..", "%",
+                                       "%25", "-", "_", "a:b", "a\\b", "\xC3\xA9", "model-1.5"};
+    for (const bool capitals : {true, false}) {
+        std::set<std::string> seen;
+        for (const std::string& id : ids) {
+            const std::string name = store_directory_name(id, capitals);
+            expect(name.find_first_of("/\\.: ") == std::string::npos, "a store name is one safe segment");
+            expect(seen.insert(name).second, "distinct ids give distinct store names: " + id);
+        }
+    }
+    // Case variants stay distinct on the local form (volumes may ignore case) and, being plain, on
+    // the S3 form.
+    expect(store_directory_name("A", true) != store_directory_name("a", true), "local case variants");
+    expect(store_directory_name("A", false) != store_directory_name("a", false), "S3 case variants");
+    expect(store_directory_name("Qwen", true) == "%51wen", "capitals are escaped locally");
+    expect(store_directory_name("Qwen", false) == "Qwen", "and kept as they are for S3");
+}
+
+ModelDefinition with_artifact(std::string id, std::string artifact) {
+    ModelDefinition out = model(std::move(id));
+    out.options.artifact_path = std::move(artifact);
+    return out;
+}
+
+void shared_state_files_are_refused() {
+    const auto refused = [](const std::vector<ModelDefinition>& models) {
+        try {
+            check_model_state_paths(models);
+        } catch (const std::invalid_argument&) { return true; }
+        return false;
+    };
+    expect(!refused({with_artifact("a", "/m/a.ninfer"), with_artifact("b", "/m/b.ninfer")}),
+           "distinct artifacts have distinct default state files");
+    expect(refused({with_artifact("a", "/m/a.ninfer"), with_artifact("b", "/m/a.ninfer")}),
+           "two models on one artifact would share its default state files");
+    auto a = with_artifact("a", "/m/a.ninfer");
+    auto b = with_artifact("b", "/m/b.ninfer");
+    b.options.flash_next.expert_state_path = "/m/a.ninfer.expert-state";
+    expect(refused({a, b}), "an explicit path equal to another model's default is refused");
+    b.options.flash_next.expert_state_path.clear();
+    b.options.flash_next.ngram_volume_path = "/m/shared.ngram";
+    a.options.flash_next.ngram_volume_path = "/m/shared.ngram";
+    expect(refused({a, b}), "one explicit n-gram volume for two models is refused");
+    a.options.flash_next.ngram_volume_path.clear();
+    b.options.flash_next.ngram_volume_path.clear();
+    a.options.request_log_jsonl = "/m/b.ninfer";
+    expect(refused({a, b}), "the request log may not land on a model's artifact");
+    a.options.request_log_jsonl = "/m/requests.jsonl";
+    expect(!refused({a, b}), "a shared request log of its own is fine");
+}
+
 void single_model_mode() {
     Journal journal;
     ModelRegistry registry({model("only")}, RegistryPolicy{}, factory(journal), false);
@@ -352,6 +405,8 @@ int main() {
         acquire_does_not_route_to_a_failed_engine();
         a_hold_outlives_the_first_load();
         observing_with_nothing_loaded();
+        store_names_never_collide();
+        shared_state_files_are_refused();
         single_model_mode();
         catalog();
     } catch (const std::exception& error) {
