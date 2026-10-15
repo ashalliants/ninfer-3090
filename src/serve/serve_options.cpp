@@ -855,10 +855,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.sleep_idle_seconds != 0 && !options.suspend.enabled) {
         throw std::invalid_argument("--sleep-idle-seconds requires --model-suspend");
     }
-    if (options.suspend.enabled && options.vision_residency == VisionResidency::Overlay) {
-        throw std::invalid_argument(
-            "--model-suspend cannot be combined with --vision-residency overlay");
-    }
     return options;
 }
 

@@ -363,11 +363,6 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     // The pool backs rank 0's arena alone: its window is borrowed by a Vision encode on the primary
     // device, and later ranks get ordinary arenas below. The planner already refuses an evictable
     // placement anywhere but rank 0.
-    if (options.suspendable && backing) {
-        // The pool's window is borrowed by a Vision encode that runs on the primary device, and its
-        // arena cannot be released with the rest of the model.
-        throw ArtifactError("model suspend cannot be combined with an eviction pool");
-    }
     out.arenas_.resize(rank_count);
     if (options.suspendable) { out.regions_.resize(rank_count); }
     for (std::size_t rank = 0; rank < rank_count; ++rank) {
@@ -376,6 +371,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             throw ArtifactError("device backing exceeds size_t");
         }
         if (rank == 0 && backing) {
+            // A suspendable materialization releases the pool's chunks itself (no VmmRegion).
             if (backing->arena().bytes < capacity) {
                 throw ArtifactError("eviction pool arena is smaller than the materialization plan");
             }
@@ -529,6 +525,7 @@ std::vector<std::byte*> MaterializedArtifact::arena_bases() const {
 bool MaterializedArtifact::suspendable() const noexcept { return reader_ != nullptr; }
 
 bool MaterializedArtifact::device_backed() const noexcept {
+    if (pool_ && !pool_->backed()) { return false; }
     for (const VmmRegion& region : regions_) {
         if (region && !region.backed()) { return false; }
     }
@@ -536,7 +533,7 @@ bool MaterializedArtifact::device_backed() const noexcept {
 }
 
 std::uint64_t MaterializedArtifact::device_backing_bytes() const noexcept {
-    std::uint64_t bytes = 0;
+    std::uint64_t bytes = pool_ ? pool_->backing_bytes() : 0;
     for (const VmmRegion& region : regions_) {
         if (region) { bytes += region.reserved_bytes(); }
     }
@@ -547,6 +544,7 @@ void MaterializedArtifact::release_device_backing() {
     if (!suspendable()) {
         throw std::logic_error("this materialization was not made suspendable");
     }
+    if (pool_) { pool_->release_backing(); }
     for (VmmRegion& region : regions_) {
         if (region) { region.release_backing(); }
     }
@@ -567,6 +565,10 @@ void MaterializedArtifact::restore_device_backing(DeviceContext& device) {
         throw std::logic_error("this materialization was not made suspendable");
     }
     try {
+        if (pool_) {
+            const ScopedRank bound(device, 0);
+            pool_->restore_backing();
+        }
         for (std::size_t rank = 0; rank < regions_.size(); ++rank) {
             if (!regions_[rank]) { continue; }
             const ScopedRank bound(device, rank);

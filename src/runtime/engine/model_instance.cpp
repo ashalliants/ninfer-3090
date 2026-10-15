@@ -82,11 +82,6 @@ void validate_engine_options(const EngineOptions& options) {
             }
         }
     }
-    if (options.suspend.enabled && models::load_options(options).overlay_vision()) {
-        throw std::invalid_argument(
-            "model suspend cannot be combined with --vision-residency overlay: the overlay borrows "
-            "weight and KV memory that a suspend releases");
-    }
     if (options.suspend.enabled && options.purpose != EnginePurpose::Generation) {
         throw std::invalid_argument("model suspend applies to Generation only");
     }

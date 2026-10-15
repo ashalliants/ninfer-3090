@@ -91,6 +91,17 @@ public:
     // overlay range. Rejects requests beyond the window capacity and nested transactions.
     [[nodiscard]] Transaction evict(std::size_t bytes, cudaStream_t stream);
 
+    // Model suspend: gives every physical chunk back while the home addresses stay reserved, and
+    // maps fresh ones at the same addresses. Contents are undefined after a restore; the owner
+    // uploads the weights again (the pinned mirror of the tail stays valid, the weights being
+    // unchanged). Both require that no transaction is open and that the device is idle. A failed
+    // restore releases whatever it created and may be retried.
+    void release_backing();
+    void restore_backing();
+    [[nodiscard]] bool backed() const noexcept;
+    // Bytes the physical backing holds on the device while it is mapped.
+    [[nodiscard]] std::size_t backing_bytes() const noexcept;
+
 private:
     struct Impl;
 

@@ -46,7 +46,7 @@ void append_live(std::vector<DeviceSnapshot::Range>& out, std::size_t rank, void
 
 std::uint64_t ProgramImpl::device_state_backing_bytes() const noexcept {
     if (!suspendable.enabled) { return 0; }
-    std::uint64_t bytes = 0;
+    std::uint64_t bytes = kv_arena ? kv_arena->backing_bytes() : 0;
     if (suspendable.persistent) { bytes += suspendable.persistent->reserved_bytes(); }
     if (suspendable.workspace) { bytes += suspendable.workspace->reserved_bytes(); }
     for (const VmmRegion& region : suspendable.persistent_by_rank) {
@@ -87,6 +87,7 @@ std::vector<DeviceSnapshot::Range> ProgramImpl::live_persistent_ranges() const {
 }
 
 void ProgramImpl::release_device_state_backing() {
+    if (kv_arena) { kv_arena->release_backing(); }
     if (suspendable.persistent) { suspendable.persistent->release_backing(); }
     for (VmmRegion& region : suspendable.persistent_by_rank) { region.release_backing(); }
     if (suspendable.workspace) { suspendable.workspace->release_backing(); }
@@ -95,6 +96,10 @@ void ProgramImpl::release_device_state_backing() {
 
 void ProgramImpl::restore_device_state_backing() {
     try {
+        if (kv_arena) {
+            const RankBinding bound(device, 0);
+            kv_arena->restore_backing();
+        }
         if (suspendable.persistent) {
             const RankBinding bound(device, 0);
             suspendable.persistent->restore_backing();

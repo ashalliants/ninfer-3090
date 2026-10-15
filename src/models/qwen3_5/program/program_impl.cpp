@@ -75,8 +75,8 @@ VmmRegion make_region(const DeviceContext& device, std::size_t rank, std::size_t
 }
 
 // A Model materialized suspendable makes the Program's device memory suspendable too: persistent
-// state and workspace on every rank at fixed addresses. Overlay Vision (an eviction pool behind
-// the persistent arena) cannot be combined with it; materialization already refuses that.
+// state and workspace on every rank at fixed addresses. With overlay Vision the persistent arena on
+// rank 0 is the KV pool's own home mapping, which releases and restores its backing itself.
 // Adapted from NInfer-all 0dcb1da9 src/models/qwen3_5/program/program_impl.cpp (Apache-2.0).
 ProgramImpl::SuspendableStorage make_suspendable_storage(const DeviceContext& device,
                                                          const execution::Parameters& parameters,
@@ -84,11 +84,10 @@ ProgramImpl::SuspendableStorage make_suspendable_storage(const DeviceContext& de
                                                          bool kv_pool_backs_persistent) {
     ProgramImpl::SuspendableStorage out;
     if (!parameters.model.weights_suspendable()) { return out; }
-    if (kv_pool_backs_persistent) {
-        throw std::invalid_argument("model suspend cannot be combined with overlay Vision");
-    }
     out.enabled = true;
-    out.persistent.emplace(make_region(device, 0, plan.persistent.bytes));
+    if (!kv_pool_backs_persistent) {
+        out.persistent.emplace(make_region(device, 0, plan.persistent.bytes));
+    }
     for (std::size_t index = 0; index < plan.persistent.extra_rank_bytes.size(); ++index) {
         out.persistent_by_rank.push_back(
             make_region(device, index + 1, plan.persistent.extra_rank_bytes[index]));

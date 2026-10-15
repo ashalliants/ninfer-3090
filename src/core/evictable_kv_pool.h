@@ -112,6 +112,16 @@ public:
     // rollback in lease() must still hand back a fully resident, unpoisoned pool.
     void inject_lease_fault(std::size_t rank, LeaseFault stage) noexcept;
 
+    // Model suspend: gives every physical piece back while the home addresses stay reserved, and
+    // maps fresh ones at the same addresses with undefined contents (the owner copies the live
+    // ranges out first and back after). Both require that no lease is open and that the device is
+    // idle. A failed restore releases whatever it created and may be retried.
+    void release_backing();
+    void restore_backing();
+    [[nodiscard]] bool backed() const noexcept;
+    // Bytes the physical backing holds on the device while it is mapped.
+    [[nodiscard]] std::size_t backing_bytes() const noexcept;
+
 private:
     struct Impl;
 

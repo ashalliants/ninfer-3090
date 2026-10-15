@@ -619,9 +619,9 @@ int main() {
     failures += check(rejected({"ninfer-serve", "model.ninfer", "--model-suspend",
                                 "--suspend-snapshot", "mapped"}),
                       "an unknown --suspend-snapshot value was accepted");
-    failures += check(rejected({"ninfer-serve", "model.ninfer", "--model-suspend", "--vision",
-                                "--vision-residency", "overlay"}),
-                      "--model-suspend was accepted with overlay Vision");
+    failures += check(!rejected({"ninfer-serve", "model.ninfer", "--model-suspend", "--vision",
+                                 "--vision-residency", "overlay"}),
+                      "--model-suspend was refused with overlay Vision");
     // The S3 copy of the context store is off unless both the endpoint and the bucket are given,
     // needs the store, and normalises its key prefix.
     const ServeOptions s3 = parse({"ninfer-serve", "model.ninfer", "--context-store", "dir",

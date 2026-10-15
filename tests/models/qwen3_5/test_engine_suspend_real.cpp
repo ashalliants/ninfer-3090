@@ -10,7 +10,10 @@
 //
 // Every configuration runs the same requests: the plain path, a pinned snapshot, a host copy of the
 // weights, MTP (when the artifact carries it) and a two-stage split (both stages on device 0 unless
-// NINFER_TEST_DEVICE_IDS lists more; Windows accepts only the repeated single id).
+// NINFER_TEST_DEVICE_IDS lists more; Windows accepts only the repeated single id). A last pair of
+// rows runs overlay Vision, whose weight and KV pools release their own chunks, with an image
+// request on either side of a suspend: one context that lends free KV pages to the encode window
+// and one so small that the window borrows the weight tail.
 
 #include "guarded_main.h"
 #include "ninfer/engine.h"
@@ -24,6 +27,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -224,6 +228,89 @@ void run_configuration(const char* artifact, const Configuration& configuration,
     check(engine.residency().resume_count == 2, "two resumes counted");
 }
 
+// Overlay Vision under suspend ------------------------------------------------------------------
+
+ninfer::EngineOptions overlay_options(const char* artifact, bool suspend, std::uint32_t context) {
+    ninfer::EngineOptions options;
+    options.artifact_path    = artifact;
+    options.max_context      = context;
+    options.kv_capacity      = ninfer::KvCapacityPolicy::explicit_capacity(context);
+    options.prefill_chunk    = 1024;
+    options.kv_cache         = ninfer::KvCacheStorage::Int8Group64;
+    options.enable_vision    = true;
+    options.vision_residency = ninfer::VisionResidency::Overlay;
+    options.suspend.enabled  = suspend;
+    return options;
+}
+
+std::vector<std::uint8_t> gradient_ppm(int width, int height) {
+    std::vector<std::uint8_t> ppm;
+    const std::string header =
+        "P6\n" + std::to_string(width) + ' ' + std::to_string(height) + "\n255\n";
+    ppm.insert(ppm.end(), header.begin(), header.end());
+    for (int index = 0; index < width * height; ++index) {
+        ppm.push_back(static_cast<std::uint8_t>(index & 0xff));
+        ppm.push_back(static_cast<std::uint8_t>((index * 3) & 0xff));
+        ppm.push_back(static_cast<std::uint8_t>((index * 7) & 0xff));
+    }
+    return ppm;
+}
+
+ninfer::PromptInput image_prompt(const char* question) {
+    ninfer::MessagePart image;
+    image.kind              = ninfer::MessagePartKind::Media;
+    image.media.kind        = ninfer::MediaKind::Image;
+    image.media.bytes       = gradient_ppm(512, 384);
+    image.media.media_type  = "image/x-portable-pixmap";
+    image.media.source_name = "suspend.ppm";
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(std::move(image));
+    message.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = question, .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.enable_thinking = false;
+    return input;
+}
+
+std::vector<ninfer::TokenId> describe_image(ninfer::Engine& engine) {
+    const ninfer::GenerationResult result =
+        engine.generate(engine.prepare(image_prompt("Describe the picture.")), greedy(32, false));
+    check(result.prompt.has_media && result.timings.vision_seconds > 0.0,
+          "the request carried an image through the encoder");
+    return result.generated_token_ids;
+}
+
+void run_overlay(const char* artifact, std::uint32_t context, const char* label) {
+    std::cout << "running: overlay Vision, " << label << std::endl;
+    std::vector<ninfer::TokenId> expected;
+    {
+        ninfer::Engine engine(overlay_options(artifact, false, context));
+        expected = describe_image(engine);
+    }
+    check(expected.size() == 32, "the overlay reference generated its tokens");
+    ninfer::Engine engine(overlay_options(artifact, true, context));
+    check(describe_image(engine) == expected, std::string(label) + ": suspend-enabled engine matches");
+    const std::size_t free_resident = free_device_bytes({});
+    const ninfer::ResidencyStatus suspended = engine.suspend();
+    const std::size_t free_suspended = free_device_bytes({});
+    check(suspended.state == ninfer::ModelResidency::Suspended, "state is suspended");
+    check(free_suspended > free_resident + suspended.releasable_device_bytes * 9 / 10,
+          "the overlay model's device memory came back");
+    std::cout << "  suspend: released " << (free_suspended - free_resident) / (1 << 20)
+              << " MiB of " << suspended.releasable_device_bytes / (1 << 20) << " MiB in "
+              << suspended.last_suspend->seconds << " s\n";
+    check(describe_image(engine) == expected,
+          std::string(label) + ": identical image answer after an automatic resume");
+    check(engine.residency().resume_count == 1, "a request resumed the model");
+    // A second cycle, to catch a pool that only works the first time.
+    (void)engine.suspend();
+    (void)engine.resume();
+    check(describe_image(engine) == expected,
+          std::string(label) + ": identical image answer after a second suspend and resume");
+}
+
 int run() {
     const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
     if (artifact == nullptr || *artifact == '\0') {
@@ -253,6 +340,14 @@ int run() {
         std::cout << "MTP rows skipped: " << error.what() << '\n';
     }
     if (mtp) { run_configuration(artifact, {.label = "MTP", .mtp = true}, *mtp); }
+    // The artifact may carry no Vision tower; the engine then refuses the overlay and the rows are
+    // skipped rather than failed.
+    try {
+        run_overlay(artifact, 8192, "free KV pages fund the window");
+        run_overlay(artifact, 1024, "the weight tail funds the window");
+    } catch (const std::invalid_argument& error) {
+        std::cout << "overlay Vision rows skipped: " << error.what() << '\n';
+    }
     return failures == 0 ? 0 : 1;
 }
 

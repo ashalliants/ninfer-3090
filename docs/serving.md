@@ -565,9 +565,10 @@ workspace, on every device of a `--devices` split) sits at a fixed address whose
 suspend releases; the CUDA Graphs, block tables and Host caches stay as they are. A resume maps fresh
 memory at the same addresses, restores the weights and copies the retained state back, so
 conversations retained before the suspend reuse their prefixes afterwards exactly as before. It
-needs CUDA virtual memory management on every device, and it is refused with
-`--vision-residency overlay` (the overlay borrows memory that a suspend releases) and for
-Qwen3.8-Flash-Next.
+needs CUDA virtual memory management on every device, and it is refused for
+Qwen3.8-Flash-Next. It works with `--vision-residency overlay`: the overlay's weight arena and KV
+arena release and restore their own chunks like every other region, and the pinned Vision tower stays
+in host memory.
 
 A suspend runs between units and only while the server is idle: nothing queued, admitted, paused or
 running, no context transaction. Otherwise it answers `409 model_busy`; it never cancels work. A
@@ -1772,7 +1773,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--vision-max-merged N` | merged-token budget of one media item, `[64, 16384]`; larger images and video frame pairs are downscaled at preprocessing instead of being rejected, and the overlay window is sized for it | 16384 |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
-| `--model-suspend` | enable [model suspend](#model-suspend): the suspend, resume and residency endpoints. Needs CUDA virtual memory management; refused with `--vision-residency overlay` | off |
+| `--model-suspend` | enable [model suspend](#model-suspend): the suspend, resume and residency endpoints. Needs CUDA virtual memory management | off |
 | `--suspend-snapshot pageable\|pinned` | where the retained state waits in host memory while suspended | `pageable` |
 | `--suspend-weights artifact\|host` | where a resume takes the weights from: the artifact again, or a host copy taken at suspend (weight-sized host memory, faster wake) | `artifact` |
 | `--no-auto-resume` | a request while suspended fails (503) instead of resuming the model | requests resume it |

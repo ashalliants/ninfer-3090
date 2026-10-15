@@ -58,6 +58,8 @@ struct EvictableKVPool::Impl {
     std::vector<std::size_t> sizes;
     std::vector<std::size_t> lent; // granule indices currently mapped at the overlay range
     bool poisoned = false;
+    bool backed   = true; // false between release_backing and restore_backing
+    CUmemAllocationProp prop{};
     // Test seam; see inject_lease_fault.
     LeaseFault fault       = LeaseFault::None;
     std::size_t fault_rank = 0;
@@ -167,6 +169,7 @@ EvictableKVPool::EvictableKVPool(DeviceContext& device, const Config& config)
     prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     prop.location.id   = device.device;
+    impl.prop          = prop;
     NINFER_CU_CHECK(cuMemGetAllocationGranularity(&impl.granularity, &prop,
                                                   CU_MEM_ALLOC_GRANULARITY_MINIMUM));
     if (impl.granularity == 0) {
@@ -215,6 +218,7 @@ EvictableKVPool::~EvictableKVPool() {
         (void)cuMemUnmap(impl.overlay + rank * impl.granularity, impl.granularity);
     }
     for (std::size_t piece = 0; piece < impl.handles.size(); ++piece) {
+        if (!impl.backed) { continue; } // released by a suspend: nothing is mapped or held
         const bool away = std::find(impl.lent.begin(), impl.lent.end(), piece) != impl.lent.end();
         if (!away) { (void)cuMemUnmap(impl.home + impl.offsets[piece], impl.sizes[piece]); }
         (void)cuMemRelease(impl.handles[piece]);
@@ -238,6 +242,57 @@ std::size_t EvictableKVPool::window_capacity_bytes() const noexcept {
 bool EvictableKVPool::lease_open() const noexcept { return !impl_->lent.empty(); }
 
 bool EvictableKVPool::poisoned() const noexcept { return impl_->poisoned; }
+
+bool EvictableKVPool::backed() const noexcept { return impl_->backed; }
+
+std::size_t EvictableKVPool::backing_bytes() const noexcept {
+    std::size_t bytes = 0;
+    for (const std::size_t size : impl_->sizes) { bytes += size; }
+    return bytes;
+}
+
+void EvictableKVPool::release_backing() {
+    Impl& impl = *impl_;
+    if (!impl.backed) { return; }
+    if (!impl.lent.empty()) {
+        throw std::logic_error("evictable KV pool cannot release its backing inside a lease");
+    }
+    CUDA_CHECK(cudaStreamSynchronize(impl.device.stream));
+    CUDA_CHECK(cudaStreamSynchronize(impl.device.transfer_stream));
+    for (std::size_t piece = 0; piece < impl.handles.size(); ++piece) {
+        (void)cuMemUnmap(impl.home + impl.offsets[piece], impl.sizes[piece]);
+        (void)cuMemRelease(impl.handles[piece]);
+        impl.handles[piece] = 0;
+    }
+    impl.backed = false;
+}
+
+void EvictableKVPool::restore_backing() {
+    Impl& impl = *impl_;
+    if (impl.backed) { return; }
+    std::size_t made = 0; // pieces [0, made) are created and mapped
+    try {
+        for (; made < impl.handles.size(); ++made) {
+            NINFER_CU_CHECK(cuMemCreate(&impl.handles[made], impl.sizes[made], &impl.prop, 0));
+            try {
+                impl.map_home(made);
+            } catch (...) {
+                (void)cuMemUnmap(impl.home + impl.offsets[made], impl.sizes[made]);
+                (void)cuMemRelease(impl.handles[made]);
+                impl.handles[made] = 0;
+                throw;
+            }
+        }
+    } catch (...) {
+        for (std::size_t piece = 0; piece < made; ++piece) {
+            (void)cuMemUnmap(impl.home + impl.offsets[piece], impl.sizes[piece]);
+            (void)cuMemRelease(impl.handles[piece]);
+            impl.handles[piece] = 0;
+        }
+        throw;
+    }
+    impl.backed = true;
+}
 
 std::size_t EvictableKVPool::granule_of(std::size_t offset) const {
     if (offset >= impl_->config.arena_bytes) {
