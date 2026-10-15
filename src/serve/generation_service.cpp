@@ -448,8 +448,13 @@ GenerationService::~GenerationService() {
 // never takes the capacity mutex.
 ninfer::ResidencyStatus GenerationService::suspend(std::optional<bool> auto_resume) {
     std::lock_guard admission(request_capacity_->mutex);
-    if (request_capacity_->active != 0 &&
-        engine_->residency().state != ninfer::ModelResidency::Suspended) {
+    // Every suspend is refused while a request is admitted, whatever the residency state: a repeat
+    // of /suspend on a suspended model would otherwise change auto_resume under a request that is
+    // still preparing and then fails it at submit(). With active != 0 resident and suspended both
+    // refuse (409 model_busy); a suspend or resume in flight holds the Engine's execution mutex,
+    // which Engine::suspend waits for. With active == 0 the Engine decides: resident suspends,
+    // suspended only updates auto_resume. The idle sleeper skips an already suspended model itself.
+    if (request_capacity_->active != 0) {
         throw ninfer::RequestError(ninfer::RequestErrorKind::Overloaded,
                                    "model suspend requires an idle server");
     }

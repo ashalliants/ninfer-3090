@@ -196,7 +196,11 @@ DeviceSnapshot::Memory DeviceSnapshot::memory() const noexcept { return impl_->m
 std::size_t DeviceSnapshot::bytes() const noexcept { return impl_->bytes; }
 
 std::size_t DeviceSnapshot::host_capacity_bytes() const noexcept {
-    return impl_->memory == Memory::Pinned ? impl_->pinned->size() : impl_->pageable.size();
+    if (impl_->memory == Memory::Pinned) { return impl_->pinned->size(); }
+    // The pageable block plus the page-locked staging rings the capture keeps until clear().
+    std::size_t bytes = impl_->pageable.size();
+    for (const auto& ring : impl_->staging) { bytes += ring.size() * kSlotBytes; }
+    return bytes;
 }
 
 bool DeviceSnapshot::empty() const noexcept { return impl_->ranges.empty(); }
