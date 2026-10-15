@@ -3053,19 +3053,29 @@ private:
                 // One prefix that cannot be exported (the Program refuses it, or a transient
                 // failure) must not keep the others from being tried: each candidate is isolated,
                 // as in the shutdown flush. One export per scan.
+                std::optional<CheckpointImage> image;
                 try {
                     const auto started = Clock::now();
-                    auto image         = program.export_checkpoints({&handle, 1}, std::nullopt,
-                                                                    store_.binding);
-                    const auto bytes   = image.bytes.size();
+                    image.emplace(program.export_checkpoints({&handle, 1}, std::nullopt,
+                                                             store_.binding));
                     cumulative_stats_.context_store_shared_export_seconds +=
                         std::chrono::duration<double>(Clock::now() - started).count();
-                    if (store_.shared_sink(std::move(image))) {
-                        shared_stored_.emplace_back(handle, bytes);
-                        ++cumulative_stats_.context_store_shared_writes;
-                    }
-                    return;
-                } catch (...) { failed = true; }
+                } catch (...) {
+                    failed = true;
+                    continue;
+                }
+                // The sink ends the scan whatever it answers: a rejection (full queue, shutdown)
+                // or a throw backs off like a failed scan instead of exporting another prefix.
+                const auto bytes = image->bytes.size();
+                bool accepted    = false;
+                try { accepted = store_.shared_sink(std::move(*image)); } catch (...) {}
+                if (accepted) {
+                    shared_stored_.emplace_back(handle, bytes);
+                    ++cumulative_stats_.context_store_shared_writes;
+                } else {
+                    next_shared_scan_ = now + std::chrono::seconds(4);
+                }
+                return;
             }
             // Every candidate failed: back off instead of retrying them each second.
             if (failed) { next_shared_scan_ = now + std::chrono::seconds(4); }
