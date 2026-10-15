@@ -5,6 +5,7 @@
 #include "core/device.h"
 
 #include "ops/launcher/hadamard_transform.h"
+#include "ops/wrapper/byte_ranges.h"
 
 #include <cmath>
 #include <cstdint>
@@ -65,14 +66,9 @@ void silu_mul_hadamard(const Tensor& plane, const Tensor& signs, Tensor& out, cu
     if (!aligned16(plane.data) || !aligned16(signs.data) || !aligned16(out.data)) {
         throw std::invalid_argument("silu_mul_hadamard: plane/signs/out must be 16-byte aligned");
     }
-    const auto* plane_begin = static_cast<const std::uint8_t*>(plane.data);
-    const auto* out_begin   = static_cast<const std::uint8_t*>(out.data);
-    if (out_begin < plane_begin + plane.bytes() && plane_begin < out_begin + out.bytes()) {
-        throw std::invalid_argument("silu_mul_hadamard: out must not overlap the plane");
-    }
-    if (signs.data == plane.data || signs.data == out.data) {
-        throw std::invalid_argument("silu_mul_hadamard: signs must not alias plane or out");
-    }
+    detail::require_disjoint("silu_mul_hadamard", "plane", plane, "out", out);
+    detail::require_disjoint("silu_mul_hadamard", "signs", signs, "out", out);
+    detail::require_disjoint("silu_mul_hadamard", "plane", plane, "signs", signs);
     detail::silu_mul_hadamard_launch(plane, signs, out, stream);
 }
 
@@ -102,12 +98,14 @@ void hadamard_transform(const Tensor& x, const Tensor& signs, bool inverse, Tens
     if (x.data == nullptr || signs.data == nullptr || out.data == nullptr) {
         throw std::invalid_argument("hadamard_transform: x/signs/out data must be non-null");
     }
-    if (signs.data == x.data || signs.data == out.data) {
-        throw std::invalid_argument("hadamard_transform: signs must not alias x or out");
-    }
     if (!aligned16(x.data) || !aligned16(signs.data) || !aligned16(out.data)) {
         throw std::invalid_argument("hadamard_transform: x/signs/out must be 16-byte aligned");
     }
+    // The multi-block kernel loads x and stores out independently, so a partial overlap would let
+    // one block overwrite values another has not loaded: only exact in-place or disjoint is safe.
+    detail::require_in_place_or_disjoint("hadamard_transform", "x", x, "out", out);
+    detail::require_disjoint("hadamard_transform", "signs", signs, "x", x);
+    detail::require_disjoint("hadamard_transform", "signs", signs, "out", out);
     detail::hadamard_transform_launch(x, signs, inverse, out, stream);
 }
 
@@ -135,9 +133,7 @@ std::int32_t require_rotation(const char* op, const Tensor& signs, const Tensor&
         throw std::invalid_argument(std::string(op) +
                                     ": signs/out must be contiguous, non-null and 16-byte aligned");
     }
-    if (signs.data == out.data) {
-        throw std::invalid_argument(std::string(op) + ": signs must not alias out");
-    }
+    detail::require_disjoint(op, "signs", signs, "out", out);
     return width;
 }
 
@@ -158,11 +154,7 @@ void rmsnorm_hadamard(const Tensor& x, const Tensor& weight, float eps, bool uni
         x.numel() == out.numel() && weight.numel() == width && x.data != nullptr &&
         weight.data != nullptr && aligned4(x.data) && aligned4(weight.data) && std::isfinite(eps) &&
         eps > 0.0f) {
-        const auto* x_begin   = static_cast<const std::uint8_t*>(x.data);
-        const auto* out_begin = static_cast<const std::uint8_t*>(out.data);
-        if (out_begin < x_begin + x.bytes() && x_begin < out_begin + out.bytes()) {
-            throw std::invalid_argument("rmsnorm_hadamard: out must not overlap x");
-        }
+        detail::require_disjoint("rmsnorm_hadamard", "x", x, "out", out);
         detail::rmsnorm_hadamard_5120_launch(x, weight, eps, unit_offset, signs, out, stream);
         return;
     }
@@ -187,13 +179,8 @@ void gated_rmsnorm_hadamard(const Tensor& x, const Tensor& weight, const Tensor&
         z.numel() == out.numel() && weight.numel() == d && x.data != nullptr && z.data != nullptr &&
         weight.data != nullptr && aligned4(x.data) && aligned4(z.data) && aligned4(weight.data) &&
         std::isfinite(eps) && eps > 0.0f) {
-        for (const Tensor* input : {&x, &z}) {
-            const auto* in_begin  = static_cast<const std::uint8_t*>(input->data);
-            const auto* out_begin = static_cast<const std::uint8_t*>(out.data);
-            if (out_begin < in_begin + input->bytes() && in_begin < out_begin + out.bytes()) {
-                throw std::invalid_argument("gated_rmsnorm_hadamard: out must not overlap x or z");
-            }
-        }
+        detail::require_disjoint("gated_rmsnorm_hadamard", "x", x, "out", out);
+        detail::require_disjoint("gated_rmsnorm_hadamard", "z", z, "out", out);
         detail::gated_rmsnorm_hadamard_d128_launch(x, weight, z, eps, signs, heads, out, stream);
         return;
     }
@@ -221,16 +208,8 @@ void sigmoid_mul_hadamard(const Tensor& gate, const Tensor& x, const Tensor& sig
         throw std::invalid_argument(
             "sigmoid_mul_hadamard: gate/x must be contiguous, non-null and 16-byte aligned");
     }
-    const auto* gate_begin = static_cast<const std::uint8_t*>(gate.data);
-    const auto* x_begin    = static_cast<const std::uint8_t*>(x.data);
-    const auto* out_begin  = static_cast<const std::uint8_t*>(out.data);
-    if (out_begin < gate_begin + gate.bytes() && gate_begin < out_begin + out.bytes()) {
-        throw std::invalid_argument("sigmoid_mul_hadamard: out must not overlap gate");
-    }
-    if (out.data != x.data && out_begin < x_begin + x.bytes() &&
-        x_begin < out_begin + out.bytes()) {
-        throw std::invalid_argument("sigmoid_mul_hadamard: out must alias x exactly or not at all");
-    }
+    detail::require_disjoint("sigmoid_mul_hadamard", "gate", gate, "out", out);
+    detail::require_in_place_or_disjoint("sigmoid_mul_hadamard", "x", x, "out", out);
     detail::sigmoid_mul_hadamard_launch(gate, x, signs, out, stream);
 }
 
@@ -250,6 +229,7 @@ void embedding_rotated(const Tensor& ids, const Weight& table, const Tensor& sig
         throw std::invalid_argument(
             "embedding_rotated: table must be a row-split t2_g128_fp16 [vocab, K] weight");
     }
+    detail::require_disjoint("embedding_rotated", "ids", ids, "out", out);
     if (ids.ne[0] == 0) { return; }
     detail::embedding_rotated_t2_launch(ids, table, signs, out, stream);
 }

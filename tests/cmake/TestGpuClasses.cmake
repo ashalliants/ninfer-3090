@@ -25,6 +25,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_gdn_replay_records_test
   ninfer_ggml_blocks_decode_test
   ninfer_grammar_test
+  ninfer_hadamard_overlap_test
   ninfer_host_arena_replay_test
   ninfer_host_cache_test
   ninfer_host_timing_test
