@@ -123,7 +123,9 @@ OpenAIPromptCachePolicy parse_openai_prompt_cache_policy(const RequestJson& body
                         field);
         }
     };
-    require_string_hint("prompt_cache_key", 64U);
+    // Same bound the Responses parser applies when it keeps the key as a session name; a client or
+    // gateway that namespaces a key per user easily passes 64 bytes.
+    require_string_hint("prompt_cache_key", ninfer::kMaximumContextCacheSessionKeyBytes);
     require_string_hint("safety_identifier", 128U);
     require_string_hint("user");
 

@@ -991,6 +991,14 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
                                  JsonFormatProtocol::Chat);
     parse_structured_outputs(body, output.generation);
     apply_openai_prompt_cache_policy(output.generation, cache_policy);
+    // Same grant the Responses and Anthropic parsers make: a client that names its conversation
+    // (prompt_cache_key) has told us the prompt will be extended, so keep a resumable point at its
+    // end. The automatic boundary above sits before the last user message, so a tool-calling
+    // exchange (many requests, no new user turn between them) would otherwise resume from the start
+    // of the exchange rather than from the previous request.
+    output.generation.private_cache_boundary_at_prompt_end =
+        body.contains("prompt_cache_key") && body.at("prompt_cache_key").is_string() &&
+        !body.at("prompt_cache_key").get_ref<const std::string&>().empty();
     return output;
 }
 

@@ -246,6 +246,40 @@ int test_ignore_eos_with_constraints() {
     return failures;
 }
 
+// A Chat request that names its conversation gets the same private long anchor at the end of its
+// prompt that Responses (prompt_cache_key) and Anthropic (cache_control) requests get.
+int test_prompt_cache_key_grants_long_anchor() {
+    int failures = 0;
+    failures += check(!parse(base_request()).generation.private_cache_boundary_at_prompt_end,
+                      "a Chat request that names no conversation gets no long anchor");
+
+    Json keyed              = base_request();
+    keyed["prompt_cache_key"] = "pi-session-1";
+    failures += check(parse(keyed).generation.private_cache_boundary_at_prompt_end,
+                      "a Chat prompt_cache_key grants a long anchor at the end of the prompt");
+
+    Json null_key              = base_request();
+    null_key["prompt_cache_key"] = nullptr;
+    failures += check(!parse(null_key).generation.private_cache_boundary_at_prompt_end,
+                      "a null prompt_cache_key names no conversation");
+
+    Json empty_key              = base_request();
+    empty_key["prompt_cache_key"] = "";
+    failures += check(!parse(empty_key).generation.private_cache_boundary_at_prompt_end,
+                      "an empty prompt_cache_key names no conversation");
+
+    // A gateway that namespaces keys per user sends well over 64 bytes; the Responses parser
+    // already accepts up to the session-key limit.
+    Json long_key              = base_request();
+    long_key["prompt_cache_key"] = std::string(ninfer::kMaximumContextCacheSessionKeyBytes, 'k');
+    failures += check(parse(long_key).generation.private_cache_boundary_at_prompt_end,
+                      "a prompt_cache_key up to the session-key limit is accepted");
+    long_key["prompt_cache_key"] = std::string(ninfer::kMaximumContextCacheSessionKeyBytes + 1U, 'k');
+    const ApiError too_long = api_error([&] { (void)parse(long_key); });
+    failures += check(too_long.param == "prompt_cache_key", "a longer prompt_cache_key is rejected");
+    return failures;
+}
+
 int test_prompt_cache_boundaries() {
     using Location = ninfer::PromptCacheMarkerLocation;
     using Evidence = ninfer::SharedCandidateEvidence;
@@ -1519,6 +1553,7 @@ int main() {
     failures += test_standard_field_policy();
     failures += test_ignore_eos_with_constraints();
     failures += test_prompt_cache_boundaries();
+    failures += test_prompt_cache_key_grants_long_anchor();
     failures += test_constrained_decoding_extensions();
     failures += test_tools();
     failures += test_custom_tools();

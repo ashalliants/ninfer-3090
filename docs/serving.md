@@ -1180,8 +1180,11 @@ latest four remain write candidates. Exact reads of already-published prefixes d
 request to repeat a marker.
 
 These fields are optimization hints. A legal boundary that cannot be represented as an exact
-rendered-token frontier is ignored without changing prompt content. `prompt_cache_key` is not an
-Engine session key or prefix identity. Valid TTL/retention values are accepted, but NInfer does not
+rendered-token frontier is ignored without changing prompt content. `prompt_cache_key` is not a
+prefix identity, but on Chat Completions and Responses a non-empty key (at most 256 bytes) tells the
+Engine the conversation will be extended, and it keeps a private long-anchor checkpoint at the end of
+the prompt, so an agent loop with no new user turn between requests resumes from its previous request.
+Valid TTL/retention values are accepted, but NInfer does not
 promise their wall-clock residency; physical retention follows the resource scheduler.
 
 ## OpenAI Responses Core
