@@ -71,8 +71,10 @@ in the skip memo below, costs one hash lookup. For a new id:
 
 1. Read the manifest and `parse_manifest()` it (checksum, structure, `info.id == name`). A bad file
    is skipped and remembered.
-2. For every chunk it names, **hard-link** `PEER/chunks/xx/<hash>.chunk` to our own
-   `chunks/xx/<hash>.chunk`, taking `io_mutex_` so our own GC cannot remove a same-named chunk
+2. For every chunk it names, **hard-link** whichever form the peer holds, `PEER/chunks/xx/<hash>.chunk`
+   or the zstd form `<hash>.chunk.zst` (draft PR #328; the file is linked as it is, never
+   decompressed or copied, and our reads handle either form), to the same name in our own
+   `chunks/xx/`, taking `io_mutex_` so our own GC cannot remove a same-named chunk
    between our existence check and the link. A chunk we already hold is reused. A hard link is
    independent of the source from then on: the peer deleting, evicting or superseding the image does
    not touch our copy, and our deleting ours does not touch theirs. No bytes are copied and the disk
