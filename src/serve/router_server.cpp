@@ -79,8 +79,14 @@ Json event_json(const ModelEvent& event) {
     return out;
 }
 
+// A `model` that is present but empty: an invalid selector, not an omitted one.
+struct EmptySelector : std::invalid_argument {
+    EmptySelector()
+        : std::invalid_argument("\"model\" must not be empty; omit it to use the last model") {}
+};
+
 // The model a request names: a JSON body's "model" on a POST, else a `model` query parameter, else
-// empty (the most recently used loaded model).
+// empty when omitted (the most recently used loaded model). A present but empty one throws.
 std::string requested_model(const httplib::Request& req, std::optional<Json>& body) {
     if (req.method == "POST" && !req.body.empty() &&
         req.get_header_value("Content-Type").find("json") != std::string::npos) {
@@ -90,15 +96,22 @@ std::string requested_model(const httplib::Request& req, std::optional<Json>& bo
                 const auto found = parsed.find("model");
                 if (found != parsed.end() && found->is_string()) {
                     std::string name = found->get<std::string>();
-                    body             = std::move(parsed);
+                    if (name.empty()) { throw EmptySelector(); }
+                    body = std::move(parsed);
                     return name;
                 }
             }
+        } catch (const EmptySelector&) {
+            throw;
         } catch (const std::exception&) {
             // The model answers a malformed body in its own words.
         }
     }
-    if (req.has_param("model")) { return req.get_param_value("model"); }
+    if (req.has_param("model")) {
+        std::string name = req.get_param_value("model");
+        if (name.empty()) { throw EmptySelector(); }
+        return name;
+    }
     return {};
 }
 
@@ -112,6 +125,9 @@ bool hop_by_hop(const std::string& name) {
            lower == "proxy-connection" || lower == "content-encoding" ||
            lower.rfind("access-control-", 0) == 0;
 }
+
+// Chunks one relay may hold ahead of its client (each is at most one upstream read, about 16 KiB).
+constexpr std::size_t kMaxQueuedChunks = 64;
 
 // One relayed response: an upstream request on a thread of its own feeding the bytes the client's
 // connection takes as they come, and the means to close the upstream connection early.
@@ -281,8 +297,14 @@ std::string body_model(const httplib::Request& req) {
         const Json body = req.body.empty() ? Json::object() : Json::parse(req.body);
         if (body.is_object()) {
             const auto found = body.find("model");
-            if (found != body.end() && found->is_string()) { return found->get<std::string>(); }
+            if (found != body.end() && found->is_string()) {
+                std::string name = found->get<std::string>();
+                if (name.empty()) { throw EmptySelector(); }
+                return name;
+            }
         }
+    } catch (const EmptySelector&) {
+        throw;
     } catch (const std::exception&) {}
     throw std::invalid_argument("the request body must be a JSON object with a \"model\" string");
 }
@@ -440,7 +462,13 @@ void RouterServer::handle_resume(const httplib::Request& req, httplib::Response&
 
 void RouterServer::route(const httplib::Request& req, httplib::Response& res) {
     std::optional<Json> body;
-    const std::string name = requested_model(req, body);
+    std::string name;
+    try {
+        name = requested_model(req, body);
+    } catch (const EmptySelector& error) {
+        write_error(req, res, 400, "invalid_request", error.what());
+        return;
+    }
     ModelRegistry::Lease lease = registry_.acquire(name);
     std::string payload        = req.body;
     // The model knows itself by its id, not by an alias the client used.
@@ -509,7 +537,13 @@ void RouterServer::relay(const httplib::Request& req, httplib::Response& res,
         return true;
     };
     upstream.content_receiver = [relayed](const char* data, size_t length, size_t, size_t) {
-        std::lock_guard lock(relayed->mutex);
+        std::unique_lock lock(relayed->mutex);
+        // Backpressure: a client that reads slowly makes the upstream read wait here, so the
+        // router holds a bounded backlog rather than the whole response. Closing the relay (the
+        // client went away) sets done and ends the wait.
+        relayed->changed.wait(lock, [&] {
+            return relayed->done || relayed->chunks.size() < kMaxQueuedChunks;
+        });
         if (relayed->done) { return false; }
         relayed->chunks.emplace_back(data, length);
         relayed->changed.notify_all();
@@ -535,6 +569,7 @@ void RouterServer::relay(const httplib::Request& req, httplib::Response& res,
             std::lock_guard lock(relayed->mutex);
             relayed->done = true;
         }
+        relayed->changed.notify_all();
         relayed->client->stop();
         if (relayed->worker.joinable()) { relayed->worker.join(); }
     };
@@ -574,6 +609,7 @@ void RouterServer::relay(const httplib::Request& req, httplib::Response& res,
                     std::string chunk = std::move(relayed->chunks.front());
                     relayed->chunks.pop_front();
                     lock.unlock();
+                    relayed->changed.notify_all();
                     return sink.write(chunk.data(), chunk.size());
                 }
                 if (relayed->done) {

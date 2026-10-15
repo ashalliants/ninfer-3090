@@ -53,12 +53,27 @@ bool catalog_key(const std::string& key) {
            key == "stop-timeout" || key == "version";
 }
 
-void append_option(std::vector<std::string>& arguments, const std::string& section,
-                   const std::string& key, const std::string& value) {
+// Options the router itself owns. The registry applies them to every model alike, so a preset
+// cannot set them per model (and a model's own option parser never sees them).
+bool router_key(const std::string& key) {
+    return key == "models-dir" || key == "models-preset" || key == "models-max" ||
+           key == "models-autoload" || key == "no-models-autoload" ||
+           key == "sleep-idle-seconds" || key == "unload-idle-seconds";
+}
+
+void check_key(const std::string& section, const std::string& key) {
     if (key.empty() || key.front() == '-') {
         throw std::invalid_argument("preset [" + section + "]: option '" + key +
                                     "' must be written without leading dashes");
     }
+    if (router_key(key)) {
+        throw std::invalid_argument("preset [" + section + "]: '" + key +
+                                    "' is a router option; give it on the command line");
+    }
+}
+
+void append_option(std::vector<std::string>& arguments, const std::string& key,
+                   const std::string& value) {
     const std::string flag = "--" + key;
     const std::string word = lower(value);
     if (word == "true" || word == "on" || word == "yes") {
@@ -157,13 +172,18 @@ std::vector<CatalogModel> build_catalog(const std::optional<std::filesystem::pat
                                         const std::vector<std::string>& command_line) {
     std::vector<CatalogModel> models;
     if (models_dir) { models = discover_models(*models_dir); }
-    std::vector<std::string> global_arguments;
+    // Preset options as written, so a model's section can override the global one by key: a false
+    // boolean emits no flag, so once flattened to arguments it could not undo an inherited true.
+    using Entries = std::vector<std::pair<std::string, std::string>>;
+    Entries global_entries;
+    std::map<std::string, Entries> own_entries;
     if (preset) {
         for (const auto& section : preset->sections) {
             if (section.name != "*") { continue; }
             for (const auto& [key, value] : section.entries) {
                 if (catalog_key(key)) { continue; }
-                append_option(global_arguments, section.name, key, value);
+                check_key(section.name, key);
+                global_entries.emplace_back(key, value);
             }
         }
         for (const auto& section : preset->sections) {
@@ -183,7 +203,8 @@ std::vector<CatalogModel> build_catalog(const std::optional<std::filesystem::pat
                 } else if (key == "load-on-startup") {
                     model->load_on_startup = parse_bool(section.name, key, value);
                 } else if (!catalog_key(key)) {
-                    append_option(model->arguments, section.name, key, value);
+                    check_key(section.name, key);
+                    own_entries[model->id].emplace_back(key, value);
                 }
             }
             if (model->artifact.empty()) {
@@ -206,8 +227,14 @@ std::vector<CatalogModel> build_catalog(const std::optional<std::filesystem::pat
         }
         // Precedence, lowest first: the preset's global section, the model's own section, then the
         // command line. The option parser keeps the last value an option is given.
-        std::vector<std::string> arguments = global_arguments;
-        arguments.insert(arguments.end(), model.arguments.begin(), model.arguments.end());
+        const Entries& own = own_entries[model.id];
+        std::vector<std::string> arguments;
+        for (const auto& [key, value] : global_entries) {
+            const bool overridden = std::any_of(
+                own.begin(), own.end(), [&](const auto& entry) { return entry.first == key; });
+            if (!overridden) { append_option(arguments, key, value); }
+        }
+        for (const auto& [key, value] : own) { append_option(arguments, key, value); }
         arguments.insert(arguments.end(), command_line.begin(), command_line.end());
         model.arguments = std::move(arguments);
     }

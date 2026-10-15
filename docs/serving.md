@@ -630,7 +630,8 @@ the command line applies to each model; a model's section in a preset can change
 [*]
 max-context = 65536
 kv-dtype = rk8v4
-model-suspend = true        ; a boolean key is a flag; false leaves it out
+; a boolean key is a flag; a model's section can turn it off with false
+model-suspend = true
 
 [coder]
 model = /models/qwen3_8_27b.ninfer
@@ -646,7 +647,9 @@ max-context = 8192
 `[*]` holds defaults for every model; any other section is a model (`model` or `artifact` is its
 path, `alias` a comma-separated list, `load-on-startup` a boolean, every other key a serve option
 without its leading dashes). A section named after a model found in `--models-dir` needs no path.
-The command line wins over a preset where they repeat an option.
+The command line wins over a preset where they repeat an option. Comments sit on lines of their own
+(`;` or `#` first). The router's own options (`models-max`, `models-autoload`, `sleep-idle-seconds`,
+`unload-idle-seconds`) are command-line only: a preset that sets one is rejected at startup.
 
 `--models-max N` (default 1, 0 for no limit) bounds how many models are loaded at once. To make room
 the least recently used model without a request in flight **sleeps** when it was started with

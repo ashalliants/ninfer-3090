@@ -226,6 +226,35 @@ void failed_model_reloads() {
            "the next request loads the failed model again");
 }
 
+void acquire_does_not_route_to_a_failed_engine() {
+    Journal journal;
+    RegistryPolicy policy;
+    policy.models_max    = 1;
+    journal.failing["a"] = false;
+    ModelRegistry registry({model("a")}, policy, factory(journal), true);
+    { auto lease = registry.acquire("a"); }
+    journal.failing["a"] = true;
+    // At once, without waiting for the idle thread's pass.
+    { auto lease = registry.acquire("a"); }
+    const auto loads = std::count(journal.calls.begin(), journal.calls.end(), "load a");
+    expect(loads >= 2,"a request that finds a failed Engine gets a fresh one");
+    journal.failing["a"] = false;
+}
+
+void a_hold_outlives_the_first_load() {
+    Journal journal;
+    ModelRegistry registry({model("a")}, RegistryPolicy{}, factory(journal), true);
+    registry.sleep("a", true, false);
+    bool refused = false;
+    try {
+        (void)registry.acquire("a");
+    } catch (const ModelNotLoaded&) { refused = true; }
+    expect(refused && journal.alive["a"] == 0, "a held model that never loaded does not autoload");
+    registry.load("a");
+    { auto lease = registry.acquire("a"); }
+    expect(state_of(registry, "a") == ModelState::Loaded, "an explicit load clears the hold");
+}
+
 void single_model_mode() {
     Journal journal;
     ModelRegistry registry({model("only")}, RegistryPolicy{}, factory(journal), false);
@@ -266,6 +295,15 @@ model-suspend = false
     expect(small.arguments == small_arguments,
            "global, then model, then command line, so the command line wins");
     expect(big.artifact == "/models/big.ninfer", "quoted path");
+    const std::vector<std::string> big_arguments{"--max-context", "8192", "--kv-capacity",
+                                                 "16384"};
+    expect(big.arguments == big_arguments, "a model's false boolean undoes the global true");
+    bool router_key = false;
+    try {
+        (void)build_catalog(std::nullopt,
+                            parse_preset_file("[a]\nmodel=/x.ninfer\nunload-idle-seconds=5\n"), {});
+    } catch (const std::invalid_argument&) { router_key = true; }
+    expect(router_key, "a preset may not set a router option per model");
     bool duplicate = false;
     try {
         (void)build_catalog(
@@ -295,6 +333,8 @@ int main() {
         idle_sleep_and_events();
         observing_is_not_use();
         failed_model_reloads();
+        acquire_does_not_route_to_a_failed_engine();
+        a_hold_outlives_the_first_load();
         single_model_mode();
         catalog();
     } catch (const std::exception& error) {

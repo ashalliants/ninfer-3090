@@ -165,8 +165,14 @@ int run_router(const char* argv0, const ninfer::serve::ServeOptions& options,
                 .unload_idle = std::chrono::seconds(options.unload_idle_seconds)},
             [&](const ninfer::serve::ModelDefinition& definition)
                 -> std::unique_ptr<ninfer::serve::ModelService> {
-                return std::make_unique<ninfer::serve::RoutedModelService>(
-                    definition.id, make_service(definition.options), logger, ports);
+                try {
+                    return std::make_unique<ninfer::serve::RoutedModelService>(
+                        definition.id, make_service(definition.options), logger, ports);
+                } catch (const std::exception& exception) {
+                    logger->error("model '{}' failed to load: {}", definition.id,
+                                  exception.what());
+                    throw;
+                }
             },
             /*router=*/true);
         ninfer::serve::RouterServer router(options, registry, ports, logger);

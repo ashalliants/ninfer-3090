@@ -113,7 +113,9 @@ std::optional<std::string> ModelRegistry::resolve(std::string_view model) const 
 std::size_t ModelRegistry::loaded_count_locked() const {
     return static_cast<std::size_t>(
         std::count_if(models_.begin(), models_.end(), [](const Slot& s) {
-            return s.state == ModelState::Loaded || s.state == ModelState::Loading;
+            // Unloading still owns its device memory until the suspend or teardown finishes.
+            return s.state == ModelState::Loaded || s.state == ModelState::Loading ||
+                   s.state == ModelState::Unloading;
         }));
 }
 
@@ -242,8 +244,10 @@ void ModelRegistry::make_loaded_locked(std::unique_lock<std::mutex>& lock, std::
                 done.last_error = "unknown error";
             }
             publish_locked(index);
+            // The cause (paths, devices) stays in the server log and in last_error, which only an
+            // authenticated GET /models shows; the failing request gets just the fact.
             throw ModelLoadFailed("model '" + definition.id +
-                                  "' failed to load: " + done.last_error);
+                                  "' failed to load (see the server log or GET /models)");
         }
         if (created) { done.service = std::move(created); }
         done.state  = ModelState::Loaded;
@@ -259,8 +263,22 @@ ModelRegistry::Lease ModelRegistry::acquire(std::string_view model, std::optiona
     std::unique_lock lock(mutex_);
     const std::size_t index = require_locked(model);
     Slot& slot              = models_[index];
-    if (slot.state == ModelState::Sleeping && slot.held) {
+    if ((slot.state == ModelState::Sleeping || slot.state == ModelState::Unloaded) && slot.held) {
         throw ModelNotLoaded("model '" + slot.definition.id + "' is suspended");
+    }
+    // A request must not reach an Engine that has latched a failure: unload it once its other
+    // requests are gone, then load it afresh below.
+    const Clock::time_point deadline = Clock::now() + policy_.room_timeout;
+    while (router_ && slot.state == ModelState::Loaded && slot.service->failed()) {
+        if (slot.leases == 0) {
+            slot.failed     = true;
+            slot.last_error = "the model's Engine failed; it loads again on the next request";
+            unload_locked(lock, index);
+            break;
+        }
+        if (changed_.wait_until(lock, deadline) == std::cv_status::timeout) {
+            throw ModelLoadFailed("model '" + slot.definition.id + "' is still failing");
+        }
     }
     if (slot.state != ModelState::Loaded) {
         if (!autoload.value_or(policy_.autoload)) {
