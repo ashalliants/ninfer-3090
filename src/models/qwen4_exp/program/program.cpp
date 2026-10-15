@@ -562,7 +562,9 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, o.device) != cudaSuccess || sms <= 0) {
         throw std::runtime_error("Qwen3.8-Flash-Next: cannot read the device's multiprocessor count");
     }
-    d.work = execution::Forward::workspace_bytes(c, d.chunk, d.pages * kPagedKVPageSize,
+    // A rows round decodes one column per lane, so a --prefill-chunk below the lane count must not
+    // size the workspace below that round.
+    d.work = execution::Forward::workspace_bytes(c, std::max(d.chunk, static_cast<std::int32_t>(d.lanes)), d.pages * kPagedKVPageSize,
                                                  DeviceExecutionView{nullptr, sms}) +
              ops::sampling_workspace_capacity_bytes(d.token_domain, 1, 1);
     if (d.drafts > 0) {
