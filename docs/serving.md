@@ -539,6 +539,49 @@ compressed chunks against 3.3-3.7 s from raw ones (file cache warm, RTX 3090 hos
 more per GB read. A chunk that does not decode to its hash is a miss like any other damaged chunk.
 
 
+#### Two engines on one box
+
+A box with two GPUs serves long conversations fastest as two independent engines, one per GPU (a
+single engine split across both GPUs does not pipeline prefill). A gateway then sends a
+conversation's next turn to whichever engine is free, often the one that did not serve the last
+turn, which would prefill the whole conversation again. `--context-store-peer DIR` lets an engine
+reuse what the other finished, through the local disk and without a bucket:
+
+```
+ninfer-serve model.ninfer --port 8000 --devices 0 --context-store /data/store0 --context-store-peer /data/store1 --context-store-idle-seconds 2
+ninfer-serve model.ninfer --port 8001 --devices 1 --context-store /data/store1 --context-store-peer /data/store0 --context-store-idle-seconds 2
+```
+
+- Every engine has its own `--context-store` directory and is its only writer. A second engine
+  started on a directory already in use refuses to start (`context store directory ... is in use by
+  another process`) instead of corrupting it; the lock is released when the process exits, so a
+  crash leaves nothing stuck. (Before this, two engines on one directory silently deleted each
+  other's files.)
+- `--context-store-peer DIR` (repeatable) names another engine's directory. Every
+  `--context-store-peer-poll-ms` (250) the engine lists the manifests there, and for each session it
+  does not hold it **hard-links** the session's chunk files into its own directory (no bytes are
+  copied, the data is on disk once) and registers it like any stored session. A request that would
+  resume from it finds it through the same lookup as its own sessions (see above), reads and
+  verifies every chunk, and prices the read with the measured read rate. A peer that has not started
+  yet is polled until it appears. Both directories must be on one volume: a link that fails (another
+  volume, or a chunk the peer evicted in the meantime) skips that session, which is only a miss.
+- An imported session is the importer's own from then on: the peer deleting, evicting or replacing
+  its copy does not affect it, and removing it here does not affect the peer. It is not uploaded to
+  the bucket by the importer (the engine that wrote it uploads it). Sessions older than
+  `--context-store-ttl-hours`, or that would not fit in `--context-store-max-gib`, are skipped, and a
+  skipped session is not looked at again until its owner rewrites it.
+- **A session is visible to the other engine only after its owner has written it**, which is
+  `--context-store-idle-seconds` (30 by default) after its last use, or when it is evicted, or at
+  shutdown, and a background write is skipped while any request is waiting. With the default, the
+  next turn of a conversation that arrives within 30 s of the last one cannot be resumed on the other
+  engine; use `--context-store-idle-seconds 1` or `2` on a box with peers. The cost is more writes
+  (only the chunks that changed, since consecutive images of a conversation share almost all of
+  theirs).
+- Failures are extra misses, never wrong output: every chunk is verified when read, a damaged peer
+  file is a miss for the importer and is never modified or removed by it, and a manifest is checked
+  by its own checksum. The `ninfer_context_store_peer_*` series (see [Metrics](#metrics)) count what
+  was imported, the bytes linked, sessions skipped and links that failed.
+
 #### Keeping a copy in a bucket
 
 `--context-store-s3-endpoint URL --context-store-s3-bucket NAME` (off by default, and only with
@@ -696,6 +739,7 @@ server restarts.
 | `ninfer_context_store_images`, `ninfer_context_store_used_bytes` | gauges: sessions and bytes held by the [context store](#context-store) (zero when it is off) |
 | `ninfer_context_store_writes_total`, `_write_failures_total`, `_dropped_total` | sessions written, writes that failed, sessions not queued because the write queue was full |
 | `ninfer_context_store_bytes_written_total`, `_bytes_stored_total`, `_bytes_reused_total` | new chunk bytes written (raw size), what they took on disk after [compression](#context-store), and chunk bytes a write found already stored |
+| `ninfer_context_store_peer_images_total`, `_peer_bytes_linked_total`, `_peer_skipped_total`, `_peer_link_failures_total` | with `--context-store-peer`: sessions imported from peers, chunk bytes hard-linked (shared on disk, not copied), sessions not imported (damaged, expired, over budget, or gone mid-import) and chunks that could not be linked |
 | `ninfer_context_store_evicted_total`, `_corrupt_total` | sessions removed for space, age or supersession, and because they could not be read back intact |
 | `ninfer_context_store_restored_sessions`, `_restored_bytes`, `_restore_seconds` | gauges: what start-up restored into the cache, and how long it took |
 | `ninfer_context_store_hydrations_total`, `_hydrated_tokens_total`, `_hydration_failures_total`, `_hydration_seconds_total` | stored sessions read back for a request, the prompt tokens that saved, failures (the request was prefilled, or its admission did not use what was read) and the time requests waited for the reads, failed ones included |
@@ -1816,6 +1860,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--context-store-idle-seconds N` | write a session unused this long, and changed since it was last written, in the background; `0` writes only at shutdown | `30` |
 | `--context-store-restore-seconds N` | time budget for restoring sessions at start-up, and the longest a request waits for its stored session to be read back | `120` |
 | `--context-store-flush-seconds N` | time budget for writing sessions that are not yet stored at shutdown | `60` |
+| `--context-store-peer DIR` | import the sessions another engine on this box keeps in its store directory, by hard link (repeatable; same volume; each engine needs its own `--context-store`); see [Two engines on one box](#two-engines-on-one-box). Requires `--context-store` | none |
+| `--context-store-peer-poll-ms N` | how often peer directories are looked at (at least 1) | `250` |
 | `--context-store-compress` | write new chunks zstd-compressed, in the directory and the bucket (about 8 % smaller; chunks of both forms are always read); see [Context store](#context-store). Requires `--context-store` | off |
 | `--context-store-s3-endpoint URL`, `--context-store-s3-bucket NAME` | keep a copy of the store in an S3-compatible bucket (both required together; credentials from `NINFER_S3_ACCESS_KEY_ID` / `NINFER_S3_SECRET_ACCESS_KEY` or the `AWS_` equivalents); see [Keeping a copy in a bucket](#keeping-a-copy-in-a-bucket). Requires `--context-store` | off |
 | `--context-store-s3-prefix P`, `--context-store-s3-region R` | key prefix inside the bucket, and the signing region | none, `us-east-1` |

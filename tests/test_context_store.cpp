@@ -174,28 +174,30 @@ void test_restart_recovers_images() {
 
 void test_corruption_is_a_miss_and_removed() {
     TempDirectory directory;
-    ContextStore store(options_for(directory.path()));
     const auto image = concat({pseudo_random(64, 1), pseudo_random(3000, 2)});
-    (void)store.put(describe("c0ffee"), image, std::array{ContextStore::Region{64, 3000}});
-    const auto files = chunk_files(directory.path());
-    check(!files.empty(), "no chunk files were written");
     {
-        std::fstream file(files.front(), std::ios::in | std::ios::out | std::ios::binary);
-        file.seekp(0);
-        char byte = 0;
-        file.read(&byte, 1);
-        file.seekp(0);
-        byte ^= 0x55;
-        file.write(&byte, 1);
-    }
-    check(!store.load("c0ffee").has_value(), "a damaged chunk was served");
-    check(!store.find("c0ffee").has_value(), "a damaged image stayed listed");
-    check(store.stats().corrupt_removed == 1, "a damaged image was not counted");
+        ContextStore store(options_for(directory.path()));
+        (void)store.put(describe("c0ffee"), image, std::array{ContextStore::Region{64, 3000}});
+        const auto files = chunk_files(directory.path());
+        check(!files.empty(), "no chunk files were written");
+        {
+            std::fstream file(files.front(), std::ios::in | std::ios::out | std::ios::binary);
+            file.seekp(0);
+            char byte = 0;
+            file.read(&byte, 1);
+            file.seekp(0);
+            byte ^= 0x55;
+            file.write(&byte, 1);
+        }
+        check(!store.load("c0ffee").has_value(), "a damaged chunk was served");
+        check(!store.find("c0ffee").has_value(), "a damaged image stayed listed");
+        check(store.stats().corrupt_removed == 1, "a damaged image was not counted");
 
-    // A truncated manifest is dropped at start-up and its chunks are swept.
-    (void)store.put(describe("beef"), image, std::array{ContextStore::Region{64, 3000}});
-    const fs::path manifest = directory.path() / "manifests" / "beef.manifest";
-    fs::resize_file(manifest, fs::file_size(manifest) / 2);
+        // A truncated manifest is dropped at start-up and its chunks are swept.
+        (void)store.put(describe("beef"), image, std::array{ContextStore::Region{64, 3000}});
+        const fs::path manifest = directory.path() / "manifests" / "beef.manifest";
+        fs::resize_file(manifest, fs::file_size(manifest) / 2);
+    } // the first store is closed: a directory has one owner
     ContextStore reopened(options_for(directory.path()));
     check(reopened.list().empty() && chunk_files(directory.path()).empty(),
           "a truncated manifest was kept or left chunks behind");
@@ -234,17 +236,19 @@ void test_ttl_and_use_extend_life() {
     std::int64_t now_ms            = 5'000'000;
     options.clock                  = [&] { return now_ms; };
     options.ttl                    = std::chrono::seconds(100);
-    ContextStore store(options);
-    const auto image = concat({pseudo_random(40, 1), pseudo_random(2000, 2)});
-    (void)store.put(describe("aa"), image, std::array{ContextStore::Region{40, 2000}});
-    (void)store.put(describe("bb"), concat({pseudo_random(40, 7), pseudo_random(2000, 8)}),
-                    std::array{ContextStore::Region{40, 2000}});
-    now_ms += 60'000;
-    check(store.load("aa").has_value(), "image should still load inside its lifetime");
-    now_ms += 60'000; // bb is 120 s old and unused; aa was used 60 s ago
-    store.maintain();
-    check(!store.find("bb") && store.find("aa"), "expiry removed the wrong image");
-    check(store.stats().expired == 1, "expiry was not counted");
+    {
+        ContextStore store(options);
+        const auto image = concat({pseudo_random(40, 1), pseudo_random(2000, 2)});
+        (void)store.put(describe("aa"), image, std::array{ContextStore::Region{40, 2000}});
+        (void)store.put(describe("bb"), concat({pseudo_random(40, 7), pseudo_random(2000, 8)}),
+                        std::array{ContextStore::Region{40, 2000}});
+        now_ms += 60'000;
+        check(store.load("aa").has_value(), "image should still load inside its lifetime");
+        now_ms += 60'000; // bb is 120 s old and unused; aa was used 60 s ago
+        store.maintain();
+        check(!store.find("bb") && store.find("aa"), "expiry removed the wrong image");
+        check(store.stats().expired == 1, "expiry was not counted");
+    } // the first store is closed: a directory has one owner
 
     // The use time survives a restart.
     ContextStore reopened(options);
@@ -1067,13 +1071,16 @@ void test_compressed_chunks_survive_restart_and_either_setting() {
     }
     const std::uint64_t on_disk = directory_bytes(directory.path() / "chunks", "");
     // Reopened with compression off: the scan keeps the compressed chunks and reads them.
-    ContextStore reopened(options_for(directory.path()));
-    check(files_with_suffix(directory.path(), ".chunk.zst") > 0,
-          "the scan swept the compressed chunks");
-    check(reopened.stats().used_bytes == on_disk + directory_bytes(directory.path() / "manifests", ".manifest"),
-          "a restart did not count the compressed chunks by their size on disk");
-    const auto loaded = reopened.load("f1f1");
-    check(loaded && *loaded == image, "a compressed image did not load with compression off");
+    {
+        ContextStore reopened(options_for(directory.path()));
+        check(files_with_suffix(directory.path(), ".chunk.zst") > 0,
+              "the scan swept the compressed chunks");
+        check(reopened.stats().used_bytes ==
+                  on_disk + directory_bytes(directory.path() / "manifests", ".manifest"),
+              "a restart did not count the compressed chunks by their size on disk");
+        const auto loaded = reopened.load("f1f1");
+        check(loaded && *loaded == image, "a compressed image did not load with compression off");
+    }
     // A compressed chunk no manifest names is an orphan like a raw one.
     const fs::path stray = directory.path() / "chunks" / "00" / "00000000000000000000000000000000.chunk.zst";
     fs::create_directories(stray.parent_path());
@@ -1204,9 +1211,311 @@ void test_remote_holds_compressed_objects_and_other_forms_interoperate() {
     check(!f.load("0b").has_value(), "a damaged compressed object was served");
 }
 
+ContextStore::Options peer_options(const fs::path& directory, const fs::path& peer) {
+    ContextStore::Options options = options_for(directory);
+    options.peers                 = {peer};
+    options.peer_poll             = std::chrono::hours(1); // tests call sync_peers() themselves
+    return options;
+}
+
+std::vector<std::uint8_t> peer_image(std::uint32_t seed, std::size_t region = 5000) {
+    return concat({pseudo_random(30, seed), pseudo_random(region, seed + 1000), pseudo_random(8, seed)});
+}
+
+void test_owner_lock_refuses_a_second_store_on_one_directory() {
+    TempDirectory directory;
+    {
+        ContextStore first(options_for(directory.path()));
+        bool refused = false;
+        try {
+            ContextStore second(options_for(directory.path()));
+        } catch (const std::runtime_error& failure) {
+            refused = std::string(failure.what()).find("in use") != std::string::npos;
+        }
+        check(refused, "a second store on a directory in use was opened");
+        (void)first.put(describe("0a"), peer_image(1), std::array{ContextStore::Region{30, 5000}});
+    }
+    ContextStore again(options_for(directory.path()));
+    check(again.list().size() == 1, "a store did not open after the first owner closed");
+    TempDirectory other;
+    bool threw = false;
+    try {
+        ContextStore self(peer_options(other.path(), other.path()));
+    } catch (const std::invalid_argument&) { threw = true; }
+    check(threw, "a store was accepted as its own peer");
+}
+
+void test_peer_import_links_chunks_and_survives_the_owner() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    const auto image = peer_image(1);
+    const std::array regions{ContextStore::Region{30, 5000}};
+    ContextStore a(options_for(a_directory.path()));
+    (void)a.put(describe("0a"), image, regions);
+    ContextStore b(peer_options(b_directory.path(), a_directory.path()));
+    check(b.list().empty(), "a store listed images before it looked at its peer");
+    check(b.sync_peers() == 1 && b.sync_peers() == 0, "a peer image was not imported exactly once");
+    const auto listed = b.list();
+    check(listed.size() == 1 && listed[0].local && !listed[0].checkpoints.empty(),
+          "an imported image is not an ordinary local image");
+    const auto loaded = b.load("0a");
+    check(loaded && *loaded == image, "an imported image differs from what the peer stored");
+    const auto stats = b.stats();
+    check(stats.peer_images == 1 && stats.peer_bytes_linked == 5000 && stats.peer_skipped == 0,
+          "peer import statistics are wrong");
+    // The chunk files are one file under two names, not a copy.
+    for (const auto& file : chunk_files(a_directory.path())) {
+        check(fs::hard_link_count(file) == 2, "an imported chunk is a copy, not a hard link");
+    }
+    check(chunk_files(a_directory.path()).size() == chunk_files(b_directory.path()).size(),
+          "the importing store holds other chunks than the peer");
+    // The peer removing its image does not touch the imported one.
+    check(a.erase("0a"), "the peer could not erase its image");
+    check(b.load("0a").value_or(std::vector<std::uint8_t>{}) == image,
+          "an imported image stopped loading when the peer erased it");
+    for (const auto& file : chunk_files(b_directory.path())) {
+        check(fs::hard_link_count(file) == 1, "an erased peer left links behind");
+    }
+    // The importer erasing its image does not touch the peer's.
+    (void)a.put(describe("0b"), peer_image(2), regions);
+    check(b.sync_peers() == 1 && b.erase("0b") && a.load("0b").has_value(),
+          "erasing an imported image damaged the peer's copy");
+}
+
+void test_peer_import_survives_restarts_of_either_store() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    const auto image = peer_image(3);
+    const std::array regions{ContextStore::Region{30, 5000}};
+    {
+        ContextStore a(options_for(a_directory.path()));
+        (void)a.put(describe("0a"), image, regions);
+        {
+            ContextStore b(peer_options(b_directory.path(), a_directory.path()));
+            check(b.sync_peers() == 1, "the image was not imported");
+        }
+        // B's start-up scan keeps what it imported (it has its own manifest copy) and A's files stay.
+        ContextStore b(peer_options(b_directory.path(), a_directory.path()));
+        check(b.list().size() == 1 && b.load("0a").value_or(std::vector<std::uint8_t>{}) == image,
+              "a restart lost an imported image");
+        check(b.sync_peers() == 0, "a restart imported an image it already held");
+        check(a.load("0a").value_or(std::vector<std::uint8_t>{}) == image,
+              "the peer's image changed when the importer restarted");
+    }
+    // The peer restarting and sweeping its directory does not touch the importer's copy.
+    ContextStore a(options_for(a_directory.path()));
+    ContextStore b(peer_options(b_directory.path(), a_directory.path()));
+    check(a.erase("0a") && b.load("0a").value_or(std::vector<std::uint8_t>{}) == image,
+          "an imported image depended on the peer's files");
+}
+
+void test_both_stores_write_the_same_image() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    const auto image = peer_image(4);
+    const std::array regions{ContextStore::Region{30, 5000}};
+    ContextStore a(peer_options(a_directory.path(), b_directory.path()));
+    ContextStore b(peer_options(b_directory.path(), a_directory.path()));
+    (void)a.put(describe("0a"), image, regions);
+    (void)b.put(describe("0a"), image, regions);
+    check(a.sync_peers() == 0 && b.sync_peers() == 0, "an image both stores hold was imported");
+    check(a.load("0a").value_or(std::vector<std::uint8_t>{}) == image &&
+              b.load("0a").value_or(std::vector<std::uint8_t>{}) == image,
+          "two stores writing one image broke one of them");
+}
+
+void test_background_poll_imports_without_being_asked() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    ContextStore a(options_for(a_directory.path()));
+    ContextStore::Options options = peer_options(b_directory.path(), a_directory.path());
+    options.peer_poll             = std::chrono::milliseconds(5);
+    ContextStore b(options);
+    (void)a.put(describe("0a"), peer_image(5), std::array{ContextStore::Region{30, 5000}});
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (b.list().empty() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    check(b.list().size() == 1, "the background poll did not import the peer's image");
+}
+
+// The peer erases an image while the other store imports it, over and over: whatever the importer
+// ends up holding must be a whole image that loads as what was written, never a partial one.
+void test_peer_erasing_during_import_never_leaves_a_partial_image() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    constexpr int kRounds = 300;
+    ContextStore a(options_for(a_directory.path()));
+    ContextStore b(peer_options(b_directory.path(), a_directory.path()));
+    std::atomic<bool> done{false};
+    std::atomic<int> imported{0};
+    std::atomic<int> wrong{0};
+    std::thread importer([&] {
+        while (!done.load()) {
+            (void)b.sync_peers();
+            for (const auto& info : b.list()) {
+                // Rounds put "r<i>" as the hex id of i; the expected bytes follow from the id.
+                const auto bytes = b.load(info.id);
+                if (bytes) {
+                    const std::uint32_t seed = static_cast<std::uint32_t>(std::stoul(info.id, nullptr, 16));
+                    if (*bytes != peer_image(seed, 3000 + seed % 7 * 500)) { ++wrong; }
+                    ++imported;
+                }
+                (void)b.erase(info.id);
+            }
+        }
+    });
+    for (int round = 1; round <= kRounds; ++round) {
+        char id[16];
+        std::snprintf(id, sizeof(id), "%x", static_cast<unsigned>(round));
+        const std::size_t region = 3000 + static_cast<std::size_t>(round) % 7 * 500;
+        (void)a.put(describe(id), peer_image(static_cast<std::uint32_t>(round), region),
+                    std::array{ContextStore::Region{30, region}});
+        if (round % 2 == 0) {
+            // Even rounds let the importer finish first (so imports certainly happen); odd rounds
+            // erase at once, racing the import.
+            const int before = imported.load();
+            const auto give_up = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+            while (imported.load() == before && std::chrono::steady_clock::now() < give_up) {
+                std::this_thread::yield();
+            }
+        }
+        (void)a.erase(id);
+    }
+    done = true;
+    importer.join();
+    check(wrong.load() == 0, "an image imported while its peer erased it differs from what was written");
+    check(imported.load() >= kRounds / 4 && b.stats().peer_images >= static_cast<std::uint64_t>(imported.load()),
+          "the importer imported too few images for the race to mean anything");
+    for (const auto& info : b.list()) {
+        (void)b.erase(info.id);
+    }
+    check(chunk_files(b_directory.path()).empty(), "an import left chunks nobody references");
+}
+
+void test_damaged_peer_files_are_skipped_or_missed_and_never_modified() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    const auto image = peer_image(6);
+    const std::array regions{ContextStore::Region{30, 5000}};
+    ContextStore a(options_for(a_directory.path()));
+    (void)a.put(describe("0a"), image, regions);
+    const fs::path manifest = a_directory.path() / "manifests" / "0a.manifest";
+    const auto manifest_size = fs::file_size(manifest);
+    fs::resize_file(manifest, manifest_size / 2);
+    ContextStore b(peer_options(b_directory.path(), a_directory.path()));
+    check(b.sync_peers() == 0 && b.stats().peer_skipped == 1, "a damaged peer manifest was imported");
+    check(b.sync_peers() == 0 && b.stats().peer_skipped == 1,
+          "a damaged peer manifest was looked at again");
+    check(fs::file_size(manifest) == manifest_size / 2, "the importer modified the peer's manifest");
+    // The peer rewrites the image: the new manifest is tried again.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    (void)a.put(describe("0a"), image, regions);
+    check(b.sync_peers() == 1, "a rewritten peer manifest was not tried again");
+    check(b.load("0a").value_or(std::vector<std::uint8_t>{}) == image, "the rewritten image differs");
+
+    // A chunk damaged on the peer's disk (the same inode the importer links) is a miss for the
+    // importer, and its removal leaves the peer's file alone.
+    (void)b.erase("0a");
+    (void)a.erase("0a"); // only the image whose chunk is damaged remains
+    (void)a.put(describe("0c"), peer_image(7), regions);
+    const auto files = chunk_files(a_directory.path());
+    fs::path victim;
+    for (const auto& file : files) {
+        if (fs::file_size(file) == 1024) { victim = file; break; }
+    }
+    check(!victim.empty(), "no full chunk to damage");
+    {
+        std::fstream file(victim, std::ios::in | std::ios::out | std::ios::binary);
+        char byte = 0;
+        file.read(&byte, 1);
+        byte ^= 0x33;
+        file.seekp(0);
+        file.write(&byte, 1);
+    }
+    check(b.sync_peers() == 1, "an image with a damaged chunk was not imported (size is intact)");
+    check(!b.load("0c").has_value() && !b.find("0c").has_value(),
+          "a chunk damaged on the peer's disk was served");
+    check(fs::exists(victim), "the importer removed the peer's damaged chunk file");
+}
+
+void test_peer_images_over_budget_expired_or_gone_are_skipped_once() {
+    const std::array regions{ContextStore::Region{30, 5000}};
+    {   // Over the importer's budget.
+        TempDirectory a_directory;
+        TempDirectory b_directory;
+        ContextStore a(options_for(a_directory.path()));
+        (void)a.put(describe("0a"), peer_image(8), regions);
+        ContextStore::Options options = peer_options(b_directory.path(), a_directory.path());
+        options.max_bytes             = 3000;
+        ContextStore b(options);
+        for (int i = 0; i < 4; ++i) { check(b.sync_peers() == 0, "an over-budget image was imported"); }
+        check(b.stats().peer_skipped == 1 && chunk_files(b_directory.path()).empty(),
+              "an over-budget image was retried or left files behind");
+    }
+    {   // Older than the importer's TTL.
+        TempDirectory a_directory;
+        TempDirectory b_directory;
+        ContextStore a(options_for(a_directory.path()));
+        (void)a.put(describe("0a"), peer_image(9), regions);
+        ContextStore::Options options = peer_options(b_directory.path(), a_directory.path());
+        options.ttl                   = std::chrono::hours(1);
+        const std::int64_t created    = a.list()[0].created_ms;
+        options.clock                 = [created] { return created + 2 * 3600 * 1000; };
+        ContextStore b(options);
+        check(b.sync_peers() == 0 && b.sync_peers() == 0 && b.stats().peer_skipped == 1,
+              "an expired image was imported or retried");
+    }
+    {   // A chunk the peer already evicted: the link fails, nothing is left behind.
+        TempDirectory a_directory;
+        TempDirectory b_directory;
+        ContextStore a(options_for(a_directory.path()));
+        (void)a.put(describe("0a"), peer_image(10), regions);
+        const auto files = chunk_files(a_directory.path());
+        check(files.size() >= 2, "no chunks to remove");
+        fs::remove(files.front());
+        ContextStore b(peer_options(b_directory.path(), a_directory.path()));
+        check(b.sync_peers() == 0 && b.stats().peer_link_failures == 1 && b.list().empty() &&
+                  chunk_files(b_directory.path()).empty(),
+              "an image with a missing peer chunk was imported or left links behind");
+    }
+    {   // No peer directory yet: not an error.
+        TempDirectory b_directory;
+        ContextStore b(peer_options(b_directory.path(), b_directory.path().parent_path() / "no-such-store"));
+        check(b.sync_peers() == 0, "a missing peer directory imported something");
+    }
+}
+
+void test_peer_import_links_compressed_chunks() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    const auto image = concat({pseudo_random(30, 1), compressible(4096, 2), pseudo_random(8, 3)});
+    ContextStore a(compressed_options(a_directory.path(), 1024));
+    (void)a.put(describe("0a"), image, std::array{ContextStore::Region{30, 4096}});
+    ContextStore b(peer_options(b_directory.path(), a_directory.path()));
+    check(b.sync_peers() == 1, "an image of compressed chunks was not imported");
+    check(files_with_suffix(b_directory.path(), ".chunk.zst") ==
+              files_with_suffix(a_directory.path(), ".chunk.zst") &&
+              files_with_suffix(b_directory.path(), ".chunk.zst") > 0,
+          "the importer did not link the compressed chunk files");
+    check(b.load("0a").value_or(std::vector<std::uint8_t>{}) == image,
+          "an image of compressed chunks differs after import");
+    check(b.stats().used_bytes == a.stats().used_bytes,
+          "the importer counts compressed chunks by another size than the peer");
+}
+
 } // namespace
 
 int main() {
+    test_owner_lock_refuses_a_second_store_on_one_directory();
+    test_peer_import_links_chunks_and_survives_the_owner();
+    test_peer_import_survives_restarts_of_either_store();
+    test_both_stores_write_the_same_image();
+    test_background_poll_imports_without_being_asked();
+    test_peer_erasing_during_import_never_leaves_a_partial_image();
+    test_damaged_peer_files_are_skipped_or_missed_and_never_modified();
+    test_peer_images_over_budget_expired_or_gone_are_skipped_once();
+    test_peer_import_links_compressed_chunks();
     test_compressed_chunks_round_trip_and_account_for_disk_use();
     test_compressed_chunks_survive_restart_and_either_setting();
     test_compressed_chunk_damage_is_a_miss();

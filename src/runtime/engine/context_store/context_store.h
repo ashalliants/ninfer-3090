@@ -69,6 +69,14 @@ public:
         std::string remote_prefix; // prepended to every key, e.g. "ninfer/"
         std::chrono::seconds remote_refresh{60};
         std::chrono::seconds remote_touch_interval{24 * 3600};
+
+        // Directories of other engines' stores on the same volume, read but never written. Every
+        // `peer_poll` the manifests there that this store does not hold are imported by hard-linking
+        // their chunks (no bytes are copied), so an image another engine finished is usable here
+        // within one poll. A peer deleting or evicting an image afterwards does not affect the
+        // imported copy; an image deleted while it is imported is skipped. Failures are misses.
+        std::vector<std::filesystem::path> peers;
+        std::chrono::milliseconds peer_poll{250};
     };
 
     // Where in the image the large, deduplicated bytes are.
@@ -148,6 +156,12 @@ public:
         std::uint64_t remote_download_bytes  = 0;
         std::uint64_t remote_download_failures = 0;
         std::uint64_t remote_refreshes       = 0;
+        // With peers: images imported from them, the chunk bytes linked (not copied), images
+        // skipped (damaged, expired, over budget, or gone mid-import) and links that failed.
+        std::uint64_t peer_images       = 0;
+        std::uint64_t peer_bytes_linked = 0;
+        std::uint64_t peer_skipped      = 0;
+        std::uint64_t peer_link_failures = 0;
     };
 
     // Creates the directory layout, reads the manifests found there and removes whatever is
@@ -193,6 +207,9 @@ public:
     // With a remote: fetches the image's missing chunks in the background so a later load() is
     // local. False when there is nothing to do.
     bool prefetch(const std::string& id);
+    // With peers: imports the images they hold that this store does not (also done in the
+    // background every peer_poll). Returns the number imported.
+    std::size_t sync_peers();
 
     [[nodiscard]] Stats stats() const;
     [[nodiscard]] const Options& options() const noexcept { return options_; }
@@ -349,6 +366,20 @@ private:
     };
     std::unordered_map<std::string, RemoteFailure> remote_failed_;
     std::int64_t last_prune_ms_ = 0; // remote worker thread only
+
+    // Peer import. `owner_` holds the exclusive lock on options_.directory for the store's life.
+    struct OwnerLock;
+    [[nodiscard]] bool import_peer_image(const std::filesystem::path& peer, const std::string& id,
+                                         std::int64_t stamp);
+    void peer_loop();
+    std::unique_ptr<OwnerLock> owner_;
+    // (peer + id) -> modification time of the peer manifest that was skipped: not tried again until
+    // the peer rewrites it. Guarded by mutex_.
+    std::unordered_map<std::string, std::int64_t> peer_skipped_;
+    std::mutex peer_mutex_;
+    std::condition_variable peer_cv_;
+    bool peer_stopping_ = false;
+    std::thread peer_thread_;
     std::thread remote_thread_;
 };
 
