@@ -381,6 +381,7 @@ void test_real_banks(const char* path) {
             // and the wide route rejects it. ninfer_offloaded_moe_layer_test checks it at 1-8 columns.
             std::printf("real bank %s (%s): narrow route only, covered by the layer test\n", object->id.c_str(),
                         format_name(g.format));
+            ++banks; // a valid bank, just not eligible for the wide-route checks below
             continue;
         }
         std::vector<std::vector<std::uint8_t>> records;
