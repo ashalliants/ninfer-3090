@@ -1,0 +1,83 @@
+{
+  "schema": "ninfer.artifact-manifest",
+  "schema_version": 2,
+  "artifact": {
+    "filename": "bonsai2_27b.ninfer",
+    "bytes": 9520051456,
+    "sha256": "975126774d7e1f9ffa36b654c0a6fc0db42c773ba4dd5f1196a9ddc6a46d4634",
+    "container_version": 3,
+    "architecture": "Qwen3_5ForCausalLM",
+    "name": "bonsai2-27b",
+    "components": [
+      "text",
+      "vision",
+      "mtp",
+      "dflash2"
+    ]
+  },
+  "source": {
+    "base": {
+      "repo_id": "Qwen/Qwen3.8-27B",
+      "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+      "license": "Apache-2.0",
+      "used_for": "Vision tower, frontend resources and config; no text weights"
+    },
+    "ternary": {
+      "repo_id": "prism-ml/Ternary-Bonsai-2-27B-gguf",
+      "revision": "b072e1d3b35a0a630cece372c2127528e0994386",
+      "filename": "Ternary-Bonsai-2-27B-PQ2_0.gguf",
+      "sha256": "3907dc1658db1f78a9826bf8d5bcb8dc65db0d466388937af57f2294fae62ec1",
+      "license": "Apache-2.0"
+    },
+    "mtp": {
+      "repo_id": "ProCreations/Ternary-Bonsai-2-27B-MTP",
+      "revision": "efffdea64c1f9e93cc7fa6bb24f72ae9d66ecf51",
+      "filename": "model_mtp.safetensors",
+      "sha256": "7a4a18b2d02116ef184d1b0ee4af46d829825ff2c042f79cf37ef8a03c399218",
+      "license": "Apache-2.0"
+    },
+    "dflash2": {
+      "repo_id": "ProCreations/Ternary-Bonsai-2-27B-DFlash2",
+      "revision": "4cfb6ad03268fed0f60ca96c1a659c0b1c77e50b",
+      "filename": "model.safetensors",
+      "sha256": "708e141bf4a33b09620c4f86263f1c7edcec7882f5dd39448e83e0c0defdc230",
+      "license": "Apache-2.0"
+    }
+  },
+  "conversion": {
+    "recipe_id": "bonsai2_27b_ternary",
+    "converter_repository": "https://github.com/ashalliants/ninfer-3090",
+    "command": "python -m tools.convert --model Qwen3.8-27B --recipe bonsai2_27b_ternary --source ternary=Ternary-Bonsai-2-27B-PQ2_0.gguf --source mtp=Ternary-Bonsai-2-27B-MTP/model_mtp.safetensors --source dflash2=Ternary-Bonsai-2-27B-DFlash2 --components text,vision,mtp,dflash2 --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja --proposal --name bonsai2-27b"
+  },
+  "runtime": {
+    "repository": "https://github.com/ashalliants/ninfer-3090",
+    "cuda_architecture": "sm_86",
+    "dflash2_draft_tokens": {
+      "recommended": 7,
+      "minimum": 1,
+      "maximum": 15
+    }
+  },
+  "inventory": {
+    "objects": 1193,
+    "tensors": 1187,
+    "resources": 6,
+    "bindings": 1513,
+    "uses": 844,
+    "formats": {
+      "bf16": 630,
+      "fp32": 96,
+      "int32": 1,
+      "q4_g64_fp16": 70,
+      "q5_g64_fp16": 54,
+      "q6_g64_fp16": 1,
+      "q8_g32_fp16": 12,
+      "t2_g128_fp16": 323
+    },
+    "layouts": {
+      "contiguous_le_v1": 727,
+      "row_split_k128_v1": 460
+    },
+    "payload_bytes": 9519645952
+  }
+}

@@ -14,6 +14,11 @@ set -euo pipefail
 #                    --spec dflash2. Executables older than the 5120x17408 Q4 linear_add route refuse
 #                    it at startup. Figures published before 2026-10 were measured against the
 #                    upstream neroued pin 1cbd84e7 (v2 18dfc887), 19.0 GiB.
+#   bonsai2-27b      Ternary Bonsai 2 27B, 8.9 GiB. Prism ML's ternary Qwen3.8-27B (2.125 bits per
+#                    weight, Hadamard-rotated) converted by this fork's bonsai2_27b_ternary recipe
+#                    (WarlaxZ/Ternary-Bonsai-2-27B-NInfer-3090), with the MTP and DFlash2 heads
+#                    ProCreations trained on it, the vision tower and a proposal head. Needs this
+#                    fork's t2_g128_fp16 weight format: older executables refuse it at startup.
 #   qwen36-27b       Qwen3.6-27B groupwise-int, 16.3 GiB, target_key qwen3_6_27b. A different model
 #                    family from qwen3_8_27b, which is why having the latter does not satisfy the
 #                    former: four real-model tests -- ninfer_qwen3_6_27b_prefix_real_test,
@@ -46,7 +51,7 @@ set -euo pipefail
 # otherwise. `apt-get install aria2` / `brew install aria2` to opt in.
 
 usage() {
-  printf 'usage: %s <model>\n\n  qwen38-27b (recommended)\n  qwen36-27b\n  qwen36-35b-a3b\n  qwen38-flash-next (preview)\n' \
+  printf 'usage: %s <model>\n\n  qwen38-27b (recommended)\n  bonsai2-27b\n  qwen36-27b\n  qwen36-35b-a3b\n  qwen38-flash-next (preview)\n' \
     "${0##*/}" >&2
 }
 
@@ -62,6 +67,16 @@ case "${1:-}" in
     expected_sha256='7f2a0086a071ee932c66106e1552d118a85cfec8ddef13c67a54cd64abb39706'
     label='the Qwen3.8-27B model (17.7 GiB)'
     tests_variable='NINFER_QWEN3_8_27B_WEIGHTS'
+    ;;
+  bonsai2-27b)
+    artifact='bonsai2_27b.ninfer'
+    owner='WarlaxZ'
+    repo='Ternary-Bonsai-2-27B-NInfer-3090'
+    revision='983a9be22f3623f3a2799655741d2a92db86d37d'
+    expected_size=9520051456
+    expected_sha256='975126774d7e1f9ffa36b654c0a6fc0db42c773ba4dd5f1196a9ddc6a46d4634'
+    label='the Ternary Bonsai 2 27B model (8.9 GiB)'
+    tests_variable='NINFER_TEST_ARTIFACT'
     ;;
   qwen36-27b)
     artifact='qwen3_6_27b.ninfer'

@@ -504,11 +504,12 @@ a 24 GB card and the server can reuse fast CUDA Graphs instead of rebuilding wor
 | Model | Artifact | Size | Notes |
 |---|---|---:|---|
 | **Qwen3.8-27B** | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Qwen3.8-27B-NInfer-3090/tree/d47f2732d369acaec76dc44228f67c72b081df2f) | 17.68 GiB | **Recommended.** Validated at C1–C8 with ReplaySSM. This fork's [3090 conversion](model-cards/Qwen3.8-27B-NInfer-3090/README.md): imatrix-weighted encoder, 4-bit embedding, 6-bit head. Carries vision, MTP and the DFlash2 bundle for `--spec dflash2` |
+| Ternary Bonsai 2 27B | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Ternary-Bonsai-2-27B-NInfer-3090/tree/983a9be22f3623f3a2799655741d2a92db86d37d) | 8.87 GiB | Prism ML's ternary Qwen3.8-27B (2.125 bits per weight), this fork's [3090 conversion](model-cards/Ternary-Bonsai-2-27B-NInfer-3090/README.md) with vision, MTP, DFlash2 and a proposal head. 6.7 GiB of weights; on one RTX 3090 about 88 tok/s plain and 250-300 with `--spec dflash2 --draft-tokens 7`, prefill about 2.8k tok/s, quick-corpus perplexity 5.627. Run it with `ninfer` or `ninfer-serve` directly: it has no `run.bat` profile yet |
 | Qwen3.6-35B-A3B | [pinned v3 artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/tree/ee4495803bc4f8015b8a7e22d4cf9b67de8e27c6) | 21.23 GiB | Carries the DFlash bundle for `--spec dflash` |
 | Qwen3.6-27B | [pinned v3 artifact](https://huggingface.co/neroued/Qwen3.6-27B-NInfer/tree/3e3d9a3951c452c1ca80bd7a2860c7f3bfc5a829) | 16.29 GiB | Supported with more runtime headroom |
 | Qwen3.8-Flash-Next (preview) | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Qwen3.8-Flash-Next-NInfer-3090/tree/c7dfb9694fc3cb3d40298afbfe2e3a8c172241fa) | 38.20 GiB in two files + 27.13 GiB n-gram volume | Windows, one request at a time (two lanes opt-in), 64 GB RAM. This fork's [exact conversion](model-cards/Qwen3.8-Flash-Next-NInfer-3090/README.md) of the GSQ-RCO IQ2_XS GGUF with the MTP drafter and vision tower. Keep the n-gram volume on NVMe |
 
-`download-model qwen38-27b`, `qwen36-35b-a3b` or `qwen36-27b` (`.bat` on Windows, `.sh` on Linux)
+`download-model qwen38-27b`, `bonsai2-27b`, `qwen36-35b-a3b` or `qwen36-27b` (`.bat` on Windows, `.sh` on Linux)
 fetches the pinned revision into `models/` and verifies it. `download-model qwen38-flash-next`
 fetches the Flash-Next model, its second file and the n-gram volume the same way; it asks which folder the volume goes in (`NINFER_NGRAM_DIR` answers in advance), because the volume is
 read on every prompt and an NVMe drive prefills 1.1-1.4x faster than a SATA SSD. **Optional bundles cost nothing in VRAM

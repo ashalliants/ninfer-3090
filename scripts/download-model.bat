@@ -62,6 +62,7 @@ set "NGRAM_NAME="
 
 if "%~1"=="" goto :menu
 if /i "%~1"=="qwen38-27b" goto :model_qwen38_27b
+if /i "%~1"=="bonsai2-27b" goto :model_bonsai2_27b
 if /i "%~1"=="qwen36-27b" goto :model_qwen36_27b
 if /i "%~1"=="qwen36-35b-a3b" goto :model_qwen36_35b_a3b
 if /i "%~1"=="qwen38-flash-next" goto :model_qwen38_flash_next
@@ -76,11 +77,13 @@ echo   1 = Qwen3.8-27B (recommended)       qwen38-27b
 echo   2 = Qwen3.6-35B-A3B                 qwen36-35b-a3b
 echo   3 = Qwen3.6-27B                     qwen36-27b
 echo   4 = Qwen3.8-Flash-Next (preview)    qwen38-flash-next   (needs 64 GB of RAM)
+echo   5 = Ternary Bonsai 2 27B            bonsai2-27b
 echo.
-choice /c 1234 /n /m "Choose 1-4: "
+choice /c 12345 /n /m "Choose 1-5: "
 rem choice reports 255 when it cannot read a key (no console, closed stdin). Refuse rather than
 rem let that fall through and pick a model nobody chose.
 if errorlevel 255 exit /b 2
+if errorlevel 5 goto :model_bonsai2_27b
 if errorlevel 4 goto :model_qwen38_flash_next
 if errorlevel 3 goto :model_qwen36_27b
 if errorlevel 2 goto :model_qwen36_35b_a3b
@@ -99,6 +102,7 @@ exit /b 2
 echo usage: %~nx0 ^<model^>
 echo.
 echo   qwen38-27b (recommended)
+echo   bonsai2-27b
 echo   qwen36-27b
 echo   qwen36-35b-a3b
 echo   qwen38-flash-next (preview)
@@ -113,6 +117,17 @@ set "EXPECTED_SIZE=18982458624"
 set "EXPECTED_SHA256=7f2a0086a071ee932c66106e1552d118a85cfec8ddef13c67a54cd64abb39706"
 set "LABEL=the Qwen3.8-27B model (17.7 GiB)"
 set "TESTS_VARIABLE=NINFER_QWEN3_8_27B_WEIGHTS"
+goto :model_selected
+
+:model_bonsai2_27b
+set "ARTIFACT=bonsai2_27b.ninfer"
+set "OWNER=WarlaxZ"
+set "REPO=Ternary-Bonsai-2-27B-NInfer-3090"
+set "REVISION=983a9be22f3623f3a2799655741d2a92db86d37d"
+set "EXPECTED_SIZE=9520051456"
+set "EXPECTED_SHA256=975126774d7e1f9ffa36b654c0a6fc0db42c773ba4dd5f1196a9ddc6a46d4634"
+set "LABEL=the Ternary Bonsai 2 27B model (8.9 GiB)"
+set "TESTS_VARIABLE=NINFER_TEST_ARTIFACT"
 goto :model_selected
 
 :model_qwen36_27b

@@ -7,6 +7,7 @@
 > |---|---|---|
 > | [RTX 3090 (`sm_86`) findings](#rtx-3090-sm_86-findings-this-fork) below | RTX 3090, `sm_86`, CUDA 12.8 | this fork |
 > | [Vision residency on RTX 3090](performance/qwen3.8-27b.md#vision-residency-on-rtx-3090-groupwise-int-sm_86) | RTX 3090, `sm_86` | this fork |
+> | [Ternary Bonsai 2 27B on RTX 3090](performance/bonsai2-27b-rtx3090.md) | RTX 3090, `sm_86`, CUDA 12.8 | this fork |
 > | Every per-model page under `performance/` | **RTX 5090, `sm_120a`, CUDA 13.1** | upstream |
 >
 > The upstream campaign is kept because it is the only corpus-scale evidence published for these
