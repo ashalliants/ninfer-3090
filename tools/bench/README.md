@@ -382,8 +382,11 @@ refusals would another placement policy have had?** It needs no GPU and no new s
 
 It reads a trace printed by a *measurement build*. The shipped server does not print one. To make one, add
 these lines to `HostContextArena` (`src/core/host_context_arena.cpp`) and keep them out of the commit; kind is
-`S` for a state image allocation and `K` for a KV run (the arena does not know the kind, so pass it from the
-two call sites, `HostStatePool::allocate` and `HostKVArena::allocate`):
+`S` for a state image allocation and `K` for a KV run (the arena does not know the kind, so pass it from every
+call site that reaches `HostContextArena::allocate`: `HostStatePool::allocate` and
+`ProgramImpl::reserve_capture_destination` (`capture.cpp`, a direct state image allocation) for `S`, and
+`HostKVArena::allocate` for `K`. Re-check with `rg "arena.*allocate\("` that no other caller exists, because a
+missing one leaves real `A`/`F` events out and the replay still runs on the incomplete sequence):
 
 ```cpp
 // allocate(), on success:  std::fprintf(stderr, "[trace] A t=%lld off=%zu bytes=%zu kind=%c\n", now_ms(), offset, rounded, kind);
