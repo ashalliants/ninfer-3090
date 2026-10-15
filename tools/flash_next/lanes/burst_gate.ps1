@@ -15,6 +15,7 @@ $client = Join-Path $PSScriptRoot 'burst_client.py'
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 $lockPath = Join-Path $env:TEMP 'ninfer-gpu.lock'
 $lock = $null
+$exitCode = 0
 $t0 = Get-Date
 while (-not $lock) {
   try   { $lock = [IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'None') }
@@ -23,6 +24,7 @@ while (-not $lock) {
 try {
   "lock acquired after {0:N0} s" -f ((Get-Date) - $t0).TotalSeconds | Out-File "$OutDir\gate.log" -Encoding utf8
   $n = 0
+  $failed = @()
   foreach ($c in $Order) {
     $n++
     $tag = "run${n}_C$c"
@@ -37,13 +39,21 @@ try {
       for ($i = 0; $i -lt 600 -and -not $ready -and -not $p.HasExited; $i++) {
         try { $null = Invoke-RestMethod "http://127.0.0.1:$Port/v1/models" -TimeoutSec 3; $ready = $true } catch { Start-Sleep -Seconds 2 }
       }
-      if (-not $ready) { "$tag server not ready (exited: $($p.HasExited))" | Out-File "$OutDir\gate.log" -Append -Encoding utf8; continue }
+      if (-not $ready) { "$tag server not ready (exited: $($p.HasExited))" | Out-File "$OutDir\gate.log" -Append -Encoding utf8; $failed += "$tag (server not ready)"; continue }
       "$tag ready" | Out-File "$OutDir\gate.log" -Append -Encoding utf8
       python $client $Port "$OutDir\$tag.json" $root 2>&1 | Out-File "$OutDir\$tag.client.txt" -Encoding utf8
-      "$tag client exit $LASTEXITCODE" | Out-File "$OutDir\gate.log" -Append -Encoding utf8
+      $clientExit = $LASTEXITCODE
+      "$tag client exit $clientExit" | Out-File "$OutDir\gate.log" -Append -Encoding utf8
+      if ($clientExit -ne 0) { $failed += "$tag (client exit $clientExit)" }
     } finally {
       if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force; $p.WaitForExit(120000) | Out-Null }
     }
   }
-  "ALL DONE" | Out-File "$OutDir\gate.log" -Append -Encoding utf8
+  if ($failed.Count -gt 0) {
+    "FAILED: $($failed -join '; ')" | Out-File "$OutDir\gate.log" -Append -Encoding utf8
+    $exitCode = 1
+  } else {
+    "ALL DONE" | Out-File "$OutDir\gate.log" -Append -Encoding utf8
+  }
 } finally { $lock.Dispose() }
+exit $exitCode
