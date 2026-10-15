@@ -651,7 +651,9 @@ The command line wins over a preset where they repeat an option. Comments sit on
 (`;` or `#` first). The router's own options (`models-max`, `models-autoload`, `sleep-idle-seconds`,
 `unload-idle-seconds`) are command-line only: a preset that sets one is rejected at startup. With
 `--context-store DIR` each model keeps its store in `DIR/<model id>` (and under `<prefix><model id>/`
-in S3), and `--request-log-jsonl` may not name any model's artifact.
+in S3; characters other than letters, digits, `-` and `_` are written as `%XX`). `--request-log-jsonl`
+may not name any model's artifact; all models append to one shared log, one record at a time.
+`--ngram-volume` and `--expert-state` may not give the same file to two models.
 
 `--models-max N` (default 1, 0 for no limit) bounds how many models are loaded at once. To make room
 the least recently used model without a request in flight **sleeps** when it was started with

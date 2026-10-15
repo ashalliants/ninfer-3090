@@ -28,6 +28,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -87,6 +88,26 @@ void handle_engine_fault(const ninfer::serve::OperationalLog& log,
 // Router mode (--models-dir / --models-preset): several models behind one address. Each model is an
 // Engine with an HTTP server of its own on loopback; the router front-end forwards to it once the
 // registry has loaded or woken the model. Adapted from NInfer-all 0dcb1da9 (Apache-2.0).
+// A directory (or key prefix) name for a model id. Every byte outside [A-Za-z0-9_-] becomes %XX, and
+// '%' is one of them, so two ids never share a name.
+std::string store_directory_name(const std::string& id, bool escape_capitals) {
+    std::string out;
+    for (const char raw : id) {
+        const unsigned char c = static_cast<unsigned char>(raw);
+        const bool plain = (std::isalnum(c) != 0 && !(escape_capitals && std::isupper(c) != 0)) ||
+                           c == '-' || c == '_';
+        if (plain) {
+            out.push_back(raw);
+        } else {
+            constexpr char kHex[] = "0123456789ABCDEF";
+            out.push_back('%');
+            out.push_back(kHex[c >> 4]);
+            out.push_back(kHex[c & 15]);
+        }
+    }
+    return out;
+}
+
 int run_router(const char* argv0, const ninfer::serve::ServeOptions& options,
                const std::shared_ptr<spdlog::logger>& logger,
                ninfer::product::StartupLogRenderer& startup_log,
@@ -157,19 +178,13 @@ int run_router(const char* argv0, const ninfer::serve::ServeOptions& options,
             model_options.model_id_override = model.id;
             // Every model's Engine keeps its own store: a shared one would be scanned, evicted and
             // rewritten by several Engines that do not know of each other.
-            std::string store_name = model.id;
-            for (char& c : store_name) {
-                if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_' &&
-                    c != '.') {
-                    c = '_';
-                }
-            }
-            if (store_name.front() == '.') { store_name.insert(store_name.begin(), '_'); }
             if (!model_options.context_store_path.empty()) {
-                model_options.context_store_path /= store_name;
+                // Local volumes may ignore case, so capitals are escaped there too.
+                model_options.context_store_path /= store_directory_name(model.id, true);
             }
             if (!model_options.context_store_s3_bucket.empty()) {
-                model_options.context_store_s3_prefix += store_name + "/";
+                model_options.context_store_s3_prefix +=
+                    store_directory_name(model.id, false) + "/";
             }
             definitions.push_back(
                 ninfer::serve::ModelDefinition{.id              = model.id,
@@ -191,6 +206,24 @@ int run_router(const char* argv0, const ninfer::serve::ServeOptions& options,
                 if (same_file(owner.options.request_log_jsonl, other.options.artifact_path)) {
                     throw std::invalid_argument("--request-log-jsonl names the artifact of model '" +
                                                 other.id + "'");
+                }
+            }
+        }
+        // Files an Engine saves to: one explicit path given to several models would be written by
+        // all of them. (Left at its default, each model has its own beside its artifact.)
+        for (std::size_t first = 0; first < definitions.size(); ++first) {
+            for (std::size_t second = first + 1; second < definitions.size(); ++second) {
+                const auto& a = definitions[first].options.flash_next;
+                const auto& b = definitions[second].options.flash_next;
+                for (const auto& [x, y, name] :
+                     {std::tuple{&a.ngram_volume_path, &b.ngram_volume_path, "--ngram-volume"},
+                      std::tuple{&a.expert_state_path, &b.expert_state_path, "--expert-state"}}) {
+                    if (!x->empty() && same_file(*x, *y)) {
+                        throw std::invalid_argument(std::string(name) + " names one file for models '" +
+                                                    definitions[first].id + "' and '" +
+                                                    definitions[second].id +
+                                                    "'; give each model its own");
+                    }
                 }
             }
         }

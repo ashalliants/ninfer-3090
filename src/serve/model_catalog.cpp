@@ -111,6 +111,10 @@ PresetFile parse_preset_file(const std::string& text) {
                                             ": malformed section header");
             }
             const std::string name = trim(line.substr(1, line.size() - 2));
+            if (name.empty()) {
+                throw std::invalid_argument("preset line " + std::to_string(line_number) +
+                                            ": empty section name");
+            }
             auto existing = std::find_if(out.sections.begin(), out.sections.end(),
                                          [&](const auto& section) { return section.name == name; });
             if (existing != out.sections.end()) {

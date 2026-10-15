@@ -315,6 +315,11 @@ model-suspend = false
                             parse_preset_file("[a]\nmodel=/x.ninfer\nunload-idle-seconds=5\n"), {});
     } catch (const std::invalid_argument&) { router_key = true; }
     expect(router_key, "a preset may not set a router option per model");
+    bool empty_name = false;
+    try {
+        (void)parse_preset_file("[ ]\nmodel=/x.ninfer\n");
+    } catch (const std::invalid_argument&) { empty_name = true; }
+    expect(empty_name, "a preset section needs a name");
     bool duplicate = false;
     try {
         (void)build_catalog(
