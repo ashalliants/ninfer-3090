@@ -582,8 +582,8 @@ What this says:
   at C4 even for copy-heavy output, where one stream preferred K=15 (381 against 272 at K=7, DFlash2).
 - **A round verifies one width for every lane**, and a 16-column round costs 2.4x a neural one at
   three or four lanes (table below), so one lane's wide round is paid for by all of them. A
-  controller can only widen when every lane wants it. That is worth about +11% (MTP K=7) to +27%
-  (DFlash2 K=7) on four copy-heavy lanes and about 1-3% on the mixed load above, where K=3 is
+  controller can only widen when every lane wants it. That is worth about +14% (MTP K=7, 469 against 410) to +27%
+  (DFlash2 K=7, 502 against 395) on four copy-heavy lanes and about 1-3% on the mixed load above, where K=3 is
   already the best fixed count.
 - **MTP K=3 beats DFlash2 K=3 by 11% on the mixed load** (341 against 308), and DFlash2 does not
   start at C4 with four 8k contexts on this card (a 5.5 GiB runtime reservation that does not
