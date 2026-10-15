@@ -27,7 +27,7 @@ concurrent cohorts through **C8**.
 33 GiB of experts pinned in host RAM: **1.15-1.18x Strata's plain decode** (81 / 80 / 78 tok/s after
 a 1K / 8K / 32K prompt against 71 / 70 / 66), **109-113 tok/s with MTP** (the launcher default, same
 tokens as plain decoding; 102.6 after a 128K prompt, in a separate run with the context raised above this release's 32K default) and **2,345 tok/s prefill** at 4K, 1.23x Strata's,
-when the n-gram volume sits on NVMe. One request at a time, 32K context in this release. Details
+when the n-gram volume sits on NVMe. One request at a time by default (two lanes opt-in with `NINFER_CONCURRENCY=2`), 32K context in this release. Details
 [below](#qwen38-flash-next-preview).
 
 Re-measured on the v0.16.0 release binaries through `ninfer-serve` (2026-10-14, launcher flags, real
@@ -355,7 +355,7 @@ starts answering in 0.1 s instead of 11.7 s, and the next turn of that conversat
 ([measurements](docs/maintainer/flash-next-context-cache.md#measurements)). Checkpoints can also
 live on local disk (`--context-nvme-mib`, with RAM as their cache, or alone with
 `--host-context-mib 0`) and survive a restart (`--context-store DIR`, `NINFER_CONTEXT_STORE` in the
-launcher). Not yet: more than one lane. Measured on this RTX 3090 with a warm expert cache: decode
+launcher). One lane is the default; `NINFER_CONCURRENCY=2` opts into two (three or more are refused). Measured on this RTX 3090 with a warm expert cache: decode
 after 1K / 8K / 32K prompts is 108-109 / 111 / 112-113 tok/s with MTP and 81 / 80 / 78 without
 (Strata with MTP 105 / 112 / 107, plain 71 / 70 / 66); prefill is 2,345 / 2,422 / 2,372 tok/s at
 4K / 32K / 128K with the volume on NVMe (Strata 1,912 / 2,397 / 2,184). Re-run on 2026-10-13 on this

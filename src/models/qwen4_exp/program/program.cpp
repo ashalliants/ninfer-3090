@@ -562,11 +562,11 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, o.device) != cudaSuccess || sms <= 0) {
         throw std::runtime_error("Qwen3.8-Flash-Next: cannot read the device's multiprocessor count");
     }
-    // A rows round decodes one column per lane, so a --prefill-chunk below the lane count must not
-    // size the workspace below that round.
+    // A rows round decodes and samples one row per lane, so neither a --prefill-chunk below the lane
+    // count nor a one-row sampling profile may size the workspace below that round.
     d.work = execution::Forward::workspace_bytes(c, std::max(d.chunk, static_cast<std::int32_t>(d.lanes)), d.pages * kPagedKVPageSize,
                                                  DeviceExecutionView{nullptr, sms}) +
-             ops::sampling_workspace_capacity_bytes(d.token_domain, 1, 1);
+             ops::sampling_workspace_capacity_bytes(d.token_domain, 1, static_cast<std::int32_t>(d.lanes));
     if (d.drafts > 0) {
         // A drafter step (one column and the head's logits), and a prefill call's drafter cells: a
         // sub-chunk's residual rows beside the call's residual. Acceptance's workspace.

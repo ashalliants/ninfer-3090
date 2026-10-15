@@ -111,7 +111,7 @@ std::pair<std::filesystem::path, std::uint64_t> plan_nvme_tier(const EngineOptio
     return {dir / (artifact.filename().string() + ".context-" + std::to_string(process_id()) + ".tier"), bytes};
 }
 
-// What this release of the model serves: one request at a time (text, or text and images with
+// What this release of the model serves: one request at a time by default, two lanes on request (text, or text and images with
 // --vision), plain or MTP decode, INT8 KV, prefix reuse from a Host and NVMe context cache that the
 // context store can persist. Every option
 // a user can set otherwise is refused with what to change.

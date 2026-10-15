@@ -211,7 +211,7 @@ std::string serve_usage_text(const char* argv0) {
            "small perplexity cost (docs/performance.md), off by default, and it wants a larger "
            "--prefill-chunk to pay; --no-prefill-cublas-projections keeps the attention and GDN "
            "input projections off that route\n"
-           "       Qwen3.8-Flash-Next (one request at a time, --kv-dtype int8): prefix reuse keeps "
+           "       Qwen3.8-Flash-Next (one or two requests at once, --kv-dtype int8): prefix reuse keeps "
            "checkpoints in pinned RAM (--host-context-mib, default 4096, 0 turns reuse off) or, with "
            "--context-nvme-mib N, in a scratch file of up to N MiB on local disk (removed at exit; "
            "--context-nvme-dir DIR, default beside the model) with --host-context-mib as its RAM "

@@ -69,7 +69,7 @@ speculation off and `NINFER_VISION=off` image input. `NINFER_CONTEXT` changes th
 model's positions; KV above 32,768 tokens is borrowed from the expert cache). What is different from
 the Qwen3.5 models:
 
-- **One request at a time.** `--max-concurrency` above 1, `--kv-dtype` other than `int8`,
+- **One request at a time by default; two lanes opt-in** (`--max-concurrency 2`, `NINFER_CONCURRENCY=2` in the launcher). `--max-concurrency` above 2, `--kv-dtype` other than `int8`,
   `--spec dflash|dflash2`, `--ngram-draft-tokens`, `--graft`, `--auto-host-cache` and the load-time
   weight flags are refused at startup with the flag to change.
 - **Images** (`--vision`, an artifact converted with `--mmproj`; otherwise startup refuses with that
