@@ -15,7 +15,7 @@ the request that commissioned this note and not measured here, or **(inferred)**
 |---|---|---|
 | A prefill-only request | **Missing.** The smallest request is one output token: the engine rejects `requested_output_tokens == 0`. A one-token request prefills, then runs one decode round and retains the conversation, so it works as prefill-only at the price of one decode step. | `src/runtime/engine/engine.cpp:846` |
 | "Resume from this stored image" request | **Missing as a request, present as a mechanism.** Hydration is not requested: on admission the engine matches the prompt's own prefix digests against the store (`start_hydration`) and reads the deepest image that is cheaper than prefilling. A decode engine that receives the full prompt after the prefill engine has stored its image would hydrate it with no new request type. | `engine_core.h:3113-3169`, `engine.cpp:552-600` |
-| Image export and import between engines | **Present.** Stored images are byte images of KV pages and recurrent states; the Host tier import is what hydration uses. Engines on one box can exchange them through directories once the peer design lands (draft PR #326), or through S3 today at 35 s to 2 min. | `docs/maintainer/shared-context-store.md` |
+| Image export and import between engines | **Present.** Stored images are byte images of KV pages and recurrent states; the Host tier import is what hydration uses. Engines on one box can exchange them through directories (`--context-store-peer`, PR #329: a second engine resumed a 46-55k-token conversation in 1.8-2.7 s against 20-28 s cold, measured), or through S3 at 35 s to 2 min. | `docs/serving.md` "Two engines on one box" |
 | Writing the image right after prefill | **Missing, and starved exactly when it matters.** Writes happen when a session has been idle for `--context-store-idle-seconds` (default 30), on eviction, and at shutdown. `persist_idle_session` returns without writing while any request is pending, prefilling, replaying or materializing, and writes at most one session a second. During a burst the prefill engine always has a request pending, so it would almost never write. | `engine_core.h:3027-3087` |
 | A signal the gateway can wait on ("image is durable") | **Missing.** The gateway has nothing to call to prefetch, pin or flush (brief; consistent with `docs/serving.md` "There is nothing for a supervisor or gateway to call"). | |
 
@@ -67,7 +67,7 @@ and not removed by simple overlap. A split removes it by construction.
 2. **Engine, write-through:** a request flag that queues the finished session for the store
    immediately and reports when it is durable, bypassing the idle gate and the "pending request"
    gate. Medium: the writer is a single thread with a bounded queue and an eviction-priority rule.
-3. **Store, peer import:** draft PR #326. Without it nothing here works inside seconds.
+3. **Store, peer import:** PR #329. Without it nothing here works inside seconds.
 4. **Engine, hydration on demand:** today a hydration is attempted once per request
    (`store_probed`) at admission, against a snapshot of the index. The decode engine must see the
    image before the request arrives, so the gateway has to wait for item 2's durability signal and
@@ -85,7 +85,8 @@ real prefill:decode work ratio is known.
 
 ## Recommendation
 
-Do not build it yet. First (a) land the peer store (#326) and measure two general engines with it,
+Do not build it yet. First (a) land the peer store (#329; its measurements are of two general engines
+sharing it, not of a split),
 (b) compute the prefill:decode work ratio from the production request log, and (c) try the cheap
 mitigation for burst decode speed (smaller prefill chunks, or capping prefill's share per round)
 against the 4-6 tok/s symptom. Revisit the split only if (c) cannot reach acceptable streaming speed.
