@@ -13,6 +13,8 @@
 #include <unordered_set>
 #include <utility>
 
+#include <zstd.h>
+
 namespace ninfer::runtime {
 namespace {
 
@@ -199,6 +201,105 @@ void remove_quietly(const fs::path& path) noexcept {
     fs::remove(path, ignored);
 }
 
+// Compressed chunks move through zstd as streams of this size: a chunk is never held twice, once
+// compressed and once raw, in the store's own buffers.
+constexpr std::size_t kStreamBytes = std::size_t{256} << 10U;
+
+// A compressed chunk is kept only when it is at least 3 % smaller than the raw one.
+constexpr std::uint64_t compressed_limit(std::uint64_t raw) noexcept { return raw / 100 * 97; }
+
+using CompressContext   = std::unique_ptr<ZSTD_CCtx, decltype(&ZSTD_freeCCtx)>;
+using DecompressContext = std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)>;
+
+// Streams `bytes` through zstd into `staging`. The frame records the content size, so the raw
+// length can be read from the first bytes of the file. Stops and returns nullopt as soon as the
+// output passes the keep limit (the chunk does not compress enough to be worth it).
+std::optional<std::uint64_t> compress_to_file(std::span<const std::uint8_t> bytes,
+                                              const fs::path& staging, int level) {
+    CompressContext context(ZSTD_createCCtx(), &ZSTD_freeCCtx);
+    if (!context) { throw std::runtime_error("cannot create a zstd compression context"); }
+    ZSTD_CCtx_setParameter(context.get(), ZSTD_c_compressionLevel, level);
+    ZSTD_CCtx_setPledgedSrcSize(context.get(), bytes.size());
+    std::ofstream file(staging, std::ios::binary | std::ios::trunc);
+    std::vector<char> out(kStreamBytes);
+    ZSTD_inBuffer input{bytes.data(), bytes.size(), 0};
+    const std::uint64_t limit = compressed_limit(bytes.size());
+    std::uint64_t total       = 0;
+    for (;;) {
+        ZSTD_outBuffer sink{out.data(), out.size(), 0};
+        const std::size_t remaining = ZSTD_compressStream2(context.get(), &sink, &input, ZSTD_e_end);
+        if (ZSTD_isError(remaining)) {
+            throw std::runtime_error(std::string("zstd: ") + ZSTD_getErrorName(remaining));
+        }
+        file.write(out.data(), static_cast<std::streamsize>(sink.pos));
+        total += sink.pos;
+        if (total > limit) { return std::nullopt; }
+        if (remaining == 0) { break; }
+    }
+    file.flush();
+    if (!file.good()) { throw std::runtime_error("cannot write " + staging.string()); }
+    return total;
+}
+
+// Decodes one zstd frame that must be exactly `out.size()` bytes. `next` fills the given buffer
+// with the next compressed bytes and returns how many it wrote (0 at the end of the input). False
+// for a damaged frame, a frame of another length, or input that ends early or runs on.
+template <class Next>
+bool decompress_stream(Next&& next, std::span<std::uint8_t> out) {
+    DecompressContext context(ZSTD_createDCtx(), &ZSTD_freeDCtx);
+    if (!context) { return false; }
+    std::vector<char> buffer(kStreamBytes);
+    ZSTD_outBuffer sink{out.data(), out.size(), 0};
+    for (;;) {
+        const std::size_t got = next(buffer);
+        if (got == 0) { return false; } // ended before the frame did
+        ZSTD_inBuffer input{buffer.data(), got, 0};
+        while (input.pos < input.size) {
+            const std::size_t more = ZSTD_decompressStream(context.get(), &sink, &input);
+            if (ZSTD_isError(more)) { return false; }
+            if (more == 0) {
+                return sink.pos == out.size() && input.pos == input.size && next(buffer) == 0;
+            }
+            if (sink.pos == sink.size) { return false; } // the frame holds more than `out`
+        }
+    }
+}
+
+bool decompress_file(const fs::path& path, std::span<std::uint8_t> out) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) { return false; }
+    return decompress_stream(
+        [&](std::vector<char>& buffer) {
+            file.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+            return static_cast<std::size_t>(file.gcount());
+        },
+        out);
+}
+
+bool decompress_memory(std::span<const std::uint8_t> packed, std::span<std::uint8_t> out) {
+    std::size_t position = 0;
+    return decompress_stream(
+        [&](std::vector<char>& buffer) {
+            const std::size_t count = std::min(buffer.size(), packed.size() - position);
+            std::memcpy(buffer.data(), packed.data() + position, count);
+            position += count;
+            return count;
+        },
+        out);
+}
+
+// The raw length a compressed chunk file declares in its frame header; nullopt when the file is
+// missing or does not start with a frame that records its size.
+std::optional<std::uint64_t> compressed_content_size(const fs::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    char head[32];
+    if (!file) { return std::nullopt; }
+    file.read(head, sizeof(head));
+    const auto size = ZSTD_getFrameContentSize(head, static_cast<std::size_t>(file.gcount()));
+    if (size == ZSTD_CONTENTSIZE_UNKNOWN || size == ZSTD_CONTENTSIZE_ERROR) { return std::nullopt; }
+    return size;
+}
+
 } // namespace
 
 std::array<std::uint64_t, 2> ContextStore::hash(std::span<const std::uint8_t> bytes) {
@@ -260,11 +361,95 @@ fs::path ContextStore::chunk_path(const std::array<std::uint64_t, 2>& hash) cons
     return options_.directory / "chunks" / key.substr(0, 2) / (key + ".chunk");
 }
 
-void ContextStore::write_atomically(const fs::path& path, std::span<const std::uint8_t> bytes) const {
+fs::path ContextStore::compressed_chunk_path(const std::array<std::uint64_t, 2>& hash) const {
+    const std::string key = hex_key(hash);
+    return options_.directory / "chunks" / key.substr(0, 2) / (key + ".chunk.zst");
+}
+
+std::optional<ContextStore::StoredChunk> ContextStore::locate_chunk(const ChunkRef& chunk) const {
+    std::error_code error;
+    const auto raw = fs::file_size(chunk_path(chunk.hash), error);
+    if (!error && raw == chunk.length) { return StoredChunk{false, raw}; }
+    const fs::path packed = compressed_chunk_path(chunk.hash);
+    const auto size       = fs::file_size(packed, error);
+    if (error) { return std::nullopt; }
+    const auto content = compressed_content_size(packed);
+    if (!content || *content != chunk.length) { return std::nullopt; }
+    return StoredChunk{true, size};
+}
+
+bool ContextStore::read_chunk(const ChunkRef& chunk, std::span<std::uint8_t> out) const {
+    {
+        std::ifstream file(chunk_path(chunk.hash), std::ios::binary);
+        if (file && file.read(reinterpret_cast<char*>(out.data()),
+                              static_cast<std::streamsize>(out.size()))) {
+            return true;
+        }
+    }
+    return decompress_file(compressed_chunk_path(chunk.hash), out);
+}
+
+std::pair<fs::path, ContextStore::StoredChunk>
+ContextStore::write_chunk(const ChunkRef& chunk, std::span<const std::uint8_t> bytes) const {
+    if (options_.compress_chunks) {
+        const fs::path final_path = compressed_chunk_path(chunk.hash);
+        const fs::path staging    = staging_path();
+        std::error_code error;
+        fs::create_directories(final_path.parent_path(), error);
+        std::optional<std::uint64_t> packed;
+        try {
+            packed = compress_to_file(bytes, staging, options_.compression_level);
+        } catch (...) {
+            remove_quietly(staging);
+            throw;
+        }
+        if (packed) {
+            fs::rename(staging, final_path, error);
+            if (error) {
+                remove_quietly(staging);
+                throw std::runtime_error("cannot publish " + final_path.string() + ": " +
+                                         error.message());
+            }
+            return {final_path, StoredChunk{true, *packed}};
+        }
+        remove_quietly(staging); // not worth compressing: kept raw
+    }
+    write_atomically(chunk_path(chunk.hash), bytes);
+    return {chunk_path(chunk.hash), StoredChunk{false, bytes.size()}};
+}
+
+void ContextStore::install_chunk_file(const ChunkRef& chunk, bool compressed,
+                                      std::span<const std::uint8_t> file_bytes) const {
+    write_atomically(compressed ? compressed_chunk_path(chunk.hash) : chunk_path(chunk.hash),
+                     file_bytes);
+}
+
+std::vector<std::uint8_t> ContextStore::verified_chunk_file(const ChunkRef& chunk,
+                                                            bool& compressed) const {
+    const auto located = locate_chunk(chunk);
+    if (!located) { throw std::runtime_error("a chunk of the image is missing on disk"); }
+    std::vector<std::uint8_t> raw(chunk.length);
+    if (!read_chunk(chunk, raw) || hash(raw) != chunk.hash) {
+        throw std::runtime_error("a chunk of the image is damaged on disk");
+    }
+    compressed = located->compressed;
+    return compressed ? read_whole_file(compressed_chunk_path(chunk.hash)) : raw;
+}
+
+fs::path ContextStore::staging_path() const {
     static std::atomic<std::uint64_t> counter{0};
     std::ostringstream name;
     name << std::this_thread::get_id() << '.' << counter.fetch_add(1) << ".tmp";
-    const fs::path staging = options_.directory / "tmp" / name.str();
+    return options_.directory / "tmp" / name.str();
+}
+
+void ContextStore::remove_chunk_files(const std::array<std::uint64_t, 2>& hash) const noexcept {
+    remove_quietly(chunk_path(hash));
+    remove_quietly(compressed_chunk_path(hash));
+}
+
+void ContextStore::write_atomically(const fs::path& path, std::span<const std::uint8_t> bytes) const {
+    const fs::path staging = staging_path();
     std::error_code error;
     fs::create_directories(path.parent_path(), error);
     {
@@ -292,10 +477,10 @@ void ContextStore::add_references(const Entry& entry) {
         if (use.references++ == 0 && use.pins == 0) {
             use.length = chunk.length;
             // An image a remote holds is registered before its chunks are fetched.
-            std::error_code error;
-            const auto size = fs::file_size(chunk_path(chunk.hash), error);
-            use.present     = !error && size == chunk.length;
-            if (use.present) { chunk_total_bytes_ += chunk.length; }
+            const auto located = locate_chunk(chunk);
+            use.present        = located.has_value();
+            use.stored         = located ? located->bytes : 0;
+            if (use.present) { chunk_total_bytes_ += use.stored; }
         }
     }
 }
@@ -305,8 +490,8 @@ void ContextStore::release_references(const Entry& entry) {
         const auto found = chunks_.find(hex_key(chunk.hash));
         if (found == chunks_.end()) { continue; }
         if (--found->second.references == 0 && found->second.pins == 0) {
-            if (found->second.present) { chunk_total_bytes_ -= found->second.length; }
-            remove_quietly(chunk_path(chunk.hash));
+            if (found->second.present) { chunk_total_bytes_ -= found->second.stored; }
+            remove_chunk_files(chunk.hash);
             chunks_.erase(found);
         }
     }
@@ -317,8 +502,8 @@ void ContextStore::unpin_chunks_locked(const std::vector<ChunkRef>& chunks) {
         const auto found = chunks_.find(hex_key(chunk.hash));
         if (found == chunks_.end() || found->second.pins == 0) { continue; }
         if (--found->second.pins == 0 && found->second.references == 0) {
-            if (found->second.present) { chunk_total_bytes_ -= found->second.length; }
-            remove_quietly(chunk_path(chunk.hash));
+            if (found->second.present) { chunk_total_bytes_ -= found->second.stored; }
+            remove_chunk_files(chunk.hash);
             chunks_.erase(found);
         }
     }
@@ -465,23 +650,31 @@ void ContextStore::scan() {
     for (const auto& shard : fs::directory_iterator(options_.directory / "chunks", error)) {
         if (!shard.is_directory()) { continue; }
         for (const auto& item : fs::directory_iterator(shard.path(), error)) {
-            const std::string key = item.path().stem().string();
-            if (item.path().extension() != ".chunk" || chunks_.find(key) == chunks_.end()) {
-                remove_quietly(item.path());
+            const std::string name = item.path().filename().string();
+            constexpr std::string_view kRaw = ".chunk";
+            constexpr std::string_view kPacked = ".chunk.zst";
+            const auto ends_with = [&](std::string_view suffix) {
+                return name.size() > suffix.size() &&
+                       name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
+            };
+            std::string key;
+            if (ends_with(kPacked)) {
+                key = name.substr(0, name.size() - kPacked.size());
+            } else if (ends_with(kRaw)) {
+                key = name.substr(0, name.size() - kRaw.size());
             }
+            if (key.empty() || chunks_.find(key) == chunks_.end()) { remove_quietly(item.path()); }
         }
     }
     // An image whose chunk is missing or the wrong size can never be reassembled.
     std::vector<std::string> broken;
     for (const auto& [id, entry] : entries_) {
         for (const ChunkRef& chunk : entry.chunks) {
-            std::error_code stat_error;
-            const auto size = fs::file_size(chunk_path(chunk.hash), stat_error);
-            if (stat_error || size != chunk.length) {
+            if (!locate_chunk(chunk)) {
                 if (options_.remote) {
                     // The remote still has it: a missing chunk is fetched when the image is
                     // loaded, and a short one is discarded so it is fetched again.
-                    if (!stat_error) { remove_quietly(chunk_path(chunk.hash)); }
+                    remove_chunk_files(chunk.hash);
                     continue;
                 }
                 broken.push_back(id);
@@ -581,7 +774,9 @@ ContextStore::PutResult ContextStore::put(const Description& description,
     std::vector<Segment> segments;
     std::vector<ChunkRef> all_chunks;
     std::vector<fs::path> written;
-    std::vector<std::string> refilled; // chunks the index knew but the directory lacked, now written
+    // Chunks the index knew but the directory lacked, now written, with their size on disk.
+    std::vector<std::pair<std::string, std::uint64_t>> refilled;
+    std::uint64_t stored_written = 0;
     std::unordered_set<std::string> seen_in_put;
     try {
         const auto add_inline = [&](std::uint64_t begin, std::uint64_t end) {
@@ -615,10 +810,11 @@ ContextStore::PutResult ContextStore::put(const Description& description,
                     present = known && found->second.present;
                 }
                 if (!present && seen_in_put.find(key) == seen_in_put.end()) {
-                    write_atomically(chunk_path(chunk.hash), bytes);
-                    written.push_back(chunk_path(chunk.hash));
-                    if (known) { refilled.push_back(key); }
+                    const auto [path, stored] = write_chunk(chunk, bytes);
+                    written.push_back(path);
+                    if (known) { refilled.emplace_back(key, stored.bytes); }
                     result.chunk_bytes_written += size;
+                    stored_written += stored.bytes;
                 } else {
                     result.chunk_bytes_reused += size;
                 }
@@ -691,11 +887,12 @@ ContextStore::PutResult ContextStore::put(const Description& description,
             manifest_total_bytes_ -= replaced.manifest_bytes;
         }
         manifest_total_bytes_ += entry.manifest_bytes;
-        for (const std::string& key : refilled) {
+        for (const auto& [key, stored] : refilled) {
             const auto found = chunks_.find(key);
             if (found != chunks_.end() && !found->second.present) {
                 found->second.present = true;
-                chunk_total_bytes_ += found->second.length;
+                found->second.stored  = stored;
+                chunk_total_bytes_ += stored;
             }
         }
         add_references(entry);
@@ -741,6 +938,7 @@ ContextStore::PutResult ContextStore::put(const Description& description,
         }
         ++stats_.puts;
         stats_.bytes_written += result.chunk_bytes_written;
+        stats_.bytes_stored += stored_written;
         stats_.bytes_reused += result.chunk_bytes_reused;
         const std::uint64_t evictions_before = stats_.evicted_for_space + stats_.expired;
         maintain_locked(&description.id);
@@ -839,13 +1037,11 @@ std::optional<std::vector<std::uint8_t>> ContextStore::load(const std::string& i
                 try {
                     for (std::size_t index = next++; index < pieces.size(); index = next++) {
                         const Piece& piece = pieces[index];
-                        std::ifstream file(chunk_path(piece.chunk->hash), std::ios::binary);
-                        if (!file ||
-                            !file.read(reinterpret_cast<char*>(buffer + piece.position),
-                                       piece.chunk->length) ||
-                            hash(std::span<const std::uint8_t>(buffer + piece.position,
-                                                               piece.chunk->length)) !=
-                                piece.chunk->hash) {
+                        // A compressed chunk is decoded as a stream straight into the image.
+                        const std::span<std::uint8_t> target(buffer + piece.position,
+                                                             piece.chunk->length);
+                        if (!read_chunk(*piece.chunk, target) ||
+                            hash(target) != piece.chunk->hash) {
                             std::scoped_lock damage(damage_mutex);
                             damaged.push_back(*piece.chunk);
                         }
@@ -892,9 +1088,10 @@ std::optional<std::vector<std::uint8_t>> ContextStore::load(const std::string& i
                 const auto found = chunks_.find(hex_key(chunk.hash));
                 if (found != chunks_.end() && found->second.present) {
                     found->second.present = false;
-                    chunk_total_bytes_ -= found->second.length;
+                    chunk_total_bytes_ -= found->second.stored;
+                    found->second.stored = 0;
                 }
-                remove_quietly(chunk_path(chunk.hash));
+                remove_chunk_files(chunk.hash);
             }
         }
         std::uint64_t generation = 0;
@@ -971,9 +1168,20 @@ std::string ContextStore::remote_manifest_key(const std::string& id) const {
     return options_.remote_prefix + "manifests/" + id + ".manifest";
 }
 
-std::string ContextStore::remote_chunk_key(const std::array<std::uint64_t, 2>& hash) const {
+std::string ContextStore::remote_chunk_key(const std::array<std::uint64_t, 2>& hash,
+                                           bool compressed) const {
     const std::string key = hex_key(hash);
-    return options_.remote_prefix + "chunks/" + key.substr(0, 2) + "/" + key + ".chunk";
+    return options_.remote_prefix + "chunks/" + key.substr(0, 2) + "/" + key +
+           (compressed ? ".chunk.zst" : ".chunk");
+}
+
+std::optional<std::pair<std::string, bool>>
+ContextStore::find_remote_chunk(const std::array<std::uint64_t, 2>& hash) {
+    for (const bool compressed : {options_.compress_chunks, !options_.compress_chunks}) {
+        std::string key = remote_chunk_key(hash, compressed);
+        if (options_.remote->exists(key)) { return std::make_pair(std::move(key), compressed); }
+    }
+    return std::nullopt;
 }
 
 void ContextStore::enqueue_remote(RemoteTask task) {
@@ -1132,7 +1340,8 @@ void ContextStore::upload_image(RemoteTask& task) {
         const std::int64_t trust = options_.remote_touch_interval.count() * 1000;
         std::unordered_set<std::string> seen;
         for (const ChunkRef& chunk : task.chunks) {
-            const std::string key = remote_chunk_key(chunk.hash);
+            // Confirmations are tracked by content hash: the bucket may hold either form.
+            const std::string key = hex_key(chunk.hash);
             if (!seen.insert(key).second) { continue; }
             {
                 // A bucket's lifecycle rule can expire an object, so a confirmation is trusted for a
@@ -1141,13 +1350,12 @@ void ContextStore::upload_image(RemoteTask& task) {
                 const auto known = uploaded_.find(key);
                 if (known != uploaded_.end() && now - known->second < trust) { continue; }
             }
-            if (!options_.remote->exists(key)) {
+            if (!find_remote_chunk(chunk.hash)) {
                 // The file is pinned, so it is there; if it is not intact the image is not published.
-                const std::vector<std::uint8_t> data = read_whole_file(chunk_path(chunk.hash));
-                if (data.size() != chunk.length || hash(data) != chunk.hash) {
-                    throw std::runtime_error("a chunk of the image is damaged on disk");
-                }
-                options_.remote->put(key, data);
+                // A compressed chunk goes up as it is on disk.
+                bool compressed = false;
+                const std::vector<std::uint8_t> data = verified_chunk_file(chunk, compressed);
+                options_.remote->put(remote_chunk_key(chunk.hash, compressed), data);
                 ++objects;
                 bytes += data.size();
             }
@@ -1210,8 +1418,10 @@ void ContextStore::touch_remote_image(const std::string& id) {
     bool complete = true;
     try {
         for (const ChunkRef& chunk : chunks) {
-            const std::string key = remote_chunk_key(chunk.hash);
-            if (options_.remote->touch(key)) {
+            const std::string key = hex_key(chunk.hash); // confirmations are tracked by content hash
+            // The bucket may hold either form of the chunk; the form this store writes is tried first.
+            if (options_.remote->touch(remote_chunk_key(chunk.hash, options_.compress_chunks)) ||
+                options_.remote->touch(remote_chunk_key(chunk.hash, !options_.compress_chunks))) {
                 std::scoped_lock lock(remote_mutex_);
                 uploaded_[key] = now;
                 continue;
@@ -1224,17 +1434,14 @@ void ContextStore::touch_remote_image(const std::string& id) {
             // Put it back from the directory while the image is still in use, if the directory
             // has an intact copy.
             std::vector<std::uint8_t> data;
+            bool compressed = false;
             try {
-                data = read_whole_file(chunk_path(chunk.hash));
+                data = verified_chunk_file(chunk, compressed);
             } catch (const std::exception&) {
                 complete = false;
                 continue;
             }
-            if (data.size() != chunk.length || hash(data) != chunk.hash) {
-                complete = false;
-                continue;
-            }
-            options_.remote->put(key, data);
+            options_.remote->put(remote_chunk_key(chunk.hash, compressed), data);
             std::scoped_lock lock(mutex_);
             ++stats_.remote_uploads;
             stats_.remote_upload_bytes += data.size();
@@ -1295,19 +1502,36 @@ ContextStore::FetchStatus ContextStore::fetch_image_chunks(const std::string& id
             if (found != chunks_.end() && found->second.present) { continue; }
         }
         std::optional<std::vector<std::uint8_t>> data;
+        bool compressed = false;
         try {
-            data = options_.remote->get(remote_chunk_key(chunk.hash));
+            // Whichever form an engine uploaded; the form this store writes is tried first.
+            for (const bool form : {options_.compress_chunks, !options_.compress_chunks}) {
+                data = options_.remote->get(remote_chunk_key(chunk.hash, form));
+                if (data) {
+                    compressed = form;
+                    break;
+                }
+            }
         } catch (const std::exception&) {
             std::scoped_lock lock(mutex_);
             ++stats_.remote_download_failures;
             return FetchStatus::Transient;
         }
-        if (!data || data->size() != chunk.length || hash(*data) != chunk.hash) {
+        bool intact = false;
+        if (data) {
+            if (compressed) {
+                std::vector<std::uint8_t> raw(chunk.length);
+                intact = decompress_memory(*data, raw) && hash(raw) == chunk.hash;
+            } else {
+                intact = data->size() == chunk.length && hash(*data) == chunk.hash;
+            }
+        }
+        if (!intact) {
             std::scoped_lock lock(mutex_);
             ++stats_.remote_download_failures;
             return FetchStatus::Corrupt;
         }
-        if (!install_chunk(chunk, *data)) { return FetchStatus::Corrupt; }
+        if (!install_chunk(chunk, compressed, *data)) { return FetchStatus::Corrupt; }
         std::scoped_lock lock(mutex_);
         ++stats_.remote_downloads;
         stats_.remote_download_bytes += data->size();
@@ -1315,15 +1539,17 @@ ContextStore::FetchStatus ContextStore::fetch_image_chunks(const std::string& id
     return FetchStatus::Complete;
 }
 
-bool ContextStore::install_chunk(const ChunkRef& chunk, std::span<const std::uint8_t> bytes) {
+bool ContextStore::install_chunk(const ChunkRef& chunk, bool compressed,
+                                 std::span<const std::uint8_t> file_bytes) {
     std::scoped_lock io(io_mutex_);
     std::scoped_lock lock(mutex_);
     const auto found = chunks_.find(hex_key(chunk.hash));
     if (found == chunks_.end() || found->second.references == 0) { return false; } // image removed
     if (found->second.present) { return true; }
-    write_atomically(chunk_path(chunk.hash), bytes);
+    install_chunk_file(chunk, compressed, file_bytes);
     found->second.present = true;
-    chunk_total_bytes_ += chunk.length;
+    found->second.stored  = file_bytes.size();
+    chunk_total_bytes_ += found->second.stored;
     return true;
 }
 

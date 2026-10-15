@@ -52,6 +52,11 @@ public:
         // Images not used for this long are removed. Zero means no expiry.
         std::chrono::seconds ttl{0};
         std::uint64_t chunk_bytes = std::uint64_t{32} << 20U;
+        // Write new chunks zstd-compressed when that saves at least 3 % (otherwise raw), locally and
+        // in the remote. A chunk keeps its raw-content hash and length either way, so manifests do
+        // not change, and chunks of both forms are always read whatever this says.
+        bool compress_chunks = false;
+        int compression_level = 3;
         Clock clock; // defaults to the system clock
 
         // An optional remote copy of the whole store (an S3-compatible bucket). The directory then
@@ -124,7 +129,8 @@ public:
         std::uint64_t images            = 0;
         std::uint64_t puts              = 0;
         std::uint64_t put_failures      = 0;
-        std::uint64_t bytes_written     = 0;
+        std::uint64_t bytes_written     = 0; // raw bytes of new chunks
+        std::uint64_t bytes_stored      = 0; // what they took on disk after compression
         std::uint64_t bytes_reused      = 0;
         std::uint64_t loads             = 0;
         std::uint64_t load_misses       = 0;
@@ -220,8 +226,14 @@ private:
         std::uint32_t references = 0;
         // Queued uploads that still need the file: it outlives its last reference until they finish.
         std::uint32_t pins       = 0;
-        std::uint32_t length     = 0;
+        std::uint32_t length     = 0; // raw length
+        std::uint64_t stored     = 0; // bytes the chunk file takes on disk (raw or compressed)
         bool present             = false; // the chunk file is in the directory
+    };
+    // Which form of a chunk the directory holds.
+    struct StoredChunk {
+        bool compressed     = false;
+        std::uint64_t bytes = 0; // file size
     };
     struct RemoteTask {
         enum class Kind : std::uint8_t { Upload, Refresh, Prefetch, Touch } kind;
@@ -235,7 +247,29 @@ private:
     [[nodiscard]] std::filesystem::path manifest_path(const std::string& id) const;
     [[nodiscard]] std::filesystem::path used_path(const std::string& id) const;
     [[nodiscard]] std::filesystem::path chunk_path(const std::array<std::uint64_t, 2>& hash) const;
+    [[nodiscard]] std::filesystem::path
+    compressed_chunk_path(const std::array<std::uint64_t, 2>& hash) const;
+    // The chunk file in the directory, raw form preferred, with the right raw length; nullopt when
+    // there is none (a compressed file is checked by the content size in its frame header).
+    [[nodiscard]] std::optional<StoredChunk> locate_chunk(const ChunkRef& chunk) const;
+    // Reads the chunk into `out` (exactly chunk.length bytes), decompressing a compressed file
+    // as a stream straight into `out`. False when the file is missing, short or not a frame of
+    // that length; the caller still verifies the hash.
+    [[nodiscard]] bool read_chunk(const ChunkRef& chunk, std::span<std::uint8_t> out) const;
+    // Writes the chunk (compressed when options_.compress_chunks and it pays) and returns the
+    // path written and its size on disk.
+    [[nodiscard]] std::pair<std::filesystem::path, StoredChunk>
+    write_chunk(const ChunkRef& chunk, std::span<const std::uint8_t> bytes) const;
+    // Writes the bytes of a chunk file exactly as the remote holds it.
+    void install_chunk_file(const ChunkRef& chunk, bool compressed,
+                            std::span<const std::uint8_t> file_bytes) const;
+    // The chunk file's bytes for upload, after checking it decodes to the chunk's hash. Throws
+    // when the file is missing or damaged. `compressed` receives which form it is.
+    [[nodiscard]] std::vector<std::uint8_t> verified_chunk_file(const ChunkRef& chunk,
+                                                                bool& compressed) const;
     [[nodiscard]] std::int64_t now_ms() const;
+    [[nodiscard]] std::filesystem::path staging_path() const;
+    void remove_chunk_files(const std::array<std::uint64_t, 2>& hash) const noexcept;
 
     void scan();
     bool read_manifest(const std::filesystem::path& path, Entry& entry,
@@ -256,7 +290,12 @@ private:
 
     // The remote tier (all no-ops without options_.remote).
     [[nodiscard]] std::string remote_manifest_key(const std::string& id) const;
-    [[nodiscard]] std::string remote_chunk_key(const std::array<std::uint64_t, 2>& hash) const;
+    [[nodiscard]] std::string remote_chunk_key(const std::array<std::uint64_t, 2>& hash,
+                                               bool compressed) const;
+    // The remote object holding the chunk, whichever form some engine uploaded: the form this
+    // store writes is tried first. Nullopt when neither exists.
+    [[nodiscard]] std::optional<std::pair<std::string, bool>>
+    find_remote_chunk(const std::array<std::uint64_t, 2>& hash);
     void enqueue_remote(RemoteTask task);
     void enqueue_upload(const std::string& id, std::vector<std::uint8_t> manifest,
                         std::vector<ChunkRef> chunks);
@@ -273,7 +312,9 @@ private:
     // A fetch of `generation` found the image damaged or gone in the bucket: drop it and do not
     // offer it again, unless the entry has been replaced since.
     void settle_failed_fetch(const std::string& id, std::uint64_t generation);
-    bool install_chunk(const ChunkRef& chunk, std::span<const std::uint8_t> bytes);
+    // `file_bytes` is the chunk file as the remote holds it (raw, or a zstd frame when `compressed`).
+    bool install_chunk(const ChunkRef& chunk, bool compressed,
+                       std::span<const std::uint8_t> file_bytes);
 
     Options options_;
     // Serializes everything that changes files (put, load, erase, touch, maintain), so a chunk is

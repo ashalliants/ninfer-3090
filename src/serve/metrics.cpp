@@ -330,6 +330,8 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
             "Sessions not written because the write queue was full.");
     COUNTER(context_store_bytes_written, "context_store_bytes_written_total",
             "New chunk bytes written to the context store.");
+    COUNTER(context_store_bytes_stored, "context_store_bytes_stored_total",
+            "What the new chunk bytes took on disk after compression.");
     COUNTER(context_store_bytes_reused, "context_store_bytes_reused_total",
             "Chunk bytes a write found already stored and did not rewrite.");
     COUNTER(context_store_evicted, "context_store_evicted_total",

@@ -995,9 +995,223 @@ void test_final_flush_drops_best_effort_tasks() {
     check(uploaded, "the upload queued before the flush was not completed");
 }
 
+// Bytes that compress well: a short random pattern repeated.
+std::vector<std::uint8_t> compressible(std::size_t size, std::uint32_t seed) {
+    const auto pattern = pseudo_random(48, seed);
+    std::vector<std::uint8_t> out(size);
+    for (std::size_t i = 0; i < size; ++i) { out[i] = pattern[i % pattern.size()]; }
+    return out;
+}
+
+bool has_suffix(const fs::path& path, const std::string& suffix) {
+    const std::string name = path.filename().string();
+    return name.size() >= suffix.size() &&
+           name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+std::size_t files_with_suffix(const fs::path& directory, const std::string& suffix) {
+    std::size_t count = 0;
+    for (const auto& file : chunk_files(directory)) { count += has_suffix(file, suffix) ? 1U : 0U; }
+    return count;
+}
+
+ContextStore::Options compressed_options(const fs::path& directory, std::uint64_t chunk_bytes) {
+    ContextStore::Options options = options_for(directory);
+    options.compress_chunks       = true;
+    options.chunk_bytes           = chunk_bytes;
+    return options;
+}
+
+std::uint64_t directory_bytes(const fs::path& directory, const std::string& suffix) {
+    std::uint64_t total = 0;
+    for (const auto& item : fs::recursive_directory_iterator(directory)) {
+        if (item.is_regular_file() && has_suffix(item.path(), suffix)) { total += item.file_size(); }
+    }
+    return total;
+}
+
+// Chunks of 1 KiB (a frame per chunk) and of 1 MiB (several 256 KiB stream pieces per frame).
+void test_compressed_chunks_round_trip_and_account_for_disk_use() {
+    for (const std::uint64_t chunk : {std::uint64_t{1024}, std::uint64_t{1} << 20U}) {
+        TempDirectory directory;
+        ContextStore store(compressed_options(directory.path(), chunk));
+        const std::size_t packed_size = 3 * static_cast<std::size_t>(chunk) + 700;
+        const auto image = concat({pseudo_random(64, 1), compressible(packed_size, 2),
+                                   pseudo_random(2 * static_cast<std::size_t>(chunk), 3),
+                                   pseudo_random(9, 4)});
+        const std::array regions{ContextStore::Region{64, packed_size},
+                                 ContextStore::Region{64 + packed_size, 2 * chunk}};
+        const auto put = store.put(describe("c0de"), image, regions);
+        check(put.chunk_bytes_written == packed_size + 2 * chunk,
+              "a compressed put changed the raw byte count it reports");
+        check(files_with_suffix(directory.path(), ".chunk.zst") == 4,
+              "compressible chunks were not stored compressed");
+        check(files_with_suffix(directory.path(), ".chunk") == 2,
+              "incompressible chunks were not kept raw");
+        const auto stats = store.stats();
+        check(stats.bytes_stored < stats.bytes_written, "compression saved nothing in the stats");
+        check(stats.used_bytes ==
+                  directory_bytes(directory.path() / "chunks", "") + directory_bytes(directory.path() / "manifests", ".manifest"),
+              "used bytes do not match the files on disk");
+        const auto loaded = store.load("c0de");
+        check(loaded && *loaded == image, "a compressed image did not round trip");
+    }
+}
+
+void test_compressed_chunks_survive_restart_and_either_setting() {
+    TempDirectory directory;
+    const auto image = concat({pseudo_random(64, 1), compressible(5000, 2), pseudo_random(8, 4)});
+    {
+        ContextStore store(compressed_options(directory.path(), 1024));
+        (void)store.put(describe("f1f1"), image, std::array{ContextStore::Region{64, 5000}});
+    }
+    const std::uint64_t on_disk = directory_bytes(directory.path() / "chunks", "");
+    // Reopened with compression off: the scan keeps the compressed chunks and reads them.
+    ContextStore reopened(options_for(directory.path()));
+    check(files_with_suffix(directory.path(), ".chunk.zst") > 0,
+          "the scan swept the compressed chunks");
+    check(reopened.stats().used_bytes == on_disk + directory_bytes(directory.path() / "manifests", ".manifest"),
+          "a restart did not count the compressed chunks by their size on disk");
+    const auto loaded = reopened.load("f1f1");
+    check(loaded && *loaded == image, "a compressed image did not load with compression off");
+    // A compressed chunk no manifest names is an orphan like a raw one.
+    const fs::path stray = directory.path() / "chunks" / "00" / "00000000000000000000000000000000.chunk.zst";
+    fs::create_directories(stray.parent_path());
+    { std::ofstream file(stray, std::ios::binary); file << "x"; }
+    ContextStore again(options_for(directory.path()));
+    check(!fs::exists(stray), "an orphaned compressed chunk survived the scan");
+}
+
+void test_compressed_chunk_damage_is_a_miss() {
+    const auto image = concat({pseudo_random(64, 1), compressible(4096, 2)});
+    const std::array regions{ContextStore::Region{64, 4096}};
+    const auto damage = [&](const char* what, auto&& change) {
+        TempDirectory directory;
+        ContextStore store(compressed_options(directory.path(), 1024));
+        (void)store.put(describe("dd01"), image, regions);
+        std::vector<fs::path> packed;
+        for (const auto& file : chunk_files(directory.path())) {
+            if (has_suffix(file, ".chunk.zst")) { packed.push_back(file); }
+        }
+        std::sort(packed.begin(), packed.end());
+        check(packed.size() >= 2, "no compressed chunks to damage");
+        change(packed);
+        check(!store.load("dd01").has_value(), what);
+        check(!store.find("dd01").has_value(), "a damaged image stayed listed");
+    };
+    damage("a flipped byte in a compressed chunk was served", [](auto& files) {
+        std::fstream file(files.front(), std::ios::in | std::ios::out | std::ios::binary);
+        file.seekp(static_cast<std::streamoff>(fs::file_size(files.front()) / 2));
+        char byte = 0;
+        file.seekg(file.tellp());
+        file.read(&byte, 1);
+        byte ^= 0x5a;
+        file.seekp(static_cast<std::streamoff>(fs::file_size(files.front()) / 2));
+        file.write(&byte, 1);
+    });
+    damage("a truncated compressed chunk was served",
+           [](auto& files) { fs::resize_file(files.front(), fs::file_size(files.front()) - 3); });
+    damage("a compressed chunk with another chunk's bytes was served", [](auto& files) {
+        // Same raw length, valid frame, wrong content: only the hash can tell.
+        fs::copy_file(files[1], files[0], fs::copy_options::overwrite_existing);
+    });
+    damage("trailing bytes after a compressed frame were ignored", [](auto& files) {
+        std::ofstream file(files.front(), std::ios::binary | std::ios::app);
+        file << "junk";
+    });
+}
+
+void test_chunks_of_both_forms_share_a_store() {
+    TempDirectory directory;
+    const auto shared = compressible(4096, 2);
+    const auto first  = concat({pseudo_random(64, 1), shared});
+    {
+        ContextStore store(options_for(directory.path())); // raw
+        (void)store.put(describe("a001"), first, std::array{ContextStore::Region{64, 4096}});
+    }
+    ContextStore store(compressed_options(directory.path(), 1024));
+    const auto second = concat({pseudo_random(64, 9), shared, compressible(2048, 5)});
+    const auto put = store.put(describe("a002", 140), second, std::array{ContextStore::Region{64, 6144}});
+    check(put.chunk_bytes_reused == 4096 && put.chunk_bytes_written == 2048,
+          "a compressing store rewrote chunks the raw store already held");
+    check(files_with_suffix(directory.path(), ".chunk.zst") == 2,
+          "only the new chunks were expected to be compressed");
+    check(store.load("a001").value_or(std::vector<std::uint8_t>{}) == first &&
+              store.load("a002").value_or(std::vector<std::uint8_t>{}) == second,
+          "an image mixing raw and compressed chunks did not load");
+    check(store.erase("a001") && store.load("a002").value_or(std::vector<std::uint8_t>{}) == second,
+          "erasing the image holding the raw chunks broke the other");
+}
+
+void test_remote_holds_compressed_objects_and_other_forms_interoperate() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    TempDirectory c_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    const auto image = concat({pseudo_random(30, 1), compressible(4096, 2), pseudo_random(1024, 3)});
+    const std::array regions{ContextStore::Region{30, 5120}};
+    ContextStore::Options a_options = remote_options(a_directory.path(), remote);
+    a_options.compress_chunks       = true;
+    {
+        ContextStore a(a_options);
+        (void)a.put(describe("0b"), image, regions);
+        check(drained(a), "the compressed upload did not drain");
+        check(a.stats().remote_upload_failures == 0, "a compressed upload failed");
+    }
+    std::size_t packed_objects = 0;
+    std::size_t raw_objects    = 0;
+    for (const auto& [key, value] : remote->objects) {
+        packed_objects += has_suffix(key, ".chunk.zst") ? 1U : 0U;
+        raw_objects += has_suffix(key, ".chunk") ? 1U : 0U;
+    }
+    // Four compressible chunks, of which the first and the last are identical, and one random.
+    check(packed_objects == 3 && raw_objects == 1, "the bucket does not hold compressed objects");
+    // An engine that does not compress fetches them, and finds them when deciding what to upload.
+    {
+        ContextStore b(remote_options(b_directory.path(), remote));
+        check(b.refresh_remote() == 1, "the compressed image was not listed");
+        const auto loaded = b.load("0b");
+        check(loaded && *loaded == image, "an image fetched in compressed form differs");
+        const int before = remote->puts;
+        (void)b.put(describe("0c", 140), image, regions); // the same chunks under another id
+        check(drained(b), "the second upload did not drain");
+        check(remote->puts - before == 1, "chunks the bucket holds compressed were uploaded again");
+    }
+    // A compressing engine fetches a raw upload.
+    auto raw_remote = std::make_shared<MemoryObjectStore>();
+    {
+        ContextStore d(remote_options(c_directory.path(), raw_remote));
+        (void)d.put(describe("0d"), image, regions);
+        check(drained(d), "the raw upload did not drain");
+    }
+    TempDirectory e_directory;
+    ContextStore::Options e_options = remote_options(e_directory.path(), raw_remote);
+    e_options.compress_chunks       = true;
+    ContextStore e(e_options);
+    check(e.refresh_remote() == 1, "the raw image was not listed");
+    const auto loaded = e.load("0d");
+    check(loaded && *loaded == image, "a compressing engine could not fetch raw objects");
+    // A damaged compressed object is a corrupt fetch, not a served image.
+    TempDirectory f_directory;
+    for (auto& [key, value] : remote->objects) {
+        if (has_suffix(key, ".chunk.zst")) {
+            value.first[value.first.size() / 2] ^= 0x5a;
+            break;
+        }
+    }
+    ContextStore f(remote_options(f_directory.path(), remote));
+    (void)f.refresh_remote();
+    check(!f.load("0b").has_value(), "a damaged compressed object was served");
+}
+
 } // namespace
 
 int main() {
+    test_compressed_chunks_round_trip_and_account_for_disk_use();
+    test_compressed_chunks_survive_restart_and_either_setting();
+    test_compressed_chunk_damage_is_a_miss();
+    test_chunks_of_both_forms_share_a_store();
+    test_remote_holds_compressed_objects_and_other_forms_interoperate();
     test_hash();
     test_round_trip();
     test_incremental_put_writes_only_new_chunks();

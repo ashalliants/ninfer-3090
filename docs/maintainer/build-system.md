@@ -22,8 +22,9 @@ The default configuration is Release. Ninja links and archives share the single-
 
 Apps or tests enable the internal product support components: media acquisition, prompt input,
 logging and serving. This is one derived condition, not a separate user option. FFmpeg belongs
-to model media decoding and remains required when apps are disabled. Curl and spdlog are needed
-only for product support. A Python 3 interpreter is found when tests are configured. The larger Python
+to model media decoding and remains required when apps are disabled. zstd (libzstd 1.4 or newer;
+the vcpkg `zstd` port on Windows, `libzstd-dev` on Linux) is always required: the runtime's context
+store compresses chunks with it. Curl and spdlog are needed only for product support. A Python 3 interpreter is found when tests are configured. The larger Python
 pytest suites and conversion/evaluation scripts run separately from CMake and CTest.
 
 CUDA 13.1 and Python 3.11 describe the maintained environment, not configuration version gates.
