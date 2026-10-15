@@ -439,7 +439,20 @@ GenerationService::~GenerationService() {
     if (idle_sleeper_.joinable()) { idle_sleeper_.join(); }
 }
 
+// The one gate for every suspend (the /suspend route and the idle sleeper). A request counts in
+// `request_capacity_->active` from acquire_request_lifetime, before it reaches the Engine (media and
+// prompt preparation come in between), so the Engine's own idle check cannot see it yet. Holding the
+// capacity mutex across the check and the suspend makes the two atomic with admission: a request
+// arriving meanwhile waits for the suspend to finish and then sees a suspended model, exactly like
+// one that arrived just after it. Lock order: capacity mutex, then the Engine's mutexes; the Engine
+// never takes the capacity mutex.
 ninfer::ResidencyStatus GenerationService::suspend(std::optional<bool> auto_resume) {
+    std::lock_guard admission(request_capacity_->mutex);
+    if (request_capacity_->active != 0 &&
+        engine_->residency().state != ninfer::ModelResidency::Suspended) {
+        throw ninfer::RequestError(ninfer::RequestErrorKind::Overloaded,
+                                   "model suspend requires an idle server");
+    }
     return engine_->suspend(auto_resume);
 }
 
@@ -448,8 +461,8 @@ ninfer::ResidencyStatus GenerationService::resume() { return engine_->resume(); 
 ninfer::ResidencyStatus GenerationService::residency() const { return engine_->residency(); }
 
 // --sleep-idle-seconds: gives the model's device memory back once no request has been admitted for
-// that long. A request that slips in between the check and the suspend makes the Engine refuse it
-// (it is not idle), and the next poll tries again.
+// that long. suspend() checks admission and suspends under one lock, so a request that slips in
+// between the sampling above and the call makes it refuse (not idle), and the next poll tries again.
 void GenerationService::idle_sleep_loop() {
     const auto idle_for = std::chrono::seconds(options_.sleep_idle_seconds);
     auto idle_since     = Clock::now();
@@ -465,7 +478,7 @@ void GenerationService::idle_sleep_loop() {
         lock.unlock();
         try {
             if (engine_->residency().state != ninfer::ModelResidency::Suspended) {
-                (void)engine_->suspend(std::nullopt);
+                (void)suspend(std::nullopt);
             }
         } catch (const ninfer::RequestError&) {
             // Not idle after all: wait for the next quiet period.
