@@ -6,6 +6,7 @@
 #include "core/device.h"
 #include "core/decode_graph.h"
 
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
@@ -42,7 +43,7 @@ std::vector<double> hadamard_oracle(const std::vector<float>& input,
                     const double sign_before =
                         inverse ? 1.0 : static_cast<double>(signs[block * kBlock + j]);
                     const double value = static_cast<double>(input[base + j]) * sign_before;
-                    sum += (__builtin_popcount(static_cast<unsigned>(i & j)) & 1) ? -value : value;
+                    sum += (std::popcount(static_cast<unsigned>(i & j)) & 1) ? -value : value;
                 }
                 const double sign_after =
                     inverse ? static_cast<double>(signs[block * kBlock + i]) : 1.0;
@@ -343,7 +344,7 @@ int run_gated_rmsnorm_hadamard_case(std::int32_t heads, std::int64_t columns, st
         tn(normalized.p, DType::BF16, {kD, heads, t}), tc(composed.p, DType::BF16, {width, t}),
         tf(fused.data(), DType::BF16, {width, t});
     DeviceContext device;
-    ops::gated_rmsnorm(tx, tw, tz, 1.0e-6F, tn, device.stream);
+    ops::gated_rmsnorm(tx, tw, tz, 1.0e-6F, tn, device.execution_view());
     Tensor tn_columns = tn.view({width, t});
     ops::hadamard_transform(tn_columns, ts, false, tc, device.stream);
     ops::gated_rmsnorm_hadamard(tx, tw, tz, 1.0e-6F, ts, tf, device.stream);

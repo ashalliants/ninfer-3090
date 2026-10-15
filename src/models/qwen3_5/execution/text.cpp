@@ -1092,7 +1092,7 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase phas
     if (const Tensor* signs = ffn_input_signs(weights.ffn)) {
         ops::rmsnorm_hadamard(x, weights.post_attention_norm, config_.rms_norm_eps, true, *signs, h,
                               ctx_.stream);
-        ffn(h, weights.ffn, x, hints, work_, ctx_.stream, false, phase == Phase::Verify,
+        ffn(h, weights.ffn, x, hints, work_, ctx_.execution_view(), false, phase == Phase::Verify,
             InputBasis::Rotated);
         return;
     }

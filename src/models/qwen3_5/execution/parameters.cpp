@@ -88,13 +88,13 @@ public:
     // like the text projections (any row count of whole 64-row blocks at the hidden width).
     LinearParameters head(WeightUseId id) const {
         LinearParameters out = rotated_linear(id);
-        integer_route(out, QType::T2_G128_FP16, out.weight.n, 5120);
+        integer_route(out, {QType::T2_G128_FP16}, out.weight.n, 5120);
         return out;
     }
 
     LinearParameters head(WeightId id) const {
         LinearParameters out = rotated_linear(id);
-        integer_route(out, QType::T2_G128_FP16, out.weight.n, 5120);
+        integer_route(out, {QType::T2_G128_FP16}, out.weight.n, 5120);
         return out;
     }
 

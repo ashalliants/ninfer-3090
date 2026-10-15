@@ -2,6 +2,7 @@
 #include "ninfer/ops/hadamard_transform.h"
 #include "ninfer/ops/gated_rmsnorm.h"
 #include "ninfer/ops/rmsnorm.h"
+#include "core/device.h"
 
 #include "ops/launcher/hadamard_transform.h"
 
@@ -197,7 +198,11 @@ void gated_rmsnorm_hadamard(const Tensor& x, const Tensor& weight, const Tensor&
         return;
     }
     Tensor rows = out.view({x.ne[0], x.ne[1], x.ne[2], x.ne[3]});
-    gated_rmsnorm(x, weight, z, eps, rows, stream);
+    int device = 0;
+    int sms    = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
+    gated_rmsnorm(x, weight, z, eps, rows, DeviceExecutionView{stream, sms});
     Tensor columns = columns_view(out, width);
     hadamard_transform(columns, signs, false, columns, stream);
 }
