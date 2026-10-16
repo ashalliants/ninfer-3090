@@ -14,7 +14,9 @@
 // Records are random blocks with finite scales (each format's bytes per record are fixed, so the
 // rate does not depend on their values).
 //
-//   ninfer_benches ninfer_offloaded_moe_bench [--mode gpu|cpu|all] [--experts 10] [--reps 30] [--misses 1]
+//   lanes C independent decode columns (spike/qwen4exp-lanes); see bench_lanes.
+//
+//   ninfer_benches ninfer_offloaded_moe_bench [--mode gpu|cpu|all|lanes] [--experts 10] [--reps 30] [--misses 1]
 
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -25,6 +27,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -221,6 +224,118 @@ void bench_gpu(int experts, int reps, int misses) {
     }
 }
 
+// SPIKE (spike/qwen4exp-lanes): one decode layer call of C lanes, each column one lane routing its
+// own top 10, the C columns' routes overlapping so that D distinct experts are read (D = 10: every
+// lane routes the same ten; D = 10C: disjoint), m of the D missing (staged into 64 slots, as decode
+// configures them; the zero-copy rule applies at T = 1 only). Cold L2, CUDA graph replay, median.
+void bench_lanes(int reps) {
+    std::mt19937 rng(7);
+    cudaStream_t stream = nullptr;
+    cuda_ok(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+    DeviceBuffer flush(256u << 20), sink(64);
+    flush.fill(1);
+    const auto flush_l2 = [&] {
+        flush_kernel<<<328, 512, 0, stream>>>(static_cast<const uint4*>(flush.p), flush.bytes / 16,
+                                              static_cast<uint4*>(sink.p));
+    };
+    for (int i = 0; i < 400; ++i) { flush_l2(); }
+    cuda_ok(cudaStreamSynchronize(stream), "warm-up");
+    cudaEvent_t a, b;
+    cuda_ok(cudaEventCreate(&a), "event");
+    cuda_ok(cudaEventCreate(&b), "event");
+    constexpr int kTop = 10, kBank = 40, kSlots = 64;
+    std::printf("Lanes: one decode layer call, C columns of top %d, D distinct experts, m staged misses; cold L2, "
+                "graph replay, median of %d\n", kTop, reps);
+    std::printf("%-8s %2s %3s %3s %9s\n", "format", "C", "D", "m", "graph us");
+    for (QType format : kFormats) {
+        const std::uint64_t stride = stride_of(format);
+        const auto bytes           = bank_bytes(format, kBank, stride, rng);
+        DeviceBuffer frames(bytes.size());
+        frames.copy_from_host(bytes.data(), bytes.size());
+        std::uint8_t* host     = nullptr;
+        std::uint8_t* host_dev = nullptr;
+        cuda_ok(cudaHostAlloc(reinterpret_cast<void**>(&host), bytes.size(), cudaHostAllocMapped | cudaHostAllocPortable), "pinned");
+        cuda_ok(cudaHostGetDevicePointer(reinterpret_cast<void**>(&host_dev), host, 0), "mapped");
+        std::memcpy(host, bytes.data(), bytes.size());
+        DeviceBuffer staging(stride * kSlots);
+        for (int t = 1; t <= 4; ++t) {
+            std::vector<int> distinct = {kTop};
+            if (t > 1) {
+                distinct.push_back(kTop + (kTop * t - kTop) / 2);
+                distinct.push_back(kTop * t);
+            }
+            for (int d : distinct) {
+                std::vector<float> logits(static_cast<std::size_t>(d + 1) * t, 0.0F);
+                for (int c = 0; c < t; ++c) {
+                    const int start = t == 1 ? 0 : static_cast<int>(std::lround(double(c) * (d - kTop) / (t - 1)));
+                    for (int i = 0; i < kTop; ++i) {
+                        logits[static_cast<std::size_t>(c) * (d + 1) + start + i] = 100.0F + static_cast<float>(i);
+                    }
+                }
+                const int entries = kTop * t;
+                DeviceBuffer d_logits(logits.size() * 4), ids(static_cast<std::size_t>(entries) * 4), weights(ids.bytes),
+                    gate(static_cast<std::size_t>(t) * 4), dispatch(ops::moe_dispatch_bytes(d, entries));
+                d_logits.copy_from_host(logits.data(), logits.size() * 4);
+                ops::MoeRouting routing{Tensor(ids.p, DType::I32, {kTop, t}), Tensor(weights.p, DType::FP32, {kTop, t}),
+                                        Tensor(gate.p, DType::FP32, {t})};
+                auto view = ops::carve_moe_dispatch(dispatch.p, d, entries);
+                ops::moe_route(Tensor(d_logits.p, DType::FP32, {d + 1, t}), kTop, routing, stream);
+                ops::moe_dispatch(routing, d, view, nullptr, stream);
+                std::vector<std::uint16_t> xh(static_cast<std::size_t>(om::kHidden) * t);
+                std::normal_distribution<float> n(0.0F, 1.0F);
+                for (auto& v : xh) {
+                    const float f = n(rng);
+                    std::uint32_t u;
+                    std::memcpy(&u, &f, 4);
+                    v = static_cast<std::uint16_t>(u >> 16);
+                }
+                DeviceBuffer x(xh.size() * 2), out(static_cast<std::size_t>(entries) * om::kHidden * 2),
+                    workspace(ops::moe_experts_workspace_bytes(d, entries, t));
+                x.copy_from_host(xh.data(), xh.size() * 2);
+                for (int m : {0, 1, 2, 4, 8}) {
+                    if (m > d) { continue; }
+                    std::vector<std::int32_t> f(d, -1);
+                    for (int e = m; e < d; ++e) { f[e] = e; }
+                    DeviceBuffer d_frames(f.size() * 4);
+                    d_frames.copy_from_host(f.data(), f.size() * 4);
+                    ops::MoeExpertSource source;
+                    source.format           = format;
+                    source.frame_base       = static_cast<const std::uint8_t*>(frames.p);
+                    source.frames           = static_cast<const std::int32_t*>(d_frames.p);
+                    source.host_records     = host_dev;
+                    source.record_stride    = stride;
+                    source.staging_base     = static_cast<std::uint8_t*>(staging.p);
+                    source.staging_slots    = kSlots;
+                    source.zero_copy_misses = 2;
+                    const Tensor xt(x.p, DType::BF16, {om::kHidden, t});
+                    Tensor ot(out.p, DType::BF16, {om::kHidden, entries});
+                    cudaGraph_t graph    = nullptr;
+                    cudaGraphExec_t exec = nullptr;
+                    cuda_ok(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "capture");
+                    ops::moe_experts(xt, view, source, kTop, d, workspace.p, ot, stream);
+                    cuda_ok(cudaStreamEndCapture(stream, &graph), "capture");
+                    cuda_ok(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+                    std::vector<double> us;
+                    for (int r = 0; r < reps + 3; ++r) {
+                        flush_l2();
+                        cuda_ok(cudaEventRecord(a, stream), "record");
+                        cuda_ok(cudaGraphLaunch(exec, stream), "replay");
+                        cuda_ok(cudaEventRecord(b, stream), "record");
+                        cuda_ok(cudaEventSynchronize(b), "sync");
+                        float ms = 0.0F;
+                        cuda_ok(cudaEventElapsedTime(&ms, a, b), "elapsed");
+                        if (r >= 3) { us.push_back(ms * 1000.0); }
+                    }
+                    cuda_ok(cudaGraphExecDestroy(exec), "destroy");
+                    cuda_ok(cudaGraphDestroy(graph), "destroy");
+                    std::printf("%-8s %2d %3d %3d %9.1f\n", name(format), t, d, m, median(us));
+                }
+            }
+        }
+        cudaFreeHost(host);
+    }
+}
+
 void bench_cpu(int reps) {
     std::mt19937 rng(9);
     const int records = 96; // > the last-level cache at every format
@@ -282,5 +397,6 @@ int main(int argc, char** argv) {
     }
     if (mode == "gpu" || mode == "all") { bench_gpu(experts, reps, misses); }
     if (mode == "cpu" || mode == "all") { bench_cpu(reps); }
+    if (mode == "lanes") { bench_lanes(reps); }
     return 0;
 }
