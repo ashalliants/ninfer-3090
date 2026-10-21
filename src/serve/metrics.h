@@ -1,11 +1,13 @@
 #pragma once
 
+#include "core/gpu_telemetry.h"
 #include "serve/generation_pace.h"
 #include "serve/generation_service.h"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -26,6 +28,9 @@ class Metrics {
 public:
     void configure(std::string model, const EngineOptions& options, const MemorySummary& memory,
                    RuntimeStats baseline);
+    // Where render() reads the GPU gauges. configure() installs NVML for options.device; a test
+    // replaces it. Unset, or fields it leaves unknown, drop those series rather than report zero.
+    void set_gpu_sampler(std::function<GpuSample()> sampler);
     void first_token(const GenerationFirstTokenObservation& observation);
     void done(const GenerationOutcome& outcome);
     void rejected();
@@ -73,6 +78,7 @@ private:
     EngineOptions options_;
     MemorySummary memory_;
     RuntimeStats baseline_;
+    std::function<GpuSample()> gpu_sampler_;
     double start_seconds_ = 0.0;
     mutable std::mutex mutex_;
     Requests requests_;

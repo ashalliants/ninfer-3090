@@ -2,12 +2,15 @@
 
 #include "product/speculative_options.h"
 
+#include <cuda_runtime.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <iomanip>
 #include <locale>
+#include <memory>
 #include <sstream>
 #include <string_view>
 #include <utility>
@@ -100,6 +103,17 @@ void Metrics::configure(std::string model, const EngineOptions& options,
     baseline_ = baseline;
     start_seconds_ =
         std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+    char bus_id[32] = {};
+    if (cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), options.device) == cudaSuccess) {
+        auto telemetry = std::make_shared<GpuTelemetry>(bus_id);
+        if (telemetry->available()) {
+            set_gpu_sampler([telemetry] { return telemetry->sample(); });
+        }
+    }
+}
+
+void Metrics::set_gpu_sampler(std::function<GpuSample()> sampler) {
+    gpu_sampler_ = std::move(sampler);
 }
 
 void Metrics::first_token(const GenerationFirstTokenObservation& observation) {
@@ -210,6 +224,24 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
     counter("constraint_draft_wait_seconds_total", stats.host_work.constraint_draft_wait_ns * 1e-9,
             baseline_.host_work.constraint_draft_wait_ns * 1e-9,
             "Draft-ready wait, counted once per batch.");
+    if (gpu_sampler_) {
+        const GpuSample gpu = gpu_sampler_();
+        const auto optional_gauge = [&](std::string_view name, const auto& value,
+                                        std::string_view help) {
+            if (value) { gauge(name, *value, help); }
+        };
+        optional_gauge("gpu_utilization_percent", gpu.utilization_percent,
+                       "Share of the last NVML sample period in which any kernel ran.");
+        optional_gauge("gpu_memory_utilization_percent", gpu.memory_utilization_percent,
+                       "Share of the last NVML sample period in which device memory was read or "
+                       "written.");
+        optional_gauge("gpu_memory_used_bytes", gpu.memory_used_bytes,
+                       "Device memory in use by every process on the GPU.");
+        optional_gauge("gpu_memory_total_bytes", gpu.memory_total_bytes,
+                       "Device memory installed.");
+        optional_gauge("gpu_temperature_celsius", gpu.temperature_celsius, "GPU core temperature.");
+        optional_gauge("gpu_power_watts", gpu.power_watts, "Board power draw.");
+    }
     gauge("engine_ready", ready ? 1 : 0, "Whether Engine can accept work.");
     gauge("server_start_time_seconds", start_seconds_,
           "Unix time at service attachment after warmup.");
