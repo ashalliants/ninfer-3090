@@ -264,6 +264,8 @@ private:
     std::deque<ModelEvent> events_;
     std::uint64_t first_event_ = 1;
     bool stopping_             = false;
+    // The slot the latest request was routed to; what a request naming no model goes to.
+    std::optional<std::size_t> last_served_;
     std::thread idle_thread_;
 };
 

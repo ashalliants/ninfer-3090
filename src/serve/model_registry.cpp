@@ -142,22 +142,25 @@ void ModelRegistry::stop() noexcept {
 std::optional<std::size_t> ModelRegistry::find_locked(std::string_view model) const {
     if (model.empty()) {
         if (models_.size() == 1) { return 0; }
-        // The most recently used loaded model serves a request that names none.
+        // The model that last served a request answers one that names none; `last_used` also moves
+        // on administrative loads and request completions, so it cannot say who served last.
+        const auto resident = [&](std::size_t index) {
+            return models_[index].state == ModelState::Loaded ||
+                   models_[index].state == ModelState::Sleeping;
+        };
+        if (last_served_ && resident(*last_served_)) { return last_served_; }
         std::optional<std::size_t> best;
         for (std::size_t index = 0; index < models_.size(); ++index) {
-            const Slot& slot = models_[index];
-            if (slot.state != ModelState::Loaded && slot.state != ModelState::Sleeping) {
-                continue;
-            }
-            if (!best || slot.last_used > models_[*best].last_used) { best = index; }
+            if (!resident(index)) { continue; }
+            if (!best || models_[index].last_used > models_[*best].last_used) { best = index; }
         }
         if (best) { return best; }
         // Everything has been unloaded: the model that last served is still the default, and a
         // request for it loads it again.
+        if (last_served_) { return last_served_; }
         for (std::size_t index = 0; index < models_.size(); ++index) {
-            const Slot& slot = models_[index];
-            if (slot.last_used == Clock::time_point{}) { continue; }
-            if (!best || slot.last_used > models_[*best].last_used) { best = index; }
+            if (models_[index].last_used == Clock::time_point{}) { continue; }
+            if (!best || models_[index].last_used > models_[*best].last_used) { best = index; }
         }
         return best;
     }
@@ -391,6 +394,7 @@ ModelRegistry::Lease ModelRegistry::acquire(std::string_view model, std::optiona
     Slot& ready = models_[index];
     ++ready.leases;
     ready.last_used = Clock::now();
+    last_served_    = index;
     return Lease(*this, index, true);
 }
 

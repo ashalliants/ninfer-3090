@@ -353,6 +353,15 @@ void empty_selector_survives_unloading() {
     expect(lease.model() == "b", "an empty selector reaches the model that last served, though unloaded");
 }
 
+void empty_selector_follows_requests_not_loads() {
+    Journal journal;
+    ModelRegistry registry({model("a"), model("b")}, RegistryPolicy{}, factory(journal), true);
+    { auto lease = registry.acquire("a"); }
+    registry.load("b"); // an administrative load is not a request
+    auto lease = registry.acquire("");
+    expect(lease.model() == "a", "an empty selector goes to the model that last served a request");
+}
+
 void a_waiting_request_can_be_cancelled() {
     Journal journal;
     RegistryPolicy policy;
@@ -495,6 +504,7 @@ int main() {
         shared_state_files_are_refused();
         a_waiting_request_can_be_cancelled();
         empty_selector_survives_unloading();
+        empty_selector_follows_requests_not_loads();
         selector_rewrite_changes_only_the_selector();
         single_model_mode();
         catalog();

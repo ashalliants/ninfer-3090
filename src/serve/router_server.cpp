@@ -382,7 +382,8 @@ void RouterServer::handle_health(const httplib::Request&, httplib::Response& res
                     "application/json");
 }
 
-void RouterServer::handle_models(const httplib::Request&, httplib::Response& res) const {
+void RouterServer::handle_models(const httplib::Request& req, httplib::Response& res) const {
+    ensure_http_request_id(req, res);
     Json data = Json::array();
     for (const ModelStatusSnapshot& status : registry_.status()) {
         data.push_back(model_entry(status));
@@ -398,6 +399,7 @@ void RouterServer::handle_model(const httplib::Request& req, httplib::Response& 
         write_error(req, res, 404, "model_not_found", "model '" + id + "' not found");
         return;
     }
+    ensure_http_request_id(req, res);
     res.set_content(model_entry(*status).dump(), "application/json");
 }
 
@@ -463,11 +465,14 @@ void RouterServer::handle_models_sleep(const httplib::Request& req, httplib::Res
         bool hold               = false;
         bool wait               = true;
         const Json body         = Json::parse(req.body);
-        if (const auto found = body.find("hold"); found != body.end() && found->is_boolean()) {
-            hold = found->get<bool>();
-        }
-        if (const auto found = body.find("wait"); found != body.end() && found->is_boolean()) {
-            wait = found->get<bool>();
+        for (const auto& [key, flag] : {std::pair<const char*, bool*>{"hold", &hold},
+                                        std::pair<const char*, bool*>{"wait", &wait}}) {
+            const auto found = body.find(key);
+            if (found == body.end()) { continue; }
+            if (!found->is_boolean()) {
+                throw std::invalid_argument(std::string("\"") + key + "\" must be a boolean");
+            }
+            *flag = found->get<bool>();
         }
         registry_.sleep(model, hold, wait);
         write_ok(res);
@@ -514,10 +519,15 @@ void RouterServer::handle_residency(const httplib::Request& req, httplib::Respon
         relay(req, res, std::move(*lease), "GET", "/v1/models/" + *resolved + "/residency", {});
         return;
     }
+    // Nothing to relay to: report the registry's own state, which is loading or unloading while
+    // the model is in transition.
+    const auto status        = registry_.status(*resolved);
+    const std::string state  = status ? model_state_name(status->state) : "unloaded";
+    ensure_http_request_id(req, res);
     res.set_content(Json{{"object", "model.residency"},
                          {"model", *resolved},
-                         {"status", "unloaded"},
-                         {"state", "unloaded"}}
+                         {"status", state},
+                         {"state", state}}
                         .dump(),
                     "application/json");
 }

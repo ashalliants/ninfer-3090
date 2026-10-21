@@ -34,14 +34,6 @@ bool is_openai_path(std::string_view path) {
     return path.starts_with("/v1/") && !is_anthropic_path(path);
 }
 
-void ensure_http_request_id(const httplib::Request& request, httplib::Response& response) {
-    if (is_anthropic_path(request.path) && !response.has_header("request-id")) {
-        response.set_header("request-id", new_anthropic_request_id());
-    } else if (is_openai_path(request.path) && !response.has_header("x-request-id")) {
-        response.set_header("x-request-id", new_openai_request_id());
-    }
-}
-
 ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
                                         const ninfer::RuntimeStats& current,
                                         double interval_seconds) {
@@ -136,6 +128,14 @@ std::string response_request_id(const httplib::Response& response) {
 }
 
 } // namespace
+
+void ensure_http_request_id(const httplib::Request& request, httplib::Response& response) {
+    if (is_anthropic_path(request.path) && !response.has_header("request-id")) {
+        response.set_header("request-id", new_anthropic_request_id());
+    } else if (is_openai_path(request.path) && !response.has_header("x-request-id")) {
+        response.set_header("x-request-id", new_openai_request_id());
+    }
+}
 
 void write_openai_error(httplib::Response& response, const ApiError& error) {
     response.status = error.status;
