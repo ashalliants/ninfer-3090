@@ -168,9 +168,16 @@ void EngineCore<Instance>::publish_runtime_stats() {
     snapshot.device_main_kv_occupied_pages    = physical.occupied.main_kv_pages;
     snapshot.device_backend_kv_occupied_pages = physical.occupied.backend_kv_pages;
 
+    std::uint64_t backlog_ns = 0;
+    const auto add_backlog   = [&backlog_ns](std::uint64_t ns) {
+        backlog_ns = ns > UINT64_MAX - backlog_ns ? UINT64_MAX : backlog_ns + ns;
+    };
     {
         std::lock_guard lock(queue_mutex_);
         snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
+        for (const auto& request : pending_) {
+            add_backlog(prefill_estimate_ns(request->prompt_summary.prompt_tokens));
+        }
     }
     snapshot.prefilling_requests              = 0;
     snapshot.paused_requests                  = static_cast<std::uint32_t>(paused_.size());
@@ -187,12 +194,22 @@ void EngineCore<Instance>::publish_runtime_stats() {
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
         if (slots_[lane] == nullptr) { continue; }
         ++snapshot.running_requests;
-        if (slots_[lane]->is_prefilling()) { ++snapshot.prefilling_requests; }
+        if (slots_[lane]->is_prefilling()) {
+            ++snapshot.prefilling_requests;
+            if (slots_[lane]->base_plan) {
+                if (const auto cursor = sibling_cursor(*slots_[lane])) {
+                    add_backlog(prefill_remaining_ns(*slots_[lane], *cursor));
+                }
+            }
+        }
         if (slots_[lane]->is_replaying()) { ++snapshot.replaying_requests; }
         if (slots_[lane]->is_decode_ready()) { ++snapshot.decode_ready_requests; }
         if (slots_[lane]->capture_pending) { ++snapshot.capture_pending_requests; }
         if (slots_[lane]->terminal_reason) { ++snapshot.terminal_pending_requests; }
     }
+    // A saturated cost model says nothing, so it reports nothing rather than a huge wait.
+    snapshot.prefill_backlog_seconds =
+        backlog_ns == UINT64_MAX ? 0.0 : static_cast<double>(backlog_ns) * 1e-9;
     detail_range.reset();
     record_detail(&RuntimeHostWorkStats::stats_publication_ns,
                   &RuntimeHostWorkStats::stats_publication_invocations, detail_started);

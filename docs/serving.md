@@ -361,7 +361,7 @@ curl http://127.0.0.1:8080/v1/load -H 'Authorization: Bearer local-secret'
                "max_context": 65536, "kv_capacity_tokens": 131072, "kv_capacity_pages": 2048,
                "kv_page_tokens": 64, "device_state_slots": 8, "host_context_bytes": 17179869184},
   "requests": {"admitted": 6, "running": 4, "prefilling": 1, "decode_ready": 3, "waiting": 2,
-               "paused": 0, "replaying": 0, "materializing": 0},
+               "paused": 0, "replaying": 0, "materializing": 0, "prefill_backlog_seconds": 14.2},
   "occupancy": {"device_main_kv_pages": 1500, "device_main_kv_tokens": 96000,
                 "device_state_slots": 5, "host_context_bytes": 2684354560,
                 "host_state_slots": 7, "host_kv_bytes": 2147483648},
@@ -386,7 +386,11 @@ curl http://127.0.0.1:8080/v1/load -H 'Authorization: Bearer local-secret'
   left to prefill, `replaying` the lanes rebuilding a paused request's state, and `decode_ready` the
   lanes in the decode batch. `waiting` counts requests submitted to the Engine FIFO that have not
   been admitted to a lane yet. `paused` counts admitted requests that resource pressure paused; they
-  hold no lane and resume in their original order.
+  hold no lane and resume in their original order. `prefill_backlog_seconds` is the prefill time the
+  Engine's context-cost model predicts is ahead of a new request: what the resident prefills have left
+  plus what each queued request costs from scratch (a cache hit makes it cheaper). It leaves out decode
+  and paused requests and is 0 when idle, so a gateway choosing between servers can prefer the smaller
+  backlog; it is a prediction from the machine's fitted costs, not a promise.
 - `capacity.host_context_bytes` is the one pinned Host budget (see
   [Automatic host cache](#automatic-host-cache)). `occupancy` reports current Main KV pages (and
   tokens), Device StateImage slots, and the Host context bytes in use, including destinations
@@ -678,6 +682,7 @@ server restarts.
 | `ninfer_waiting_cancelled_requests_total`, `ninfer_waiting_expired_requests_total`, `ninfer_waiting_abandoned_seconds_total` | requests the client cancelled, or the pending timeout expired, before admission, and the total time they had waited (a client that gives up after 60 s shows up here) |
 | `ninfer_cancelled_prefills_total`, `ninfer_cancelled_prefill_computed_tokens_total` | requests cancelled while prefilling, and the prompt tokens they had computed |
 | `ninfer_paced_prefill_steps_total`, `ninfer_paced_prefill_deferred_tokens_total` | prefill steps cut short by `--prefill-stall-budget-ms` because another lane was decoding, and the prompt tokens they pushed to later steps |
+| `ninfer_prefill_backlog_seconds` | gauge: predicted prefill work ahead of a new request (resident remainder plus queued requests uncached); the same figure as `prefill_backlog_seconds` in `/v1/load` |
 | `ninfer_prefill_yields_total` | prefills paused so a short request at the head of the queue could be admitted (`--yield-long-prefill-ms`) |
 | `ninfer_engine_recoveries_total` | host-side worker failures the server survived by failing the in-flight requests and clearing the context cache |
 | `ninfer_device_kv_{used,capacity}_pages`, `ninfer_device_backend_kv_used_pages`, `ninfer_device_state_{used,capacity}_slots` | physical Main KV, speculative backend KV and StateImage occupancy; retained history also occupies these pools |

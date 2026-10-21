@@ -48,6 +48,7 @@ int main() {
     sample.stats.paused_requests               = 1;
     sample.stats.replaying_requests            = 1;
     sample.stats.materializing_requests        = 0;
+    sample.stats.prefill_backlog_seconds       = 61.25;
     sample.stats.device_main_kv_occupied_pages = 100;
     sample.stats.device_state_occupied_slots   = 5;
     sample.stats.host_state_occupied_slots     = 7;
@@ -86,6 +87,8 @@ int main() {
                           requests.at("waiting") == 2 && requests.at("paused") == 1 &&
                           requests.at("replaying") == 1 && requests.at("materializing") == 0,
                       "request gauges");
+    failures += check(requests.at("prefill_backlog_seconds") == 61.25,
+                      "the predicted prefill backlog");
 
     const Json& occupancy = report.at("occupancy");
     failures += check(occupancy.at("device_main_kv_pages") == 100 &&

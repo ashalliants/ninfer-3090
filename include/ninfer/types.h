@@ -1432,6 +1432,10 @@ struct RuntimeStats {
     std::uint32_t prefilling_requests       = 0;
     std::uint32_t decode_ready_requests     = 0;
     std::uint32_t waiting_requests          = 0;
+    // Prefill work still ahead of a caller, in seconds the context-cost model predicts: what the
+    // resident prefills have left plus what the queued requests cost uncached. Paused and replaying
+    // requests are not counted. A gauge, 0 when idle or when the model has no estimate.
+    double prefill_backlog_seconds          = 0.0;
     std::uint32_t paused_requests           = 0;
     std::uint32_t replaying_requests        = 0;
     std::uint32_t materializing_requests    = 0;
