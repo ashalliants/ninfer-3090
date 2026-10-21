@@ -657,7 +657,8 @@ may not name any model's artifact, n-gram volume or expert state, whether it com
 line or a model's own section; models that name the same file append to one shared log, one record
 at a time. The router accepts a request body up to the largest `--max-request-mib` of any model, and
 that model's own server then applies its limit.
-`--ngram-volume` and `--expert-state` may not give the same file to two models.
+`--ngram-volume` and `--expert-state` may not give the same file to two models, and one model's
+n-gram volume, expert state and artifact must be three different files.
 
 `--models-max N` (default 1, 0 for no limit) bounds how many models are loaded at once. To make room
 the least recently used model without a request in flight **sleeps** when it was started with
@@ -679,8 +680,8 @@ The router answers llama.cpp's model API itself:
 | `POST /v1/models/{id}/suspend`, `/resume`, `GET /v1/models/{id}/residency` | the [model suspend](#model-suspend) endpoints of one model |
 
 `GET /health` is 200 while the router runs. `GET /props`, `/metrics` and `/v1/load` answer for the
-model that last served, without waking a sleeping one. Everything else (chat completions, Responses,
-Messages and the rest) is forwarded to the model it names: each model runs the ordinary
+model that last served, without waking or loading it (a 503 while it is unloaded). Everything
+else (chat completions, Responses, Messages and the rest) is forwarded to the model it names: each model runs the ordinary
 single-model server on a loopback port of its own, so every endpoint, request log and metric works
 per model unchanged. The router checks `--api-key` and applies `--cors`; models need neither.
 Streamed responses stream, and a client that disconnects cancels the generation, also while the

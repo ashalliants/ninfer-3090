@@ -324,6 +324,11 @@ void shared_state_files_are_refused() {
     a.options.flash_next.expert_state_path = "/m/x";
     a.options.flash_next.ngram_volume_path = "/m/x";
     expect(refused({a, b}), "a model's n-gram volume and expert state may not share a file");
+    a.options.flash_next.expert_state_path.clear();
+    a.options.flash_next.ngram_volume_path.clear();
+    expect(!refused({a, b}), "a model's default n-gram volume and expert state are distinct files");
+    a.options.flash_next.ngram_volume_path = "/m/a.ninfer";
+    expect(refused({a, b}), "a model's n-gram volume may not land on its own artifact");
     a.options.flash_next.save_expert_state = false;
     a.options.flash_next.expert_state_path.clear();
     a.options.flash_next.ngram_volume_path.clear();
@@ -381,8 +386,20 @@ void empty_selector_prefers_last_served_over_other_residents() {
     { auto lease = registry.acquire("a"); }
     registry.unload("a");
     registry.load("b");
+    expect(!registry.observe("").has_value(), "status for the unloaded default observes nothing");
     auto lease = registry.acquire("");
     expect(lease.model() == "a", "an empty selector keeps the last-served model though another is resident");
+}
+
+void router_takes_the_largest_model_limit() {
+    Journal journal;
+    auto small                      = model("small");
+    auto large                      = model("large");
+    small.options.max_request_bytes = 8ULL << 20;
+    large.options.max_request_bytes = 16ULL << 20;
+    ModelRegistry registry({small, large}, RegistryPolicy{}, factory(journal), true);
+    expect(registry.max_request_bytes() == (16ULL << 20),
+           "the router's limit is the largest model's, even below the 384 MiB default");
 }
 
 void a_resumed_failed_service_is_rebuilt() {
@@ -545,6 +562,7 @@ int main() {
         empty_selector_survives_unloading();
         empty_selector_follows_requests_not_loads();
         empty_selector_prefers_last_served_over_other_residents();
+        router_takes_the_largest_model_limit();
         a_resumed_failed_service_is_rebuilt();
         selector_rewrite_changes_only_the_selector();
         single_model_mode();
