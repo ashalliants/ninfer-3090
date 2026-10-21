@@ -110,12 +110,25 @@ bool ProgramImpl::prompt_fits_beside_residents(const RequestBasePlan& base,
     }
     // Live reservations are pages residents will map as they grow, and lent pages are gone from the
     // pool, so the pool's own counters decide what is left (reclaimable checkpoint pages stay free).
+    // Optional capture tails are reservations too, but binding reclaims them first, so they are not
+    // a reason to defer.
+    std::uint32_t capture_main = 0, capture_backend = 0;
+    for (const auto& request : requests) {
+        const auto& ticket = request.capture_reservation;
+        if (!ticket) { continue; }
+        if (ticket->main_tail) { capture_main += ticket->main_tail->pages(); }
+        if (ticket->backend_tail) { capture_backend += ticket->backend_tail->pages(); }
+    }
     const auto& main_pool = text_kv_pages->physical_pool();
     const auto* backend   = backend_kv_pages ? &backend_kv_pages->physical_pool() : nullptr;
+    const auto live_main =
+        main_pool.reserved_pages() - std::min(main_pool.reserved_pages(), capture_main);
+    const auto live_backend =
+        backend ? backend->reserved_pages() - std::min(backend->reserved_pages(), capture_backend)
+                : 0U;
     return runtime::prompt_fits_beside_residents(
         {need_main, need_backend},
-        {pinned_main.size() + main_pool.reserved_pages(),
-         pinned_backend.size() + (backend ? backend->reserved_pages() : 0U)},
+        {pinned_main.size() + live_main, pinned_backend.size() + live_backend},
         {main_pool.usable_pages(), backend ? backend->usable_pages() : 0U}, residents);
 }
 
