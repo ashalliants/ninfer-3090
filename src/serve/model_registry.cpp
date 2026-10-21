@@ -43,6 +43,14 @@ void check_model_state_paths(const std::vector<ModelDefinition>& models) {
         auto out = std::filesystem::weakly_canonical(path, error);
         return error ? std::filesystem::absolute(path, error).lexically_normal() : out;
     };
+    // Windows and macOS volumes usually ignore case, so names differing only in case are one file.
+    const auto key = [](const std::filesystem::path& path) {
+        std::string text = path.string();
+        for (char& letter : text) {
+            if (letter >= 'A' && letter <= 'Z') { letter = static_cast<char>(letter - 'A' + 'a'); }
+        }
+        return text;
+    };
     std::vector<Entry> entries;
     for (const ModelDefinition& model : models) {
         const std::filesystem::path artifact = normal(model.options.artifact_path);
@@ -81,7 +89,7 @@ void check_model_state_paths(const std::vector<ModelDefinition>& models) {
         for (std::size_t second = first + 1; second < entries.size(); ++second) {
             const Entry& a = entries[first];
             const Entry& b = entries[second];
-            if (a.owner == b.owner || a.path != b.path) { continue; }
+            if (a.owner == b.owner || key(a.path) != key(b.path)) { continue; }
             const auto who = [](const Entry& e) {
                 return e.what + (e.owner.empty() ? std::string() : " (model '" + e.owner + "')");
             };
@@ -138,6 +146,14 @@ std::optional<std::size_t> ModelRegistry::find_locked(std::string_view model) co
             if (slot.state != ModelState::Loaded && slot.state != ModelState::Sleeping) {
                 continue;
             }
+            if (!best || slot.last_used > models_[*best].last_used) { best = index; }
+        }
+        if (best) { return best; }
+        // Everything has been unloaded: the model that last served is still the default, and a
+        // request for it loads it again.
+        for (std::size_t index = 0; index < models_.size(); ++index) {
+            const Slot& slot = models_[index];
+            if (slot.last_used == Clock::time_point{}) { continue; }
             if (!best || slot.last_used > models_[*best].last_used) { best = index; }
         }
         return best;
@@ -243,6 +259,10 @@ bool ModelRegistry::make_room_locked(std::unique_lock<std::mutex>& lock, std::si
                                      Clock::time_point deadline, const Cancelled& cancelled) {
     for (;;) {
         if (stopping_) { return false; }
+        // Also between victims: a request whose client left must not start another transition.
+        if (cancelled && cancelled()) {
+            throw RequestCancelled("the request went away while waiting for a model");
+        }
         if (policy_.models_max == 0 || loaded_count_locked() < policy_.models_max) { return true; }
         std::optional<std::size_t> victim;
         for (std::size_t index = 0; index < models_.size(); ++index) {
@@ -259,7 +279,7 @@ bool ModelRegistry::make_room_locked(std::unique_lock<std::mutex>& lock, std::si
                     // shortly rather than spin.
                     const auto retry =
                         std::min(deadline, Clock::now() + std::chrono::milliseconds(50));
-                    if (changed_.wait_until(lock, retry) == std::cv_status::timeout &&
+                    if (!wait_unless_cancelled_locked(lock, retry, cancelled) &&
                         Clock::now() >= deadline) {
                         return false;
                     }

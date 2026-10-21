@@ -332,8 +332,21 @@ void shared_state_files_are_refused() {
         m->options.flash_next.context_nvme_dir    = "/scratch";
     }
     expect(refused({c, d}), "a shared NVMe directory would give same-named artifacts one scratch file");
+    d.options.flash_next.context_nvme_dir = "/SCRATCH";
+    expect(refused({c, d}), "directories differing only in case are one on a case-insensitive volume");
     d.options.flash_next.context_nvme_dir = "/scratch2";
     expect(!refused({c, d}), "separate NVMe directories keep the scratch files apart");
+}
+
+void empty_selector_survives_unloading() {
+    Journal journal;
+    ModelRegistry registry({model("a"), model("b")}, RegistryPolicy{}, factory(journal), true);
+    { auto lease = registry.acquire("a"); }
+    { auto lease = registry.acquire("b"); }
+    registry.unload("a");
+    registry.unload("b");
+    auto lease = registry.acquire("");
+    expect(lease.model() == "b", "an empty selector reaches the model that last served, though unloaded");
 }
 
 void a_waiting_request_can_be_cancelled() {
@@ -477,6 +490,7 @@ int main() {
         store_names_never_collide();
         shared_state_files_are_refused();
         a_waiting_request_can_be_cancelled();
+        empty_selector_survives_unloading();
         selector_rewrite_changes_only_the_selector();
         single_model_mode();
         catalog();
