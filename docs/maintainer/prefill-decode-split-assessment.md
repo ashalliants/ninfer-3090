@@ -48,8 +48,12 @@ the 55 tok/s uncontended rate is about 6.6 s. By medians the ratio is about 1.1-
 It would be nearer 2 only if the mean is dominated by cold starts (a cold 72k conversation is about
 a minute of prefill). I cannot say which from the data I have; the request log has `prompt_tokens`,
 `cached_tokens` and `completion_tokens` per request, so the ratio should be computed from that log
-before this is decided. Either way a 1:1 split cannot beat two general engines on throughput: each
-GPU does the same total work and the split adds the transfers above.
+before this is decided. Whether a 1:1 split beats two general engines on throughput is **unmeasured**.
+Total GPU work is the same, so no gain is guaranteed, and the split adds the transfers above. But
+removing prefill/decode contention on each card could raise aggregate throughput even at equal
+total work, and an unbalanced split would leave one GPU underused. The trade-off is scheduling
+contention against transfer overhead and idle capacity; it needs a measurement on the request log
+and a prototype before it is decided.
 
 ## What a split would fix
 
