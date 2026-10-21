@@ -97,6 +97,10 @@ ninfer_add_test(ninfer_host_context_arena_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_context_arena.cpp"
   LIBRARIES ninfer_core)
 
+ninfer_add_test(ninfer_chunked_reservation_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_chunked_reservation.cpp"
+  LIBRARIES ninfer_core)
+
 ninfer_add_test(ninfer_state_store_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_state_store.cpp"
   LIBRARIES ninfer_core)

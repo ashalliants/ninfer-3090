@@ -1,4 +1,5 @@
 #include "runtime/contract/progress_anchors.h"
+#include "runtime/engine/pause_policy.h"
 #include "runtime/engine/scheduler.h"
 
 #include <algorithm>
@@ -350,6 +351,23 @@ void test_progress_anchor_frontiers() {
             "the frontier arithmetic does not overflow near the 32-bit limit");
 }
 
+void test_pause_host_target() {
+    using ninfer::runtime::next_pause_host_target;
+    // Enough bytes free but no run for the image: ask for another image's worth.
+    require(next_pause_host_target(300, 150, 1000) == std::optional<std::size_t>(450),
+            "an unplaced state image asks the victim search for one more image of free bytes");
+    require(next_pause_host_target(300, 0, 1000) == std::nullopt,
+            "a placed state image needs no further eviction");
+    require(next_pause_host_target(900, 150, 1000) == std::optional<std::size_t>(1000),
+            "near the budget the target clamps to it, so evicting the rest can still coalesce a run");
+    require(next_pause_host_target(1000, 150, 1000) == std::nullopt,
+            "a fully free Host that still has no run cannot be helped by more eviction");
+    require(next_pause_host_target(0, 2000, 1000) == std::nullopt,
+            "an image larger than the whole Host budget can never be saved");
+    require(next_pause_host_target(850, 150, 1000) == std::optional<std::size_t>(1000),
+            "a target that exactly fills the budget is still reachable");
+}
+
 } // namespace
 
 int main() {
@@ -362,6 +380,7 @@ int main() {
         test_prefill_replay_round_robin();
         test_decode_and_control_membership();
         test_progress_anchor_frontiers();
+        test_pause_host_target();
         std::cout << "ok\n";
         return 0;
     } catch (const std::exception& error) {

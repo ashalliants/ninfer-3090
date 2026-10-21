@@ -11,6 +11,7 @@
 #include "runtime/engine/request_record.h"
 #include "runtime/engine/context_cache/resource_manager.h"
 #include "runtime/engine/context_store/context_store.h"
+#include "runtime/engine/pause_policy.h"
 #include "runtime/engine/scheduler.h"
 #include "runtime/engine/effective_thinking_budget.h"
 #include "runtime/engine/generation_budget.h"
@@ -1940,11 +1941,16 @@ private:
                     later.push_back(*(*it)->suspended->snapshot_handle());
                 }
             }
-            if (const auto victims =
-                    resources_.host_victims(*instance_.program, *bytes, std::nullopt, later)) {
+            // The victim search counts free bytes, but the state image needs one contiguous run:
+            // when the freed bytes do not form one, ask for another image's worth and try again.
+            std::size_t target = *bytes;
+            for (std::size_t round = 0; round < kMaxPauseHostRounds; ++round) {
+                const auto victims =
+                    resources_.host_victims(*instance_.program, target, std::nullopt, later);
+                if (!victims) { break; }
                 for (const auto handle : *victims) {
                     const auto usage = instance_.program->physical_usage();
-                    if (usage.capacity.host_bytes - usage.occupied.host_bytes >= *bytes) { break; }
+                    if (usage.capacity.host_bytes - usage.occupied.host_bytes >= target) { break; }
                     if (resources_.release_victim(*instance_.program, handle)) { continue; }
                     const auto owner =
                         std::find_if(paused_.begin(), paused_.end(), [&](const auto& other) {
@@ -1958,7 +1964,18 @@ private:
                     (*owner)->recovery_route = GenerationRecoveryRoute::Replay;
                     observe_scheduling(*owner, GenerationSchedulingTransition::SnapshotRevoked);
                 }
-                save_snapshot = true;
+                const auto unplaced =
+                    instance_.program->pause_state_image_unplaced(*request->sequence);
+                if (unplaced == 0) {
+                    save_snapshot = true;
+                    break;
+                }
+                const auto usage = instance_.program->physical_usage();
+                const auto next  = next_pause_host_target(
+                    usage.capacity.host_bytes - usage.occupied.host_bytes, unplaced,
+                    usage.capacity.host_bytes);
+                if (!next) { break; }
+                target = *next;
             }
         }
         ProgramCallScope call(*this);
