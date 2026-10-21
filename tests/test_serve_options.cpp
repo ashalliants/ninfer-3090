@@ -38,6 +38,21 @@ int main() {
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
     failures += check(!defaults.tolerant_tool_calls, "tolerant tool calls are on by default");
+    failures += check(defaults.progress_anchor_tokens == 0, "progress anchors are on by default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--progress-anchor-tokens", "16384"})
+                              .progress_anchor_tokens == 16384,
+                      "--progress-anchor-tokens did not reach serving options");
+    for (const auto& bad : {std::vector<std::string>{"--progress-anchor-tokens", "1000"},
+                            std::vector<std::string>{"--progress-anchor-tokens", "4096",
+                                                     "--no-prefix-reuse"}}) {
+        std::vector<std::string> args{"ninfer-serve", "model.ninfer"};
+        args.insert(args.end(), bad.begin(), bad.end());
+        bool rejected = false;
+        try {
+            (void)parse(args);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "an unusable --progress-anchor-tokens was accepted");
+    }
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
     failures += check(defaults.request_log_jsonl.empty(),
                       "request JSONL logging is not disabled by default");

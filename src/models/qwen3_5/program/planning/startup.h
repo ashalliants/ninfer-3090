@@ -92,6 +92,7 @@ struct SequencePlanningInputs {
     std::uint32_t capacity                  = 0;
     std::uint32_t max_concurrency           = 1;
     std::uint32_t prefill_chunk             = 0;
+    std::uint32_t progress_anchor_tokens    = 0;
     std::uint32_t draft_window              = 0;
     // N-gram copy drafting: the copy window (0 when off) and the tail match it requires.
     std::uint32_t ngram_draft_tokens        = 0;
@@ -114,6 +115,7 @@ struct SequencePlanImpl {
     std::uint32_t main_page_groups          = 0;
     std::uint32_t max_concurrency           = 1;
     std::uint32_t prefill_chunk             = 0;
+    std::uint32_t progress_anchor_tokens    = 0;
     std::uint32_t draft_window              = 0;
     // N-gram copy drafting: the copy window (0 when off) and the tail match it requires.
     std::uint32_t ngram_draft_tokens        = 0;

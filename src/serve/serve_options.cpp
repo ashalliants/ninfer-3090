@@ -169,7 +169,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--ram-headroom-mib N] [--expert-cache-mib N] [--context-nvme-mib N [--context-nvme-dir DIR]] "
            "[--chat-template FILE] "
            "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
-           "[--gdn-state-fp16] "
+           "[--gdn-state-fp16] [--progress-anchor-tokens N] "
            "[--model-suspend [--suspend-snapshot pageable|pinned] "
            "[--suspend-weights artifact|host] [--no-auto-resume] [--sleep-idle-seconds N]] "
            "[--mlp-a8-decode] [--no-prefill-a8] "
@@ -416,6 +416,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
+        } else if (arg == "--progress-anchor-tokens") {
+            options.progress_anchor_tokens = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--progress-anchor-tokens"), "progress-anchor-tokens"));
         } else if (arg == "--context-cost-presets") {
             options.context_cost_presets = require_value("--context-cost-presets");
             if (options.context_cost_presets.empty()) {
@@ -845,6 +848,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
+    }
+    if (options.progress_anchor_tokens % options.prefill_chunk != 0) {
+        throw std::invalid_argument("--progress-anchor-tokens must be 0 or a multiple of --prefill-chunk");
+    }
+    if (options.progress_anchor_tokens != 0 && !options.allow_prefix_reuse) {
+        throw std::invalid_argument("--progress-anchor-tokens cannot be combined with --no-prefix-reuse");
     }
     product::apply_speculative_defaults(options.speculative);
     product::validate_speculative_cli_options(options.speculative);

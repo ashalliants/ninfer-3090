@@ -371,6 +371,11 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    // Zero (off), or a multiple of prefill_chunk: a long prefill leaves a private LongAnchor
+    // checkpoint every this many tokens, so a request that loses its pause snapshot replays from
+    // the nearest anchor instead of from the root. Needs the context cache; each owner keeps its
+    // newest four anchors. Qwen3.5-family models only.
+    std::uint32_t progress_anchor_tokens = 0;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;

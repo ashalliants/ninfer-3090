@@ -209,6 +209,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     : parameters(parameters_in), device(device_in), capacity(plan.capacity),
       kv_capacity(plan.kv_capacity), max_concurrency(plan.max_concurrency),
       context_cache(plan.context_cache), prefill_chunk(plan.prefill_chunk),
+      progress_anchor_tokens(plan.progress_anchor_tokens),
       draft_window(plan.draft_window),
       max_verify_drafts(detail::max_verify_drafts(plan.round_shapes)),
       ngram_draft_tokens(plan.ngram_draft_tokens), ngram_min_match(plan.ngram_min_match),

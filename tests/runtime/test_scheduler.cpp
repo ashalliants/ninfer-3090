@@ -1,3 +1,4 @@
+#include "runtime/contract/progress_anchors.h"
 #include "runtime/engine/scheduler.h"
 
 #include <algorithm>
@@ -334,6 +335,21 @@ void test_decode_and_control_membership() {
             "compact control membership changed committed control spans or request order");
 }
 
+void test_progress_anchor_frontiers() {
+    using ninfer::runtime::progress_anchor_frontiers;
+    using Frontiers = std::vector<std::uint32_t>;
+    require(progress_anchor_frontiers(10000, 4096) == Frontiers({4096, 8192}),
+            "anchors fall on every multiple of the spacing inside the prompt");
+    require(progress_anchor_frontiers(8192, 4096) == Frontiers({4096}),
+            "the prompt end is the InputReplay point, not a progress anchor");
+    require(progress_anchor_frontiers(4096, 4096).empty() &&
+                progress_anchor_frontiers(100, 4096).empty(),
+            "a prompt no longer than the spacing needs no anchor");
+    require(progress_anchor_frontiers(100000, 0).empty(), "zero spacing turns anchors off");
+    require(progress_anchor_frontiers(0xFFFFFFFFU, 0x80000000U) == Frontiers({0x80000000U}),
+            "the frontier arithmetic does not overflow near the 32-bit limit");
+}
+
 } // namespace
 
 int main() {
@@ -345,6 +361,7 @@ int main() {
         test_restore_events();
         test_prefill_replay_round_robin();
         test_decode_and_control_membership();
+        test_progress_anchor_frontiers();
         std::cout << "ok\n";
         return 0;
     } catch (const std::exception& error) {
