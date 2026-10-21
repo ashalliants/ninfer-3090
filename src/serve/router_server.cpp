@@ -33,6 +33,8 @@ void write_error(const httplib::Request& req, httplib::Response& res, int status
     error.code    = std::move(code);
     error.message = std::move(message);
     if (anthropic_path(req.path)) {
+        // An empty id would be kept by the later error handler, which fills only an absent header.
+        ensure_http_request_id(req, res);
         write_anthropic_error(res, error, res.get_header_value("request-id"));
     } else {
         write_openai_error(res, error);
@@ -111,10 +113,10 @@ struct EmptySelector : std::invalid_argument {
     explicit EmptySelector(const char* message) : std::invalid_argument(message) {}
 };
 
-// The model a request names: a JSON body's "model" on a POST, else a `model` query parameter, else
+// The model a request names: a JSON body's "model" on any method (GET and DELETE follow-ups may carry one), else a `model` query parameter, else
 // empty when omitted (the most recently used loaded model). A present but empty one throws.
 std::string requested_model(const httplib::Request& req, std::optional<Json>& body) {
-    if (req.method == "POST" && !req.body.empty() &&
+    if (!req.body.empty() &&
         is_json_content_type(req.get_header_value("Content-Type"))) {
         try {
             Json parsed = Json::parse(req.body);
@@ -661,11 +663,7 @@ void RouterServer::route(const httplib::Request& req, httplib::Response& res) {
 void RouterServer::route_status(const httplib::Request& req, httplib::Response& res) {
     auto lease = registry_.observe("");
     if (!lease) {
-        if (req.path == "/metrics") {
-            res.set_content("", "text/plain; version=0.0.4; charset=utf-8");
-        } else {
-            write_error(req, res, 503, "model_not_loaded", "no model is loaded");
-        }
+        write_error(req, res, 503, "model_not_loaded", "no model is loaded");
         return;
     }
     relay(req, res, std::move(*lease), req.method, without_model_param(req.target), {});
