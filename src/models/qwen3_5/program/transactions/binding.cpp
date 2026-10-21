@@ -1,10 +1,12 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "core/device.h"
+#include "runtime/contract/admission_fit.h"
 
 #include <algorithm>
 #include <array>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace ninfer::models::qwen3_5::detail {
 
@@ -50,6 +52,64 @@ void ProgramImpl::initialize_prefill(std::uint32_t lane, std::uint32_t base) {
         }
         if (!vision.uses.empty()) { staged.vision = make_vision_session(staged.prompt, vision); }
     }
+}
+
+bool ProgramImpl::prompt_fits_beside_residents(const RequestBasePlan& base,
+                                               const SourceCandidate& candidate) const {
+    if (!base.impl_ || !text_kv_pages) { return true; }
+    const auto source = candidate.checkpoint;
+    if (source && !valid_checkpoint(*source)) { return true; } // start_binding reports it
+    std::unordered_set<std::uint32_t> pinned_main, pinned_backend;
+    bool residents = false;
+    const auto pin = [](const KVAddressSpaceStore& addresses, const LogicalKVPageStore& pages,
+                        KVAddressSpaceHandle address, auto& seen) {
+        for (std::uint32_t i = 0; i < addresses.mapped_pages(address); ++i) {
+            seen.insert(pages.descriptor_index(addresses.logical_page(address, i)));
+        }
+    };
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        const auto& sequence = sequences[lane];
+        if (!sequence.kv) { continue; }
+        residents = true;
+        pin(*text_kv_addresses, *text_kv_pages, sequence.kv->text, pinned_main);
+        if (sequence.kv->backend) {
+            pin(*backend_kv_addresses, *backend_kv_pages, *sequence.kv->backend, pinned_backend);
+        }
+    }
+    const auto prompt = base.summary().prompt_tokens;
+    // The last chunk's frontiers are the whole prompt's, including the draft's extra rows.
+    const auto whole = prefill_unit(prompt, prompt > prefill_chunk ? prompt - prefill_chunk : 0,
+                                    initial_mtp_extent(*base.impl_));
+    std::uint64_t need_main    = kv_pages_for_frontier(whole.main_frontier);
+    std::uint64_t need_backend = kv_pages_for_frontier(whole.backend_frontier);
+    if (source) {
+        // A reused prefix a resident already holds is in `pinned`; counting it again would turn
+        // the common shared system prompt into a false "does not fit".
+        const auto& record = checkpoint(*source);
+        const auto shared  = [](const KVAddressSpaceStore& addresses, const LogicalKVPageStore& pages,
+                               KVAddressSpaceHandle address, std::uint32_t prefix_pages,
+                               const auto& seen) {
+            std::uint64_t count = 0;
+            for (std::uint32_t i = 0; i < std::min(prefix_pages, addresses.mapped_pages(address)); ++i) {
+                count += seen.count(pages.descriptor_index(addresses.logical_page(address, i)));
+            }
+            return count;
+        };
+        need_main -= std::min<std::uint64_t>(
+            need_main, shared(*text_kv_addresses, *text_kv_pages, record.kv->text,
+                              kv_pages_for_frontier(record.frontier), pinned_main));
+        if (record.kv->backend) {
+            need_backend -= std::min<std::uint64_t>(
+                need_backend, shared(*backend_kv_addresses, *backend_kv_pages, *record.kv->backend,
+                                     kv_pages_for_frontier(record.backend_frontier),
+                                     pinned_backend));
+        }
+    }
+    return runtime::prompt_fits_beside_residents(
+        {need_main, need_backend}, {pinned_main.size(), pinned_backend.size()},
+        {text_kv_pages->physical_pool().capacity_pages(),
+         backend_kv_pages ? backend_kv_pages->physical_pool().capacity_pages() : 0U},
+        residents);
 }
 
 BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runtime::LaneId lane_id,

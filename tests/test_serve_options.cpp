@@ -53,6 +53,10 @@ int main() {
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "an unusable --progress-anchor-tokens was accepted");
     }
+    failures += check(!defaults.admission_fit_check, "the admission fit check is on by default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--admission-fit-check"})
+                          .admission_fit_check,
+                      "--admission-fit-check did not reach serving options");
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
     failures += check(defaults.request_log_jsonl.empty(),
                       "request JSONL logging is not disabled by default");

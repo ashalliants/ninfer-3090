@@ -335,6 +335,8 @@ public:
     [[nodiscard]] BindingReservation start_binding(const RequestBasePlan&, runtime::LaneId,
                                                    const SourceCandidate&, ResumeState*,
                                                    ExecutionUnitKind, std::uint32_t);
+    [[nodiscard]] bool prompt_fits_beside_residents(const RequestBasePlan&,
+                                                    const SourceCandidate&) const;
     [[nodiscard]] bool start_capture(SequenceHandle);
     [[nodiscard]] bool capture_is_input(SequenceHandle) const;
     [[nodiscard]] std::optional<CapturePreparation> prepare_capture(SequenceHandle);

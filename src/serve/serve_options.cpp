@@ -169,7 +169,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--ram-headroom-mib N] [--expert-cache-mib N] [--context-nvme-mib N [--context-nvme-dir DIR]] "
            "[--chat-template FILE] "
            "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
-           "[--gdn-state-fp16] [--progress-anchor-tokens N] "
+           "[--gdn-state-fp16] [--progress-anchor-tokens N] [--admission-fit-check] "
            "[--model-suspend [--suspend-snapshot pageable|pinned] "
            "[--suspend-weights artifact|host] [--no-auto-resume] [--sleep-idle-seconds N]] "
            "[--mlp-a8-decode] [--no-prefill-a8] "
@@ -651,6 +651,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.mtp_experts_q4 = true;
         } else if (arg == "--gdn-state-fp16") {
             options.gdn_state_fp16 = true;
+        } else if (arg == "--admission-fit-check") {
+            options.admission_fit_check = true;
         } else if (arg == "--model-suspend") {
             options.suspend.enabled = true;
         } else if (arg == "--suspend-snapshot") {

@@ -341,6 +341,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.embedding_q6             = options.embedding_q6;
     engine_options.mtp_experts_q4           = options.mtp_experts_q4;
     engine_options.gdn_state_fp16           = options.gdn_state_fp16;
+    engine_options.admission_fit_check      = options.admission_fit_check;
     engine_options.suspend                  = options.suspend;
     engine_options.mlp_a8_decode            = options.mlp_a8_decode;
     engine_options.prefill_a8               = options.prefill_a8;

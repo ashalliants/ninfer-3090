@@ -252,6 +252,11 @@ BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::
     return impl_->start_binding(base, lane, source, resume, kind, tokens);
 }
 
+bool Program::prompt_fits_beside_residents(const RequestBasePlan& base,
+                                           const SourceCandidate& source) const {
+    return impl_->prompt_fits_beside_residents(base, source);
+}
+
 bool Program::start_capture(SequenceHandle h) { return impl_->start_capture(h); }
 
 bool Program::capture_is_input(SequenceHandle h) const { return impl_->capture_is_input(h); }

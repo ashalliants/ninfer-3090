@@ -1768,6 +1768,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--fit-context MIN` | treat `--max-context` as a ceiling: start at the largest context (multiple of 1,024, KV pool equal to it) that fits free GPU memory less 256 MiB, never below `MIN`; requires `--kv-capacity` unset or equal to `--max-context` | off |
 | `--max-concurrency N` | resident execution lanes; valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
+| `--admission-fit-check` | queue a fresh request whose whole prompt cannot fit in the KV pool beside the resident requests, instead of starting it, pausing it when the pool fills and recomputing its history; always admits when nothing is resident (counted by `ninfer_admission_fit_deferrals_total`) | off |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `600000` |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
 | `--progress-anchor-tokens N` | during a long prefill, keep a private checkpoint every N tokens (a multiple of `--prefill-chunk`; needs prefix reuse; each request keeps its newest four) so a paused request that loses its snapshot replays from the nearest checkpoint instead of from the start. Each checkpoint costs one State image; Qwen3.5-family models only | `0` (off) |
