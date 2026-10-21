@@ -2228,6 +2228,7 @@ private:
             auto& decision = *admission_decision_;
             ContextResourceUsage shortage;
             bool deferred = false;
+            std::optional<std::size_t> first_unfit;
             while (decision.current < decision.sources.size()) {
                 auto& choice            = decision.sources[decision.current];
                 const bool own_snapshot = restoring && request->suspended->has_snapshot();
@@ -2258,14 +2259,11 @@ private:
                     !instance_.program->prompt_fits_beside_residents(*request->base_plan,
                                                                     choice.source)) {
                     // Starting would fill the pool beside older requests, get this one paused and
-                    // recompute its history later. Queue it until a resident leaves.
-                    retain_admission_source(request, choice, restoring);
-                    if (!request->fit_deferred) {
-                        request->fit_deferred = true;
-                        ++cumulative_stats_.admission_fit_deferrals;
-                    }
-                    deferred = true;
-                    break;
+                    // recompute its history later. Try the remaining sources (a cheaper reuse or a
+                    // root start may fit); queue it only when none does.
+                    if (!first_unfit) { first_unfit = decision.current; }
+                    ++decision.current;
+                    continue;
                 }
                 auto binding_started = Clock::now();
                 const auto bind      = [&](const auto& source) {
@@ -2380,6 +2378,15 @@ private:
                     publish_generation_start(request, begin);
                 }
                 return true;
+            }
+            if (!deferred && first_unfit) {
+                // No source fits beside the residents; keep the preferred one and wait.
+                retain_admission_source(request, decision.sources[*first_unfit], restoring);
+                if (!request->fit_deferred) {
+                    request->fit_deferred = true;
+                    ++cumulative_stats_.admission_fit_deferrals;
+                }
+                deferred = true;
             }
             admission_decision_.reset();
             if (deferred) {
