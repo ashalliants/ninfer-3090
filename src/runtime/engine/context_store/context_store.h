@@ -240,10 +240,18 @@ private:
         // The bucket's modified time of the manifest this entry was imported from (0: written or
         // loaded here). Compared only with other bucket times, never with the local clock.
         std::int64_t remote_modified_ms = 0;
-        // Set on an image imported from a peer: the peer_skipped_ key and manifest time to restore
-        // if this copy proves damaged, so the unchanged peer manifest is not imported again.
+        // Set on an image whose manifest was imported from a peer: the peer_skipped_ key and
+        // manifest time to restore if the manifest proves damaged. Such an image is the peer's to
+        // upload, so a use here never puts it in the bucket.
         std::string peer_memo_key;
         std::int64_t peer_stamp = 0;
+        // The chunks each peer linked into this entry (peer_skipped_ key -> manifest time and the
+        // chunks' hex keys): a damaged chunk quarantines only the peer that supplied it.
+        struct PeerFill {
+            std::int64_t stamp = 0;
+            std::unordered_set<std::string> chunk_keys;
+        };
+        std::unordered_map<std::string, PeerFill> peer_fills;
     };
     struct ChunkUse {
         std::uint32_t references = 0;
@@ -304,6 +312,11 @@ private:
     void add_references(const Entry& entry);
     void release_references(const Entry& entry);
     void remove_entry_locked(const std::string& id, bool corrupt);
+    // A load found `entry` damaged: the peers whose copies are at fault are not imported from again
+    // until they rewrite the image. `damaged` lists the bad chunks (each blames only the peer that
+    // linked it, and is no longer counted as that peer's); nullptr means the manifest itself, which
+    // blames the peer it came from.
+    void quarantine_peers_locked(Entry& entry, const std::vector<ChunkRef>* damaged);
     void write_used(const std::string& id, std::int64_t last_used_ms) const;
     [[nodiscard]] std::uint64_t used_bytes_locked() const;
     void maintain_locked(const std::string* protect);

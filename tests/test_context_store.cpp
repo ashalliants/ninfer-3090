@@ -1667,6 +1667,98 @@ void test_damaged_peer_chunk_falls_back_to_the_remote_once() {
     }
 }
 
+void flip_first_byte(const fs::path& file) {
+    std::fstream stream(file, std::ios::in | std::ios::out | std::ios::binary);
+    char byte = 0;
+    stream.read(&byte, 1);
+    byte ^= 0x5a;
+    stream.seekp(0);
+    stream.write(&byte, 1);
+}
+
+// Removes the bucket's copy of the chunk `file` holds, so a repair of it cannot succeed.
+void remove_remote_chunk(MemoryObjectStore& remote, const fs::path& file) {
+    const std::string hex = file.filename().string().substr(0, 32);
+    std::erase_if(remote.objects, [&](const auto& object) {
+        return object.first.find("chunks/") != std::string::npos &&
+               object.first.find(hex) != std::string::npos;
+    });
+}
+
+// The image the bucket registered shares its first two chunks with one the importer wrote itself,
+// so the peer fills only the rest. A damaged chunk blames the peer only when the peer linked it.
+void test_damaged_chunk_blames_the_peer_only_when_the_peer_supplied_it() {
+    for (const bool peer_supplied : {false, true}) {
+        PeerAndRemote setup;
+        const auto b = setup.importer();
+        const std::vector<std::uint8_t> region(setup.image.begin() + 30,
+                                               setup.image.begin() + 30 + 2048);
+        (void)b->put(describe("0b"), concat({pseudo_random(30, 99), region, pseudo_random(8, 99)}),
+                     std::array{ContextStore::Region{30, 2048}});
+        check(drained(*b), "the importer's own upload did not drain");
+        check(b->sync_peers() == 1 && b->stats().peer_bytes_linked == 5000 - 2048,
+              "the peer did not fill only the chunks the importer lacked");
+        // Own chunks are single files; the peer's are links to the peer's files.
+        fs::path victim;
+        for (const fs::path& file : chunk_files(setup.b_directory.path())) {
+            if ((fs::hard_link_count(file) == 2) == peer_supplied) {
+                victim = file;
+                break;
+            }
+        }
+        check(!victim.empty(), "no chunk of the wanted origin to damage");
+        // A linked chunk is the peer's file too; an own chunk leaves the peer's copy intact.
+        flip_first_byte(victim);
+        remove_remote_chunk(*setup.remote, victim);
+        check(!b->load("0a").has_value(), "an image with an unrepairable damaged chunk was served");
+        if (peer_supplied) {
+            check(b->sync_peers() == 0, "a peer whose chunk was damaged was linked from again");
+        } else {
+            check(b->sync_peers() == 1,
+                  "a damaged chunk the peer never supplied stopped the peer being asked again");
+            check(b->load("0a").value_or(std::vector<std::uint8_t>{}) == setup.image,
+                  "the peer's intact copy did not complete the image");
+        }
+    }
+}
+
+// An image imported whole from a peer is the peer's to upload: using it here must not put it in
+// the bucket. An image the bucket registered and a peer filled is still repaired from here.
+void test_peer_images_are_not_uploaded_by_the_importer() {
+    {
+        TempDirectory a_directory;
+        TempDirectory b_directory;
+        const auto remote = std::make_shared<MemoryObjectStore>();
+        const auto image  = peer_image(13);
+        ContextStore a(options_for(a_directory.path())); // the peer has not uploaded it (yet)
+        (void)a.put(describe("0a"), image, std::array{ContextStore::Region{30, 5000}});
+        ContextStore::Options options = remote_options(b_directory.path(), remote);
+        options.peers                 = {a_directory.path()};
+        options.peer_poll             = std::chrono::hours(1);
+        ContextStore b(options);
+        check(b.sync_peers() == 1, "the peer image was not imported");
+        // As the engine restores: a load without touch, then touch() once it is used.
+        check(b.load("0a", false).value_or(std::vector<std::uint8_t>{}) == image,
+              "the imported image did not load");
+        b.touch("0a");
+        check(b.load("0a").has_value(), "the imported image did not load with a touch");
+        check(drained(b), "the importer's remote queue did not drain");
+        check(remote->puts == 0 && remote->objects.empty() && b.stats().remote_uploads == 0,
+              "the importer uploaded an image a peer wrote");
+    }
+    {
+        PeerAndRemote setup;
+        const auto b = setup.importer();
+        check(b->sync_peers() == 1, "the peer did not fill the bucket-registered image");
+        std::erase_if(setup.remote->objects, [](const auto& object) {
+            return object.first.find("chunks/") != std::string::npos;
+        });
+        check(b->load("0a").has_value() && drained(*b), "the filled image did not load");
+        check(b->stats().remote_uploads > 0,
+              "an image the bucket registered was not repaired there");
+    }
+}
+
 void test_non_positive_peer_poll_is_refused() {
     TempDirectory a_directory;
     TempDirectory b_directory;
@@ -1699,6 +1791,8 @@ int main() {
     test_peer_fills_an_image_the_remote_registered();
     test_peer_skips_an_image_already_fetched_from_the_remote();
     test_damaged_peer_chunk_falls_back_to_the_remote_once();
+    test_damaged_chunk_blames_the_peer_only_when_the_peer_supplied_it();
+    test_peer_images_are_not_uploaded_by_the_importer();
     test_compressed_chunks_round_trip_and_account_for_disk_use();
     test_compressed_chunks_survive_restart_and_either_setting();
     test_compressed_chunk_damage_is_a_miss();

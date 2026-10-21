@@ -594,17 +594,30 @@ void ContextStore::unpin_chunks_locked(const std::vector<ChunkRef>& chunks) {
 void ContextStore::remove_entry_locked(const std::string& id, bool corrupt) {
     const auto found = entries_.find(id);
     if (found != entries_.end()) {
-        const std::string peer_memo   = found->second.peer_memo_key;
-        const std::int64_t peer_stamp = found->second.peer_stamp;
         release_references(found->second);
         manifest_total_bytes_ -= found->second.manifest_bytes;
         entries_.erase(found);
         if (corrupt) { ++stats_.corrupt_removed; }
-        // A damaged image imported from a peer is not imported again until the peer rewrites it.
-        if (corrupt && !peer_memo.empty()) { peer_skipped_[peer_memo] = peer_stamp; }
     }
     remove_quietly(manifest_path(id));
     remove_quietly(used_path(id));
+}
+
+void ContextStore::quarantine_peers_locked(Entry& entry, const std::vector<ChunkRef>* damaged) {
+    if (damaged == nullptr) {
+        if (!entry.peer_memo_key.empty()) { peer_skipped_[entry.peer_memo_key] = entry.peer_stamp; }
+        return;
+    }
+    // A damaged chunk this store wrote, fetched or shared with another image says nothing about a
+    // peer: that peer is asked again, and its intact copy can still complete the image. The damaged
+    // files are discarded, so whatever replaces them is no longer the peer's.
+    for (auto& [memo_key, fill] : entry.peer_fills) {
+        for (const ChunkRef& chunk : *damaged) {
+            if (fill.chunk_keys.erase(hex_key(chunk.hash)) != 0) {
+                peer_skipped_[memo_key] = fill.stamp;
+            }
+        }
+    }
 }
 
 void ContextStore::write_used(const std::string& id, std::int64_t last_used_ms) const {
@@ -1082,8 +1095,12 @@ std::optional<std::vector<std::uint8_t>> ContextStore::load(const std::string& i
                     return std::nullopt;
                 }
             }
-            const auto fail = [&]() -> std::optional<std::vector<std::uint8_t>> {
+            // `bad_chunks` nullptr: the manifest or its layout is at fault.
+            const auto fail = [&](const std::vector<ChunkRef>* bad_chunks =
+                                      nullptr) -> std::optional<std::vector<std::uint8_t>> {
                 std::scoped_lock lock(mutex_);
+                const auto found = entries_.find(id);
+                if (found != entries_.end()) { quarantine_peers_locked(found->second, bad_chunks); }
                 remove_entry_locked(id, true);
                 ++stats_.load_misses;
                 return std::nullopt;
@@ -1153,7 +1170,7 @@ std::optional<std::vector<std::uint8_t>> ContextStore::load(const std::string& i
             // Every damaged chunk is discarded and fetched again together (with a remote), so one
             // bad chunk does not leave the next to fail the retry.
             const bool intact = damaged.empty();
-            if (!intact && !(options_.remote && pass == 0)) { return fail(); }
+            if (!intact && !(options_.remote && pass == 0)) { return fail(&damaged); }
             if (intact) {
                 if (touch) {
                     std::scoped_lock lock(mutex_);
@@ -1168,13 +1185,11 @@ std::optional<std::vector<std::uint8_t>> ContextStore::load(const std::string& i
                 if (touch) { enqueue_remote({RemoteTask::Kind::Touch, id, {}, {}}); }
                 return image;
             }
-            // Discard the damaged local copies; the remote holds the good ones. Chunks linked from
-            // a peer are not linked again from its unchanged manifest while the fetch runs.
+            // Discard the damaged local copies; the remote holds the good ones. A peer that linked
+            // one of them is not linked from again, unchanged, while the fetch runs.
             std::scoped_lock lock(mutex_);
             const auto held = entries_.find(id);
-            if (held != entries_.end() && !held->second.peer_memo_key.empty()) {
-                peer_skipped_[held->second.peer_memo_key] = held->second.peer_stamp;
-            }
+            if (held != entries_.end()) { quarantine_peers_locked(held->second, &damaged); }
             for (const ChunkRef& chunk : damaged) {
                 const auto found = chunks_.find(hex_key(chunk.hash));
                 if (found != chunks_.end() && found->second.present) {
@@ -1488,12 +1503,16 @@ void ContextStore::prune_remote_state() {
 void ContextStore::touch_remote_image(const std::string& id) {
     std::vector<ChunkRef> chunks;
     std::uint64_t generation = 0;
+    // An image imported whole from a peer is the peer's to upload: its age in the bucket is
+    // restarted, but what the bucket lacks is not put there from here.
+    bool peer_image = false;
     {
         std::scoped_lock lock(mutex_);
         const auto found = entries_.find(id);
         if (found == entries_.end()) { return; }
         chunks     = found->second.chunks;
         generation = found->second.generation;
+        peer_image = !found->second.peer_memo_key.empty();
     }
     const std::int64_t now = now_ms();
     {
@@ -1522,6 +1541,10 @@ void ContextStore::touch_remote_image(const std::string& id) {
                 std::scoped_lock lock(remote_mutex_);
                 uploaded_.erase(key);
             }
+            if (peer_image) {
+                complete = false;
+                continue;
+            }
             // Put it back from the directory while the image is still in use, if the directory
             // has an intact copy.
             std::vector<std::uint8_t> data;
@@ -1543,7 +1566,7 @@ void ContextStore::touch_remote_image(const std::string& id) {
             // A manifest goes up only after every chunk it names is confirmed or put back
             // (manifest-last): with a chunk still missing, publishing it would offer other engines
             // an image they cannot read. The next use retries.
-            if (!complete) { return; }
+            if (!complete || peer_image) { return; }
             // Republish only the manifest of the image the chunks above were taken from: if the id
             // has been rewritten since, the new image has its own upload and this one is stale.
             std::vector<std::uint8_t> manifest;
@@ -1935,11 +1958,18 @@ bool ContextStore::import_peer_image(const fs::path& peer, const std::string& id
     peer_skipped_.erase(memo_key);
     ++stats_.peer_images;
     stats_.peer_bytes_linked += linked_bytes;
+    // Only the chunks linked here are the peer's: one this store already held is not.
+    const auto record_fill = [&](Entry& target) {
+        Entry::PeerFill& fill = target.peer_fills[memo_key];
+        fill.stamp            = stamp;
+        for (const auto& [chunk, stored] : linked) { fill.chunk_keys.insert(hex_key(chunk->hash)); }
+    };
     if (held != nullptr) {
         // Same references, manifest and generation: a fetch of this entry in flight finds the
-        // chunks present and skips them. The use time is the later of the bucket's and the peer's.
-        held->peer_memo_key = memo_key;
-        held->peer_stamp    = stamp;
+        // chunks present and skips them. The manifest stays the bucket's, so the image is still
+        // this store's to repair in the bucket. The use time is the later of the bucket's and the
+        // peer's.
+        record_fill(*held);
         if (entry.info.last_used_ms > held->info.last_used_ms) {
             held->info.last_used_ms = entry.info.last_used_ms;
             write_used(id, held->info.last_used_ms);
@@ -1948,6 +1978,7 @@ bool ContextStore::import_peer_image(const fs::path& peer, const std::string& id
     }
     entry.peer_memo_key     = memo_key;
     entry.peer_stamp        = stamp;
+    record_fill(entry);
     manifest_total_bytes_ += entry.manifest_bytes;
     add_references(entry);
     entry.generation = ++next_generation_;
