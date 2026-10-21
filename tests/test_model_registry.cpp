@@ -333,7 +333,11 @@ void shared_state_files_are_refused() {
     }
     expect(refused({c, d}), "a shared NVMe directory would give same-named artifacts one scratch file");
     d.options.flash_next.context_nvme_dir = "/SCRATCH";
+#if defined(_WIN32) || defined(__APPLE__)
     expect(refused({c, d}), "directories differing only in case are one on a case-insensitive volume");
+#else
+    expect(!refused({c, d}), "directories differing only in case are two on a case-sensitive volume");
+#endif
     d.options.flash_next.context_nvme_dir = "/scratch2";
     expect(!refused({c, d}), "separate NVMe directories keep the scratch files apart");
 }

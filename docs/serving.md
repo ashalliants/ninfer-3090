@@ -630,7 +630,8 @@ the command line applies to each model; a model's section in a preset can change
 [*]
 max-context = 65536
 kv-dtype = rk8v4
-; a boolean key is a flag; a model's section can turn it off with false
+; a boolean key is a flag; a model's section can drop it with false. A flag that is on by
+; default (prefill-a8, cuda-graph, prefix-reuse) is turned off with its no- key, e.g. no-cuda-graph = true
 model-suspend = true
 
 [coder]

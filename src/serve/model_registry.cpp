@@ -43,12 +43,15 @@ void check_model_state_paths(const std::vector<ModelDefinition>& models) {
         auto out = std::filesystem::weakly_canonical(path, error);
         return error ? std::filesystem::absolute(path, error).lexically_normal() : out;
     };
-    // Windows and macOS volumes usually ignore case, so names differing only in case are one file.
+    // Windows and macOS volumes usually ignore case, so names differing only in case are one file
+    // there; on Linux they are two.
     const auto key = [](const std::filesystem::path& path) {
         std::string text = path.string();
+#if defined(_WIN32) || defined(__APPLE__)
         for (char& letter : text) {
             if (letter >= 'A' && letter <= 'Z') { letter = static_cast<char>(letter - 'A' + 'a'); }
         }
+#endif
         return text;
     };
     std::vector<Entry> entries;
