@@ -1769,7 +1769,12 @@ std::size_t ContextStore::sync_peers() {
             std::error_code time_error;
             const std::int64_t stamp = static_cast<std::int64_t>(
                 fs::last_write_time(path, time_error).time_since_epoch().count());
-            if (time_error) { continue; }
+            if (time_error) {
+                // The peer removed it since the listing: count it, so the skip metrics show the loss.
+                std::scoped_lock lock(mutex_);
+                ++stats_.peer_skipped;
+                continue;
+            }
             {
                 std::scoped_lock lock(mutex_);
                 if (entries_.find(id) != entries_.end()) { continue; }
@@ -1807,8 +1812,16 @@ bool ContextStore::import_peer_image(const fs::path& peer, const std::string& id
     }
     Entry entry;
     if (!parse_manifest(data, entry, nullptr) || entry.info.id != id) { return skip(); }
+    // The peer's last use of the image, as its `.used` sidecar records it (creation time when it
+    // has none): the TTL and the LRU order both go by use, as for the store's own images.
+    entry.info.last_used_ms = entry.info.created_ms;
+    try {
+        const std::vector<std::uint8_t> used = read_whole_file(peer / "manifests" / (id + ".used"));
+        entry.info.last_used_ms = std::max<std::int64_t>(
+            entry.info.created_ms, std::stoll(std::string(used.begin(), used.end())));
+    } catch (const std::exception&) {}
     if (options_.ttl.count() > 0 &&
-        entry.info.created_ms < now_ms() - options_.ttl.count() * 1000) {
+        entry.info.last_used_ms < now_ms() - options_.ttl.count() * 1000) {
         return skip();
     }
 
@@ -1821,8 +1834,15 @@ bool ContextStore::import_peer_image(const fs::path& peer, const std::string& id
         return false;
     };
 
-    // The chunks this store does not already hold, each once.
-    std::vector<const ChunkRef*> needed;
+    // The chunks this store does not already hold, each once, in whichever form the peer holds it.
+    // The fit check counts the bytes the links will occupy (a compressed chunk takes its file size).
+    struct Source {
+        const ChunkRef* chunk;
+        fs::path path;
+        bool compressed;
+        std::uint64_t size;
+    };
+    std::vector<Source> needed;
     std::unordered_set<std::string> seen;
     std::uint64_t new_bytes = entry.manifest_bytes;
     for (const ChunkRef& chunk : entry.chunks) {
@@ -1830,8 +1850,23 @@ bool ContextStore::import_peer_image(const fs::path& peer, const std::string& id
         if (!seen.insert(key).second) { continue; }
         const auto known = chunks_.find(key);
         if (known != chunks_.end() && known->second.present) { continue; }
-        needed.push_back(&chunk);
-        new_bytes += chunk.length; // an upper bound: a compressed chunk takes less
+        const fs::path raw_source    = peer / "chunks" / key.substr(0, 2) / (key + ".chunk");
+        const fs::path packed_source = peer / "chunks" / key.substr(0, 2) / (key + ".chunk.zst");
+        std::error_code error;
+        std::uint64_t size = fs::file_size(raw_source, error);
+        if (!error && size == chunk.length) {
+            needed.push_back({&chunk, raw_source, false, size});
+        } else {
+            error.clear();
+            size = fs::file_size(packed_source, error);
+            const auto content = error ? std::nullopt : compressed_content_size(packed_source);
+            if (error || !content || *content != chunk.length) {
+                ++stats_.peer_link_failures;
+                return skip_locked(); // the peer evicted it meanwhile, or it is damaged
+            }
+            needed.push_back({&chunk, packed_source, true, size});
+        }
+        new_bytes += size;
     }
     // Nothing is imported that would be evicted at once, or the store would link, evict and link
     // the same image again at every poll.
@@ -1839,44 +1874,29 @@ bool ContextStore::import_peer_image(const fs::path& peer, const std::string& id
         return skip_locked();
     }
 
-    // Hard-link each chunk in whichever form the peer holds it. A link is independent of the
-    // peer's file from then on: the peer deleting its copy does not touch ours.
+    // Hard-link each chunk. A link is independent of the peer's file from then on: the peer
+    // deleting its copy does not touch ours.
     std::vector<fs::path> created;
     std::vector<std::pair<const ChunkRef*, StoredChunk>> linked;
     std::uint64_t linked_bytes = 0;
     const auto roll_back       = [&] {
         for (const fs::path& path : created) { remove_quietly(path); }
     };
-    for (const ChunkRef* chunk : needed) {
-        const std::string key = hex_key(chunk->hash);
-        const fs::path raw_source    = peer / "chunks" / key.substr(0, 2) / (key + ".chunk");
-        const fs::path packed_source = peer / "chunks" / key.substr(0, 2) / (key + ".chunk.zst");
+    for (const Source& source : needed) {
         std::error_code error;
-        bool compressed = false;
-        std::uint64_t size = fs::file_size(raw_source, error);
-        if (error || size != chunk->length) {
-            error.clear();
-            size = fs::file_size(packed_source, error);
-            const auto content = error ? std::nullopt : compressed_content_size(packed_source);
-            if (error || !content || *content != chunk->length) {
-                ++stats_.peer_link_failures;
-                roll_back();
-                return skip_locked(); // the peer evicted it meanwhile, or it is damaged
-            }
-            compressed = true;
-        }
-        remove_chunk_files(chunk->hash); // a stale file of ours under the name would block the link
-        const fs::path target = compressed ? compressed_chunk_path(chunk->hash) : chunk_path(chunk->hash);
+        remove_chunk_files(source.chunk->hash); // a stale file of ours under the name would block the link
+        const fs::path target = source.compressed ? compressed_chunk_path(source.chunk->hash)
+                                                  : chunk_path(source.chunk->hash);
         fs::create_directories(target.parent_path(), error);
-        fs::create_hard_link(compressed ? packed_source : raw_source, target, error);
+        fs::create_hard_link(source.path, target, error);
         if (error) {
             ++stats_.peer_link_failures; // another volume, or the peer removed it just now
             roll_back();
             return skip_locked();
         }
         created.push_back(target);
-        linked.emplace_back(chunk, StoredChunk{compressed, size});
-        linked_bytes += size;
+        linked.emplace_back(source.chunk, StoredChunk{source.compressed, source.size});
+        linked_bytes += source.size;
     }
     try {
         write_atomically(manifest_path(id), data);
@@ -1894,7 +1914,6 @@ bool ContextStore::import_peer_image(const fs::path& peer, const std::string& id
             chunk_total_bytes_ += stored.bytes;
         }
     }
-    entry.info.last_used_ms = entry.info.created_ms;
     entry.peer_memo_key     = memo_key;
     entry.peer_stamp        = stamp;
     manifest_total_bytes_ += entry.manifest_bytes;
@@ -1902,6 +1921,7 @@ bool ContextStore::import_peer_image(const fs::path& peer, const std::string& id
     entry.generation = ++next_generation_;
     entries_.emplace(id, std::move(entry));
     peer_skipped_.erase(memo_key);
+    write_used(id, entries_.find(id)->second.info.last_used_ms); // our own sidecar, so a restart keeps it
     ++stats_.peer_images;
     stats_.peer_bytes_linked += linked_bytes;
     return true;

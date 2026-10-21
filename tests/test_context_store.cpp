@@ -1504,6 +1504,44 @@ void test_peer_import_links_compressed_chunks() {
           "the importer counts compressed chunks by another size than the peer");
 }
 
+// The TTL counts from the peer's last use, not from creation, and the copy keeps that use time.
+void test_peer_import_ttl_counts_from_the_peers_last_use() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    const std::int64_t hour = 3600 * 1000;
+    std::int64_t a_now      = 10 * hour;
+    ContextStore::Options a_options = options_for(a_directory.path());
+    a_options.clock                 = [&] { return a_now; };
+    ContextStore a(a_options);
+    (void)a.put(describe("0a"), peer_image(11), std::array{ContextStore::Region{30, 5000}});
+    a_now += 90 * 60 * 1000;
+    check(a.load("0a").has_value(), "the peer could not load its own image");
+    ContextStore::Options options = peer_options(b_directory.path(), a_directory.path());
+    options.ttl                   = std::chrono::hours(1);
+    options.clock                 = [&] { return 10 * hour + 2 * hour; }; // created 2 h ago, used 30 min ago
+    ContextStore b(options);
+    check(b.sync_peers() == 1 && b.stats().peer_skipped == 0,
+          "an image the peer used recently was skipped as expired");
+    check(b.list().size() == 1 && b.list()[0].last_used_ms == 10 * hour + 90 * 60 * 1000,
+          "the imported image does not carry the peer's use time");
+}
+
+// The fit check counts the compressed files the links will occupy, not the raw chunk lengths.
+void test_peer_import_budget_counts_compressed_sizes() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    const auto image = concat({pseudo_random(30, 1), compressible(8192, 2), pseudo_random(8, 3)});
+    ContextStore a(compressed_options(a_directory.path(), 1024));
+    (void)a.put(describe("0a"), image, std::array{ContextStore::Region{30, 8192}});
+    const std::uint64_t packed = a.stats().used_bytes;
+    check(packed < image.size(), "the test image did not compress");
+    ContextStore::Options options = peer_options(b_directory.path(), a_directory.path());
+    options.max_bytes             = packed + 16;
+    ContextStore b(options);
+    check(b.sync_peers() == 1 && b.stats().peer_skipped == 0,
+          "an image that fits compressed was skipped for its raw size");
+}
+
 // A same-size bit flip passes the import's length check; the load that finds it must leave the
 // unchanged peer manifest skipped, not imported again at every poll.
 void test_damaged_imported_image_is_not_imported_again() {
@@ -1552,6 +1590,8 @@ int main() {
     test_damaged_peer_files_are_skipped_or_missed_and_never_modified();
     test_peer_images_over_budget_expired_or_gone_are_skipped_once();
     test_peer_import_links_compressed_chunks();
+    test_peer_import_ttl_counts_from_the_peers_last_use();
+    test_peer_import_budget_counts_compressed_sizes();
     test_damaged_imported_image_is_not_imported_again();
     test_non_positive_peer_poll_is_refused();
     test_compressed_chunks_round_trip_and_account_for_disk_use();
