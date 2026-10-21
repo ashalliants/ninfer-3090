@@ -44,6 +44,7 @@ struct GpuTelemetry::Impl {
         memory      = reinterpret_cast<int (*)(void*, Memory*)>(symbol("nvmlDeviceGetMemoryInfo"));
         temperature = reinterpret_cast<int (*)(void*, unsigned, unsigned*)>(symbol("nvmlDeviceGetTemperature"));
         power       = reinterpret_cast<int (*)(void*, unsigned*)>(symbol("nvmlDeviceGetPowerUsage"));
+        energy      = reinterpret_cast<int (*)(void*, unsigned long long*)>(symbol("nvmlDeviceGetTotalEnergyConsumption"));
         if (init == nullptr || shutdown == nullptr || by_pci == nullptr || init() != 0) {
             release();
             return;
@@ -79,6 +80,7 @@ struct GpuTelemetry::Impl {
     int (*memory)(void*, Memory*)                    = nullptr;
     int (*temperature)(void*, unsigned, unsigned*)   = nullptr;
     int (*power)(void*, unsigned*)                   = nullptr;
+    int (*energy)(void*, unsigned long long*)        = nullptr; // millijoules
     void* device                                     = nullptr;
     bool initialized                                 = false;
 };
@@ -119,6 +121,10 @@ GpuSample GpuTelemetry::sample() const {
     if (impl_->power != nullptr) {
         unsigned milliwatts = 0;
         if (impl_->power(device, &milliwatts) == 0) { sample.power_watts = milliwatts / 1000.0; }
+    }
+    if (impl_->energy != nullptr) {
+        unsigned long long millijoules = 0;
+        if (impl_->energy(device, &millijoules) == 0) { sample.energy_joules = static_cast<double>(millijoules) / 1000.0; }
     }
     return sample;
 }

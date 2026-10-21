@@ -79,6 +79,8 @@ private:
     MemorySummary memory_;
     RuntimeStats baseline_;
     std::function<GpuSample()> gpu_sampler_;
+    // The sampler's energy reading when it was installed; the counter reports the change since.
+    std::optional<double> gpu_energy_baseline_;
     double start_seconds_ = 0.0;
     mutable std::mutex mutex_;
     Requests requests_;

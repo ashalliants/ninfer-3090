@@ -16,6 +16,8 @@ struct GpuSample {
     std::optional<std::uint64_t> memory_total_bytes;
     std::optional<unsigned> temperature_celsius;
     std::optional<double> power_watts;
+    // Cumulative since the driver loaded, so only differences are meaningful.
+    std::optional<double> energy_joules;
 };
 
 using GpuSymbolLookup = std::function<void*(const char*)>;

@@ -115,7 +115,8 @@ void Metrics::configure(std::string model, const EngineOptions& options,
 }
 
 void Metrics::set_gpu_sampler(std::function<GpuSample()> sampler) {
-    gpu_sampler_ = std::move(sampler);
+    gpu_sampler_         = std::move(sampler);
+    gpu_energy_baseline_ = gpu_sampler_ ? gpu_sampler_().energy_joules : std::nullopt;
 }
 
 void Metrics::first_token(const GenerationFirstTokenObservation& observation) {
@@ -243,6 +244,13 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
                        "Device memory installed.");
         optional_gauge("gpu_temperature_celsius", gpu.temperature_celsius, "GPU core temperature.");
         optional_gauge("gpu_power_watts", gpu.power_watts, "Board power draw.");
+        // Needs a baseline: NVML counts from driver load, so a reading first seen later would
+        // otherwise report the whole uptime of the machine.
+        if (gpu.energy_joules && gpu_energy_baseline_) {
+            counter("gpu_energy_joules_total", *gpu.energy_joules, *gpu_energy_baseline_,
+                    "Board energy used since attachment. Its rate is the mean power over any "
+                    "window, which the power gauge's instantaneous reading cannot give.");
+        }
     }
     gauge("engine_ready", ready ? 1 : 0, "Whether Engine can accept work.");
     gauge("server_start_time_seconds", start_seconds_,
