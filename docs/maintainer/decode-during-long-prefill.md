@@ -1,6 +1,6 @@
 # Decode during a long prefill: what is built, what is not, and what decides the rest
 
-Status: design note. Nothing here was measured; the host this was written on has no GPU. Numbers are
+Status: design note. Nothing here was measured; the host this was written on has no GPU, and the layer-sliced prefill described below is GPU code that has not run. Numbers are
 from `docs/serving.md`, `docs/performance.md` and the source comments they cite, and say so. Delete or
 fold into `docs/serving.md` once the open question below is settled.
 
@@ -50,7 +50,7 @@ The first two are the "smaller chunks, or capping prefill's share per round" tha
 split assessment (branch `docs/prefill-decode-split-assessment`, analysis only) asked to be tried before
 any redesign.
 
-## What is not built, and why
+## Options not taken, and the one built without a GPU
 
 ### Fusing the decode rows into the prefill step
 
