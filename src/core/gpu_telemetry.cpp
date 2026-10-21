@@ -24,12 +24,19 @@ struct GpuTelemetry::Impl {
 #ifdef _WIN32
         library = ::LoadLibraryA("nvml.dll");
         if (library == nullptr) { return; }
-        const auto symbol = [&](const char* name) { return reinterpret_cast<void*>(::GetProcAddress(library, name)); };
+        bind(pci_bus_id, [&](const char* name) { return reinterpret_cast<void*>(::GetProcAddress(library, name)); });
 #else
         library = ::dlopen("libnvidia-ml.so.1", RTLD_LAZY | RTLD_LOCAL);
         if (library == nullptr) { return; }
-        const auto symbol = [&](const char* name) { return ::dlsym(library, name); };
+        bind(pci_bus_id, [&](const char* name) { return ::dlsym(library, name); });
 #endif
+    }
+
+    Impl(const std::string& pci_bus_id, const GpuSymbolLookup& lookup) { bind(pci_bus_id, lookup); }
+
+    // Resolves the NVML entry points through `symbol` and opens the device; on any failure it
+    // leaves the object unavailable.
+    void bind(const std::string& pci_bus_id, const GpuSymbolLookup& symbol) {
         init        = reinterpret_cast<int (*)()>(symbol("nvmlInit_v2"));
         shutdown    = reinterpret_cast<int (*)()>(symbol("nvmlShutdown"));
         by_pci      = reinterpret_cast<int (*)(const char*, void**)>(symbol("nvmlDeviceGetHandleByPciBusId_v2"));
@@ -77,6 +84,9 @@ struct GpuTelemetry::Impl {
 };
 
 GpuTelemetry::GpuTelemetry(const std::string& pci_bus_id) : impl_(std::make_unique<Impl>(pci_bus_id)) {}
+
+GpuTelemetry::GpuTelemetry(const std::string& pci_bus_id, const GpuSymbolLookup& lookup)
+    : impl_(std::make_unique<Impl>(pci_bus_id, lookup)) {}
 
 GpuTelemetry::~GpuTelemetry() = default;
 

@@ -35,6 +35,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_json_schema_oracle_test
   ninfer_json_schema_test
   ninfer_kv_capacity_test
+  ninfer_gpu_telemetry_test
   ninfer_kv_plane_types_test
   ninfer_load_report_test
   ninfer_media_decode_test

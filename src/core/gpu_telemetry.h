@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -17,6 +18,8 @@ struct GpuSample {
     std::optional<double> power_watts;
 };
 
+using GpuSymbolLookup = std::function<void*(const char*)>;
+
 // Reads GpuSample from NVML, loaded at runtime from the driver's library so that its absence (no
 // driver, a container without it) only leaves every field unknown and never stops startup.
 class GpuTelemetry {
@@ -24,6 +27,9 @@ public:
     // `pci_bus_id` as cudaDeviceGetPCIBusId prints it ("00000000:01:00.0"): CUDA and NVML number
     // devices differently, so the bus id is the join key.
     explicit GpuTelemetry(const std::string& pci_bus_id);
+    // Same, with the NVML entry points taken from `lookup` (name -> function, nullptr when absent)
+    // instead of the driver's library: the seam that lets a test stand in a fake driver.
+    GpuTelemetry(const std::string& pci_bus_id, const GpuSymbolLookup& lookup);
     ~GpuTelemetry();
 
     GpuTelemetry(const GpuTelemetry&)            = delete;

@@ -639,7 +639,7 @@ more while resident.
 the API key when one is configured, answers `503 model_loading` until warmup completes, and works
 independently of `--request-log-jsonl` and `--log-stats-interval-ms`. Engine failure leaves the
 endpoint readable with `ninfer_engine_ready 0`. The handler copies published snapshots and formats
-them outside the Engine worker; scraping does not reset counters or initiate device work.
+them outside the Engine worker; scraping does not reset counters or initiate CUDA work. The one live read is the `ninfer_gpu_*` gauges below, which query NVML (the driver's monitoring library) once per scrape.
 
 ```bash
 curl http://127.0.0.1:8080/metrics -H 'Authorization: Bearer local-secret'
@@ -693,6 +693,9 @@ server restarts.
 | `ninfer_requests_total{outcome}`, `ninfer_response_failures_total` | generation attempts entering preparation by outcome (`completed`, `cancelled`, `failed`, `rejected`), and response failures after settlement; protocol/model validation failures and token-count requests are excluded |
 | `ninfer_time_to_first_token_seconds` | histogram updated once at the first committed token, including preparation, queueing and binding |
 | `ninfer_request_duration_seconds`, `ninfer_request_queue_seconds` | histograms for settled generation outcomes, including cancellation; exceptional failures have separate counts |
+| `ninfer_gpu_utilization_percent`, `ninfer_gpu_memory_utilization_percent` | gauges: share of NVML's last sample period in which any kernel ran, and in which device memory was read or written. Measured on the first device (`--device`, or the first of `--devices`) |
+| `ninfer_gpu_memory_used_bytes`, `ninfer_gpu_memory_total_bytes` | gauges: device memory in use by every process on the card (not only this server), and installed |
+| `ninfer_gpu_temperature_celsius`, `ninfer_gpu_power_watts` | gauges: GPU core temperature and board power draw. All six `ninfer_gpu_*` series are omitted, not reported as 0, when NVML or the device cannot be opened (no driver library, a container without it); a single reading NVML cannot give is omitted on its own |
 | `ninfer_context_store_images`, `ninfer_context_store_used_bytes` | gauges: sessions and bytes held by the [context store](#context-store) (zero when it is off) |
 | `ninfer_context_store_writes_total`, `_write_failures_total`, `_dropped_total` | sessions written, writes that failed, sessions not queued because the write queue was full |
 | `ninfer_context_store_bytes_written_total`, `_bytes_stored_total`, `_bytes_reused_total` | new chunk bytes written (raw size), what they took on disk after [compression](#context-store), and chunk bytes a write found already stored |

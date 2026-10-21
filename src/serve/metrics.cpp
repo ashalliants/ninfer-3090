@@ -103,8 +103,10 @@ void Metrics::configure(std::string model, const EngineOptions& options,
     baseline_ = baseline;
     start_seconds_ =
         std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+    // The primary device is the first of --devices when that is given, else --device.
+    const int primary_device = options.devices.empty() ? options.device : options.devices.front();
     char bus_id[32] = {};
-    if (cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), options.device) == cudaSuccess) {
+    if (cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), primary_device) == cudaSuccess) {
         auto telemetry = std::make_shared<GpuTelemetry>(bus_id);
         if (telemetry->available()) {
             set_gpu_sampler([telemetry] { return telemetry->sample(); });
