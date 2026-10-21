@@ -383,6 +383,9 @@ ContextStore::ContextStore(Options options) : options_(std::move(options)) {
                                      (options_.directory / sub).string() + ": " + error.message());
         }
     }
+    if (!options_.peers.empty() && options_.peer_poll.count() <= 0) {
+        throw std::invalid_argument("context store peer_poll must be positive");
+    }
     for (const fs::path& peer : options_.peers) {
         std::error_code same_error;
         if (peer.empty() || fs::equivalent(peer, options_.directory, same_error)) {
@@ -591,10 +594,14 @@ void ContextStore::unpin_chunks_locked(const std::vector<ChunkRef>& chunks) {
 void ContextStore::remove_entry_locked(const std::string& id, bool corrupt) {
     const auto found = entries_.find(id);
     if (found != entries_.end()) {
+        const std::string peer_memo   = found->second.peer_memo_key;
+        const std::int64_t peer_stamp = found->second.peer_stamp;
         release_references(found->second);
         manifest_total_bytes_ -= found->second.manifest_bytes;
         entries_.erase(found);
         if (corrupt) { ++stats_.corrupt_removed; }
+        // A damaged image imported from a peer is not imported again until the peer rewrites it.
+        if (corrupt && !peer_memo.empty()) { peer_skipped_[peer_memo] = peer_stamp; }
     }
     remove_quietly(manifest_path(id));
     remove_quietly(used_path(id));
@@ -1793,7 +1800,10 @@ bool ContextStore::import_peer_image(const fs::path& peer, const std::string& id
     try {
         data = read_whole_file(peer / "manifests" / (id + ".manifest"));
     } catch (const std::exception&) {
-        return false; // the peer removed it since the listing
+        // The peer removed it since the listing: count it, so the skip metrics show the loss.
+        std::scoped_lock lock(mutex_);
+        ++stats_.peer_skipped;
+        return false;
     }
     Entry entry;
     if (!parse_manifest(data, entry, nullptr) || entry.info.id != id) { return skip(); }
@@ -1885,6 +1895,8 @@ bool ContextStore::import_peer_image(const fs::path& peer, const std::string& id
         }
     }
     entry.info.last_used_ms = entry.info.created_ms;
+    entry.peer_memo_key     = memo_key;
+    entry.peer_stamp        = stamp;
     manifest_total_bytes_ += entry.manifest_bytes;
     add_references(entry);
     entry.generation = ++next_generation_;

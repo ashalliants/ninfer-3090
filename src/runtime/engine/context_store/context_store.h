@@ -238,6 +238,10 @@ private:
         // The bucket's modified time of the manifest this entry was imported from (0: written or
         // loaded here). Compared only with other bucket times, never with the local clock.
         std::int64_t remote_modified_ms = 0;
+        // Set on an image imported from a peer: the peer_skipped_ key and manifest time to restore
+        // if this copy proves damaged, so the unchanged peer manifest is not imported again.
+        std::string peer_memo_key;
+        std::int64_t peer_stamp = 0;
     };
     struct ChunkUse {
         std::uint32_t references = 0;

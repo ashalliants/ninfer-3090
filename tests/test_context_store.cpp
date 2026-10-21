@@ -1504,6 +1504,42 @@ void test_peer_import_links_compressed_chunks() {
           "the importer counts compressed chunks by another size than the peer");
 }
 
+// A same-size bit flip passes the import's length check; the load that finds it must leave the
+// unchanged peer manifest skipped, not imported again at every poll.
+void test_damaged_imported_image_is_not_imported_again() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    ContextStore a(options_for(a_directory.path()));
+    ContextStore b(peer_options(b_directory.path(), a_directory.path()));
+    (void)a.put(describe("0a"), peer_image(6), std::array{ContextStore::Region{30, 5000}});
+    check(b.sync_peers() == 1, "the image was not imported");
+    const auto files = chunk_files(b_directory.path());
+    check(!files.empty(), "the importer holds no chunk files");
+    {
+        std::fstream file(files.front(), std::ios::in | std::ios::out | std::ios::binary);
+        char byte = 0;
+        file.read(&byte, 1);
+        byte ^= 0x5a;
+        file.seekp(0);
+        file.write(&byte, 1);
+    }
+    check(!b.load("0a").has_value(), "a damaged imported image was served");
+    check(b.sync_peers() == 0 && b.list().empty(), "a damaged image was imported again");
+}
+
+void test_non_positive_peer_poll_is_refused() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    ContextStore a(options_for(a_directory.path()));
+    ContextStore::Options options = peer_options(b_directory.path(), a_directory.path());
+    options.peer_poll             = std::chrono::milliseconds(0);
+    bool threw = false;
+    try {
+        ContextStore b(options);
+    } catch (const std::invalid_argument&) { threw = true; }
+    check(threw, "a zero peer poll interval was accepted");
+}
+
 } // namespace
 
 int main() {
@@ -1516,6 +1552,8 @@ int main() {
     test_damaged_peer_files_are_skipped_or_missed_and_never_modified();
     test_peer_images_over_budget_expired_or_gone_are_skipped_once();
     test_peer_import_links_compressed_chunks();
+    test_damaged_imported_image_is_not_imported_again();
+    test_non_positive_peer_poll_is_refused();
     test_compressed_chunks_round_trip_and_account_for_disk_use();
     test_compressed_chunks_survive_restart_and_either_setting();
     test_compressed_chunk_damage_is_a_miss();
