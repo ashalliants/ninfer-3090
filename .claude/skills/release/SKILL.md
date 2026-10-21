@@ -141,6 +141,13 @@ launch fails instantly with exit 127 (it still looks "completed"; read the outpu
 
 Do not wait idle on one while the other builds; check both logs when notified.
 
+**Away from the 3090 PC** (only a Mac, no local GPU): build Linux on the Vast dev instance with
+`vast-release-linux.sh`, and Windows on a GPU-less Windows box with `scripts/release-windows-remote.sh
+<ssh-host>`. See "Building the release without the RTX 3090 PC" in `docs/maintainer/release-process.md`.
+The Windows archive then cannot be run, so the notes' Verification section must say it was built and
+dependency-checked only, and step 6's stripped-`PATH` and real-card smoke tests for Windows are
+unverified. Say so in the final report.
+
 ## 5. Package
 
 - Windows: `scripts\package-release.ps1` (or `build.ps1 -Package`). It copies the cuBLAS DLLs and

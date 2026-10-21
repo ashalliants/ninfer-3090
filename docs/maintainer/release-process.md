@@ -94,6 +94,49 @@ Start the launcher with nothing overridden and confirm it serves a request.
 - `cmd` batch files: a trailing `^` on a `rem` line continues the comment onto the next line, an unquoted
   `>>` in `set /a` is a redirect, and `Tee-Object` writes UTF-16 (`findstr` cannot search it).
 
+## Building the release without the RTX 3090 PC
+
+Compiling needs the CUDA toolkit, not a card, so a release can be cut with the 3090 PC off. Written
+for being away from it; **none of this has been run end to end yet**, so expect to fix a snag or two
+the first time and record them here.
+
+- **Linux archive: a rented Vast 3090.** `vast-release-linux.sh <repo>` (in the `vast-ninfer` scripts
+  directory, beside `vast-dev-launch.sh`) syncs the committed release commit to the dev instance,
+  builds `ninfer ninfer-serve ninfer_bench` from a `git archive` of it, runs `package-release.sh`,
+  checks `--version`, `ldd` and the checksums, serves one chat completion with the default profile on
+  the real card, and pulls the archive back into `dist/`. The instance image is Ubuntu 24.04 with CUDA
+  12.8.1, the baseline `docs/release-archive-linux.md` documents.
+- **Windows archive: any x64 Windows machine, no NVIDIA GPU needed.** `scripts/release-windows.ps1`
+  installs the toolchain (VS 2022 Build Tools, CMake, Ninja, CUDA 12.8.1 without the driver, vcpkg at the
+  manifest baseline, ccache), builds the three products and runs the packager.
+  `scripts/release-windows-remote.sh <ssh-host>` drives it over SSH and pulls the zip back. The first
+  run builds ffmpeg through vcpkg and compiles every kernel cold, so it is slow; later runs are
+  incremental.
+- **What the Windows box cannot verify.** With no driver there is no `nvcuda.dll`, which every
+  executable imports, so the executables cannot start there. `package-release.ps1` therefore checks the
+  import tables with `dumpbin /dependents` (every DLL imported must be shipped, a Windows DLL, or an
+  NVIDIA driver DLL) instead of starting them. It says so, and uses the real start-up check whenever a
+  driver is present (`NINFER_PACKAGE_STATIC_DEPENDENCY_CHECK=1` forces the static check, to test it).
+  Nothing is served on the card, so the release notes must say the Windows archive was built and
+  dependency-checked but not run, and the first chance to run it should be taken.
+- **Using CUDA 12.8.1 on both platforms** keeps one cuBLAS to reason about. Do not move the Windows build
+  to a newer toolkit for speed without measuring it on the card.
+
+One-time OpenSSH setup on the Windows box (elevated PowerShell), so `release-windows-remote.sh` can drive it:
+
+```powershell
+Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+Set-Service sshd -StartupType Automatic ; Start-Service sshd
+New-ItemProperty -Path HKLM:\SOFTWARE\OpenSSH -Name DefaultShell -PropertyType String -Force `
+  -Value 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+# Administrators' keys live in one file with a locked-down ACL, not in ~\.ssh:
+Set-Content -Path C:\ProgramData\ssh\administrators_authorized_keys -Value '<your public key>'
+icacls C:\ProgramData\ssh\administrators_authorized_keys /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F'
+powercfg /change standby-timeout-ac 0 ; powercfg /change hibernate-timeout-ac 0
+```
+
+Do not forward port 22 to the internet. Reach the box over a private network such as Tailscale.
+
 ## Checks before publishing
 
 - `scripts/check-linux-scripts.sh` passes.

@@ -102,12 +102,69 @@ foreach ($script in @('run.bat', 'download-model.bat')) {
 # that none of them started on a PC without the Toolkit. Start each one from the folder about to be
 # archived with nothing but Windows on PATH: a DLL the archive does not carry stops it (0xC0000135)
 # and stops the release here.
-$CleanPath = "$env:SystemRoot\System32;$env:SystemRoot"
-foreach ($exe in ($Products | ForEach-Object { $_.Destination })) {
-    $null = cmd /c "set PATH=$CleanPath&& `"$(Join-Path $ProductRoot $exe)`" --help 2>&1"
-    if ($LASTEXITCODE -ne 0) {
-        throw "$exe did not start with only Windows on PATH (exit $LASTEXITCODE): a DLL it needs is missing from the archive or cannot be loaded"
+#
+# That needs an NVIDIA driver on the packaging machine: every executable imports nvcuda.dll (the
+# driver API, for the VMM pools), and without a driver the loader stops it before main for a reason
+# unrelated to the archive. A build box with no NVIDIA GPU therefore cannot run the check, so it
+# falls back to reading each image's import table instead. Same question, answered statically: every
+# DLL any .exe or .dll in the folder imports must be in the folder, be a Windows system DLL, or be
+# one of the NVIDIA driver's own DLLs (which every machine that can run the product has, and which
+# are not redistributable). The fallback is used only when nvcuda.dll is absent, or when
+# NINFER_PACKAGE_STATIC_DEPENDENCY_CHECK=1 asks for it, which is how to test it on a machine
+# that does have a driver. Where a driver is present the real start-up check still runs.
+$DriverDlls = @('nvcuda.dll', 'nvml.dll', 'nvapi64.dll', 'nvcuvid.dll', 'nvencodeapi64.dll')
+
+function Find-Dumpbin {
+    $onPath = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
+    if ($onPath) { return $onPath.Source }
+    foreach ($root in @("${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022", "$env:ProgramFiles\Microsoft Visual Studio\2022")) {
+        $hit = Get-ChildItem -Path "$root\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1
+        if ($hit) { return $hit.FullName }
     }
+    throw 'dumpbin.exe not found: it ships with the VS 2022 C++ build tools, which the release build needs anyway'
+}
+
+function Assert-ArchiveDependenciesSatisfied([string]$Root) {
+    $dumpbin = Find-Dumpbin
+    $shipped = @{}
+    Get-ChildItem -LiteralPath $Root -File | ForEach-Object { $shipped[$_.Name.ToLowerInvariant()] = $true }
+    $problems = [System.Collections.Generic.List[string]]::new()
+    $images = @(Get-ChildItem -LiteralPath $Root -File | Where-Object { $_.Extension -in '.exe', '.dll' })
+    if ($images.Count -eq 0) { throw "No executables or DLLs found in $Root to check" }
+    foreach ($image in $images) {
+        $report = & $dumpbin /nologo /dependents $image.FullName
+        if ($LASTEXITCODE -ne 0) { throw "dumpbin failed on $($image.Name) (exit $LASTEXITCODE)" }
+        foreach ($line in $report) {
+            if ($line -match '^\s{4}(\S+\.dll)\s*$') {
+                $dependency = $Matches[1].ToLowerInvariant()
+                if ($shipped.ContainsKey($dependency)) { continue }
+                if ($DriverDlls -contains $dependency) { continue }
+                # API sets are resolved by the loader and have no file in System32.
+                if ($dependency -like 'api-ms-win-*' -or $dependency -like 'ext-ms-*') { continue }
+                if (Test-Path -LiteralPath (Join-Path $env:SystemRoot "System32\$dependency")) { continue }
+                $problems.Add("$($image.Name) imports $dependency")
+            }
+        }
+    }
+    if ($problems.Count -gt 0) {
+        throw ("The archive is missing DLLs its binaries import (checked statically, no NVIDIA driver here):`n  " + ($problems -join "`n  "))
+    }
+    Write-Host "dependency check: every import of the $($images.Count) images is shipped, a Windows DLL or an NVIDIA driver DLL"
+}
+
+$HaveDriver = Test-Path -LiteralPath (Join-Path $env:SystemRoot 'System32\nvcuda.dll')
+if ($HaveDriver -and $env:NINFER_PACKAGE_STATIC_DEPENDENCY_CHECK -ne '1') {
+    $CleanPath = "$env:SystemRoot\System32;$env:SystemRoot"
+    foreach ($exe in ($Products | ForEach-Object { $_.Destination })) {
+        $null = cmd /c "set PATH=$CleanPath&& `"$(Join-Path $ProductRoot $exe)`" --help 2>&1"
+        if ($LASTEXITCODE -ne 0) {
+            throw "$exe did not start with only Windows on PATH (exit $LASTEXITCODE): a DLL it needs is missing from the archive or cannot be loaded"
+        }
+    }
+} else {
+    Write-Warning 'No NVIDIA driver on this machine (or the static check was requested): checking import tables instead of starting the executables. They have NOT been run.'
+    Assert-ArchiveDependenciesSatisfied $ProductRoot
 }
 
 $innerHashes = Get-ChildItem -LiteralPath $ProductRoot -File | Sort-Object Name | ForEach-Object {
