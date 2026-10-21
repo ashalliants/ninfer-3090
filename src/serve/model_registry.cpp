@@ -475,6 +475,8 @@ ModelStatusSnapshot ModelRegistry::snapshot_locked(const Slot& slot) const {
                                .aliases    = slot.definition.aliases,
                                .state      = slot.state,
                                .arguments  = slot.definition.arguments,
+                               .max_context = slot.definition.options.max_context,
+                               .vision      = slot.definition.options.enable_vision,
                                .failed     = slot.failed,
                                .last_error = slot.last_error,
                                .leases     = slot.leases,

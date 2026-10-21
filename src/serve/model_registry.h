@@ -55,6 +55,9 @@ struct ModelStatusSnapshot {
     std::vector<std::string> aliases;
     ModelState state = ModelState::Unloaded;
     std::vector<std::string> arguments;
+    // What discovery advertises, known before the model loads.
+    std::uint32_t max_context = 0;
+    bool vision               = false;
     // The last load or wake failed; cleared by the next success.
     bool failed = false;
     std::string last_error;

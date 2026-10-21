@@ -2,6 +2,7 @@
 
 #include "serve/http_server.h"
 #include "serve/http_transport.h"
+#include "product/version/version.h"
 #include "serve/openai_common.h"
 
 #include <nlohmann/json.hpp>
@@ -56,18 +57,42 @@ void write_registry_error(const httplib::Request& req, httplib::Response& res,
     }
 }
 
+// Discovery is reachable with the public key (or none), so a credential the model was started with
+// must not appear in it: `--api-key VALUE` and `--api-key=VALUE`, from the command line or a preset.
+std::vector<std::string> redact_credentials(const std::vector<std::string>& arguments) {
+    std::vector<std::string> out;
+    out.reserve(arguments.size());
+    bool redact_next = false;
+    for (const std::string& argument : arguments) {
+        if (redact_next) {
+            out.emplace_back("<redacted>");
+            redact_next = false;
+        } else if (argument == "--api-key") {
+            out.push_back(argument);
+            redact_next = true;
+        } else if (argument.rfind("--api-key=", 0) == 0) {
+            out.emplace_back("--api-key=<redacted>");
+        } else {
+            out.push_back(argument);
+        }
+    }
+    return out;
+}
+
 Json model_entry(const ModelStatusSnapshot& status) {
-    Json state{{"value", model_state_name(status.state)}, {"args", status.arguments}};
+    Json state{{"value", model_state_name(status.state)},
+               {"args", redact_credentials(status.arguments)}};
     if (status.failed) {
         state["failed"] = true;
         if (!status.last_error.empty()) { state["last_error"] = status.last_error; }
     }
-    return Json{{"id", status.id},
-                {"object", "model"},
-                {"created", unix_time_now()},
-                {"owned_by", "ninfer"},
-                {"aliases", status.aliases},
-                {"status", std::move(state)}};
+    // The same schema a single-model server advertises, so a client reads one shape either way.
+    Json entry = Json::parse(make_model_object(
+        ModelDescription{.id = status.id, .max_model_len = status.max_context, .vision = status.vision},
+        unix_time_now()));
+    entry["aliases"] = status.aliases;
+    entry["status"]  = std::move(state);
+    return entry;
 }
 
 Json event_json(const ModelEvent& event) {
@@ -307,6 +332,8 @@ void RouterServer::register_routes() {
                         [](const httplib::Request&, httplib::Response& res) { res.status = 204; });
     }
     server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
+        // On every response, errors included, as on a single-model server.
+        res.set_header("X-NInfer-Version", std::string(ninfer::product::build_version()));
         if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
             return httplib::Server::HandlerResponse::Unhandled;
         }
@@ -385,7 +412,10 @@ void RouterServer::handle_health(const httplib::Request&, httplib::Response& res
         if (status.state == ModelState::Loaded) { ++loaded; }
     }
     res.set_header("Cache-Control", "no-store");
-    res.set_content(Json{{"status", "ok"}, {"models", total}, {"loaded", loaded}}.dump(),
+    res.set_content(Json{{"status", "ok"},
+                         {"version", std::string(ninfer::product::build_version())},
+                         {"models", total},
+                         {"loaded", loaded}}.dump(),
                     "application/json");
 }
 
@@ -747,7 +777,8 @@ void RouterServer::relay(const httplib::Request& req, httplib::Response& res,
     for (const auto& [name, value] : relayed->headers) {
         if (lower_ascii(name) == "content-type") {
             content_type = value;
-        } else if (!hop_by_hop(name)) {
+        } else if (!hop_by_hop(name) && lower_ascii(name) != "x-ninfer-version") {
+            // The router stamped its own on the way in; one copy per response.
             res.set_header(name, value);
         }
     }
