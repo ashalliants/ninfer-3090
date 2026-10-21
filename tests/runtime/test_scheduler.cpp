@@ -385,6 +385,16 @@ void test_prompt_fit_beside_residents() {
             "a prompt that needs nothing new fits even beside a full pool");
     require(!prompt_fits_beside_residents({1, 0}, {100, 0}, KvPageCounts{100, 0}, true),
             "a pool already full of resident pages has no room for one more");
+    // Resident reservations count as pinned and lent pages leave the capacity.
+    require(!prompt_fits_beside_residents({10, 0}, {40 + 51, 0}, capacity, true),
+            "pages promised to residents are not free for a new prompt");
+    require(!prompt_fits_beside_residents({10, 0}, {40, 0}, KvPageCounts{49, 0}, true),
+            "pages lent away are not free for a new prompt");
+    // An unaligned reused prefix shares only its full pages: 130 tokens = 2 full + a copied tail.
+    require(ninfer::runtime::shareable_prefix_pages(130, 64) == 2 &&
+                ninfer::runtime::shareable_prefix_pages(128, 64) == 2 &&
+                ninfer::runtime::shareable_prefix_pages(63, 64) == 0,
+            "only full pages of a reused prefix are shared with its donor");
 }
 
 } // namespace

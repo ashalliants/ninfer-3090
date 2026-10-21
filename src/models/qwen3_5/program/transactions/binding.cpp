@@ -84,7 +84,8 @@ bool ProgramImpl::prompt_fits_beside_residents(const RequestBasePlan& base,
     std::uint64_t need_backend = kv_pages_for_frontier(whole.backend_frontier);
     if (source) {
         // A reused prefix a resident already holds is in `pinned`; counting it again would turn
-        // the common shared system prompt into a false "does not fit".
+        // the common shared system prompt into a false "does not fit". Only full pages are shared:
+        // an unaligned prefix's tail page is copied, so it stays in `need`.
         const auto& record = checkpoint(*source);
         const auto shared  = [](const KVAddressSpaceStore& addresses, const LogicalKVPageStore& pages,
                                KVAddressSpaceHandle address, std::uint32_t prefix_pages,
@@ -97,19 +98,25 @@ bool ProgramImpl::prompt_fits_beside_residents(const RequestBasePlan& base,
         };
         need_main -= std::min<std::uint64_t>(
             need_main, shared(*text_kv_addresses, *text_kv_pages, record.kv->text,
-                              kv_pages_for_frontier(record.frontier), pinned_main));
+                              runtime::shareable_prefix_pages(record.frontier, kPagedKVPageSize),
+                              pinned_main));
         if (record.kv->backend) {
             need_backend -= std::min<std::uint64_t>(
                 need_backend, shared(*backend_kv_addresses, *backend_kv_pages, *record.kv->backend,
-                                     kv_pages_for_frontier(record.backend_frontier),
+                                     runtime::shareable_prefix_pages(record.backend_frontier,
+                                                                kPagedKVPageSize),
                                      pinned_backend));
         }
     }
+    // Live reservations are pages residents will map as they grow, and lent pages are gone from the
+    // pool, so the pool's own counters decide what is left (reclaimable checkpoint pages stay free).
+    const auto& main_pool = text_kv_pages->physical_pool();
+    const auto* backend   = backend_kv_pages ? &backend_kv_pages->physical_pool() : nullptr;
     return runtime::prompt_fits_beside_residents(
-        {need_main, need_backend}, {pinned_main.size(), pinned_backend.size()},
-        {text_kv_pages->physical_pool().capacity_pages(),
-         backend_kv_pages ? backend_kv_pages->physical_pool().capacity_pages() : 0U},
-        residents);
+        {need_main, need_backend},
+        {pinned_main.size() + main_pool.reserved_pages(),
+         pinned_backend.size() + (backend ? backend->reserved_pages() : 0U)},
+        {main_pool.usable_pages(), backend ? backend->usable_pages() : 0U}, residents);
 }
 
 BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runtime::LaneId lane_id,
