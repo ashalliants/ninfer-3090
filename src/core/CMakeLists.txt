@@ -27,6 +27,7 @@ add_library(ninfer_core STATIC
   link_probe.cpp
   power_throttling.cpp
   vram_budget.cpp
+  gpu_telemetry.cpp
 )
 if(WIN32)
   target_sources(ninfer_core PRIVATE read_only_file_win32.cpp scratch_file_win32.cpp)
