@@ -562,7 +562,6 @@ int main() {
              std::vector<std::string>{"--max-cache-markers-per-request", "4"},
              std::vector<std::string>{"--auto-long-anchors", "2"},
              std::vector<std::string>{"--auto-prefix-grid"},
-             std::vector<std::string>{"--progress-anchor-tokens", "4096"},
              std::vector<std::string>{"--max-prefill-lanes", "2"},
              std::vector<std::string>{"--prefill-max-skip", "8"},
              std::vector<std::string>{"--decode-rounds-per-prefill", "4"},
