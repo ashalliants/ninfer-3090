@@ -410,6 +410,17 @@ std::optional<std::size_t> ProgramImpl::pause_host_bytes(SequenceHandle handle) 
     return bytes;
 }
 
+std::size_t ProgramImpl::pause_state_image_unplaced(SequenceHandle handle) const {
+    if (!host_context_arena || !valid_sequence(handle)) { return 0; }
+    const auto& sequence = sequences[ContractAccess::lane(handle).value];
+    if (!state_store->valid(sequence.state.read) || state_store->host_resident(sequence.state.read)) {
+        return 0;
+    }
+    // The image is one contiguous arena run, unlike the KV pages, which can be split.
+    const auto bytes = state_images->host_layout().image_bytes;
+    return host_context_arena->can_allocate(bytes) ? 0 : bytes;
+}
+
 std::size_t ProgramImpl::release_redundant_host(std::span<const CheckpointHandle> excluded,
                                                 std::optional<SequenceHandle> pending_backup) {
     if (!host_context_arena) { return 0; }
