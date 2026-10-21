@@ -97,10 +97,10 @@ Start the launcher with nothing overridden and confirm it serves a request.
 ## Building the release without the RTX 3090 PC
 
 Compiling needs the CUDA toolkit, not a card, so a release can be cut with the 3090 PC off. Written
-for being away from it; **none of this has been run end to end yet**, so expect to fix a snag or two
+for being away from it (a handoff for a fresh agent is in `release-away-from-3090.md`); **none of this has been run end to end yet**, so expect to fix a snag or two
 the first time and record them here.
 
-- **Linux archive: a rented Vast 3090.** `vast-release-linux.sh <repo>` (in the `vast-ninfer` scripts
+- **Linux archive: a rented Vast 3090.** `scripts/vast/vast-release-linux.sh <repo>` (copy it into the `vast-ninfer` scripts
   directory, beside `vast-dev-launch.sh`) syncs the committed release commit to the dev instance,
   builds `ninfer ninfer-serve ninfer_bench` from a `git archive` of it, runs `package-release.sh`,
   checks `--version`, `ldd` and the checksums, serves one chat completion with the default profile on
