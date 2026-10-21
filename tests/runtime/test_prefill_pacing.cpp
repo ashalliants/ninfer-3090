@@ -7,6 +7,8 @@
 namespace {
 
 using ninfer::runtime::ContextMachineCostModel;
+using ninfer::runtime::kMaximumDecodeDebtNs;
+using ninfer::runtime::kMaximumDeferredPrefillTurns;
 using ninfer::runtime::kMinimumPacedPrefillTokens;
 using ninfer::runtime::kPacedPrefillAlignment;
 using ninfer::runtime::PrefillPacing;
@@ -30,7 +32,7 @@ ContextMachineCostModel model() {
 void test_cap_is_off_by_default() {
     const PrefillPacing pacing;
     require(pacing.step_cap(model(), 0, 4096, true) == 0, "default pacing capped a step");
-    require(pacing.options().stall_budget_ms == 0, "default options set a budget");
+    require(!pacing.options().active(), "default options reported active");
 }
 
 void test_cap_needs_a_decoding_neighbour() {
@@ -102,7 +104,7 @@ void test_observed_slowness_tightens_the_cap() {
     for (int i = 0; i < 16; ++i) {
         // The card is twice as slow as the preset says.
         const std::uint64_t predicted = predicted_prefill_step_ns(costs, 0, 2048);
-        pacing.prefill_step_done(predicted, predicted * 2);
+        pacing.prefill_step_done(predicted, predicted * 2, true);
     }
     require(pacing.correction() > 1.8 && pacing.correction() <= 2.0, "correction did not converge");
     const auto after = pacing.step_cap(costs, 0, 4096, true);
@@ -111,12 +113,77 @@ void test_observed_slowness_tightens_the_cap() {
 
 void test_correction_is_bounded() {
     PrefillPacing pacing(PrefillPacingOptions{.stall_budget_ms = 600});
-    for (int i = 0; i < 64; ++i) { pacing.prefill_step_done(1'000, 1'000'000'000'000ULL); }
+    for (int i = 0; i < 64; ++i) { pacing.prefill_step_done(1'000, 1'000'000'000'000ULL, false); }
     require(pacing.correction() <= 4.0, "correction exceeded its bound");
-    for (int i = 0; i < 64; ++i) { pacing.prefill_step_done(1'000'000'000'000ULL, 1'000); }
+    for (int i = 0; i < 64; ++i) { pacing.prefill_step_done(1'000'000'000'000ULL, 1'000, false); }
     require(pacing.correction() >= 0.25, "correction fell below its bound");
-    pacing.prefill_step_done(0, 123);
-    pacing.prefill_step_done(UINT64_MAX, 123);
+    pacing.prefill_step_done(0, 123, false);
+    pacing.prefill_step_done(UINT64_MAX, 123, false);
+}
+
+void test_share_off_never_defers() {
+    PrefillPacing pacing;
+    pacing.prefill_step_done(1, 1'000'000'000, true);
+    require(!pacing.defer_prefill(true), "a zero decode share deferred a prefill turn");
+    require(pacing.decode_debt_ns() == 0, "a zero decode share accrued debt");
+}
+
+void test_share_owes_decode_time_after_a_step() {
+    PrefillPacing pacing(PrefillPacingOptions{.decode_share_percent = 50});
+    pacing.prefill_step_done(1, 1'000'000'000, true);
+    require(pacing.decode_debt_ns() == 1'000'000'000, "50% share did not owe one step of decode");
+    int turns = 0;
+    while (pacing.defer_prefill(true)) {
+        pacing.decode_round_done(50'000'000);
+        ++turns;
+        require(turns < 1000, "debt never cleared");
+    }
+    require(turns == 20, "a 1 s debt paid in 50 ms rounds should defer exactly 20 turns");
+    require(pacing.decode_debt_ns() == 0, "debt remained after the last deferral");
+}
+
+void test_share_ratio() {
+    for (const std::uint32_t share : {10U, 25U, 50U, 75U, 90U}) {
+        PrefillPacing pacing(PrefillPacingOptions{.decode_share_percent = share});
+        pacing.prefill_step_done(1, 1'000'000'000, true);
+        const std::uint64_t expected = 1'000'000'000ULL / (100U - share) * share;
+        require(pacing.decode_debt_ns() == expected, "debt does not match share/(100-share)");
+    }
+}
+
+void test_share_ignores_steps_nobody_waited_on() {
+    PrefillPacing pacing(PrefillPacingOptions{.decode_share_percent = 50});
+    pacing.prefill_step_done(1, 1'000'000'000, false);
+    require(pacing.decode_debt_ns() == 0, "a step with no decoding lane created debt");
+}
+
+void test_share_debt_is_capped() {
+    PrefillPacing pacing(PrefillPacingOptions{.decode_share_percent = 90});
+    for (int i = 0; i < 100; ++i) { pacing.prefill_step_done(1, 5'000'000'000ULL, true); }
+    require(pacing.decode_debt_ns() == kMaximumDecodeDebtNs, "decode debt was not capped");
+}
+
+void test_share_does_not_defer_when_decode_did_not_run() {
+    PrefillPacing pacing(PrefillPacingOptions{.decode_share_percent = 50});
+    pacing.prefill_step_done(1, 1'000'000'000, true);
+    require(!pacing.defer_prefill(false),
+            "prefill was deferred in a cycle where no decode round ran");
+    require(pacing.decode_debt_ns() == 0, "debt survived a cycle with nobody to decode");
+}
+
+void test_share_has_a_turn_limit() {
+    PrefillPacing pacing(PrefillPacingOptions{.decode_share_percent = 50});
+    pacing.prefill_step_done(1, kMaximumDecodeDebtNs, true);
+    std::uint32_t turns = 0;
+    // Decode rounds too short to ever repay the debt must not starve prefill.
+    while (pacing.defer_prefill(true)) {
+        pacing.decode_round_done(1);
+        require(++turns <= kMaximumDeferredPrefillTurns, "deferral never gave way to prefill");
+    }
+    require(turns == kMaximumDeferredPrefillTurns && pacing.decode_debt_ns() > 0,
+            "deferral ended before the limit while debt remained, or never reached it");
+    // After the forced turn the count starts over.
+    require(pacing.defer_prefill(true), "the turn limit left the pacer unusable");
 }
 
 } // namespace
@@ -132,6 +199,13 @@ int main() {
         test_attention_cost_shrinks_deep_steps();
         test_observed_slowness_tightens_the_cap();
         test_correction_is_bounded();
+        test_share_off_never_defers();
+        test_share_owes_decode_time_after_a_step();
+        test_share_ratio();
+        test_share_ignores_steps_nobody_waited_on();
+        test_share_debt_is_capped();
+        test_share_does_not_defer_when_decode_did_not_run();
+        test_share_has_a_turn_limit();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
         return 1;

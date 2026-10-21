@@ -145,6 +145,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--prefill-stall-budget-ms N] [--yield-long-prefill-ms N] "
+           "[--prefill-decode-share P] "
            "[--log-stats-interval-ms N] "
            "[--device N] "
            "[--context-cost-presets FILE] "
@@ -221,6 +222,11 @@ std::string serve_usage_text(const char* argv0) {
            "quarter of that, instead of waiting out the whole prompt. The paused prefill keeps its "
            "progress as a snapshot and resumes behind the newcomer (at most four pauses per "
            "request; prompts with media are never paused). Off by default\n"
+           "       --prefill-decode-share P runs decode rounds for P percent of the time a prefill step "
+           "took before the next step starts, while another lane is decoding (0-90). Streams get a "
+           "burst of tokens after every step instead of one and the prompt takes longer while it "
+           "lasts; the longest gap is still a step, so combine it with --prefill-stall-budget-ms. "
+           "Off by default\n"
            "       --prefill-cublas hands wide prefill GEMMs to cuBLAS: a large prefill speedup for a "
            "small perplexity cost (docs/performance.md), off by default, and it wants a larger "
            "--prefill-chunk to pay; --no-prefill-cublas-projections keeps the attention and GDN "
@@ -439,6 +445,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.prefill_schedule.yield_remaining_ms = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--yield-long-prefill-ms"),
                                       "yield-long-prefill-ms"));
+        } else if (arg == "--prefill-decode-share") {
+            options.prefill_schedule.decode_share_percent = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--prefill-decode-share"),
+                                      "prefill-decode-share"));
         } else if (arg == "--context-cost-presets") {
             options.context_cost_presets = require_value("--context-cost-presets");
             if (options.context_cost_presets.empty()) {
@@ -880,6 +890,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.prefill_schedule.yield_remaining_ms > kMaximumPrefillYieldRemainingMs) {
         throw std::invalid_argument("--yield-long-prefill-ms must be at most 3600000");
+    }
+    if (options.prefill_schedule.decode_share_percent > kMaximumPrefillDecodeSharePercent) {
+        throw std::invalid_argument("--prefill-decode-share must be at most 90");
     }
     product::apply_speculative_defaults(options.speculative);
     product::validate_speculative_cli_options(options.speculative);

@@ -70,6 +70,8 @@ inline constexpr std::uint32_t kFitContextStepTokens  = 1024;
 inline constexpr std::uint32_t kMaximumPrefillStallBudgetMs = 60'000;
 // PrefillScheduleOptions::yield_remaining_ms: an hour is past any prefill the context allows.
 inline constexpr std::uint32_t kMaximumPrefillYieldRemainingMs = 3'600'000;
+// PrefillScheduleOptions::decode_share_percent: beyond this decode would starve the prompt.
+inline constexpr std::uint32_t kMaximumPrefillDecodeSharePercent = 90;
 
 struct KvCapacityPolicy {
     KvCapacityMode mode                  = KvCapacityMode::Explicit;
@@ -280,6 +282,15 @@ struct PrefillScheduleOptions {
     // media is never paused, and a pause that cannot save the prefill's progress is not made.
     // 0 (the default) never pauses a prefill for the queue. At most 3,600,000.
     std::uint32_t yield_remaining_ms = 0;
+    // After each prefill step, while another lane is decoding, run decode rounds until they have
+    // used this percent of the time the step took before the next step starts. At 50, a 1.5 s step
+    // is followed by 1.5 s of decode rounds, so a stream gets a burst of tokens after every step
+    // instead of one, and the prompt takes about twice as long while it lasts. It does not shorten
+    // the longest gap between a stream's tokens (the step still runs whole); combine it with a
+    // stall budget for that. Rounds shorter than the debt cannot starve the prompt: after 4,096
+    // deferred turns in a row a step runs regardless. 0 (the default) keeps one round per step;
+    // at most 90.
+    std::uint32_t decode_share_percent = 0;
 };
 
 struct ContextCostOptions {
@@ -1463,6 +1474,9 @@ struct RuntimeStats {
     // Prefills paused so a short request at the head of the queue could be admitted
     // (PrefillScheduleOptions::yield_remaining_ms).
     std::uint64_t prefill_yields                    = 0;
+    // Worker cycles that skipped their prefill step so decode rounds could use their share
+    // (PrefillScheduleOptions::decode_share_percent).
+    std::uint64_t deferred_prefill_turns            = 0;
 
     std::uint64_t root_selections               = 0;
     std::uint64_t checkpoint_selections         = 0;
