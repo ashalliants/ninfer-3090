@@ -780,8 +780,11 @@ errors distinguish `invalid_json_schema`, `unsupported_json_schema` and `unsatis
 `invalid_request_error` envelope with the schema location in the message. Responses echoes the
 selected `text.format` in aggregate responses and SSE response objects.
 
-JSON output uses compact separators and declared property order. State the desired content in the
-prompt; the schema is not inserted into it. Only one output constraint may be supplied.
+JSON output may use any layout, compact or indented (whitespace runs are capped at 32
+characters), and follows declared property order. State the desired content in the prompt; the
+schema is not inserted into it. Only one output constraint may be supplied. `json_object` also
+accepts `"schema":{"type":"object"}`, which llama.cpp-style clients send; any other schema belongs
+in `json_schema`.
 
 Schemas support positional arrays (`prefixItems` plus tail `items`) and inclusive/exclusive
 `number` ranges. Bounded numbers use exact int64 integers or finite binary64-compatible decimal
