@@ -261,6 +261,12 @@ int main() {
     energy = 5312.5;
     check(has_line(metrics.render(running, true, 0), "ninfer_gpu_energy_joules_total 312.5"),
           "the energy counter must report the change since attachment");
+    energy = 40.0; // NVML's counter restarted (driver reset): never negative, never going back
+    check(has_line(metrics.render(running, true, 0), "ninfer_gpu_energy_joules_total 352.5"),
+          "an NVML counter reset must add the energy since the reset, not subtract the baseline");
+    energy = 100.0;
+    check(has_line(metrics.render(running, true, 0), "ninfer_gpu_energy_joules_total 412.5"),
+          "the energy counter must keep accumulating after a reset");
     metrics.set_gpu_sampler(nullptr);
     check(metrics.render(running, true, 0).find("ninfer_gpu_") == std::string::npos,
           "without a sampler no GPU series is exported");
