@@ -23,6 +23,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_context_store_test
   ninfer_device_sync_invalid_test
   ninfer_effective_thinking_budget_test
+  ninfer_engine_scheduling_test
   ninfer_gdn_replay_records_test
   ninfer_ggml_blocks_decode_test
   ninfer_grammar_test
