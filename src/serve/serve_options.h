@@ -40,6 +40,7 @@ struct ServeOptions {
     // callers before they were ever admitted.
     std::uint32_t pending_timeout_ms   = 600000;
     std::uint32_t prefill_chunk        = 1024;
+    std::uint32_t progress_anchor_tokens = 0;
     std::filesystem::path context_cost_presets;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;

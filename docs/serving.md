@@ -1754,6 +1754,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `600000` |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
+| `--progress-anchor-tokens N` | during a long prefill, keep a private checkpoint every N tokens (a multiple of `--prefill-chunk`; needs prefix reuse; each request keeps its newest four) so a paused request that loses its snapshot replays from the nearest checkpoint instead of from the start. Each checkpoint costs one State image; Qwen3.5-family models only | `0` (off) |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--device N` | CUDA device index | `0` |
 | `--devices A,B,...` | one pipeline stage per listed CUDA device (2 to 8, Linux; see the [README](../README.md#several-gpus-pipeline-stages---devices-ab)); overrides `--device` | none |

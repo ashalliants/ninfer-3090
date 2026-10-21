@@ -876,6 +876,9 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     if (options.prefill_chunk == 0 || options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");
     }
+    if (options.progress_anchor_tokens % options.prefill_chunk != 0) {
+        throw std::invalid_argument("progress_anchor_tokens must be 0 or a multiple of prefill_chunk");
+    }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("max_concurrency must be in [1,8]");
     }
@@ -987,6 +990,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         "resolved Paged KV capacity exceeds int32"));
     impl->max_concurrency      = inputs.max_concurrency;
     impl->prefill_chunk        = inputs.prefill_chunk;
+    impl->progress_anchor_tokens = inputs.progress_anchor_tokens;
     impl->draft_window         = inputs.draft_window;
     impl->ngram_draft_tokens   = inputs.ngram_draft_tokens;
     impl->ngram_min_match      = inputs.ngram_min_match;
@@ -1153,6 +1157,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .capacity             = options.max_context,
         .max_concurrency      = options.max_concurrency,
         .prefill_chunk        = std::min(options.prefill_chunk, options.max_context),
+        .progress_anchor_tokens = options.progress_anchor_tokens,
         .draft_window         = options.speculative.draft_tokens,
         .ngram_draft_tokens   = options.speculative.ngram_draft_tokens,
         .ngram_min_match      = options.speculative.ngram_min_match,
