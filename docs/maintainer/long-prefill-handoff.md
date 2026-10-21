@@ -49,7 +49,7 @@ Linear order: #341 -> #343 -> #344 -> #342 -> #351 -> #352. Others hang off mast
 | PR | Branch | What | New flag / artefact | Status |
 |----|--------|------|---------------------|--------|
 | #339 | fix/qwen4-exp-memory-plan-test-linux | Linux build of a test | - | merged |
-| #340 | feat/prefill-progress-anchors | `SharedPrefix` checkpoints along a long prefill so a cancelled prompt's work survives; rolling retirement | `--prefill-anchor-tokens N` | **overlaps merged #338, see below** |
+| #340 | feat/prefill-progress-anchors | `SharedPrefix` checkpoints along a long prefill so a cancelled prompt's work survives; rolling retirement | `--progress-anchors-shared` (needs #338's `--progress-anchor-tokens`) | rebased as a delta on #338 |
 | #341 | feat/prefill-stall-budget | `PrefillPacing::step_cap`: shrink a prefill step so a neighbouring decode waits at most N ms | `--prefill-stall-budget-ms` | CPU-tested only |
 | #343 | feat/yield-long-prefill | pause a long prefill for a short queue head (`choose_yield_victim`, ratio 4, max 4 yields) | `--yield-long-prefill-ms` | CPU-tested only |
 | #344 | feat/prefill-backlog-metric | `ninfer_prefill_backlog_seconds` gauge + `/v1/load` field | - | CPU-tested only |
@@ -63,14 +63,19 @@ Linear order: #341 -> #343 -> #344 -> #342 -> #351 -> #352. Others hang off mast
 `PrefillScheduleOptions` (include/ninfer/types.h): `stall_budget_ms, yield_remaining_ms, decode_share_percent,
 layer_slices`. Flash-Next accepts and ignores the options (layer slices refused).
 
-### #340 vs merged #338 (decide first)
+### #340 and #338
 
-Master now has `--progress-anchor-tokens` (#338): private `LongAnchor` checkpoints every N tokens
-(`src/runtime/contract/progress_anchors.h`, `request_plan.cpp`). #340 does the same job with `SharedPrefix` anchors
-under another flag. Do not ship both. Recommended: rebase #340 down to a delta on #338 (also publish the anchors
-as `SharedPrefix` so a *cancelled* prompt's work survives, keep rolling retirement), or close it if #338 covers the
-use case. This was not reconciled; the rest of the stack was written against pre-#338 master and needs a rebase
-onto current master (expect conflicts in `engine_core.h`, `request_plan.cpp`, `types.h`, `serve_options.cpp`).
+Master has `--progress-anchor-tokens` (#338): private `LongAnchor` checkpoints every N tokens. #340 is now only a
+small delta on it: `--progress-anchors-shared` publishes the same anchors as `SharedPrefix`, so a *cancelled*
+request's work survives for the retry, and the engine keeps a request's two newest (`trim_progress_anchors`,
+`ResourceManager::retire_unreused_shared`). The stack was rebased onto master of 2026-10-21 (after #348) and builds
+with the CPU tests green on Linux/GCC 13 (only `ninfer_qwen4_exp_ngram_volume_test`, a timing flake, fails).
+If the rebased branches are not yet on the remotes, the old pre-#338 commits are what the PRs show: force-push them.
+
+### Master fixes the stack needs
+
+#354 fixes two things that kept master from passing on Linux (a `reserve_in_chunks` compile error from #334 and a
+self-contradicting `ninfer_serve_options_test` entry from #338). Merge it first.
 
 ## What is verified and what is not
 
@@ -86,7 +91,7 @@ holds control batches while a sliced chunk is in flight; check that hold is enou
 
 ## What to do, in order
 
-1. **Rebase and build.** Reconcile #340/#338, rebase the stack onto master, build (`build-ninja`), run
+1. **Build.** Merge #354, make sure the stack is rebased on master, build (`build-ninja`), run
    `tools/run-tests.ps1 -CpuOnly`.
 2. **Correctness gate for slicing (#352):** under the lock,
    `pwsh tools/run-tests.ps1 -GpuOnly -Regex 'qwen3_5_native_transactions'`. `sliced_prefill_matches_whole` must pass
