@@ -107,7 +107,7 @@ void Metrics::configure(std::string model, const EngineOptions& options,
     const int primary_device = options.devices.empty() ? options.device : options.devices.front();
     char bus_id[32] = {};
     if (cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), primary_device) == cudaSuccess) {
-        auto telemetry = std::make_shared<GpuTelemetry>(bus_id);
+        auto telemetry = std::make_shared<Nvml>(bus_id);
         if (telemetry->available()) {
             set_gpu_sampler([telemetry] { return telemetry->sample(); });
         }

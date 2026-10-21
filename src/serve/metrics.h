@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/gpu_telemetry.h"
+#include "core/nvml.h"
 #include "serve/generation_pace.h"
 #include "serve/generation_service.h"
 

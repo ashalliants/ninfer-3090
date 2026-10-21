@@ -1,4 +1,4 @@
-#include "core/gpu_telemetry.h"
+#include "core/nvml.h"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -11,12 +11,16 @@
 
 namespace ninfer {
 
-struct GpuTelemetry::Impl {
+struct Nvml::Impl {
     struct Utilization { // nvmlUtilization_t
         unsigned gpu, memory;
     };
     struct Memory { // nvmlMemory_t (v1)
         unsigned long long total, free, used;
+    };
+    struct MemoryV2 { // nvmlMemory_v2_t
+        unsigned version;
+        unsigned long long total, reserved, free, used;
     };
     static constexpr unsigned kTemperatureGpuSensor = 0; // NVML_TEMPERATURE_GPU
 
@@ -37,14 +41,18 @@ struct GpuTelemetry::Impl {
     // Resolves the NVML entry points through `symbol` and opens the device; on any failure it
     // leaves the object unavailable.
     void bind(const std::string& pci_bus_id, const GpuSymbolLookup& symbol) {
-        init        = reinterpret_cast<int (*)()>(symbol("nvmlInit_v2"));
-        shutdown    = reinterpret_cast<int (*)()>(symbol("nvmlShutdown"));
-        by_pci      = reinterpret_cast<int (*)(const char*, void**)>(symbol("nvmlDeviceGetHandleByPciBusId_v2"));
-        utilization = reinterpret_cast<int (*)(void*, Utilization*)>(symbol("nvmlDeviceGetUtilizationRates"));
-        memory      = reinterpret_cast<int (*)(void*, Memory*)>(symbol("nvmlDeviceGetMemoryInfo"));
-        temperature = reinterpret_cast<int (*)(void*, unsigned, unsigned*)>(symbol("nvmlDeviceGetTemperature"));
-        power       = reinterpret_cast<int (*)(void*, unsigned*)>(symbol("nvmlDeviceGetPowerUsage"));
-        energy      = reinterpret_cast<int (*)(void*, unsigned long long*)>(symbol("nvmlDeviceGetTotalEnergyConsumption"));
+        // Only these three are needed to open the device; every query is optional, so an older
+        // driver missing one drops that answer and no more.
+        init         = reinterpret_cast<int (*)()>(symbol("nvmlInit_v2"));
+        shutdown     = reinterpret_cast<int (*)()>(symbol("nvmlShutdown"));
+        by_pci       = reinterpret_cast<int (*)(const char*, void**)>(symbol("nvmlDeviceGetHandleByPciBusId_v2"));
+        display      = reinterpret_cast<int (*)(void*, int*)>(symbol("nvmlDeviceGetDisplayActive"));
+        memory_v2    = reinterpret_cast<int (*)(void*, MemoryV2*)>(symbol("nvmlDeviceGetMemoryInfo_v2"));
+        utilization  = reinterpret_cast<int (*)(void*, Utilization*)>(symbol("nvmlDeviceGetUtilizationRates"));
+        memory       = reinterpret_cast<int (*)(void*, Memory*)>(symbol("nvmlDeviceGetMemoryInfo"));
+        temperature  = reinterpret_cast<int (*)(void*, unsigned, unsigned*)>(symbol("nvmlDeviceGetTemperature"));
+        power        = reinterpret_cast<int (*)(void*, unsigned*)>(symbol("nvmlDeviceGetPowerUsage"));
+        energy       = reinterpret_cast<int (*)(void*, unsigned long long*)>(symbol("nvmlDeviceGetTotalEnergyConsumption"));
         if (init == nullptr || shutdown == nullptr || by_pci == nullptr || init() != 0) {
             release();
             return;
@@ -73,28 +81,44 @@ struct GpuTelemetry::Impl {
 #else
     void* library = nullptr;
 #endif
-    int (*init)()                                    = nullptr;
-    int (*shutdown)()                                = nullptr;
-    int (*by_pci)(const char*, void**)               = nullptr;
-    int (*utilization)(void*, Utilization*)          = nullptr;
-    int (*memory)(void*, Memory*)                    = nullptr;
-    int (*temperature)(void*, unsigned, unsigned*)   = nullptr;
-    int (*power)(void*, unsigned*)                   = nullptr;
-    int (*energy)(void*, unsigned long long*)        = nullptr; // millijoules
-    void* device                                     = nullptr;
-    bool initialized                                 = false;
+    int (*init)()                                  = nullptr;
+    int (*shutdown)()                              = nullptr;
+    int (*by_pci)(const char*, void**)             = nullptr;
+    int (*display)(void*, int*)                    = nullptr;
+    int (*memory_v2)(void*, MemoryV2*)             = nullptr;
+    int (*utilization)(void*, Utilization*)        = nullptr;
+    int (*memory)(void*, Memory*)                  = nullptr;
+    int (*temperature)(void*, unsigned, unsigned*) = nullptr;
+    int (*power)(void*, unsigned*)                 = nullptr;
+    int (*energy)(void*, unsigned long long*)      = nullptr; // millijoules
+    void* device                                   = nullptr;
+    bool initialized                               = false;
 };
 
-GpuTelemetry::GpuTelemetry(const std::string& pci_bus_id) : impl_(std::make_unique<Impl>(pci_bus_id)) {}
+Nvml::Nvml(const std::string& pci_bus_id) : impl_(std::make_unique<Impl>(pci_bus_id)) {}
 
-GpuTelemetry::GpuTelemetry(const std::string& pci_bus_id, const GpuSymbolLookup& lookup)
+Nvml::Nvml(const std::string& pci_bus_id, const GpuSymbolLookup& lookup)
     : impl_(std::make_unique<Impl>(pci_bus_id, lookup)) {}
 
-GpuTelemetry::~GpuTelemetry() = default;
+Nvml::~Nvml() = default;
 
-bool GpuTelemetry::available() const noexcept { return impl_->device != nullptr; }
+bool Nvml::available() const noexcept { return impl_->device != nullptr; }
 
-GpuSample GpuTelemetry::sample() const {
+std::uint64_t Nvml::usable_bytes() const {
+    if (!available() || impl_->memory_v2 == nullptr) { return 0; }
+    Impl::MemoryV2 memory{};
+    memory.version = static_cast<unsigned>(sizeof(Impl::MemoryV2)) | (2U << 24U);
+    if (impl_->memory_v2(impl_->device, &memory) != 0 || memory.reserved > memory.total) { return 0; }
+    return memory.total - memory.reserved;
+}
+
+int Nvml::display_active() const {
+    if (!available() || impl_->display == nullptr) { return -1; }
+    int active = 0;
+    return impl_->display(impl_->device, &active) == 0 ? (active != 0 ? 1 : 0) : -1;
+}
+
+GpuSample Nvml::sample() const {
     GpuSample sample;
     if (!available()) { return sample; }
     void* const device = impl_->device;
