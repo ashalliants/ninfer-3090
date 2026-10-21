@@ -6,6 +6,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -20,25 +21,54 @@ void expect(bool condition, std::string_view message) {
 
 // First-fit over free runs counted in pages, like HostContextArena: the free pages can add up to
 // the request while no single run holds it.
+struct FakeArena;
+
+// A held run: giving it up (destruction) returns the pages, like HostKVAllocation.
+struct Hold {
+    FakeArena* arena = nullptr;
+    std::size_t run = 0, pages = 0;
+    Hold(FakeArena* a, std::size_t r, std::size_t p) : arena(a), run(r), pages(p) {}
+    Hold(Hold&& o) noexcept : arena(std::exchange(o.arena, nullptr)), run(o.run), pages(o.pages) {}
+    Hold& operator=(Hold&& o) noexcept {
+        if (this != &o) {
+            give_back();
+            arena = std::exchange(o.arena, nullptr);
+            run   = o.run;
+            pages = o.pages;
+        }
+        return *this;
+    }
+    ~Hold() { give_back(); }
+    void give_back();
+};
+
+// First-fit over free runs counted in pages, like HostContextArena: the free pages can add up to
+// the request while no single run holds it.
 struct FakeArena {
     std::vector<std::size_t> runs;
     std::size_t calls = 0;
 
-    std::optional<int> reserve(std::size_t pages) {
+    std::optional<Hold> reserve(std::size_t pages) {
         ++calls;
-        for (auto& run : runs) {
-            if (run >= pages) {
-                run -= pages;
-                return 1;
+        for (std::size_t i = 0; i < runs.size(); ++i) {
+            if (runs[i] >= pages) {
+                runs[i] -= pages;
+                return Hold(this, i, pages);
             }
         }
         return std::nullopt;
     }
 };
 
+void Hold::give_back() {
+    if (arena) { arena->runs[run] += pages; }
+    arena = nullptr;
+}
+
 struct Result {
     bool ok = false;
     std::vector<std::vector<int>> chunks;
+    std::vector<Hold> holds;  // kept alive so accepted runs stay taken
 };
 
 Result run(FakeArena& arena, std::size_t count) {
@@ -47,8 +77,9 @@ Result run(FakeArena& arena, std::size_t count) {
     Result result;
     result.ok = ninfer::reserve_in_chunks<int>(
         items, [&](std::span<const int> chunk) { return arena.reserve(chunk.size()); },
-        [&](int&&, std::span<const int> chunk) {
+        [&](Hold&& hold, std::span<const int> chunk) {
             result.chunks.emplace_back(chunk.begin(), chunk.end());
+            result.holds.push_back(std::move(hold));
         });
     return result;
 }
@@ -84,6 +115,16 @@ void test_fragmented_arena_splits() {
     expect(flattened == expected, "chunks are consecutive and keep the page order");
 }
 
+void test_uses_largest_run_not_first_halving() {
+    // Halving alone would take 5 of 10 from the 6-run, then crumbs; the largest fit is 6 then 4.
+    FakeArena arena{{6, 4}};
+    const auto result = run(arena, 10);
+    expect(result.ok && result.chunks.size() == 2, "two runs hold ten pages in two extents");
+    expect(result.chunks.size() == 2 && result.chunks[0].size() == 6 &&
+               result.chunks[1].size() == 4,
+           "each extent is the largest the arena can place");
+}
+
 void test_not_enough_total_space() {
     FakeArena arena{{3, 2}};
     const auto result = run(arena, 8);
@@ -108,6 +149,7 @@ void test_single_page_run() {
 int main() {
     test_one_run_is_enough();
     test_fragmented_arena_splits();
+    test_uses_largest_run_not_first_halving();
     test_not_enough_total_space();
     test_empty_request();
     test_single_page_run();

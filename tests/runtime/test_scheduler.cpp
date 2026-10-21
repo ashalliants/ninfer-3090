@@ -358,8 +358,10 @@ void test_pause_host_target() {
             "an unplaced state image asks the victim search for one more image of free bytes");
     require(next_pause_host_target(300, 0, 1000) == std::nullopt,
             "a placed state image needs no further eviction");
-    require(next_pause_host_target(900, 150, 1000) == std::nullopt,
-            "asking for more than the Host budget can hold must stop");
+    require(next_pause_host_target(900, 150, 1000) == std::optional<std::size_t>(1000),
+            "near the budget the target clamps to it, so evicting the rest can still coalesce a run");
+    require(next_pause_host_target(1000, 150, 1000) == std::nullopt,
+            "a fully free Host that still has no run cannot be helped by more eviction");
     require(next_pause_host_target(0, 2000, 1000) == std::nullopt,
             "an image larger than the whole Host budget can never be saved");
     require(next_pause_host_target(850, 150, 1000) == std::optional<std::size_t>(1000),
