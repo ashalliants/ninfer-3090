@@ -154,6 +154,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--context-store DIR [--context-store-max-gib N] [--context-store-ttl-hours N] "
            "[--context-store-idle-seconds N] [--context-store-restore-seconds N] "
            "[--context-store-flush-seconds N] [--context-store-compress] "
+           "[--context-store-peer DIR]... [--context-store-peer-poll-ms N] "
            "[--context-store-s3-endpoint URL --context-store-s3-bucket NAME "
            "[--context-store-s3-prefix P] [--context-store-s3-region R]]] "
            "[--no-exit-on-engine-failure] "
@@ -246,7 +247,12 @@ std::string serve_usage_text(const char* argv0) {
            "its stored session (default 120); "
            "--context-store-flush-seconds N bounds the write at shutdown (default 60); "
            "--context-store-compress writes new chunks zstd-compressed (about 8% smaller; "
-           "off by default), on disk and in the bucket; chunks of both kinds are always read\n"
+           "off by default), on disk and in the bucket; chunks of both kinds are always read; "
+           "--context-store-peer DIR (repeatable) imports the sessions another engine on this "
+           "box keeps in its store directory (same volume; hard links, nothing copied) every "
+           "--context-store-peer-poll-ms (default 250), so a conversation one engine finished "
+           "resumes on the other; each engine needs its own --context-store directory, and a "
+           "short --context-store-idle-seconds (1-2) lets the other engine see a turn soon\n"
            "       --context-store-s3-endpoint URL and --context-store-s3-bucket NAME keep a copy of "
            "the store in an S3-compatible bucket (off by default): sessions are uploaded in the "
            "background, sessions other engines wrote become visible and are fetched when needed, "
@@ -620,6 +626,18 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.context_store_flush_seconds = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--context-store-flush-seconds"), "context-store-flush-seconds"));
             context_store_tuning = true;
+        } else if (arg == "--context-store-peer") {
+            const std::string directory = require_value("--context-store-peer");
+            if (directory.empty()) { throw std::invalid_argument("--context-store-peer needs a directory"); }
+            options.context_store_peers.emplace_back(directory);
+            context_store_tuning = true;
+        } else if (arg == "--context-store-peer-poll-ms") {
+            options.context_store_peer_poll_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--context-store-peer-poll-ms"), "context-store-peer-poll-ms"));
+            if (options.context_store_peer_poll_ms == 0) {
+                throw std::invalid_argument("--context-store-peer-poll-ms must be at least 1");
+            }
+            context_store_tuning = true;
         } else if (arg == "--context-store-compress") {
             options.context_store_compress = true;
             context_store_tuning           = true;
@@ -785,6 +803,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (!options.context_store_path.empty() && !options.allow_prefix_reuse) {
         throw std::invalid_argument("--no-prefix-reuse cannot be combined with --context-store");
+    }
+    for (const auto& peer : options.context_store_peers) {
+        if (peer.lexically_normal() == options.context_store_path.lexically_normal()) {
+            throw std::invalid_argument(
+                "--context-store-peer must be another engine's store, not --context-store itself");
+        }
     }
     if (options.context_store_s3_endpoint.empty() != options.context_store_s3_bucket.empty()) {
         throw std::invalid_argument(

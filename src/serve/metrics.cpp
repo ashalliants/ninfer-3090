@@ -425,6 +425,14 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
     COUNTER(context_store_remote_download_failures,
             "context_store_remote_download_failures_total",
             "Remote listings or fetches that failed or returned damaged data.");
+    COUNTER(context_store_peer_images, "context_store_peer_images_total",
+            "Sessions imported from another engine's store directory (--context-store-peer).");
+    COUNTER(context_store_peer_bytes_linked, "context_store_peer_bytes_linked_total",
+            "Chunk bytes hard-linked from peer directories (shared on disk, not copied).");
+    COUNTER(context_store_peer_skipped, "context_store_peer_skipped_total",
+            "Peer sessions not imported: damaged, expired, over budget or gone mid-import.");
+    COUNTER(context_store_peer_link_failures, "context_store_peer_link_failures_total",
+            "Chunks of a peer session that could not be linked (removed by the peer, or another volume).");
 #undef GAUGE
 #undef COUNTER
 

@@ -603,6 +603,24 @@ int main() {
                              "--context-store-compress"})
                           .context_store_compress,
                       "--context-store-compress did not reach serving options");
+    const ServeOptions peered = parse({"ninfer-serve", "model.ninfer", "--context-store", "cache0",
+                                       "--context-store-peer", "cache1", "--context-store-peer",
+                                       "cache2", "--context-store-peer-poll-ms", "40"});
+    failures += check(peered.context_store_peers.size() == 2 &&
+                          peered.context_store_peers[0] == "cache1" &&
+                          peered.context_store_peers[1] == "cache2" &&
+                          peered.context_store_peer_poll_ms == 40,
+                      "--context-store-peer options did not reach serving options");
+    failures += check(no_store.context_store_peers.empty() && no_store.context_store_peer_poll_ms == 250,
+                      "context store peers were on by default");
+    failures += check(rejected({"ninfer-serve", "model.ninfer", "--context-store-peer", "cache1"}),
+                      "--context-store-peer was accepted without --context-store");
+    failures += check(rejected({"ninfer-serve", "model.ninfer", "--context-store", "cache0",
+                                "--context-store-peer", "cache0"}),
+                      "a store was accepted as its own peer");
+    failures += check(rejected({"ninfer-serve", "model.ninfer", "--context-store", "cache0",
+                                "--context-store-peer-poll-ms", "0"}),
+                      "a zero --context-store-peer-poll-ms was accepted");
     failures += check(rejected({"ninfer-serve", "model.ninfer", "--context-store-compress"}),
                       "--context-store-compress was accepted without --context-store");
     failures += check(rejected({"ninfer-serve", "model.ninfer", "--context-store-max-gib", "4"}),

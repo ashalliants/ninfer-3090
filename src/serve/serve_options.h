@@ -93,6 +93,10 @@ struct ServeOptions {
     std::uint32_t context_store_flush_seconds   = 60;
     // --context-store-compress: write new chunks zstd-compressed (disk and bucket).
     bool context_store_compress                 = false;
+    // --context-store-peer DIR (repeatable): another engine's store directory on the same volume,
+    // imported by hard link; --context-store-peer-poll-ms N: how often they are looked at.
+    std::vector<std::filesystem::path> context_store_peers;
+    std::uint32_t context_store_peer_poll_ms    = 250;
     // --context-store-s3-endpoint URL / --context-store-s3-bucket NAME: keep a copy of the store in
     // an S3-compatible bucket (credentials come from the environment, never the command line).
     std::string context_store_s3_endpoint;
