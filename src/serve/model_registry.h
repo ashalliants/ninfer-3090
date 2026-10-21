@@ -15,6 +15,7 @@
 
 #include "serve/generation_service.h"
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -187,6 +188,16 @@ public:
     [[nodiscard]] std::optional<std::string> resolve(std::string_view model) const;
 
     [[nodiscard]] std::size_t size() const noexcept { return models_.size(); }
+
+    // The largest request body any model accepts: a section of a preset can raise its own
+    // --max-request-mib, and the router's ingress must not refuse what that model would take.
+    [[nodiscard]] std::size_t max_request_bytes() const noexcept {
+        std::size_t largest = 0;
+        for (const Slot& slot : models_) {
+            largest = std::max(largest, slot.definition.options.max_request_bytes);
+        }
+        return largest;
+    }
 
     [[nodiscard]] bool router() const noexcept { return router_; }
 

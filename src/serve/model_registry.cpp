@@ -61,8 +61,9 @@ void check_model_state_paths(const std::vector<ModelDefinition>& models) {
     }
     for (const ModelDefinition& model : models) {
         if (!model.options.request_log_jsonl.empty()) {
+            // Models may share one log (same path, owner ""), but a preset section can also give
+            // a model a log of its own, and that file must not be another model's state either.
             entries.push_back({"the request log", "", normal(model.options.request_log_jsonl)});
-            break; // one log, shared by every model (options come from one command line)
         }
     }
     for (std::size_t first = 0; first < entries.size(); ++first) {

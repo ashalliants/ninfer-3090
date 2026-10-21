@@ -6,6 +6,7 @@
 
 #include "serve/model_catalog.h"
 #include "serve/model_registry.h"
+#include "serve/router_server.h"
 
 #include <atomic>
 #include <chrono>
@@ -317,6 +318,37 @@ void shared_state_files_are_refused() {
     expect(refused({a, b}), "the request log may not land on a model's artifact");
     a.options.request_log_jsonl = "/m/requests.jsonl";
     expect(!refused({a, b}), "a shared request log of its own is fine");
+    b.options.request_log_jsonl = "/m/a.ninfer";
+    expect(refused({a, b}), "a later model's own request log may not land on another model's artifact");
+    b.options.request_log_jsonl = "/m/b-requests.jsonl";
+    expect(!refused({a, b}), "each model may have a request log of its own");
+}
+
+void selector_rewrite_changes_only_the_selector() {
+    const auto rewrite = [](const std::string& body) {
+        return with_model_selector(body, "big").value_or("<none>");
+    };
+    expect(rewrite(R"({"model":"alias","n":1})") == R"({"model":"big","n":1})",
+           "a named selector is replaced in place");
+    expect(rewrite(R"({ "a" : 1.10 , "model" : "x" , "b" : 1e400 })") ==
+               R"({ "a" : 1.10 , "model" : "big" , "b" : 1e400 })",
+           "numbers keep the text the client wrote");
+    expect(rewrite(R"({"a":0.1000000000000000055511151231257827})") ==
+               R"({"model":"big","a":0.1000000000000000055511151231257827})",
+           "a missing selector is added without re-serialising the rest");
+    expect(rewrite("{}") == R"({"model":"big"})", "an empty object gets just the selector");
+    expect(rewrite(R"({"model":null})") == R"({"model":"big"})", "a non-string selector is replaced");
+    expect(rewrite(R"({"x":{"model":"inner"},"model":"m"})") == R"({"x":{"model":"inner"},"model":"big"})",
+           "a nested model member is left alone");
+    expect(rewrite(R"({"model":"a","k":[1,{"model":2}]})") == R"({"model":"big","k":[1,{"model":2}]})",
+           "an escaped key is matched by its decoded name");
+    expect(rewrite(R"({"model":"a","model":"b"})") == R"({"model":"a","model":"big"})",
+           "the last duplicate is the one a parser would use");
+    expect(rewrite("[1]") == "<none>" && rewrite(R"({"model":"a")") == "<none>",
+           "a body that is not an object is not rewritten");
+    expect(is_json_content_type("Application/JSON; charset=utf-8") &&
+               is_json_content_type("application/vnd.api+json") && !is_json_content_type("text/plain"),
+           "the media type is matched without regard to case");
 }
 
 void single_model_mode() {
@@ -407,6 +439,7 @@ int main() {
         observing_with_nothing_loaded();
         store_names_never_collide();
         shared_state_files_are_refused();
+        selector_rewrite_changes_only_the_selector();
         single_model_mode();
         catalog();
     } catch (const std::exception& error) {

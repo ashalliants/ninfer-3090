@@ -382,13 +382,21 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         return arg == "--models-dir" || arg == "--models-preset" || arg == "--models-max" ||
                arg == "--sleep-idle-seconds" || arg == "--unload-idle-seconds";
     };
+    // Flags that only mean something to a router (--sleep-idle-seconds also works on one model).
+    std::string router_only_flag;
     for (int i = artifact_given ? 2 : 1; i < argc; ++i) {
         const std::string_view current = argv[i];
         if (router_option(current)) {
+            if (current == "--models-max" || current == "--unload-idle-seconds") {
+                router_only_flag = std::string(current);
+            }
             ++i;
             continue;
         }
-        if (current == "--models-autoload" || current == "--no-models-autoload") { continue; }
+        if (current == "--models-autoload" || current == "--no-models-autoload") {
+            router_only_flag = std::string(current);
+            continue;
+        }
         options.model_arguments.emplace_back(current);
     }
     for (int i = artifact_given ? 2 : 1; i < argc; ++i) {
@@ -892,6 +900,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument(
             "router mode takes its models from --models-dir / --models-preset, not an artifact "
             "path");
+    }
+    if (!router_only_flag.empty() && !options.router()) {
+        throw std::invalid_argument(router_only_flag +
+                                    " applies to router mode (--models-dir / --models-preset)");
     }
     if (options.sleep_idle_seconds != 0 && !options.suspend.enabled && !options.router()) {
         throw std::invalid_argument("--sleep-idle-seconds requires --model-suspend");

@@ -652,7 +652,10 @@ The command line wins over a preset where they repeat an option. Comments sit on
 `unload-idle-seconds`) are command-line only: a preset that sets one is rejected at startup. With
 `--context-store DIR` each model keeps its store in `DIR/<model id>` (and under `<prefix><model id>/`
 in S3; characters other than letters, digits, `-` and `_` are written as `%XX`). `--request-log-jsonl`
-may not name any model's artifact; all models append to one shared log, one record at a time.
+may not name any model's artifact, n-gram volume or expert state, whether it comes from the command
+line or a model's own section; models that name the same file append to one shared log, one record
+at a time. The router accepts a request body up to the largest `--max-request-mib` of any model, and
+that model's own server then applies its limit.
 `--ngram-volume` and `--expert-state` may not give the same file to two models.
 
 `--models-max N` (default 1, 0 for no limit) bounds how many models are loaded at once. To make room
@@ -679,7 +682,15 @@ model that last served, without waking a sleeping one. Everything else (chat com
 Messages and the rest) is forwarded to the model it names: each model runs the ordinary
 single-model server on a loopback port of its own, so every endpoint, request log and metric works
 per model unchanged. The router checks `--api-key` and applies `--cors`; models need neither.
-Streamed responses stream, and a client that disconnects cancels the generation.
+Streamed responses stream, and a client that disconnects cancels the generation, also while the
+model is still loading or working on the prompt. The router rewrites only the `"model"` member of a
+body it forwards (to the model's id), so every other value reaches the model as you wrote it.
+
+Each model keeps its own Responses store, and a response ID does not say which model made it. A
+request that names no model goes to the model that last served, so `GET` or `DELETE
+/v1/responses/{id}`, `.../input_items` and a `previous_response_id` follow-up must name the model
+that created the response (`?model=ID` on the request, or `"model"` in the body). Routing these by
+the response ID alone is tracked in [#336](https://github.com/ashalliants/ninfer-3090/issues/336).
 
 On an RTX 3090 with two copies of the Qwen3.8-27B artifact under `--models-max 1 --model-suspend`: a
 cold request loaded its model and answered in 6.0 s (the file was in the operating system's cache),

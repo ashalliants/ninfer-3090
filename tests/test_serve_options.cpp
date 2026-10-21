@@ -643,6 +643,12 @@ int main() {
                       "no artifact and no router models was accepted");
     failures += check(rejected({"ninfer-serve", "model.ninfer", "--models-dir", "models"}),
                       "an artifact path was accepted together with --models-dir");
+    for (const char* flag : {"--models-max", "--unload-idle-seconds"}) {
+        failures += check(rejected({"ninfer-serve", "model.ninfer", flag, "2"}),
+                          "a router-only flag was silently accepted in single-model mode");
+    }
+    failures += check(rejected({"ninfer-serve", "model.ninfer", "--no-models-autoload"}),
+                      "--no-models-autoload was silently accepted in single-model mode");
     // The S3 copy of the context store is off unless both the endpoint and the bucket are given,
     // needs the store, and normalises its key prefix.
     const ServeOptions s3 = parse({"ninfer-serve", "model.ninfer", "--context-store", "dir",

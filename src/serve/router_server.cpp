@@ -89,7 +89,7 @@ struct EmptySelector : std::invalid_argument {
 // empty when omitted (the most recently used loaded model). A present but empty one throws.
 std::string requested_model(const httplib::Request& req, std::optional<Json>& body) {
     if (req.method == "POST" && !req.body.empty() &&
-        req.get_header_value("Content-Type").find("json") != std::string::npos) {
+        is_json_content_type(req.get_header_value("Content-Type"))) {
         try {
             Json parsed = Json::parse(req.body);
             if (parsed.is_object()) {
@@ -135,10 +135,14 @@ std::string without_model_param(const std::string& target) {
     return target.substr(0, question) + (kept.empty() ? "" : "?" + kept);
 }
 
-bool hop_by_hop(const std::string& name) {
-    std::string lower = name;
-    std::transform(lower.begin(), lower.end(), lower.begin(),
+std::string lower_ascii(std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return text;
+}
+
+bool hop_by_hop(const std::string& name) {
+    const std::string lower = lower_ascii(name);
     return lower == "connection" || lower == "keep-alive" || lower == "transfer-encoding" ||
            lower == "content-length" || lower == "content-type" || lower == "host" ||
            lower == "upgrade" || lower == "te" || lower == "trailer" ||
@@ -167,6 +171,87 @@ struct Relay {
 
 } // namespace
 
+std::optional<std::string> with_model_selector(std::string_view body, std::string_view model) {
+    const auto blank = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
+    std::size_t open = 0;
+    while (open < body.size() && blank(body[open])) { ++open; }
+    if (open >= body.size() || body[open] != '{') { return std::nullopt; }
+    std::size_t after_open = open + 1;
+    while (after_open < body.size() && blank(body[after_open])) { ++after_open; }
+    const bool empty_object = after_open < body.size() && body[after_open] == '}';
+
+    // One pass over the text, tracking nesting, to find the top-level "model" member's value.
+    // Strings are skipped escape-aware; a key with an escape is decoded to compare exactly.
+    std::size_t depth       = 0;
+    char previous           = 0; // the last significant character, to tell keys from values
+    bool model_key          = false;
+    std::size_t value_begin = std::string_view::npos;
+    std::size_t value_end   = std::string_view::npos;
+    std::size_t last_end    = open;
+    for (std::size_t i = open; i < body.size(); ++i) {
+        const char c = body[i];
+        if (blank(c)) { continue; }
+        // A value begins. Only the last "model" member counts, as with a parsed object.
+        if (depth == 1 && previous == ':' && model_key) {
+            value_begin = i;
+            value_end   = std::string_view::npos;
+        }
+        if (c == '"') {
+            std::size_t end = i + 1;
+            while (end < body.size() && body[end] != '"') { end += body[end] == '\\' ? 2 : 1; }
+            if (end >= body.size()) { return std::nullopt; }
+            if (depth == 1 && (previous == '{' || previous == ',')) {
+                const std::string_view raw = body.substr(i, end - i + 1);
+                try {
+                    model_key = raw.find('\\') == std::string_view::npos
+                                    ? raw == "\"model\""
+                                    : Json::parse(raw).get<std::string>() == "model";
+                } catch (const std::exception&) { return std::nullopt; }
+            }
+            i        = end;
+            previous = '"';
+            last_end = end + 1;
+            continue;
+        }
+        if (c == '{' || c == '[') {
+            ++depth;
+        } else if (c == '}' || c == ']') {
+            if (depth == 0) { return std::nullopt; }
+            if (depth == 1 && model_key && value_begin != std::string_view::npos &&
+                value_end == std::string_view::npos) {
+                value_end = last_end;
+            }
+            --depth;
+            if (depth == 0) { break; }
+        } else if (c == ',' && depth == 1) {
+            if (model_key && value_begin != std::string_view::npos &&
+                value_end == std::string_view::npos) {
+                value_end = last_end;
+            }
+            model_key = false;
+        }
+        previous = c;
+        last_end = i + 1;
+    }
+    if (depth != 0) { return std::nullopt; }
+
+    const std::string quoted = Json(std::string(model)).dump();
+    std::string out;
+    out.reserve(body.size() + quoted.size() + 12);
+    if (value_begin != std::string_view::npos && value_end != std::string_view::npos) {
+        out.append(body.substr(0, value_begin)).append(quoted).append(body.substr(value_end));
+    } else {
+        out.append(body.substr(0, open + 1)).append("\"model\":").append(quoted);
+        if (!empty_object) { out.push_back(','); }
+        out.append(body.substr(open + 1));
+    }
+    return out;
+}
+
+bool is_json_content_type(std::string_view content_type) {
+    return lower_ascii(std::string(content_type)).find("json") != std::string::npos;
+}
+
 RouterServer::RouterServer(ServeOptions options, ModelRegistry& registry,
                            std::shared_ptr<RoutedPorts> ports,
                            std::shared_ptr<spdlog::logger> logger)
@@ -180,7 +265,14 @@ RouterServer::RouterServer(ServeOptions options, ModelRegistry& registry,
         return new httplib::ThreadPool(kBaseWorkers, kMaxWorkers, kMaxWorkers);
     };
     server_.set_socket_options(configure_http_server_socket);
+    // A model's preset section may raise its own --max-request-mib; the router takes the largest, and
+    // the model's own server then enforces its limit with its own error.
+    options_.max_request_bytes = std::max(options_.max_request_bytes, registry_.max_request_bytes());
     server_.set_payload_max_length(options_.max_request_bytes);
+    // An oversized body is refused before any route runs; give it the JSON error the models give.
+    server_.set_error_handler([this](const httplib::Request& request, httplib::Response& response) {
+        return handle_unrendered_http_error(options_, request, response);
+    });
     register_routes();
 }
 
@@ -497,8 +589,10 @@ void RouterServer::route(const httplib::Request& req, httplib::Response& res) {
         const auto found = body->find("model");
         const bool named = found != body->end() && found->is_string();
         if ((named && found->get<std::string>() != lease.model()) || (!named && !name.empty())) {
-            (*body)["model"] = lease.model();
-            payload          = body->dump();
+            // Only the selector's text changes, so the model reads every number as sent.
+            if (auto rewritten = with_model_selector(req.body, lease.model())) {
+                payload = std::move(*rewritten);
+            }
         }
     }
     relay(req, res, std::move(lease), req.method, without_model_param(req.target),
@@ -540,9 +634,7 @@ void RouterServer::relay(const httplib::Request& req, httplib::Response& res,
     upstream.path   = target;
     upstream.body   = std::move(body);
     for (const auto& [name, value] : req.headers) {
-        std::string lower = name;
-        std::transform(lower.begin(), lower.end(), lower.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        const std::string lower = lower_ascii(name);
         // The model needs no credentials (it listens on loopback for the router alone), and
         // compression is the router's business with its client, not the model's.
         if (hop_by_hop(name) || lower == "authorization" || lower == "x-api-key" ||
@@ -601,7 +693,16 @@ void RouterServer::relay(const httplib::Request& req, httplib::Response& res,
     };
 
     std::unique_lock lock(relayed->mutex);
-    relayed->changed.wait(lock, [&] { return relayed->headers_ready || relayed->done; });
+    // The model may still be loading a prompt or generating before it sends headers; wake now and
+    // then to notice a client that has gone, and stop the upstream request for it.
+    while (!relayed->headers_ready && !relayed->done) {
+        relayed->changed.wait_for(lock, std::chrono::milliseconds(500));
+        if (!relayed->headers_ready && !relayed->done && client_disconnected(req)) {
+            lock.unlock();
+            finish(false);
+            return;
+        }
+    }
     if (!relayed->headers_ready) {
         lock.unlock();
         finish(false);
@@ -613,10 +714,7 @@ void RouterServer::relay(const httplib::Request& req, httplib::Response& res,
     res.status = relayed->status;
     std::string content_type = "application/json";
     for (const auto& [name, value] : relayed->headers) {
-        std::string lower = name;
-        std::transform(lower.begin(), lower.end(), lower.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (lower == "content-type") {
+        if (lower_ascii(name) == "content-type") {
             content_type = value;
         } else if (!hop_by_hop(name)) {
             res.set_header(name, value);

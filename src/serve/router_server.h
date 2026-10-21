@@ -22,9 +22,20 @@
 
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 
 namespace ninfer::serve {
+
+// `body` (a JSON object) with its top-level "model" set to `model`, adding the member when there
+// is none. Only that member's text changes: every other byte, numbers included, reaches the model
+// as the client wrote it. nullopt when `body` is not a JSON object.
+[[nodiscard]] std::optional<std::string> with_model_selector(std::string_view body,
+                                                             std::string_view model);
+
+// Whether a Content-Type header value names a JSON media type (the token is case-insensitive).
+[[nodiscard]] bool is_json_content_type(std::string_view content_type);
 
 class RouterServer {
 public:
