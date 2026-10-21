@@ -13,9 +13,9 @@ the request that commissioned this note and not measured here, or **(inferred)**
 
 | Needed for a split | State today | Evidence |
 |---|---|---|
-| A prefill-only request | **Missing.** The smallest request is one output token: the engine rejects `requested_output_tokens == 0`. A one-token request prefills, then runs one decode round and retains the conversation, so it works as prefill-only at the price of one decode step. | `src/runtime/engine/engine.cpp:846` |
+| A prefill-only request | **Missing as prefill-only.** `Engine::submit` accepts `requested_output_tokens == 0`, but only as an immediate result: it returns `OutputLimit` at once, with no prefill and nothing retained. So a zero-token request does not warm the cache. The smallest request that prefills and retains the conversation is one output token, which costs one decode step. | `src/runtime/engine/engine.cpp:846` |
 | "Resume from this stored image" request | **Missing as a request, present as a mechanism.** Hydration is not requested: on admission the engine matches the prompt's own prefix digests against the store (`start_hydration`) and reads the deepest image that is cheaper than prefilling. A decode engine that receives the full prompt after the prefill engine has stored its image would hydrate it with no new request type. | `engine_core.h:3113-3169`, `engine.cpp:552-600` |
-| Image export and import between engines | **Present.** Stored images are byte images of KV pages and recurrent states; the Host tier import is what hydration uses. Engines on one box can exchange them through directories (`--context-store-peer`, PR #329: a second engine resumed a 46-55k-token conversation in 1.8-2.7 s against 20-28 s cold, measured), or through S3 at 35 s to 2 min. | `docs/serving.md` "Two engines on one box" |
+| Image export and import between engines | **Present through S3 only in this checkout; the directory path is external.** Stored images are byte images of KV pages and recurrent states; the Host tier import is what hydration uses. This checkout exchanges them through S3 (35 s to 2 min). Exchange through directories (`--context-store-peer`) is PR #329, not merged here: its measurement (a second engine resumed a 46-55k-token conversation in 1.8-2.7 s against 20-28 s cold) comes from that PR and is not reproducible from this tree. | `docs/serving.md` (S3 options; no peer section yet) |
 | Writing the image right after prefill | **Missing, and starved exactly when it matters.** Writes happen when a session has been idle for `--context-store-idle-seconds` (default 30), on eviction, and at shutdown. `persist_idle_session` returns without writing while any request is pending, prefilling, replaying or materializing, and writes at most one session a second. During a burst the prefill engine always has a request pending, so it would almost never write. | `engine_core.h:3027-3087` |
 | A signal the gateway can wait on ("image is durable") | **Missing.** The gateway has nothing to call to prefetch, pin or flush (brief; consistent with `docs/serving.md` "There is nothing for a supervisor or gateway to call"). | |
 
@@ -62,8 +62,8 @@ and not removed by simple overlap. A split removes it by construction.
 
 ## What would have to change
 
-1. **Engine, prefill-only:** accept `max_tokens = 0` (or a flag) that prefills, retains the closure
-   and finishes without a decode round. Small (parse and admission path).
+1. **Engine, prefill-only:** make `max_tokens = 0` (or a flag) prefill, retain the closure and finish
+   without a decode round. Today the zero-token path returns before any prefill. Small (admission path).
 2. **Engine, write-through:** a request flag that queues the finished session for the store
    immediately and reports when it is durable, bypassing the idle gate and the "pending request"
    gate. Medium: the writer is a single thread with a bounded queue and an eviction-priority rule.
