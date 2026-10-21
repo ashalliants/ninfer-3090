@@ -347,6 +347,7 @@ public:
         out.context_store_write_failures  = s.put_failures;
         out.context_store_dropped         = store_dropped.load(std::memory_order_relaxed);
         out.context_store_bytes_written   = s.bytes_written;
+        out.context_store_bytes_stored    = s.bytes_stored;
         out.context_store_bytes_reused    = s.bytes_reused;
         out.context_store_evicted         = s.evicted_for_space + s.expired + s.superseded;
         out.context_store_corrupt         = s.corrupt_removed;
@@ -498,6 +499,7 @@ private:
         store_options.directory = config.directory;
         store_options.max_bytes = max_bytes;
         store_options.ttl       = config.ttl;
+        store_options.compress_chunks = config.compress_chunks;
         store_options.remote        = config.remote;
         store_options.remote_prefix = config.remote_prefix;
         store         = std::make_unique<runtime::ContextStore>(std::move(store_options));

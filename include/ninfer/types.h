@@ -185,6 +185,9 @@ struct ContextStoreOptions {
     std::chrono::seconds restore_budget{120};
     // Upper bound on the time spent writing sessions at shutdown.
     std::chrono::seconds flush_budget{60};
+    // Write new chunks zstd-compressed (on disk and in the remote) when that saves at least 3 %.
+    // Chunks of both forms are always read, so this can be switched either way on an existing store.
+    bool compress_chunks = false;
     // A remote copy of the store (an S3-compatible bucket). The directory then caches it: sessions
     // are uploaded in the background, sessions other engines wrote appear in the store, and one
     // evicted from the directory stays available remotely. Null keeps the store local. Expiry
@@ -1485,7 +1488,8 @@ struct RuntimeStats {
     std::uint64_t context_store_writes         = 0; // sessions written
     std::uint64_t context_store_write_failures = 0;
     std::uint64_t context_store_dropped        = 0; // sessions not written: write queue full
-    std::uint64_t context_store_bytes_written  = 0; // new chunk bytes written to disk
+    std::uint64_t context_store_bytes_written  = 0; // new chunk bytes written (raw size)
+    std::uint64_t context_store_bytes_stored   = 0; // what they took on disk after compression
     std::uint64_t context_store_bytes_reused   = 0; // chunk bytes already held, not rewritten
     std::uint64_t context_store_evicted        = 0; // removed for space, age or supersession
     std::uint64_t context_store_corrupt        = 0; // removed because they could not be read

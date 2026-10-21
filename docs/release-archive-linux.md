@@ -17,7 +17,7 @@ changed.
 - The CUDA 12.8 runtime libraries, **including cuBLAS** (`libcudart.so.12`, `libcublas.so.12`,
   `libcublasLt.so.12`). The cuBLAS prefill route links it, so the binaries need it even when you do
   not turn that route on. From NVIDIA's CUDA repository: `sudo apt install cuda-libraries-12-8`
-- FFmpeg 6 shared libraries and libcurl (`sudo apt install ffmpeg libcurl4t64` on Ubuntu 24.04)
+- FFmpeg 6 shared libraries, libcurl and libzstd (`sudo apt install ffmpeg libcurl4t64 libzstd1` on Ubuntu 24.04)
 - `curl` for the downloaders
 
 Model artifacts are **not** included — they are 17–21 GB each. The downloaders below fetch them.
