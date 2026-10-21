@@ -96,6 +96,7 @@ public:
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
+          progress_anchor_tokens_(options.progress_anchors_shared ? options.progress_anchor_tokens : 0),
           fault_listener_(options.fault_listener),
           resources_(options.context_cache.enabled, std::move(context_cost)) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
@@ -1554,6 +1555,30 @@ private:
         }
     }
 
+    // Shared progress anchors (EngineOptions::progress_anchors_shared) exist so that work done on a
+    // long prompt survives a cancellation, not to cache every stride of it: a request keeps its
+    // two newest unreused anchors and releases an older one the moment a newer one lands. An
+    // anchor something has asked for since stays, as it has proven itself like any other prefix.
+    void trim_progress_anchors(const std::shared_ptr<Request>& request,
+                               std::span<const Checkpoint> captured) {
+        constexpr std::size_t kAnchorsKept = 2;
+        if (progress_anchor_tokens_ == 0 || !request->base_plan) { return; }
+        const std::uint32_t prompt_tokens = request->base_plan->summary().prompt_tokens;
+        for (const auto point : captured) {
+            if (!instance_.program->valid_checkpoint(point)) { continue; }
+            const auto summary = instance_.program->checkpoint_metadata(point);
+            if (summary.role == CheckpointRole::SharedPrefix && summary.frontier < prompt_tokens &&
+                summary.frontier % progress_anchor_tokens_ == 0) {
+                request->progress_anchors.push_back(point);
+            }
+        }
+        while (request->progress_anchors.size() > kAnchorsKept) {
+            const Checkpoint stale = request->progress_anchors.front();
+            request->progress_anchors.erase(request->progress_anchors.begin());
+            (void)resources_.retire_unreused_shared(*instance_.program, stale);
+        }
+    }
+
     void reserve_active_capture(const std::shared_ptr<Request>& request, EngineRequestState next) {
         request->model_state        = next;
         request->capture_pending    = true;
@@ -1858,6 +1883,7 @@ private:
                 for (const auto point : progress.captured_checkpoints) {
                     resources_.publish(*instance_.program, request->continuation_owner, point);
                 }
+                trim_progress_anchors(request, progress.captured_checkpoints);
             }
             context_owner_.reset();
         }
@@ -3888,6 +3914,7 @@ private:
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
+    const std::uint32_t progress_anchor_tokens_;
     const std::function<void(const EngineFaultEvent&)> fault_listener_;
     ResourceManagement resources_;
 

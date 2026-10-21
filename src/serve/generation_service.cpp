@@ -328,6 +328,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.pending_timeout_ms       = options.pending_timeout_ms;
     engine_options.prefill_chunk            = options.prefill_chunk;
     engine_options.progress_anchor_tokens   = options.progress_anchor_tokens;
+    engine_options.progress_anchors_shared  = options.progress_anchors_shared;
     engine_options.kv_cache                = options.kv_cache;
     engine_options.enable_vision            = options.enable_vision;
     engine_options.grafts                   = options.grafts;

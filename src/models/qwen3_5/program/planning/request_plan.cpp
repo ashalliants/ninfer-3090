@@ -194,12 +194,15 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
                                           ? runtime::CheckpointRole::LongAnchor
                                           : runtime::CheckpointRole::SharedPrefix);
         }
-        // A private LongAnchor every progress_anchor_tokens: a pause that cannot keep its snapshot
-        // then replays from the nearest one. The owner keeps its newest four, so memory stays
-        // bounded, and a capture that finds no room is skipped like any other optional write.
+        // A LongAnchor every progress_anchor_tokens: a pause that cannot keep its snapshot then
+        // replays from the nearest one. The owner keeps its newest four, so memory stays bounded,
+        // and a capture that finds no room is skipped like any other optional write. With
+        // progress_anchors_shared they are SharedPrefix instead, which also survive a cancellation
+        // (the engine retires all but the newest two).
         for (const auto frontier :
              runtime::progress_anchor_frontiers(base->summary.prompt_tokens, progress_anchor_tokens)) {
-            add(frontier, runtime::CheckpointRole::LongAnchor);
+            add(frontier, progress_anchors_shared ? runtime::CheckpointRole::SharedPrefix
+                                                  : runtime::CheckpointRole::LongAnchor);
         }
         std::sort(base->capture_groups.begin(), base->capture_groups.end(),
                   [](const auto& a, const auto& b) { return a.frontier < b.frontier; });

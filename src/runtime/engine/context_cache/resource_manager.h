@@ -594,6 +594,23 @@ public:
         return true;
     }
 
+    // Releases a shared checkpoint that no request has asked for since it was published: not
+    // pinned, no demand recorded for its prefix, and not held by a waiting request. A request
+    // that publishes a trail of progress anchors uses it to keep the trail short. Returns whether
+    // the checkpoint was released; a checkpoint that is gone, in demand or held stays.
+    bool retire_unreused_shared(Program& program, Handle handle) {
+        if (!program.valid_checkpoint(handle)) { return false; }
+        const auto entry = std::find_if(shared_.begin(), shared_.end(),
+                                        [&](const auto& shared) { return shared.handle == handle; });
+        if (entry == shared_.end() || entry->pinned || entry->priority.reused) { return false; }
+        const auto summary = program.checkpoint_metadata(handle);
+        if (demand_priority(program.checkpoint_key(handle, summary.frontier)).reused) {
+            return false;
+        }
+        // Not release_victim: a retired anchor is not worth offering to the durable store.
+        return erase(program, handle, ReclaimRights{ReclaimPurpose::OptionalWrite, 0});
+    }
+
     // Releases one Host victim the way commit_release does: its continuation is offered to the
     // durable store first, while every point is still valid. False, with nothing offered, when the
     // handle is not a catalogued point or may not be released now.
