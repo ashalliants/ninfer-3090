@@ -46,6 +46,10 @@ public:
         : id_(std::move(id)), suspendable_(suspendable), journal_(journal) {
         journal_.calls.push_back("load " + id_);
         ++journal_.alive[id_];
+        // A new Engine carries no failure latch; a woken one keeps it.
+        if (const auto found = journal_.failing.find(id_); found != journal_.failing.end()) {
+            found->second = false;
+        }
     }
 
     ~FakeService() override {
@@ -362,6 +366,22 @@ void empty_selector_follows_requests_not_loads() {
     expect(lease.model() == "a", "an empty selector goes to the model that last served a request");
 }
 
+void a_resumed_failed_service_is_rebuilt() {
+    Journal journal;
+    RegistryPolicy policy;
+    policy.models_max    = 1;
+    journal.failing["a"] = false;
+    ModelRegistry registry({model("a"), model("b")}, policy, factory(journal), true);
+    { auto lease = registry.acquire("a"); }
+    journal.failing["a"] = true; // the latch survives suspend and resume
+    { auto lease = registry.acquire("b"); } // a is idle and failed: it leaves for room
+    auto lease = registry.acquire("a");
+    expect(lease.model() == "a" && !journal.failing["a"].load(),
+           "a request is leased a fresh service, not the failed one that was woken");
+    expect(std::find(journal.calls.begin(), journal.calls.end(), "unload a") != journal.calls.end(),
+           "the failed service was unloaded and built afresh first");
+}
+
 void a_waiting_request_can_be_cancelled() {
     Journal journal;
     RegistryPolicy policy;
@@ -505,6 +525,7 @@ int main() {
         a_waiting_request_can_be_cancelled();
         empty_selector_survives_unloading();
         empty_selector_follows_requests_not_loads();
+        a_resumed_failed_service_is_rebuilt();
         selector_rewrite_changes_only_the_selector();
         single_model_mode();
         catalog();

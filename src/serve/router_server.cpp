@@ -83,6 +83,7 @@ Json event_json(const ModelEvent& event) {
 struct EmptySelector : std::invalid_argument {
     EmptySelector()
         : std::invalid_argument("\"model\" must not be empty; omit it to use the last model") {}
+    explicit EmptySelector(const char* message) : std::invalid_argument(message) {}
 };
 
 // The model a request names: a JSON body's "model" on a POST, else a `model` query parameter, else
@@ -99,6 +100,11 @@ std::string requested_model(const httplib::Request& req, std::optional<Json>& bo
                     if (name.empty()) { throw EmptySelector(); }
                     body = std::move(parsed);
                     return name;
+                }
+                // Every model requires a string here, so a present one of another type is a client
+                // error, not an omitted selector to be filled in with the default.
+                if (found != parsed.end()) {
+                    throw EmptySelector("\"model\" must be a non-empty string");
                 }
                 // The selector may be in the query; the body is still the one to rewrite.
                 body = std::move(parsed);

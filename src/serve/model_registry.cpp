@@ -371,25 +371,33 @@ ModelRegistry::Lease ModelRegistry::acquire(std::string_view model, std::optiona
         throw ModelNotLoaded("model '" + slot.definition.id + "' is suspended");
     }
     // A request must not reach an Engine that has latched a failure: unload it once its other
-    // requests are gone, then load it afresh below.
+    // requests are gone, then load it afresh. The latch survives suspend and resume, so a service
+    // that was woken (or born failed) is checked again before the lease is issued; the second pass
+    // is a fresh build, and one that is still failed refuses the request.
     const Clock::time_point deadline = Clock::now() + policy_.room_timeout;
-    while (router_ && slot.state == ModelState::Loaded && slot.service->failed()) {
-        if (slot.leases == 0) {
-            slot.failed     = true;
-            slot.last_error = "the model's Engine failed; it loads again on the next request";
-            unload_locked(lock, index);
-            break;
+    for (int pass = 0;; ++pass) {
+        while (router_ && slot.state == ModelState::Loaded && slot.service->failed()) {
+            if (slot.leases == 0) {
+                slot.failed     = true;
+                slot.last_error = "the model's Engine failed; it loads again on the next request";
+                unload_locked(lock, index);
+                break;
+            }
+            if (!wait_unless_cancelled_locked(lock, deadline, cancelled)) {
+                throw ModelLoadFailed("model '" + slot.definition.id + "' is still failing");
+            }
         }
-        if (!wait_unless_cancelled_locked(lock, deadline, cancelled)) {
-            throw ModelLoadFailed("model '" + slot.definition.id + "' is still failing");
+        if (slot.state != ModelState::Loaded) {
+            if (!autoload.value_or(policy_.autoload)) {
+                throw ModelNotLoaded("model '" + slot.definition.id + "' is " +
+                                     model_state_name(slot.state) + " and autoload is off");
+            }
+            make_loaded_locked(lock, index, /*honor_hold=*/true, cancelled);
         }
-    }
-    if (slot.state != ModelState::Loaded) {
-        if (!autoload.value_or(policy_.autoload)) {
-            throw ModelNotLoaded("model '" + slot.definition.id + "' is " +
-                                 model_state_name(slot.state) + " and autoload is off");
+        if (!(router_ && slot.state == ModelState::Loaded && slot.service->failed())) { break; }
+        if (pass > 0) {
+            throw ModelLoadFailed("model '" + slot.definition.id + "' failed right after loading");
         }
-        make_loaded_locked(lock, index, /*honor_hold=*/true, cancelled);
     }
     Slot& ready = models_[index];
     ++ready.leases;
