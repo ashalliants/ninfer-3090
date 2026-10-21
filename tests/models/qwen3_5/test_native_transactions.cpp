@@ -2067,6 +2067,42 @@ void shared_capture_alignment(DeviceContext& device, const qwen::execution::Para
     }
 }
 
+// Progress anchors reach the planned capture groups as extra LongAnchor frontiers, and the option
+// is refused where nothing could keep them (context cache off).
+void progress_anchor_planning(DeviceContext& device, const qwen::execution::Parameters& parameters,
+                              qwen::Frontend& frontend, EngineOptions options) {
+    options.max_context                       = 512;
+    options.kv_capacity                       = KvCapacityPolicy::explicit_capacity(512);
+    options.max_concurrency                   = 1;
+    options.prefill_chunk                     = kChunk;
+    options.progress_anchor_tokens            = 2 * kChunk;
+    options.context_cache.enabled             = true;
+    options.context_cache.device_state_slots  = 2;
+    options.context_cache.host_capacity_bytes = 0;
+    auto planner = qwen::detail::make_sequence_planner_impl(parameters, device, options);
+    auto plan    = qwen::detail::finalize_sequence_plan_impl(std::move(planner), 2);
+    qwen::detail::ProgramImpl program(parameters, *plan, device, {});
+    runtime::ResolvedExecutionOptions request;
+    request.requested_output_tokens = 8;
+    request.allow_prefix_reuse      = true;
+    const auto frontiers_for = [&](std::uint32_t prompt_tokens) {
+        auto prepared = qwen::PreparedPromptAccess::take(
+            frontend.prepare_tokens(std::vector<TokenId>(prompt_tokens, 198)));
+        return program.plan_request(std::move(prepared), request).capture_frontiers();
+    };
+    require(frontiers_for(500) == std::vector<std::uint32_t>({256, 500}),
+            "progress anchors were not planned at every spacing inside the prompt");
+    require(frontiers_for(256) == std::vector<std::uint32_t>({256}),
+            "a progress anchor duplicated the InputReplay frontier");
+
+    options.context_cache.enabled = false;
+    bool rejected                 = false;
+    try {
+        (void)qwen::detail::make_sequence_planner_impl(parameters, device, options);
+    } catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "progress anchors were accepted without the context cache");
+}
+
 void replay_sampling_counts(DeviceContext& device, const qwen::execution::Parameters& parameters,
                             qwen::Frontend& frontend, EngineOptions options) {
     options.max_context                       = 128;
@@ -2303,6 +2339,7 @@ int main(int argc, char** argv) {
         }
         capture_retry.reset();
         shared_capture_alignment(device, parameters, frontend, options);
+        progress_anchor_planning(device, parameters, frontend, options);
         replay_sampling_counts(device, parameters, frontend, options);
         std::cout << "OK native transaction cancellation, paused ownership and replay recovery\n";
         return 0;

@@ -879,6 +879,10 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     if (options.progress_anchor_tokens % options.prefill_chunk != 0) {
         throw std::invalid_argument("progress_anchor_tokens must be 0 or a multiple of prefill_chunk");
     }
+    if (options.progress_anchor_tokens != 0 && !options.context_cache.enabled) {
+        throw std::invalid_argument(
+            "progress_anchor_tokens needs the context cache: enable it or set 0");
+    }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("max_concurrency must be in [1,8]");
     }
