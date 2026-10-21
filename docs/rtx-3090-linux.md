@@ -51,7 +51,7 @@ sudo apt-get update
 sudo apt-get install --yes \
   build-essential gcc-13 g++-13 cmake ninja-build pkg-config \
   libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
-  libcurl4-openssl-dev
+  libcurl4-openssl-dev libzstd-dev
 ```
 
 Select GCC 13 for host and CUDA compilation:
