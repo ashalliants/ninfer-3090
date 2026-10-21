@@ -4,6 +4,36 @@ Maintainer orchestration for the public `ninfer_bench` throughput tool, serving 
 runners, and the external Serve TTFT client. Correctness is owned by the affected suites under
 [`tests/`](../../tests/README.md).
 
+## What a long uncached prompt does to a stream next to it
+
+`run_prefill_stall.py` starts a streaming chat completion against a running `ninfer-serve`, lets it
+settle, then submits one long uncached prompt and records the stream's event timestamps around it. It
+reports the stream's inter-event gaps (p50/p90/p99/max) and events per second in three windows, before,
+during and after the long prompt, and the long prompt's own time and prefill rate. It is the
+measurement behind `--prefill-stall-budget-ms`, `--prefill-decode-share`, `--yield-long-prefill-ms` and
+`--prefill-anchor-tokens`; the experiments are listed in
+[`docs/maintainer/decode-during-long-prefill.md`](../../docs/maintainer/decode-during-long-prefill.md).
+
+```bash
+# server: two lanes, so the stream and the long prompt run at once
+ninfer-serve models/qwen3_8_27b.ninfer --max-concurrency 2 --max-context 131072 \
+    --prefill-cublas --prefill-chunk 4096 --prefill-stall-budget-ms 500
+
+python tools/bench/run_prefill_stall.py --model qwen3.8-27b --long-tokens 100000 --output stall.json
+# a short request 10 s into the long prompt: its time to first event is the head-of-line wait
+python tools/bench/run_prefill_stall.py --model qwen3.8-27b --short-delay-seconds 10
+# cancel the long prompt at 60 s and resubmit it: the retry's time shows what --prefill-anchor-tokens saved
+python tools/bench/run_prefill_stall.py --model qwen3.8-27b --cancel-long-after-seconds 60
+```
+
+Start each setting from a fresh server so the prompt cache is cold, and take the baseline (no flags) the
+same way. Every run draws a new prompt seed (printed on stderr) so one run cannot warm the next; pass
+`--seed` to repeat a prompt on purpose. `--words-per-token` is a guess at the tokenizer: adjust it until the
+reported `prompt_tokens` matches `--long-tokens`. `--extra-body '{"chat_template_kwargs":{"enable_thinking":false}}'`
+adds fields to every request. With `--max-concurrency 1` the long prompt queues behind the stream instead,
+which is itself the head-of-line case. `python -I tools/bench/test_prefill_stall.py` checks the tool against a
+fake server that stalls its streams on a long request.
+
 ## Interleaved A/B between two builds
 
 `run_interleaved_ab.py` compares two executables by alternating them **inside** each repetition.

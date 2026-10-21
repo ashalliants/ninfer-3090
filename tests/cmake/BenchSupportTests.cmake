@@ -19,6 +19,11 @@ target_include_directories(ninfer_context_cost_measure_test PRIVATE
 
 add_test(NAME ninfer_context_cost_measure_test COMMAND ninfer_context_cost_measure_test)
 
+# The prefill stall probe's self-test (tools/bench/run_prefill_stall.py), against a fake server that
+# stalls its streams while a long request is "prefilling". Pure Python, no GPU.
+add_test(NAME ninfer_prefill_stall_probe_test
+  COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/bench/test_prefill_stall.py)
+
 # The Host arena replay tool's self-test (tools/bench/replay_host_arena.py). Pure Python, no GPU: the
 # replay of a known allocator run must reproduce it exactly, or the tool's predictions mean nothing.
 add_test(NAME ninfer_host_arena_replay_test
