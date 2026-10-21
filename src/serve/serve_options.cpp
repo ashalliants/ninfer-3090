@@ -145,7 +145,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--prefill-stall-budget-ms N] [--yield-long-prefill-ms N] "
-           "[--prefill-decode-share P] "
+           "[--prefill-decode-share P] [--prefill-layer-slices N] "
            "[--log-stats-interval-ms N] "
            "[--device N] "
            "[--context-cost-presets FILE] "
@@ -227,6 +227,11 @@ std::string serve_usage_text(const char* argv0) {
            "burst of tokens after every step instead of one and the prompt takes longer while it "
            "lasts; the longest gap is still a step, so combine it with --prefill-stall-budget-ms. "
            "Off by default\n"
+           "       --prefill-layer-slices N runs each text prefill chunk as N slices of layers while "
+           "another lane is decoding, and lets that lane's decode round run between slices: its "
+           "gap shrinks to a slice while the chunk keeps its size (so the prompt is not slowed "
+           "the way a smaller --prefill-chunk or a stall budget slows it). Not for media, DFlash "
+           "or a pipeline split; 0 or 1 is off, at most 16. Off by default\n"
            "       --prefill-cublas hands wide prefill GEMMs to cuBLAS: a large prefill speedup for a "
            "small perplexity cost (docs/performance.md), off by default, and it wants a larger "
            "--prefill-chunk to pay; --no-prefill-cublas-projections keeps the attention and GDN "
@@ -449,6 +454,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.prefill_schedule.decode_share_percent = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-decode-share"),
                                       "prefill-decode-share"));
+        } else if (arg == "--prefill-layer-slices") {
+            options.prefill_schedule.layer_slices = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--prefill-layer-slices"),
+                                      "prefill-layer-slices"));
         } else if (arg == "--context-cost-presets") {
             options.context_cost_presets = require_value("--context-cost-presets");
             if (options.context_cost_presets.empty()) {
@@ -893,6 +902,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.prefill_schedule.decode_share_percent > kMaximumPrefillDecodeSharePercent) {
         throw std::invalid_argument("--prefill-decode-share must be at most 90");
+    }
+    if (options.prefill_schedule.layer_slices > kMaximumPrefillLayerSlices) {
+        throw std::invalid_argument("--prefill-layer-slices must be at most 16");
     }
     product::apply_speculative_defaults(options.speculative);
     product::validate_speculative_cli_options(options.speculative);

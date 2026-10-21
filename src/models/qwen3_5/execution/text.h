@@ -39,7 +39,23 @@ struct NullTap {
 struct PrefillChunkResult {
     std::uint32_t processed_tokens = 0;
     bool finalized                 = false;
+    // A sliced chunk that has run some of its layers and not yet all: nothing is processed, and
+    // the next call with the same PrefillSliceState runs the next slice.
+    bool partial = false;
     runtime::ExecutionTiming timing;
+};
+
+// One text prefill chunk run as `count` slices of consecutive layers, so work for other lanes can
+// run between them. The first slice embeds the chunk, the last takes the final norm, the head, the
+// sampler and the MTP tail, and between slices the residual stream waits in
+// `prefill_hidden` (which no layer touches: only the tail writes it). Everything else a slice reads
+// is rebuilt at its start (positions, the control tensors the layers read), because a decode round
+// in between reuses the workspace. The Program owns the state between calls. Nothing else may use
+// `prefill_hidden` while a chunk is part-way: the Engine finishes the chunk before it runs a replay
+// or a forced-token control batch, the only other writers.
+struct PrefillSliceState {
+    std::uint32_t count = 1; // slices per chunk; 1 runs the chunk whole
+    std::uint32_t index = 0; // the next slice to run
 };
 
 struct DFlashFeatureSink {
@@ -104,6 +120,10 @@ public:
     void set_prefill_split_frontier(std::int64_t position) noexcept {
         prefill_split_frontier_ = position;
     }
+
+    // Runs the next prefill chunk in slices (PrefillSliceState). Text-only, single-device chunks
+    // only; any other chunk runs whole whatever this holds.
+    void set_prefill_slice(PrefillSliceState* slice) noexcept { prefill_slice_ = slice; }
 
     void set_rewrite_checkpoint_hidden_output(Tensor* output) noexcept {
         rewrite_checkpoint_hidden_output_ = output;
@@ -178,8 +198,10 @@ private:
     template <class Tap>
     void run_layers(Tensor& x, Phase phase, Tap& tap);
     // The layers one stage owns, on the device that stage's context is currently bound to.
+    // `first`/`last` (stage-relative defaults: the whole stage) run only layers [first, last).
     template <class Tap>
-    void run_stage_layers(std::size_t stage, Tensor& x, Phase phase, Tap& tap);
+    void run_stage_layers(std::size_t stage, Tensor& x, Phase phase, Tap& tap,
+                          std::uint32_t first = UINT32_MAX, std::uint32_t last = UINT32_MAX);
     // The whole layer stack across pipeline stages, ending with the residual back on rank 0. A
     // feature tap receives every layer it names, wherever that layer ran.
     template <class Tap>
@@ -270,6 +292,7 @@ private:
     GdnStateAction gdn_state_action_          = GdnStateAction::UpdateInPlace;
     const GdnReplayRecords* replay_records_   = nullptr;
     std::int64_t prefill_split_frontier_      = -1;
+    PrefillSliceState* prefill_slice_         = nullptr;
     Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
     std::uint32_t mtp_proposal_extent_        = 0;
 

@@ -217,6 +217,13 @@ struct RequestRecord {
     bool awaiting_sibling  = false;
     bool sibling_wait_used = false;
 
+    // A prefill chunk is part-way through its layers (PrefillScheduleOptions::layer_slices): the
+    // lane must be advanced again before anything else claims the Program's parking buffer, and
+    // cannot be paused until it finishes. `slice_elapsed_ns` and `slice_prefix` describe the step
+    // for the pacing model, which sees the step whole.
+    bool slice_in_flight                   = false;
+    std::uint64_t slice_elapsed_ns         = 0;
+    std::uint32_t slice_prefix             = 0;
     bool recovery_pending                  = false;
     std::uint64_t committed_decode_tokens  = 0;
     GenerationRecoveryRoute recovery_route = GenerationRecoveryRoute::None;

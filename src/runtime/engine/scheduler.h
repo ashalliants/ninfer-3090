@@ -127,6 +127,15 @@ public:
     template <class Slots>
     [[nodiscard]] std::optional<std::uint32_t>
     next_prefill(const Slots& slots, std::uint32_t concurrency) const noexcept {
+        // A chunk part-way through its layers goes first: the Program has one parking buffer for
+        // the residual between slices, so only one lane can be in that state.
+        for (std::uint32_t lane = 0; lane < concurrency; ++lane) {
+            const auto& request = slots[lane];
+            if (request && request->slice_in_flight && request->is_prefilling() &&
+                !request->capture_pending) {
+                return lane;
+            }
+        }
         for (std::uint32_t offset = 0; offset < concurrency; ++offset) {
             const std::uint32_t lane = (prefill_cursor_ + offset) % concurrency;
             const auto& request      = slots[lane];
@@ -230,7 +239,8 @@ public:
                 continue;
             }
             if (!oldest || request->id < slots[*oldest]->id) { oldest = lane; }
-            if (!request->recovery_pending &&
+            // A lane part-way through a sliced chunk cannot be paused; the next cycle finishes it.
+            if (!request->recovery_pending && !request->slice_in_flight &&
                 (!priority_ticket || request->id > *priority_ticket) &&
                 (!youngest || request->id > slots[*youngest]->id)) {
                 youngest = lane;

@@ -206,6 +206,7 @@ struct PrefillProgress {
     BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
+    bool partial                          = false;
     ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     bool capture_ready = false;
@@ -430,6 +431,8 @@ struct Event {
     std::uint32_t cap        = 0; // prefill: the max_tokens it was given
     std::uint32_t position   = 0; // prefill: cursor before the step
     bool snapshot            = false;
+    std::uint32_t slice      = 0;     // prefill: which layer slice of its chunk this call ran
+    bool partial             = false; // prefill: more slices of this chunk remain
 };
 
 struct Cost {
@@ -601,6 +604,8 @@ public:
     }
     [[nodiscard]] bool start_pause(SequenceHandle sequence, bool save_snapshot, ExecutionTiming* = nullptr) {
         if (transaction_ || !valid(sequence)) { return false; }
+        // Like the real Program: a chunk part-way through its layers has no frontier to save.
+        if (lanes_[sequence.lane].slice_count != 0) { return false; }
         Transaction tx;
         tx.kind     = ContextOperationKind::Pause;
         tx.lane     = sequence.lane;
@@ -662,18 +667,42 @@ public:
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   ExecutionTiming* = nullptr,
                                                   TokenMaskProvider* = nullptr,
-                                                  std::uint32_t max_tokens = 0) {
+                                                  std::uint32_t max_tokens   = 0,
+                                                  std::uint32_t layer_slices = 0) {
         Lane& lane = checked(sequence);
-        const std::uint32_t remaining = lane.prompt - lane.cursor;
-        std::uint32_t step            = std::min(chunk_, remaining);
-        if (max_tokens != 0) { step = std::min(step, max_tokens); }
-        Event event{Event::Kind::Prefill, sequence.lane, lane.plan, step, max_tokens, lane.cursor, false};
+        // A chunk begun in slices is finished at the size it began, as the real Program does.
+        const bool resuming = lane.slice_count != 0;
+        std::uint32_t step  = lane.slice_tokens;
+        if (!resuming) {
+            const std::uint32_t remaining = lane.prompt - lane.cursor;
+            step                          = std::min(chunk_, remaining);
+            if (max_tokens != 0) { step = std::min(step, max_tokens); }
+            if (layer_slices > 1) {
+                lane.slice_count  = layer_slices;
+                lane.slice_index  = 0;
+                lane.slice_tokens = step;
+            }
+        }
+        const bool sliced = lane.slice_count != 0;
+        const bool last   = !sliced || lane.slice_index + 1 >= lane.slice_count;
+        Event event{Event::Kind::Prefill, sequence.lane, lane.plan, last ? step : 0U, max_tokens,
+                    lane.cursor, false, lane.slice_index, !last};
         hook(event);
         if (cost_.prefill_sleep.count() != 0) { std::this_thread::sleep_for(cost_.prefill_sleep); }
         PrefillProgress progress;
         progress.summary = {.prompt_tokens = lane.prompt};
+        const std::uint64_t step_ns = cost_.prefill_fixed_ns + cost_.prefill_per_token_ns * step;
+        progress.timing.device_wait_ns = sliced ? step_ns / lane.slice_count : step_ns;
+        if (!last) {
+            // Part of the chunk ran: nothing is processed and the cursor stays.
+            ++lane.slice_index;
+            progress.partial = true;
+            record(event);
+            return progress;
+        }
+        lane.slice_count = 0;
+        lane.slice_index = 0;
         progress.processed_prompt_tokens = step;
-        progress.timing.device_wait_ns = cost_.prefill_fixed_ns + cost_.prefill_per_token_ns * step;
         lane.cursor += step;
         record(event);
         if (lane.cursor >= lane.prompt) {
@@ -789,6 +818,9 @@ private:
         std::uint32_t generated = 0;
         bool decoding           = false;
         bool pending            = false;
+        std::uint32_t slice_count  = 0; // slices of the chunk in progress; 0: not part-way
+        std::uint32_t slice_index  = 0;
+        std::uint32_t slice_tokens = 0;
     };
     struct Transaction {
         ContextOperationKind kind = ContextOperationKind::Bind;

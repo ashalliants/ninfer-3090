@@ -72,6 +72,8 @@ inline constexpr std::uint32_t kMaximumPrefillStallBudgetMs = 60'000;
 inline constexpr std::uint32_t kMaximumPrefillYieldRemainingMs = 3'600'000;
 // PrefillScheduleOptions::decode_share_percent: beyond this decode would starve the prompt.
 inline constexpr std::uint32_t kMaximumPrefillDecodeSharePercent = 90;
+// PrefillScheduleOptions::layer_slices: more slices than this leaves a few layers per slice.
+inline constexpr std::uint32_t kMaximumPrefillLayerSlices = 16;
 
 struct KvCapacityPolicy {
     KvCapacityMode mode                  = KvCapacityMode::Explicit;
@@ -291,6 +293,16 @@ struct PrefillScheduleOptions {
     // deferred turns in a row a step runs regardless. 0 (the default) keeps one round per step;
     // at most 90.
     std::uint32_t decode_share_percent = 0;
+    // While another lane is decoding, run each text prefill chunk as this many slices of
+    // consecutive layers and let that lane's decode round run between slices, so its next token
+    // waits a slice (a step's time divided by this) instead of the whole step. The chunk keeps its
+    // size, so the cuBLAS route's weight dequantise pass is still paid once per chunk: this is the
+    // way to short gaps that does not slow the prompt down the way a small --prefill-chunk or a
+    // stall budget does. It costs two copies of the residual stream per slice boundary (a few
+    // dozen MB at 4096 tokens, well under a millisecond) and one extra decode round per boundary
+    // while the neighbour lasts. A chunk with media, a DFlash backend or a pipeline split runs
+    // whole. 0 or 1 (the default) never slices; at most 16.
+    std::uint32_t layer_slices = 0;
 };
 
 struct ContextCostOptions {
@@ -1477,6 +1489,10 @@ struct RuntimeStats {
     // Worker cycles that skipped their prefill step so decode rounds could use their share
     // (PrefillScheduleOptions::decode_share_percent).
     std::uint64_t deferred_prefill_turns            = 0;
+    // Prefill steps run in layer slices and the boundaries between their slices
+    // (PrefillScheduleOptions::layer_slices): each boundary is a point where a neighbour decoded.
+    std::uint64_t sliced_prefill_steps              = 0;
+    std::uint64_t prefill_slice_boundaries          = 0;
 
     std::uint64_t root_selections               = 0;
     std::uint64_t checkpoint_selections         = 0;

@@ -222,6 +222,8 @@ struct PrefillProgress {
     runtime::BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
+    // Never set: this Program does not slice its prefill (the Engine reads it for any model).
+    bool partial = false;
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     bool capture_ready = false;
@@ -470,12 +472,13 @@ public:
     [[nodiscard]] bool vision_pending(SequenceHandle) const noexcept { return false; }
     bool poll_vision() { return false; }
     bool drain_vision_window() { return false; }
-    // `max_tokens` is accepted so the Engine can pass it to any model; this model sizes its own
-    // calls (the router decides how wide each is) and ignores it.
+    // `max_tokens` and `layer_slices` are accepted so the Engine can pass them to any model; this
+    // model sizes its own calls (the router decides how wide each is) and ignores both.
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   runtime::ExecutionTiming* failed_timing = nullptr,
                                                   runtime::TokenMaskProvider* masks       = nullptr,
-                                                  std::uint32_t max_tokens                = 0);
+                                                  std::uint32_t max_tokens                = 0,
+                                                  std::uint32_t layer_slices              = 0);
     [[nodiscard]] ReplayProgress advance_replay(SequenceHandle sequence,
                                                 runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,

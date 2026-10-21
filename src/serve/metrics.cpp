@@ -359,6 +359,10 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
             "Prefills paused so a short request at the head of the queue could be admitted.");
     COUNTER(deferred_prefill_turns, "deferred_prefill_turns_total",
             "Worker cycles that skipped their prefill step to give decode rounds their share.");
+    COUNTER(sliced_prefill_steps, "sliced_prefill_steps_total",
+            "Prefill steps run in layer slices because another lane was decoding.");
+    COUNTER(prefill_slice_boundaries, "prefill_slice_boundaries_total",
+            "Boundaries between the layer slices of those steps, where the other lane's decode ran.");
     COUNTER(engine_recoveries, "engine_recoveries_total",
             "Host-side worker failures survived by failing in-flight requests and clearing the "
             "context cache.");

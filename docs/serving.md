@@ -685,6 +685,7 @@ server restarts.
 | `ninfer_prefill_backlog_seconds` | gauge: predicted prefill work ahead of a new request (resident remainder plus queued requests uncached); the same figure as `prefill_backlog_seconds` in `/v1/load` |
 | `ninfer_prefill_yields_total` | prefills paused so a short request at the head of the queue could be admitted (`--yield-long-prefill-ms`) |
 | `ninfer_deferred_prefill_turns_total` | worker cycles that held the prefill step back for `--prefill-decode-share` |
+| `ninfer_sliced_prefill_steps_total`, `ninfer_prefill_slice_boundaries_total` | prefill steps run in layer slices (`--prefill-layer-slices`), and the boundaries between their slices where a neighbour's decode round ran |
 | `ninfer_engine_recoveries_total` | host-side worker failures the server survived by failing the in-flight requests and clearing the context cache |
 | `ninfer_device_kv_{used,capacity}_pages`, `ninfer_device_backend_kv_used_pages`, `ninfer_device_state_{used,capacity}_slots` | physical Main KV, speculative backend KV and StateImage occupancy; retained history also occupies these pools |
 | `ninfer_host_context_{used,reserved,capacity,peak}_bytes`, `ninfer_host_state_images`, `ninfer_host_kv_used_bytes` | unified Host backing; reserved bytes, StateImages and KV bytes are breakdowns already included in used bytes |
@@ -1820,6 +1821,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--prefill-stall-budget-ms N` | while another lane decodes, cut each prefill step so it is predicted to take at most N ms; see [execution behavior](#execution-behavior) | off |
 | `--yield-long-prefill-ms N` | let the request at the head of the queue pause a prefill with at least N ms of work left, when its own prefill costs at most a quarter of that; see [execution behavior](#execution-behavior) | off |
 | `--prefill-decode-share P` | after each prefill step, while another lane decodes, run decode rounds for P percent (0-90) of the step's time before the next step; see [execution behavior](#execution-behavior) | off |
+| `--prefill-layer-slices N` | while another lane decodes, run each text prefill chunk as N slices of layers with that lane's decode round between slices (2-16); see [execution behavior](#execution-behavior) | off |
 | `--device-state-slots N` | extra Device StateImages beyond `max-concurrency` | `max-concurrency` |
 | `--host-context-mib N` | shared pinned Host budget for StateImages, KV and pause snapshots, including in-flight destinations; refused together with `--auto-host-cache` | `8192 MiB + 8 native StateImages` |
 | `--auto-host-cache` | size the Host context budget from the host memory still free once the model has loaded, for a machine that exists to serve; see [automatic host cache](#automatic-host-cache). Refuses an explicit `--host-context-mib` | off |
@@ -2079,6 +2081,26 @@ want and let the budget shorten it only when somebody is waiting. `ninfer_paced_
 and `ninfer_paced_prefill_deferred_tokens_total` count the steps it cut and the tokens it pushed to
 later steps. Off by default; it does nothing at `--max-concurrency 1`, where no other lane decodes.
 Qwen3.8-Flash-Next sizes its own prefill calls and refuses the flag.
+
+`--prefill-layer-slices N` (2-16) is the option that shortens the gap without shrinking the chunk. While
+another lane is decoding, each text prefill chunk runs as N slices of consecutive layers, and the
+Engine runs that lane's decode round between slices: its next token waits one slice, about a step's time
+divided by N, instead of the whole step, and the chunk keeps its size, so the cuBLAS route's weight
+dequantise pass is still paid once per chunk. That is what separates it from a smaller `--prefill-chunk`
+or a stall budget, which buy the same gap with the prompt's own speed. What it costs: two copies of the
+residual stream per slice boundary (a few dozen MB at 4,096 tokens on the 27B, well under a millisecond),
+one extra decode round per boundary while the neighbour lasts, and a delay for anything that needs the
+prefill path while a chunk is part-way: a thinking-budget control batch waits until the chunk is done, a
+lane that wants to pause the prefill (yielding, or resource pressure) waits for the chunk boundary, and
+another prompt's prefill does not start until the chunk in progress has finished. Cancelling a request
+part-way is immediate. A chunk with media, with a DFlash backend, or on a pipeline split runs whole, so
+the default one-lane DFlash2 profile is unaffected; the two-lane MTP profile is the one it is for.
+`ninfer_sliced_prefill_steps_total` and `ninfer_prefill_slice_boundaries_total` count the steps run
+sliced and the boundaries where the neighbour decoded. It combines with the stall budget (the budget
+cuts the chunk, the slices divide what is left) and the decode share. Off by default; Qwen3.8-Flash-Next
+refuses the flag. **This path is new GPU code that has not been run on a GPU**: output is the same
+model computation but, like any change to where a chunk is split, not claimed bit-identical to an
+unsliced run.
 
 `--yield-long-prefill-ms N` is for the queue rather than the other streams. A fresh request never
 preempts a resident one, so with every lane busy it waits for the lane's request to finish, which behind

@@ -70,7 +70,7 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
 PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const TokenId> ids,
                                       std::uint32_t nominal_length,
                                       std::optional<std::uint32_t> split_frontier,
-                                      bool finalize_at_end) {
+                                      bool finalize_at_end, PrefillSliceState* slice) {
     TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
@@ -83,6 +83,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
     card.set_layer_ready(state.layer_ready);
+    card.set_prefill_slice(slice);
     const std::span<const int> prompt(ids.data(), ids.size());
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
@@ -199,7 +200,8 @@ std::array<std::int32_t, 3> prompt_rope_position(const PreparedPromptData& promp
 PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
                                              runtime::ExecutionTiming* timing,
                                              runtime::TokenMaskProvider* masks,
-                                             std::uint32_t max_tokens) {
+                                             std::uint32_t max_tokens,
+                                             std::uint32_t layer_slices) {
     if (!valid_sequence(handle)) { throw std::logic_error("prefill has a stale lane"); }
     const auto lane = ContractAccess::lane(handle).value;
     require_unit(lane, ExecutionUnitKind::Prefill);
@@ -222,16 +224,17 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
         CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &config, sizeof(config),
                                    cudaMemcpyHostToDevice, device.stream));
     }
-    auto progress = wrap_prefill(lane, advance_prefill_raw(lane, timing, max_tokens));
+    auto progress = wrap_prefill(lane, advance_prefill_raw(lane, timing, max_tokens, layer_slices));
     if (!progress.complete) { settle_unit(lane); }
     return progress;
 }
 
 runtime::PrefillStepResult
 ProgramImpl::advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing,
-                                 std::uint32_t max_tokens) {
+                                 std::uint32_t max_tokens, std::uint32_t layer_slices) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
-    return advance_prefill(active_sequence(lane), requests[lane], failed_timing, max_tokens);
+    return advance_prefill(active_sequence(lane), requests[lane], failed_timing, max_tokens,
+                           layer_slices);
 }
 
 runtime::ExecutionTiming ProgramImpl::resolve_prefill_raw(std::uint32_t lane, bool terminal,
@@ -509,7 +512,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
 runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                                                         RequestControl& request,
                                                         runtime::ExecutionTiming* failed_timing,
-                                                        std::uint32_t max_tokens) {
+                                                        std::uint32_t max_tokens,
+                                                        std::uint32_t layer_slices) {
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
     if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) {
         throw std::logic_error("staged prefill step requires an active concurrent request");
@@ -594,6 +598,18 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             // A cap shortens the step only; the planned chunk and its reservation stay as they
             // were. A media item's span decides its own step, so a prompt with media keeps the plan.
             if (max_tokens != 0 && !staged.vision) { nominal = std::min(nominal, max_tokens); }
+            // A chunk begun in slices is finished at the size it began, whatever cap the caller
+            // passes now, and keeps the slice count its first call chose.
+            const bool resuming = staged.slice.index != 0;
+            if (resuming) { nominal = staged.slice_tokens; }
+            const bool sliced_call =
+                resuming || (layer_slices > 1 && !staged.vision &&
+                             !is_masked_draft_backend(speculative_backend) &&
+                             prefill_hidden.data != nullptr && !parameters.text.split_execution());
+            if (!resuming && sliced_call) {
+                staged.slice        = execution::PrefillSliceState{.count = layer_slices, .index = 0};
+                staged.slice_tokens = nominal;
+            }
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
             if (is_masked_draft_backend(speculative_backend)) {
@@ -645,10 +661,23 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 } else {
                     result = execution::prefill_text_chunk(
                         schedule_state, std::span<const TokenId>(staged.prompt.token_ids),
-                        remaining, split_frontier, final_candidate);
+                        remaining, split_frontier, final_candidate,
+                        sliced_call ? &staged.slice : nullptr);
                 }
                 timing.include(result.timing);
                 timing.resume_post();
+                if (result.partial) {
+                    // Some layers ran. Nothing is committed and the cursor stays. Each call reports
+                    // its own time; the caller adds a step's slices up.
+                    staged.elapsed_seconds +=
+                        std::chrono::duration<double>(Clock::now() - started).count();
+                    return runtime::PrefillStepResult{
+                        .summary                 = summary,
+                        .processed_prompt_tokens = 0,
+                        .partial                 = true,
+                        .timing                  = timing.finish(),
+                    };
+                }
                 // A chunk waits for every restored layer and synchronizes: a restore landing
                 // under this lane has landed.
                 schedule_state.layer_ready = {};
@@ -693,7 +722,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 }
 
                 finalized = result.finalized;
-                if (finalized || remaining == 0) { break; }
+                // A sliced chunk ends its call: the next chunk, if any, starts a call of its own.
+                if (finalized || remaining == 0 || sliced_call) { break; }
             }
 
             if (!finalized) {

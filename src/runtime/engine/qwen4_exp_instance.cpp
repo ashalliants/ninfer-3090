@@ -183,6 +183,9 @@ void validate(const EngineOptions& options) {
     if (options.prefill_schedule.yield_remaining_ms != 0) {
         refuse("does not pause a prefill for the queue: remove --yield-long-prefill-ms");
     }
+    if (options.prefill_schedule.layer_slices > 1) {
+        refuse("runs its layers in its own routed calls and does not slice them: remove --prefill-layer-slices");
+    }
     if (options.prefill_schedule.stall_budget_ms != 0) {
         refuse("sizes its own prefill calls and ignores a stall budget: remove --prefill-stall-budget-ms");
     }
