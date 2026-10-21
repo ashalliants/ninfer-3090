@@ -581,14 +581,26 @@ void RouterServer::route(const httplib::Request& req, httplib::Response& res) {
         write_error(req, res, 400, "invalid_request", error.what());
         return;
     }
-    ModelRegistry::Lease lease = registry_.acquire(name);
+    // A client that hangs up while the model loads or waits for room stops the wait; the model
+    // being loaded for it is not abandoned half-built (see ModelRegistry::acquire).
+    std::optional<ModelRegistry::Lease> acquired;
+    try {
+        acquired.emplace(
+            registry_.acquire(name, std::nullopt, [&req] { return client_disconnected(req); }));
+    } catch (const RequestCancelled&) {
+        res.status = 499;
+        return;
+    }
+    ModelRegistry::Lease lease = std::move(*acquired);
     std::string payload        = req.body;
     // The model knows itself by its id, not by an alias the client used.
     // A selector given in the query is carried into the body, which the models require.
     if (body) {
         const auto found = body->find("model");
         const bool named = found != body->end() && found->is_string();
-        if ((named && found->get<std::string>() != lease.model()) || (!named && !name.empty())) {
+        // A body without a selector gets one too when the request was default-routed: the model
+        // requires the field.
+        if ((named && found->get<std::string>() != lease.model()) || !named) {
             // Only the selector's text changes, so the model reads every number as sent.
             if (auto rewritten = with_model_selector(req.body, lease.model())) {
                 payload = std::move(*rewritten);
@@ -672,7 +684,9 @@ void RouterServer::relay(const httplib::Request& req, httplib::Response& res,
         httplib::Error error = httplib::Error::Success;
         const bool ok        = relayed->client->send(request, response, error);
         std::lock_guard lock(relayed->mutex);
-        if (!ok && !relayed->headers_ready) {
+        // A request that fails while the relay is still open is an upstream failure, before or
+        // after the headers; one that fails because the relay was closed is the client leaving.
+        if (!ok && !relayed->done) {
             relayed->failed = true;
             relayed->error  = httplib::to_string(error);
         }
@@ -737,6 +751,9 @@ void RouterServer::relay(const httplib::Request& req, httplib::Response& res,
                     return sink.write(chunk.data(), chunk.size());
                 }
                 if (relayed->done) {
+                    // Headers are out, so the status cannot change: drop the connection rather than
+                    // end the body as though the model had finished.
+                    if (relayed->failed) { return false; }
                     sink.done();
                     return true;
                 }

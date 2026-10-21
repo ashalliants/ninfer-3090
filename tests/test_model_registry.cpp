@@ -322,6 +322,43 @@ void shared_state_files_are_refused() {
     expect(refused({a, b}), "a later model's own request log may not land on another model's artifact");
     b.options.request_log_jsonl = "/m/b-requests.jsonl";
     expect(!refused({a, b}), "each model may have a request log of its own");
+    // Same artifact basename in two folders, one shared NVMe directory: one scratch file.
+    auto c = with_artifact("c", "/m/one/model.ninfer");
+    auto d = with_artifact("d", "/m/two/model.ninfer");
+    expect(!refused({c, d}), "same basenames in different folders are fine without an NVMe tier");
+    for (auto* m : {&c, &d}) {
+        m->options.context_cache.enabled          = true;
+        m->options.flash_next.context_nvme_bytes  = 1ULL << 30;
+        m->options.flash_next.context_nvme_dir    = "/scratch";
+    }
+    expect(refused({c, d}), "a shared NVMe directory would give same-named artifacts one scratch file");
+    d.options.flash_next.context_nvme_dir = "/scratch2";
+    expect(!refused({c, d}), "separate NVMe directories keep the scratch files apart");
+}
+
+void a_waiting_request_can_be_cancelled() {
+    Journal journal;
+    RegistryPolicy policy;
+    policy.models_max   = 1;
+    policy.room_timeout = std::chrono::seconds(30);
+    ModelRegistry registry({model("a"), model("b")}, policy, factory(journal), true);
+    auto busy = registry.acquire("a"); // its lease leaves no room for b
+    std::atomic<bool> gone{false};
+    std::thread hang_up([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        gone = true;
+    });
+    const auto started = std::chrono::steady_clock::now();
+    bool cancelled     = false;
+    try {
+        (void)registry.acquire("b", std::nullopt, [&] { return gone.load(); });
+    } catch (const RequestCancelled&) { cancelled = true; }
+    hang_up.join();
+    expect(cancelled, "a request whose client left stops waiting for room");
+    expect(std::chrono::steady_clock::now() - started < std::chrono::seconds(5),
+           "it does not wait out the room timeout");
+    expect(state_of(registry, "b") == ModelState::Unloaded, "the cancelled request loaded nothing");
+    expect(journal.alive["b"] == 0, "and left no service behind");
 }
 
 void selector_rewrite_changes_only_the_selector() {
@@ -439,6 +476,7 @@ int main() {
         observing_with_nothing_loaded();
         store_names_never_collide();
         shared_state_files_are_refused();
+        a_waiting_request_can_be_cancelled();
         selector_rewrite_changes_only_the_selector();
         single_model_mode();
         catalog();

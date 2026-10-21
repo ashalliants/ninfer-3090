@@ -167,7 +167,13 @@ public:
     // leased, loading or waking it -- and making room -- when `autoload` allows. Throws
     // ModelUnknown for a name that matches nothing, ModelNotLoaded when it is not loaded and may
     // not be, and ModelLoadFailed when loading or waking fails.
-    Lease acquire(std::string_view model, std::optional<bool> autoload = std::nullopt);
+    //
+    // `cancelled`, when given, is polled while the request waits for the model or for room; a true
+    // answer abandons the wait with RequestCancelled. A load or wake already underway is not
+    // interrupted, so a cancelled request never leaves a half-built service behind.
+    using Cancelled = std::function<bool()>;
+    Lease acquire(std::string_view model, std::optional<bool> autoload = std::nullopt,
+                  const Cancelled& cancelled = {});
 
     // A loaded or sleeping model leased without waking it, to read its state (statistics, slots,
     // residency); nullopt when it is not loaded. Throws ModelUnknown for an unknown name.
@@ -231,10 +237,17 @@ private:
     [[nodiscard]] std::optional<std::size_t> find_locked(std::string_view model) const;
     [[nodiscard]] std::size_t require_locked(std::string_view model) const;
     // Brings `index` to Loaded, releasing the lock while the service loads or wakes.
-    void make_loaded_locked(std::unique_lock<std::mutex>& lock, std::size_t index, bool honor_hold);
+    void make_loaded_locked(std::unique_lock<std::mutex>& lock, std::size_t index, bool honor_hold,
+                            const Cancelled& cancelled = {});
+    // Waits on `changed_` until `deadline`, waking now and then to poll `cancelled`. Returns false
+    // at the deadline and throws RequestCancelled when `cancelled` answers true.
+    bool wait_unless_cancelled_locked(std::unique_lock<std::mutex>& lock,
+                                      std::chrono::steady_clock::time_point deadline,
+                                      const Cancelled& cancelled);
     // Frees one loaded slot other than `keep`, waiting for one to become idle; false on timeout.
     bool make_room_locked(std::unique_lock<std::mutex>& lock, std::size_t keep,
-                          std::chrono::steady_clock::time_point deadline);
+                          std::chrono::steady_clock::time_point deadline,
+                          const Cancelled& cancelled = {});
     void put_to_sleep_locked(std::unique_lock<std::mutex>& lock, std::size_t index);
     void unload_locked(std::unique_lock<std::mutex>& lock, std::size_t index);
     void publish_locked(std::size_t index);
@@ -267,6 +280,11 @@ struct ModelLoadFailed : std::runtime_error {
 };
 
 struct ModelBusy : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+// The request that was waiting for a model has gone away.
+struct RequestCancelled : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 

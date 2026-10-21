@@ -58,6 +58,17 @@ void check_model_state_paths(const std::vector<ModelDefinition>& models) {
                                    ? std::filesystem::path(artifact.string() + ".expert-state")
                                    : normal(next.expert_state_path)});
         }
+        if (model.options.context_cache.enabled && next.context_nvme_bytes != 0) {
+            // The runtime names the NVMe scratch file for the artifact's basename (and the
+            // process) inside --context-nvme-dir, so same-named artifacts in different folders
+            // would share one file there. This is the name's stem; the pid suffix is the same
+            // for every model of a router.
+            const std::filesystem::path dir =
+                next.context_nvme_dir.empty() ? artifact.parent_path()
+                                              : normal(next.context_nvme_dir);
+            entries.push_back({"its NVMe scratch file", model.id,
+                               dir / (artifact.filename().string() + ".context")});
+        }
     }
     for (const ModelDefinition& model : models) {
         if (!model.options.request_log_jsonl.empty()) {
@@ -217,8 +228,19 @@ void ModelRegistry::unload_locked(std::unique_lock<std::mutex>& lock, std::size_
     publish_locked(index);
 }
 
+bool ModelRegistry::wait_unless_cancelled_locked(std::unique_lock<std::mutex>& lock,
+                                                 Clock::time_point deadline,
+                                                 const Cancelled& cancelled) {
+    if (!cancelled) { return changed_.wait_until(lock, deadline) != std::cv_status::timeout; }
+    // Nothing signals a client that has gone, so wake now and then to ask.
+    const auto slice = std::min(deadline, Clock::now() + std::chrono::milliseconds(250));
+    const bool woken = changed_.wait_until(lock, slice) != std::cv_status::timeout;
+    if (cancelled()) { throw RequestCancelled("the request went away while waiting for a model"); }
+    return woken || Clock::now() < deadline;
+}
+
 bool ModelRegistry::make_room_locked(std::unique_lock<std::mutex>& lock, std::size_t keep,
-                                     Clock::time_point deadline) {
+                                     Clock::time_point deadline, const Cancelled& cancelled) {
     for (;;) {
         if (stopping_) { return false; }
         if (policy_.models_max == 0 || loaded_count_locked() < policy_.models_max) { return true; }
@@ -247,24 +269,24 @@ bool ModelRegistry::make_room_locked(std::unique_lock<std::mutex>& lock, std::si
             unload_locked(lock, *victim);
             continue;
         }
-        if (changed_.wait_until(lock, deadline) == std::cv_status::timeout) { return false; }
+        if (!wait_unless_cancelled_locked(lock, deadline, cancelled)) { return false; }
     }
 }
 
 void ModelRegistry::make_loaded_locked(std::unique_lock<std::mutex>& lock, std::size_t index,
-                                       bool honor_hold) {
+                                       bool honor_hold, const Cancelled& cancelled) {
     const Clock::time_point deadline = Clock::now() + policy_.room_timeout;
     for (;;) {
         Slot& slot = models_[index];
         if (stopping_) { throw ModelLoadFailed("the server is stopping"); }
         if (slot.state == ModelState::Loaded) { return; }
         if (slot.state == ModelState::Loading || slot.state == ModelState::Unloading) {
-            if (changed_.wait_until(lock, deadline) == std::cv_status::timeout) {
+            if (!wait_unless_cancelled_locked(lock, deadline, cancelled)) {
                 throw ModelLoadFailed("model '" + slot.definition.id + "' did not become ready");
             }
             continue;
         }
-        if (!make_room_locked(lock, index, deadline)) {
+        if (!make_room_locked(lock, index, deadline, cancelled)) {
             throw ModelLoadFailed("no room to load model '" + slot.definition.id +
                                   "': every loaded model is busy");
         }
@@ -314,7 +336,8 @@ void ModelRegistry::make_loaded_locked(std::unique_lock<std::mutex>& lock, std::
     }
 }
 
-ModelRegistry::Lease ModelRegistry::acquire(std::string_view model, std::optional<bool> autoload) {
+ModelRegistry::Lease ModelRegistry::acquire(std::string_view model, std::optional<bool> autoload,
+                                            const Cancelled& cancelled) {
     std::unique_lock lock(mutex_);
     const std::size_t index = require_locked(model);
     Slot& slot              = models_[index];
@@ -331,7 +354,7 @@ ModelRegistry::Lease ModelRegistry::acquire(std::string_view model, std::optiona
             unload_locked(lock, index);
             break;
         }
-        if (changed_.wait_until(lock, deadline) == std::cv_status::timeout) {
+        if (!wait_unless_cancelled_locked(lock, deadline, cancelled)) {
             throw ModelLoadFailed("model '" + slot.definition.id + "' is still failing");
         }
     }
@@ -340,7 +363,7 @@ ModelRegistry::Lease ModelRegistry::acquire(std::string_view model, std::optiona
             throw ModelNotLoaded("model '" + slot.definition.id + "' is " +
                                  model_state_name(slot.state) + " and autoload is off");
         }
-        make_loaded_locked(lock, index, /*honor_hold=*/true);
+        make_loaded_locked(lock, index, /*honor_hold=*/true, cancelled);
     }
     Slot& ready = models_[index];
     ++ready.leases;
