@@ -248,6 +248,9 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
 
+    if (options.prefill_schedule.stall_budget_ms > kMaximumPrefillStallBudgetMs) {
+        throw std::invalid_argument("prefill_schedule.stall_budget_ms must be at most 60000");
+    }
     ContextCacheOptions& cache      = options.context_cache;
     const std::uint32_t concurrency = options.max_concurrency;
     // Each direct graft is installed as a pinned context-cache checkpoint that holds one StateImage

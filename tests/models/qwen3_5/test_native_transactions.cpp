@@ -2103,6 +2103,85 @@ void progress_anchor_planning(DeviceContext& device, const qwen::execution::Para
     require(rejected, "progress anchors were accepted without the context cache");
 }
 
+// A cap on a prefill step shortens that step and nothing else: the prompt is still computed in
+// full, in order, whatever sizes the steps take.
+void capped_prefill_steps(DeviceContext& device, const qwen::execution::Parameters& parameters,
+                          qwen::Frontend& frontend, EngineOptions options) {
+    constexpr std::uint32_t kStepChunk = 2 * kChunk;
+    constexpr std::uint32_t kPrompt    = 3 * kChunk;
+    options.max_context                       = kCapacity;
+    options.kv_capacity                       = KvCapacityPolicy::explicit_capacity(2 * kCapacity);
+    options.prefill_chunk                     = kStepChunk;
+    options.max_concurrency                   = 1;
+    options.context_cache.enabled             = false;
+    options.context_cache.device_state_slots  = 0;
+    options.context_cache.host_capacity_bytes = 0;
+    auto planner = qwen::detail::make_sequence_planner_impl(parameters, device, options);
+    auto plan    = qwen::detail::finalize_sequence_plan_impl(std::move(planner), 2);
+    qwen::detail::ProgramImpl program(parameters, *plan, device, {});
+    const auto empty = program.physical_usage().occupied;
+
+    const auto settle = [&]() {
+        std::atomic<bool> flag{false};
+        for (unsigned step = 0; step < 8; ++step) {
+            device.synchronize();
+            CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+            auto progress = program.poll_context({&flag});
+            if (progress.complete) { return progress; }
+        }
+        throw std::runtime_error("capped prefill transaction did not settle");
+    };
+    const auto step = [&](qwen::SequenceHandle sequence, std::uint32_t max_tokens) {
+        const std::array<qwen::ExecutionUnit, 1> units{
+            {{sequence, qwen::ExecutionUnitKind::Prefill}}};
+        require(static_cast<bool>(program.reserve_units(units)),
+                "capped prefill could not reserve its unit");
+        return program.advance_prefill(sequence, nullptr, nullptr, max_tokens);
+    };
+
+    // Each schedule of steps must end at the prompt's end after the same total, however it is cut.
+    const std::vector<std::vector<std::uint32_t>> schedules{
+        {0, 0}, {kChunk, 0}, {kChunk, kChunk, kChunk}, {kChunk, kChunk, 0}, {4 * kChunk, 0}};
+    for (const auto& caps : schedules) {
+        runtime::ResolvedExecutionOptions request;
+        request.requested_output_tokens = 8;
+        auto base = program.plan_request(
+            qwen::PreparedPromptAccess::take(
+                frontend.prepare_tokens(std::vector<TokenId>(kPrompt, 198))),
+            request);
+        const auto root = program.inspect_source(base, std::nullopt);
+        require(root.has_value(), "capped prefill request has no root source");
+        require(static_cast<bool>(program.start_binding(
+                    base, {0}, *root, nullptr, qwen::ExecutionUnitKind::Prefill, 0)),
+                "capped prefill could not bind its request");
+        const auto bound = settle();
+        require(bound.sequence.has_value(), "capped prefill binding did not publish");
+        const auto sequence = *bound.sequence;
+
+        std::uint32_t done = 0;
+        for (std::size_t index = 0; index < caps.size(); ++index) {
+            const std::uint32_t cap  = caps[index];
+            const std::uint32_t left = kPrompt - done;
+            const std::uint32_t want = std::min({left, kStepChunk, cap == 0 ? kStepChunk : cap});
+            auto result              = step(sequence, cap);
+            require(result.processed_prompt_tokens == want,
+                    "a prefill step ignored its cap or ran past its chunk");
+            done += result.processed_prompt_tokens;
+            require(result.complete == (done == kPrompt),
+                    "a capped prefill reported completion before the prompt's end");
+            if (result.pending) {
+                const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
+                (void)program.commit(std::move(*result.pending), accepted, {}, nullptr);
+            }
+        }
+        require(done == kPrompt, "a schedule of capped steps did not cover the prompt");
+        require(program.abort(sequence).status == runtime::ConsumeStatus::Consumed,
+                "capped prefill retained its execution resources");
+        require(program.physical_usage().occupied == empty,
+                "capped prefill leaked physical resources");
+    }
+}
+
 void replay_sampling_counts(DeviceContext& device, const qwen::execution::Parameters& parameters,
                             qwen::Frontend& frontend, EngineOptions options) {
     options.max_context                       = 128;
@@ -2340,6 +2419,7 @@ int main(int argc, char** argv) {
         capture_retry.reset();
         shared_capture_alignment(device, parameters, frontend, options);
         progress_anchor_planning(device, parameters, frontend, options);
+        capped_prefill_steps(device, parameters, frontend, options);
         replay_sampling_counts(device, parameters, frontend, options);
         std::cout << "OK native transaction cancellation, paused ownership and replay recovery\n";
         return 0;

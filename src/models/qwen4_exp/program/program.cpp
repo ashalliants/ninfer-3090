@@ -4812,7 +4812,7 @@ ContextProgress Program::poll_context(runtime::CancellationFlagView cancellation
 bool Program::has_context_transaction() const noexcept { return impl_->has_context_transaction(); }
 
 PrefillProgress Program::advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming* failed_timing,
-                                         runtime::TokenMaskProvider* masks) {
+                                         runtime::TokenMaskProvider* masks, std::uint32_t) {
     return impl_->advance_prefill(sequence, failed_timing, masks);
 }
 

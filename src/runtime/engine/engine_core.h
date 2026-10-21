@@ -8,6 +8,7 @@
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
+#include "runtime/engine/prefill_pacing.h"
 #include "runtime/engine/request_record.h"
 #include "runtime/engine/context_cache/resource_manager.h"
 #include "runtime/engine/context_store/context_store.h"
@@ -96,6 +97,8 @@ public:
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
+          prefill_chunk_(std::min(options.prefill_chunk, options.max_context)),
+          pacing_(PrefillPacingOptions{.stall_budget_ms = options.prefill_schedule.stall_budget_ms}),
           fault_listener_(options.fault_listener),
           resources_(options.context_cache.enabled, std::move(context_cost)) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
@@ -1688,10 +1691,36 @@ private:
         RoundMasks masks;
         masks.outputs[0] = &request->output;
         auto* provider   = request->output.constrained() ? &masks : nullptr;
+        // While another lane decodes, a step that would run for longer than the stall budget is
+        // cut down to what the cost model predicts fits it (PrefillScheduleOptions).
+        const bool streaming_neighbour = pacing_.options().stall_budget_ms != 0 &&
+                                         other_lane_streaming(lane);
+        std::uint32_t planned_tokens = 0;
+        std::uint32_t step_cap       = 0;
+        std::uint32_t step_prefix    = 0;
+        if (streaming_neighbour) {
+            if (const auto position = sibling_cursor(*request)) {
+                const std::uint32_t prompt_tokens = request->base_plan->summary().prompt_tokens;
+                step_prefix    = *position;
+                planned_tokens = std::min(prefill_chunk_, prompt_tokens - std::min(prompt_tokens, *position));
+                step_cap = pacing_.step_cap(resources_.costs(), step_prefix, planned_tokens, true);
+            }
+        }
         ProgramCallScope program_call(*this);
-        auto progress = instance_.program->advance_prefill(*request->sequence,
-                                                           &program_call.failed_timing(), provider);
+        auto progress = instance_.program->advance_prefill(
+            *request->sequence, &program_call.failed_timing(), provider, step_cap);
         program_call.finish(progress.timing);
+        if (streaming_neighbour && progress.processed_prompt_tokens != 0) {
+            pacing_.prefill_step_done(
+                predicted_prefill_step_ns(resources_.costs(), step_prefix,
+                                          progress.processed_prompt_tokens),
+                progress.timing.elapsed_ns());
+            if (step_cap != 0 && progress.processed_prompt_tokens < planned_tokens) {
+                ++cumulative_stats_.paced_prefill_steps;
+                cumulative_stats_.paced_prefill_deferred_tokens +=
+                    planned_tokens - progress.processed_prompt_tokens;
+            }
+        }
         if (!progress.landed_transfers.empty()) {
             typename ModelContract::ContextProgress landed;
             landed.transfers = std::move(progress.landed_transfers);
@@ -2008,6 +2037,19 @@ private:
 
     // A wait must save at least this much prefill over the best source available now.
     static constexpr std::uint32_t kSiblingWaitMinimumTokens = 1024;
+
+    // Whether a lane other than `lane` is generating: its next token waits behind this lane's
+    // prefill step.
+    [[nodiscard]] bool other_lane_streaming(std::uint32_t lane) const noexcept {
+        for (std::uint32_t other = 0; other < max_concurrency_; ++other) {
+            const auto& request = slots_[other];
+            if (other != lane && request && !request->cancelled.load(std::memory_order_acquire) &&
+                (request->is_decode_ready() || request->is_control_ready())) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     // Prompt position the resident sibling has committed, or nullopt when it is not prefilling.
     [[nodiscard]] std::optional<std::uint32_t> sibling_cursor(const Request& sibling) const {
@@ -3888,6 +3930,8 @@ private:
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
+    const std::uint32_t prefill_chunk_;
+    PrefillPacing pacing_;
     const std::function<void(const EngineFaultEvent&)> fault_listener_;
     ResourceManagement resources_;
 

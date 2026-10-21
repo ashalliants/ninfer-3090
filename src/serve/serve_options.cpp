@@ -144,7 +144,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--fit-context MIN] "
            "[--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
+           "[--prefill-chunk N] [--prefill-stall-budget-ms N] [--log-stats-interval-ms N] "
+           "[--device N] "
            "[--context-cost-presets FILE] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
@@ -209,6 +210,11 @@ std::string serve_usage_text(const char* argv0) {
            std::to_string(kFitContextStepTokens) +
            " tokens that does (the KV pool follows) and logs the reduction; below MIN it refuses "
            "to start\n"
+           "       --prefill-stall-budget-ms N cuts a prefill step so the cost model predicts it to take "
+           "at most N ms whenever another lane is decoding (steps are multiples of 128 tokens, never "
+           "below 512). A step normally runs the whole --prefill-chunk, which pauses every other "
+           "stream for its duration. Smaller steps make the prompt itself slower; 0 (the default) "
+           "keeps the planned chunk\n"
            "       --prefill-cublas hands wide prefill GEMMs to cuBLAS: a large prefill speedup for a "
            "small perplexity cost (docs/performance.md), off by default, and it wants a larger "
            "--prefill-chunk to pay; --no-prefill-cublas-projections keeps the attention and GDN "
@@ -419,6 +425,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--progress-anchor-tokens") {
             options.progress_anchor_tokens = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--progress-anchor-tokens"), "progress-anchor-tokens"));
+        } else if (arg == "--prefill-stall-budget-ms") {
+            options.prefill_schedule.stall_budget_ms = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--prefill-stall-budget-ms"),
+                                      "prefill-stall-budget-ms"));
         } else if (arg == "--context-cost-presets") {
             options.context_cost_presets = require_value("--context-cost-presets");
             if (options.context_cost_presets.empty()) {
@@ -854,6 +864,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.progress_anchor_tokens != 0 && !options.allow_prefix_reuse) {
         throw std::invalid_argument("--progress-anchor-tokens cannot be combined with --no-prefix-reuse");
+    }
+    if (options.prefill_schedule.stall_budget_ms > kMaximumPrefillStallBudgetMs) {
+        throw std::invalid_argument("--prefill-stall-budget-ms must be at most 60000");
     }
     product::apply_speculative_defaults(options.speculative);
     product::validate_speculative_cli_options(options.speculative);
