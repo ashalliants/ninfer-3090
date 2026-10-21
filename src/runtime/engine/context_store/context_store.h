@@ -73,8 +73,10 @@ public:
         // Directories of other engines' stores on the same volume, read but never written. Every
         // `peer_poll` the manifests there that this store does not hold are imported by hard-linking
         // their chunks (no bytes are copied), so an image another engine finished is usable here
-        // within one poll. A peer deleting or evicting an image afterwards does not affect the
-        // imported copy; an image deleted while it is imported is skipped. Failures are misses.
+        // within one poll. An image the remote listing registered but whose chunks are not fetched
+        // yet takes the peer's chunks the same way, instead of downloading them. A peer deleting or
+        // evicting an image afterwards does not affect the imported copy; an image deleted while
+        // it is imported is skipped. Failures are misses.
         std::vector<std::filesystem::path> peers;
         std::chrono::milliseconds peer_poll{250};
     };

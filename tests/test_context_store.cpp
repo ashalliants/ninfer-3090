@@ -371,6 +371,7 @@ public:
         gate();
         std::scoped_lock lock(mutex);
         if (down) { throw std::runtime_error("the bucket is unreachable"); }
+        if (key.find("chunks/") != std::string::npos) { ++chunk_gets; }
         const auto found = objects.find(key);
         if (found == objects.end()) { return std::nullopt; }
         return found->second.first;
@@ -431,6 +432,7 @@ public:
     bool down          = false;
     int puts           = 0;
     int touches        = 0;
+    int chunk_gets     = 0;
 
 private:
     void gate() {
@@ -1565,6 +1567,106 @@ void test_damaged_imported_image_is_not_imported_again() {
     check(b.sync_peers() == 0 && b.list().empty(), "a damaged image was imported again");
 }
 
+// An engine with both a bucket and a peer: the bucket listing registers the image first, by name
+// only. The peer's copy must still be linked, so the load reads the disk instead of the network.
+struct PeerAndRemote {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    std::shared_ptr<MemoryObjectStore> remote = std::make_shared<MemoryObjectStore>();
+    std::vector<std::uint8_t> image           = peer_image(12);
+    std::unique_ptr<ContextStore> a;
+
+    PeerAndRemote() {
+        a = std::make_unique<ContextStore>(remote_options(a_directory.path(), remote));
+        (void)a->put(describe("0a"), image, std::array{ContextStore::Region{30, 5000}});
+        check(drained(*a), "the peer's upload did not drain");
+    }
+    [[nodiscard]] std::unique_ptr<ContextStore> importer() const {
+        ContextStore::Options options = remote_options(b_directory.path(), remote);
+        options.peers                 = {a_directory.path()};
+        options.peer_poll             = std::chrono::hours(1);
+        auto b = std::make_unique<ContextStore>(options);
+        (void)b->refresh_remote(); // the start-up refresh runs in the background
+        check(b->list().size() == 1 && !b->list()[0].local,
+              "the bucket listing did not register the image by name only");
+        return b;
+    }
+};
+
+void test_peer_fills_an_image_the_remote_registered() {
+    PeerAndRemote setup;
+    const auto b = setup.importer();
+    check(b->sync_peers() == 1, "the peer's copy of a bucket-registered image was not linked");
+    check(b->list().size() == 1 && b->list()[0].local, "the linked image does not report itself local");
+    check(b->stats().peer_images == 1 && b->stats().peer_bytes_linked == 5000,
+          "the fill was not counted as a peer import");
+    check(b->stats().used_bytes == setup.a->stats().used_bytes,
+          "the filled image is counted by other sizes than the peer's");
+    setup.remote->chunk_gets = 0;
+    check(b->load("0a").value_or(std::vector<std::uint8_t>{}) == setup.image,
+          "the filled image differs from what the peer stored");
+    check(setup.remote->chunk_gets == 0 && b->stats().remote_downloads == 0,
+          "the load downloaded chunks the peer had already supplied");
+    for (const fs::path& file : chunk_files(setup.b_directory.path())) {
+        check(fs::hard_link_count(file) == 2, "a filled chunk is not a link to the peer's file");
+    }
+    check(b->sync_peers() == 0 && b->stats().peer_images == 1, "a filled image was linked again");
+}
+
+// An image already complete here (fetched from the bucket) is not linked from the peer.
+void test_peer_skips_an_image_already_fetched_from_the_remote() {
+    PeerAndRemote setup;
+    const auto b = setup.importer();
+    check(b->load("0a").value_or(std::vector<std::uint8_t>{}) == setup.image,
+          "the image did not load from the bucket");
+    check(b->stats().remote_downloads > 0, "the load did not download");
+    check(b->sync_peers() == 0 && b->stats().peer_images == 0 && b->stats().peer_skipped == 0,
+          "an image already held whole was imported from the peer");
+    for (const fs::path& file : chunk_files(setup.b_directory.path())) {
+        check(fs::hard_link_count(file) == 1, "a fetched chunk was replaced by a peer link");
+    }
+}
+
+// A peer chunk of the wrong size is skipped once (the bucket supplies the image), and a same-size
+// bit flip is repaired from the bucket by the load; neither is linked again at the next poll.
+void test_damaged_peer_chunk_falls_back_to_the_remote_once() {
+    {
+        PeerAndRemote setup;
+        const auto victim = chunk_files(setup.a_directory.path()).front();
+        fs::resize_file(victim, fs::file_size(victim) / 2);
+        const auto b = setup.importer();
+        check(b->sync_peers() == 0 && b->stats().peer_link_failures == 1 &&
+                  b->stats().peer_skipped == 1,
+              "a peer chunk of the wrong size was linked or not counted");
+        check(b->sync_peers() == 0 && b->stats().peer_link_failures == 1,
+              "the damaged peer image was looked at again");
+        check(b->load("0a").value_or(std::vector<std::uint8_t>{}) == setup.image &&
+                  b->stats().remote_downloads > 0,
+              "the image did not load from the bucket after the peer copy was skipped");
+    }
+    {
+        PeerAndRemote setup;
+        const auto b = setup.importer();
+        const auto victim = chunk_files(setup.a_directory.path()).front();
+        {
+            std::fstream file(victim, std::ios::in | std::ios::out | std::ios::binary);
+            char byte = 0;
+            file.read(&byte, 1);
+            byte ^= 0x5a;
+            file.seekp(0);
+            file.write(&byte, 1);
+        }
+        check(b->sync_peers() == 1, "an intact-size peer chunk was not linked");
+        check(b->load("0a").value_or(std::vector<std::uint8_t>{}) == setup.image,
+              "a damaged peer chunk was served or not repaired from the bucket");
+        check(b->stats().remote_downloads == 1, "the repair did not download only the damaged chunk");
+        check(b->sync_peers() == 0 && b->stats().peer_images == 1,
+              "the damaged peer image was linked again");
+        check(b->load("0a").value_or(std::vector<std::uint8_t>{}) == setup.image,
+              "the repaired image did not load again");
+    }
+}
+
 void test_non_positive_peer_poll_is_refused() {
     TempDirectory a_directory;
     TempDirectory b_directory;
@@ -1594,6 +1696,9 @@ int main() {
     test_peer_import_budget_counts_compressed_sizes();
     test_damaged_imported_image_is_not_imported_again();
     test_non_positive_peer_poll_is_refused();
+    test_peer_fills_an_image_the_remote_registered();
+    test_peer_skips_an_image_already_fetched_from_the_remote();
+    test_damaged_peer_chunk_falls_back_to_the_remote_once();
     test_compressed_chunks_round_trip_and_account_for_disk_use();
     test_compressed_chunks_survive_restart_and_either_setting();
     test_compressed_chunk_damage_is_a_miss();

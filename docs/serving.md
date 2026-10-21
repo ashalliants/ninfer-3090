@@ -565,6 +565,8 @@ ninfer-serve model.ninfer --port 8001 --devices 1 --context-store /data/store1 -
   verifies every chunk, and prices the read with the measured read rate. A peer that has not started
   yet is polled until it appears. Both directories must be on one volume: a link that fails (another
   volume, or a chunk the peer evicted in the meantime) skips that session, which is only a miss.
+  With a bucket as well, a session the bucket listing registered before its chunks were downloaded
+  takes the peer's chunks the same way, so loading it reads the disk instead of the bucket.
 - An imported session is the importer's own from then on: the peer deleting, evicting or replacing
   its copy does not affect it, and removing it here does not affect the peer. It is not uploaded to
   the bucket by the importer (the engine that wrote it uploads it). Sessions older than
