@@ -271,9 +271,10 @@ RouterServer::RouterServer(ServeOptions options, ModelRegistry& registry,
         return new httplib::ThreadPool(kBaseWorkers, kMaxWorkers, kMaxWorkers);
     };
     server_.set_socket_options(configure_http_server_socket);
-    // A model's preset section may raise its own --max-request-mib; the router takes the largest, and
-    // the model's own server then enforces its limit with its own error.
-    options_.max_request_bytes = std::max(options_.max_request_bytes, registry_.max_request_bytes());
+    // A model's preset section may raise or lower its own --max-request-mib; the router takes the
+    // largest of the models' limits (not the top-level default, which could be larger than every
+    // model's), and the model's own server then enforces its limit with its own error.
+    options_.max_request_bytes = registry_.max_request_bytes();
     server_.set_payload_max_length(options_.max_request_bytes);
     // An oversized body is refused before any route runs; give it the JSON error the models give.
     server_.set_error_handler([this](const httplib::Request& request, httplib::Response& response) {

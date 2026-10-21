@@ -92,7 +92,10 @@ void check_model_state_paths(const std::vector<ModelDefinition>& models) {
         for (std::size_t second = first + 1; second < entries.size(); ++second) {
             const Entry& a = entries[first];
             const Entry& b = entries[second];
-            if (a.owner == b.owner || key(a.path) != key(b.path)) { continue; }
+            // Only the shared request log may repeat (owner ""): every other file, the artifact
+            // included, is one model's own, and a model's state path may not alias its artifact
+            // or another of its own state files either.
+            if ((a.owner.empty() && b.owner.empty()) || key(a.path) != key(b.path)) { continue; }
             const auto who = [](const Entry& e) {
                 return e.what + (e.owner.empty() ? std::string() : " (model '" + e.owner + "')");
             };
@@ -142,24 +145,14 @@ void ModelRegistry::stop() noexcept {
 std::optional<std::size_t> ModelRegistry::find_locked(std::string_view model) const {
     if (model.empty()) {
         if (models_.size() == 1) { return 0; }
-        // The model that last served a request answers one that names none; `last_used` also moves
-        // on administrative loads and request completions, so it cannot say who served last.
-        const auto resident = [&](std::size_t index) {
-            return models_[index].state == ModelState::Loaded ||
-                   models_[index].state == ModelState::Sleeping;
-        };
-        if (last_served_ && resident(*last_served_)) { return last_served_; }
+        // The model that last served a request answers one that names none, whether or not it is
+        // resident now (a request for it loads it again); `last_used` also moves on administrative
+        // loads and request completions, so it cannot say who served last.
+        if (last_served_) { return last_served_; }
         std::optional<std::size_t> best;
         for (std::size_t index = 0; index < models_.size(); ++index) {
-            if (!resident(index)) { continue; }
-            if (!best || models_[index].last_used > models_[*best].last_used) { best = index; }
-        }
-        if (best) { return best; }
-        // Everything has been unloaded: the model that last served is still the default, and a
-        // request for it loads it again.
-        if (last_served_) { return last_served_; }
-        for (std::size_t index = 0; index < models_.size(); ++index) {
-            if (models_[index].last_used == Clock::time_point{}) { continue; }
+            const ModelState state = models_[index].state;
+            if (state != ModelState::Loaded && state != ModelState::Sleeping) { continue; }
             if (!best || models_[index].last_used > models_[*best].last_used) { best = index; }
         }
         return best;

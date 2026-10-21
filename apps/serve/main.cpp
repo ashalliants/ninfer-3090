@@ -33,12 +33,14 @@ namespace {
 
 std::atomic<ninfer::serve::HttpServer*> g_server{nullptr};
 std::atomic<ninfer::serve::RouterServer*> g_router{nullptr};
+std::atomic<bool> g_router_stop_requested{false};
 
+// RouterServer::stop() takes the registry's mutex, which a signal handler must not do (the signal
+// can land on a thread that holds it). The handler only sets a flag; a watcher thread stops it.
 void handle_signal(int) {
     ninfer::serve::HttpServer* server = g_server.load();
     if (server != nullptr) { server->stop(); }
-    ninfer::serve::RouterServer* router = g_router.load();
-    if (router != nullptr) { router->stop(); }
+    g_router_stop_requested.store(true);
 }
 
 // Time for in-flight error responses to flush once the Engine has latched, before the exit.
@@ -206,18 +208,31 @@ int run_router(const char* argv0, const ninfer::serve::ServeOptions& options,
         // The router answers from here on; a request for a model that is still loading waits for it.
         bool listened = true;
         std::thread listener([&] { listened = router.listen(); });
+        std::atomic<bool> router_done{false};
+        std::thread signal_watcher([&] {
+            while (!router_done.load() && !g_router_stop_requested.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            if (g_router_stop_requested.load()) { router.stop(); }
+        });
+        const auto join_watcher = [&] {
+            router_done.store(true);
+            signal_watcher.join();
+        };
         try {
             registry.load_startup_models();
         } catch (const std::exception& exception) {
             operational_log.server_failure(false, exception.what());
             router.stop();
             listener.join();
+            join_watcher();
             g_router.store(nullptr);
             return 1;
         }
         operational_log.server_ready(options.host, options.port, "router",
                                      !options.api_key.empty());
         listener.join();
+        join_watcher();
         g_router.store(nullptr);
         if (!listened) {
             operational_log.listen_failure(options.host, options.port);

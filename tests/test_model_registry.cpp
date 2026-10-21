@@ -318,6 +318,15 @@ void shared_state_files_are_refused() {
     expect(refused({a, b}), "one explicit n-gram volume for two models is refused");
     a.options.flash_next.ngram_volume_path.clear();
     b.options.flash_next.ngram_volume_path.clear();
+    a.options.flash_next.save_expert_state = true;
+    a.options.flash_next.expert_state_path = "/m/a.ninfer";
+    expect(refused({a, b}), "a model's expert state may not land on its own artifact");
+    a.options.flash_next.expert_state_path = "/m/x";
+    a.options.flash_next.ngram_volume_path = "/m/x";
+    expect(refused({a, b}), "a model's n-gram volume and expert state may not share a file");
+    a.options.flash_next.save_expert_state = false;
+    a.options.flash_next.expert_state_path.clear();
+    a.options.flash_next.ngram_volume_path.clear();
     a.options.request_log_jsonl = "/m/b.ninfer";
     expect(refused({a, b}), "the request log may not land on a model's artifact");
     a.options.request_log_jsonl = "/m/requests.jsonl";
@@ -364,6 +373,16 @@ void empty_selector_follows_requests_not_loads() {
     registry.load("b"); // an administrative load is not a request
     auto lease = registry.acquire("");
     expect(lease.model() == "a", "an empty selector goes to the model that last served a request");
+}
+
+void empty_selector_prefers_last_served_over_other_residents() {
+    Journal journal;
+    ModelRegistry registry({model("a"), model("b")}, RegistryPolicy{}, factory(journal), true);
+    { auto lease = registry.acquire("a"); }
+    registry.unload("a");
+    registry.load("b");
+    auto lease = registry.acquire("");
+    expect(lease.model() == "a", "an empty selector keeps the last-served model though another is resident");
 }
 
 void a_resumed_failed_service_is_rebuilt() {
@@ -525,6 +544,7 @@ int main() {
         a_waiting_request_can_be_cancelled();
         empty_selector_survives_unloading();
         empty_selector_follows_requests_not_loads();
+        empty_selector_prefers_last_served_over_other_residents();
         a_resumed_failed_service_is_rebuilt();
         selector_rewrite_changes_only_the_selector();
         single_model_mode();
