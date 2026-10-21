@@ -34,6 +34,10 @@ Each is a flag, off by default, with its own counters:
 - **`--prefill-decode-share P`**: after a prefill step, decode rounds run until they have used P percent
   of the GPU time of that step before the next one starts. This does not shorten the longest gap. It
   turns one round per step into a burst of rounds per step.
+- **`--prefill-layer-slices N`**: while another lane decodes, a text prefill chunk runs as N slices of
+  consecutive layers and the neighbour's decode round runs between slices, so its gap is a slice
+  (about a step / N) while the chunk keeps its size. The option the next sections argue for. **New GPU
+  code that has not run on a GPU**; see "Decode rounds between the layers of a prefill step" below.
 - **`--yield-long-prefill-ms N`**: with every lane busy, a short request waiting at the head of the
   queue pauses a long prefill (at least N ms left) at a step boundary instead of waiting out its
   minute. The paused prefill keeps its progress as a snapshot and resumes after.
@@ -83,28 +87,29 @@ card (not kept in the repo) in which overlapping one prefill with one decode "ga
 
 ### Decode rounds between the layers of a prefill step
 
-This is the option that would give streams short gaps while keeping a large step (so the dequantise
-pass stays amortised): make a prefill step resumable at layer boundaries and run a decode round every few
-layers. The gap becomes the step time divided by the number of slices, at the cost of the decode round
-repeated each slice.
+This is the option that shortens gaps while keeping a large step (so the dequantise pass stays
+amortised), and it **is built** as `--prefill-layer-slices`, as best-guess code written without a GPU.
+How it works and what it rests on:
 
-It needs more than it looks:
+- A chunk runs as N Program calls. Between slices the residual stream (`T x hidden`, 40 MB at 4096 on
+  the 27B) is parked in `prefill_hidden`, a persistent buffer only the chunk's tail writes, so no
+  second arena is needed (a second arena was what I expected this to cost). A later slice rebuilds
+  the workspace-resident inputs of the layers (positions, rope positions, the scoped control tensors)
+  because a decode round reuses the workspace, and copies the residual back.
+- The invariants it needs, each checked by reading and some by the fake-model Engine tests: only
+  one lane mid-chunk (one parking buffer), so it goes first for prefill; no pause of a lane that is
+  mid-chunk (its in-place GDN state is half advanced); replays and forced-token control batches, the
+  other writers of `prefill_hidden`, wait for it; a refused yield is retried when the chunk ends.
+- Limits: text-only chunks, no DFlash tap (its per-chunk state would have to cross the boundary), no
+  pipeline split, so the default one-lane DFlash2 profile never slices and the two-lane MTP profile is the
+  one it is for.
+- **Unverified:** the GPU path. The assumption everything rests on is that nothing but the residual and
+  the roots is live in the arena across layers; I found nothing else reading `prefill_impl` and
+  `run_stage_layers`, and the tests that would show it wrong (`sliced_prefill_matches_whole`, which
+  requires the identical first token across 2, 3 and 5 slices) have not run.
 
-- The step's residual stream (`T x hidden`, 40 MB at 4096 on the 27B) and every per-step tensor in
-  `work_` must survive the decode rounds in between, so decode needs its own workspace arena. The size
-  is the decode phase's peak (`ordinary_round`/`mtp_round`/`dflash_round`, which `WorkspacePlan` already
-  sizes), and it has to be found in device memory that the KV pool and context length currently use.
-- `TextContext` holds step state in members that RAII scopes set and restore (`active_cache_positions_`,
-  `active_rope_positions_`, `active_causal_attention_envelope_`) and that a decode round on the same
-  object would overwrite. They would have to be saved per slice.
-- The step's tail (final norm, head, sampling, capture splits, the MTP and DFlash feature taps that
-  read layer outputs) runs after the layer loop and must see the same state it does now.
-- GDN's state fork (`state_source`/`state_destination`) is settled after a step; a decode round between
-  slices must not touch a lane that is mid-step, which the lane model already guarantees only because the
-  two never interleave.
-
-I would not start this without the measurements below, because stall budget plus decode share may already
-be enough.
+Its cost is the decode round it adds at each boundary (tens of ms, while the neighbour lasts) and the
+two residual copies per boundary (under a millisecond), against a prompt that runs at full chunk speed.
 
 ## What would decide it
 
@@ -114,6 +119,8 @@ All on the 3090, with a long prompt and streams that are decoding, using the two
 live server (its README section gives the commands) and reports the stream's gaps in three windows, the
 long prompt's time and rate, the short request's first-event time and the retry's time.
 
+0. **First, correctness of the sliced path:** `pwsh tools/run-tests.ps1 -GpuOnly -Regex native_transactions`.
+   It must pass before any number from `--prefill-layer-slices` means anything.
 1. **Baseline.** A 100,000-token uncached prompt submitted while one stream decodes. Record the stream's
    inter-token latency (p50, p99, max) and tokens per second during the prompt, and the prompt's total
    prefill time. Take it at `--prefill-chunk` 1024, 2048 and 4096.
@@ -127,6 +134,7 @@ long prompt's time and rate, the short request's first-event time and the retry'
 
 The acceptance questions are: does a stream reach an acceptable inter-token latency while a 100,000-token
 prompt prefills (the assessment's symptom was 4-6 tok/s against ~55 uncontended), and what did the
-prompt's own speed cost? If a budget around 500 ms with a decode share reaches it, layer slicing is not
-needed. If the only settings that reach it make the prompt 3x slower, layer slicing is the next option
-and this note is its starting point.
+prompt's own speed cost? Compare them with `--prefill-layer-slices` (2, 4 and 8, chunk 4096): the claim is a gap of about a step
+divided by N at full prompt speed. If a budget around 500 ms with a decode share already reaches the gap
+you need, slicing is not needed; if the only settings that reach it make the prompt 3x slower, slicing
+is the option that should, once its GPU path has been shown correct.
