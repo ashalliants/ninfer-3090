@@ -9,6 +9,7 @@
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
 #include "runtime/engine/prefill_pacing.h"
+#include "runtime/engine/prefill_yield.h"
 #include "runtime/engine/request_record.h"
 #include "runtime/engine/context_cache/resource_manager.h"
 #include "runtime/engine/context_store/context_store.h"
@@ -99,6 +100,8 @@ public:
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
           prefill_chunk_(std::min(options.prefill_chunk, options.max_context)),
           pacing_(PrefillPacingOptions{.stall_budget_ms = options.prefill_schedule.stall_budget_ms}),
+          yield_min_remaining_ns_(
+              static_cast<std::uint64_t>(options.prefill_schedule.yield_remaining_ms) * 1'000'000ULL),
           fault_listener_(options.fault_listener),
           resources_(options.context_cache.enabled, std::move(context_cost)) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
@@ -1950,7 +1953,10 @@ private:
         return pause_resident(*victim);
     }
 
-    bool pause_resident(std::uint32_t lane) {
+    // `require_snapshot` refuses the pause unless the request's progress can be saved. A pause that
+    // cannot save it makes the request recompute everything it had done, which is acceptable under
+    // resource pressure and not for a pause that only serves the queue.
+    bool pause_resident(std::uint32_t lane, bool require_snapshot = false) {
         if (instance_.program->has_context_transaction()) { return false; }
         // An admission that pauses a resident has touched another request: a failure from here
         // on is no longer confined to the request being admitted.
@@ -2007,6 +2013,7 @@ private:
                 target = *next;
             }
         }
+        if (require_snapshot && !save_snapshot) { return false; }
         ProgramCallScope call(*this);
         const auto pause_started = Clock::now();
         if (!instance_.program->start_pause(*request->sequence, save_snapshot,
@@ -2182,9 +2189,87 @@ private:
         }
     }
 
+    // How long a paused prefill waits for the request it yielded to before it may be restored
+    // anyway, in case that request cannot be admitted.
+    static constexpr std::chrono::seconds kYieldHold{10};
+
+    // With every lane busy, a request at the head of the queue that costs far less than what a
+    // resident prefill still has to do pauses that prefill (prefill_yield.h). Returns whether a
+    // pause started.
+    bool yield_long_prefill_for_head() {
+        std::shared_ptr<Request> head;
+        {
+            std::lock_guard lock(queue_mutex_);
+            if (pending_.empty()) { return false; }
+            head = pending_.front();
+        }
+        if (head->id == yield_beneficiary_ || head->hydrating || head->awaiting_sibling ||
+            head->cancelled.load(std::memory_order_acquire)) {
+            return false;
+        }
+        std::array<YieldCandidate, kMaximumConcurrency> field{};
+        std::size_t count = 0;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            const auto& resident = slots_[lane];
+            if (!resident || !resident->is_prefilling() || resident->capture_pending ||
+                resident->prompt_summary.has_media || !resident->base_plan) {
+                continue;
+            }
+            if (const auto cursor = sibling_cursor(*resident)) {
+                field[count++] = {lane, prefill_remaining_ns(*resident, *cursor),
+                                  resident->preemption_count};
+            }
+        }
+        if (count == 0) { return false; }
+        // Planning the head is what admission does next; a failure here belongs to it alone.
+        admission_subject_ = head;
+        ensure_base_plan(head);
+        const std::uint32_t prompt = head->base_plan->summary().prompt_tokens;
+        const std::uint64_t waiting_ns =
+            resources_.prefill_ns(instance_.program->prefill_work(*head->base_plan, 0, prompt));
+        const auto victim = choose_yield_victim(yield_min_remaining_ns_, waiting_ns,
+                                                std::span<const YieldCandidate>(field.data(), count));
+        if (!victim || !pause_resident(*victim, true)) { return false; }
+        ++cumulative_stats_.prefill_yields;
+        yield_beneficiary_ = head->id;
+        yield_hold_        = true;
+        yield_hold_until_  = Clock::now() + kYieldHold;
+        return true;
+    }
+
+    [[nodiscard]] std::uint64_t prefill_remaining_ns(const Request& request,
+                                                     std::uint32_t cursor) const {
+        const std::uint32_t prompt = request.base_plan->summary().prompt_tokens;
+        if (cursor >= prompt) { return 0; }
+        return resources_.prefill_ns(instance_.program->prefill_work(*request.base_plan, cursor, prompt));
+    }
+
+    // A prefill paused for a newcomer is restored behind it, not into the lane it just freed:
+    // restoring is otherwise the first thing an empty set of lanes does. The hold ends when the
+    // newcomer leaves the queue, or after kYieldHold if it never gets in.
+    [[nodiscard]] bool restore_held_for_yield() {
+        if (!yield_hold_) { return false; }
+        bool waiting = false;
+        {
+            std::lock_guard lock(queue_mutex_);
+            waiting = std::any_of(pending_.begin(), pending_.end(), [&](const auto& request) {
+                return request->id == yield_beneficiary_ &&
+                       !request->cancelled.load(std::memory_order_acquire);
+            });
+        }
+        if (!waiting || Clock::now() >= yield_hold_until_) {
+            yield_hold_ = false;
+            return false;
+        }
+        return true;
+    }
+
     bool try_admit_one(bool restoring) {
         if (instance_.program->has_context_transaction()) { return false; }
         const auto lane = free_lane();
+        if (!lane && !restoring && yield_min_remaining_ns_ != 0 && yield_long_prefill_for_head()) {
+            return true;
+        }
         if (!lane && restoring) {
             if (!paused_.empty() && !has_older_resident(paused_.front()->id)) {
                 if (const auto victim =
@@ -3748,7 +3833,8 @@ private:
                 }
                 if (!recovering &&
                     ((admission_decision_ && admission_decision_->restoring) ||
-                     scheduler_.should_restore(!paused_.empty(), resident_empty()))) {
+                     scheduler_.should_restore(!paused_.empty() && !restore_held_for_yield(),
+                                               resident_empty()))) {
                     unit = "admission";
                     admit_or_contain(true, device_fault);
                     unit = "boundary";
@@ -3932,6 +4018,13 @@ private:
     const std::chrono::milliseconds pending_timeout_;
     const std::uint32_t prefill_chunk_;
     PrefillPacing pacing_;
+    // Zero: a long prefill is never paused for a waiting request.
+    const std::uint64_t yield_min_remaining_ns_;
+    // The request a prefill was last paused for, so it cannot pause a second one for the same
+    // newcomer, and the hold that keeps the paused prefill from being restored ahead of it.
+    std::uint64_t yield_beneficiary_ = 0;
+    bool yield_hold_                 = false;
+    Clock::time_point yield_hold_until_{};
     const std::function<void(const EngineFaultEvent&)> fault_listener_;
     ResourceManagement resources_;
 

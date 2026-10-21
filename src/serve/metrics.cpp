@@ -352,6 +352,8 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
             "Prefill steps cut short by --prefill-stall-budget-ms because another lane was decoding.");
     COUNTER(paced_prefill_deferred_tokens, "paced_prefill_deferred_tokens_total",
             "Prompt tokens those steps left for later steps.");
+    COUNTER(prefill_yields, "prefill_yields_total",
+            "Prefills paused so a short request at the head of the queue could be admitted.");
     COUNTER(engine_recoveries, "engine_recoveries_total",
             "Host-side worker failures survived by failing in-flight requests and clearing the "
             "context cache.");

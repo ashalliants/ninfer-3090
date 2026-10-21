@@ -6,6 +6,10 @@ ninfer_add_test(ninfer_prefill_pacing_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_prefill_pacing.cpp"
   LIBRARIES ninfer_runtime_support)
 
+ninfer_add_test(ninfer_prefill_yield_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_prefill_yield.cpp"
+  LIBRARIES ninfer_runtime_support)
+
 ninfer_add_test(ninfer_worker_recovery_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_worker_recovery.cpp"
   LIBRARIES ninfer_runtime_support)
