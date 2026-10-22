@@ -1748,10 +1748,10 @@ private:
                 predicted_prefill_step_ns(resources_.costs(), step_prefix,
                                           progress.processed_prompt_tokens),
                 progress.timing.elapsed_ns(), decode_ran, step_wall_ns);
-            if (step_cap != 0 && step_cap < planned_tokens &&
-                progress.processed_prompt_tokens == step_cap) {
+            if (progress.cap_applied) {
                 ++cumulative_stats_.paced_prefill_steps;
-                cumulative_stats_.paced_prefill_deferred_tokens += planned_tokens - step_cap;
+                cumulative_stats_.paced_prefill_deferred_tokens +=
+                    planned_tokens - progress.processed_prompt_tokens;
             }
         }
         if (!progress.landed_transfers.empty()) {
