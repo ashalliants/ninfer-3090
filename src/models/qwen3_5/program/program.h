@@ -515,8 +515,13 @@ public:
                   std::span<const CheckpointHandle> excluded,
                   runtime::ContextResourceUsage shortage) const;
     [[nodiscard]] bool start_demote(const ContextDemotion& plan);
+    // `require_snapshot` makes the pause all-or-nothing for a caller that only serves the queue: it is
+    // refused, with nothing changed, where the progress could not be saved (a replaying lane, or a
+    // chunk part-way through a Vision item). A backup reservation that fails after the pause has
+    // begun can still leave a snapshot-less pause; see the yield documentation.
     [[nodiscard]] bool start_pause(SequenceHandle sequence, bool save_snapshot,
-                                   runtime::ExecutionTiming* timing = nullptr);
+                                   runtime::ExecutionTiming* timing = nullptr,
+                                   bool require_snapshot = false);
     [[nodiscard]] ContextProgress poll_context(runtime::CancellationFlagView cancellation);
     [[nodiscard]] bool has_context_transaction() const noexcept;
     // Model suspend, for a Program over a Model materialized suspendable. The Program must be idle:

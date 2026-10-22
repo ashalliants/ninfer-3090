@@ -814,6 +814,7 @@ server restarts.
 | `ninfer_waiting_cancelled_requests_total`, `ninfer_waiting_expired_requests_total`, `ninfer_waiting_abandoned_seconds_total` | requests the client cancelled, or the pending timeout expired, before admission, and the total time they had waited (a client that gives up after 60 s shows up here) |
 | `ninfer_cancelled_prefills_total`, `ninfer_cancelled_prefill_computed_tokens_total` | requests cancelled while prefilling, and the prompt tokens they had computed |
 | `ninfer_paced_prefill_steps_total`, `ninfer_paced_prefill_deferred_tokens_total` | prefill steps cut short by `--prefill-stall-budget-ms` because another lane was decoding, and the prompt tokens they pushed to later steps |
+| `ninfer_prefill_yields_total` | prefills paused so a short request at the head of the queue could be admitted (`--yield-long-prefill-ms`) |
 | `ninfer_engine_recoveries_total` | host-side worker failures the server survived by failing the in-flight requests and clearing the context cache |
 | `ninfer_device_kv_{used,capacity}_pages`, `ninfer_device_backend_kv_used_pages`, `ninfer_device_state_{used,capacity}_slots` | physical Main KV, speculative backend KV and StateImage occupancy; retained history also occupies these pools |
 | `ninfer_host_context_{used,reserved,capacity,peak}_bytes`, `ninfer_host_state_images`, `ninfer_host_kv_used_bytes` | unified Host backing; reserved bytes, StateImages and KV bytes are breakdowns already included in used bytes |
@@ -1952,6 +1953,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--suspend-weights artifact\|host` | where a resume takes the weights from: the artifact again, or a host copy taken at suspend (weight-sized host memory, faster wake) | `artifact` |
 | `--no-auto-resume` | a request while suspended fails (503) instead of resuming the model | requests resume it |
 | `--prefill-stall-budget-ms N` | while another lane decodes, cut each prefill step so it is predicted to take at most N ms; see [execution behavior](#execution-behavior) | off |
+| `--yield-long-prefill-ms N` | let the request at the head of the queue pause a prefill with at least N ms of work left, when its own prefill costs at most a quarter of that; see [execution behavior](#execution-behavior) | off |
 | `--sleep-idle-seconds N` | suspend the model after N seconds with no request; needs `--model-suspend` (with a router, sleeps idle models that were started with it) | off |
 | `--models-dir DIR` | [router mode](#several-models-router): serve every `.ninfer` in DIR; give no artifact path | off |
 | `--models-preset FILE` | router mode: INI presets, `[id]` sections with `model = PATH` and options without dashes; `[*]` applies to all | off |
@@ -2219,6 +2221,20 @@ want and let the budget shorten it only when somebody is waiting. `ninfer_paced_
 and `ninfer_paced_prefill_deferred_tokens_total` count the steps it cut and the tokens it pushed to
 later steps. Off by default; it does nothing at `--max-concurrency 1`, where no other lane decodes.
 Qwen3.8-Flash-Next sizes its own prefill calls and refuses the flag.
+
+`--yield-long-prefill-ms N` is for the queue rather than the other streams. A fresh request never
+preempts a resident one, so with every lane busy it waits for the lane's request to finish, which behind
+a 100,000-token prompt is about a minute however small the newcomer is. With the flag, the request at the
+head of the queue may pause a resident prefill that still has at least N ms of work left, as the cost
+model predicts it, when the newcomer's own prefill (uncached, so a cache hit only makes it cheaper) costs
+at most a quarter of that. The prefill is paused at a step boundary and keeps its progress as a snapshot;
+it is restored behind the newcomer, once that request has been admitted (or after 10 s if it cannot be).
+Several limits keep it from doing harm: a pause that cannot save the prefill's progress is not made (the
+alternative would recompute it all), a prompt with media is never paused, a request is paused at most
+four times, and the same newcomer never pauses a second prefill. `ninfer_prefill_yields_total` counts the
+pauses. It needs a free state slot and Host room for the snapshot (the same capacity as a pause for
+resource pressure), and it does nothing when a lane is free. Off by default; Qwen3.8-Flash-Next refuses
+the flag.
 
 Input memory is bounded by the outstanding-request count and the per-request
 `--max-request-mib` limit. Media preparation uses a shared permit pool sized from `--media-live-mib`

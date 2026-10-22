@@ -68,6 +68,8 @@ inline constexpr std::size_t kFitContextHeadroomBytes = 256ULL * 1024ULL * 1024U
 inline constexpr std::uint32_t kFitContextStepTokens  = 1024;
 // PrefillScheduleOptions::stall_budget_ms: a minute is far past any step the engine runs.
 inline constexpr std::uint32_t kMaximumPrefillStallBudgetMs = 60'000;
+// PrefillScheduleOptions::yield_remaining_ms: an hour is past any prefill the context allows.
+inline constexpr std::uint32_t kMaximumPrefillYieldRemainingMs = 3'600'000;
 
 struct KvCapacityPolicy {
     KvCapacityMode mode                  = KvCapacityMode::Explicit;
@@ -274,6 +276,15 @@ struct PrefillScheduleOptions {
     // weight-sized), so this trades the prompt's own speed for the other streams' latency.
     // 0 (the default) always runs the planned --prefill-chunk. At most 60,000.
     std::uint32_t stall_budget_ms = 0;
+    // A fresh request never preempts a resident one, so with every lane busy it waits for the
+    // lane's request to finish: behind a 100,000-token prompt, about a minute. A nonzero value lets
+    // the request at the head of the queue pause a prefill that still has at least this many
+    // milliseconds of work left (as the cost model predicts it), when the newcomer's own prefill
+    // costs at most a quarter of that. The paused prefill keeps its progress as a snapshot and
+    // resumes behind the newcomer. A request is paused for this at most four times, a prompt with
+    // media is never paused, and a pause that cannot save the prefill's progress is not made.
+    // 0 (the default) never pauses a prefill for the queue. At most 3,600,000.
+    std::uint32_t yield_remaining_ms = 0;
 };
 
 struct ContextCostOptions {
@@ -1455,6 +1466,9 @@ struct RuntimeStats {
     // those steps left for later steps.
     std::uint64_t paced_prefill_steps               = 0;
     std::uint64_t paced_prefill_deferred_tokens     = 0;
+    // Prefills paused so a short request at the head of the queue could be admitted
+    // (PrefillScheduleOptions::yield_remaining_ms).
+    std::uint64_t prefill_yields                    = 0;
 
     std::uint64_t root_selections               = 0;
     std::uint64_t checkpoint_selections         = 0;

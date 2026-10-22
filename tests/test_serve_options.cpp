@@ -414,6 +414,18 @@ int main() {
     failures += check(parse({"ninfer-serve", "model.ninfer", "--prefill-stall-budget-ms", "300"})
                               .prefill_schedule.stall_budget_ms == 300,
                       "--prefill-stall-budget-ms did not reach serving options");
+    failures += check(defaults.prefill_schedule.yield_remaining_ms == 0,
+                      "yielding a long prefill is not off by default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--yield-long-prefill-ms", "5000"})
+                              .prefill_schedule.yield_remaining_ms == 5000,
+                      "--yield-long-prefill-ms did not reach serving options");
+    {
+        bool oversized_yield_rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--yield-long-prefill-ms", "3600001"});
+        } catch (const std::invalid_argument&) { oversized_yield_rejected = true; }
+        failures += check(oversized_yield_rejected, "--yield-long-prefill-ms accepted over an hour");
+    }
     {
         bool oversized_budget_rejected = false;
         try {
