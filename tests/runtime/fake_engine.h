@@ -675,10 +675,13 @@ public:
         // A chunk begun in slices is finished at the size it began, as the real Program does.
         const bool resuming = lane.slice_count != 0;
         std::uint32_t step  = lane.slice_tokens;
+        bool cap_narrowed   = false;
         if (!resuming) {
             const std::uint32_t remaining = lane.prompt - lane.cursor;
             step                          = std::min(chunk_, remaining);
+            const std::uint32_t uncapped = step;
             if (max_tokens != 0) { step = std::min(step, max_tokens); }
+            cap_narrowed = step < uncapped; // the fake has no capture frontiers
             if (layer_slices > 1) {
                 lane.slice_count  = layer_slices;
                 lane.slice_index  = 0;
@@ -705,6 +708,7 @@ public:
         lane.slice_count = 0;
         lane.slice_index = 0;
         progress.processed_prompt_tokens = step;
+        progress.cap_applied             = cap_narrowed;
         lane.cursor += step;
         record(event);
         if (lane.cursor >= lane.prompt) {
