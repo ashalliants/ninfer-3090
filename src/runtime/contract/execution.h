@@ -82,6 +82,10 @@ struct PrefillStepResult {
     // Part of one chunk ran (a sliced step): no prompt tokens are processed yet, and the next
     // advance_prefill for the lane runs the next slice.
     bool partial = false;
+    // The step ran as wide as the caller's cap and the cap is what made it narrower than planned:
+    // not set for a step a capture frontier ended, for media (which ignores the cap) or for a step
+    // that was never capped.
+    bool cap_applied = false;
     ExecutionTiming timing;
 };
 

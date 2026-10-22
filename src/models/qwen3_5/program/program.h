@@ -320,6 +320,7 @@ struct PrefillProgress {
     bool complete                         = false;
     // Some layers of the step's chunk ran and the rest wait for the next call (layer_slices).
     bool partial = false;
+    bool cap_applied                      = false; // see runtime::PrefillStepResult
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     bool capture_ready = false;

@@ -224,6 +224,7 @@ struct PrefillProgress {
     bool complete                         = false;
     // Never set: this Program does not slice its prefill (the Engine reads it for any model).
     bool partial = false;
+    bool cap_applied                      = false; // this Program ignores the cap
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     bool capture_ready = false;

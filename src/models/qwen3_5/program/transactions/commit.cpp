@@ -55,6 +55,7 @@ PrefillProgress ProgramImpl::wrap_prefill(std::uint32_t lane, runtime::PrefillSt
     out.processed_prompt_tokens = step.processed_prompt_tokens;
     out.complete                = step.complete;
     out.partial                 = step.partial;
+    out.cap_applied             = step.cap_applied;
     out.timing                  = step.timing;
     if (step.complete) {
         const std::array<std::uint32_t, 1> lanes{lane};
