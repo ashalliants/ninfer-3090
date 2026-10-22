@@ -40,7 +40,8 @@ public:
     // Starts the model's server on a free loopback port and attaches `service` to it. The service
     // is loaded and warmed up already.
     RoutedModelService(std::string id, std::unique_ptr<GenerationService> service,
-                       std::shared_ptr<spdlog::logger> logger, std::shared_ptr<RoutedPorts> ports);
+                       std::shared_ptr<spdlog::logger> logger, std::shared_ptr<RoutedPorts> ports,
+                       std::shared_ptr<OpenAIResponsesStore> responses_store);
     ~RoutedModelService() override;
 
     RoutedModelService(const RoutedModelService&)            = delete;

@@ -42,7 +42,10 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 
 class HttpServer {
 public:
-    HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger);
+    // `responses_store` lets the owner keep stored Responses across this server's lifetime (the
+    // router reloads a model into a fresh server); by default the server owns a store of its own.
+    HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger,
+               std::shared_ptr<OpenAIResponsesStore> responses_store = nullptr);
     // Stops and joins the startup listener if it is still running. Without this, a failure between
     // start_serving_during_startup() and listen() -- the Engine throwing while loading weights, the
     // most likely failure there is -- would destroy a joinable std::thread and call std::terminate,
@@ -152,7 +155,8 @@ private:
     // Written by attach() together with service_, before ready_ is published.
     LoadCapacity load_capacity_;
     std::chrono::steady_clock::time_point attached_at_;
-    OpenAIResponsesStore openai_responses_store_;
+    std::shared_ptr<OpenAIResponsesStore> responses_store_;
+    OpenAIResponsesStore& openai_responses_store_;
     OperationalLog operational_log_;
     JsonlRequestLog request_jsonl_;
     Metrics metrics_;

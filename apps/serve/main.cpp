@@ -18,6 +18,7 @@
 #include <exception>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -182,6 +183,14 @@ int run_router(const char* argv0, const ninfer::serve::ServeOptions& options,
         // Files and stores the models would share by accident are refused before any Engine starts.
         ninfer::serve::check_model_state_paths(definitions);
         const auto ports = std::make_shared<ninfer::serve::RoutedPorts>();
+        // Stored Responses outlive an unload: the store holds no Engine state, so a reloaded model
+        // still answers previous_response_id and response lookups.
+        std::map<std::string, std::shared_ptr<ninfer::serve::OpenAIResponsesStore>> response_stores;
+        for (const auto& definition : definitions) {
+            response_stores[definition.id] = std::make_shared<ninfer::serve::OpenAIResponsesStore>(
+                definition.options.response_store_max_records,
+                definition.options.response_store_max_bytes);
+        }
         ninfer::serve::ModelRegistry registry(
             std::move(definitions),
             ninfer::serve::RegistryPolicy{
@@ -193,7 +202,8 @@ int run_router(const char* argv0, const ninfer::serve::ServeOptions& options,
                 -> std::unique_ptr<ninfer::serve::ModelService> {
                 try {
                     return std::make_unique<ninfer::serve::RoutedModelService>(
-                        definition.id, make_service(definition.options), logger, ports);
+                        definition.id, make_service(definition.options), logger, ports,
+                        response_stores.at(definition.id));
                 } catch (const std::exception& exception) {
                     logger->error("model '{}' failed to load: {}", definition.id,
                                   exception.what());
