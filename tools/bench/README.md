@@ -10,7 +10,7 @@ runners, and the external Serve TTFT client. Correctness is owned by the affecte
 settle, then submits one long uncached prompt and records the stream's event timestamps around it. It
 reports the stream's inter-event gaps (p50/p90/p99/max) and events per second in three windows, before,
 during and after the long prompt, and the long prompt's own time and prefill rate. The during window starts at
-the long request's wire-send timestamp and ends when it finishes; the baseline runs from the stream's
+the moment the long request's body has been sent and ends when it finishes; the baseline runs from the stream's
 settle point to that send, and the after window starts when the long request ends. A worker that is still running when its bounded wait ends, or a
 cancel that lands after the prompt finished, fails the run rather than producing a report.
 

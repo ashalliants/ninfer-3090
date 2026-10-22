@@ -178,13 +178,15 @@ class Prober:
         self.extra = extra_body
         self.started: list[tuple[Any, threading.Thread]] = []
 
-    def shutdown(self, join_seconds: float = 10.0) -> None:
+    def shutdown(self, join_seconds: float = 10.0) -> int:
         """Cancel every exchange this prober started and wait for its worker, whatever state the
-        scenario ended in: a failed run must not leave requests running on the server."""
+        scenario ended in: a failed run must not leave requests running on the server. Returns how
+        many workers were still alive after the bounded wait."""
         for exchange, _ in self.started:
             exchange.cancel()
         for _, thread in self.started:
             thread.join(join_seconds)
+        return sum(1 for _, thread in self.started if thread.is_alive())
 
     def start_stream(self, prompt: str, max_tokens: int) -> tuple[Any, StreamRecord, threading.Thread]:
         """Start a streaming completion on a thread; returns (exchange, record, thread)."""
@@ -232,14 +234,15 @@ class Prober:
         sent = threading.Event()
         outcome["sent_event"] = sent
 
-        def on_sent(now: int) -> None:
-            # The first byte is about to leave: this, not the moment the thread was started, is
-            # when the server's clock for the request begins.
+        def on_body_sent(now: int) -> None:
+            # The whole request, body included, has left the client: this, not the moment the thread
+            # was started or the first byte went out, is when the server's work for it can begin, so
+            # a large prompt's upload time is not counted as prefill.
             outcome["sent_ns"] = now
             sent.set()
 
         def run() -> None:
-            result = exchange.execute(on_sent=on_sent)
+            result = exchange.execute(on_body_sent=on_body_sent)
             sent.set()  # a request that never got as far as sending must not hang the scenario
             outcome["ended_ns"] = result.ended_ns
             outcome["status"] = result.status
@@ -301,9 +304,16 @@ def run_scenario(args: argparse.Namespace) -> dict[str, Any]:
     prober = Prober(args.base_url, args.model, args.api_key, args.timeout,
                     json.loads(args.extra_body) if args.extra_body else {})
     try:
-        return _scenario(prober, args)
-    finally:
-        prober.shutdown()
+        report = _scenario(prober, args)
+    except BaseException as error:
+        stuck = prober.shutdown()
+        if stuck:
+            raise RuntimeError(f"{error}; and {stuck} request worker(s) did not exit after cancel") from error
+        raise
+    stuck = prober.shutdown()
+    if stuck:
+        raise RuntimeError(f"{stuck} request worker(s) did not exit after cancel; the report is not trustworthy")
+    return report
 
 
 def _scenario(prober: Prober, args: argparse.Namespace) -> dict[str, Any]:
