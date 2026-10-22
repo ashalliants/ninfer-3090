@@ -109,6 +109,8 @@ public:
     [[nodiscard]] RuntimeStats runtime_stats() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] bool is_available() const;
+    // The Engine failed Engine-wide and never recovers: only constructing it again serves requests.
+    [[nodiscard]] bool has_failed() const;
 
     // Model residency (EngineOptions::suspend; throws std::invalid_argument when it is off). A
     // suspend gives the model's device memory back to the GPU while the Engine is idle and refuses

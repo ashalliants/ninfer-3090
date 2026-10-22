@@ -539,6 +539,53 @@ compressed chunks against 3.3-3.7 s from raw ones (file cache warm, RTX 3090 hos
 more per GB read. A chunk that does not decode to its hash is a miss like any other damaged chunk.
 
 
+#### Two engines on one box
+
+A box with two GPUs serves long conversations fastest as two independent engines, one per GPU (a
+single engine split across both GPUs does not pipeline prefill). A gateway then sends a
+conversation's next turn to whichever engine is free, often the one that did not serve the last
+turn, which would prefill the whole conversation again. `--context-store-peer DIR` lets an engine
+reuse what the other finished, through the local disk and without a bucket:
+
+```
+ninfer-serve model.ninfer --port 8000 --devices 0 --context-store /data/store0 --context-store-peer /data/store1 --context-store-idle-seconds 2
+ninfer-serve model.ninfer --port 8001 --devices 1 --context-store /data/store1 --context-store-peer /data/store0 --context-store-idle-seconds 2
+```
+
+- Every engine has its own `--context-store` directory and is its only writer. A second engine
+  started on a directory already in use refuses to start (`context store directory ... is in use by
+  another process`) instead of corrupting it; the lock is released when the process exits, so a
+  crash leaves nothing stuck. (Before this, two engines on one directory silently deleted each
+  other's files.)
+- `--context-store-peer DIR` (repeatable) names another engine's directory. Every
+  `--context-store-peer-poll-ms` (250) the engine lists the manifests there, and for each session it
+  does not hold it **hard-links** the session's chunk files into its own directory (no bytes are
+  copied, the data is on disk once) and registers it like any stored session. A request that would
+  resume from it finds it through the same lookup as its own sessions (see above), reads and
+  verifies every chunk, and prices the read with the measured read rate. A peer that has not started
+  yet is polled until it appears. Both directories must be on one volume: a link that fails (another
+  volume, or a chunk the peer evicted in the meantime) skips that session, which is only a miss.
+  With a bucket as well, a session the bucket listing registered before its chunks were downloaded
+  takes the peer's chunks the same way, so loading it reads the disk instead of the bucket.
+- An imported session is the importer's own from then on: the peer deleting, evicting or replacing
+  its copy does not affect it, and removing it here does not affect the peer. It is not uploaded to
+  the bucket by the importer (the engine that wrote it uploads it), until the importer restarts: its
+  start-up scan cannot tell an imported session from its own, so from then on a use puts back what
+  the bucket lacks, as for its own sessions. Sessions older than
+  `--context-store-ttl-hours`, or that would not fit in `--context-store-max-gib`, are skipped, and a
+  skipped session is not looked at again until its owner rewrites it.
+- **A session is visible to the other engine only after its owner has written it**, which is
+  `--context-store-idle-seconds` (30 by default) after its last use, or when it is evicted, or at
+  shutdown, and a background write is skipped while any request is waiting. With the default, the
+  next turn of a conversation that arrives within 30 s of the last one cannot be resumed on the other
+  engine; use `--context-store-idle-seconds 1` or `2` on a box with peers. The cost is more writes
+  (only the chunks that changed, since consecutive images of a conversation share almost all of
+  theirs).
+- Failures are extra misses, never wrong output: every chunk is verified when read, a damaged peer
+  file is a miss for the importer and is never modified or removed by it, and a manifest is checked
+  by its own checksum. The `ninfer_context_store_peer_*` series (see [Metrics](#metrics)) count what
+  was imported, the bytes linked, sessions skipped and links that failed.
+
 #### Keeping a copy in a bucket
 
 `--context-store-s3-endpoint URL --context-store-s3-bucket NAME` (off by default, and only with
@@ -633,13 +680,102 @@ context itself and anything allocated outside the model's regions stay resident:
 more while resident.
 
 
+### Several models (router)
+
+Give `ninfer-serve` no artifact and name the models with `--models-dir DIR` (every `.ninfer` in
+`DIR`, and each subdirectory holding exactly one, by its file or directory name) or
+`--models-preset FILE`, and one server answers for all of them on one address. Models load on demand:
+a request names its model in the body's `"model"` (an id or an alias) or a `?model=` query
+parameter, and a request that names none goes to the model that last served. Every other option on
+the command line applies to each model; a model's section in a preset can change any of them.
+
+```ini
+[*]
+max-context = 65536
+kv-dtype = rk8v4
+; a boolean key is a flag; a model's section can drop it with false. A flag that is on by
+; default (prefill-a8, cuda-graph, prefix-reuse) is turned off with its no- key, e.g. no-cuda-graph = true
+model-suspend = true
+
+[coder]
+model = /models/qwen3_8_27b.ninfer
+alias = default, qwen
+spec = dflash2
+draft-tokens = 7
+
+[small]
+model = /models/other.ninfer
+max-context = 8192
+```
+
+`[*]` holds defaults for every model; any other section is a model (`model` or `artifact` is its
+path, `alias` a comma-separated list, `load-on-startup` a boolean, every other key a serve option
+without its leading dashes). A section named after a model found in `--models-dir` needs no path.
+The command line wins over a preset where they repeat an option. Comments sit on lines of their own
+(`;` or `#` first). The router's own options (`models-max`, `models-autoload`, `sleep-idle-seconds`,
+`unload-idle-seconds`) are command-line only, as are the options the router overrides for every
+model (`api-key`, `host`, `port`, `model-id`): a preset that sets one is rejected at startup. A model
+id may not contain `/`, `?`, `#`, `%` or `\`. With
+`--context-store DIR` each model keeps its store in `DIR/<model id>` (and under `<prefix><model id>/`
+in S3; characters other than letters, digits, `-` and `_` are written as `%XX`). `--request-log-jsonl`
+may not name any model's artifact, n-gram volume or expert state, whether it comes from the command
+line or a model's own section; models that name the same file append to one shared log, one record
+at a time. The router accepts a request body up to the largest `--max-request-mib` of any model, and
+that model's own server then applies its limit.
+`--ngram-volume` and `--expert-state` may not give the same file to two models, and one model's
+n-gram volume, expert state and artifact must be three different files.
+
+`--models-max N` (default 1, 0 for no limit) bounds how many models are loaded at once. To make room
+the least recently used model without a request in flight **sleeps** when it was started with
+`--model-suspend` (its device memory is given back, and it wakes in seconds with its retained
+conversations) and is **unloaded** otherwise. `--sleep-idle-seconds N` and
+`--unload-idle-seconds N` apply the same transitions to idle models. A request for a model that is
+not loaded loads or wakes it, unless `--no-models-autoload`. A model whose Engine failed is unloaded
+once its requests are gone, so the next request loads it again.
+
+The router answers llama.cpp's model API itself:
+
+| Endpoint | |
+|---|---|
+| `GET /models`, `GET /v1/models` | every model with its `status.value` (`unloaded`, `loading`, `loaded`, `sleeping`, `unloading`), the arguments it starts with, its aliases and the last failure |
+| `POST /models/load` | `{"model": ID}`: load it, or wake it when it sleeps |
+| `POST /models/unload` | `{"model": ID}`: unload it once its requests have ended |
+| `POST /models/sleep` | `{"model": ID, "hold": false}`: suspend it; with `hold` it stays asleep until loaded again |
+| `GET /models/sse` | a stream of `{"model", "status"}` events |
+| `POST /v1/models/{id}/suspend`, `/resume`, `GET /v1/models/{id}/residency` | the [model suspend](#model-suspend) endpoints of one model |
+
+`GET /health` is 200 while the router runs. `GET /props`, `/metrics` and `/v1/load` answer for the
+model that last served, without waking or loading it (a 503 while it is unloaded). Everything
+else (chat completions, Responses, Messages and the rest) is forwarded to the model it names: each model runs the ordinary
+single-model server on a loopback port of its own, so every endpoint, request log and metric works
+per model unchanged. The router checks `--api-key` and applies `--cors`; models need neither.
+Streamed responses stream, and a client that disconnects cancels the generation, also while the
+model is still loading or working on the prompt. The router rewrites only the `"model"` member of a
+body it forwards (to the model's id), so every other value reaches the model as you wrote it.
+
+Each model keeps its own Responses store, and a response ID does not say which model made it. A
+request that names no model goes to the model that last served, so `GET` or `DELETE
+/v1/responses/{id}`, `.../input_items` and a `previous_response_id` follow-up must name the model
+that created the response (`?model=ID` on the request, or `"model"` in the body). Routing these by
+the response ID alone is tracked in [#336](https://github.com/ashalliants/ninfer-3090/issues/336).
+
+A model's Responses store survives both sleep and unload (eviction, idle unload, an explicit unload, or
+a rebuild after an Engine failure): after the model loads again, `previous_response_id` follow-ups and
+`GET`/`DELETE /v1/responses/{id}` still find responses made before. The store lives in memory, so it
+is still lost when the router process restarts.
+
+On an RTX 3090 with two copies of the Qwen3.8-27B artifact under `--models-max 1 --model-suspend`: a
+cold request loaded its model and answered in 6.0 s (the file was in the operating system's cache),
+a request for the other model put the first to sleep and answered in 6.1 s while it loaded, and each
+swap after that took 4.0 to 4.1 s with both models staying in the process.
+
 ### Metrics
 
 `GET /metrics` serves Prometheus text format 0.0.4 on the same port. Like `/v1/load` it requires
 the API key when one is configured, answers `503 model_loading` until warmup completes, and works
 independently of `--request-log-jsonl` and `--log-stats-interval-ms`. Engine failure leaves the
 endpoint readable with `ninfer_engine_ready 0`. The handler copies published snapshots and formats
-them outside the Engine worker; scraping does not reset counters or initiate device work.
+them outside the Engine worker; scraping does not reset counters or initiate CUDA work. The one live read is the `ninfer_gpu_*` gauges below, which query NVML (the driver's monitoring library) once per scrape.
 
 ```bash
 curl http://127.0.0.1:8080/metrics -H 'Authorization: Bearer local-secret'
@@ -693,9 +829,14 @@ server restarts.
 | `ninfer_requests_total{outcome}`, `ninfer_response_failures_total` | generation attempts entering preparation by outcome (`completed`, `cancelled`, `failed`, `rejected`), and response failures after settlement; protocol/model validation failures and token-count requests are excluded |
 | `ninfer_time_to_first_token_seconds` | histogram updated once at the first committed token, including preparation, queueing and binding |
 | `ninfer_request_duration_seconds`, `ninfer_request_queue_seconds` | histograms for settled generation outcomes, including cancellation; exceptional failures have separate counts |
+| `ninfer_gpu_utilization_percent`, `ninfer_gpu_memory_utilization_percent` | gauges: share of NVML's last sample period in which any kernel ran, and in which device memory was read or written. Measured on the first device (`--device`, or the first of `--devices`) |
+| `ninfer_gpu_memory_used_bytes`, `ninfer_gpu_memory_total_bytes` | gauges: device memory in use by every process on the card (not only this server), and installed |
+| `ninfer_gpu_temperature_celsius`, `ninfer_gpu_power_watts` | gauges: GPU core temperature and board power draw. All six `ninfer_gpu_*` series are omitted, not reported as 0, when NVML or the device cannot be opened (no driver library, a container without it); a single reading NVML cannot give is omitted on its own |
+| `ninfer_gpu_energy_joules_total` | counter: board energy used since the server attached to the GPU, from NVML's lifetime energy counter. The rate over any window is the mean power over it (`rate(ninfer_gpu_energy_joules_total[5m])` is watts), which the instantaneous `ninfer_gpu_power_watts` cannot give. It starts at 0 at attachment, not at driver load, and keeps counting through an NVML counter reset. Omitted, like the other `ninfer_gpu_*` series, when NVML cannot supply it (older drivers, a card without an energy counter) |
 | `ninfer_context_store_images`, `ninfer_context_store_used_bytes` | gauges: sessions and bytes held by the [context store](#context-store) (zero when it is off) |
 | `ninfer_context_store_writes_total`, `_write_failures_total`, `_dropped_total` | sessions written, writes that failed, sessions not queued because the write queue was full |
 | `ninfer_context_store_bytes_written_total`, `_bytes_stored_total`, `_bytes_reused_total` | new chunk bytes written (raw size), what they took on disk after [compression](#context-store), and chunk bytes a write found already stored |
+| `ninfer_context_store_peer_images_total`, `_peer_bytes_linked_total`, `_peer_skipped_total`, `_peer_link_failures_total` | with `--context-store-peer`: sessions imported from peers, chunk bytes hard-linked (shared on disk, not copied), sessions not imported (damaged, expired, over budget, or gone mid-import) and chunks that could not be linked |
 | `ninfer_context_store_evicted_total`, `_corrupt_total` | sessions removed for space, age or supersession, and because they could not be read back intact |
 | `ninfer_context_store_restored_sessions`, `_restored_bytes`, `_restore_seconds` | gauges: what start-up restored into the cache, and how long it took |
 | `ninfer_context_store_hydrations_total`, `_hydrated_tokens_total`, `_hydration_failures_total`, `_hydration_seconds_total` | stored sessions read back for a request, the prompt tokens that saved, failures (the request was prefilled, or its admission did not use what was read) and the time requests waited for the reads, failed ones included |
@@ -1805,7 +1946,12 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--suspend-snapshot pageable\|pinned` | where the retained state waits in host memory while suspended | `pageable` |
 | `--suspend-weights artifact\|host` | where a resume takes the weights from: the artifact again, or a host copy taken at suspend (weight-sized host memory, faster wake) | `artifact` |
 | `--no-auto-resume` | a request while suspended fails (503) instead of resuming the model | requests resume it |
-| `--sleep-idle-seconds N` | suspend the model after N seconds with no request; needs `--model-suspend` | off |
+| `--sleep-idle-seconds N` | suspend the model after N seconds with no request; needs `--model-suspend` (with a router, sleeps idle models that were started with it) | off |
+| `--models-dir DIR` | [router mode](#several-models-router): serve every `.ninfer` in DIR; give no artifact path | off |
+| `--models-preset FILE` | router mode: INI presets, `[id]` sections with `model = PATH` and options without dashes; `[*]` applies to all | off |
+| `--models-max N` | router mode: models loaded at once (`0` = no limit); the least recently used idle one sleeps or unloads to make room | `1` |
+| `--no-models-autoload` | router mode: a request for a model that is not loaded fails instead of loading it | autoload |
+| `--unload-idle-seconds N` | router mode: unload a model idle for N seconds | off |
 | `--device-state-slots N` | extra Device StateImages beyond `max-concurrency` | `max-concurrency` |
 | `--host-context-mib N` | shared pinned Host budget for StateImages, KV and pause snapshots, including in-flight destinations; refused together with `--auto-host-cache` | `8192 MiB + 8 native StateImages` |
 | `--auto-host-cache` | size the Host context budget from the host memory still free once the model has loaded, for a machine that exists to serve; see [automatic host cache](#automatic-host-cache). Refuses an explicit `--host-context-mib` | off |
@@ -1820,6 +1966,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--context-store-idle-seconds N` | write a session unused this long, and changed since it was last written, in the background; `0` writes only at shutdown | `30` |
 | `--context-store-restore-seconds N` | time budget for restoring sessions at start-up, and the longest a request waits for its stored session to be read back | `120` |
 | `--context-store-flush-seconds N` | time budget for writing sessions that are not yet stored at shutdown | `60` |
+| `--context-store-peer DIR` | import the sessions another engine on this box keeps in its store directory, by hard link (repeatable; same volume; each engine needs its own `--context-store`); see [Two engines on one box](#two-engines-on-one-box). Requires `--context-store` | none |
+| `--context-store-peer-poll-ms N` | how often peer directories are looked at (at least 1) | `250` |
 | `--context-store-compress` | write new chunks zstd-compressed, in the directory and the bucket (about 8 % smaller; chunks of both forms are always read); see [Context store](#context-store). Requires `--context-store` | off |
 | `--context-store-s3-endpoint URL`, `--context-store-s3-bucket NAME` | keep a copy of the store in an S3-compatible bucket (both required together; credentials from `NINFER_S3_ACCESS_KEY_ID` / `NINFER_S3_SECRET_ACCESS_KEY` or the `AWS_` equivalents); see [Keeping a copy in a bucket](#keeping-a-copy-in-a-bucket). Requires `--context-store` | off |
 | `--context-store-s3-prefix P`, `--context-store-s3-region R` | key prefix inside the bucket, and the signing region | none, `us-east-1` |
