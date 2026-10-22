@@ -60,6 +60,11 @@ public:
         return service_->has_failed() || listener_failed_.load();
     }
 
+    // Forwarded so /models reports the limit the engine settled on, not the configured one.
+    [[nodiscard]] std::uint32_t effective_max_context() const override {
+        return service_->options().max_context;
+    }
+
     [[nodiscard]] int port() const noexcept { return port_; }
 
 private:
