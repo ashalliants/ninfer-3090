@@ -426,6 +426,18 @@ int main() {
         } catch (const std::invalid_argument&) { oversized_yield_rejected = true; }
         failures += check(oversized_yield_rejected, "--yield-long-prefill-ms accepted over an hour");
     }
+    failures += check(defaults.prefill_schedule.decode_share_percent == 0,
+                      "the prefill decode share is not off by default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--prefill-decode-share", "50"})
+                              .prefill_schedule.decode_share_percent == 50,
+                      "--prefill-decode-share did not reach serving options");
+    {
+        bool oversized_share_rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--prefill-decode-share", "91"});
+        } catch (const std::invalid_argument&) { oversized_share_rejected = true; }
+        failures += check(oversized_share_rejected, "--prefill-decode-share accepted more than 90");
+    }
     {
         bool oversized_budget_rejected = false;
         try {

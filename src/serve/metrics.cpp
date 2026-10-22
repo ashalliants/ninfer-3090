@@ -371,6 +371,8 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
             "Prompt tokens those steps left for later steps.");
     COUNTER(prefill_yields, "prefill_yields_total",
             "Prefills paused so a short request at the head of the queue could be admitted.");
+    COUNTER(deferred_prefill_turns, "deferred_prefill_turns_total",
+            "Worker cycles that skipped their prefill step to give decode rounds their share.");
     COUNTER(engine_recoveries, "engine_recoveries_total",
             "Host-side worker failures survived by failing in-flight requests and clearing the "
             "context cache.");

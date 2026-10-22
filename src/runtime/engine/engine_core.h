@@ -99,7 +99,9 @@ public:
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
           prefill_chunk_(std::min(options.prefill_chunk, options.max_context)),
-          pacing_(PrefillPacingOptions{.stall_budget_ms = options.prefill_schedule.stall_budget_ms}),
+          pacing_(PrefillPacingOptions{
+              .stall_budget_ms      = options.prefill_schedule.stall_budget_ms,
+              .decode_share_percent = options.prefill_schedule.decode_share_percent}),
           yield_min_remaining_ns_(
               static_cast<std::uint64_t>(options.prefill_schedule.yield_remaining_ms) * 1'000'000ULL),
           progress_anchor_tokens_(options.progress_anchors_shared ? options.progress_anchor_tokens : 0),
@@ -1718,8 +1720,10 @@ private:
         progress.pending.reset();
     }
 
+    // `decode_ran` is whether this cycle ran a decode round: only then does the step owe it a share.
     void run_prefill_step(std::uint32_t lane,
-                          const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+                          const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start,
+                          bool decode_ran) {
         nvtx::ScopedRange prefill_range(nvtx::Name::Prefill, nvtx::Category::Prefill);
         EnginePhaseScope setup(*this, EngineHostPhase::CommitOutput);
         const auto request = slots_[lane];
@@ -1735,7 +1739,7 @@ private:
         auto* provider   = request->output.constrained() ? &masks : nullptr;
         // While another lane decodes, a step that would run for longer than the stall budget is
         // cut down to what the cost model predicts fits it (PrefillScheduleOptions).
-        const bool pacing_on           = pacing_.options().stall_budget_ms != 0;
+        const bool pacing_on           = pacing_.options().active();
         const bool streaming_neighbour = pacing_on && other_lane_streaming(lane);
         std::uint32_t planned_tokens = 0;
         std::uint32_t step_cap       = 0;
@@ -1755,9 +1759,11 @@ private:
             }
         }
         ProgramCallScope program_call(*this);
+        const Clock::time_point step_started = Clock::now();
         auto progress = instance_.program->advance_prefill(
             *request->sequence, &program_call.failed_timing(), provider, step_cap);
         program_call.finish(progress.timing);
+        const std::uint64_t step_wall_ns = elapsed_ns(step_started, Clock::now());
         // A media step ignores the cap and is priced by a text-only model, so it must not teach the
         // correction factor; a step cut short by a capture or rewrite frontier did not run at the
         // cap either. The cap counts as honored only when the step ran exactly that wide.
@@ -1766,7 +1772,7 @@ private:
             pacing_.prefill_step_done(
                 predicted_prefill_step_ns(resources_.costs(), step_prefix,
                                           progress.processed_prompt_tokens),
-                progress.timing.elapsed_ns());
+                progress.timing.elapsed_ns(), decode_ran, step_wall_ns);
             if (progress.cap_applied) {
                 ++cumulative_stats_.paced_prefill_steps;
                 cumulative_stats_.paced_prefill_deferred_tokens +=
@@ -3115,6 +3121,7 @@ private:
                         exception_text(std::current_exception()));
             return false;
         }
+        pacing_.reset_decode_debt();
         recovery_streak_.record_recovery(failed_at);
         ++cumulative_stats_.engine_recoveries;
         request_admission_check();
@@ -3956,11 +3963,15 @@ private:
                     }
                     decode = selected;
                 }
+                bool decode_ran = false;
                 if (!decode.empty()) {
                     set_host_work_class(HostWorkClass::Decode, decode.lane_span());
                     unit = "decode";
+                    const auto decode_started = Clock::now();
                     run_decode_round(decode, cancelled);
-                    executed = true;
+                    pacing_.decode_round_done(elapsed_ns(decode_started, Clock::now()));
+                    executed   = true;
+                    decode_ran = true;
                 }
                 if (instance_.program->has_context_transaction()) {
                     set_host_work_class(HostWorkClass::Control);
@@ -3986,15 +3997,28 @@ private:
                         prefill_slots[lane].reset();
                     }
                 }
-                if (const auto lane = scheduler_.next_prefill(prefill_slots, max_concurrency_)) {
+                auto prefill_lane = scheduler_.next_prefill(prefill_slots, max_concurrency_);
+                // A cycle without a decode round owes nothing, whether or not a prefill lane is
+                // selectable: stale debt must not delay an unrelated prompt later.
+                if (!decode_ran) { pacing_.reset_decode_debt(); }
+                // A decode share holds the prefill turn back while the rounds since the last step
+                // have not yet used their share of its time.
+                if (prefill_lane && pacing_.defer_prefill(decode_ran)) {
+                    ++cumulative_stats_.deferred_prefill_turns;
+                    prefill_lane.reset();
+                }
+                if (const auto lane = prefill_lane) {
                     const auto request = slots_[*lane];
                     set_host_work_class(HostWorkClass::Prefill);
                     unit = "prefill";
                     if (request->is_replaying()) {
                         ProgramCallScope call(*this);
+                        const Clock::time_point replay_started = Clock::now();
                         auto progress = instance_.program->advance_replay(*request->sequence,
                                                                           &call.failed_timing());
                         call.finish(progress.timing);
+                        pacing_.prefill_step_done(0, progress.timing.elapsed_ns(), decode_ran,
+                                                  elapsed_ns(replay_started, Clock::now()));
                         if (!request->first_output_timing) {
                             record_execution_work(request->replay_work, progress.timing);
                         }
@@ -4011,7 +4035,7 @@ private:
                                                GenerationSchedulingTransition::ReplayComplete);
                         }
                     } else {
-                        run_prefill_step(*lane, snapshot_cancellations());
+                        run_prefill_step(*lane, snapshot_cancellations(), decode_ran);
                     }
                     scheduler_.prefill_executed(*lane, max_concurrency_);
                     update_recovery(request);

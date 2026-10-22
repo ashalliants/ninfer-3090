@@ -820,6 +820,7 @@ server restarts.
 | `ninfer_paced_prefill_steps_total`, `ninfer_paced_prefill_deferred_tokens_total` | prefill steps cut short by `--prefill-stall-budget-ms` because another lane was decoding, and the prompt tokens they pushed to later steps |
 | `ninfer_prefill_backlog_seconds` | gauge: predicted prefill work ahead of a new request (resident remainder plus queued requests uncached); the same figure as `prefill_backlog_seconds` in `/v1/load` |
 | `ninfer_prefill_yields_total` | prefills paused so a short request at the head of the queue could be admitted (`--yield-long-prefill-ms`) |
+| `ninfer_deferred_prefill_turns_total` | worker cycles that held the prefill step back for `--prefill-decode-share` |
 | `ninfer_engine_recoveries_total` | host-side worker failures the server survived by failing the in-flight requests and clearing the context cache |
 | `ninfer_device_kv_{used,capacity}_pages`, `ninfer_device_backend_kv_used_pages`, `ninfer_device_state_{used,capacity}_slots` | physical Main KV, speculative backend KV and StateImage occupancy; retained history also occupies these pools |
 | `ninfer_host_context_{used,reserved,capacity,peak}_bytes`, `ninfer_host_state_images`, `ninfer_host_kv_used_bytes` | unified Host backing; reserved bytes, StateImages and KV bytes are breakdowns already included in used bytes |
@@ -1959,6 +1960,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-auto-resume` | a request while suspended fails (503) instead of resuming the model | requests resume it |
 | `--prefill-stall-budget-ms N` | while another lane decodes, cut each prefill step so it is predicted to take at most N ms; see [execution behavior](#execution-behavior) | off |
 | `--yield-long-prefill-ms N` | let the request at the head of the queue pause a prefill with at least N ms of work left, when its own prefill costs at most a quarter of that; see [execution behavior](#execution-behavior) | off |
+| `--prefill-decode-share P` | after each prefill step, while another lane decodes, run decode rounds for P percent (0-90) of the step's time before the next step; see [execution behavior](#execution-behavior) | off |
 | `--sleep-idle-seconds N` | suspend the model after N seconds with no request; needs `--model-suspend` (with a router, sleeps idle models that were started with it) | off |
 | `--models-dir DIR` | [router mode](#several-models-router): serve every `.ninfer` in DIR; give no artifact path | off |
 | `--models-preset FILE` | router mode: INI presets, `[id]` sections with `model = PATH` and options without dashes; `[*]` applies to all | off |
@@ -2240,6 +2242,16 @@ four times, and the same newcomer never pauses a second prefill. `ninfer_prefill
 pauses. It needs a free state slot and Host room for the snapshot (the same capacity as a pause for
 resource pressure), and it does nothing when a lane is free. Off by default; Qwen3.8-Flash-Next refuses
 the flag.
+
+`--prefill-decode-share P` (0-90) is the other half. After each prefill step, while a lane is decoding,
+the Engine runs decode rounds until they have used P percent of the time the step took before it runs
+the next step. At 50 a 1.5 s step is followed by 1.5 s of decode rounds, so each stream gets a burst of
+tokens (DFlash2 and MTP rounds emit several each) instead of one, and the prompt takes about twice as
+long while the neighbour lasts. It does not shorten the longest gap between a stream's tokens, which is
+still one step; use the stall budget for that. The two combine: a budget of 500 ms and a share of 50 give
+a stream a burst every ~1 s with half its normal speed. The debt a step creates is capped at 10 s, and
+after 4,096 deferred turns in a row a step runs regardless. `ninfer_deferred_prefill_turns_total` counts
+the cycles that held the prefill back. Off by default.
 
 Input memory is bounded by the outstanding-request count and the per-request
 `--max-request-mib` limit. Media preparation uses a shared permit pool sized from `--media-live-mib`
