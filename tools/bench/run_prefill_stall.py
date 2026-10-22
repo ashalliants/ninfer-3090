@@ -6,7 +6,8 @@ one long uncached prompt (non-streaming, max_tokens 1) and records the stream's 
 around it. Optionally it also sends a short request part-way through the long prompt, and cancels
 the long prompt and resubmits it. It answers the questions behind the prefill scheduling flags
 (--prefill-stall-budget-ms, --prefill-decode-share, --yield-long-prefill-ms,
---prefill-anchor-tokens; see docs/maintainer/decode-during-long-prefill.md):
+--progress-anchor-tokens with --progress-anchors-shared; see
+docs/maintainer/decode-during-long-prefill.md and docs/maintainer/long-prefill-handoff.md):
 
   stream      inter-event gaps before, during and after the long prompt, and events/s
   long        how long the prompt took and the prompt tokens the server reports for it
@@ -344,7 +345,11 @@ def _scenario(prober: Prober, args: argparse.Namespace) -> dict[str, Any]:
     short_record = None
     short_started = False
     cancelled_at_ns = None
+    long_deadline = time.monotonic() + args.timeout
     while long_thread.is_alive():
+        if time.monotonic() > long_deadline:
+            raise RuntimeError(f"the long prompt had not finished {args.timeout:g} s after it was sent; "
+                               "the report would be invalid")
         elapsed = (time.perf_counter_ns() - long_start_ns) / NS
         if args.short_delay_seconds is not None and not short_started and elapsed >= args.short_delay_seconds:
             short_started = True
@@ -356,6 +361,10 @@ def _scenario(prober: Prober, args: argparse.Namespace) -> dict[str, Any]:
             cancelled_at_ns = long_exchange.cancel()
         time.sleep(0.02)
     long_end_ns = long_outcome.get("ended_ns") or time.perf_counter_ns()
+    if args.short_delay_seconds is not None and not short_started:
+        raise RuntimeError(
+            "the long prompt finished before --short-delay-seconds was reached; lower it or raise "
+            "--long-tokens")
 
     retry_report = None
     if args.cancel_long_after_seconds is not None or cancelled_at_ns is not None:

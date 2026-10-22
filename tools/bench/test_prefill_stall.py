@@ -176,6 +176,15 @@ def test_a_failed_scenario_leaves_nothing_running():
         server.shutdown()
 
 
+def test_a_short_probe_that_never_starts_fails_the_run():
+    try:
+        run(["--short-delay-seconds", str(STALL + 0.4)])
+    except RuntimeError as error:
+        check("before --short-delay-seconds" in str(error), f"unexpected error: {error}")
+        return
+    check(False, "a short request that never started produced a report")
+
+
 def test_prompt_is_deterministic_and_uncached_across_seeds():
     a = probe.build_prompt(1000, 0.5, 1)
     check(a == probe.build_prompt(1000, 0.5, 1), "same seed, same prompt")
