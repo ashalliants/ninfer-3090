@@ -2244,9 +2244,12 @@ the default one-lane DFlash2 profile is unaffected; the two-lane MTP profile is 
 `ninfer_sliced_prefill_steps_total` and `ninfer_prefill_slice_boundaries_total` count the steps run
 sliced and the boundaries where the neighbour decoded. It combines with the stall budget (the budget
 cuts the chunk, the slices divide what is left) and the decode share. Off by default; Qwen3.8-Flash-Next
-refuses the flag. **This path is new GPU code that has not been run on a GPU**: output is the same
-model computation but, like any change to where a chunk is split, not claimed bit-identical to an
-unsliced run.
+refuses the flag. Run on an RTX 3090 (2026-10-22, Qwen3.8-27B, a stream beside a 108K-token uncached
+prompt at chunk 4096): the neighbour's worst gap fell from 2.93 s to 402 ms at `--prefill-layer-slices 8`
+while the prompt took 61 s instead of 56 s (a 500 ms stall budget gets 528 ms at 72 s). Greedy output of
+a sliced prefill matched the unsliced run token for token in the engine test
+(`sliced_prefill_matches_whole`) and in a served 56K-token prompt with a stream and a short request
+beside it.
 
 `--yield-long-prefill-ms N` is for the queue rather than the other streams. A fresh request never
 preempts a resident one, so with every lane busy it waits for the lane's request to finish, which behind
