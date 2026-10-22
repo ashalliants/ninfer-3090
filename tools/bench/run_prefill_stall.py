@@ -63,22 +63,24 @@ def summarize_gaps(stamps_ns: Sequence[int], start_ns: int, end_ns: int,
     """Gaps between consecutive events in [start_ns, end_ns], in milliseconds.
 
     By default a gap counts when both its events lie in the window. With `overlapping` it counts,
-    whole, when any part of it does: that is how the window of the long prompt picks up the stall
-    that begins at the last event before the prompt and ends at the first one after it. Using
-    "inside" for the windows before and after and "overlapping" for the one between assigns every
-    gap to exactly one of them. `open_gap_ms` is the time from the last event to the window's end,
+    whole, when it crosses the window: it starts before `end_ns` and ends after `start_ns`. That is
+    how the window of the long prompt picks up the stall that begins at the last event before the
+    prompt and ends at the first one after it. A gap that ends exactly at `start_ns` is the
+    baseline's, one that starts exactly at `end_ns` is the next window's. Using "inside" for the
+    windows before and after and "overlapping" for the one between therefore assigns every gap to
+    exactly one of them, and an event is counted in the window [start_ns, end_ns) that holds it. `open_gap_ms` is the time from the last event to the window's end,
     a lower bound on the stall when the stream was still blocked at the end.
     """
     stamps = sorted(stamps_ns)
     gaps_ms: list[float] = []
     for earlier, later in zip(stamps, stamps[1:]):
         if overlapping:
-            counted = later >= start_ns and earlier <= end_ns
+            counted = later > start_ns and earlier < end_ns
         else:
             counted = earlier >= start_ns and later <= end_ns
         if counted:
             gaps_ms.append((later - earlier) / 1e6)
-    inside = [stamp for stamp in stamps if start_ns <= stamp <= end_ns]
+    inside = [stamp for stamp in stamps if start_ns <= stamp < end_ns]
     before = [stamp for stamp in stamps if stamp < start_ns]
     last = inside[-1] if inside else (before[-1] if before else None)
     open_gap_ms = max(0.0, (end_ns - last) / 1e6) if last is not None else 0.0
@@ -174,6 +176,15 @@ class Prober:
         self.model = model
         self.api_key = api_key
         self.extra = extra_body
+        self.started: list[tuple[Any, threading.Thread]] = []
+
+    def shutdown(self, join_seconds: float = 10.0) -> None:
+        """Cancel every exchange this prober started and wait for its worker, whatever state the
+        scenario ended in: a failed run must not leave requests running on the server."""
+        for exchange, _ in self.started:
+            exchange.cancel()
+        for _, thread in self.started:
+            thread.join(join_seconds)
 
     def start_stream(self, prompt: str, max_tokens: int) -> tuple[Any, StreamRecord, threading.Thread]:
         """Start a streaming completion on a thread; returns (exchange, record, thread)."""
@@ -207,6 +218,7 @@ class Prober:
 
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
+        self.started.append((exchange, thread))
         return exchange, record, thread
 
     def start_blocking(self, prompt: str, max_tokens: int) -> tuple[Any, dict[str, Any], threading.Thread]:
@@ -247,6 +259,7 @@ class Prober:
 
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
+        self.started.append((exchange, thread))
         return exchange, outcome, thread
 
 
@@ -287,6 +300,13 @@ def _long_report(outcome: dict[str, Any]) -> dict[str, Any]:
 def run_scenario(args: argparse.Namespace) -> dict[str, Any]:
     prober = Prober(args.base_url, args.model, args.api_key, args.timeout,
                     json.loads(args.extra_body) if args.extra_body else {})
+    try:
+        return _scenario(prober, args)
+    finally:
+        prober.shutdown()
+
+
+def _scenario(prober: Prober, args: argparse.Namespace) -> dict[str, Any]:
     long_prompt = build_prompt(args.long_tokens, args.words_per_token, args.seed)
 
     stream_exchange, stream, stream_thread = prober.start_stream(

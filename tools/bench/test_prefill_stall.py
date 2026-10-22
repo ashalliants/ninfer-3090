@@ -131,9 +131,49 @@ def test_gap_window():
     after_hole = probe.summarize_gaps(stamps, 250 * ms, 500 * ms)
     check(before_hole["gap_max_ms"] == 10.0 and after_hole["gap_max_ms"] == 10.0,
           "the stall was assigned to a neighbouring window as well as its own")
-    quiet = probe.summarize_gaps(stamps, 0, 90 * ms)
+    quiet = probe.summarize_gaps(stamps, 0, 91 * ms)
     check(quiet["gap_max_ms"] == 10.0 and quiet["events"] == 10, "a window with no hole")
     check(probe.summarize_gaps([], 0, ms)["events"] == 0, "no events")
+
+
+def test_a_boundary_event_has_one_owner():
+    ms = 1_000_000
+    stamps = [0, 10 * ms, 20 * ms, 30 * ms, 40 * ms]
+    # The long prompt is sent exactly at the event at 20 ms and ends exactly at the one at 30 ms.
+    start, end = 20 * ms, 30 * ms
+    before = probe.summarize_gaps(stamps, 0, start)
+    during = probe.summarize_gaps(stamps, start, end, overlapping=True)
+    after = probe.summarize_gaps(stamps, end, 40 * ms)
+    # Gaps: 0-10, 10-20, 20-30, 30-40. The 10-20 gap ends at the send, so it is the baseline's;
+    # the 20-30 gap is the prompt's; the 30-40 gap starts at the end, so it is the next window's.
+    check(before["gap_count"] == 2 and during["gap_count"] == 1 and after["gap_count"] == 1,
+          f"gaps per window {before['gap_count']} {during['gap_count']} {after['gap_count']}")
+    check(before["gap_count"] + during["gap_count"] + after["gap_count"] == 4,
+          "a gap was counted twice or not at all")
+    check(before["events"] + during["events"] + after["events"] == 4,
+          "a boundary event was counted in two windows")
+
+
+def test_a_failed_scenario_leaves_nothing_running():
+    server = fake_server()
+    try:
+        args = probe.parse_args([
+            "--base-url", f"http://127.0.0.1:{server.server_port}", "--model", "fake",
+            "--long-tokens", "2000", "--words-per-token", "1.0", "--seed", "7",
+            "--stream-tokens", "400", "--settle-events", "10", "--baseline-seconds", "0.3",
+            "--after-seconds", "0.3", "--timeout", "30",
+            "--cancel-long-after-seconds", str(STALL + 0.4)])
+        before = threading.active_count()
+        try:
+            probe.run_scenario(args)
+        except RuntimeError:
+            pass
+        else:
+            check(False, "the scenario did not fail")
+        time.sleep(0.2)
+        check(threading.active_count() <= before, "a worker thread was left running after a failure")
+    finally:
+        server.shutdown()
 
 
 def test_prompt_is_deterministic_and_uncached_across_seeds():
