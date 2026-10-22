@@ -562,7 +562,9 @@ void ModelRegistry::idle_loop() {
                     put_to_sleep_locked(lock, index);
                 } else if ((slot.state == ModelState::Loaded ||
                             slot.state == ModelState::Sleeping) &&
-                           policy_.unload_idle.count() > 0 && idle >= policy_.unload_idle) {
+                           !slot.held && policy_.unload_idle.count() > 0 &&
+                           idle >= policy_.unload_idle) {
+                    // A held sleep lasts until an explicit load(), so it is never auto-unloaded.
                     unload_locked(lock, index);
                 }
             } catch (...) {
