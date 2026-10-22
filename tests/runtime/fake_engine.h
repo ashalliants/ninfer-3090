@@ -206,6 +206,7 @@ struct PrefillProgress {
     BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
+    bool cap_applied                      = false;
     ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     bool capture_ready = false;
