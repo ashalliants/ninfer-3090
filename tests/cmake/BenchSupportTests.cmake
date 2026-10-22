@@ -19,6 +19,11 @@ target_include_directories(ninfer_context_cost_measure_test PRIVATE
 
 add_test(NAME ninfer_context_cost_measure_test COMMAND ninfer_context_cost_measure_test)
 
+# The prefill stall probe's self-test (tools/bench/run_prefill_stall.py), against a fake server that
+# stalls its streams while a long request is "prefilling". Pure Python, no GPU.
+add_test(NAME ninfer_prefill_stall_probe_test
+  COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/bench/test_prefill_stall.py)
+
 # The prefill time model (tools/bench/prefill_time_model.py) and the depth sweep that checks it against
 # a card (tools/bench/run_prefill_depth_sweep.py). Pure Python, no GPU: the model is checked against the
 # measurements docs/performance.md records and against the C++ PrefillPacing::step_cap; the sweep against
