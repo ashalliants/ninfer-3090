@@ -1,6 +1,6 @@
 # Decode during a long prefill: what is built, what is not, and what decides the rest
 
-Status: design note. It was written without a GPU; the options it describes were then run on an RTX 3090 on 2026-10-22 and the measurements are in `docs/maintainer/long-prefill-handoff.md` (PR #353) (layer slices: worst neighbour gap 2.93 s to 402 ms for 8% more prompt time). Numbers are
+Status: design note. It was written without a GPU. The options it describes are implemented in separate PRs (#340-#344 and #352); their GPU tests and measurements are recorded there and in the handoff note of #353, not in this note. Numbers are
 from `docs/serving.md`, `docs/performance.md` and the source comments they cite, and say so. Delete or
 fold into `docs/serving.md` once the open question below is settled.
 
@@ -36,9 +36,8 @@ Each is a flag, off by default, with its own counters:
   turns one round per step into a burst of rounds per step.
 - **`--prefill-layer-slices N`**: while another lane decodes, a text prefill chunk runs as N slices of
   consecutive layers and the neighbour's decode round runs between slices, so its gap is a slice
-  (about a step / N) while the chunk keeps its size. The option the next sections argue for. **Run on
-  an RTX 3090 on 2026-10-22**: the sliced prefill equals the whole-chunk prefill bit for bit and the
-  neighbour's worst gap fell from 2.93 s to 402 ms; see "Decode rounds between the layers of a prefill step" below.
+  (about a step / N) while the chunk keeps its size. The option the next sections argue for (PR #352; see
+  "Decode rounds between the layers of a prefill step" below).
 - **`--yield-long-prefill-ms N`**: with every lane busy, a short request waiting at the head of the
   queue pauses a long prefill (at least N ms left) at a step boundary instead of waiting out its
   minute. The paused prefill keeps its progress as a snapshot and resumes after.
@@ -89,8 +88,8 @@ card (not kept in the repo) in which overlapping one prefill with one decode "ga
 ### Decode rounds between the layers of a prefill step
 
 This is the option that shortens gaps while keeping a large step (so the dequantise pass stays
-amortised), and it **is built** as `--prefill-layer-slices`. It was written without a GPU and has since been run on
-one (see the verification bullet below). How it works and what it rests on:
+amortised), and it **is built** as `--prefill-layer-slices`. It was written without a GPU for this note; its tests and
+measurements are recorded with the implementation (PR #352). How it works and what it rests on:
 
 - A chunk runs as N Program calls. Between slices the residual stream (`T x hidden`, 40 MB at 4096 on
   the 27B) is parked in `prefill_hidden`, a persistent buffer only the chunk's tail writes, so no
@@ -104,14 +103,11 @@ one (see the verification bullet below). How it works and what it rests on:
 - Limits: text-only chunks, no DFlash tap (its per-chunk state would have to cross the boundary), no
   pipeline split, so the default one-lane DFlash2 profile never slices and the two-lane MTP profile is the
   one it is for.
-- **Verified on a GPU (RTX 3090, 2026-10-22), and what is not:** the assumption everything rests on is
-  that nothing but the residual and the roots is live in the arena across layers. `sliced_prefill_matches_whole`
-  (sliced hidden states, KV and state equal the whole-chunk prefill, a part-way abort leaks nothing, a lane
-  part-way through a chunk cannot be paused) passes, and greedy output of a 56K-token prompt served beside a
-  stream and a short request was token-identical with and without the flag. That test drives one lane
-  through `Program`; the resume-after-a-sibling's-decode path is covered by those served runs, the fake-model
-  scheduling tests and not yet by a two-lane GPU `Program` test. CPU and fake-model coverage is the
-  scheduling logic; the GPU evidence is the test above and the served runs.
+- **What it assumes, and where that is checked:** that nothing but the residual and the roots is live in
+  the arena across layers. The checks belong to the implementation and are recorded there: the GPU test
+  `sliced_prefill_matches_whole` (sliced hidden states, KV and state equal the whole-chunk prefill; a
+  part-way abort leaks nothing; a lane part-way through a chunk cannot be paused), served-output equality,
+  the fake-model scheduling tests for ordering and lifecycle, and the timings. This note does not repeat them.
 
 Its cost is the decode round it adds at each boundary (tens of ms, while the neighbour lasts) and the
 two residual copies per boundary (under a millisecond), against a prompt that runs at full chunk speed.
@@ -142,4 +138,4 @@ prompt prefills (the assessment's symptom was 4-6 tok/s against ~55 uncontended)
 prompt's own speed cost? Compare them with `--prefill-layer-slices` (2, 4 and 8, chunk 4096): the claim is a gap of about a step
 divided by N at full prompt speed. If a budget around 500 ms with a decode share already reaches the gap
 you need, slicing is not needed; if the only settings that reach it make the prompt 3x slower, slicing
-is the option that should; the 3090 measurements say it does (402 ms at 8 slices for 8% more prompt time).
+is the option that should.
