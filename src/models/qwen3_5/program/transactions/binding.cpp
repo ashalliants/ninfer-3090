@@ -76,6 +76,16 @@ bool ProgramImpl::prompt_fits_beside_residents(const RequestBasePlan& base,
             pin(*backend_kv_addresses, *backend_kv_pages, *sequence.kv->backend, pinned_backend);
         }
     }
+    // Installed external context (a prompt graft) is pinned for good: its device pages are held
+    // whether or not any resident uses them, and nothing can reclaim them. A resident that shares
+    // them is already in the sets, and a set counts each page once.
+    for (const auto& slot : checkpoints) {
+        if (!slot.external || !slot.value || !slot.value->kv) { continue; }
+        pin(*text_kv_addresses, *text_kv_pages, slot.value->kv->text, pinned_main);
+        if (slot.value->kv->backend) {
+            pin(*backend_kv_addresses, *backend_kv_pages, *slot.value->kv->backend, pinned_backend);
+        }
+    }
     const auto prompt = base.summary().prompt_tokens;
     // The last chunk's frontiers are the whole prompt's, including the draft's extra rows.
     const auto whole = prefill_unit(prompt, prompt > prefill_chunk ? prompt - prefill_chunk : 0,
