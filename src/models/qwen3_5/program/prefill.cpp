@@ -593,7 +593,9 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             std::uint32_t nominal = std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
             // A cap shortens the step only; the planned chunk and its reservation stay as they
             // were. A media item's span decides its own step, so a prompt with media keeps the plan.
+            const std::uint32_t uncapped_nominal = nominal;
             if (max_tokens != 0 && !staged.vision) { nominal = std::min(nominal, max_tokens); }
+            const bool cap_shortened = nominal < uncapped_nominal;
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
             if (is_masked_draft_backend(speculative_backend)) {
@@ -702,9 +704,12 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 }
                 staged.elapsed_seconds +=
                     std::chrono::duration<double>(Clock::now() - started).count();
+                // A step that ran its whole (capped) width without meeting a capture frontier was
+                // narrowed by the cap; one a frontier ended would have ended there anyway.
                 return runtime::PrefillStepResult{
                     .summary                 = summary,
                     .processed_prompt_tokens = processed_prompt_tokens,
+                    .cap_applied             = cap_shortened && remaining == 0,
                     .timing                  = timing.finish(),
                 };
             }
