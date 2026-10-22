@@ -274,6 +274,9 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
     GAUGE(running_requests, "requests_running", "Resident requests, including prefill and decode.");
     GAUGE(waiting_requests, "requests_waiting", "Requests waiting for initial admission.");
     GAUGE(paused_requests, "requests_paused", "Paused requests waiting for recovery.");
+    GAUGE(prefill_backlog_seconds, "prefill_backlog_seconds",
+          "Predicted prefill work ahead of a new request: resident prefills' remainder plus queued "
+          "requests uncached.");
     GAUGE(prefilling_requests, "requests_prefilling", "Resident requests in initial prefill.");
     GAUGE(decode_ready_requests, "requests_decode_ready", "Resident requests ready for decode.");
     GAUGE(replaying_requests, "requests_replaying",
