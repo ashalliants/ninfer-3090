@@ -23,6 +23,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_context_store_test
   ninfer_device_sync_invalid_test
   ninfer_effective_thinking_budget_test
+  ninfer_engine_scheduling_test
   ninfer_gdn_replay_records_test
   ninfer_ggml_blocks_decode_test
   ninfer_grammar_test
@@ -46,6 +47,9 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_openai_responses_test
   ninfer_openai_schema_test
   ninfer_perplexity_evaluation_test
+  ninfer_prefill_stall_probe_test
+  ninfer_prefill_pacing_test
+  ninfer_prefill_yield_test
   ninfer_prefill_depth_sweep_test
   ninfer_prefill_time_model_test
   ninfer_pretty_logging_test

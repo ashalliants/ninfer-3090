@@ -413,6 +413,44 @@ int main() {
                           context_cache.context_cache.host_capacity_bytes == (64ULL << 20),
                       "context-cache capacities did not reach serving options");
 
+    failures += check(defaults.prefill_schedule.stall_budget_ms == 0,
+                      "the prefill stall budget is not off by default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--prefill-stall-budget-ms", "300"})
+                              .prefill_schedule.stall_budget_ms == 300,
+                      "--prefill-stall-budget-ms did not reach serving options");
+    failures += check(defaults.prefill_schedule.yield_remaining_ms == 0,
+                      "yielding a long prefill is not off by default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--yield-long-prefill-ms", "5000"})
+                              .prefill_schedule.yield_remaining_ms == 5000,
+                      "--yield-long-prefill-ms did not reach serving options");
+    {
+        bool oversized_yield_rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--yield-long-prefill-ms", "3600001"});
+        } catch (const std::invalid_argument&) { oversized_yield_rejected = true; }
+        failures += check(oversized_yield_rejected, "--yield-long-prefill-ms accepted over an hour");
+    }
+    failures += check(defaults.prefill_schedule.decode_share_percent == 0,
+                      "the prefill decode share is not off by default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--prefill-decode-share", "50"})
+                              .prefill_schedule.decode_share_percent == 50,
+                      "--prefill-decode-share did not reach serving options");
+    {
+        bool oversized_share_rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--prefill-decode-share", "91"});
+        } catch (const std::invalid_argument&) { oversized_share_rejected = true; }
+        failures += check(oversized_share_rejected, "--prefill-decode-share accepted more than 90");
+    }
+    {
+        bool oversized_budget_rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--prefill-stall-budget-ms", "60001"});
+        } catch (const std::invalid_argument&) { oversized_budget_rejected = true; }
+        failures += check(oversized_budget_rejected,
+                          "--prefill-stall-budget-ms accepted more than a minute");
+    }
+
     const ServeOptions zero_host_context =
         parse({"ninfer-serve", "model.ninfer", "--host-context-mib", "0"});
     failures += check(zero_host_context.context_cache.enabled &&

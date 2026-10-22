@@ -180,6 +180,12 @@ void validate(const EngineOptions& options) {
     if (options.devices.size() > 1) { refuse("runs on one GPU: pass a single id to --devices"); }
     if (!options.stage_layers.empty()) { refuse("runs on one GPU with no pipeline stages: remove --stage-layers"); }
     if (options.flash_next.context_nvme_bytes > kMaxByteOption) { refuse("--context-nvme-mib is at most 1048576"); }
+    if (options.prefill_schedule.yield_remaining_ms != 0) {
+        refuse("does not pause a prefill for the queue: remove --yield-long-prefill-ms");
+    }
+    if (options.prefill_schedule.stall_budget_ms != 0) {
+        refuse("sizes its own prefill calls and ignores a stall budget: remove --prefill-stall-budget-ms");
+    }
     if (options.context_cache.auto_host_cache) {
         refuse("sizes its context cache's Host tier from its own RAM ledger: remove --auto-host-cache (set the size with "
                "--host-context-mib, or 0 to turn prefix reuse off)");

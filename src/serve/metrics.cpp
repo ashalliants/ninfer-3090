@@ -274,6 +274,9 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
     GAUGE(running_requests, "requests_running", "Resident requests, including prefill and decode.");
     GAUGE(waiting_requests, "requests_waiting", "Requests waiting for initial admission.");
     GAUGE(paused_requests, "requests_paused", "Paused requests waiting for recovery.");
+    GAUGE(prefill_backlog_seconds, "prefill_backlog_seconds",
+          "Predicted prefill work ahead of a new request: resident prefills' remainder plus queued "
+          "requests uncached.");
     GAUGE(prefilling_requests, "requests_prefilling", "Resident requests in initial prefill.");
     GAUGE(decode_ready_requests, "requests_decode_ready", "Resident requests ready for decode.");
     GAUGE(replaying_requests, "requests_replaying",
@@ -364,6 +367,14 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
             "Requests cancelled while their prompt was prefilling.");
     COUNTER(cancelled_prefill_computed_tokens, "cancelled_prefill_computed_tokens_total",
             "Prompt tokens those requests had computed when they were cancelled.");
+    COUNTER(paced_prefill_steps, "paced_prefill_steps_total",
+            "Prefill steps cut short by --prefill-stall-budget-ms because another lane was decoding.");
+    COUNTER(paced_prefill_deferred_tokens, "paced_prefill_deferred_tokens_total",
+            "Prompt tokens those steps left for later steps.");
+    COUNTER(prefill_yields, "prefill_yields_total",
+            "Prefills paused so a short request at the head of the queue could be admitted.");
+    COUNTER(deferred_prefill_turns, "deferred_prefill_turns_total",
+            "Worker cycles that skipped their prefill step to give decode rounds their share.");
     COUNTER(engine_recoveries, "engine_recoveries_total",
             "Host-side worker failures survived by failing in-flight requests and clearing the "
             "context cache.");

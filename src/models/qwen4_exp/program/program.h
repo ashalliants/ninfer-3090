@@ -222,6 +222,7 @@ struct PrefillProgress {
     runtime::BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
+    bool cap_applied                      = false; // this Program ignores the cap
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     bool capture_ready = false;
@@ -462,7 +463,8 @@ public:
     [[nodiscard]] bool start_demote(const ContextDemotion&) { return false; }
     // One lane and a whole-extent reservation at admission: there is never a younger resident to
     // pause, so pausing is refused.
-    [[nodiscard]] bool start_pause(SequenceHandle, bool, runtime::ExecutionTiming* = nullptr) { return false; }
+    [[nodiscard]] bool start_pause(SequenceHandle, bool, runtime::ExecutionTiming* = nullptr,
+                                   bool = false) { return false; }
     [[nodiscard]] ContextProgress poll_context(runtime::CancellationFlagView cancellation);
     [[nodiscard]] bool has_context_transaction() const noexcept;
     [[nodiscard]] bool context_blocks(SequenceHandle) const noexcept { return false; }
@@ -473,9 +475,12 @@ public:
     [[nodiscard]] bool vision_pending(SequenceHandle) const noexcept { return false; }
     bool poll_vision() { return false; }
     bool drain_vision_window() { return false; }
+    // `max_tokens` is accepted so the Engine can pass it to any model; this model sizes its own
+    // calls (the router decides how wide each is) and ignores it.
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   runtime::ExecutionTiming* failed_timing = nullptr,
-                                                  runtime::TokenMaskProvider* masks       = nullptr);
+                                                  runtime::TokenMaskProvider* masks       = nullptr,
+                                                  std::uint32_t max_tokens                = 0);
     [[nodiscard]] ReplayProgress advance_replay(SequenceHandle sequence,
                                                 runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,

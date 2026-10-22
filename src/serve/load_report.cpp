@@ -55,7 +55,11 @@ std::string make_load_report(const LoadCapacity& capacity, const LoadSample& sam
                           {"waiting", stats.waiting_requests},
                           {"paused", stats.paused_requests},
                           {"replaying", stats.replaying_requests},
-                          {"materializing", stats.materializing_requests}}},
+                          {"materializing", stats.materializing_requests},
+                          {"prefill_backlog_seconds",
+                           std::isfinite(stats.prefill_backlog_seconds)
+                               ? stats.prefill_backlog_seconds
+                               : 0.0}}},
         {"occupancy", Json{{"device_main_kv_pages", stats.device_main_kv_occupied_pages},
                            {"device_main_kv_tokens", occupied_tokens},
                            {"device_state_slots", stats.device_state_occupied_slots},

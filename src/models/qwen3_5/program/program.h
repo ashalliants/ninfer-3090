@@ -318,6 +318,7 @@ struct PrefillProgress {
     runtime::BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
+    bool cap_applied                      = false; // see runtime::PrefillStepResult
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     bool capture_ready = false;
@@ -519,8 +520,13 @@ public:
                   std::span<const CheckpointHandle> excluded,
                   runtime::ContextResourceUsage shortage) const;
     [[nodiscard]] bool start_demote(const ContextDemotion& plan);
+    // `require_snapshot` makes the pause all-or-nothing for a caller that only serves the queue: it is
+    // refused, with nothing changed, where the progress could not be saved (a replaying lane, or a
+    // chunk part-way through a Vision item). A backup reservation that fails after the pause has
+    // begun can still leave a snapshot-less pause; see the yield documentation.
     [[nodiscard]] bool start_pause(SequenceHandle sequence, bool save_snapshot,
-                                   runtime::ExecutionTiming* timing = nullptr);
+                                   runtime::ExecutionTiming* timing = nullptr,
+                                   bool require_snapshot = false);
     [[nodiscard]] ContextProgress poll_context(runtime::CancellationFlagView cancellation);
     [[nodiscard]] bool has_context_transaction() const noexcept;
     // Model suspend, for a Program over a Model materialized suspendable. The Program must be idle:
@@ -552,9 +558,14 @@ public:
     // Waits for an open window's encode and returns its pages; the embeddings stay with the
     // sequence. Called before any shortage is answered by eviction or preemption.
     bool drain_vision_window();
+    // Runs one prefill step. `max_tokens` (0: none) caps the step below the planned chunk, in the
+    // caller's choice of multiple of 128; a step that has to cover a media item ignores it.
+    // The unit's reservation was made for the whole chunk, so a shorter step simply leaves part of
+    // it unused, as a step cut at a capture frontier does.
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   runtime::ExecutionTiming* failed_timing = nullptr,
-                                                  runtime::TokenMaskProvider* masks = nullptr);
+                                                  runtime::TokenMaskProvider* masks = nullptr,
+                                                  std::uint32_t max_tokens = 0);
     [[nodiscard]] ReplayProgress advance_replay(SequenceHandle sequence,
                                                 runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,

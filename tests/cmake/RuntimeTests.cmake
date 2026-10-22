@@ -2,6 +2,18 @@ ninfer_add_test(ninfer_scheduler_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_scheduler.cpp"
   LIBRARIES ninfer_runtime_support)
 
+ninfer_add_test(ninfer_prefill_pacing_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_prefill_pacing.cpp"
+  LIBRARIES ninfer_runtime_support)
+
+ninfer_add_test(ninfer_prefill_yield_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_prefill_yield.cpp"
+  LIBRARIES ninfer_runtime_support)
+
+ninfer_add_test(ninfer_engine_scheduling_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_engine_scheduling.cpp"
+  LIBRARIES ninfer_runtime_support ninfer_engine ninfer::json)
+
 ninfer_add_test(ninfer_worker_recovery_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_worker_recovery.cpp"
   LIBRARIES ninfer_runtime_support)

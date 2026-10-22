@@ -198,7 +198,8 @@ std::array<std::int32_t, 3> prompt_rope_position(const PreparedPromptData& promp
 
 PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
                                              runtime::ExecutionTiming* timing,
-                                             runtime::TokenMaskProvider* masks) {
+                                             runtime::TokenMaskProvider* masks,
+                                             std::uint32_t max_tokens) {
     if (!valid_sequence(handle)) { throw std::logic_error("prefill has a stale lane"); }
     const auto lane = ContractAccess::lane(handle).value;
     require_unit(lane, ExecutionUnitKind::Prefill);
@@ -221,15 +222,16 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
         CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &config, sizeof(config),
                                    cudaMemcpyHostToDevice, device.stream));
     }
-    auto progress = wrap_prefill(lane, advance_prefill_raw(lane, timing));
+    auto progress = wrap_prefill(lane, advance_prefill_raw(lane, timing, max_tokens));
     if (!progress.complete) { settle_unit(lane); }
     return progress;
 }
 
 runtime::PrefillStepResult
-ProgramImpl::advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing) {
+ProgramImpl::advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing,
+                                 std::uint32_t max_tokens) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
-    return advance_prefill(active_sequence(lane), requests[lane], failed_timing);
+    return advance_prefill(active_sequence(lane), requests[lane], failed_timing, max_tokens);
 }
 
 runtime::ExecutionTiming ProgramImpl::resolve_prefill_raw(std::uint32_t lane, bool terminal,
@@ -506,7 +508,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
 
 runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                                                         RequestControl& request,
-                                                        runtime::ExecutionTiming* failed_timing) {
+                                                        runtime::ExecutionTiming* failed_timing,
+                                                        std::uint32_t max_tokens) {
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
     if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) {
         throw std::logic_error("staged prefill step requires an active concurrent request");
@@ -587,8 +590,12 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         }
 
         if (staged.cursor < staged.prompt_tokens) {
-            const std::uint32_t nominal =
-                std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+            std::uint32_t nominal = std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+            // A cap shortens the step only; the planned chunk and its reservation stay as they
+            // were. A media item's span decides its own step, so a prompt with media keeps the plan.
+            const std::uint32_t uncapped_nominal = nominal;
+            if (max_tokens != 0 && !staged.vision) { nominal = std::min(nominal, max_tokens); }
+            const bool cap_shortened = nominal < uncapped_nominal;
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
             if (is_masked_draft_backend(speculative_backend)) {
@@ -697,9 +704,12 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 }
                 staged.elapsed_seconds +=
                     std::chrono::duration<double>(Clock::now() - started).count();
+                // A step that ran its whole (capped) width without meeting a capture frontier was
+                // narrowed by the cap; one a frontier ended would have ended there anyway.
                 return runtime::PrefillStepResult{
                     .summary                 = summary,
                     .processed_prompt_tokens = processed_prompt_tokens,
+                    .cap_applied             = cap_shortened && remaining == 0,
                     .timing                  = timing.finish(),
                 };
             }

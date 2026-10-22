@@ -26,6 +26,7 @@ namespace ninfer::runtime {
 
 struct Qwen4ExpInstance {
     using ModelContract = models::qwen4_exp::RuntimeTypes;
+    using Device        = DeviceContext;
 
     std::unique_ptr<models::qwen4_exp::Model> model;
     const models::qwen4_exp::execution::Parameters parameters;

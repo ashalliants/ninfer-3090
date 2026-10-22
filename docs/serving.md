@@ -361,7 +361,7 @@ curl http://127.0.0.1:8080/v1/load -H 'Authorization: Bearer local-secret'
                "max_context": 65536, "kv_capacity_tokens": 131072, "kv_capacity_pages": 2048,
                "kv_page_tokens": 64, "device_state_slots": 8, "host_context_bytes": 17179869184},
   "requests": {"admitted": 6, "running": 4, "prefilling": 1, "decode_ready": 3, "waiting": 2,
-               "paused": 0, "replaying": 0, "materializing": 0},
+               "paused": 0, "replaying": 0, "materializing": 0, "prefill_backlog_seconds": 14.2},
   "occupancy": {"device_main_kv_pages": 1500, "device_main_kv_tokens": 96000,
                 "device_state_slots": 5, "host_context_bytes": 2684354560,
                 "host_state_slots": 7, "host_kv_bytes": 2147483648},
@@ -386,7 +386,11 @@ curl http://127.0.0.1:8080/v1/load -H 'Authorization: Bearer local-secret'
   left to prefill, `replaying` the lanes rebuilding a paused request's state, and `decode_ready` the
   lanes in the decode batch. `waiting` counts requests submitted to the Engine FIFO that have not
   been admitted to a lane yet. `paused` counts admitted requests that resource pressure paused; they
-  hold no lane and resume in their original order.
+  hold no lane and resume in their original order. `prefill_backlog_seconds` is the prefill time the
+  Engine's context-cost model predicts is ahead of a new request: what the resident prefills have left
+  plus what each queued request costs from scratch (a cache hit makes it cheaper). It leaves out decode
+  and paused requests and is 0 when idle, so a gateway choosing between servers can prefer the smaller
+  backlog; it is a prediction from the machine's fitted costs, not a promise.
 - `capacity.host_context_bytes` is the one pinned Host budget (see
   [Automatic host cache](#automatic-host-cache)). `occupancy` reports current Main KV pages (and
   tokens), Device StateImage slots, and the Host context bytes in use, including destinations
@@ -814,6 +818,10 @@ server restarts.
 | `ninfer_admission_fit_deferrals_total` | fresh requests queued by `--admission-fit-check` because their whole prompt could not fit in the KV pool beside the resident requests; zero when the flag is off |
 | `ninfer_waiting_cancelled_requests_total`, `ninfer_waiting_expired_requests_total`, `ninfer_waiting_abandoned_seconds_total` | requests the client cancelled, or the pending timeout expired, before admission, and the total time they had waited (a client that gives up after 60 s shows up here) |
 | `ninfer_cancelled_prefills_total`, `ninfer_cancelled_prefill_computed_tokens_total` | requests cancelled while prefilling, and the prompt tokens they had computed |
+| `ninfer_paced_prefill_steps_total`, `ninfer_paced_prefill_deferred_tokens_total` | prefill steps cut short by `--prefill-stall-budget-ms` because another lane was decoding, and the prompt tokens they pushed to later steps |
+| `ninfer_prefill_backlog_seconds` | gauge: predicted prefill work ahead of a new request (resident remainder plus queued requests uncached); the same figure as `prefill_backlog_seconds` in `/v1/load` |
+| `ninfer_prefill_yields_total` | prefills paused so a short request at the head of the queue could be admitted (`--yield-long-prefill-ms`) |
+| `ninfer_deferred_prefill_turns_total` | worker cycles that held the prefill step back for `--prefill-decode-share` |
 | `ninfer_engine_recoveries_total` | host-side worker failures the server survived by failing the in-flight requests and clearing the context cache |
 | `ninfer_device_kv_{used,capacity}_pages`, `ninfer_device_backend_kv_used_pages`, `ninfer_device_state_{used,capacity}_slots` | physical Main KV, speculative backend KV and StateImage occupancy; retained history also occupies these pools |
 | `ninfer_host_context_{used,reserved,capacity,peak}_bytes`, `ninfer_host_state_images`, `ninfer_host_kv_used_bytes` | unified Host backing; reserved bytes, StateImages and KV bytes are breakdowns already included in used bytes |
@@ -1952,6 +1960,9 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--suspend-snapshot pageable\|pinned` | where the retained state waits in host memory while suspended | `pageable` |
 | `--suspend-weights artifact\|host` | where a resume takes the weights from: the artifact again, or a host copy taken at suspend (weight-sized host memory, faster wake) | `artifact` |
 | `--no-auto-resume` | a request while suspended fails (503) instead of resuming the model | requests resume it |
+| `--prefill-stall-budget-ms N` | while another lane decodes, cut each prefill step so it is predicted to take at most N ms; see [execution behavior](#execution-behavior) | off |
+| `--yield-long-prefill-ms N` | let the request at the head of the queue pause a prefill with at least N ms of work left, when its own prefill costs at most a quarter of that; see [execution behavior](#execution-behavior) | off |
+| `--prefill-decode-share P` | after each prefill step, while another lane decodes, run decode rounds for P percent (0-90) of the step's time before the next step; see [execution behavior](#execution-behavior) | off |
 | `--sleep-idle-seconds N` | suspend the model after N seconds with no request; needs `--model-suspend` (with a router, sleeps idle models that were started with it) | off |
 | `--models-dir DIR` | [router mode](#several-models-router): serve every `.ninfer` in DIR; give no artifact path | off |
 | `--models-preset FILE` | router mode: INI presets, `[id]` sections with `model = PATH` and options without dashes; `[*]` applies to all | off |
@@ -2204,6 +2215,45 @@ measured 1,043 ms at chunk 1024, 515 ms at 512, and 312 ms at 256, against an 82
 interval; the ingesting request's own prefill rate fell only from 1,135 to 1,130 to 1,110 tok/s.
 Prefill units of different requests are never batched together, so a smaller chunk trades almost no
 ingestion throughput for a proportionally smaller stall. The shipped concurrent launcher uses 512.
+
+`--prefill-stall-budget-ms N` makes that choice per step instead of per server. While another lane is
+decoding, the Engine cuts a prefill step so the context-cost model predicts it to take at most N ms,
+in multiples of 128 tokens and never below 512; with nobody decoding a step keeps the full
+`--prefill-chunk`, so a lone long prompt prefills at full speed. The prediction is the machine's
+fitted per-step, per-token and per-attention-pair costs, scaled by how long recent steps actually
+took against what the model said, so it follows a card that runs slower than the preset. A step deep
+into a long prompt costs more attention than an early one and is cut harder for the same budget.
+A smaller step is slower per token: at `--prefill-cublas` the weight dequantise pass is paid once per
+step: measured end to end on the 27B, the route runs 1.22x the integer route's speed at chunk 512 and
+1.59x at 4096 (`src/ops/linear_swiglu/q4cublas/w4_cublas_prefill.h`). Pick a chunk near the largest you
+want and let the budget shorten it only when somebody is waiting. `ninfer_paced_prefill_steps_total`
+and `ninfer_paced_prefill_deferred_tokens_total` count the steps it cut and the tokens it pushed to
+later steps. Off by default; it does nothing at `--max-concurrency 1`, where no other lane decodes.
+Qwen3.8-Flash-Next sizes its own prefill calls and refuses the flag.
+
+`--yield-long-prefill-ms N` is for the queue rather than the other streams. A fresh request never
+preempts a resident one, so with every lane busy it waits for the lane's request to finish, which behind
+a 100,000-token prompt is about a minute however small the newcomer is. With the flag, the request at the
+head of the queue may pause a resident prefill that still has at least N ms of work left, as the cost
+model predicts it, when the newcomer's own prefill (uncached, so a cache hit only makes it cheaper) costs
+at most a quarter of that. The prefill is paused at a step boundary and keeps its progress as a snapshot;
+it is restored behind the newcomer, once that request has been admitted (or after 10 s if it cannot be).
+Several limits keep it from doing harm: a pause that cannot save the prefill's progress is not made (the
+alternative would recompute it all), a prompt with media is never paused, a request is paused at most
+four times, and the same newcomer never pauses a second prefill. `ninfer_prefill_yields_total` counts the
+pauses. It needs a free state slot and Host room for the snapshot (the same capacity as a pause for
+resource pressure), and it does nothing when a lane is free. Off by default; Qwen3.8-Flash-Next refuses
+the flag.
+
+`--prefill-decode-share P` (0-90) is the other half. After each prefill step, while a lane is decoding,
+the Engine runs decode rounds until they have used P percent of the time the step took before it runs
+the next step. At 50 a 1.5 s step is followed by 1.5 s of decode rounds, so each stream gets a burst of
+tokens (DFlash2 and MTP rounds emit several each) instead of one, and the prompt takes about twice as
+long while the neighbour lasts. It does not shorten the longest gap between a stream's tokens, which is
+still one step; use the stall budget for that. The two combine: a budget of 500 ms and a share of 50 give
+a stream a burst every ~1 s with half its normal speed. The debt a step creates is capped at 10 s, and
+after 4,096 deferred turns in a row a step runs regardless. `ninfer_deferred_prefill_turns_total` counts
+the cycles that held the prefill back. Off by default.
 
 Input memory is bounded by the outstanding-request count and the per-request
 `--max-request-mib` limit. Media preparation uses a shared permit pool sized from `--media-live-mib`

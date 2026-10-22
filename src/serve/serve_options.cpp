@@ -148,7 +148,10 @@ std::string serve_usage_text(const char* argv0) {
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--fit-context MIN] "
            "[--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
+           "[--prefill-chunk N] [--prefill-stall-budget-ms N] [--yield-long-prefill-ms N] "
+           "[--prefill-decode-share P] "
+           "[--log-stats-interval-ms N] "
+           "[--device N] "
            "[--context-cost-presets FILE] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
@@ -216,6 +219,21 @@ std::string serve_usage_text(const char* argv0) {
            std::to_string(kFitContextStepTokens) +
            " tokens that does (the KV pool follows) and logs the reduction; below MIN it refuses "
            "to start\n"
+           "       --prefill-stall-budget-ms N cuts a prefill step so the cost model predicts it to take "
+           "at most N ms whenever another lane is decoding (steps are multiples of 128 tokens, never "
+           "below 512). A step normally runs the whole --prefill-chunk, which pauses every other "
+           "stream for its duration. Smaller steps make the prompt itself slower; 0 (the default) "
+           "keeps the planned chunk\n"
+           "       --yield-long-prefill-ms N lets the request at the head of the queue pause a prefill "
+           "that still has at least N ms of work left, when its own prefill costs at most a "
+           "quarter of that, instead of waiting out the whole prompt. The paused prefill keeps its "
+           "progress as a snapshot and resumes behind the newcomer (at most four pauses per "
+           "request; prompts with media are never paused). Off by default\n"
+           "       --prefill-decode-share P runs decode rounds for P percent of the time a prefill step "
+           "took before the next step starts, while another lane is decoding (0-90). Streams get a "
+           "burst of tokens after every step instead of one and the prompt takes longer while it "
+           "lasts; the longest gap is still a step, so combine it with --prefill-stall-budget-ms. "
+           "Off by default\n"
            "       --prefill-cublas hands wide prefill GEMMs to cuBLAS: a large prefill speedup for a "
            "small perplexity cost (docs/performance.md), off by default, and it wants a larger "
            "--prefill-chunk to pay; --no-prefill-cublas-projections keeps the attention and GDN "
@@ -455,6 +473,18 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--progress-anchor-tokens") {
             options.progress_anchor_tokens = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--progress-anchor-tokens"), "progress-anchor-tokens"));
+        } else if (arg == "--prefill-stall-budget-ms") {
+            options.prefill_schedule.stall_budget_ms = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--prefill-stall-budget-ms"),
+                                      "prefill-stall-budget-ms"));
+        } else if (arg == "--yield-long-prefill-ms") {
+            options.prefill_schedule.yield_remaining_ms = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--yield-long-prefill-ms"),
+                                      "yield-long-prefill-ms"));
+        } else if (arg == "--prefill-decode-share") {
+            options.prefill_schedule.decode_share_percent = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--prefill-decode-share"),
+                                      "prefill-decode-share"));
         } else if (arg == "--progress-anchors-shared") {
             options.progress_anchors_shared = true;
         } else if (arg == "--context-cost-presets") {
@@ -929,6 +959,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.progress_anchor_tokens != 0 && !options.allow_prefix_reuse) {
         throw std::invalid_argument("--progress-anchor-tokens cannot be combined with --no-prefix-reuse");
+    }
+    if (options.prefill_schedule.stall_budget_ms > kMaximumPrefillStallBudgetMs) {
+        throw std::invalid_argument("--prefill-stall-budget-ms must be at most 60000");
+    }
+    if (options.prefill_schedule.yield_remaining_ms > kMaximumPrefillYieldRemainingMs) {
+        throw std::invalid_argument("--yield-long-prefill-ms must be at most 3600000");
+    }
+    if (options.prefill_schedule.decode_share_percent > kMaximumPrefillDecodeSharePercent) {
+        throw std::invalid_argument("--prefill-decode-share must be at most 90");
     }
     product::apply_speculative_defaults(options.speculative);
     product::validate_speculative_cli_options(options.speculative);

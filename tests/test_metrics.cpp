@@ -142,6 +142,11 @@ int main() {
     fork.waiting_abandoned_seconds        = 240.5;
     fork.cancelled_prefills               = 2;
     fork.cancelled_prefill_computed_tokens = 4096;
+    fork.paced_prefill_steps              = 6;
+    fork.paced_prefill_deferred_tokens    = 14336;
+    fork.prefill_yields                   = 3;
+    fork.prefill_backlog_seconds          = 61.25;
+    fork.deferred_prefill_turns           = 31;
     fork.engine_recoveries                = 1;
     fork.context_store_images             = 5;
     fork.context_store_used_bytes         = 123456789;
@@ -165,6 +170,11 @@ int main() {
               has_line(series, "ninfer_waiting_abandoned_seconds_total 240.5") &&
               has_line(series, "ninfer_cancelled_prefills_total 2") &&
               has_line(series, "ninfer_cancelled_prefill_computed_tokens_total 4096") &&
+              has_line(series, "ninfer_paced_prefill_steps_total 6") &&
+              has_line(series, "ninfer_paced_prefill_deferred_tokens_total 14336") &&
+              has_line(series, "ninfer_prefill_yields_total 3") &&
+              has_line(series, "ninfer_prefill_backlog_seconds 61.25") &&
+              has_line(series, "ninfer_deferred_prefill_turns_total 31") &&
               has_line(series, "ninfer_engine_recoveries_total 1"),
           "abandoned, cancelled, recovery and phase-time series must be reported");
     check(has_line(series, "ninfer_context_store_images 5") &&
