@@ -29,6 +29,28 @@ ContextMachineCostModel model() {
     return costs;
 }
 
+// The same table is asserted by `test_step_cap_matches_the_expected_values_of_the_cpp_policy` in
+// tools/bench/test_prefill_time_model.py, which keeps the Python time model on this policy: change a
+// value here and the other test fails until it is changed there too.
+void test_step_cap_expected_values() {
+    ContextMachineCostModel costs;
+    costs.prefill.chunk_ns              = 100'000'000;
+    costs.prefill.token_ns_q32          = 310'000ULL << 32U;
+    costs.prefill.attention_pair_ns_q32 = 1ULL << 31U; // 0.5 ns per attention pair
+    struct Row {
+        std::uint32_t budget_ms, at_start, at_90k;
+    };
+    const Row table[] = {{100, 512, 512},   {200, 512, 512},   {300, 640, 512},  {500, 1280, 1024},
+                         {800, 2176, 1920}, {1200, 3456, 3072}, {1500, 0, 3840}};
+    for (const Row& row : table) {
+        const PrefillPacing pacing(PrefillPacingOptions{.stall_budget_ms = row.budget_ms});
+        require(pacing.step_cap(costs, 0, 4096, true) == row.at_start,
+                "step cap at prefix 0 left the table shared with the Python time model");
+        require(pacing.step_cap(costs, 90'000, 4096, true) == row.at_90k,
+                "step cap at prefix 90k left the table shared with the Python time model");
+    }
+}
+
 void test_cap_is_off_by_default() {
     const PrefillPacing pacing;
     require(pacing.step_cap(model(), 0, 4096, true) == 0, "default pacing capped a step");
@@ -201,6 +223,7 @@ void test_share_has_a_turn_limit() {
 
 int main() {
     try {
+        test_step_cap_expected_values();
         test_cap_is_off_by_default();
         test_cap_needs_a_decoding_neighbour();
         test_cap_respects_budget_and_alignment();
