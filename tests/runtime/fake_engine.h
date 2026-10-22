@@ -667,7 +667,8 @@ public:
                                                   std::uint32_t max_tokens = 0) {
         Lane& lane = checked(sequence);
         const std::uint32_t remaining = lane.prompt - lane.cursor;
-        std::uint32_t step            = std::min(chunk_, remaining);
+        const std::uint32_t uncapped  = std::min(chunk_, remaining);
+        std::uint32_t step            = uncapped;
         if (max_tokens != 0) { step = std::min(step, max_tokens); }
         Event event{Event::Kind::Prefill, sequence.lane, lane.plan, step, max_tokens, lane.cursor, false};
         hook(event);
@@ -675,6 +676,7 @@ public:
         PrefillProgress progress;
         progress.summary = {.prompt_tokens = lane.prompt};
         progress.processed_prompt_tokens = step;
+        progress.cap_applied             = step < uncapped; // the fake has no capture frontiers
         progress.timing.device_wait_ns = cost_.prefill_fixed_ns + cost_.prefill_per_token_ns * step;
         lane.cursor += step;
         record(event);
