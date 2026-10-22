@@ -29,6 +29,8 @@ void require(bool condition, const std::string& message) {
     if (!condition) { throw std::runtime_error(message); }
 }
 
+using Result = std::shared_future<GenerationResult>;
+
 struct Settings {
     std::uint32_t chunk          = 1024;
     std::uint32_t lanes          = 2;
@@ -74,14 +76,17 @@ public:
         // Release a test that failed while holding the worker, then stop the Engine, which fails
         // whatever is still waiting so the waiter threads can end.
         release();
-        core_.reset();
+        // Stop the worker first, with the Engine still alive: it fails whatever is waiting, and a
+        // waiter that has just been woken still calls back into the Engine (release_consumer).
+        // Only after every waiter has ended is the Engine destroyed.
+        core_->stop_worker();
         for (std::thread& waiter : waiters_) { waiter.join(); }
+        core_.reset();
     }
 
     // Starts a request and returns its result future. `id` names it in the event log.
-    std::future<GenerationResult> run(std::uint64_t id, std::uint32_t prompt_tokens,
-                                      std::uint32_t output_tokens,
-                                      std::shared_ptr<std::atomic<bool>> cancel = nullptr) {
+    Result run(std::uint64_t id, std::uint32_t prompt_tokens, std::uint32_t output_tokens,
+               std::shared_ptr<std::atomic<bool>> cancel = nullptr) {
         ResolvedRequestOptions request;
         request.execution.requested_output_tokens = output_tokens;
         PromptSummary summary;
@@ -92,7 +97,7 @@ public:
         // A promise, not std::async: a future from async blocks in its destructor, which would
         // deadlock a failing test that still holds the worker.
         auto promise = std::make_shared<std::promise<GenerationResult>>();
-        auto result  = promise->get_future();
+        Result result = promise->get_future().share();
         waiters_.emplace_back([submission, promise, cancel] {
             try {
                 CancellationView view;
@@ -189,10 +194,22 @@ private:
     std::unique_ptr<EngineCore<fake::Instance>> core_;
 };
 
-[[nodiscard]] bool finished(std::future<GenerationResult>& result,
+// Waits for a request and reports whether it finished. A request that ended with an error throws,
+// so a scenario cannot pass on its scheduling events while the request itself failed.
+[[nodiscard]] bool finished(const Result& result,
                             std::chrono::milliseconds limit = std::chrono::seconds(30)) {
-    return result.wait_for(limit) == std::future_status::ready;
+    if (result.wait_for(limit) != std::future_status::ready) { return false; }
+    try {
+        (void)result.get();
+    } catch (const std::exception& error) {
+        throw std::runtime_error(std::string("a request ended with an error: ") + error.what());
+    }
+    return true;
 }
+
+// Waits up to `limit` for a request that may legitimately still be running; if it did end, an
+// error fails the scenario like finished() does.
+void drain(const Result& result, std::chrono::milliseconds limit) { (void)finished(result, limit); }
 
 // ---- tests -----------------------------------------------------------------------------------
 
@@ -243,7 +260,7 @@ void test_stall_budget_caps_steps_next_to_a_decoding_lane() {
     require(rig.core().runtime_stats().paced_prefill_steps >= capped &&
                 rig.core().runtime_stats().paced_prefill_deferred_tokens > 0,
             "capped steps were not counted");
-    (void)stream.wait_for(std::chrono::seconds(30));
+    drain(stream, std::chrono::seconds(30));
 }
 
 void test_stall_budget_leaves_a_lone_prefill_alone() {
@@ -268,7 +285,7 @@ void test_stall_budget_off_never_caps() {
     for (const Event& step : rig.events_of(2, Event::Kind::Prefill)) {
         require(step.cap == 0 && step.tokens == 1024, "a step was cut with the budget off\n" + rig.dump());
     }
-    (void)stream.wait_for(std::chrono::seconds(30));
+    drain(stream, std::chrono::seconds(30));
 }
 
 // Decode rounds that ran between consecutive prefill steps of request `id`.
@@ -316,8 +333,8 @@ void test_decode_share_gives_the_stream_a_burst_per_step() {
         require(rounds <= 2, "with no share a stream got " + std::to_string(rounds) +
                                  " rounds between steps\n" + plain.dump());
     }
-    (void)stream.wait_for(std::chrono::seconds(60));
-    (void)plain_stream.wait_for(std::chrono::seconds(60));
+    drain(stream, std::chrono::seconds(60));
+    drain(plain_stream, std::chrono::seconds(60));
 }
 
 void test_decode_share_does_nothing_without_a_decoding_lane() {
@@ -331,7 +348,7 @@ void test_decode_share_does_nothing_without_a_decoding_lane() {
 }
 
 // A long prompt holds the only lane. Returns once the worker is held inside its second step.
-void start_long_prompt(Rig& rig, std::future<GenerationResult>& long_result) {
+void start_long_prompt(Rig& rig, Result& long_result) {
     rig.hold_at([](const Event& e) {
         return e.kind == Event::Kind::Prefill && e.request == 1 && e.position == 1024;
     });
@@ -341,7 +358,7 @@ void start_long_prompt(Rig& rig, std::future<GenerationResult>& long_result) {
 
 void test_without_yield_a_short_request_waits_for_the_long_prompt() {
     Rig rig({.chunk = 1024, .lanes = 1});
-    std::future<GenerationResult> long_result;
+    Result long_result;
     start_long_prompt(rig, long_result);
     auto short_result = rig.run(2, 100, 1);
     rig.release();
@@ -358,7 +375,7 @@ void test_without_yield_a_short_request_waits_for_the_long_prompt() {
 
 void test_a_short_request_pauses_a_long_prefill_and_it_resumes() {
     Rig rig({.chunk = 1024, .lanes = 1, .yield_ms = 100});
-    std::future<GenerationResult> long_result;
+    Result long_result;
     start_long_prompt(rig, long_result);
     auto short_result = rig.run(2, 100, 1);
     rig.release();
@@ -400,7 +417,7 @@ void test_a_short_request_pauses_a_long_prefill_and_it_resumes() {
 
 void test_a_long_newcomer_does_not_displace_a_long_prefill() {
     Rig rig({.chunk = 1024, .lanes = 1, .yield_ms = 100});
-    std::future<GenerationResult> long_result;
+    Result long_result;
     start_long_prompt(rig, long_result);
     auto other_long = rig.run(2, 8192, 1);
     rig.release();
@@ -412,7 +429,7 @@ void test_a_long_newcomer_does_not_displace_a_long_prefill() {
 void test_a_prefill_with_little_left_is_not_paused() {
     // After the second step of 4 the prompt has ~2 steps (~225 ms) left; require more than that.
     Rig rig({.chunk = 1024, .lanes = 1, .yield_ms = 5000});
-    std::future<GenerationResult> long_result;
+    Result long_result;
     start_long_prompt(rig, long_result);
     auto short_result = rig.run(2, 100, 1);
     rig.release();
