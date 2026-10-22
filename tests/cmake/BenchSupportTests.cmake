@@ -24,6 +24,15 @@ add_test(NAME ninfer_context_cost_measure_test COMMAND ninfer_context_cost_measu
 add_test(NAME ninfer_prefill_stall_probe_test
   COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/bench/test_prefill_stall.py)
 
+# The prefill time model (tools/bench/prefill_time_model.py) and the depth sweep that checks it against
+# a card (tools/bench/run_prefill_depth_sweep.py). Pure Python, no GPU: the model is checked against the
+# measurements docs/performance.md records and against the C++ PrefillPacing::step_cap; the sweep against
+# a fake ninfer_bench.
+add_test(NAME ninfer_prefill_time_model_test
+  COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/bench/test_prefill_time_model.py)
+add_test(NAME ninfer_prefill_depth_sweep_test
+  COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/bench/test_prefill_depth_sweep.py)
+
 # The Host arena replay tool's self-test (tools/bench/replay_host_arena.py). Pure Python, no GPU: the
 # replay of a known allocator run must reproduce it exactly, or the tool's predictions mean nothing.
 add_test(NAME ninfer_host_arena_replay_test

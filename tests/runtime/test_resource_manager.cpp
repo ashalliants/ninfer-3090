@@ -1014,6 +1014,82 @@ void test_reclaim_respects_native_lease_and_stops_host_eviction_at_capacity() {
 // Installed external context (a direct prompt graft) is a pinned shared prefix: matchable by every
 // request that carries its identity, never a reclaim or Host victim, never erased, and kept when the
 // cache is cleared. The fake Native here would release it on request, so only the catalog protects it.
+void test_progress_anchor_retirement_keeps_whatever_was_used() {
+    Fixture f(64);
+    const auto cold   = f.program.add({1, 2}, {f.program.host_block(8)});
+    const auto used   = f.program.add({3, 4}, {f.program.host_block(8)});
+    const auto held   = f.program.add({5, 6}, {f.program.host_block(8)});
+    const auto pinned = f.program.add({7, 8}, {f.program.host_block(8)});
+    const auto input  = f.program.add({9, 9}, {}, Role::InputReplay);
+    const auto watched = f.program.add({10, 11}, {f.program.host_block(8)});
+    f.publish(cold);
+    f.publish(used);
+    f.publish(held);
+    f.publish(watched);
+    f.publish(pinned);
+    f.publish(input);
+    f.cache.pin_shared(f.program, pinned);
+    f.use_shared(used);
+    const Base waiting{.tokens = {5, 6, 7}};
+    f.cache.retain_source(f.program, 10, f.source(waiting, held));
+
+    // Two requests crossing the same frontier is demand for it even if neither adopted the anchor.
+    const Base probe{.tokens = {10, 11, 12}, .captures = {2}};
+    f.cache.observe_committed(probe, 1, 0, 3);
+    f.cache.observe_committed(probe, 2, 0, 3);
+
+    require(!f.cache.retire_unreused_shared(f.program, watched) &&
+                f.program.valid_checkpoint(watched),
+            "an anchor with recorded demand was retired");
+    require(!f.cache.retire_unreused_shared(f.program, used) && f.program.valid_checkpoint(used),
+            "an anchor that a later request reused was retired");
+    require(!f.cache.retire_unreused_shared(f.program, held) && f.program.valid_checkpoint(held),
+            "an anchor a waiting request holds was retired");
+    require(!f.cache.retire_unreused_shared(f.program, pinned) && f.program.valid_checkpoint(pinned),
+            "a pinned prefix was retired");
+    require(!f.cache.retire_unreused_shared(f.program, input) && f.program.valid_checkpoint(input),
+            "a private point was retired through the shared path");
+
+    require(f.cache.retire_unreused_shared(f.program, cold) && !f.program.valid_checkpoint(cold),
+            "an unreused anchor was kept");
+    require(f.program.released == std::vector<Handle>{cold},
+            "retiring one anchor released something else");
+    require(!f.cache.retire_unreused_shared(f.program, cold),
+            "retiring an anchor twice reported a second release");
+    const Base again{.tokens = {1, 2, 3}};
+    require(!f.cache.candidates(f.program, again).front().source.checkpoint,
+            "a retired anchor is still offered as a source");
+}
+
+// A hold that refused a retirement must not turn it into a permanent keep: the anchor goes when the
+// holder is cancelled (release_source) or moves to another source (retain_source).
+void test_held_progress_anchor_is_retired_when_the_hold_ends() {
+    Fixture f(64);
+    const auto held_a = f.program.add({1, 2}, {f.program.host_block(8)});
+    const auto held_b = f.program.add({3, 4}, {f.program.host_block(8)});
+    const auto other  = f.program.add({5, 6}, {f.program.host_block(8)});
+    f.publish(held_a);
+    f.publish(held_b);
+    f.publish(other);
+    const Base waiting_a{.tokens = {1, 2, 3}};
+    const Base waiting_b{.tokens = {3, 4, 5}};
+    f.cache.retain_source(f.program, 10, f.source(waiting_a, held_a));
+    f.cache.retain_source(f.program, 11, f.source(waiting_b, held_b));
+    require(!f.cache.retire_unreused_shared(f.program, held_a) && f.program.valid_checkpoint(held_a) &&
+                !f.cache.retire_unreused_shared(f.program, held_b) && f.program.valid_checkpoint(held_b),
+            "a held anchor was retired while its waiter held it");
+
+    f.cache.release_source(f.program, 10); // the waiter is cancelled
+    require(!f.program.valid_checkpoint(held_a),
+            "an anchor stayed after the waiter that held it was cancelled");
+    require(f.program.valid_checkpoint(held_b), "an anchor was retired while still held");
+
+    f.cache.retain_source(f.program, 11, f.source(Base{.tokens = {5, 6, 7}}, other)); // source replaced
+    require(!f.program.valid_checkpoint(held_b),
+            "an anchor stayed after its waiter moved to another source");
+    require(f.program.valid_checkpoint(other), "the waiter's new source was retired");
+}
+
 void test_pinned_shared_prefix_survives_reclaim_and_cache_clear() {
     Fixture f(64);
     const auto graft = f.program.add({7, 7, 7}, {f.program.host_block(16)});
@@ -2367,6 +2443,8 @@ void test_direct_victim_release_offers_the_continuation_first() {
 int main() {
     try {
         test_direct_victim_release_offers_the_continuation_first();
+        test_progress_anchor_retirement_keeps_whatever_was_used();
+        test_held_progress_anchor_is_retired_when_the_hold_ends();
         test_candidate_memo_cuts_victim_selection_work();
         test_candidate_memo_changes_no_decision();
         test_pinned_shared_prefix_survives_reclaim_and_cache_clear();
