@@ -1977,7 +1977,13 @@ private:
         admission_subject_.reset();
         auto request       = slots_[lane];
         bool save_snapshot = false;
-        if (const auto bytes = instance_.program->pause_host_bytes(*request->sequence)) {
+        if (require_snapshot) {
+            // A pause that only serves the queue is not worth evicting other requests' history, so
+            // it saves a snapshot only where the image already fits: nothing is released, revoked or
+            // marked for replay before the answer is known.
+            save_snapshot = instance_.program->pause_host_bytes(*request->sequence).has_value() &&
+                            instance_.program->pause_state_image_unplaced(*request->sequence) == 0;
+        } else if (const auto bytes = instance_.program->pause_host_bytes(*request->sequence)) {
             const auto usage = instance_.program->physical_usage();
             if (*bytes <= usage.capacity.host_bytes &&
                 *bytes > usage.capacity.host_bytes - usage.occupied.host_bytes) {
