@@ -433,17 +433,24 @@ void ModelRegistry::load(std::string_view model) {
     Slot& slot              = models_[index];
     slot.held               = false;
     // An Engine that latched a failure is rebuilt, as a request would rebuild it, rather than
-    // reported as loaded.
-    if (router_ && slot.state == ModelState::Loaded && slot.service->failed()) {
-        if (slot.leases != 0) {
-            throw ModelLoadFailed("model '" + slot.definition.id +
-                                  "' has failed and still has requests in flight");
+    // reported as loaded. The latch survives suspend and resume, so a woken service is checked
+    // again; the second pass is a fresh build, and one that is still failed is refused.
+    for (int pass = 0;; ++pass) {
+        if (router_ && slot.state == ModelState::Loaded && slot.service->failed()) {
+            if (slot.leases != 0) {
+                throw ModelLoadFailed("model '" + slot.definition.id +
+                                      "' has failed and still has requests in flight");
+            }
+            slot.failed     = true;
+            slot.last_error = "the model's Engine failed; it loads again on the next request";
+            unload_locked(lock, index);
         }
-        slot.failed     = true;
-        slot.last_error = "the model's Engine failed; it loads again on the next request";
-        unload_locked(lock, index);
+        make_loaded_locked(lock, index, /*honor_hold=*/false);
+        if (!(router_ && slot.state == ModelState::Loaded && slot.service->failed())) { break; }
+        if (pass > 0) {
+            throw ModelLoadFailed("model '" + slot.definition.id + "' failed right after loading");
+        }
     }
-    make_loaded_locked(lock, index, /*honor_hold=*/false);
 }
 
 void ModelRegistry::unload(std::string_view model) {

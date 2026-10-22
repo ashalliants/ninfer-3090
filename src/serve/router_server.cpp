@@ -739,6 +739,13 @@ void RouterServer::relay(const httplib::Request& req, httplib::Response& res,
         httplib::Error error = httplib::Error::Success;
         const bool ok        = relayed->client->send(request, response, error);
         std::lock_guard lock(relayed->mutex);
+        // The client calls response_handler only while processing a body, so a HEAD response (and
+        // any other without one) reaches here with its status and headers still unrecorded.
+        if (ok && !relayed->headers_ready) {
+            relayed->status        = response.status;
+            relayed->headers       = response.headers;
+            relayed->headers_ready = true;
+        }
         // A request that fails while the relay is still open is an upstream failure, before or
         // after the headers; one that fails because the relay was closed is the client leaving.
         if (!ok && !relayed->done) {
