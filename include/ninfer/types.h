@@ -66,6 +66,12 @@ inline constexpr std::size_t kDefaultKvCapacityHeadroomBytes = 1024ULL * 1024ULL
 // the card into paging, and the step between fitted contexts.
 inline constexpr std::size_t kFitContextHeadroomBytes = 256ULL * 1024ULL * 1024ULL;
 inline constexpr std::uint32_t kFitContextStepTokens  = 1024;
+// PrefillScheduleOptions::stall_budget_ms: a minute is far past any step the engine runs.
+inline constexpr std::uint32_t kMaximumPrefillStallBudgetMs = 60'000;
+// PrefillScheduleOptions::yield_remaining_ms: an hour is past any prefill the context allows.
+inline constexpr std::uint32_t kMaximumPrefillYieldRemainingMs = 3'600'000;
+// PrefillScheduleOptions::decode_share_percent: beyond this decode would starve the prompt.
+inline constexpr std::uint32_t kMaximumPrefillDecodeSharePercent = 90;
 
 struct KvCapacityPolicy {
     KvCapacityMode mode                  = KvCapacityMode::Explicit;
@@ -262,6 +268,36 @@ struct ContextCacheOptions {
     std::optional<std::uint32_t> host_cache_percent;
 };
 
+// How a long prefill shares the GPU with lanes that are already generating. Off by default.
+struct PrefillScheduleOptions {
+    // The Engine runs one prefill step per worker cycle, so a stream that decodes next to a prefill
+    // is paused for a whole step (about 1.5 s at --prefill-chunk 4096 on a 3090). A nonzero budget
+    // cuts a step's size, whenever another lane is decoding, so the cost model predicts it to take
+    // at most this many milliseconds. Steps run in multiples of 128 tokens and never below 512.
+    // A smaller step is slower per token (the cuBLAS prefill route's dequantise pass is
+    // weight-sized), so this trades the prompt's own speed for the other streams' latency.
+    // 0 (the default) always runs the planned --prefill-chunk. At most 60,000.
+    std::uint32_t stall_budget_ms = 0;
+    // A fresh request never preempts a resident one, so with every lane busy it waits for the
+    // lane's request to finish: behind a 100,000-token prompt, about a minute. A nonzero value lets
+    // the request at the head of the queue pause a prefill that still has at least this many
+    // milliseconds of work left (as the cost model predicts it), when the newcomer's own prefill
+    // costs at most a quarter of that. The paused prefill keeps its progress as a snapshot and
+    // resumes behind the newcomer. A request is paused for this at most four times, a prompt with
+    // media is never paused, and a pause that cannot save the prefill's progress is not made.
+    // 0 (the default) never pauses a prefill for the queue. At most 3,600,000.
+    std::uint32_t yield_remaining_ms = 0;
+    // After each prefill step, while another lane is decoding, run decode rounds until they have
+    // used this percent of the time the step took before the next step starts. At 50, a 1.5 s step
+    // is followed by 1.5 s of decode rounds, so a stream gets a burst of tokens after every step
+    // instead of one, and the prompt takes about twice as long while it lasts. It does not shorten
+    // the longest gap between a stream's tokens (the step still runs whole); combine it with a
+    // stall budget for that. Rounds shorter than the debt cannot starve the prompt: after 4,096
+    // deferred turns in a row a step runs regardless. 0 (the default) keeps one round per step;
+    // at most 90.
+    std::uint32_t decode_share_percent = 0;
+};
+
 struct ContextCostOptions {
     // Empty selects generic defaults plus any matching values compiled into the binary. A
     // nonempty runtime preset independently overrides its matching machine transfer and
@@ -438,6 +474,7 @@ struct EngineOptions {
     bool use_cuda_graph                    = true;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
+    PrefillScheduleOptions prefill_schedule;
     // Prompt grafts a request may select by name through PromptOptions::graft. Each is loaded and
     // validated against the resident model at construction.
     std::vector<GraftSource> grafts;
@@ -889,6 +926,9 @@ struct PromptSummary {
     bool starts_in_reasoning    = false;
     std::uint32_t prompt_tokens = 0;
     bool has_media              = false;
+    // Vision work the prompt will cost, for predicting its prefill time while it waits.
+    std::uint32_t vision_items   = 0;
+    std::uint64_t vision_patches = 0;
 };
 
 struct PromptPreparationStats {
@@ -1416,6 +1456,10 @@ struct RuntimeStats {
     std::uint32_t prefilling_requests       = 0;
     std::uint32_t decode_ready_requests     = 0;
     std::uint32_t waiting_requests          = 0;
+    // Prefill work still ahead of a caller, in seconds the context-cost model predicts: what the
+    // resident prefills have left plus what the queued requests cost uncached. Paused and replaying
+    // requests are not counted. A gauge, 0 when idle or when the model has no estimate.
+    double prefill_backlog_seconds          = 0.0;
     std::uint32_t paused_requests           = 0;
     std::uint32_t replaying_requests        = 0;
     std::uint32_t materializing_requests    = 0;
@@ -1436,6 +1480,16 @@ struct RuntimeStats {
     // Requests cancelled while their prompt was prefilling and the prompt tokens they had computed.
     std::uint64_t cancelled_prefills                = 0;
     std::uint64_t cancelled_prefill_computed_tokens = 0;
+    // Prefill steps cut short by PrefillScheduleOptions::stall_budget_ms, and the prompt tokens
+    // those steps left for later steps.
+    std::uint64_t paced_prefill_steps               = 0;
+    std::uint64_t paced_prefill_deferred_tokens     = 0;
+    // Prefills paused so a short request at the head of the queue could be admitted
+    // (PrefillScheduleOptions::yield_remaining_ms).
+    std::uint64_t prefill_yields                    = 0;
+    // Worker cycles that skipped their prefill step so decode rounds could use their share
+    // (PrefillScheduleOptions::decode_share_percent).
+    std::uint64_t deferred_prefill_turns            = 0;
 
     std::uint64_t root_selections               = 0;
     std::uint64_t checkpoint_selections         = 0;

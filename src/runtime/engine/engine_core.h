@@ -8,6 +8,8 @@
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
+#include "runtime/engine/prefill_pacing.h"
+#include "runtime/engine/prefill_yield.h"
 #include "runtime/engine/request_record.h"
 #include "runtime/engine/context_cache/resource_manager.h"
 #include "runtime/engine/context_store/context_store.h"
@@ -96,6 +98,12 @@ public:
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
+          prefill_chunk_(std::min(options.prefill_chunk, options.max_context)),
+          pacing_(PrefillPacingOptions{
+              .stall_budget_ms      = options.prefill_schedule.stall_budget_ms,
+              .decode_share_percent = options.prefill_schedule.decode_share_percent}),
+          yield_min_remaining_ns_(
+              static_cast<std::uint64_t>(options.prefill_schedule.yield_remaining_ms) * 1'000'000ULL),
           progress_anchor_tokens_(options.progress_anchors_shared ? options.progress_anchor_tokens : 0),
           fault_listener_(options.fault_listener),
           resources_(options.context_cache.enabled, std::move(context_cost)) {
@@ -494,6 +502,13 @@ public:
     // stored images by the recomputation they save.
     [[nodiscard]] std::uint64_t prefill_estimate_ns(std::uint32_t tokens) const noexcept {
         return resources_.prefill_ns(make_prefill_work(0, tokens, 0, 0, 0));
+    }
+
+    // Prefill time the cost model expects for a request still in the queue: every chunk the prompt
+    // will run and the Vision work of its media, so the backlog is not lower than the work that runs.
+    [[nodiscard]] std::uint64_t queued_prefill_ns(const PromptSummary& summary) const noexcept {
+        return resources_.prefill_ns(make_prefill_work(0, summary.prompt_tokens, summary.vision_items,
+                                                       summary.vision_patches, prefill_chunk_));
     }
 
     // Host context bytes free now, for choosing which stored images to restore at start-up.
@@ -1705,8 +1720,10 @@ private:
         progress.pending.reset();
     }
 
+    // `decode_ran` is whether this cycle ran a decode round: only then does the step owe it a share.
     void run_prefill_step(std::uint32_t lane,
-                          const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+                          const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start,
+                          bool decode_ran) {
         nvtx::ScopedRange prefill_range(nvtx::Name::Prefill, nvtx::Category::Prefill);
         EnginePhaseScope setup(*this, EngineHostPhase::CommitOutput);
         const auto request = slots_[lane];
@@ -1720,10 +1737,48 @@ private:
         RoundMasks masks;
         masks.outputs[0] = &request->output;
         auto* provider   = request->output.constrained() ? &masks : nullptr;
+        // While another lane decodes, a step that would run for longer than the stall budget is
+        // cut down to what the cost model predicts fits it (PrefillScheduleOptions).
+        const bool pacing_on           = pacing_.options().active();
+        const bool streaming_neighbour = pacing_on && other_lane_streaming(lane);
+        std::uint32_t planned_tokens = 0;
+        std::uint32_t step_cap       = 0;
+        std::uint32_t step_prefix    = 0;
+        bool          have_position  = false;
+        // The position is read whenever pacing is on, so an uncontended step still calibrates the
+        // cost model; only the cap itself waits for a neighbour.
+        if (pacing_on) {
+            if (const auto position = sibling_cursor(*request)) {
+                const std::uint32_t prompt_tokens = request->base_plan->summary().prompt_tokens;
+                have_position  = true;
+                step_prefix    = *position;
+                planned_tokens = std::min(prefill_chunk_, prompt_tokens - std::min(prompt_tokens, *position));
+                if (streaming_neighbour) {
+                    step_cap = pacing_.step_cap(resources_.costs(), step_prefix, planned_tokens, true);
+                }
+            }
+        }
         ProgramCallScope program_call(*this);
-        auto progress = instance_.program->advance_prefill(*request->sequence,
-                                                           &program_call.failed_timing(), provider);
+        const Clock::time_point step_started = Clock::now();
+        auto progress = instance_.program->advance_prefill(
+            *request->sequence, &program_call.failed_timing(), provider, step_cap);
         program_call.finish(progress.timing);
+        const std::uint64_t step_wall_ns = elapsed_ns(step_started, Clock::now());
+        // A media step ignores the cap and is priced by a text-only model, so it must not teach the
+        // correction factor; a step cut short by a capture or rewrite frontier did not run at the
+        // cap either. The cap counts as honored only when the step ran exactly that wide.
+        if (have_position && progress.processed_prompt_tokens != 0 &&
+            !request->prompt_summary.has_media) {
+            pacing_.prefill_step_done(
+                predicted_prefill_step_ns(resources_.costs(), step_prefix,
+                                          progress.processed_prompt_tokens),
+                progress.timing.elapsed_ns(), decode_ran, step_wall_ns);
+            if (progress.cap_applied) {
+                ++cumulative_stats_.paced_prefill_steps;
+                cumulative_stats_.paced_prefill_deferred_tokens +=
+                    planned_tokens - progress.processed_prompt_tokens;
+            }
+        }
         if (!progress.landed_transfers.empty()) {
             typename ModelContract::ContextProgress landed;
             landed.transfers = std::move(progress.landed_transfers);
@@ -1954,14 +2009,23 @@ private:
         return pause_resident(*victim);
     }
 
-    bool pause_resident(std::uint32_t lane) {
+    // `require_snapshot` refuses the pause unless the request's progress can be saved. A pause that
+    // cannot save it makes the request recompute everything it had done, which is acceptable under
+    // resource pressure and not for a pause that only serves the queue.
+    bool pause_resident(std::uint32_t lane, bool require_snapshot = false) {
         if (instance_.program->has_context_transaction()) { return false; }
         // An admission that pauses a resident has touched another request: a failure from here
         // on is no longer confined to the request being admitted.
         admission_subject_.reset();
         auto request       = slots_[lane];
         bool save_snapshot = false;
-        if (const auto bytes = instance_.program->pause_host_bytes(*request->sequence)) {
+        if (require_snapshot) {
+            // A pause that only serves the queue is not worth evicting other requests' history, so
+            // it saves a snapshot only where the image already fits: nothing is released, revoked or
+            // marked for replay before the answer is known.
+            save_snapshot = instance_.program->pause_host_bytes(*request->sequence).has_value() &&
+                            instance_.program->pause_state_image_unplaced(*request->sequence) == 0;
+        } else if (const auto bytes = instance_.program->pause_host_bytes(*request->sequence)) {
             const auto usage = instance_.program->physical_usage();
             if (*bytes <= usage.capacity.host_bytes &&
                 *bytes > usage.capacity.host_bytes - usage.occupied.host_bytes) {
@@ -2011,10 +2075,11 @@ private:
                 target = *next;
             }
         }
+        if (require_snapshot && !save_snapshot) { return false; }
         ProgramCallScope call(*this);
         const auto pause_started = Clock::now();
         if (!instance_.program->start_pause(*request->sequence, save_snapshot,
-                                            &call.failed_timing())) {
+                                            &call.failed_timing(), require_snapshot)) {
             return false;
         }
         call.finish(call.failed_timing());
@@ -2041,6 +2106,19 @@ private:
 
     // A wait must save at least this much prefill over the best source available now.
     static constexpr std::uint32_t kSiblingWaitMinimumTokens = 1024;
+
+    // Whether a lane other than `lane` is generating: its next token waits behind this lane's
+    // prefill step.
+    [[nodiscard]] bool other_lane_streaming(std::uint32_t lane) const noexcept {
+        for (std::uint32_t other = 0; other < max_concurrency_; ++other) {
+            const auto& request = slots_[other];
+            if (other != lane && request && !request->cancelled.load(std::memory_order_acquire) &&
+                (request->is_decode_ready() || request->is_control_ready())) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     // Prompt position the resident sibling has committed, or nullopt when it is not prefilling.
     [[nodiscard]] std::optional<std::uint32_t> sibling_cursor(const Request& sibling) const {
@@ -2173,9 +2251,87 @@ private:
         }
     }
 
+    // How long a paused prefill waits for the request it yielded to before it may be restored
+    // anyway, in case that request cannot be admitted.
+    static constexpr std::chrono::seconds kYieldHold{10};
+
+    // With every lane busy, a request at the head of the queue that costs far less than what a
+    // resident prefill still has to do pauses that prefill (prefill_yield.h). Returns whether a
+    // pause started.
+    bool yield_long_prefill_for_head() {
+        std::shared_ptr<Request> head;
+        {
+            std::lock_guard lock(queue_mutex_);
+            if (pending_.empty()) { return false; }
+            head = pending_.front();
+        }
+        if (head->id == yield_beneficiary_ || head->hydrating || head->awaiting_sibling ||
+            head->cancelled.load(std::memory_order_acquire)) {
+            return false;
+        }
+        std::array<YieldCandidate, kMaximumConcurrency> field{};
+        std::size_t count = 0;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            const auto& resident = slots_[lane];
+            if (!resident || !resident->is_prefilling() || resident->capture_pending ||
+                resident->prompt_summary.has_media || !resident->base_plan) {
+                continue;
+            }
+            if (const auto cursor = sibling_cursor(*resident)) {
+                field[count++] = {lane, prefill_remaining_ns(*resident, *cursor),
+                                  resident->preemption_count};
+            }
+        }
+        if (count == 0) { return false; }
+        // Planning the head is what admission does next; a failure here belongs to it alone.
+        admission_subject_ = head;
+        ensure_base_plan(head);
+        const std::uint32_t prompt = head->base_plan->summary().prompt_tokens;
+        const std::uint64_t waiting_ns =
+            resources_.prefill_ns(instance_.program->prefill_work(*head->base_plan, 0, prompt));
+        const auto victim = choose_yield_victim(yield_min_remaining_ns_, waiting_ns,
+                                                std::span<const YieldCandidate>(field.data(), count));
+        if (!victim || !pause_resident(*victim, true)) { return false; }
+        ++cumulative_stats_.prefill_yields;
+        yield_beneficiary_ = head->id;
+        yield_hold_        = true;
+        yield_hold_until_  = Clock::now() + kYieldHold;
+        return true;
+    }
+
+    [[nodiscard]] std::uint64_t prefill_remaining_ns(const Request& request,
+                                                     std::uint32_t cursor) const {
+        const std::uint32_t prompt = request.base_plan->summary().prompt_tokens;
+        if (cursor >= prompt) { return 0; }
+        return resources_.prefill_ns(instance_.program->prefill_work(*request.base_plan, cursor, prompt));
+    }
+
+    // A prefill paused for a newcomer is restored behind it, not into the lane it just freed:
+    // restoring is otherwise the first thing an empty set of lanes does. The hold ends when the
+    // newcomer leaves the queue, or after kYieldHold if it never gets in.
+    [[nodiscard]] bool restore_held_for_yield() {
+        if (!yield_hold_) { return false; }
+        bool waiting = false;
+        {
+            std::lock_guard lock(queue_mutex_);
+            waiting = std::any_of(pending_.begin(), pending_.end(), [&](const auto& request) {
+                return request->id == yield_beneficiary_ &&
+                       !request->cancelled.load(std::memory_order_acquire);
+            });
+        }
+        if (!waiting || Clock::now() >= yield_hold_until_) {
+            yield_hold_ = false;
+            return false;
+        }
+        return true;
+    }
+
     bool try_admit_one(bool restoring) {
         if (instance_.program->has_context_transaction()) { return false; }
         const auto lane = free_lane();
+        if (!lane && !restoring && yield_min_remaining_ns_ != 0 && yield_long_prefill_for_head()) {
+            return true;
+        }
         if (!lane && restoring) {
             if (!paused_.empty() && !has_older_resident(paused_.front()->id)) {
                 if (const auto victim =
@@ -2965,6 +3121,7 @@ private:
                         exception_text(std::current_exception()));
             return false;
         }
+        pacing_.reset_decode_debt();
         recovery_streak_.record_recovery(failed_at);
         ++cumulative_stats_.engine_recoveries;
         request_admission_check();
@@ -3739,7 +3896,8 @@ private:
                 }
                 if (!recovering &&
                     ((admission_decision_ && admission_decision_->restoring) ||
-                     scheduler_.should_restore(!paused_.empty(), resident_empty()))) {
+                     scheduler_.should_restore(!paused_.empty() && !restore_held_for_yield(),
+                                               resident_empty()))) {
                     unit = "admission";
                     admit_or_contain(true, device_fault);
                     unit = "boundary";
@@ -3805,11 +3963,15 @@ private:
                     }
                     decode = selected;
                 }
+                bool decode_ran = false;
                 if (!decode.empty()) {
                     set_host_work_class(HostWorkClass::Decode, decode.lane_span());
                     unit = "decode";
+                    const auto decode_started = Clock::now();
                     run_decode_round(decode, cancelled);
-                    executed = true;
+                    pacing_.decode_round_done(elapsed_ns(decode_started, Clock::now()));
+                    executed   = true;
+                    decode_ran = true;
                 }
                 if (instance_.program->has_context_transaction()) {
                     set_host_work_class(HostWorkClass::Control);
@@ -3835,15 +3997,28 @@ private:
                         prefill_slots[lane].reset();
                     }
                 }
-                if (const auto lane = scheduler_.next_prefill(prefill_slots, max_concurrency_)) {
+                auto prefill_lane = scheduler_.next_prefill(prefill_slots, max_concurrency_);
+                // A cycle without a decode round owes nothing, whether or not a prefill lane is
+                // selectable: stale debt must not delay an unrelated prompt later.
+                if (!decode_ran) { pacing_.reset_decode_debt(); }
+                // A decode share holds the prefill turn back while the rounds since the last step
+                // have not yet used their share of its time.
+                if (prefill_lane && pacing_.defer_prefill(decode_ran)) {
+                    ++cumulative_stats_.deferred_prefill_turns;
+                    prefill_lane.reset();
+                }
+                if (const auto lane = prefill_lane) {
                     const auto request = slots_[*lane];
                     set_host_work_class(HostWorkClass::Prefill);
                     unit = "prefill";
                     if (request->is_replaying()) {
                         ProgramCallScope call(*this);
+                        const Clock::time_point replay_started = Clock::now();
                         auto progress = instance_.program->advance_replay(*request->sequence,
                                                                           &call.failed_timing());
                         call.finish(progress.timing);
+                        pacing_.prefill_step_done(0, progress.timing.elapsed_ns(), decode_ran,
+                                                  elapsed_ns(replay_started, Clock::now()));
                         if (!request->first_output_timing) {
                             record_execution_work(request->replay_work, progress.timing);
                         }
@@ -3860,7 +4035,7 @@ private:
                                                GenerationSchedulingTransition::ReplayComplete);
                         }
                     } else {
-                        run_prefill_step(*lane, snapshot_cancellations());
+                        run_prefill_step(*lane, snapshot_cancellations(), decode_ran);
                     }
                     scheduler_.prefill_executed(*lane, max_concurrency_);
                     update_recovery(request);
@@ -3921,6 +4096,15 @@ private:
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
+    const std::uint32_t prefill_chunk_;
+    PrefillPacing pacing_;
+    // Zero: a long prefill is never paused for a waiting request.
+    const std::uint64_t yield_min_remaining_ns_;
+    // The request a prefill was last paused for, so it cannot pause a second one for the same
+    // newcomer, and the hold that keeps the paused prefill from being restored ahead of it.
+    std::uint64_t yield_beneficiary_ = 0;
+    bool yield_hold_                 = false;
+    Clock::time_point yield_hold_until_{};
     const std::uint32_t progress_anchor_tokens_;
     const std::function<void(const EngineFaultEvent&)> fault_listener_;
     ResourceManagement resources_;

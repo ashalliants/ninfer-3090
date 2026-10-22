@@ -60,6 +60,7 @@ struct ServeOptions {
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     ContextCacheOptions context_cache;
+    PrefillScheduleOptions prefill_schedule;
     bool enable_vision      = false;
     VisionResidency vision_residency       = VisionResidency::Resident;
     std::uint32_t vision_max_merged_tokens = 16384;

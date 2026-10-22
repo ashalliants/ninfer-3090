@@ -346,7 +346,8 @@ public:
                                                             std::span<const CheckpointHandle>,
                                                             runtime::ContextResourceUsage) const;
     [[nodiscard]] bool start_demote(const ContextDemotion&);
-    [[nodiscard]] bool start_pause(SequenceHandle, bool save_snapshot, runtime::ExecutionTiming*);
+    [[nodiscard]] bool start_pause(SequenceHandle, bool save_snapshot, runtime::ExecutionTiming*,
+                                   bool require_snapshot = false);
     [[nodiscard]] ContextProgress poll_context(runtime::CancellationFlagView);
 
     [[nodiscard]] bool has_context_transaction() const noexcept {
@@ -373,7 +374,8 @@ public:
     make_vision_session(const PreparedPromptData& prompt, const VisionPrefillPlan& plan);
 
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle, runtime::ExecutionTiming*,
-                                                  runtime::TokenMaskProvider*);
+                                                  runtime::TokenMaskProvider*,
+                                                  std::uint32_t max_tokens = 0);
     [[nodiscard]] ReplayProgress advance_replay(SequenceHandle, runtime::ExecutionTiming*);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle>,
                                       std::span<const runtime::RoundBudget>,
@@ -720,7 +722,8 @@ public:
     [[nodiscard]] PendingBatch wrap_pending(std::span<const std::uint32_t>,
                                             const runtime::BatchedGeneratedRound&);
     [[nodiscard]] runtime::PrefillStepResult advance_prefill_raw(std::uint32_t,
-                                                                 runtime::ExecutionTiming*);
+                                                                 runtime::ExecutionTiming*,
+                                                                 std::uint32_t max_tokens);
     [[nodiscard]] runtime::ExecutionTiming resolve_prefill_raw(std::uint32_t, bool,
                                                                runtime::ExecutionTiming*);
     [[nodiscard]] runtime::ExecutionTiming
@@ -754,7 +757,7 @@ public:
                                     runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::PrefillStepResult
     advance_prefill(SequenceState& sequence, RequestControl& request,
-                    runtime::ExecutionTiming* failed_timing);
+                    runtime::ExecutionTiming* failed_timing, std::uint32_t max_tokens);
     void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);

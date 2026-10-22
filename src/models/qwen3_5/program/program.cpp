@@ -276,8 +276,9 @@ std::vector<ContextRelease> Program::plan_releases(std::span<const CheckpointHan
     return impl_->plan_releases(allowed, excluded, shortage);
 }
 
-bool Program::start_pause(SequenceHandle h, bool save, runtime::ExecutionTiming* timing) {
-    return impl_->start_pause(h, save, timing);
+bool Program::start_pause(SequenceHandle h, bool save, runtime::ExecutionTiming* timing,
+                          bool require_snapshot) {
+    return impl_->start_pause(h, save, timing, require_snapshot);
 }
 
 ContextProgress Program::poll_context(runtime::CancellationFlagView c) {
@@ -313,13 +314,13 @@ DeviceSnapshot::Stats Program::resume_device_state(DeviceSnapshot& snapshot) {
 }
 
 PrefillProgress Program::advance_prefill(SequenceHandle h, runtime::ExecutionTiming* t,
-                                         runtime::TokenMaskProvider* m) {
+                                         runtime::TokenMaskProvider* m, std::uint32_t max_tokens) {
     // Landings complete inside this call (each lane's first prefill pass), so the list is empty on
     // entry. A call that throws after one completed must not leave its observations for the next
     // request's progress.
     auto progress = [&] {
         try {
-            return impl_->advance_prefill(h, t, m);
+            return impl_->advance_prefill(h, t, m, max_tokens);
         } catch (...) {
             impl_->landed_transfers_.clear();
             throw;
