@@ -281,7 +281,10 @@ std::vector<std::size_t> decode_rounds_between_steps(const Rig& rig, std::uint64
 
 void test_decode_share_gives_the_stream_a_burst_per_step() {
     // A 1024-token step "takes" 112 ms; at 50% the Engine owes decode 112 ms, a 1 ms round at a time.
-    Rig shared({.chunk = 1024, .lanes = 2, .decode_share = 50});
+    // The debt follows the worker's wall clock (as the decode repayment does), so the fake step
+    // really sleeps that long.
+    Rig shared({.chunk = 1024, .lanes = 2, .decode_share = 50,
+                .prefill_sleep = std::chrono::microseconds(112'000)});
     auto stream = shared.run(1, 64, 2000);
     require(decoding(shared, 3), "the neighbour never started decoding\n" + shared.dump());
     auto prompt = shared.run(2, 4096, 1);
