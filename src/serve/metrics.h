@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/gpu_telemetry.h"
+#include "core/nvml.h"
 #include "serve/generation_pace.h"
 #include "serve/generation_service.h"
 
@@ -79,6 +79,14 @@ private:
     MemorySummary memory_;
     RuntimeStats baseline_;
     std::function<GpuSample()> gpu_sampler_;
+    // Serialises sampling with the energy accumulation below, so concurrent scrapes cannot apply
+    // readings out of order. Separate from mutex_ so an NVML call never delays request recording.
+    mutable std::mutex gpu_mutex_;
+    // The counter is the sum of increases between consecutive readings since the sampler was
+    // installed. A reading below the previous one means NVML's counter restarted (driver reset);
+    // the energy since the restart is then the new reading itself.
+    mutable std::optional<double> gpu_energy_last_;
+    mutable double gpu_energy_total_ = 0.0;
     double start_seconds_ = 0.0;
     mutable std::mutex mutex_;
     Requests requests_;
