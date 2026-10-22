@@ -431,6 +431,18 @@ int test_constrained_decoding_extensions() {
     failures += check(options(parse(body).generation).constraint->kind ==
                           ninfer::OutputConstraintKind::JsonObject,
                       "JSON object mode lost in Engine translation");
+    // llama.cpp-style clients restate the object root as a schema next to json_object.
+    body["response_format"] = Json{{"type", "json_object"}, {"schema", {{"type", "object"}}}};
+    failures += check(options(parse(body).generation).constraint->kind ==
+                          ninfer::OutputConstraintKind::JsonObject,
+                      "json_object with a bare-object schema was refused");
+    for (const Json& narrowing :
+         {Json{{"type", "object"}, {"properties", {{"a", {{"type", "integer"}}}}}},
+          Json{{"type", "array"}}}) {
+        body["response_format"] = Json{{"type", "json_object"}, {"schema", narrowing}};
+        failures += check(api_error([&] { (void)parse(body); }).param == "response_format",
+                          "json_object accepted a schema that narrows the object");
+    }
     const Json schema = {
         {"type", "object"},
         {"properties", {{"description", {{"type", "string"}}}, {"a", {{"type", "integer"}}}}}};

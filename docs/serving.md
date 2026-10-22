@@ -944,8 +944,11 @@ errors distinguish `invalid_json_schema`, `unsupported_json_schema` and `unsatis
 `invalid_request_error` envelope with the schema location in the message. Responses echoes the
 selected `text.format` in aggregate responses and SSE response objects.
 
-JSON output uses compact separators and declared property order. State the desired content in the
-prompt; the schema is not inserted into it. Only one output constraint may be supplied.
+JSON output may use any layout, compact or indented (whitespace runs are capped at 32
+characters), and follows declared property order. State the desired content in the prompt; the
+schema is not inserted into it. Only one output constraint may be supplied. `json_object` also
+accepts `"schema":{"type":"object"}`, which llama.cpp-style clients send; any other schema belongs
+in `json_schema`.
 
 Schemas support positional arrays (`prefixItems` plus tail `items`) and inclusive/exclusive
 `number` ranges. Bounded numbers use exact int64 integers or finite binary64-compatible decimal
@@ -1919,6 +1922,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `600000` |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
 | `--progress-anchor-tokens N` | during a long prefill, keep a private checkpoint every N tokens (a multiple of `--prefill-chunk`; needs prefix reuse; each request keeps its newest four) so a paused request that loses its snapshot replays from the nearest checkpoint instead of from the start. Each checkpoint costs one State image; Qwen3.5-family models only | `0` (off) |
+| `--progress-anchors-shared` | with `--progress-anchor-tokens`: publish the anchors as shared checkpoints, so a request cancelled part-way (client timeout or disconnect) leaves its work for the retry or for any request with the same prefix. A request keeps its two newest anchors and releases an older one unless something has reused it. Not run on a GPU yet | off |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--device N` | CUDA device index | `0` |
 | `--devices A,B,...` | one pipeline stage per listed CUDA device (2 to 8, Linux; see the [README](../README.md#several-gpus-pipeline-stages---devices-ab)); overrides `--device` | none |

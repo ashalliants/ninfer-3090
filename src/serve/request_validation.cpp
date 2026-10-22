@@ -64,7 +64,14 @@ void parse_json_output_format(const RequestJson& format, GenerationRequest& requ
         return;
     }
     if (type == "json_object" && protocol != JsonFormatProtocol::Anthropic) {
-        if (format.size() != 1) bad_request("json_object format has no options", param);
+        // llama.cpp-style clients send the bare-object schema alongside json_object, because
+        // older llama-server releases ignored a bare json_object. It restates json_object.
+        const bool restates_object =
+            format.size() == 2 && format.contains("schema") &&
+            format["schema"] == RequestJson{{"type", "object"}};
+        if (format.size() != 1 && !restates_object)
+            bad_request("json_object format has no options; use json_schema to constrain keys",
+                        param);
         set_constraint(request, OutputConstraint::json_object(), param);
         return;
     }

@@ -46,7 +46,7 @@ ninfer_add_test(ninfer_serve_options_test
 
 ninfer_add_test(ninfer_model_registry_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_model_registry.cpp"
-  LIBRARIES ninfer_serve)
+  LIBRARIES ninfer_serve ninfer_product_logging)
 
 ninfer_add_test(ninfer_request_log_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_request_log.cpp"
