@@ -32,9 +32,10 @@ void write_error(const httplib::Request& req, httplib::Response& res, int status
     error.type    = status >= 500 ? "server_error" : "invalid_request_error";
     error.code    = std::move(code);
     error.message = std::move(message);
+    // Each API family's id, before either envelope: an empty one would be kept by the later error
+    // handler, which fills only an absent header.
+    ensure_http_request_id(req, res);
     if (anthropic_path(req.path)) {
-        // An empty id would be kept by the later error handler, which fills only an absent header.
-        ensure_http_request_id(req, res);
         write_anthropic_error(res, error, res.get_header_value("request-id"));
     } else {
         write_openai_error(res, error);
@@ -531,6 +532,7 @@ void RouterServer::handle_models_sse(const httplib::Request&, httplib::Response&
     std::vector<ModelEvent> skipped;
     auto cursor = std::make_shared<std::uint64_t>(
         registry_.events(0, std::chrono::milliseconds(0), skipped));
+    prepare_sse_response(res);
     res.set_chunked_content_provider(
         "text/event-stream",
         [this, cursor](size_t, httplib::DataSink& sink) {
