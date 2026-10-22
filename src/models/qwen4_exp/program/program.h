@@ -449,6 +449,9 @@ public:
                                                    const SourceCandidate& source, ResumeState* resume = nullptr,
                                                    ExecutionUnitKind resume_kind = ExecutionUnitKind::Decode,
                                                    std::uint32_t resume_tokens   = 1);
+    [[nodiscard]] bool prompt_fits_beside_residents(const RequestBasePlan&, const SourceCandidate&) const {
+        return true; // one lane reserves its whole extent at admission
+    }
     [[nodiscard]] bool start_capture(SequenceHandle sequence);
     [[nodiscard]] bool capture_is_input(SequenceHandle sequence) const;
     [[nodiscard]] std::optional<CapturePreparation> prepare_capture(SequenceHandle sequence);

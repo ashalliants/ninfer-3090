@@ -1,10 +1,12 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "core/device.h"
+#include "runtime/contract/admission_fit.h"
 
 #include <algorithm>
 #include <array>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace ninfer::models::qwen3_5::detail {
 
@@ -50,6 +52,94 @@ void ProgramImpl::initialize_prefill(std::uint32_t lane, std::uint32_t base) {
         }
         if (!vision.uses.empty()) { staged.vision = make_vision_session(staged.prompt, vision); }
     }
+}
+
+bool ProgramImpl::prompt_fits_beside_residents(const RequestBasePlan& base,
+                                               const SourceCandidate& candidate) const {
+    if (!base.impl_ || !text_kv_pages) { return true; }
+    const auto source = candidate.checkpoint;
+    if (source && !valid_checkpoint(*source)) { return true; } // start_binding reports it
+    std::unordered_set<std::uint32_t> pinned_main, pinned_backend;
+    bool residents = false;
+    const auto pin = [](const KVAddressSpaceStore& addresses, const LogicalKVPageStore& pages,
+                        KVAddressSpaceHandle address, auto& seen) {
+        for (std::uint32_t i = 0; i < addresses.mapped_pages(address); ++i) {
+            seen.insert(pages.descriptor_index(addresses.logical_page(address, i)));
+        }
+    };
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        const auto& sequence = sequences[lane];
+        if (!sequence.kv) { continue; }
+        residents = true;
+        pin(*text_kv_addresses, *text_kv_pages, sequence.kv->text, pinned_main);
+        if (sequence.kv->backend) {
+            pin(*backend_kv_addresses, *backend_kv_pages, *sequence.kv->backend, pinned_backend);
+        }
+    }
+    // Installed external context (a prompt graft) is pinned for good: its device pages are held
+    // whether or not any resident uses them, and nothing can reclaim them. A resident that shares
+    // them is already in the sets, and a set counts each page once.
+    for (const auto& slot : checkpoints) {
+        if (!slot.external || !slot.value || !slot.value->kv) { continue; }
+        pin(*text_kv_addresses, *text_kv_pages, slot.value->kv->text, pinned_main);
+        if (slot.value->kv->backend) {
+            pin(*backend_kv_addresses, *backend_kv_pages, *slot.value->kv->backend, pinned_backend);
+        }
+    }
+    const auto prompt = base.summary().prompt_tokens;
+    // The last chunk's frontiers are the whole prompt's, including the draft's extra rows.
+    const auto whole = prefill_unit(prompt, prompt > prefill_chunk ? prompt - prefill_chunk : 0,
+                                    initial_mtp_extent(*base.impl_));
+    std::uint64_t need_main    = kv_pages_for_frontier(whole.main_frontier);
+    std::uint64_t need_backend = kv_pages_for_frontier(whole.backend_frontier);
+    if (source) {
+        // A reused prefix a resident already holds is in `pinned`; counting it again would turn
+        // the common shared system prompt into a false "does not fit". Only full pages are shared:
+        // an unaligned prefix's tail page is copied, so it stays in `need`.
+        const auto& record = checkpoint(*source);
+        const auto shared  = [](const KVAddressSpaceStore& addresses, const LogicalKVPageStore& pages,
+                               KVAddressSpaceHandle address, std::uint32_t prefix_pages,
+                               const auto& seen) {
+            std::uint64_t count = 0;
+            for (std::uint32_t i = 0; i < std::min(prefix_pages, addresses.mapped_pages(address)); ++i) {
+                count += seen.count(pages.descriptor_index(addresses.logical_page(address, i)));
+            }
+            return count;
+        };
+        need_main -= std::min<std::uint64_t>(
+            need_main, shared(*text_kv_addresses, *text_kv_pages, record.kv->text,
+                              runtime::shareable_prefix_pages(record.frontier, kPagedKVPageSize),
+                              pinned_main));
+        if (record.kv->backend) {
+            need_backend -= std::min<std::uint64_t>(
+                need_backend, shared(*backend_kv_addresses, *backend_kv_pages, *record.kv->backend,
+                                     runtime::shareable_prefix_pages(record.backend_frontier,
+                                                                kPagedKVPageSize),
+                                     pinned_backend));
+        }
+    }
+    // Live reservations are pages residents will map as they grow, and lent pages are gone from the
+    // pool, so the pool's own counters decide what is left (reclaimable checkpoint pages stay free).
+    // Optional capture tails are reservations too, but binding reclaims them first, so they are not
+    // a reason to defer.
+    std::uint32_t capture_main = 0, capture_backend = 0;
+    for (const auto& request : requests) {
+        const auto& ticket = request.capture_reservation;
+        if (!ticket) { continue; }
+        if (ticket->main_tail) { capture_main += ticket->main_tail->pages(); }
+        if (ticket->backend_tail) { capture_backend += ticket->backend_tail->pages(); }
+    }
+    const auto& main_pool = text_kv_pages->physical_pool();
+    const auto* backend   = backend_kv_pages ? &backend_kv_pages->physical_pool() : nullptr;
+    const auto live_main =
+        main_pool.reserved_pages() - std::min(main_pool.reserved_pages(), capture_main);
+    const auto live_backend =
+        backend ? backend->reserved_pages() - std::min(backend->reserved_pages(), capture_backend)
+                : 0U;
+    return runtime::prompt_fits_beside_residents(
+        {need_main, need_backend},
+        {pinned_main.size() + live_main, pinned_backend.size() + live_backend},
+        {main_pool.usable_pages(), backend ? backend->usable_pages() : 0U}, residents);
 }
 
 BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runtime::LaneId lane_id,

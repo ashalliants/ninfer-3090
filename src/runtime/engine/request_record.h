@@ -220,6 +220,9 @@ struct RequestRecord {
     // checkpoint it will publish, and the request is not offered for admission. One wait at most.
     bool awaiting_sibling  = false;
     bool sibling_wait_used = false;
+    // Counted once: admission held this request back because its whole prompt could not fit
+    // beside the resident requests (EngineOptions::admission_fit_check).
+    bool fit_deferred = false;
 
     // A prefill chunk is part-way through its layers (PrefillScheduleOptions::layer_slices): the
     // lane must be advanced again before anything else claims the Program's parking buffer, and

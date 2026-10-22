@@ -41,6 +41,7 @@ struct Settings {
     // Real time a prefill step takes, for a test that must submit while one runs.
     std::chrono::microseconds prefill_sleep{0};
     std::uint32_t layer_slices = 0;
+    bool admission_fit_check = false;
 };
 
 class Rig {
@@ -62,6 +63,7 @@ public:
         options.pending_timeout_ms    = 60'000;
         options.prefill_chunk         = settings.chunk;
         options.context_cache.enabled = false;
+        options.admission_fit_check   = settings.admission_fit_check;
         options.prefill_schedule      = {.stall_budget_ms      = settings.stall_budget,
                                          .yield_remaining_ms   = settings.yield_ms,
                                          .decode_share_percent = settings.decode_share,
@@ -438,6 +440,59 @@ void test_a_prefill_with_little_left_is_not_paused() {
             "a prefill with less than the threshold left was paused\n" + rig.dump());
 }
 
+// --admission-fit-check on the real worker loop: a newcomer the Program says cannot fit beside the
+// running request is queued (counted once, however many cycles it waits) and starts as soon as the
+// resident leaves; one that fits starts at once, and without the flag the answer is never asked.
+void test_a_prompt_that_does_not_fit_beside_a_resident_waits_for_it() {
+    Rig rig({.chunk = 1024, .lanes = 2, .admission_fit_check = true});
+    rig.program().set_fits(false);
+    Result long_result;
+    start_long_prompt(rig, long_result);
+    auto short_result = rig.run(2, 100, 1);
+    rig.release();
+    require(finished(long_result) && finished(short_result), "a request did not finish\n" + rig.dump());
+    const auto events = rig.events();
+    std::size_t long_finish = 0, short_bind = 0;
+    for (std::size_t i = 0; i < events.size(); ++i) {
+        if (events[i].kind == Event::Kind::Finish && events[i].request == 1) { long_finish = i; }
+        if (events[i].kind == Event::Kind::Bind && events[i].request == 2) { short_bind = i; }
+    }
+    require(short_bind > long_finish,
+            "a prompt that did not fit started beside the resident\n" + rig.dump());
+    require(rig.core().runtime_stats().admission_fit_deferrals == 1,
+            "the deferral was not counted exactly once: " +
+                std::to_string(rig.core().runtime_stats().admission_fit_deferrals));
+}
+
+void test_a_prompt_that_fits_beside_a_resident_starts_at_once() {
+    Rig rig({.chunk = 1024, .lanes = 2, .admission_fit_check = true});
+    Result long_result;
+    start_long_prompt(rig, long_result);
+    auto short_result = rig.run(2, 100, 1);
+    rig.release();
+    require(finished(long_result) && finished(short_result), "a request did not finish\n" + rig.dump());
+    const auto events = rig.events();
+    std::size_t long_finish = 0, short_bind = 0;
+    for (std::size_t i = 0; i < events.size(); ++i) {
+        if (events[i].kind == Event::Kind::Finish && events[i].request == 1) { long_finish = i; }
+        if (events[i].kind == Event::Kind::Bind && events[i].request == 2) { short_bind = i; }
+    }
+    require(short_bind < long_finish, "a prompt that fits waited for the resident\n" + rig.dump());
+    require(rig.core().runtime_stats().admission_fit_deferrals == 0, "a fitting prompt was deferred");
+}
+
+void test_the_fit_answer_is_not_asked_without_the_flag() {
+    Rig rig({.chunk = 1024, .lanes = 2});
+    rig.program().set_fits(false);
+    Result long_result;
+    start_long_prompt(rig, long_result);
+    auto short_result = rig.run(2, 100, 1);
+    rig.release();
+    require(finished(long_result) && finished(short_result), "a request did not finish\n" + rig.dump());
+    require(rig.core().runtime_stats().admission_fit_deferrals == 0,
+            "the fit check ran with the flag off");
+}
+
 void test_backlog_gauge_tracks_queued_and_resident_prefill() {
     Rig rig({.chunk = 1024, .lanes = 1, .prefill_sleep = std::chrono::microseconds(10'000)});
     // The gauge as published before each prefill step: stats are published at unit boundaries.
@@ -630,6 +685,12 @@ int main() {
         test_without_yield_a_short_request_waits_for_the_long_prompt);
     run("a short request pauses a long prefill and it resumes",
         test_a_short_request_pauses_a_long_prefill_and_it_resumes);
+    run("a prompt that does not fit beside a resident waits for it",
+        test_a_prompt_that_does_not_fit_beside_a_resident_waits_for_it);
+    run("a prompt that fits beside a resident starts at once",
+        test_a_prompt_that_fits_beside_a_resident_starts_at_once);
+    run("the fit answer is not asked without the flag",
+        test_the_fit_answer_is_not_asked_without_the_flag);
     run("a long newcomer does not displace a long prefill",
         test_a_long_newcomer_does_not_displace_a_long_prefill);
     run("a prefill with little left is not paused", test_a_prefill_with_little_left_is_not_paused);

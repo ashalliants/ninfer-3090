@@ -2429,6 +2429,110 @@ void sliced_prefill_beside_a_decoding_lane(DeviceContext& device,
     }
 }
 
+// The admission fit check on real KV pools (--admission-fit-check): whether a fresh prompt's whole
+// KV need can ever fit beside the pages the resident requests hold. Pure arithmetic is covered by
+// the CPU scheduler test; this checks the Program's own accounting of mapped pages, live reservations
+// and the pool's usable pages against a real allocator.
+void prompt_fits_beside_residents_on_real_pools(DeviceContext& device,
+                                                const qwen::execution::Parameters& parameters,
+                                                qwen::Frontend& frontend, EngineOptions options) {
+    // 15 pages of 64 tokens: a 500-token prompt needs 8, so two of them cannot share the pool.
+    constexpr std::uint32_t kPoolTokens = 15 * 64;
+    options.max_context                       = kCapacity;
+    options.kv_capacity                       = KvCapacityPolicy::explicit_capacity(kPoolTokens);
+    options.prefill_chunk                     = kChunk;
+    options.max_concurrency                   = 2;
+    options.context_cache.enabled             = false;
+    options.context_cache.device_state_slots  = 0;
+    options.context_cache.host_capacity_bytes = 0;
+    auto planner = qwen::detail::make_sequence_planner_impl(parameters, device, options);
+    // Not the curve minimum (8 pages, one request's worth): the pool this test needs is the 15 pages
+    // of the explicit capacity, which the curve allows between one request and max_concurrency of them.
+    constexpr std::uint32_t pages = kPoolTokens / 64;
+    require(pages >= planner->curve.minimum_main_page_groups &&
+                pages <= planner->curve.maximum_main_page_groups,
+            "the fit test's pool is outside the capacity curve");
+    auto plan                 = qwen::detail::finalize_sequence_plan_impl(std::move(planner), pages);
+    qwen::detail::ProgramImpl program(parameters, *plan, device, {});
+    const auto empty = program.physical_usage().occupied;
+
+    const auto settle = [&]() {
+        std::atomic<bool> flag{false};
+        for (unsigned step = 0; step < 8; ++step) {
+            device.synchronize();
+            CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+            auto progress = program.poll_context({&flag});
+            if (progress.complete) { return progress; }
+        }
+        throw std::runtime_error("admission fit transaction did not settle");
+    };
+    const auto make_ids = [](std::uint32_t count, std::uint32_t salt) {
+        std::vector<TokenId> ids(count);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            ids[i] = 100 + static_cast<TokenId>((i * 37 + salt) % 900);
+        }
+        return ids;
+    };
+    const auto plan_request = [&](const std::vector<TokenId>& ids) {
+        runtime::ResolvedExecutionOptions request;
+        request.requested_output_tokens = 8;
+        return program.plan_request(qwen::PreparedPromptAccess::take(frontend.prepare_tokens(ids)),
+                                    request);
+    };
+    // Binds `ids` on `lane` and prefills it completely, so it holds its pages as a resident.
+    const auto make_resident = [&](const std::vector<TokenId>& ids, std::uint32_t lane) {
+        auto base       = plan_request(ids);
+        const auto root = program.inspect_source(base, std::nullopt);
+        require(root.has_value(), "resident request has no root source");
+        require(static_cast<bool>(program.start_binding(
+                    base, {lane}, *root, nullptr, qwen::ExecutionUnitKind::Prefill, 0)),
+                "resident request could not bind");
+        const auto bound = settle();
+        require(bound.sequence.has_value(), "resident binding did not publish");
+        const auto sequence = *bound.sequence;
+        std::uint32_t processed = 0;
+        for (unsigned call = 0; call < 64 && processed < ids.size(); ++call) {
+            const std::array<qwen::ExecutionUnit, 1> units{
+                {{sequence, qwen::ExecutionUnitKind::Prefill}}};
+            require(static_cast<bool>(program.reserve_units(units)),
+                    "resident could not reserve its unit");
+            auto step = program.advance_prefill(sequence, nullptr, nullptr, 0);
+            processed += step.processed_prompt_tokens;
+            if (step.pending) {
+                const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
+                (void)program.commit(std::move(*step.pending), accepted, {}, nullptr);
+            }
+        }
+        require(processed == ids.size(), "resident prefill did not finish");
+        return sequence;
+    };
+    const auto fits = [&](const std::vector<TokenId>& ids) {
+        auto base       = plan_request(ids);
+        const auto root = program.inspect_source(base, std::nullopt);
+        require(root.has_value(), "candidate request has no root source");
+        return program.prompt_fits_beside_residents(base, *root);
+    };
+
+    const auto newcomer = make_ids(500, 11);
+    // Nothing resident: always admitted.
+    require(fits(newcomer), "a fresh prompt did not fit an empty pool");
+
+    // A small resident leaves room (2 + 8 of 15 pages).
+    const auto small = make_resident(make_ids(100, 3), 0);
+    require(fits(newcomer), "a prompt was deferred beside a resident that leaves room");
+    require(program.abort(small).status == runtime::ConsumeStatus::Consumed,
+            "the small resident retained its resources");
+
+    // A large resident does not (8 + 8 of 15 pages): the newcomer is deferred ...
+    const auto large = make_resident(make_ids(500, 5), 0);
+    require(!fits(newcomer), "a prompt that cannot fit beside the resident was admitted");
+    // ... and fits again once the resident's pages are released.
+    require(program.abort(large).status == runtime::ConsumeStatus::Consumed,
+            "the large resident retained its resources");
+    require(fits(newcomer), "a prompt was still deferred after the resident released its pages");
+    require(program.physical_usage().occupied == empty, "the fit check leaked physical resources");
+}
+
 void replay_sampling_counts(DeviceContext& device, const qwen::execution::Parameters& parameters,
                             qwen::Frontend& frontend, EngineOptions options) {
     options.max_context                       = 128;
@@ -2666,6 +2770,7 @@ int main(int argc, char** argv) {
         capture_retry.reset();
         shared_capture_alignment(device, parameters, frontend, options);
         progress_anchor_planning(device, parameters, frontend, options);
+        prompt_fits_beside_residents_on_real_pools(device, parameters, frontend, options);
         capped_prefill_steps(device, parameters, frontend, options);
         sliced_prefill_matches_whole(device, parameters, frontend, options);
         sliced_prefill_beside_a_decoding_lane(device, parameters, frontend, options);

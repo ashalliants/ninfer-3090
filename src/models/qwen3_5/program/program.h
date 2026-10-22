@@ -499,6 +499,11 @@ public:
     [[nodiscard]] runtime::ResourceReservation reserve_units(std::span<const ExecutionUnit> units);
     [[nodiscard]] bool reclaim_capture_reservation(runtime::ContextResourceUsage shortage);
     void release_units(std::span<const SequenceHandle> sequences) noexcept;
+    // Whether this fresh prompt's whole KV need can ever fit beside the pages the resident
+    // requests hold now (cached checkpoints are reclaimable and not counted). A prompt that
+    // cannot would fill the pool, be paused, and recompute its history.
+    [[nodiscard]] bool prompt_fits_beside_residents(const RequestBasePlan& base,
+                                                    const SourceCandidate& source) const;
     [[nodiscard]] BindingReservation
     start_binding(const RequestBasePlan& base, runtime::LaneId lane, const SourceCandidate& source,
                   ResumeState* resume           = nullptr,

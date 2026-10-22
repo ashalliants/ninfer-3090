@@ -1,4 +1,5 @@
 #include "runtime/contract/progress_anchors.h"
+#include "runtime/contract/admission_fit.h"
 #include "runtime/engine/pause_policy.h"
 #include "runtime/engine/scheduler.h"
 
@@ -369,6 +370,34 @@ void test_pause_host_target() {
             "a target that exactly fills the budget is still reachable");
 }
 
+void test_prompt_fit_beside_residents() {
+    using ninfer::runtime::KvPageCounts;
+    using ninfer::runtime::prompt_fits_beside_residents;
+    const KvPageCounts capacity{100, 40};
+    require(prompt_fits_beside_residents({60, 20}, {40, 20}, capacity, true),
+            "a prompt that exactly fills the pool beside residents fits");
+    require(!prompt_fits_beside_residents({61, 0}, {40, 0}, capacity, true),
+            "one page too many in the main pool is hopeless beside the residents");
+    require(!prompt_fits_beside_residents({10, 21}, {10, 20}, capacity, true),
+            "the draft pool can be the one that does not fit");
+    require(prompt_fits_beside_residents({500, 500}, {90, 40}, capacity, false),
+            "with no resident the prompt is always let in, so the queue keeps moving");
+    require(prompt_fits_beside_residents({0, 0}, {100, 40}, capacity, true),
+            "a prompt that needs nothing new fits even beside a full pool");
+    require(!prompt_fits_beside_residents({1, 0}, {100, 0}, KvPageCounts{100, 0}, true),
+            "a pool already full of resident pages has no room for one more");
+    // Resident reservations count as pinned and lent pages leave the capacity.
+    require(!prompt_fits_beside_residents({10, 0}, {40 + 51, 0}, capacity, true),
+            "pages promised to residents are not free for a new prompt");
+    require(!prompt_fits_beside_residents({10, 0}, {40, 0}, KvPageCounts{49, 0}, true),
+            "pages lent away are not free for a new prompt");
+    // An unaligned reused prefix shares only its full pages: 130 tokens = 2 full + a copied tail.
+    require(ninfer::runtime::shareable_prefix_pages(130, 64) == 2 &&
+                ninfer::runtime::shareable_prefix_pages(128, 64) == 2 &&
+                ninfer::runtime::shareable_prefix_pages(63, 64) == 0,
+            "only full pages of a reused prefix are shared with its donor");
+}
+
 } // namespace
 
 int main() {
@@ -382,6 +411,7 @@ int main() {
         test_decode_and_control_membership();
         test_progress_anchor_frontiers();
         test_pause_host_target();
+        test_prompt_fit_beside_residents();
         std::cout << "ok\n";
         return 0;
     } catch (const std::exception& error) {
