@@ -334,6 +334,27 @@ int main(int argc, char** argv) {
         object_request.execution.sampling.temperature = 0;
         record({{"type", "object"}}, engine.generate(engine.prepare(json_prompt), object_request));
 
+        // Constraining must not change what the model says: at temperature 0 the constrained
+        // object carries the same keys and values as the unconstrained reply (issue #331 returned
+        // empty keys and punctuation values while still parsing as JSON).
+        {
+            auto capital = prompt();
+            capital.messages[0].parts[0].text =
+                "Reply in JSON with keys city and country, for the capital of Japan.";
+            capital.context_cache.session_key.reset();
+            const auto constrained = engine.generate(engine.prepare(capital), object_request);
+            record({{"type", "object"}}, constrained);
+            const auto value = nlohmann::json::parse(constrained.content);
+            require(value.is_object() && value.size() == 2 && value.value("city", "") == "Tokyo" &&
+                        value.value("country", "") == "Japan",
+                    "json_object changed the model's answer");
+            auto free_text                    = object_request;
+            free_text.constraint.reset();
+            const auto unconstrained = engine.generate(engine.prepare(capital), free_text);
+            require(nlohmann::json::parse(unconstrained.content) == value,
+                    "json_object output differs from the unconstrained reply");
+        }
+
         const auto fixed  = nlohmann::ordered_json{{"const", {{"text", "你好\n"}, {"n", 2}}}};
         auto continuation = prompt();
         continuation.options.continuation = ninfer::PromptContinuationMode::ContinueFinalAssistant;

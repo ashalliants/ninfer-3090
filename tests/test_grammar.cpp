@@ -134,6 +134,60 @@ void check_draft_lookahead() {
     session->confirm();
     require(allows(mask(*session), 3), "generation failed after rejected draft lookahead");
 }
+
+// One token per ASCII byte (IDs 1..127), so the mask is judged on characters alone. ID 0 is a
+// forbidden special and 128 is EOS.
+ninfer::text::GrammarCompiler byte_compiler() {
+    std::vector<std::string> vocabulary(129);
+    for (int byte = 1; byte < 128; ++byte) { vocabulary[byte] = std::string(1, char(byte)); }
+    return ninfer::text::GrammarCompiler(std::move(vocabulary), {128}, 1024 * 1024);
+}
+
+bool accepts(ninfer::text::GrammarCompiler& compiler, const ninfer::OutputConstraint& constraint,
+             std::string_view text, bool* complete = nullptr) {
+    auto session = compiler.compile(constraint, {}, {});
+    for (unsigned char byte : text) {
+        if (!allows(mask(*session), byte)) { return false; }
+        session->accept(byte);
+        session->confirm();
+    }
+    if (complete) { *complete = allows(mask(*session), 128); }
+    return true;
+}
+
+// Constrained JSON must admit the layout the model writes on its own, not only compact text:
+// forcing compact output steered Qwen off its preferred tokens and corrupted the content.
+void check_json_whitespace() {
+    auto compiler = byte_compiler();
+    const auto object = ninfer::OutputConstraint::json_object();
+    const auto schema = ninfer::OutputConstraint::json_schema(
+        R"({"type":"object","properties":{"city":{"type":"string"},"country":{"type":"string"}},)"
+        R"("required":["city","country"]})");
+
+    for (const auto* text : {"{\"city\":\"Tokyo\",\"country\":\"Japan\"}",
+                             "{\"city\": \"Tokyo\", \"country\": \"Japan\"}",
+                             "{\n  \"city\": \"Tokyo\",\n  \"country\": \"Japan\"\n}"}) {
+        bool complete = false;
+        require(accepts(compiler, schema, text, &complete) && complete,
+                "schema rejected a layout of the same JSON value");
+    }
+    bool complete = false;
+    require(accepts(compiler, object, "{\n  \"a\": [1, 2],\n  \"b\": {\"c\": null}\n}", &complete) &&
+                complete,
+            "json_object rejected indented JSON");
+
+    // Whitespace is still insignificant-only: it cannot replace tokens or end the value early.
+    require(!accepts(compiler, schema, "{\"city\" \"Tokyo\"}"), "missing colon accepted");
+    require(!accepts(compiler, schema, "{\"city\":\"Tokyo\",\"zone\":\"JST\"}"),
+            "schema key order or names not enforced");
+    complete = true;
+    require(accepts(compiler, object, "{\n", &complete) && !complete,
+            "object completed before its closing brace");
+
+    // A run of blanks is bounded so a stalled model cannot burn its whole budget on them.
+    require(accepts(compiler, object, "{" + std::string(32, ' ')), "bounded whitespace run rejected");
+    require(!accepts(compiler, object, "{" + std::string(33, ' ')), "whitespace run is unbounded");
+}
 } // namespace
 
 int main() {
@@ -141,6 +195,7 @@ int main() {
         check_finite_language_masks();
         check_compiled_grammar_lifetime();
         check_draft_lookahead();
+        check_json_whitespace();
         std::vector<std::string> vocab;
         for (int byte = 0; byte < 256; ++byte) { vocab.emplace_back(1, static_cast<char>(byte)); }
         vocab.emplace_back();                        // EOS

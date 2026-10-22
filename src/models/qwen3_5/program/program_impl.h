@@ -409,6 +409,8 @@ public:
     const std::uint32_t prefill_chunk;
     // Spacing of private progress anchors on long prefills (0 off), see plan_request.
     const std::uint32_t progress_anchor_tokens;
+    // Anchors are SharedPrefix (survive a cancellation) rather than private LongAnchor.
+    const bool progress_anchors_shared;
     // The draft model's own proposal width.
     const std::uint32_t draft_window;
     // The widest round family's verify_drafts; per-round buffers are allocated at it.
