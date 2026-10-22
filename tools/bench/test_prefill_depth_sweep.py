@@ -127,6 +127,52 @@ def test_a_single_length_equal_to_the_chunk_still_gets_a_context():
     check(False, "an empty length list was accepted")
 
 
+def write_report(directory, document):
+    path = os.path.join(directory, "report.json")
+    with open(path, "w") as f:
+        json.dump(document, f)
+    return __import__("pathlib").Path(path)
+
+
+def test_a_combined_row_does_not_replace_the_pure_prefill():
+    document = bench_document(fake_times())
+    document["tests"].append({"label": "pp4096+tg1", "kind": "pp+tg", "n_prompt": 4096, "n_gen": 1,
+                              "prefill_seconds_mean": 99.0})
+    with tempfile.TemporaryDirectory() as d:
+        parsed = sweep.parse_bench_json(write_report(d, document))
+    check(abs(parsed[4096] - fake_times()[4096]) < 1e-9, f"the combined row won: {parsed[4096]}")
+
+
+def test_two_pure_prefill_rows_for_one_length_are_refused():
+    document = bench_document(fake_times())
+    document["tests"].append(dict(document["tests"][0]))
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            sweep.parse_bench_json(write_report(d, document))
+        except ValueError:
+            return
+    check(False, "a duplicated prompt length was accepted")
+
+
+def test_a_saved_report_is_priced_with_its_own_chunk():
+    document = bench_document(fake_times(2048))
+    document["config"] = {"prefill_chunk": 2048}
+    with tempfile.TemporaryDirectory() as d:
+        path = write_report(d, document)
+        run = lambda *extra: subprocess.run(
+            [sys.executable, "-I", os.path.join(HERE, "run_prefill_depth_sweep.py"),
+             "--from-json", str(path), *extra], capture_output=True, text=True)
+        ok = run()
+        check(ok.returncode == 0, ok.stderr)
+        wrong = run("--chunk", "4096")
+        check(wrong.returncode != 0 and "does not match" in wrong.stderr, wrong.stderr)
+        document["config"] = {}
+        path = write_report(d, document)
+        missing = run()
+        check(missing.returncode != 0 and "pass --chunk" in missing.stderr, missing.stderr)
+        check(run("--chunk", "2048").returncode == 0, "an explicit matching chunk was refused")
+
+
 if __name__ == "__main__":
     for name, function in list(globals().items()):
         if name.startswith("test_"):

@@ -116,6 +116,14 @@ def test_unusable_numbers_are_an_argument_error_not_a_hang():
     m.parse_args([])
 
 
+def test_yield_prices_a_partial_final_step():
+    cost = m.load_cost("27b")
+    late = m.yield_wait(cost, 100_000, 4096, 0.99)
+    check(late["arrives_after_tokens"] == 98304, late)
+    check(abs(late["wait_with_yield_s"] - cost.step_ns(98304, 1696) / 1e9) < 1e-12,
+          "the final partial step was priced as a full chunk")
+
+
 if __name__ == "__main__":
     for name, function in list(globals().items()):
         if name.startswith("test_"):

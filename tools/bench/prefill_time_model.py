@@ -188,7 +188,7 @@ def yield_wait(cost: Cost, prompt: int, chunk: int, arrives_at_fraction: float) 
     arrive = int(prompt * arrives_at_fraction) // chunk * chunk
     rest = prefill_profile(cost, prompt, chunk, arrive)["seconds"]
     return {"arrives_after_tokens": arrive, "wait_without_yield_s": rest,
-            "wait_with_yield_s": cost.step_ns(arrive, chunk) / 1e9}
+            "wait_with_yield_s": cost.step_ns(arrive, min(chunk, prompt - arrive)) / 1e9}
 
 
 # ---- output ---------------------------------------------------------------------------------

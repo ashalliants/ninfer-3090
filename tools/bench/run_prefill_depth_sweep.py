@@ -63,18 +63,31 @@ def fit_scales(rows: list[dict]) -> dict:
 
 
 def parse_bench_json(path: Path) -> dict[int, float]:
-    """prompt tokens -> mean prefill seconds, from ninfer_bench's JSON for its pp tests."""
+    """prompt tokens -> mean prefill seconds, from ninfer_bench's JSON for its pure-prefill tests.
+
+    Only rows of kind exactly "pp" count: a combined "pp+tg" row also starts with "pp" and carries
+    the prompt length, but it times a different execution shape and must not stand in for (or
+    overwrite) the pure prefill. Two pure-prefill rows for one prompt length are refused.
+    """
     document = json.loads(path.read_text())
     out: dict[int, float] = {}
     for test in document.get("tests", []):
-        if test.get("kind") not in ("pp", "prompt", "prefill") and not str(test.get("label", "")).startswith("pp"):
-            continue
-        if test.get("n_gen", 0) not in (0, 1) and "+" in str(test.get("label", "")):
+        if test.get("kind") != "pp":
             continue
         seconds = test.get("prefill_seconds_mean")
-        if seconds:
-            out[int(test["n_prompt"])] = float(seconds)
+        if not seconds:
+            continue
+        prompt = int(test["n_prompt"])
+        if prompt in out:
+            raise ValueError(f"{path}: two pure-prefill rows for {prompt} tokens")
+        out[prompt] = float(seconds)
     return out
+
+
+def bench_prefill_chunk(path: Path) -> int | None:
+    """The --prefill-chunk a saved ninfer_bench report was produced with, if it records one."""
+    chunk = (json.loads(path.read_text()).get("config") or {}).get("prefill_chunk")
+    return int(chunk) if chunk else None
 
 
 def analyse(measured: dict[int, float], chunk: int, model_name: str) -> dict:
@@ -140,7 +153,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ninfer-bench", type=Path, help="the ninfer_bench executable")
     parser.add_argument("--weights", type=Path)
     parser.add_argument("--lengths", default="4096,16384,32768,65536,98304")
-    parser.add_argument("--chunk", type=int, default=4096)
+    parser.add_argument("--chunk", type=int, default=None,
+                        help="prefill chunk the benchmark ran with (default 4096; with --from-json, the "
+                             "saved report's own value, which an explicit --chunk must match)")
     parser.add_argument("--model", choices=sorted(model.MODELS), default="27b")
     parser.add_argument("-r", "--repetitions", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=1)
@@ -154,22 +169,29 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     lengths = [int(x) for x in args.lengths.split(",") if x]
-    if not lengths or any(n <= 0 for n in lengths) or args.chunk <= 0:
+    if not lengths or any(n <= 0 for n in lengths) or (args.chunk is not None and args.chunk <= 0):
         raise SystemExit("--lengths needs at least one positive prompt length and --chunk must be positive")
     if args.print_attention_commands:
-        print("\n".join(attention_commands(args.chunk, lengths)))
+        print("\n".join(attention_commands(args.chunk or 4096, lengths)))
         return 0
     extra = [x for x in args.bench_args if x != "--"]
     if args.from_json:
         measured = parse_bench_json(args.from_json)
+        recorded = bench_prefill_chunk(args.from_json)
+        if args.chunk is not None and recorded is not None and args.chunk != recorded:
+            raise SystemExit(f"--chunk {args.chunk} does not match the report's prefill_chunk {recorded}")
+        if args.chunk is None and recorded is None:
+            raise SystemExit("the saved report records no prefill_chunk: pass --chunk")
+        chunk = args.chunk or recorded
     else:
+        chunk = args.chunk or 4096
         if not args.ninfer_bench or not args.weights:
             raise SystemExit("--ninfer-bench and --weights are required (or --from-json)")
         with tempfile.TemporaryDirectory() as directory:
             out = Path(directory) / "bench.json"
             command = [str(args.ninfer_bench), "--weights", str(args.weights),
                        "-p", ",".join(map(str, lengths)), "-r", str(args.repetitions),
-                       "--warmup", str(args.warmup), "--prefill-chunk", str(args.chunk),
+                       "--warmup", str(args.warmup), "--prefill-chunk", str(chunk),
                        "--max-ctx", str(max(lengths) + 1024), "-o", "json", "--output-file", str(out),
                        *extra]
             print("+", " ".join(command), file=sys.stderr)
@@ -177,7 +199,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             measured = parse_bench_json(out)
     if not measured:
         raise SystemExit("no pp results found in the benchmark output")
-    result = analyse(measured, args.chunk, args.model)
+    result = analyse(measured, chunk, args.model)
     print_analysis(result)
     if args.output:
         args.output.write_text(json.dumps(result, indent=2) + "\n")
