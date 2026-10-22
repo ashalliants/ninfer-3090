@@ -327,6 +327,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.max_pending_requests     = options.max_pending_requests;
     engine_options.pending_timeout_ms       = options.pending_timeout_ms;
     engine_options.prefill_chunk            = options.prefill_chunk;
+    engine_options.progress_anchor_tokens   = options.progress_anchor_tokens;
     engine_options.kv_cache                = options.kv_cache;
     engine_options.enable_vision            = options.enable_vision;
     engine_options.grafts                   = options.grafts;
@@ -357,6 +358,10 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
         std::chrono::seconds(options.context_store_restore_seconds);
     engine_options.context_store.flush_budget =
         std::chrono::seconds(options.context_store_flush_seconds);
+    engine_options.context_store.compress_chunks = options.context_store_compress;
+    engine_options.context_store.peers           = options.context_store_peers;
+    engine_options.context_store.peer_poll =
+        std::chrono::milliseconds(options.context_store_peer_poll_ms);
     if (!options.context_store_s3_endpoint.empty()) {
         const auto environment = [](const char* primary, const char* fallback) {
             for (const char* name : {primary, fallback}) {

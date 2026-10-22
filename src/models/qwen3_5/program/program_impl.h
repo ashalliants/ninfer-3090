@@ -2,6 +2,7 @@
 #include "models/qwen3_5/program/internal.h"
 
 #include "core/arena.h"
+#include "core/chunked_reservation.h"
 #include "core/gdn_replay_records.h"
 #include "core/device_snapshot.h"
 #include "core/host_kv_arena.h"
@@ -324,6 +325,7 @@ public:
     [[nodiscard]] std::size_t
     host_bytes_released(std::span<const CheckpointHandle> checkpoints) const;
     [[nodiscard]] std::optional<std::size_t> pause_host_bytes(SequenceHandle sequence) const;
+    [[nodiscard]] std::size_t pause_state_image_unplaced(SequenceHandle sequence) const;
     [[nodiscard]] std::size_t
     release_redundant_host(std::span<const CheckpointHandle> excluded,
                            std::optional<SequenceHandle> pending_backup = std::nullopt);
@@ -403,6 +405,8 @@ public:
     const std::uint32_t max_concurrency;
     const ContextCacheOptions context_cache;
     const std::uint32_t prefill_chunk;
+    // Spacing of private progress anchors on long prefills (0 off), see plan_request.
+    const std::uint32_t progress_anchor_tokens;
     // The draft model's own proposal width.
     const std::uint32_t draft_window;
     // The widest round family's verify_drafts; per-round buffers are allocated at it.
@@ -675,6 +679,11 @@ public:
                            DeviceKVPageHandle destination, runtime::ContextResourceClass);
     void publish_context_transfers(ContextTransaction&);
     [[nodiscard]] bool prepare_backup(ContextTransaction&, CheckpointState&, bool shared_device);
+    // Reserves Host extents for `pages`, splitting across free runs when one run is too small,
+    // and appends one device-to-host KVTransfer per extent.
+    [[nodiscard]] bool reserve_host_kv_transfers(ContextTransaction&, LogicalKVPageStore&,
+                                                 runtime::ContextResourceClass,
+                                                 std::span<const LogicalKVPageHandle> pages);
     void install_binding(ContextTransaction&);
     void prepare_binding(ContextTransaction&);
     void complete_binding(ContextTransaction&, ContextProgress&);

@@ -13,6 +13,24 @@
 #include <unordered_set>
 #include <utility>
 
+#include <zstd.h>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+
+#include <cerrno>
+#endif
+
 namespace ninfer::runtime {
 namespace {
 
@@ -199,11 +217,154 @@ void remove_quietly(const fs::path& path) noexcept {
     fs::remove(path, ignored);
 }
 
+// Compressed chunks move through zstd as streams of this size: a chunk is never held twice, once
+// compressed and once raw, in the store's own buffers.
+constexpr std::size_t kStreamBytes = std::size_t{256} << 10U;
+
+// A compressed chunk is kept only when it is at least 3 % smaller than the raw one.
+constexpr std::uint64_t compressed_limit(std::uint64_t raw) noexcept { return raw / 100 * 97; }
+
+using CompressContext   = std::unique_ptr<ZSTD_CCtx, decltype(&ZSTD_freeCCtx)>;
+using DecompressContext = std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)>;
+
+// Streams `bytes` through zstd into `staging`. The frame records the content size, so the raw
+// length can be read from the first bytes of the file. Stops and returns nullopt as soon as the
+// output passes the keep limit (the chunk does not compress enough to be worth it).
+std::optional<std::uint64_t> compress_to_file(std::span<const std::uint8_t> bytes,
+                                              const fs::path& staging, int level) {
+    CompressContext context(ZSTD_createCCtx(), &ZSTD_freeCCtx);
+    if (!context) { throw std::runtime_error("cannot create a zstd compression context"); }
+    ZSTD_CCtx_setParameter(context.get(), ZSTD_c_compressionLevel, level);
+    ZSTD_CCtx_setPledgedSrcSize(context.get(), bytes.size());
+    std::ofstream file(staging, std::ios::binary | std::ios::trunc);
+    std::vector<char> out(kStreamBytes);
+    ZSTD_inBuffer input{bytes.data(), bytes.size(), 0};
+    const std::uint64_t limit = compressed_limit(bytes.size());
+    std::uint64_t total       = 0;
+    for (;;) {
+        ZSTD_outBuffer sink{out.data(), out.size(), 0};
+        const std::size_t remaining = ZSTD_compressStream2(context.get(), &sink, &input, ZSTD_e_end);
+        if (ZSTD_isError(remaining)) {
+            throw std::runtime_error(std::string("zstd: ") + ZSTD_getErrorName(remaining));
+        }
+        file.write(out.data(), static_cast<std::streamsize>(sink.pos));
+        total += sink.pos;
+        if (total > limit) { return std::nullopt; }
+        if (remaining == 0) { break; }
+    }
+    file.flush();
+    if (!file.good()) { throw std::runtime_error("cannot write " + staging.string()); }
+    return total;
+}
+
+// Decodes one zstd frame that must be exactly `out.size()` bytes. `next` fills the given buffer
+// with the next compressed bytes and returns how many it wrote (0 at the end of the input). False
+// for a damaged frame, a frame of another length, or input that ends early or runs on.
+template <class Next>
+bool decompress_stream(Next&& next, std::span<std::uint8_t> out) {
+    DecompressContext context(ZSTD_createDCtx(), &ZSTD_freeDCtx);
+    if (!context) { return false; }
+    std::vector<char> buffer(kStreamBytes);
+    ZSTD_outBuffer sink{out.data(), out.size(), 0};
+    for (;;) {
+        const std::size_t got = next(buffer);
+        if (got == 0) { return false; } // ended before the frame did
+        ZSTD_inBuffer input{buffer.data(), got, 0};
+        while (input.pos < input.size) {
+            const std::size_t more = ZSTD_decompressStream(context.get(), &sink, &input);
+            if (ZSTD_isError(more)) { return false; }
+            if (more == 0) {
+                return sink.pos == out.size() && input.pos == input.size && next(buffer) == 0;
+            }
+            if (sink.pos == sink.size) { return false; } // the frame holds more than `out`
+        }
+    }
+}
+
+bool decompress_file(const fs::path& path, std::span<std::uint8_t> out) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) { return false; }
+    return decompress_stream(
+        [&](std::vector<char>& buffer) {
+            file.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+            return static_cast<std::size_t>(file.gcount());
+        },
+        out);
+}
+
+bool decompress_memory(std::span<const std::uint8_t> packed, std::span<std::uint8_t> out) {
+    std::size_t position = 0;
+    return decompress_stream(
+        [&](std::vector<char>& buffer) {
+            const std::size_t count = std::min(buffer.size(), packed.size() - position);
+            std::memcpy(buffer.data(), packed.data() + position, count);
+            position += count;
+            return count;
+        },
+        out);
+}
+
+// The raw length a compressed chunk file declares in its frame header; nullopt when the file is
+// missing or does not start with a frame that records its size.
+std::optional<std::uint64_t> compressed_content_size(const fs::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    char head[32];
+    if (!file) { return std::nullopt; }
+    file.read(head, sizeof(head));
+    const auto size = ZSTD_getFrameContentSize(head, static_cast<std::size_t>(file.gcount()));
+    if (size == ZSTD_CONTENTSIZE_UNKNOWN || size == ZSTD_CONTENTSIZE_ERROR) { return std::nullopt; }
+    return size;
+}
+
 } // namespace
 
 std::array<std::uint64_t, 2> ContextStore::hash(std::span<const std::uint8_t> bytes) {
     return {xxh64(bytes.data(), bytes.size(), 0), xxh64(bytes.data(), bytes.size(), 0x9e3779b97f4a7c15ULL)};
 }
+
+// An exclusive lock on one file of the directory, held for the store's life. The directory's logic
+// (refcounts, scan, garbage collection) is only sound with one process in it, so a second owner
+// must fail at start-up rather than corrupt it. The OS releases the lock when the process dies.
+struct ContextStore::OwnerLock {
+    explicit OwnerLock(const fs::path& path) {
+#ifdef _WIN32
+        handle_ = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle_ == INVALID_HANDLE_VALUE) {
+            const DWORD code = GetLastError();
+            throw std::runtime_error(code == ERROR_SHARING_VIOLATION
+                                         ? "in use by another process"
+                                         : "cannot open " + path.string() + " (error " +
+                                               std::to_string(code) + ")");
+        }
+#else
+        fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        if (fd_ < 0) { throw std::runtime_error("cannot open " + path.string()); }
+        if (::flock(fd_, LOCK_EX | LOCK_NB) != 0) {
+            const int code = errno;
+            ::close(fd_);
+            throw std::runtime_error(code == EWOULDBLOCK ? "in use by another process"
+                                                         : "cannot lock " + path.string());
+        }
+#endif
+    }
+    ~OwnerLock() {
+#ifdef _WIN32
+        CloseHandle(handle_);
+#else
+        ::close(fd_);
+#endif
+    }
+    OwnerLock(const OwnerLock&)            = delete;
+    OwnerLock& operator=(const OwnerLock&) = delete;
+
+private:
+#ifdef _WIN32
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+#else
+    int fd_ = -1;
+#endif
+};
 
 ContextStore::ContextStore(Options options) : options_(std::move(options)) {
     if (options_.directory.empty()) {
@@ -222,6 +383,21 @@ ContextStore::ContextStore(Options options) : options_(std::move(options)) {
                                      (options_.directory / sub).string() + ": " + error.message());
         }
     }
+    if (!options_.peers.empty() && options_.peer_poll.count() <= 0) {
+        throw std::invalid_argument("context store peer_poll must be positive");
+    }
+    for (const fs::path& peer : options_.peers) {
+        std::error_code same_error;
+        if (peer.empty() || fs::equivalent(peer, options_.directory, same_error)) {
+            throw std::invalid_argument("a context store peer must be another store's directory");
+        }
+    }
+    try {
+        owner_ = std::make_unique<OwnerLock>(options_.directory / "owner.lock");
+    } catch (const std::exception& failure) {
+        throw std::runtime_error("context store directory " + options_.directory.string() + ": " +
+                                 failure.what());
+    }
     {
         std::scoped_lock io(io_mutex_);
         std::scoped_lock lock(mutex_);
@@ -232,9 +408,16 @@ ContextStore::ContextStore(Options options) : options_(std::move(options)) {
         remote_thread_ = std::thread([this] { remote_loop(); });
         enqueue_remote({RemoteTask::Kind::Refresh, std::string(), {}, {}});
     }
+    if (!options_.peers.empty()) { peer_thread_ = std::thread([this] { peer_loop(); }); }
 }
 
 ContextStore::~ContextStore() {
+    {
+        std::scoped_lock lock(peer_mutex_);
+        peer_stopping_ = true;
+    }
+    peer_cv_.notify_all();
+    if (peer_thread_.joinable()) { peer_thread_.join(); }
     {
         std::scoped_lock lock(remote_mutex_);
         remote_stopping_ = true;
@@ -260,11 +443,95 @@ fs::path ContextStore::chunk_path(const std::array<std::uint64_t, 2>& hash) cons
     return options_.directory / "chunks" / key.substr(0, 2) / (key + ".chunk");
 }
 
-void ContextStore::write_atomically(const fs::path& path, std::span<const std::uint8_t> bytes) const {
+fs::path ContextStore::compressed_chunk_path(const std::array<std::uint64_t, 2>& hash) const {
+    const std::string key = hex_key(hash);
+    return options_.directory / "chunks" / key.substr(0, 2) / (key + ".chunk.zst");
+}
+
+std::optional<ContextStore::StoredChunk> ContextStore::locate_chunk(const ChunkRef& chunk) const {
+    std::error_code error;
+    const auto raw = fs::file_size(chunk_path(chunk.hash), error);
+    if (!error && raw == chunk.length) { return StoredChunk{false, raw}; }
+    const fs::path packed = compressed_chunk_path(chunk.hash);
+    const auto size       = fs::file_size(packed, error);
+    if (error) { return std::nullopt; }
+    const auto content = compressed_content_size(packed);
+    if (!content || *content != chunk.length) { return std::nullopt; }
+    return StoredChunk{true, size};
+}
+
+bool ContextStore::read_chunk(const ChunkRef& chunk, std::span<std::uint8_t> out) const {
+    {
+        std::ifstream file(chunk_path(chunk.hash), std::ios::binary);
+        if (file && file.read(reinterpret_cast<char*>(out.data()),
+                              static_cast<std::streamsize>(out.size()))) {
+            return true;
+        }
+    }
+    return decompress_file(compressed_chunk_path(chunk.hash), out);
+}
+
+std::pair<fs::path, ContextStore::StoredChunk>
+ContextStore::write_chunk(const ChunkRef& chunk, std::span<const std::uint8_t> bytes) const {
+    if (options_.compress_chunks) {
+        const fs::path final_path = compressed_chunk_path(chunk.hash);
+        const fs::path staging    = staging_path();
+        std::error_code error;
+        fs::create_directories(final_path.parent_path(), error);
+        std::optional<std::uint64_t> packed;
+        try {
+            packed = compress_to_file(bytes, staging, options_.compression_level);
+        } catch (...) {
+            remove_quietly(staging);
+            throw;
+        }
+        if (packed) {
+            fs::rename(staging, final_path, error);
+            if (error) {
+                remove_quietly(staging);
+                throw std::runtime_error("cannot publish " + final_path.string() + ": " +
+                                         error.message());
+            }
+            return {final_path, StoredChunk{true, *packed}};
+        }
+        remove_quietly(staging); // not worth compressing: kept raw
+    }
+    write_atomically(chunk_path(chunk.hash), bytes);
+    return {chunk_path(chunk.hash), StoredChunk{false, bytes.size()}};
+}
+
+void ContextStore::install_chunk_file(const ChunkRef& chunk, bool compressed,
+                                      std::span<const std::uint8_t> file_bytes) const {
+    write_atomically(compressed ? compressed_chunk_path(chunk.hash) : chunk_path(chunk.hash),
+                     file_bytes);
+}
+
+std::vector<std::uint8_t> ContextStore::verified_chunk_file(const ChunkRef& chunk,
+                                                            bool& compressed) const {
+    const auto located = locate_chunk(chunk);
+    if (!located) { throw std::runtime_error("a chunk of the image is missing on disk"); }
+    std::vector<std::uint8_t> raw(chunk.length);
+    if (!read_chunk(chunk, raw) || hash(raw) != chunk.hash) {
+        throw std::runtime_error("a chunk of the image is damaged on disk");
+    }
+    compressed = located->compressed;
+    return compressed ? read_whole_file(compressed_chunk_path(chunk.hash)) : raw;
+}
+
+fs::path ContextStore::staging_path() const {
     static std::atomic<std::uint64_t> counter{0};
     std::ostringstream name;
     name << std::this_thread::get_id() << '.' << counter.fetch_add(1) << ".tmp";
-    const fs::path staging = options_.directory / "tmp" / name.str();
+    return options_.directory / "tmp" / name.str();
+}
+
+void ContextStore::remove_chunk_files(const std::array<std::uint64_t, 2>& hash) const noexcept {
+    remove_quietly(chunk_path(hash));
+    remove_quietly(compressed_chunk_path(hash));
+}
+
+void ContextStore::write_atomically(const fs::path& path, std::span<const std::uint8_t> bytes) const {
+    const fs::path staging = staging_path();
     std::error_code error;
     fs::create_directories(path.parent_path(), error);
     {
@@ -292,10 +559,10 @@ void ContextStore::add_references(const Entry& entry) {
         if (use.references++ == 0 && use.pins == 0) {
             use.length = chunk.length;
             // An image a remote holds is registered before its chunks are fetched.
-            std::error_code error;
-            const auto size = fs::file_size(chunk_path(chunk.hash), error);
-            use.present     = !error && size == chunk.length;
-            if (use.present) { chunk_total_bytes_ += chunk.length; }
+            const auto located = locate_chunk(chunk);
+            use.present        = located.has_value();
+            use.stored         = located ? located->bytes : 0;
+            if (use.present) { chunk_total_bytes_ += use.stored; }
         }
     }
 }
@@ -305,8 +572,8 @@ void ContextStore::release_references(const Entry& entry) {
         const auto found = chunks_.find(hex_key(chunk.hash));
         if (found == chunks_.end()) { continue; }
         if (--found->second.references == 0 && found->second.pins == 0) {
-            if (found->second.present) { chunk_total_bytes_ -= found->second.length; }
-            remove_quietly(chunk_path(chunk.hash));
+            if (found->second.present) { chunk_total_bytes_ -= found->second.stored; }
+            remove_chunk_files(chunk.hash);
             chunks_.erase(found);
         }
     }
@@ -317,8 +584,8 @@ void ContextStore::unpin_chunks_locked(const std::vector<ChunkRef>& chunks) {
         const auto found = chunks_.find(hex_key(chunk.hash));
         if (found == chunks_.end() || found->second.pins == 0) { continue; }
         if (--found->second.pins == 0 && found->second.references == 0) {
-            if (found->second.present) { chunk_total_bytes_ -= found->second.length; }
-            remove_quietly(chunk_path(chunk.hash));
+            if (found->second.present) { chunk_total_bytes_ -= found->second.stored; }
+            remove_chunk_files(chunk.hash);
             chunks_.erase(found);
         }
     }
@@ -334,6 +601,23 @@ void ContextStore::remove_entry_locked(const std::string& id, bool corrupt) {
     }
     remove_quietly(manifest_path(id));
     remove_quietly(used_path(id));
+}
+
+void ContextStore::quarantine_peers_locked(Entry& entry, const std::vector<ChunkRef>* damaged) {
+    if (damaged == nullptr) {
+        if (!entry.peer_memo_key.empty()) { peer_skipped_[entry.peer_memo_key] = entry.peer_stamp; }
+        return;
+    }
+    // A damaged chunk this store wrote, fetched or shared with another image says nothing about a
+    // peer: that peer is asked again, and its intact copy can still complete the image. The damaged
+    // files are discarded, so whatever replaces them is no longer the peer's.
+    for (auto& [memo_key, fill] : entry.peer_fills) {
+        for (const ChunkRef& chunk : *damaged) {
+            if (fill.chunk_keys.erase(hex_key(chunk.hash)) != 0) {
+                peer_skipped_[memo_key] = fill.stamp;
+            }
+        }
+    }
 }
 
 void ContextStore::write_used(const std::string& id, std::int64_t last_used_ms) const {
@@ -465,23 +749,31 @@ void ContextStore::scan() {
     for (const auto& shard : fs::directory_iterator(options_.directory / "chunks", error)) {
         if (!shard.is_directory()) { continue; }
         for (const auto& item : fs::directory_iterator(shard.path(), error)) {
-            const std::string key = item.path().stem().string();
-            if (item.path().extension() != ".chunk" || chunks_.find(key) == chunks_.end()) {
-                remove_quietly(item.path());
+            const std::string name = item.path().filename().string();
+            constexpr std::string_view kRaw = ".chunk";
+            constexpr std::string_view kPacked = ".chunk.zst";
+            const auto ends_with = [&](std::string_view suffix) {
+                return name.size() > suffix.size() &&
+                       name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
+            };
+            std::string key;
+            if (ends_with(kPacked)) {
+                key = name.substr(0, name.size() - kPacked.size());
+            } else if (ends_with(kRaw)) {
+                key = name.substr(0, name.size() - kRaw.size());
             }
+            if (key.empty() || chunks_.find(key) == chunks_.end()) { remove_quietly(item.path()); }
         }
     }
     // An image whose chunk is missing or the wrong size can never be reassembled.
     std::vector<std::string> broken;
     for (const auto& [id, entry] : entries_) {
         for (const ChunkRef& chunk : entry.chunks) {
-            std::error_code stat_error;
-            const auto size = fs::file_size(chunk_path(chunk.hash), stat_error);
-            if (stat_error || size != chunk.length) {
+            if (!locate_chunk(chunk)) {
                 if (options_.remote) {
                     // The remote still has it: a missing chunk is fetched when the image is
                     // loaded, and a short one is discarded so it is fetched again.
-                    if (!stat_error) { remove_quietly(chunk_path(chunk.hash)); }
+                    remove_chunk_files(chunk.hash);
                     continue;
                 }
                 broken.push_back(id);
@@ -581,7 +873,9 @@ ContextStore::PutResult ContextStore::put(const Description& description,
     std::vector<Segment> segments;
     std::vector<ChunkRef> all_chunks;
     std::vector<fs::path> written;
-    std::vector<std::string> refilled; // chunks the index knew but the directory lacked, now written
+    // Chunks the index knew but the directory lacked, now written, with their size on disk.
+    std::vector<std::pair<std::string, std::uint64_t>> refilled;
+    std::uint64_t stored_written = 0;
     std::unordered_set<std::string> seen_in_put;
     try {
         const auto add_inline = [&](std::uint64_t begin, std::uint64_t end) {
@@ -615,10 +909,11 @@ ContextStore::PutResult ContextStore::put(const Description& description,
                     present = known && found->second.present;
                 }
                 if (!present && seen_in_put.find(key) == seen_in_put.end()) {
-                    write_atomically(chunk_path(chunk.hash), bytes);
-                    written.push_back(chunk_path(chunk.hash));
-                    if (known) { refilled.push_back(key); }
+                    const auto [path, stored] = write_chunk(chunk, bytes);
+                    written.push_back(path);
+                    if (known) { refilled.emplace_back(key, stored.bytes); }
                     result.chunk_bytes_written += size;
+                    stored_written += stored.bytes;
                 } else {
                     result.chunk_bytes_reused += size;
                 }
@@ -691,11 +986,12 @@ ContextStore::PutResult ContextStore::put(const Description& description,
             manifest_total_bytes_ -= replaced.manifest_bytes;
         }
         manifest_total_bytes_ += entry.manifest_bytes;
-        for (const std::string& key : refilled) {
+        for (const auto& [key, stored] : refilled) {
             const auto found = chunks_.find(key);
             if (found != chunks_.end() && !found->second.present) {
                 found->second.present = true;
-                chunk_total_bytes_ += found->second.length;
+                found->second.stored  = stored;
+                chunk_total_bytes_ += stored;
             }
         }
         add_references(entry);
@@ -741,6 +1037,7 @@ ContextStore::PutResult ContextStore::put(const Description& description,
         }
         ++stats_.puts;
         stats_.bytes_written += result.chunk_bytes_written;
+        stats_.bytes_stored += stored_written;
         stats_.bytes_reused += result.chunk_bytes_reused;
         const std::uint64_t evictions_before = stats_.evicted_for_space + stats_.expired;
         maintain_locked(&description.id);
@@ -798,8 +1095,12 @@ std::optional<std::vector<std::uint8_t>> ContextStore::load(const std::string& i
                     return std::nullopt;
                 }
             }
-            const auto fail = [&]() -> std::optional<std::vector<std::uint8_t>> {
+            // `bad_chunks` nullptr: the manifest or its layout is at fault.
+            const auto fail = [&](const std::vector<ChunkRef>* bad_chunks =
+                                      nullptr) -> std::optional<std::vector<std::uint8_t>> {
                 std::scoped_lock lock(mutex_);
+                const auto found = entries_.find(id);
+                if (found != entries_.end()) { quarantine_peers_locked(found->second, bad_chunks); }
                 remove_entry_locked(id, true);
                 ++stats_.load_misses;
                 return std::nullopt;
@@ -839,13 +1140,11 @@ std::optional<std::vector<std::uint8_t>> ContextStore::load(const std::string& i
                 try {
                     for (std::size_t index = next++; index < pieces.size(); index = next++) {
                         const Piece& piece = pieces[index];
-                        std::ifstream file(chunk_path(piece.chunk->hash), std::ios::binary);
-                        if (!file ||
-                            !file.read(reinterpret_cast<char*>(buffer + piece.position),
-                                       piece.chunk->length) ||
-                            hash(std::span<const std::uint8_t>(buffer + piece.position,
-                                                               piece.chunk->length)) !=
-                                piece.chunk->hash) {
+                        // A compressed chunk is decoded as a stream straight into the image.
+                        const std::span<std::uint8_t> target(buffer + piece.position,
+                                                             piece.chunk->length);
+                        if (!read_chunk(*piece.chunk, target) ||
+                            hash(target) != piece.chunk->hash) {
                             std::scoped_lock damage(damage_mutex);
                             damaged.push_back(*piece.chunk);
                         }
@@ -871,7 +1170,7 @@ std::optional<std::vector<std::uint8_t>> ContextStore::load(const std::string& i
             // Every damaged chunk is discarded and fetched again together (with a remote), so one
             // bad chunk does not leave the next to fail the retry.
             const bool intact = damaged.empty();
-            if (!intact && !(options_.remote && pass == 0)) { return fail(); }
+            if (!intact && !(options_.remote && pass == 0)) { return fail(&damaged); }
             if (intact) {
                 if (touch) {
                     std::scoped_lock lock(mutex_);
@@ -886,15 +1185,19 @@ std::optional<std::vector<std::uint8_t>> ContextStore::load(const std::string& i
                 if (touch) { enqueue_remote({RemoteTask::Kind::Touch, id, {}, {}}); }
                 return image;
             }
-            // Discard the damaged local copies; the remote holds the good ones.
+            // Discard the damaged local copies; the remote holds the good ones. A peer that linked
+            // one of them is not linked from again, unchanged, while the fetch runs.
             std::scoped_lock lock(mutex_);
+            const auto held = entries_.find(id);
+            if (held != entries_.end()) { quarantine_peers_locked(held->second, &damaged); }
             for (const ChunkRef& chunk : damaged) {
                 const auto found = chunks_.find(hex_key(chunk.hash));
                 if (found != chunks_.end() && found->second.present) {
                     found->second.present = false;
-                    chunk_total_bytes_ -= found->second.length;
+                    chunk_total_bytes_ -= found->second.stored;
+                    found->second.stored = 0;
                 }
-                remove_quietly(chunk_path(chunk.hash));
+                remove_chunk_files(chunk.hash);
             }
         }
         std::uint64_t generation = 0;
@@ -971,9 +1274,20 @@ std::string ContextStore::remote_manifest_key(const std::string& id) const {
     return options_.remote_prefix + "manifests/" + id + ".manifest";
 }
 
-std::string ContextStore::remote_chunk_key(const std::array<std::uint64_t, 2>& hash) const {
+std::string ContextStore::remote_chunk_key(const std::array<std::uint64_t, 2>& hash,
+                                           bool compressed) const {
     const std::string key = hex_key(hash);
-    return options_.remote_prefix + "chunks/" + key.substr(0, 2) + "/" + key + ".chunk";
+    return options_.remote_prefix + "chunks/" + key.substr(0, 2) + "/" + key +
+           (compressed ? ".chunk.zst" : ".chunk");
+}
+
+std::optional<std::pair<std::string, bool>>
+ContextStore::find_remote_chunk(const std::array<std::uint64_t, 2>& hash) {
+    for (const bool compressed : {options_.compress_chunks, !options_.compress_chunks}) {
+        std::string key = remote_chunk_key(hash, compressed);
+        if (options_.remote->exists(key)) { return std::make_pair(std::move(key), compressed); }
+    }
+    return std::nullopt;
 }
 
 void ContextStore::enqueue_remote(RemoteTask task) {
@@ -1132,7 +1446,8 @@ void ContextStore::upload_image(RemoteTask& task) {
         const std::int64_t trust = options_.remote_touch_interval.count() * 1000;
         std::unordered_set<std::string> seen;
         for (const ChunkRef& chunk : task.chunks) {
-            const std::string key = remote_chunk_key(chunk.hash);
+            // Confirmations are tracked by content hash: the bucket may hold either form.
+            const std::string key = hex_key(chunk.hash);
             if (!seen.insert(key).second) { continue; }
             {
                 // A bucket's lifecycle rule can expire an object, so a confirmation is trusted for a
@@ -1141,13 +1456,12 @@ void ContextStore::upload_image(RemoteTask& task) {
                 const auto known = uploaded_.find(key);
                 if (known != uploaded_.end() && now - known->second < trust) { continue; }
             }
-            if (!options_.remote->exists(key)) {
+            if (!find_remote_chunk(chunk.hash)) {
                 // The file is pinned, so it is there; if it is not intact the image is not published.
-                const std::vector<std::uint8_t> data = read_whole_file(chunk_path(chunk.hash));
-                if (data.size() != chunk.length || hash(data) != chunk.hash) {
-                    throw std::runtime_error("a chunk of the image is damaged on disk");
-                }
-                options_.remote->put(key, data);
+                // A compressed chunk goes up as it is on disk.
+                bool compressed = false;
+                const std::vector<std::uint8_t> data = verified_chunk_file(chunk, compressed);
+                options_.remote->put(remote_chunk_key(chunk.hash, compressed), data);
                 ++objects;
                 bytes += data.size();
             }
@@ -1189,12 +1503,16 @@ void ContextStore::prune_remote_state() {
 void ContextStore::touch_remote_image(const std::string& id) {
     std::vector<ChunkRef> chunks;
     std::uint64_t generation = 0;
+    // An image imported whole from a peer is the peer's to upload: its age in the bucket is
+    // restarted, but what the bucket lacks is not put there from here.
+    bool peer_image = false;
     {
         std::scoped_lock lock(mutex_);
         const auto found = entries_.find(id);
         if (found == entries_.end()) { return; }
         chunks     = found->second.chunks;
         generation = found->second.generation;
+        peer_image = !found->second.peer_memo_key.empty();
     }
     const std::int64_t now = now_ms();
     {
@@ -1210,8 +1528,10 @@ void ContextStore::touch_remote_image(const std::string& id) {
     bool complete = true;
     try {
         for (const ChunkRef& chunk : chunks) {
-            const std::string key = remote_chunk_key(chunk.hash);
-            if (options_.remote->touch(key)) {
+            const std::string key = hex_key(chunk.hash); // confirmations are tracked by content hash
+            // The bucket may hold either form of the chunk; the form this store writes is tried first.
+            if (options_.remote->touch(remote_chunk_key(chunk.hash, options_.compress_chunks)) ||
+                options_.remote->touch(remote_chunk_key(chunk.hash, !options_.compress_chunks))) {
                 std::scoped_lock lock(remote_mutex_);
                 uploaded_[key] = now;
                 continue;
@@ -1221,20 +1541,21 @@ void ContextStore::touch_remote_image(const std::string& id) {
                 std::scoped_lock lock(remote_mutex_);
                 uploaded_.erase(key);
             }
+            if (peer_image) {
+                complete = false;
+                continue;
+            }
             // Put it back from the directory while the image is still in use, if the directory
             // has an intact copy.
             std::vector<std::uint8_t> data;
+            bool compressed = false;
             try {
-                data = read_whole_file(chunk_path(chunk.hash));
+                data = verified_chunk_file(chunk, compressed);
             } catch (const std::exception&) {
                 complete = false;
                 continue;
             }
-            if (data.size() != chunk.length || hash(data) != chunk.hash) {
-                complete = false;
-                continue;
-            }
-            options_.remote->put(key, data);
+            options_.remote->put(remote_chunk_key(chunk.hash, compressed), data);
             std::scoped_lock lock(mutex_);
             ++stats_.remote_uploads;
             stats_.remote_upload_bytes += data.size();
@@ -1245,7 +1566,7 @@ void ContextStore::touch_remote_image(const std::string& id) {
             // A manifest goes up only after every chunk it names is confirmed or put back
             // (manifest-last): with a chunk still missing, publishing it would offer other engines
             // an image they cannot read. The next use retries.
-            if (!complete) { return; }
+            if (!complete || peer_image) { return; }
             // Republish only the manifest of the image the chunks above were taken from: if the id
             // has been rewritten since, the new image has its own upload and this one is stale.
             std::vector<std::uint8_t> manifest;
@@ -1295,19 +1616,36 @@ ContextStore::FetchStatus ContextStore::fetch_image_chunks(const std::string& id
             if (found != chunks_.end() && found->second.present) { continue; }
         }
         std::optional<std::vector<std::uint8_t>> data;
+        bool compressed = false;
         try {
-            data = options_.remote->get(remote_chunk_key(chunk.hash));
+            // Whichever form an engine uploaded; the form this store writes is tried first.
+            for (const bool form : {options_.compress_chunks, !options_.compress_chunks}) {
+                data = options_.remote->get(remote_chunk_key(chunk.hash, form));
+                if (data) {
+                    compressed = form;
+                    break;
+                }
+            }
         } catch (const std::exception&) {
             std::scoped_lock lock(mutex_);
             ++stats_.remote_download_failures;
             return FetchStatus::Transient;
         }
-        if (!data || data->size() != chunk.length || hash(*data) != chunk.hash) {
+        bool intact = false;
+        if (data) {
+            if (compressed) {
+                std::vector<std::uint8_t> raw(chunk.length);
+                intact = decompress_memory(*data, raw) && hash(raw) == chunk.hash;
+            } else {
+                intact = data->size() == chunk.length && hash(*data) == chunk.hash;
+            }
+        }
+        if (!intact) {
             std::scoped_lock lock(mutex_);
             ++stats_.remote_download_failures;
             return FetchStatus::Corrupt;
         }
-        if (!install_chunk(chunk, *data)) { return FetchStatus::Corrupt; }
+        if (!install_chunk(chunk, compressed, *data)) { return FetchStatus::Corrupt; }
         std::scoped_lock lock(mutex_);
         ++stats_.remote_downloads;
         stats_.remote_download_bytes += data->size();
@@ -1315,15 +1653,17 @@ ContextStore::FetchStatus ContextStore::fetch_image_chunks(const std::string& id
     return FetchStatus::Complete;
 }
 
-bool ContextStore::install_chunk(const ChunkRef& chunk, std::span<const std::uint8_t> bytes) {
+bool ContextStore::install_chunk(const ChunkRef& chunk, bool compressed,
+                                 std::span<const std::uint8_t> file_bytes) {
     std::scoped_lock io(io_mutex_);
     std::scoped_lock lock(mutex_);
     const auto found = chunks_.find(hex_key(chunk.hash));
     if (found == chunks_.end() || found->second.references == 0) { return false; } // image removed
     if (found->second.present) { return true; }
-    write_atomically(chunk_path(chunk.hash), bytes);
+    install_chunk_file(chunk, compressed, file_bytes);
     found->second.present = true;
-    chunk_total_bytes_ += chunk.length;
+    found->second.stored  = file_bytes.size();
+    chunk_total_bytes_ += found->second.stored;
     return true;
 }
 
@@ -1333,6 +1673,8 @@ void ContextStore::settle_failed_fetch(const std::string& id, std::uint64_t gene
     const auto found = entries_.find(id);
     // Replaced while the fetch ran: the failure belongs to an image that is already gone.
     if (found == entries_.end() || found->second.generation != generation) { return; }
+    // Completed meanwhile from a peer's copy: the bucket's failure no longer matters here.
+    if (entry_local_locked(found->second)) { return; }
     // An image written or loaded here has no bucket time: it is not retried until the entry expires.
     const std::int64_t remote_modified = found->second.remote_modified_ms != 0
                                              ? found->second.remote_modified_ms
@@ -1424,6 +1766,225 @@ std::size_t ContextStore::refresh_remote(std::chrono::steady_clock::time_point d
         ++stats_.remote_download_failures;
     }
     return added;
+}
+
+void ContextStore::peer_loop() {
+    std::unique_lock lock(peer_mutex_);
+    while (!peer_stopping_) {
+        peer_cv_.wait_for(lock, options_.peer_poll, [&] { return peer_stopping_; });
+        if (peer_stopping_) { break; }
+        lock.unlock();
+        try {
+            (void)sync_peers();
+        } catch (...) {} // a peer that cannot be read this time is read again next time
+        lock.lock();
+    }
+}
+
+std::size_t ContextStore::sync_peers() {
+    std::size_t imported = 0;
+    std::unordered_set<std::string> listed;
+    for (const fs::path& peer : options_.peers) {
+        std::error_code error;
+        fs::directory_iterator item(peer / "manifests", error);
+        if (error) { continue; } // the peer has not started yet, or has no store
+        for (; item != fs::directory_iterator(); item.increment(error)) {
+            if (error) { break; }
+            const fs::path& path = item->path();
+            if (path.extension() != ".manifest") { continue; }
+            const std::string id = path.stem().string();
+            if (!valid_id(id)) { continue; }
+            const std::string memo_key = peer.string() + "|" + id;
+            listed.insert(memo_key);
+            std::error_code time_error;
+            const std::int64_t stamp = static_cast<std::int64_t>(
+                fs::last_write_time(path, time_error).time_since_epoch().count());
+            if (time_error) {
+                // The peer removed it since the listing: count it, so the skip metrics show the loss.
+                std::scoped_lock lock(mutex_);
+                ++stats_.peer_skipped;
+                continue;
+            }
+            {
+                std::scoped_lock lock(mutex_);
+                // An image the bucket listing registered by name only is still worth the peer's
+                // copy: linking it spares load() the download.
+                const auto held = entries_.find(id);
+                if (held != entries_.end() && entry_local_locked(held->second)) { continue; }
+                const auto skipped = peer_skipped_.find(memo_key);
+                if (skipped != peer_skipped_.end() && skipped->second == stamp) { continue; }
+            }
+            if (import_peer_image(peer, id, stamp)) { ++imported; }
+        }
+    }
+    // A skipped image the peers no longer list is forgotten, so the memo cannot outgrow them.
+    std::scoped_lock lock(mutex_);
+    for (auto it = peer_skipped_.begin(); it != peer_skipped_.end();) {
+        it = listed.count(it->first) != 0 ? std::next(it) : peer_skipped_.erase(it);
+    }
+    return imported;
+}
+
+bool ContextStore::import_peer_image(const fs::path& peer, const std::string& id,
+                                     std::int64_t stamp) {
+    const std::string memo_key = peer.string() + "|" + id;
+    const auto skip            = [&] {
+        std::scoped_lock lock(mutex_);
+        peer_skipped_[memo_key] = stamp;
+        ++stats_.peer_skipped;
+        return false;
+    };
+    std::vector<std::uint8_t> data;
+    try {
+        data = read_whole_file(peer / "manifests" / (id + ".manifest"));
+    } catch (const std::exception&) {
+        // The peer removed it since the listing: count it, so the skip metrics show the loss.
+        std::scoped_lock lock(mutex_);
+        ++stats_.peer_skipped;
+        return false;
+    }
+    Entry entry;
+    if (!parse_manifest(data, entry, nullptr) || entry.info.id != id) { return skip(); }
+    // The peer's last use of the image, as its `.used` sidecar records it (creation time when it
+    // has none): the TTL and the LRU order both go by use, as for the store's own images.
+    entry.info.last_used_ms = entry.info.created_ms;
+    try {
+        const std::vector<std::uint8_t> used = read_whole_file(peer / "manifests" / (id + ".used"));
+        entry.info.last_used_ms = std::max<std::int64_t>(
+            entry.info.created_ms, std::stoll(std::string(used.begin(), used.end())));
+    } catch (const std::exception&) {}
+    if (options_.ttl.count() > 0 &&
+        entry.info.last_used_ms < now_ms() - options_.ttl.count() * 1000) {
+        return skip();
+    }
+
+    std::scoped_lock io(io_mutex_);
+    std::scoped_lock lock(mutex_);
+    // An entry the index already holds (registered from the bucket, its chunks not fetched yet)
+    // keeps its own manifest and generation; only the chunk files it lacks are linked, found by
+    // their content hash, so the peer's manifest need not be the same write of the image.
+    const auto held_entry = entries_.find(id);
+    Entry* const held     = held_entry != entries_.end() ? &held_entry->second : nullptr;
+    if (held != nullptr && entry_local_locked(*held)) { return false; }
+    const std::vector<ChunkRef>& wanted = held != nullptr ? held->chunks : entry.chunks;
+    const auto skip_locked = [&] {
+        peer_skipped_[memo_key] = stamp;
+        ++stats_.peer_skipped;
+        return false;
+    };
+
+    // The chunks this store does not already hold, each once, in whichever form the peer holds it.
+    // The fit check counts the bytes the links will occupy (a compressed chunk takes its file size).
+    struct Source {
+        const ChunkRef* chunk;
+        fs::path path;
+        bool compressed;
+        std::uint64_t size;
+    };
+    std::vector<Source> needed;
+    std::unordered_set<std::string> seen;
+    std::uint64_t new_bytes = held != nullptr ? 0 : entry.manifest_bytes; // a held manifest is counted
+    for (const ChunkRef& chunk : wanted) {
+        const std::string key = hex_key(chunk.hash);
+        if (!seen.insert(key).second) { continue; }
+        const auto known = chunks_.find(key);
+        if (known != chunks_.end() && known->second.present) { continue; }
+        const fs::path raw_source    = peer / "chunks" / key.substr(0, 2) / (key + ".chunk");
+        const fs::path packed_source = peer / "chunks" / key.substr(0, 2) / (key + ".chunk.zst");
+        std::error_code error;
+        std::uint64_t size = fs::file_size(raw_source, error);
+        if (!error && size == chunk.length) {
+            needed.push_back({&chunk, raw_source, false, size});
+        } else {
+            error.clear();
+            size = fs::file_size(packed_source, error);
+            const auto content = error ? std::nullopt : compressed_content_size(packed_source);
+            if (error || !content || *content != chunk.length) {
+                ++stats_.peer_link_failures;
+                return skip_locked(); // the peer evicted it meanwhile, or it is damaged
+            }
+            needed.push_back({&chunk, packed_source, true, size});
+        }
+        new_bytes += size;
+    }
+    // Nothing is imported that would be evicted at once, or the store would link, evict and link
+    // the same image again at every poll.
+    if (options_.max_bytes != 0 && used_bytes_locked() + new_bytes > options_.max_bytes) {
+        return skip_locked();
+    }
+
+    // Hard-link each chunk. A link is independent of the peer's file from then on: the peer
+    // deleting its copy does not touch ours.
+    std::vector<fs::path> created;
+    std::vector<std::pair<const ChunkRef*, StoredChunk>> linked;
+    std::uint64_t linked_bytes = 0;
+    const auto roll_back       = [&] {
+        for (const fs::path& path : created) { remove_quietly(path); }
+    };
+    for (const Source& source : needed) {
+        std::error_code error;
+        remove_chunk_files(source.chunk->hash); // a stale file of ours under the name would block the link
+        const fs::path target = source.compressed ? compressed_chunk_path(source.chunk->hash)
+                                                  : chunk_path(source.chunk->hash);
+        fs::create_directories(target.parent_path(), error);
+        fs::create_hard_link(source.path, target, error);
+        if (error) {
+            ++stats_.peer_link_failures; // another volume, or the peer removed it just now
+            roll_back();
+            return skip_locked();
+        }
+        created.push_back(target);
+        linked.emplace_back(source.chunk, StoredChunk{source.compressed, source.size});
+        linked_bytes += source.size;
+    }
+    if (held == nullptr) {
+        try {
+            write_atomically(manifest_path(id), data);
+        } catch (const std::exception&) {
+            roll_back();
+            return skip_locked();
+        }
+    }
+
+    // Chunks the index knew by name only (an image registered from the bucket) now have files.
+    for (const auto& [chunk, stored] : linked) {
+        const auto known = chunks_.find(hex_key(chunk->hash));
+        if (known != chunks_.end() && !known->second.present) {
+            known->second.present = true;
+            known->second.stored  = stored.bytes;
+            chunk_total_bytes_ += stored.bytes;
+        }
+    }
+    peer_skipped_.erase(memo_key);
+    ++stats_.peer_images;
+    stats_.peer_bytes_linked += linked_bytes;
+    // Only the chunks linked here are the peer's: one this store already held is not.
+    const auto record_fill = [&](Entry& target) {
+        Entry::PeerFill& fill = target.peer_fills[memo_key];
+        fill.stamp            = stamp;
+        for (const auto& [chunk, stored] : linked) { fill.chunk_keys.insert(hex_key(chunk->hash)); }
+    };
+    if (held != nullptr) {
+        // Same references, manifest and generation: a fetch of this entry in flight finds the
+        // chunks present and skips them. The manifest stays the bucket's, so the image is still
+        // this store's to repair in the bucket. The use time is the later of the bucket's and the
+        // peer's.
+        record_fill(*held);
+        if (entry.info.last_used_ms > held->info.last_used_ms) {
+            held->info.last_used_ms = entry.info.last_used_ms;
+            write_used(id, held->info.last_used_ms);
+        }
+        return true;
+    }
+    entry.peer_memo_key     = memo_key;
+    entry.peer_stamp        = stamp;
+    record_fill(entry);
+    manifest_total_bytes_ += entry.manifest_bytes;
+    add_references(entry);
+    entry.generation = ++next_generation_;
+    entries_.emplace(id, std::move(entry));
+    write_used(id, entries_.find(id)->second.info.last_used_ms); // our own sidecar, so a restart keeps it
+    return true;
 }
 
 } // namespace ninfer::runtime

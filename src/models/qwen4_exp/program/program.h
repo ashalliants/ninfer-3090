@@ -434,6 +434,7 @@ public:
     [[nodiscard]] runtime::ContextResourceUsage snapshot_resources(const ResumeState&) const { return {}; }
     [[nodiscard]] std::size_t host_bytes_released(std::span<const CheckpointHandle> checkpoints) const;
     [[nodiscard]] std::optional<std::size_t> pause_host_bytes(SequenceHandle) const { return std::nullopt; }
+    [[nodiscard]] std::size_t pause_state_image_unplaced(SequenceHandle) const { return 0; }
     // Drops the lane's references to Host pages no checkpoint holds (a capture then copies them
     // again), except for `pending_backup`'s lane. Returns the bytes freed.
     [[nodiscard]] std::size_t release_redundant_host(std::span<const CheckpointHandle> excluded,
