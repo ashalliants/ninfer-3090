@@ -456,6 +456,11 @@ public:
     }
 
     // ---- planning ----
+    // The admission fit check (--admission-fit-check) asks the Program; the fake pool never fills.
+    [[nodiscard]] bool prompt_fits_beside_residents(const RequestBasePlan&,
+                                                    const SourceCandidate&) const noexcept {
+        return true;
+    }
     [[nodiscard]] RequestBasePlan plan_request(PreparedPrompt&& prompt,
                                                const ResolvedExecutionOptions& options) {
         if (prompt.tokens == 0) { throw std::invalid_argument("prompt must contain tokens"); }

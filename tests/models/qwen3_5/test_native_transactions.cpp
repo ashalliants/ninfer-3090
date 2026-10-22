@@ -2248,7 +2248,7 @@ void prompt_fits_beside_residents_on_real_pools(DeviceContext& device,
                 {{sequence, qwen::ExecutionUnitKind::Prefill}}};
             require(static_cast<bool>(program.reserve_units(units)),
                     "resident could not reserve its unit");
-            auto step = program.advance_prefill(sequence, nullptr, nullptr, 0, 0);
+            auto step = program.advance_prefill(sequence, nullptr, nullptr, 0);
             processed += step.processed_prompt_tokens;
             if (step.pending) {
                 const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
