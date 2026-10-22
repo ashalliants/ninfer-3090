@@ -696,6 +696,12 @@ request that names no model goes to the model that last served, so `GET` or `DEL
 that created the response (`?model=ID` on the request, or `"model"` in the body). Routing these by
 the response ID alone is tracked in [#336](https://github.com/ashalliants/ninfer-3090/issues/336).
 
+A model that is put to sleep keeps its Responses store, but one that is unloaded (evicted, idle
+past `--unload-idle-seconds`, unloaded explicitly, or rebuilt after an Engine failure) loses it: after
+it loads again, a `previous_response_id` follow-up or a `GET`/`DELETE /v1/responses/{id}` for a
+response made before the unload is answered as an unknown response. Keeping the store across an
+unload is tracked in [#356](https://github.com/ashalliants/ninfer-3090/issues/356).
+
 On an RTX 3090 with two copies of the Qwen3.8-27B artifact under `--models-max 1 --model-suspend`: a
 cold request loaded its model and answered in 6.0 s (the file was in the operating system's cache),
 a request for the other model put the first to sleep and answered in 6.1 s while it loaded, and each
