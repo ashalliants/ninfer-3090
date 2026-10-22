@@ -2037,7 +2037,7 @@ private:
         ProgramCallScope call(*this);
         const auto pause_started = Clock::now();
         if (!instance_.program->start_pause(*request->sequence, save_snapshot,
-                                            &call.failed_timing())) {
+                                            &call.failed_timing(), require_snapshot)) {
             return false;
         }
         call.finish(call.failed_timing());
