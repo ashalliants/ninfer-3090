@@ -1703,32 +1703,39 @@ private:
         auto* provider   = request->output.constrained() ? &masks : nullptr;
         // While another lane decodes, a step that would run for longer than the stall budget is
         // cut down to what the cost model predicts fits it (PrefillScheduleOptions).
-        const bool streaming_neighbour = pacing_.options().stall_budget_ms != 0 &&
-                                         other_lane_streaming(lane);
+        const bool pacing_on           = pacing_.options().stall_budget_ms != 0;
+        const bool streaming_neighbour = pacing_on && other_lane_streaming(lane);
         std::uint32_t planned_tokens = 0;
         std::uint32_t step_cap       = 0;
         std::uint32_t step_prefix    = 0;
-        if (streaming_neighbour) {
+        bool          have_position  = false;
+        // The position is read whenever pacing is on, so an uncontended step still calibrates the
+        // cost model; only the cap itself waits for a neighbour.
+        if (pacing_on) {
             if (const auto position = sibling_cursor(*request)) {
                 const std::uint32_t prompt_tokens = request->base_plan->summary().prompt_tokens;
+                have_position  = true;
                 step_prefix    = *position;
                 planned_tokens = std::min(prefill_chunk_, prompt_tokens - std::min(prompt_tokens, *position));
-                step_cap = pacing_.step_cap(resources_.costs(), step_prefix, planned_tokens, true);
+                if (streaming_neighbour) {
+                    step_cap = pacing_.step_cap(resources_.costs(), step_prefix, planned_tokens, true);
+                }
             }
         }
         ProgramCallScope program_call(*this);
         auto progress = instance_.program->advance_prefill(
             *request->sequence, &program_call.failed_timing(), provider, step_cap);
         program_call.finish(progress.timing);
-        if (streaming_neighbour && progress.processed_prompt_tokens != 0) {
+        if (have_position && progress.processed_prompt_tokens != 0) {
             pacing_.prefill_step_done(
                 predicted_prefill_step_ns(resources_.costs(), step_prefix,
                                           progress.processed_prompt_tokens),
                 progress.timing.elapsed_ns());
-            if (step_cap != 0 && progress.processed_prompt_tokens < planned_tokens) {
+            // Count a step as paced only when the stall cap, not a capture or rewrite frontier,
+            // made it smaller than planned; the deferred tokens are what the cap took off.
+            if (step_cap != 0 && step_cap < planned_tokens) {
                 ++cumulative_stats_.paced_prefill_steps;
-                cumulative_stats_.paced_prefill_deferred_tokens +=
-                    planned_tokens - progress.processed_prompt_tokens;
+                cumulative_stats_.paced_prefill_deferred_tokens += planned_tokens - step_cap;
             }
         }
         if (!progress.landed_transfers.empty()) {
