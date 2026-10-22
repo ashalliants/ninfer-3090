@@ -161,7 +161,12 @@ public:
         }
     }
 
-    ~EngineCore() noexcept {
+    ~EngineCore() noexcept { stop_worker(); }
+
+    // Stops the worker, failing whatever is still waiting, and leaves the Engine alive so that a
+    // thread woken by that can finish its callbacks (Submission::wait ends in release_consumer)
+    // before the Engine is destroyed. Idempotent; the destructor calls it.
+    void stop_worker() noexcept {
         {
             std::lock_guard lock(queue_mutex_);
             stopping_ = true;
