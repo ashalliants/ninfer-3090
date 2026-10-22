@@ -680,6 +680,95 @@ context itself and anything allocated outside the model's regions stay resident:
 more while resident.
 
 
+### Several models (router)
+
+Give `ninfer-serve` no artifact and name the models with `--models-dir DIR` (every `.ninfer` in
+`DIR`, and each subdirectory holding exactly one, by its file or directory name) or
+`--models-preset FILE`, and one server answers for all of them on one address. Models load on demand:
+a request names its model in the body's `"model"` (an id or an alias) or a `?model=` query
+parameter, and a request that names none goes to the model that last served. Every other option on
+the command line applies to each model; a model's section in a preset can change any of them.
+
+```ini
+[*]
+max-context = 65536
+kv-dtype = rk8v4
+; a boolean key is a flag; a model's section can drop it with false. A flag that is on by
+; default (prefill-a8, cuda-graph, prefix-reuse) is turned off with its no- key, e.g. no-cuda-graph = true
+model-suspend = true
+
+[coder]
+model = /models/qwen3_8_27b.ninfer
+alias = default, qwen
+spec = dflash2
+draft-tokens = 7
+
+[small]
+model = /models/other.ninfer
+max-context = 8192
+```
+
+`[*]` holds defaults for every model; any other section is a model (`model` or `artifact` is its
+path, `alias` a comma-separated list, `load-on-startup` a boolean, every other key a serve option
+without its leading dashes). A section named after a model found in `--models-dir` needs no path.
+The command line wins over a preset where they repeat an option. Comments sit on lines of their own
+(`;` or `#` first). The router's own options (`models-max`, `models-autoload`, `sleep-idle-seconds`,
+`unload-idle-seconds`) are command-line only, as are the options the router overrides for every
+model (`api-key`, `host`, `port`, `model-id`): a preset that sets one is rejected at startup. A model
+id may not contain `/`, `?`, `#`, `%` or `\`. With
+`--context-store DIR` each model keeps its store in `DIR/<model id>` (and under `<prefix><model id>/`
+in S3; characters other than letters, digits, `-` and `_` are written as `%XX`). `--request-log-jsonl`
+may not name any model's artifact, n-gram volume or expert state, whether it comes from the command
+line or a model's own section; models that name the same file append to one shared log, one record
+at a time. The router accepts a request body up to the largest `--max-request-mib` of any model, and
+that model's own server then applies its limit.
+`--ngram-volume` and `--expert-state` may not give the same file to two models, and one model's
+n-gram volume, expert state and artifact must be three different files.
+
+`--models-max N` (default 1, 0 for no limit) bounds how many models are loaded at once. To make room
+the least recently used model without a request in flight **sleeps** when it was started with
+`--model-suspend` (its device memory is given back, and it wakes in seconds with its retained
+conversations) and is **unloaded** otherwise. `--sleep-idle-seconds N` and
+`--unload-idle-seconds N` apply the same transitions to idle models. A request for a model that is
+not loaded loads or wakes it, unless `--no-models-autoload`. A model whose Engine failed is unloaded
+once its requests are gone, so the next request loads it again.
+
+The router answers llama.cpp's model API itself:
+
+| Endpoint | |
+|---|---|
+| `GET /models`, `GET /v1/models` | every model with its `status.value` (`unloaded`, `loading`, `loaded`, `sleeping`, `unloading`), the arguments it starts with, its aliases and the last failure |
+| `POST /models/load` | `{"model": ID}`: load it, or wake it when it sleeps |
+| `POST /models/unload` | `{"model": ID}`: unload it once its requests have ended |
+| `POST /models/sleep` | `{"model": ID, "hold": false}`: suspend it; with `hold` it stays asleep until loaded again |
+| `GET /models/sse` | a stream of `{"model", "status"}` events |
+| `POST /v1/models/{id}/suspend`, `/resume`, `GET /v1/models/{id}/residency` | the [model suspend](#model-suspend) endpoints of one model |
+
+`GET /health` is 200 while the router runs. `GET /props`, `/metrics` and `/v1/load` answer for the
+model that last served, without waking or loading it (a 503 while it is unloaded). Everything
+else (chat completions, Responses, Messages and the rest) is forwarded to the model it names: each model runs the ordinary
+single-model server on a loopback port of its own, so every endpoint, request log and metric works
+per model unchanged. The router checks `--api-key` and applies `--cors`; models need neither.
+Streamed responses stream, and a client that disconnects cancels the generation, also while the
+model is still loading or working on the prompt. The router rewrites only the `"model"` member of a
+body it forwards (to the model's id), so every other value reaches the model as you wrote it.
+
+Each model keeps its own Responses store, and a response ID does not say which model made it. A
+request that names no model goes to the model that last served, so `GET` or `DELETE
+/v1/responses/{id}`, `.../input_items` and a `previous_response_id` follow-up must name the model
+that created the response (`?model=ID` on the request, or `"model"` in the body). Routing these by
+the response ID alone is tracked in [#336](https://github.com/ashalliants/ninfer-3090/issues/336).
+
+A model's Responses store survives both sleep and unload (eviction, idle unload, an explicit unload, or
+a rebuild after an Engine failure): after the model loads again, `previous_response_id` follow-ups and
+`GET`/`DELETE /v1/responses/{id}` still find responses made before. The store lives in memory, so it
+is still lost when the router process restarts.
+
+On an RTX 3090 with two copies of the Qwen3.8-27B artifact under `--models-max 1 --model-suspend`: a
+cold request loaded its model and answered in 6.0 s (the file was in the operating system's cache),
+a request for the other model put the first to sleep and answered in 6.1 s while it loaded, and each
+swap after that took 4.0 to 4.1 s with both models staying in the process.
+
 ### Metrics
 
 `GET /metrics` serves Prometheus text format 0.0.4 on the same port. Like `/v1/load` it requires
@@ -1857,7 +1946,12 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--suspend-snapshot pageable\|pinned` | where the retained state waits in host memory while suspended | `pageable` |
 | `--suspend-weights artifact\|host` | where a resume takes the weights from: the artifact again, or a host copy taken at suspend (weight-sized host memory, faster wake) | `artifact` |
 | `--no-auto-resume` | a request while suspended fails (503) instead of resuming the model | requests resume it |
-| `--sleep-idle-seconds N` | suspend the model after N seconds with no request; needs `--model-suspend` | off |
+| `--sleep-idle-seconds N` | suspend the model after N seconds with no request; needs `--model-suspend` (with a router, sleeps idle models that were started with it) | off |
+| `--models-dir DIR` | [router mode](#several-models-router): serve every `.ninfer` in DIR; give no artifact path | off |
+| `--models-preset FILE` | router mode: INI presets, `[id]` sections with `model = PATH` and options without dashes; `[*]` applies to all | off |
+| `--models-max N` | router mode: models loaded at once (`0` = no limit); the least recently used idle one sleeps or unloads to make room | `1` |
+| `--no-models-autoload` | router mode: a request for a model that is not loaded fails instead of loading it | autoload |
+| `--unload-idle-seconds N` | router mode: unload a model idle for N seconds | off |
 | `--device-state-slots N` | extra Device StateImages beyond `max-concurrency` | `max-concurrency` |
 | `--host-context-mib N` | shared pinned Host budget for StateImages, KV and pause snapshots, including in-flight destinations; refused together with `--auto-host-cache` | `8192 MiB + 8 native StateImages` |
 | `--auto-host-cache` | size the Host context budget from the host memory still free once the model has loaded, for a machine that exists to serve; see [automatic host cache](#automatic-host-cache). Refuses an explicit `--host-context-mib` | off |

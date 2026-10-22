@@ -140,6 +140,10 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
+           " (--models-dir DIR | --models-preset FILE) [--models-max N] [--no-models-autoload] "
+           "[options passed to every model]    (router mode: several models, no artifact path)\n"
+           "   or: " +
+           argv0 +
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--fit-context MIN] "
            "[--max-concurrency N] "
@@ -173,6 +177,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--gdn-state-fp16] [--progress-anchor-tokens N] "
            "[--model-suspend [--suspend-snapshot pageable|pinned] "
            "[--suspend-weights artifact|host] [--no-auto-resume] [--sleep-idle-seconds N]] "
+           "[--models-dir DIR] [--models-preset FILE] [--models-max N] [--no-models-autoload] "
+           "[--unload-idle-seconds N] "
            "[--mlp-a8-decode] [--no-prefill-a8] "
            "[--prefill-cublas [--no-prefill-cublas-projections]] "
            "[--no-thinking] [--preserve-thinking] [--tolerant-tool-calls] "
@@ -380,8 +386,32 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         return options;
     }
     if (argc < 2) { throw std::invalid_argument("artifact path is required"); }
-    options.artifact_path = argv[1];
-    for (int i = 2; i < argc; ++i) {
+    // Router mode starts with an option: the models come from --models-dir or --models-preset.
+    const bool artifact_given = std::string_view(argv[1]).substr(0, 2) != "--";
+    if (artifact_given) { options.artifact_path = argv[1]; }
+    // Router options apply to the router; every other argument is passed on to each model.
+    const auto router_option = [](std::string_view arg) {
+        return arg == "--models-dir" || arg == "--models-preset" || arg == "--models-max" ||
+               arg == "--sleep-idle-seconds" || arg == "--unload-idle-seconds";
+    };
+    // Flags that only mean something to a router (--sleep-idle-seconds also works on one model).
+    std::string router_only_flag;
+    for (int i = artifact_given ? 2 : 1; i < argc; ++i) {
+        const std::string_view current = argv[i];
+        if (router_option(current)) {
+            if (current == "--models-max" || current == "--unload-idle-seconds") {
+                router_only_flag = std::string(current);
+            }
+            ++i;
+            continue;
+        }
+        if (current == "--models-autoload" || current == "--no-models-autoload") {
+            router_only_flag = std::string(current);
+            continue;
+        }
+        options.model_arguments.emplace_back(current);
+    }
+    for (int i = artifact_given ? 2 : 1; i < argc; ++i) {
         const std::string arg    = argv[i];
         const auto require_value = [&](const char* flag) -> const char* {
             if (++i >= argc) { throw std::invalid_argument(std::string(flag) + " needs a value"); }
@@ -694,6 +724,20 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--sleep-idle-seconds") {
             options.sleep_idle_seconds = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--sleep-idle-seconds"), "sleep-idle-seconds"));
+        } else if (arg == "--unload-idle-seconds") {
+            options.unload_idle_seconds = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--unload-idle-seconds"), "unload-idle-seconds"));
+        } else if (arg == "--models-dir") {
+            options.models_dir = require_value("--models-dir");
+        } else if (arg == "--models-preset") {
+            options.models_preset = require_value("--models-preset");
+        } else if (arg == "--models-max") {
+            options.models_max = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--models-max"), "models-max"));
+        } else if (arg == "--models-autoload") {
+            options.models_autoload = true;
+        } else if (arg == "--no-models-autoload") {
+            options.models_autoload = false;
         } else if (arg == "--mlp-a8-decode") {
             options.mlp_a8_decode = true;
         } else if (arg == "--no-prefill-a8") {
@@ -890,7 +934,20 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.default_max_tokens && *options.default_max_tokens <= 0) {
         throw std::invalid_argument("--default-max-tokens must be positive");
     }
-    if (options.sleep_idle_seconds != 0 && !options.suspend.enabled) {
+    if (!artifact_given && !options.router()) {
+        throw std::invalid_argument(
+            "artifact path is required (or --models-dir / --models-preset for router mode)");
+    }
+    if (artifact_given && options.router()) {
+        throw std::invalid_argument(
+            "router mode takes its models from --models-dir / --models-preset, not an artifact "
+            "path");
+    }
+    if (!router_only_flag.empty() && !options.router()) {
+        throw std::invalid_argument(router_only_flag +
+                                    " applies to router mode (--models-dir / --models-preset)");
+    }
+    if (options.sleep_idle_seconds != 0 && !options.suspend.enabled && !options.router()) {
         throw std::invalid_argument("--sleep-idle-seconds requires --model-suspend");
     }
     return options;

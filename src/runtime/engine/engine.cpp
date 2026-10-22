@@ -1014,6 +1014,21 @@ ResidencyStatus Engine::residency() const {
         impl_->core);
 }
 
+bool Engine::has_failed() const {
+    if (impl_ == nullptr) { return false; }
+    return std::visit(
+        [](const auto& core) {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate> ||
+                          std::is_same_v<CoreState, std::unique_ptr<Engine::Impl::ScoringCore>>) {
+                return false;
+            } else {
+                return core != nullptr && core->has_failed();
+            }
+        },
+        impl_->core);
+}
+
 void Engine::reset_memory_peaks() noexcept {
     if (impl_ == nullptr) { return; }
     std::visit(
