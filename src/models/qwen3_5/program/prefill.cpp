@@ -225,7 +225,12 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
                                    cudaMemcpyHostToDevice, device.stream));
     }
     auto progress = wrap_prefill(lane, advance_prefill_raw(lane, timing, max_tokens, layer_slices));
-    if (!progress.complete) { settle_unit(lane); }
+    // A partial slice keeps its permit: the chunk's KV growth is mapped and its earlier layers have
+    // already written into it, but the frontier only commits with the last slice. Settling now would
+    // truncate those pages to the old frontier, and the next slice would remap fresh ones that the
+    // earlier layers never wrote (or that a sibling took in between). Reserving the same unit again
+    // while the permit is held is a no-op, so the lane simply continues.
+    if (!progress.complete && !progress.partial) { settle_unit(lane); }
     return progress;
 }
 
