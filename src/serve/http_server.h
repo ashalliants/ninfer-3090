@@ -27,6 +27,9 @@ void write_openai_error(httplib::Response& response, const ApiError& error);
 void write_anthropic_error(httplib::Response& response, const ApiError& error,
                            const std::string& request_id);
 
+// Gives a /v1 response the request ID header its API family carries, unless it already has one.
+void ensure_http_request_id(const httplib::Request& request, httplib::Response& response);
+
 // cpp-httplib invokes the error handler for every application response with status >= 400. Only
 // an empty 413 is its own pre-routing payload-limit rejection; application-authored errors must be
 // left untouched.
@@ -39,7 +42,10 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 
 class HttpServer {
 public:
-    HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger);
+    // `responses_store` lets the owner keep stored Responses across this server's lifetime (the
+    // router reloads a model into a fresh server); by default the server owns a store of its own.
+    HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger,
+               std::shared_ptr<OpenAIResponsesStore> responses_store = nullptr);
     // Stops and joins the startup listener if it is still running. Without this, a failure between
     // start_serving_during_startup() and listen() -- the Engine throwing while loading weights, the
     // most likely failure there is -- would destroy a joinable std::thread and call std::terminate,
@@ -52,6 +58,9 @@ public:
     // Reserves the configured address before model loading. The service is attached only after its
     // Engine is ready, then listen() enters the blocking accept loop on the already-bound socket.
     bool bind();
+    // Binds any free port on options.host and returns it (0 on failure): a model behind a router
+    // listens on loopback at a port of its own.
+    int bind_any_port();
     void attach(GenerationService& service);
     bool listen();
     void stop();
@@ -146,7 +155,8 @@ private:
     // Written by attach() together with service_, before ready_ is published.
     LoadCapacity load_capacity_;
     std::chrono::steady_clock::time_point attached_at_;
-    OpenAIResponsesStore openai_responses_store_;
+    std::shared_ptr<OpenAIResponsesStore> responses_store_;
+    OpenAIResponsesStore& openai_responses_store_;
     OperationalLog operational_log_;
     JsonlRequestLog request_jsonl_;
     Metrics metrics_;

@@ -1247,6 +1247,10 @@ void JsonlRequestLog::write_throughput(const ThroughputReport& report) {
 void JsonlRequestLog::append(std::string record) {
     bool report_failure = false;
     {
+        // One lock for every log in the process: in router mode each model opens the same file, and
+        // records from different models must not interleave.
+        static std::mutex shared_write_mutex;
+        std::lock_guard<std::mutex> shared(shared_write_mutex);
         std::lock_guard<std::mutex> lock(mutex_);
         if (failed_) { return; }
         output_ << record << '\n';
