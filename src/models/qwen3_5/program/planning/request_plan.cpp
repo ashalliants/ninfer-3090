@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/execution_context.h"
+#include "runtime/contract/progress_anchors.h"
 #include <algorithm>
 #include <cmath>
 #include <iterator>
@@ -192,6 +193,13 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
             add(opportunity.frontier, opportunity.kind == PromptCacheMarkerKind::PrivateLongAnchor
                                           ? runtime::CheckpointRole::LongAnchor
                                           : runtime::CheckpointRole::SharedPrefix);
+        }
+        // A private LongAnchor every progress_anchor_tokens: a pause that cannot keep its snapshot
+        // then replays from the nearest one. The owner keeps its newest four, so memory stays
+        // bounded, and a capture that finds no room is skipped like any other optional write.
+        for (const auto frontier :
+             runtime::progress_anchor_frontiers(base->summary.prompt_tokens, progress_anchor_tokens)) {
+            add(frontier, runtime::CheckpointRole::LongAnchor);
         }
         std::sort(base->capture_groups.begin(), base->capture_groups.end(),
                   [](const auto& a, const auto& b) { return a.frontier < b.frontier; });

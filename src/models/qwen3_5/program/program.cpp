@@ -225,6 +225,10 @@ std::optional<std::size_t> Program::pause_host_bytes(SequenceHandle sequence) co
     return impl_->pause_host_bytes(sequence);
 }
 
+std::size_t Program::pause_state_image_unplaced(SequenceHandle sequence) const {
+    return impl_->pause_state_image_unplaced(sequence);
+}
+
 std::size_t Program::release_redundant_host(std::span<const CheckpointHandle> excluded,
                                             std::optional<SequenceHandle> pending_backup) {
     return impl_->release_redundant_host(excluded, pending_backup);

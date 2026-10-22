@@ -1,11 +1,13 @@
 #pragma once
 
+#include "core/nvml.h"
 #include "serve/generation_pace.h"
 #include "serve/generation_service.h"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -26,6 +28,9 @@ class Metrics {
 public:
     void configure(std::string model, const EngineOptions& options, const MemorySummary& memory,
                    RuntimeStats baseline);
+    // Where render() reads the GPU gauges. configure() installs NVML for options.device; a test
+    // replaces it. Unset, or fields it leaves unknown, drop those series rather than report zero.
+    void set_gpu_sampler(std::function<GpuSample()> sampler);
     void first_token(const GenerationFirstTokenObservation& observation);
     void done(const GenerationOutcome& outcome);
     void rejected();
@@ -73,6 +78,15 @@ private:
     EngineOptions options_;
     MemorySummary memory_;
     RuntimeStats baseline_;
+    std::function<GpuSample()> gpu_sampler_;
+    // Serialises sampling with the energy accumulation below, so concurrent scrapes cannot apply
+    // readings out of order. Separate from mutex_ so an NVML call never delays request recording.
+    mutable std::mutex gpu_mutex_;
+    // The counter is the sum of increases between consecutive readings since the sampler was
+    // installed. A reading below the previous one means NVML's counter restarted (driver reset);
+    // the energy since the restart is then the new reading itself.
+    mutable std::optional<double> gpu_energy_last_;
+    mutable double gpu_energy_total_ = 0.0;
     double start_seconds_ = 0.0;
     mutable std::mutex mutex_;
     Requests requests_;

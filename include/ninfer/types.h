@@ -185,6 +185,9 @@ struct ContextStoreOptions {
     std::chrono::seconds restore_budget{120};
     // Upper bound on the time spent writing sessions at shutdown.
     std::chrono::seconds flush_budget{60};
+    // Write new chunks zstd-compressed (on disk and in the remote) when that saves at least 3 %.
+    // Chunks of both forms are always read, so this can be switched either way on an existing store.
+    bool compress_chunks = false;
     // A remote copy of the store (an S3-compatible bucket). The directory then caches it: sessions
     // are uploaded in the background, sessions other engines wrote appear in the store, and one
     // evicted from the directory stays available remotely. Null keeps the store local. Expiry
@@ -193,6 +196,11 @@ struct ContextStoreOptions {
     std::string remote_prefix;
     // How long shutdown waits for the uploads still queued.
     std::chrono::seconds remote_flush_budget{120};
+    // Other engines' store directories on the same volume (read, never written): their sessions
+    // are imported by hard link within `peer_poll`, so an engine on another GPU of the same box
+    // resumes a conversation this one finished without a bucket round trip. See ContextStore.
+    std::vector<std::filesystem::path> peers;
+    std::chrono::milliseconds peer_poll{250};
     // Called on the writer thread after each session is written. Exceptions are ignored.
     std::function<void(const ContextStoreWriteEvent& event)> listener;
 
@@ -368,6 +376,11 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    // Zero (off), or a multiple of prefill_chunk: a long prefill leaves a private LongAnchor
+    // checkpoint every this many tokens, so a request that loses its pause snapshot replays from
+    // the nearest anchor instead of from the root. Needs the context cache; each owner keeps its
+    // newest four anchors. Qwen3.5-family models only.
+    std::uint32_t progress_anchor_tokens = 0;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
@@ -1485,7 +1498,8 @@ struct RuntimeStats {
     std::uint64_t context_store_writes         = 0; // sessions written
     std::uint64_t context_store_write_failures = 0;
     std::uint64_t context_store_dropped        = 0; // sessions not written: write queue full
-    std::uint64_t context_store_bytes_written  = 0; // new chunk bytes written to disk
+    std::uint64_t context_store_bytes_written  = 0; // new chunk bytes written (raw size)
+    std::uint64_t context_store_bytes_stored   = 0; // what they took on disk after compression
     std::uint64_t context_store_bytes_reused   = 0; // chunk bytes already held, not rewritten
     std::uint64_t context_store_evicted        = 0; // removed for space, age or supersession
     std::uint64_t context_store_corrupt        = 0; // removed because they could not be read
@@ -1521,6 +1535,12 @@ struct RuntimeStats {
     std::uint64_t context_store_remote_downloads         = 0;
     std::uint64_t context_store_remote_download_bytes    = 0;
     std::uint64_t context_store_remote_download_failures = 0;
+    // With peers: images imported from another engine's directory, the chunk bytes hard-linked
+    // (not copied), images skipped, and links that failed.
+    std::uint64_t context_store_peer_images        = 0;
+    std::uint64_t context_store_peer_bytes_linked  = 0;
+    std::uint64_t context_store_peer_skipped       = 0;
+    std::uint64_t context_store_peer_link_failures = 0;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {

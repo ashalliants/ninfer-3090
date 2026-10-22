@@ -52,7 +52,7 @@ outside the project's Apache-2.0 licence. Re-read the EULA of the toolkit that b
 
 **Linux links cuBLAS, FFmpeg and glibc dynamically.** The Linux archive does not ship `libcublas` (the
 Lt library alone is about 500 MB), so `docs/release-archive-linux.md` states the requirements: glibc 2.38
-or newer (built on Ubuntu 24.04), the CUDA 12.8 runtime libraries including cuBLAS, FFmpeg 6 and libcurl.
+or newer (built on Ubuntu 24.04), the CUDA 12.8 runtime libraries including cuBLAS, FFmpeg 6, libcurl and libzstd.
 Check them with `ldd` on the new binaries and update the guide if they change.
 
 **Asset sizes.** Each executable is about 460-490 MB (every kernel is linked in). The Windows zip is about

@@ -11,6 +11,7 @@ RUN apt-get update \
         libavutil-dev \
         libcurl4-openssl-dev \
         libswscale-dev \
+        libzstd-dev \
         ninja-build \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
@@ -36,6 +37,7 @@ RUN apt-get update \
         libavutil58 \
         libcurl4t64 \
         libswscale7 \
+        libzstd1 \
     && rm -rf /var/lib/apt/lists/*
 
 # The CUDA runtime image ships forward-compatibility libraries in

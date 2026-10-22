@@ -3,7 +3,9 @@
 #include "core/device.h"
 
 #include <array>
+#include <span>
 #include <stdexcept>
+#include <vector>
 
 namespace ninfer::models::qwen3_5::detail {
 
@@ -62,6 +64,29 @@ std::optional<CheckpointHandle> ProgramImpl::detach_checkpoint(SequenceState& st
     return handle;
 }
 
+bool ProgramImpl::reserve_host_kv_transfers(ContextTransaction& tx, LogicalKVPageStore& pages,
+                                            runtime::ContextResourceClass resource,
+                                            std::span<const LogicalKVPageHandle> logical) {
+    if (!host_kv_extents) { return false; }
+    // One Host extent is a single contiguous arena run. A busy arena can hold enough bytes in
+    // total yet no run big enough for every page, so the pages are placed in as few extents as fit.
+    return reserve_in_chunks(
+        logical,
+        [&](std::span<const LogicalKVPageHandle> chunk) {
+            return host_kv_extents->prepare(pages, chunk);
+        },
+        [&](HostKVExtentReservation&& destination, std::span<const LogicalKVPageHandle> chunk) {
+            KVTransfer transfer;
+            transfer.pages       = &pages;
+            transfer.resource    = resource;
+            transfer.drop_device = true;
+            transfer.logical.assign(chunk.begin(), chunk.end());
+            transfer.physical = host_kv_extents->device_sources(destination);
+            transfer.host_destination.emplace(std::move(destination));
+            tx.kv_transfers.push_back(std::move(transfer));
+        });
+}
+
 bool ProgramImpl::prepare_backup(ContextTransaction& tx, CheckpointState& record,
                                  bool shared_device) {
     if (!host_context_arena) { return false; }
@@ -75,10 +100,7 @@ bool ProgramImpl::prepare_backup(ContextTransaction& tx, CheckpointState& record
     }
     const auto collect = [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
                              KVAddressSpaceHandle address, runtime::ContextResourceClass resource) {
-        KVTransfer transfer;
-        transfer.pages       = &pages;
-        transfer.resource    = resource;
-        transfer.drop_device = true;
+        std::vector<LogicalKVPageHandle> missing;
         for (std::uint32_t i = 0; i < addresses.mapped_pages(address); ++i) {
             const auto page = addresses.logical_page(address, i);
             if (!pages.device_resident(page) ||
@@ -88,18 +110,10 @@ bool ProgramImpl::prepare_backup(ContextTransaction& tx, CheckpointState& record
             if (pages.host_resident(page)) {
                 if (!pages.drop_device_replica(page)) { return false; }
             } else {
-                transfer.logical.push_back(page);
+                missing.push_back(page);
             }
         }
-        if (!transfer.logical.empty()) {
-            auto destination =
-                host_kv_extents ? host_kv_extents->prepare(pages, transfer.logical) : std::nullopt;
-            if (destination) { transfer.host_destination.emplace(std::move(*destination)); }
-            if (!transfer.host_destination) { return false; }
-            transfer.physical = host_kv_extents->device_sources(*transfer.host_destination);
-        }
-        tx.kv_transfers.push_back(std::move(transfer));
-        return true;
+        return missing.empty() || reserve_host_kv_transfers(tx, pages, resource, missing);
     };
     if (!collect(*text_kv_addresses, *text_kv_pages, record.kv->text,
                  runtime::ContextResourceClass::MainKV)) {

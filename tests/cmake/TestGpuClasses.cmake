@@ -16,6 +16,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_artifact_reader_test
   ninfer_bench_support_test
   ninfer_chat_templates_test
+  ninfer_chunked_reservation_test
   ninfer_cli_options_test
   ninfer_context_cost_measure_test
   ninfer_context_cost_test
@@ -35,6 +36,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_json_schema_oracle_test
   ninfer_json_schema_test
   ninfer_kv_capacity_test
+  ninfer_gpu_telemetry_test
   ninfer_kv_plane_types_test
   ninfer_load_report_test
   ninfer_media_decode_test
@@ -75,6 +77,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_s3_object_store_test
   ninfer_sampling_defaults_test
   ninfer_scheduler_test
+  ninfer_model_registry_test
   ninfer_serve_options_test
   ninfer_tensor_test
   ninfer_tool_call_parser_test

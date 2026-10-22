@@ -52,6 +52,11 @@ public:
         // Images not used for this long are removed. Zero means no expiry.
         std::chrono::seconds ttl{0};
         std::uint64_t chunk_bytes = std::uint64_t{32} << 20U;
+        // Write new chunks zstd-compressed when that saves at least 3 % (otherwise raw), locally and
+        // in the remote. A chunk keeps its raw-content hash and length either way, so manifests do
+        // not change, and chunks of both forms are always read whatever this says.
+        bool compress_chunks = false;
+        int compression_level = 3;
         Clock clock; // defaults to the system clock
 
         // An optional remote copy of the whole store (an S3-compatible bucket). The directory then
@@ -64,6 +69,16 @@ public:
         std::string remote_prefix; // prepended to every key, e.g. "ninfer/"
         std::chrono::seconds remote_refresh{60};
         std::chrono::seconds remote_touch_interval{24 * 3600};
+
+        // Directories of other engines' stores on the same volume, read but never written. Every
+        // `peer_poll` the manifests there that this store does not hold are imported by hard-linking
+        // their chunks (no bytes are copied), so an image another engine finished is usable here
+        // within one poll. An image the remote listing registered but whose chunks are not fetched
+        // yet takes the peer's chunks the same way, instead of downloading them. A peer deleting or
+        // evicting an image afterwards does not affect the imported copy; an image deleted while
+        // it is imported is skipped. Failures are misses.
+        std::vector<std::filesystem::path> peers;
+        std::chrono::milliseconds peer_poll{250};
     };
 
     // Where in the image the large, deduplicated bytes are.
@@ -124,7 +139,8 @@ public:
         std::uint64_t images            = 0;
         std::uint64_t puts              = 0;
         std::uint64_t put_failures      = 0;
-        std::uint64_t bytes_written     = 0;
+        std::uint64_t bytes_written     = 0; // raw bytes of new chunks
+        std::uint64_t bytes_stored      = 0; // what they took on disk after compression
         std::uint64_t bytes_reused      = 0;
         std::uint64_t loads             = 0;
         std::uint64_t load_misses       = 0;
@@ -142,6 +158,12 @@ public:
         std::uint64_t remote_download_bytes  = 0;
         std::uint64_t remote_download_failures = 0;
         std::uint64_t remote_refreshes       = 0;
+        // With peers: images imported from them, the chunk bytes linked (not copied), images
+        // skipped (damaged, expired, over budget, or gone mid-import) and links that failed.
+        std::uint64_t peer_images       = 0;
+        std::uint64_t peer_bytes_linked = 0;
+        std::uint64_t peer_skipped      = 0;
+        std::uint64_t peer_link_failures = 0;
     };
 
     // Creates the directory layout, reads the manifests found there and removes whatever is
@@ -187,6 +209,9 @@ public:
     // With a remote: fetches the image's missing chunks in the background so a later load() is
     // local. False when there is nothing to do.
     bool prefetch(const std::string& id);
+    // With peers: imports the images they hold that this store does not (also done in the
+    // background every peer_poll). Returns the number imported.
+    std::size_t sync_peers();
 
     [[nodiscard]] Stats stats() const;
     [[nodiscard]] const Options& options() const noexcept { return options_; }
@@ -215,13 +240,31 @@ private:
         // The bucket's modified time of the manifest this entry was imported from (0: written or
         // loaded here). Compared only with other bucket times, never with the local clock.
         std::int64_t remote_modified_ms = 0;
+        // Set on an image whose manifest was imported from a peer: the peer_skipped_ key and
+        // manifest time to restore if the manifest proves damaged. Such an image is the peer's to
+        // upload, so a use here never puts it in the bucket.
+        std::string peer_memo_key;
+        std::int64_t peer_stamp = 0;
+        // The chunks each peer linked into this entry (peer_skipped_ key -> manifest time and the
+        // chunks' hex keys): a damaged chunk quarantines only the peer that supplied it.
+        struct PeerFill {
+            std::int64_t stamp = 0;
+            std::unordered_set<std::string> chunk_keys;
+        };
+        std::unordered_map<std::string, PeerFill> peer_fills;
     };
     struct ChunkUse {
         std::uint32_t references = 0;
         // Queued uploads that still need the file: it outlives its last reference until they finish.
         std::uint32_t pins       = 0;
-        std::uint32_t length     = 0;
+        std::uint32_t length     = 0; // raw length
+        std::uint64_t stored     = 0; // bytes the chunk file takes on disk (raw or compressed)
         bool present             = false; // the chunk file is in the directory
+    };
+    // Which form of a chunk the directory holds.
+    struct StoredChunk {
+        bool compressed     = false;
+        std::uint64_t bytes = 0; // file size
     };
     struct RemoteTask {
         enum class Kind : std::uint8_t { Upload, Refresh, Prefetch, Touch } kind;
@@ -235,7 +278,29 @@ private:
     [[nodiscard]] std::filesystem::path manifest_path(const std::string& id) const;
     [[nodiscard]] std::filesystem::path used_path(const std::string& id) const;
     [[nodiscard]] std::filesystem::path chunk_path(const std::array<std::uint64_t, 2>& hash) const;
+    [[nodiscard]] std::filesystem::path
+    compressed_chunk_path(const std::array<std::uint64_t, 2>& hash) const;
+    // The chunk file in the directory, raw form preferred, with the right raw length; nullopt when
+    // there is none (a compressed file is checked by the content size in its frame header).
+    [[nodiscard]] std::optional<StoredChunk> locate_chunk(const ChunkRef& chunk) const;
+    // Reads the chunk into `out` (exactly chunk.length bytes), decompressing a compressed file
+    // as a stream straight into `out`. False when the file is missing, short or not a frame of
+    // that length; the caller still verifies the hash.
+    [[nodiscard]] bool read_chunk(const ChunkRef& chunk, std::span<std::uint8_t> out) const;
+    // Writes the chunk (compressed when options_.compress_chunks and it pays) and returns the
+    // path written and its size on disk.
+    [[nodiscard]] std::pair<std::filesystem::path, StoredChunk>
+    write_chunk(const ChunkRef& chunk, std::span<const std::uint8_t> bytes) const;
+    // Writes the bytes of a chunk file exactly as the remote holds it.
+    void install_chunk_file(const ChunkRef& chunk, bool compressed,
+                            std::span<const std::uint8_t> file_bytes) const;
+    // The chunk file's bytes for upload, after checking it decodes to the chunk's hash. Throws
+    // when the file is missing or damaged. `compressed` receives which form it is.
+    [[nodiscard]] std::vector<std::uint8_t> verified_chunk_file(const ChunkRef& chunk,
+                                                                bool& compressed) const;
     [[nodiscard]] std::int64_t now_ms() const;
+    [[nodiscard]] std::filesystem::path staging_path() const;
+    void remove_chunk_files(const std::array<std::uint64_t, 2>& hash) const noexcept;
 
     void scan();
     bool read_manifest(const std::filesystem::path& path, Entry& entry,
@@ -247,6 +312,11 @@ private:
     void add_references(const Entry& entry);
     void release_references(const Entry& entry);
     void remove_entry_locked(const std::string& id, bool corrupt);
+    // A load found `entry` damaged: the peers whose copies are at fault are not imported from again
+    // until they rewrite the image. `damaged` lists the bad chunks (each blames only the peer that
+    // linked it, and is no longer counted as that peer's); nullptr means the manifest itself, which
+    // blames the peer it came from.
+    void quarantine_peers_locked(Entry& entry, const std::vector<ChunkRef>* damaged);
     void write_used(const std::string& id, std::int64_t last_used_ms) const;
     [[nodiscard]] std::uint64_t used_bytes_locked() const;
     void maintain_locked(const std::string* protect);
@@ -256,7 +326,12 @@ private:
 
     // The remote tier (all no-ops without options_.remote).
     [[nodiscard]] std::string remote_manifest_key(const std::string& id) const;
-    [[nodiscard]] std::string remote_chunk_key(const std::array<std::uint64_t, 2>& hash) const;
+    [[nodiscard]] std::string remote_chunk_key(const std::array<std::uint64_t, 2>& hash,
+                                               bool compressed) const;
+    // The remote object holding the chunk, whichever form some engine uploaded: the form this
+    // store writes is tried first. Nullopt when neither exists.
+    [[nodiscard]] std::optional<std::pair<std::string, bool>>
+    find_remote_chunk(const std::array<std::uint64_t, 2>& hash);
     void enqueue_remote(RemoteTask task);
     void enqueue_upload(const std::string& id, std::vector<std::uint8_t> manifest,
                         std::vector<ChunkRef> chunks);
@@ -273,7 +348,9 @@ private:
     // A fetch of `generation` found the image damaged or gone in the bucket: drop it and do not
     // offer it again, unless the entry has been replaced since.
     void settle_failed_fetch(const std::string& id, std::uint64_t generation);
-    bool install_chunk(const ChunkRef& chunk, std::span<const std::uint8_t> bytes);
+    // `file_bytes` is the chunk file as the remote holds it (raw, or a zstd frame when `compressed`).
+    bool install_chunk(const ChunkRef& chunk, bool compressed,
+                       std::span<const std::uint8_t> file_bytes);
 
     Options options_;
     // Serializes everything that changes files (put, load, erase, touch, maintain), so a chunk is
@@ -308,6 +385,20 @@ private:
     };
     std::unordered_map<std::string, RemoteFailure> remote_failed_;
     std::int64_t last_prune_ms_ = 0; // remote worker thread only
+
+    // Peer import. `owner_` holds the exclusive lock on options_.directory for the store's life.
+    struct OwnerLock;
+    [[nodiscard]] bool import_peer_image(const std::filesystem::path& peer, const std::string& id,
+                                         std::int64_t stamp);
+    void peer_loop();
+    std::unique_ptr<OwnerLock> owner_;
+    // (peer + id) -> modification time of the peer manifest that was skipped: not tried again until
+    // the peer rewrites it. Guarded by mutex_.
+    std::unordered_map<std::string, std::int64_t> peer_skipped_;
+    std::mutex peer_mutex_;
+    std::condition_variable peer_cv_;
+    bool peer_stopping_ = false;
+    std::thread peer_thread_;
     std::thread remote_thread_;
 };
 
