@@ -255,6 +255,7 @@ public:
         waiting->choice = choice;
         waiting->held   = std::move(held);
         for (const auto point : old) { release_unreferenced(program, point); }
+        retry_deferred_retirements(program);
     }
 
     [[nodiscard]] std::optional<SourceChoice> retained_source(std::uint64_t request) const {
@@ -302,6 +303,7 @@ public:
         auto held = std::move(found->held);
         waiting_.erase(found);
         for (const auto handle : held) { release_unreferenced(program, handle); }
+        retry_deferred_retirements(program);
     }
 
     // Called exactly once after Native's irreversible bind commit. The choice preserves logical
@@ -592,6 +594,35 @@ public:
         forget(handle);
         prune(program);
         return true;
+    }
+
+    // Releases a shared checkpoint that no request has asked for since it was published: not
+    // pinned, no demand recorded for its prefix, and not held by a waiting request. A request
+    // that publishes a trail of progress anchors uses it to keep the trail short. Returns whether
+    // the checkpoint was released; a checkpoint that is gone, in demand or pinned stays. One that a
+    // waiting request holds stays for now and is retired when that hold ends (see
+    // retry_deferred_retirements), so abandoned prompts cannot leave anchors behind the bound.
+    bool retire_unreused_shared(Program& program, Handle handle) {
+        switch (try_retire_unreused_shared(program, handle)) {
+        case Retirement::Released: return true;
+        case Retirement::Held:
+            if (!contains(retire_deferred_, handle)) { retire_deferred_.push_back(handle); }
+            return false;
+        case Retirement::Kept: return false;
+        }
+        return false;
+    }
+
+    // Retries the retirements that a waiting request's hold refused, after a hold has ended.
+    void retry_deferred_retirements(Program& program) {
+        if (retire_deferred_.empty()) { return; }
+        auto pending = std::move(retire_deferred_);
+        retire_deferred_.clear();
+        for (const auto handle : pending) {
+            if (try_retire_unreused_shared(program, handle) == Retirement::Held) {
+                retire_deferred_.push_back(handle);
+            }
+        }
     }
 
     // Releases one Host victim the way commit_release does: its continuation is offered to the
@@ -905,6 +936,27 @@ public:
     }
 
 private:
+    // How a shared progress anchor's retirement ended: released; refused because a waiting request
+    // holds it (retry when the hold ends); or refused for good (gone, pinned, reused or in demand).
+    enum class Retirement { Released, Held, Kept };
+
+    Retirement try_retire_unreused_shared(Program& program, Handle handle) {
+        if (!program.valid_checkpoint(handle)) { return Retirement::Kept; }
+        const auto entry = std::find_if(shared_.begin(), shared_.end(),
+                                        [&](const auto& shared) { return shared.handle == handle; });
+        if (entry == shared_.end() || entry->pinned || entry->priority.reused) {
+            return Retirement::Kept;
+        }
+        const auto summary = program.checkpoint_metadata(handle);
+        if (demand_priority(program.checkpoint_key(handle, summary.frontier)).reused) {
+            return Retirement::Kept;
+        }
+        // Not release_victim: a retired anchor is not worth offering to the durable store.
+        return erase(program, handle, ReclaimRights{ReclaimPurpose::OptionalWrite, 0})
+                   ? Retirement::Released
+                   : Retirement::Held;
+    }
+
     struct WaitingSource {
         std::uint64_t request;
         SourceChoice choice;
@@ -1943,6 +1995,8 @@ private:
     std::vector<Owner> owners_;
     std::vector<Shared> shared_;
     std::vector<WaitingSource> waiting_;
+    // Shared anchors whose retirement a waiting request's hold refused; retried when a hold ends.
+    std::vector<Handle> retire_deferred_;
     static constexpr std::size_t kDemandCapacity = 256;
     std::vector<Demand> demand_;
     std::uint64_t clock_   = 0;

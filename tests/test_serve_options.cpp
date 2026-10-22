@@ -44,7 +44,8 @@ int main() {
                       "--progress-anchor-tokens did not reach serving options");
     for (const auto& bad : {std::vector<std::string>{"--progress-anchor-tokens", "1000"},
                             std::vector<std::string>{"--progress-anchor-tokens", "4096",
-                                                     "--no-prefix-reuse"}}) {
+                                                     "--no-prefix-reuse"},
+                            std::vector<std::string>{"--progress-anchors-shared"}}) {
         std::vector<std::string> args{"ninfer-serve", "model.ninfer"};
         args.insert(args.end(), bad.begin(), bad.end());
         bool rejected = false;
@@ -53,6 +54,11 @@ int main() {
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "an unusable --progress-anchor-tokens was accepted");
     }
+    failures += check(!defaults.progress_anchors_shared, "shared progress anchors are on by default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--progress-anchor-tokens", "4096",
+                             "--progress-anchors-shared"})
+                          .progress_anchors_shared,
+                      "--progress-anchors-shared did not reach serving options");
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
     failures += check(defaults.request_log_jsonl.empty(),
                       "request JSONL logging is not disabled by default");

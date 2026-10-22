@@ -395,6 +395,11 @@ struct EngineOptions {
     // the nearest anchor instead of from the root. Needs the context cache; each owner keeps its
     // newest four anchors. Qwen3.5-family models only.
     std::uint32_t progress_anchor_tokens = 0;
+    // With progress_anchor_tokens: publish the anchors as SharedPrefix checkpoints instead of private
+    // ones, so a request that is cancelled part-way (a client timeout or disconnect) leaves its work
+    // for the retry, or for any request with the same prefix. A request keeps its two newest anchors
+    // and releases an older one unless something has reused it. Off by default.
+    bool progress_anchors_shared = false;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
