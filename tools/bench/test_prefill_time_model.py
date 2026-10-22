@@ -57,7 +57,10 @@ def test_larger_chunks_amortise_the_fixed_cost():
     check(rates == sorted(rates), "a larger chunk was predicted slower")
 
 
-def test_step_cap_agrees_with_the_cpp_policy():
+def test_step_cap_matches_the_expected_values_of_the_cpp_policy():
+    # A Python expected-value test. The same table is asserted by the C++ test
+    # `test_step_cap_expected_values` in tests/runtime/test_prefill_pacing.cpp (the stall-budget PR),
+    # so a change to either side that is not made to the other fails one of them.
     # Values printed by PrefillPacing::step_cap (src/runtime/engine/prefill_pacing.h) for this cost:
     # 100 ms per step, 0.31 ms per token, 0.5 ns per attention pair, chunk 4096.
     cost = m.Cost(chunk_ns=100e6, token_ns=310_000, pair_ns=0.5)
@@ -99,6 +102,18 @@ def test_scenarios_behave():
 def test_yield_turns_a_wait_for_the_prompt_into_a_wait_for_a_step():
     y = m.yield_wait(m.load_cost("27b"), 100_000, 4096, 0.2)
     check(y["wait_without_yield_s"] > 30 and y["wait_with_yield_s"] < 3, f"yield wait {y}")
+
+
+def test_unusable_numbers_are_an_argument_error_not_a_hang():
+    for bad in (["--chunk", "0"], ["--chunks", "1024", "0"], ["--prompt", "0"], ["--prompt", "-5"],
+                ["--decode-round-ms", "0"], ["--yield-arrival", "0"], ["--yield-arrival", "1"]):
+        try:
+            m.parse_args(bad)
+        except SystemExit as error:
+            check(error.code == 2, f"{bad}: exit code {error.code}")
+        else:
+            check(False, f"{bad} was accepted")
+    m.parse_args([])
 
 
 if __name__ == "__main__":

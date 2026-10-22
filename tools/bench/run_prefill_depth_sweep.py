@@ -15,7 +15,7 @@ about 8% off the prompt. Needs a GPU and an artifact; run it under the GPU lock 
         -- --kv-dtype rk4v4 --prefill-cublas --gdn-state-fp16
 
 Arguments after `--` go to ninfer_bench unchanged (match the serving flags you care about).
-`--print-attention-commands` prints the op-bench commands for the attention kernel at the chunk's
+`--print-attention-commands` prints the raw op-bench commands (no profiler wrapper) for the attention kernel at the chunk's
 width, for a kernel-level look at the same depths.
 """
 
@@ -113,7 +113,7 @@ def print_analysis(result: dict) -> None:
     print(f"  per-step and per-token together {s['base']:.2f}   attention-per-pair {s['attention']:.2f}")
     if s["attention"] > 1.10:
         print("Attention at depth costs more than the fit says: the long-context attention path is "
-              "worth a kernel-level look (--print-attention-commands).")
+              "worth a kernel-level look (--print-attention-commands prints the raw attention benchmark commands).")
     elif s["attention"] < 0.90:
         print("Attention at depth is cheaper than the fit says; the Engine's cost model is pessimistic.")
     else:
@@ -121,7 +121,14 @@ def print_analysis(result: dict) -> None:
 
 
 def attention_commands(chunk: int, lengths: Sequence[int]) -> list[str]:
-    contexts = ",".join(str(max(0, n - chunk)) for n in lengths if n > chunk)
+    """`ninfer_benches` commands for the attention kernel at the chunk's width, one context per length.
+
+    These are the raw benchmark commands: run them under `ncu`/`nsys` yourself for a kernel or system
+    profile. A prompt no longer than one chunk starts from context 0.
+    """
+    if not lengths:
+        raise ValueError("no prompt lengths given")
+    contexts = ",".join(str(max(0, n - chunk)) for n in lengths)
     base = ("ninfer_benches ninfer_causal_softmax_attention_bench --entry append --geometry d256-h24-kv4 "
             f"--kv-dtype rk4v4 --batch 1 --tokens {chunk} --context {contexts} --execution eager "
             "--cache cold --warmup 5 --repeat 21")
@@ -147,6 +154,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     lengths = [int(x) for x in args.lengths.split(",") if x]
+    if not lengths or any(n <= 0 for n in lengths) or args.chunk <= 0:
+        raise SystemExit("--lengths needs at least one positive prompt length and --chunk must be positive")
     if args.print_attention_commands:
         print("\n".join(attention_commands(args.chunk, lengths)))
         return 0

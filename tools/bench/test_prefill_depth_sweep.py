@@ -77,16 +77,29 @@ def test_one_length_fits_attention_only():
     check(s["free"] == ["attention"], "with one length only attention should be free")
 
 
+def write_fake_bench(directory, document):
+    """A fake ninfer_bench that runs on any platform: a Python script behind a one-line launcher."""
+    script = os.path.join(directory, "fake_bench.py")
+    with open(script, "w") as f:
+        f.write("import sys\nargs = sys.argv[1:]\n"
+                "out = args[args.index('--output-file') + 1]\n"
+                "assert '--prefill-chunk' in args and '-p' in args\n"
+                "open(out, 'w').write(%r)\n" % document)
+    if os.name == "nt":
+        launcher = os.path.join(directory, "ninfer_bench.cmd")
+        with open(launcher, "w") as f:
+            f.write('@"%s" "%s" %%*\r\n' % (sys.executable, script))
+    else:
+        launcher = os.path.join(directory, "ninfer_bench")
+        with open(launcher, "w") as f:
+            f.write('#!/bin/sh\nexec "%s" "%s" "$@"\n' % (sys.executable, script))
+        os.chmod(launcher, os.stat(launcher).st_mode | stat.S_IEXEC)
+    return launcher
+
+
 def test_end_to_end_with_a_fake_executable():
     with tempfile.TemporaryDirectory() as d:
-        exe = os.path.join(d, "ninfer_bench")
-        document = json.dumps(bench_document(fake_times()))
-        with open(exe, "w") as f:
-            f.write("#!%s\nimport sys, json\nargs = sys.argv[1:]\n"
-                    "out = args[args.index('--output-file') + 1]\n"
-                    "assert '--prefill-chunk' in args and '-p' in args\n"
-                    "open(out, 'w').write(%r)\n" % (sys.executable, document))
-        os.chmod(exe, os.stat(exe).st_mode | stat.S_IEXEC)
+        exe = write_fake_bench(d, json.dumps(bench_document(fake_times())))
         out_json = os.path.join(d, "analysis.json")
         process = subprocess.run(
             [sys.executable, "-I", os.path.join(HERE, "run_prefill_depth_sweep.py"),
@@ -99,8 +112,19 @@ def test_end_to_end_with_a_fake_executable():
 
 def test_attention_commands_target_the_chunk_width():
     commands = sweep.attention_commands(4096, [4096, 65536])
-    check(all("--tokens 4096" in c for c in commands) and "--context 61440" in commands[0],
+    check(all("--tokens 4096" in c for c in commands) and "--context 0,61440" in commands[0],
           f"{commands}")
+
+
+def test_a_single_length_equal_to_the_chunk_still_gets_a_context():
+    commands = sweep.attention_commands(4096, [4096])
+    check(all("--context 0 " in c for c in commands), f"{commands}")
+    check(all("--context --" not in c for c in commands), "an empty --context value")
+    try:
+        sweep.attention_commands(4096, [])
+    except ValueError:
+        return
+    check(False, "an empty length list was accepted")
 
 
 if __name__ == "__main__":

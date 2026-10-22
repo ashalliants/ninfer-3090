@@ -246,7 +246,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--yield-arrival", type=float, default=0.2,
                         help="fraction of the prompt done when the short request arrives")
     parser.add_argument("--json", action="store_true")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    # The simulation steps through the prompt a chunk at a time and divides by the prompt, the decode
+    # round and the arrival point, so each of them has to be a usable number.
+    if args.prompt <= 0:
+        parser.error("--prompt must be positive")
+    if args.chunk <= 0 or any(c <= 0 for c in args.chunks):
+        parser.error("--chunk and --chunks must be positive")
+    if args.decode_round_ms <= 0:
+        parser.error("--decode-round-ms must be positive")
+    if not 0.0 < args.yield_arrival < 1.0:
+        parser.error("--yield-arrival must be strictly between 0 and 1")
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:

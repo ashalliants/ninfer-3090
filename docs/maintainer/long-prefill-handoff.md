@@ -109,7 +109,7 @@ holds control batches while a sliced chunk is in flight; check that hold is enou
    Compare measured vs the model. A disagreement over ~15% means the model or the implementation is wrong; find out which.
 6. **Attention study:** `python tools/bench/run_prefill_depth_sweep.py --weights <27B> --lengths 4096,16384,32768,65536,100000
    --chunk 4096 --model 27b -- <ninfer_bench flags>` (`--from-json` re-analyses a saved run;
-   `--print-attention-commands` prints the ncu/nsys commands). It reports where the fitted `attention_pair_ns` is wrong
+   `--print-attention-commands` prints the raw attention benchmark commands (run them under ncu/nsys)). It reports where the fitted `attention_pair_ns` is wrong
    with depth. Candidates, in rough order of expected win:
    - chunk 8192 (fewer steps, fewer weight passes) vs the longer stalls it causes;
    - refit the FA2 plan constants at 4096 columns (they were fitted only for 17-2048 columns);
@@ -155,8 +155,8 @@ holds control batches while a sliced chunk is in flight; check that hold is enou
   1.27 s / 5.5 s / 12.2 s / 28.5 s / 50.4 s for 4K / 16K / 32K / 64K / 100K tokens; fitted scales 0.97 for the
   per-step and per-token cost and 0.89 for attention (the Engine's pair cost is slightly pessimistic at depth).
   Attention is 40% of the 100K prompt.
-- **Layer slices are the best of the options for the neighbour**: a 7x smaller worst gap than baseline for 8% more
-  prompt time, against 2.6x smaller for 28% more with the stall budget. `sliced_prefill_matches_whole` passes bit-exact on the
+- **Layer slices are the best of the options for the neighbour**: a 7.3x smaller worst gap than baseline (2930 to
+  402 ms) for 8% more prompt time, against 5.5x smaller (528 ms) for 28% more with the stall budget. `sliced_prefill_matches_whole` passes bit-exact on the
   GPU (it did not before: see below), and greedy output of a 56K prompt, a stream and a short request is
   token-identical with every flag (and with all four together).
 - **Yield**: a short request sent 10 s into the 108K prompt got its first token after 0.77 s with
