@@ -79,6 +79,10 @@ struct PrefillStepResult {
     GeneratedRound round;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
+    // The step ran as wide as the caller's cap and the cap is what made it narrower than planned:
+    // not set for a step a capture frontier ended, for media (which ignores the cap) or for a step
+    // that was never capped.
+    bool cap_applied = false;
     ExecutionTiming timing;
 };
 
