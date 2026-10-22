@@ -1947,7 +1947,6 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--suspend-snapshot pageable\|pinned` | where the retained state waits in host memory while suspended | `pageable` |
 | `--suspend-weights artifact\|host` | where a resume takes the weights from: the artifact again, or a host copy taken at suspend (weight-sized host memory, faster wake) | `artifact` |
 | `--no-auto-resume` | a request while suspended fails (503) instead of resuming the model | requests resume it |
-| `--sleep-idle-seconds N` | suspend the model after N seconds with no request; needs `--model-suspend` | off |
 | `--prefill-stall-budget-ms N` | while another lane decodes, cut each prefill step so it is predicted to take at most N ms; see [execution behavior](#execution-behavior) | off |
 | `--sleep-idle-seconds N` | suspend the model after N seconds with no request; needs `--model-suspend` (with a router, sleeps idle models that were started with it) | off |
 | `--models-dir DIR` | [router mode](#several-models-router): serve every `.ninfer` in DIR; give no artifact path | off |
