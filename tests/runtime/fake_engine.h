@@ -599,7 +599,9 @@ public:
         transaction_ = tx;
         return {.reserved = true};
     }
-    [[nodiscard]] bool start_pause(SequenceHandle sequence, bool save_snapshot, ExecutionTiming* = nullptr) {
+    [[nodiscard]] bool start_pause(SequenceHandle sequence, bool save_snapshot, ExecutionTiming* = nullptr,
+                                   bool require_snapshot = false) {
+        (void)require_snapshot; // the fake always has room for the snapshot
         if (transaction_ || !valid(sequence)) { return false; }
         Transaction tx;
         tx.kind     = ContextOperationKind::Pause;
