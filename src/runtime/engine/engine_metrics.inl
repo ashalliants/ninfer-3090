@@ -176,7 +176,7 @@ void EngineCore<Instance>::publish_runtime_stats() {
         std::lock_guard lock(queue_mutex_);
         snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
         for (const auto& request : pending_) {
-            add_backlog(prefill_estimate_ns(request->prompt_summary.prompt_tokens));
+            add_backlog(queued_prefill_ns(request->prompt_summary));
         }
     }
     snapshot.prefilling_requests              = 0;

@@ -128,6 +128,17 @@ void test_share_off_never_defers() {
     require(pacing.decode_debt_ns() == 0, "a zero decode share accrued debt");
 }
 
+void test_reset_forgets_debt_and_keeps_calibration() {
+    PrefillPacing pacing(PrefillPacingOptions{.stall_budget_ms = 500, .decode_share_percent = 50});
+    pacing.prefill_step_done(1'000'000'000, 2'000'000'000, true);
+    require(pacing.decode_debt_ns() != 0, "the step owed nothing before the reset");
+    const double correction = pacing.correction();
+    pacing.reset_decode_debt();
+    require(pacing.decode_debt_ns() == 0, "the reset left decode debt");
+    require(!pacing.defer_prefill(true), "the reset left a deferred turn pending");
+    require(pacing.correction() == correction, "the reset discarded the stall-budget calibration");
+}
+
 void test_share_owes_decode_time_after_a_step() {
     PrefillPacing pacing(PrefillPacingOptions{.decode_share_percent = 50});
     pacing.prefill_step_done(1, 1'000'000'000, true);
@@ -201,6 +212,7 @@ int main() {
         test_correction_is_bounded();
         test_share_off_never_defers();
         test_share_owes_decode_time_after_a_step();
+        test_reset_forgets_debt_and_keeps_calibration();
         test_share_ratio();
         test_share_ignores_steps_nobody_waited_on();
         test_share_debt_is_capped();

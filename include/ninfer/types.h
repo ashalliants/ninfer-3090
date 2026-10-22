@@ -933,6 +933,9 @@ struct PromptSummary {
     bool starts_in_reasoning    = false;
     std::uint32_t prompt_tokens = 0;
     bool has_media              = false;
+    // Vision work the prompt will cost, for predicting its prefill time while it waits.
+    std::uint32_t vision_items   = 0;
+    std::uint64_t vision_patches = 0;
 };
 
 struct PromptPreparationStats {

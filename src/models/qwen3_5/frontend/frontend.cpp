@@ -781,9 +781,12 @@ PreparedPrompt& PreparedPrompt::operator=(PreparedPrompt&&) noexcept = default;
 
 PromptSummary PreparedPrompt::summary() const {
     if (data_ == nullptr) { throw std::logic_error("prepared prompt is empty"); }
-    return PromptSummary{.starts_in_reasoning = data_->starts_in_reasoning,
-                         .prompt_tokens       = checked_token_count(data_->token_ids.size()),
-                         .has_media           = data_->has_media()};
+    PromptSummary summary{.starts_in_reasoning = data_->starts_in_reasoning,
+                          .prompt_tokens       = checked_token_count(data_->token_ids.size()),
+                          .has_media           = data_->has_media()};
+    summary.vision_items = static_cast<std::uint32_t>(data_->vision_items.size());
+    for (const auto& item : data_->vision_items) { summary.vision_patches += item.patch_count; }
+    return summary;
 }
 
 PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {
