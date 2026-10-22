@@ -2080,7 +2080,9 @@ void progress_anchor_planning(DeviceContext& device, const qwen::execution::Para
     options.context_cache.device_state_slots  = 2;
     options.context_cache.host_capacity_bytes = 0;
     auto planner = qwen::detail::make_sequence_planner_impl(parameters, device, options);
-    auto plan    = qwen::detail::finalize_sequence_plan_impl(std::move(planner), 2);
+    // The explicit capacity fixes the page count; the page size depends on the KV storage.
+    const std::uint32_t pages = planner->curve.minimum_main_page_groups;
+    auto plan                 = qwen::detail::finalize_sequence_plan_impl(std::move(planner), pages);
     qwen::detail::ProgramImpl program(parameters, *plan, device, {});
     runtime::ResolvedExecutionOptions request;
     request.requested_output_tokens = 8;
