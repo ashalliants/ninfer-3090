@@ -394,6 +394,11 @@ std::string prepare_json_schema(std::string_view source) {
     return schema.root.dump();
 }
 
+namespace {
+// Longest run of insignificant whitespace between JSON tokens: a newline plus deep indentation.
+constexpr int kMaxJsonWhitespace = 32;
+} // namespace
+
 xgrammar::Grammar build_json_grammar(const OutputConstraint& constraint) {
     try {
         if (!constraint.choices.empty())
@@ -407,9 +412,12 @@ xgrammar::Grammar build_json_grammar(const OutputConstraint& constraint) {
         else
             throw RequestError(Kind::InvalidJsonSchema,
                                "expected JSON object or schema constraint");
-        return xgrammar::Grammar::FromJSONSchema(source, false, std::nullopt,
-                                                 std::pair<std::string, std::string>{",", ":"},
-                                                 false, std::nullopt, false, false);
+        // Insignificant whitespace stays licensed: the model's own habit is to indent and to put a
+        // space after ':' and ','. Forcing compact text steers it off those tokens and the content
+        // that follows goes wrong (empty keys, punctuation values). The run length is capped so a
+        // stalled model cannot spend its budget on blanks.
+        return xgrammar::Grammar::FromJSONSchema(source, true, std::nullopt, std::nullopt, false,
+                                                 kMaxJsonWhitespace, false, false);
     } catch (const xgrammar::JSONSchemaCompileError& error) {
         const auto kind = error.kind == xgrammar::SchemaErrorType::kUnsupportedSchema
                               ? Kind::UnsupportedJsonSchema
