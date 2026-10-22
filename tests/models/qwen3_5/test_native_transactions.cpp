@@ -2371,7 +2371,8 @@ void sliced_prefill_beside_a_decoding_lane(DeviceContext& device,
     };
     // One decode round for `sequence`; returns the token it produced.
     const auto decode_round = [&](qwen::SequenceHandle sequence) {
-        const std::array<qwen::ExecutionUnit, 1> units{{{sequence, qwen::ExecutionUnitKind::Decode}}};
+        const std::array<qwen::ExecutionUnit, 1> units{
+            {{sequence, qwen::ExecutionUnitKind::Decode, 64}}}; // 64: remaining output budget
         require(static_cast<bool>(program.reserve_units(units)),
                 "the sibling could not reserve a decode unit");
         const std::array<qwen::SequenceHandle, 1> rows{sequence};
