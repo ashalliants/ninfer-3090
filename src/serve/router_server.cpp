@@ -315,7 +315,15 @@ RouterServer::~RouterServer() = default;
 
 bool RouterServer::bind() { return server_.bind_to_port(options_.host, options_.port); }
 
-bool RouterServer::listen() { return server_.listen_after_bind(); }
+bool RouterServer::listen() {
+    // Runs on a background thread: an escaping exception would terminate the process instead of
+    // reaching the caller's listen-failure path.
+    try {
+        return server_.listen_after_bind();
+    } catch (...) {
+        return false;
+    }
+}
 
 void RouterServer::stop() {
     registry_.stop();

@@ -150,6 +150,13 @@ int run_router(const char* argv0, const ninfer::serve::ServeOptions& options,
             for (std::string& word : words) { model_argv.push_back(word.data()); }
             ninfer::serve::ServeOptions model_options = ninfer::serve::parse_serve_options(
                 static_cast<int>(model_argv.size()), model_argv.data());
+            // The multi-device pipeline is parked: a router model runs on one GPU, as a single server
+            // does, and a preset's --devices / --stage-layers must not slip past that at startup.
+            if (model_options.devices.size() > 1 || !model_options.stage_layers.empty()) {
+                throw std::invalid_argument("model '" + model.id +
+                                            "': router mode runs each model on one GPU "
+                                            "(--devices takes one id, --stage-layers is unsupported)");
+            }
             // The router owns the address and the key; a model answers to the router alone.
             model_options.host              = options.host;
             model_options.port              = options.port;
