@@ -1,5 +1,7 @@
 #include "serve/model_registry.h"
 
+#include "core/device_snapshot.h"
+
 #include <algorithm>
 #include <exception>
 #include <filesystem>
@@ -215,13 +217,19 @@ void ModelRegistry::put_to_sleep_locked(std::unique_lock<std::mutex>& lock, std:
     publish_locked(index);
     lock.unlock();
     std::exception_ptr failure;
+    bool left_suspended = false;
     try {
         service->suspend();
+    } catch (const ResidencyRollbackError&) {
+        // The memory it had released could not be put back: the Engine stays suspended, its
+        // state held in the snapshots, and a resume retries the restore.
+        left_suspended = true;
+        failure        = std::current_exception();
     } catch (...) { failure = std::current_exception(); }
     lock.lock();
     if (failure) {
-        // Still resident: a request may have arrived in between. It stays loaded.
-        slot.state = ModelState::Loaded;
+        // Otherwise still resident: a request may have arrived in between. It stays loaded.
+        slot.state = left_suspended ? ModelState::Sleeping : ModelState::Loaded;
         publish_locked(index);
         std::rethrow_exception(failure);
     }
