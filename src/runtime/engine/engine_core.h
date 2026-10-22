@@ -501,6 +501,13 @@ public:
         return resources_.prefill_ns(make_prefill_work(0, tokens, 0, 0, 0));
     }
 
+    // Prefill time the cost model expects for a request still in the queue: every chunk the prompt
+    // will run and the Vision work of its media, so the backlog is not lower than the work that runs.
+    [[nodiscard]] std::uint64_t queued_prefill_ns(const PromptSummary& summary) const noexcept {
+        return resources_.prefill_ns(make_prefill_work(0, summary.prompt_tokens, summary.vision_items,
+                                                       summary.vision_patches, prefill_chunk_));
+    }
+
     // Host context bytes free now, for choosing which stored images to restore at start-up.
     [[nodiscard]] std::size_t free_host_bytes() const {
         std::scoped_lock lock(execution_mutex_);
