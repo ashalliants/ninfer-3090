@@ -125,6 +125,13 @@ public:
         return true;
     }
 
+    // Forgets what the decode share is owed: a cycle without a decode round, or an Engine recovery,
+    // leaves nothing for a later prompt to pay. The stall-budget calibration is kept.
+    void reset_decode_debt() noexcept {
+        debt_ns_        = 0;
+        deferred_turns_ = 0;
+    }
+
     [[nodiscard]] std::uint64_t decode_debt_ns() const noexcept { return debt_ns_; }
     [[nodiscard]] double correction() const noexcept { return static_cast<double>(correction_); }
 

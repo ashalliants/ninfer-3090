@@ -506,6 +506,13 @@ public:
         return resources_.prefill_ns(make_prefill_work(0, tokens, 0, 0, 0));
     }
 
+    // Prefill time the cost model expects for a request still in the queue: every chunk the prompt
+    // will run and the Vision work of its media, so the backlog is not lower than the work that runs.
+    [[nodiscard]] std::uint64_t queued_prefill_ns(const PromptSummary& summary) const noexcept {
+        return resources_.prefill_ns(make_prefill_work(0, summary.prompt_tokens, summary.vision_items,
+                                                       summary.vision_patches, prefill_chunk_));
+    }
+
     // Host context bytes free now, for choosing which stored images to restore at start-up.
     [[nodiscard]] std::size_t free_host_bytes() const {
         std::scoped_lock lock(execution_mutex_);
@@ -1691,8 +1698,10 @@ private:
         progress.pending.reset();
     }
 
+    // `decode_ran` is whether this cycle ran a decode round: only then does the step owe it a share.
     void run_prefill_step(std::uint32_t lane,
-                          const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+                          const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start,
+                          bool decode_ran) {
         nvtx::ScopedRange prefill_range(nvtx::Name::Prefill, nvtx::Category::Prefill);
         EnginePhaseScope setup(*this, EngineHostPhase::CommitOutput);
         const auto request = slots_[lane];
@@ -1708,31 +1717,39 @@ private:
         auto* provider   = request->output.constrained() ? &masks : nullptr;
         // While another lane decodes, a step that would run for longer than the stall budget is
         // cut down to what the cost model predicts fits it (PrefillScheduleOptions).
-        const bool streaming_neighbour = pacing_.options().active() && other_lane_streaming(lane);
+        const bool pacing_on           = pacing_.options().active();
+        const bool streaming_neighbour = pacing_on && other_lane_streaming(lane);
         std::uint32_t planned_tokens = 0;
         std::uint32_t step_cap       = 0;
         std::uint32_t step_prefix    = 0;
-        if (streaming_neighbour) {
+        bool          have_position  = false;
+        // The position is read whenever pacing is on, so an uncontended step still calibrates the
+        // cost model; only the cap itself waits for a neighbour.
+        if (pacing_on) {
             if (const auto position = sibling_cursor(*request)) {
                 const std::uint32_t prompt_tokens = request->base_plan->summary().prompt_tokens;
+                have_position  = true;
                 step_prefix    = *position;
                 planned_tokens = std::min(prefill_chunk_, prompt_tokens - std::min(prompt_tokens, *position));
-                step_cap = pacing_.step_cap(resources_.costs(), step_prefix, planned_tokens, true);
+                if (streaming_neighbour) {
+                    step_cap = pacing_.step_cap(resources_.costs(), step_prefix, planned_tokens, true);
+                }
             }
         }
         ProgramCallScope program_call(*this);
         auto progress = instance_.program->advance_prefill(
             *request->sequence, &program_call.failed_timing(), provider, step_cap);
         program_call.finish(progress.timing);
-        if (streaming_neighbour && progress.processed_prompt_tokens != 0) {
+        if (have_position && progress.processed_prompt_tokens != 0) {
             pacing_.prefill_step_done(
                 predicted_prefill_step_ns(resources_.costs(), step_prefix,
                                           progress.processed_prompt_tokens),
-                progress.timing.elapsed_ns(), true);
-            if (step_cap != 0 && progress.processed_prompt_tokens < planned_tokens) {
+                progress.timing.elapsed_ns(), decode_ran);
+            // Count a step as paced only when the stall cap, not a capture or rewrite frontier,
+            // made it smaller than planned; the deferred tokens are what the cap took off.
+            if (step_cap != 0 && step_cap < planned_tokens) {
                 ++cumulative_stats_.paced_prefill_steps;
-                cumulative_stats_.paced_prefill_deferred_tokens +=
-                    planned_tokens - progress.processed_prompt_tokens;
+                cumulative_stats_.paced_prefill_deferred_tokens += planned_tokens - step_cap;
             }
         }
         if (!progress.landed_transfers.empty()) {
@@ -1974,7 +1991,13 @@ private:
         admission_subject_.reset();
         auto request       = slots_[lane];
         bool save_snapshot = false;
-        if (const auto bytes = instance_.program->pause_host_bytes(*request->sequence)) {
+        if (require_snapshot) {
+            // A pause that only serves the queue is not worth evicting other requests' history, so
+            // it saves a snapshot only where the image already fits: nothing is released, revoked or
+            // marked for replay before the answer is known.
+            save_snapshot = instance_.program->pause_host_bytes(*request->sequence).has_value() &&
+                            instance_.program->pause_state_image_unplaced(*request->sequence) == 0;
+        } else if (const auto bytes = instance_.program->pause_host_bytes(*request->sequence)) {
             const auto usage = instance_.program->physical_usage();
             if (*bytes <= usage.capacity.host_bytes &&
                 *bytes > usage.capacity.host_bytes - usage.occupied.host_bytes) {
@@ -3070,6 +3093,7 @@ private:
                         exception_text(std::current_exception()));
             return false;
         }
+        pacing_.reset_decode_debt();
         recovery_streak_.record_recovery(failed_at);
         ++cumulative_stats_.engine_recoveries;
         request_admission_check();
@@ -3946,6 +3970,9 @@ private:
                     }
                 }
                 auto prefill_lane = scheduler_.next_prefill(prefill_slots, max_concurrency_);
+                // A cycle without a decode round owes nothing, whether or not a prefill lane is
+                // selectable: stale debt must not delay an unrelated prompt later.
+                if (!decode_ran) { pacing_.reset_decode_debt(); }
                 // A decode share holds the prefill turn back while the rounds since the last step
                 // have not yet used their share of its time.
                 if (prefill_lane && pacing_.defer_prefill(decode_ran)) {
@@ -3961,9 +3988,7 @@ private:
                         auto progress = instance_.program->advance_replay(*request->sequence,
                                                                           &call.failed_timing());
                         call.finish(progress.timing);
-                        pacing_.prefill_step_done(0, progress.timing.elapsed_ns(),
-                                                  pacing_.options().active() &&
-                                                      other_lane_streaming(*lane));
+                        pacing_.prefill_step_done(0, progress.timing.elapsed_ns(), decode_ran);
                         if (!request->first_output_timing) {
                             record_execution_work(request->replay_work, progress.timing);
                         }
@@ -3980,7 +4005,7 @@ private:
                                                GenerationSchedulingTransition::ReplayComplete);
                         }
                     } else {
-                        run_prefill_step(*lane, snapshot_cancellations());
+                        run_prefill_step(*lane, snapshot_cancellations(), decode_ran);
                     }
                     scheduler_.prefill_executed(*lane, max_concurrency_);
                     update_recovery(request);
