@@ -174,6 +174,25 @@ def test_cancel_and_retry():
     check(state.long_requests == 2, "the prompt was resubmitted once")
 
 
+def test_cancel_after_completion_is_not_a_retry():
+    # The fake long request takes STALL seconds; a cancel scheduled after that lands on a finished
+    # request, and the run must fail instead of "retrying" a prompt that completed normally.
+    try:
+        run(["--cancel-long-after-seconds", str(STALL + 0.4)])
+    except RuntimeError as error:
+        check("before the cancel took effect" in str(error), f"unexpected error: {error}")
+        return
+    check(False, "a cancel after completion produced a report")
+
+
+def test_windows_start_at_the_wire_send_timestamp():
+    report, _ = run([])
+    during = report["stream"]["during_long_prompt"]
+    check(during["gap_max_ms"] >= STALL * 1000 * 0.6, "the stall is in the during window")
+    check(report["long"]["seconds"] is not None and report["long"]["seconds"] >= STALL * 0.9,
+          "the long duration is measured from the send")
+
+
 if __name__ == "__main__":
     for name, function in list(globals().items()):
         if name.startswith("test_"):

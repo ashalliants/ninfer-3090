@@ -217,9 +217,18 @@ class Prober:
             _headers(self.api_key),
         )
 
+        sent = threading.Event()
+        outcome["sent_event"] = sent
+
+        def on_sent(now: int) -> None:
+            # The first byte is about to leave: this, not the moment the thread was started, is
+            # when the server's clock for the request begins.
+            outcome["sent_ns"] = now
+            sent.set()
+
         def run() -> None:
-            outcome["sent_ns"] = time.perf_counter_ns()
-            result = exchange.execute()
+            result = exchange.execute(on_sent=on_sent)
+            sent.set()  # a request that never got as far as sending must not hang the scenario
             outcome["ended_ns"] = result.ended_ns
             outcome["status"] = result.status
             outcome["error"] = result.error
@@ -239,6 +248,13 @@ class Prober:
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
         return exchange, outcome, thread
+
+
+def _join_or_fail(thread: threading.Thread, timeout: float, what: str) -> None:
+    """A worker still running after the bounded join leaves no usable measurement: fail loudly."""
+    thread.join(timeout)
+    if thread.is_alive():
+        raise RuntimeError(f"{what} had not finished after {timeout:g} s; the report would be invalid")
 
 
 def _seconds(outcome: dict[str, Any]) -> float | None:
@@ -286,8 +302,11 @@ def run_scenario(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError(f"the stream ended early: {stream.error}")
     time.sleep(args.baseline_seconds)
 
-    long_start_ns = time.perf_counter_ns()
     long_exchange, long_outcome, long_thread = prober.start_blocking(long_prompt, 1)
+    # Every window and clock below starts at the long request's wire-send timestamp.
+    if not long_outcome["sent_event"].wait(args.timeout) or long_outcome.get("sent_ns") is None:
+        raise RuntimeError("the long prompt was never sent")
+    long_start_ns = long_outcome["sent_ns"]
 
     short_report: dict[str, Any] | None = None
     cancel_report: dict[str, Any] | None = None
@@ -309,15 +328,22 @@ def run_scenario(args: argparse.Namespace) -> dict[str, Any]:
     long_end_ns = long_outcome.get("ended_ns") or time.perf_counter_ns()
 
     retry_report = None
-    if cancelled_at_ns is not None:
+    if args.cancel_long_after_seconds is not None or cancelled_at_ns is not None:
+        # cancel() returns a timestamp even when the request had already finished, so the first
+        # exchange has to report the cancellation itself before there is anything to retry; and a
+        # prompt that completed before the cancel time leaves nothing to cancel at all.
+        if cancelled_at_ns is None or not long_outcome.get("cancelled"):
+            raise RuntimeError(
+                "the long prompt finished before the cancel took effect; lower "
+                "--cancel-long-after-seconds or raise --long-tokens")
         cancel_report = _long_report(long_outcome)
         _, retry_outcome, retry_thread = prober.start_blocking(long_prompt, 1)
-        retry_thread.join(args.timeout)
+        _join_or_fail(retry_thread, args.timeout, "the retry")
         retry_report = _long_report(retry_outcome)
         long_end_ns = retry_outcome.get("ended_ns") or long_end_ns
 
     if short_thread is not None:
-        short_thread.join(args.timeout)
+        _join_or_fail(short_thread, args.timeout, "the short request")
         first = short_record.first_event_seconds() if short_record else None
         short_report = {
             "started_after_seconds": args.short_delay_seconds,
@@ -328,7 +354,7 @@ def run_scenario(args: argparse.Namespace) -> dict[str, Any]:
     time.sleep(args.after_seconds)
     after_end_ns = time.perf_counter_ns()
     stream_exchange.cancel()
-    stream_thread.join(args.timeout)
+    _join_or_fail(stream_thread, args.timeout, "the stream")
 
     stamps = stream.stamps_ns
     settle_end = stamps[args.settle_events - 1]
