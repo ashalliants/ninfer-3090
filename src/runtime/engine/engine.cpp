@@ -362,6 +362,10 @@ public:
         out.context_store_remote_downloads         = s.remote_downloads;
         out.context_store_remote_download_bytes    = s.remote_download_bytes;
         out.context_store_remote_download_failures = s.remote_download_failures;
+        out.context_store_peer_images        = s.peer_images;
+        out.context_store_peer_bytes_linked  = s.peer_bytes_linked;
+        out.context_store_peer_skipped       = s.peer_skipped;
+        out.context_store_peer_link_failures = s.peer_link_failures;
     }
 
     using CheckpointImage = runtime::ModelInstance::ModelContract::CheckpointImage;
@@ -500,6 +504,8 @@ private:
         store_options.max_bytes = max_bytes;
         store_options.ttl       = config.ttl;
         store_options.compress_chunks = config.compress_chunks;
+        store_options.peers           = config.peers;
+        store_options.peer_poll       = config.peer_poll;
         store_options.remote        = config.remote;
         store_options.remote_prefix = config.remote_prefix;
         store         = std::make_unique<runtime::ContextStore>(std::move(store_options));
@@ -1003,6 +1009,21 @@ ResidencyStatus Engine::residency() const {
                 return ResidencyStatus{};
             } else {
                 return core->residency();
+            }
+        },
+        impl_->core);
+}
+
+bool Engine::has_failed() const {
+    if (impl_ == nullptr) { return false; }
+    return std::visit(
+        [](const auto& core) {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate> ||
+                          std::is_same_v<CoreState, std::unique_ptr<Engine::Impl::ScoringCore>>) {
+                return false;
+            } else {
+                return core != nullptr && core->has_failed();
             }
         },
         impl_->core);
