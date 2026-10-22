@@ -56,6 +56,9 @@ struct PrefillChunkResult {
 struct PrefillSliceState {
     std::uint32_t count = 1; // slices per chunk; 1 runs the chunk whole
     std::uint32_t index = 0; // the next slice to run
+    // GPU time of the slices run so far, each measured on its own so that the sibling decode
+    // rounds queued between slice calls are not counted as prefill.
+    std::uint64_t gpu_ns = 0;
 };
 
 struct DFlashFeatureSink {

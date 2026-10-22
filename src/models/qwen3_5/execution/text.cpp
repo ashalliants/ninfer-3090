@@ -1496,7 +1496,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         }
         // Vision has its own interval. The Program-owned pair measures this text chunk,
         // including MTP alignment or the draft feature consumer submitted below.
-        if (prefill_gpu_timer_ && slice_first) { prefill_gpu_timer_->start(); }
+        if (prefill_gpu_timer_) { prefill_gpu_timer_->start(); }
         const bool is_last = finalize_at_end && (t0 + len == T);
         nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                       static_cast<std::uint64_t>(len));
@@ -1617,9 +1617,14 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                                                cudaMemcpyDeviceToDevice, s));
                     ++prefill_slice_->index;
                     prefill_split_frontier_ = -1;
+                    if (prefill_gpu_timer_) { prefill_gpu_timer_->record_stop(); }
                     timing.begin_wait();
                     ctx_.synchronize();
                     timing.end_wait();
+                    if (prefill_gpu_timer_) {
+                        prefill_slice_->gpu_ns += static_cast<std::uint64_t>(
+                            static_cast<double>(prefill_gpu_timer_->elapsed_ms()) * 1.0e6 + 0.5);
+                    }
                     return PrefillChunkResult{.partial = true, .timing = timing.finish()};
                 }
             } else {
@@ -1768,8 +1773,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     ctx_.synchronize();
     timing.end_wait();
     if (prefill_gpu_timer_) {
-        timing.include({.gpu_elapsed_ns = static_cast<std::uint64_t>(
-                            static_cast<double>(prefill_gpu_timer_->elapsed_ms()) * 1.0e6 + 0.5)});
+        const std::uint64_t earlier = sliced ? prefill_slice_->gpu_ns : 0;
+        timing.include({.gpu_elapsed_ns =
+                            earlier + static_cast<std::uint64_t>(
+                                          static_cast<double>(prefill_gpu_timer_->elapsed_ms()) * 1.0e6 + 0.5)});
     }
     work_.reset();
     if (sliced) { *prefill_slice_ = PrefillSliceState{.count = prefill_slice_->count}; }
