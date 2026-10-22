@@ -2297,7 +2297,9 @@ void sliced_prefill_beside_a_decoding_lane(DeviceContext& device,
                                            const qwen::execution::Parameters& parameters,
                                            qwen::Frontend& frontend, EngineOptions options) {
     constexpr std::uint32_t kLongPrompt  = 2 * kChunk + 40;
-    constexpr std::uint32_t kShortPrompt = 48;
+    // 62 tokens: the sibling's third decode round needs a new KV page (64 tokens per page), so it
+    // takes a page from the pool while the sliced lane's chunk is part-way through.
+    constexpr std::uint32_t kShortPrompt = 62;
     constexpr unsigned kRounds           = 12;
     options.max_context                       = kCapacity;
     options.kv_capacity                       = KvCapacityPolicy::explicit_capacity(kCapacity);
