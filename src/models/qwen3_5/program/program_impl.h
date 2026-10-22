@@ -249,6 +249,12 @@ struct RequestControl {
         bool prepare_mtp                 = false;
         PrefixReusePath reuse            = PrefixReusePath::Root;
         MtpBridgeMode mtp_bridge         = MtpBridgeMode::None;
+        // A chunk run in slices (execution::PrefillSliceState): where it stands, and how many
+        // tokens it covers, so a call that resumes it finishes the same chunk.
+        execution::PrefillSliceState slice;
+        std::uint32_t slice_tokens = 0;
+    // Whether the stall cap narrowed this chunk when its first slice was planned; reported by the last.
+    bool slice_cap_applied = false;
     };
 
     std::optional<Prefill> prefill;
@@ -377,7 +383,8 @@ public:
 
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle, runtime::ExecutionTiming*,
                                                   runtime::TokenMaskProvider*,
-                                                  std::uint32_t max_tokens = 0);
+                                                  std::uint32_t max_tokens   = 0,
+                                                  std::uint32_t layer_slices = 0);
     [[nodiscard]] ReplayProgress advance_replay(SequenceHandle, runtime::ExecutionTiming*);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle>,
                                       std::span<const runtime::RoundBudget>,
@@ -725,7 +732,8 @@ public:
                                             const runtime::BatchedGeneratedRound&);
     [[nodiscard]] runtime::PrefillStepResult advance_prefill_raw(std::uint32_t,
                                                                  runtime::ExecutionTiming*,
-                                                                 std::uint32_t max_tokens);
+                                                                 std::uint32_t max_tokens,
+                                                                 std::uint32_t layer_slices);
     [[nodiscard]] runtime::ExecutionTiming resolve_prefill_raw(std::uint32_t, bool,
                                                                runtime::ExecutionTiming*);
     [[nodiscard]] runtime::ExecutionTiming
@@ -759,7 +767,8 @@ public:
                                     runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::PrefillStepResult
     advance_prefill(SequenceState& sequence, RequestControl& request,
-                    runtime::ExecutionTiming* failed_timing, std::uint32_t max_tokens);
+                    runtime::ExecutionTiming* failed_timing, std::uint32_t max_tokens,
+                    std::uint32_t layer_slices);
     void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);

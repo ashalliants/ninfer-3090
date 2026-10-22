@@ -55,6 +55,7 @@ struct Request {
     std::uint32_t admission_bypasses = 0;
     Phase phase                      = Phase::Waiting;
     bool capture_pending             = false;
+    bool slice_in_flight             = false;
     bool recovery_pending            = false;
     std::optional<Budget> budget     = Budget{};
     std::optional<SequenceHandle> sequence;

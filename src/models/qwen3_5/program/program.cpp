@@ -319,13 +319,14 @@ DeviceSnapshot::Stats Program::resume_device_state(DeviceSnapshot& snapshot) {
 }
 
 PrefillProgress Program::advance_prefill(SequenceHandle h, runtime::ExecutionTiming* t,
-                                         runtime::TokenMaskProvider* m, std::uint32_t max_tokens) {
+                                         runtime::TokenMaskProvider* m, std::uint32_t max_tokens,
+                                         std::uint32_t layer_slices) {
     // Landings complete inside this call (each lane's first prefill pass), so the list is empty on
     // entry. A call that throws after one completed must not leave its observations for the next
     // request's progress.
     auto progress = [&] {
         try {
-            return impl_->advance_prefill(h, t, m, max_tokens);
+            return impl_->advance_prefill(h, t, m, max_tokens, layer_slices);
         } catch (...) {
             impl_->landed_transfers_.clear();
             throw;

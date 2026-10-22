@@ -40,6 +40,7 @@ struct Settings {
     std::chrono::microseconds decode_sleep{1000};
     // Real time a prefill step takes, for a test that must submit while one runs.
     std::chrono::microseconds prefill_sleep{0};
+    std::uint32_t layer_slices = 0;
     bool admission_fit_check = false;
 };
 
@@ -65,7 +66,8 @@ public:
         options.admission_fit_check   = settings.admission_fit_check;
         options.prefill_schedule      = {.stall_budget_ms      = settings.stall_budget,
                                          .yield_remaining_ms   = settings.yield_ms,
-                                         .decode_share_percent = settings.decode_share};
+                                         .decode_share_percent = settings.decode_share,
+                                         .layer_slices         = settings.layer_slices};
         ContextMachineCostModel costs;
         costs.prefill.chunk_ns     = kFixedNs;
         costs.prefill.token_ns_q32 = kPerTokenNs << 32U;
@@ -85,8 +87,8 @@ public:
     }
 
     // Starts a request and returns its result future. `id` names it in the event log.
-    Result run(std::uint64_t id, std::uint32_t prompt_tokens,
-                                      std::uint32_t output_tokens) {
+    Result run(std::uint64_t id, std::uint32_t prompt_tokens, std::uint32_t output_tokens,
+               std::shared_ptr<std::atomic<bool>> cancel = nullptr) {
         ResolvedRequestOptions request;
         request.execution.requested_output_tokens = output_tokens;
         PromptSummary summary;
@@ -98,9 +100,13 @@ public:
         // deadlock a failing test that still holds the worker.
         auto promise = std::make_shared<std::promise<GenerationResult>>();
         Result result = promise->get_future().share();
-        waiters_.emplace_back([submission, promise] {
+        waiters_.emplace_back([submission, promise, cancel] {
             try {
-                promise->set_value(submission->wait(nullptr, CancellationView{}));
+                CancellationView view;
+                if (cancel) {
+                    view = CancellationView([cancel] { return cancel->load(std::memory_order_acquire); });
+                }
+                promise->set_value(submission->wait(nullptr, view));
             } catch (...) { promise->set_exception(std::current_exception()); }
         });
         return result;
@@ -515,6 +521,144 @@ void test_backlog_gauge_tracks_queued_and_resident_prefill() {
             "the backlog did not return to zero when idle");
 }
 
+// ---- layer slices ----------------------------------------------------------------------------
+
+// Prefill events of request `id`, in order.
+std::vector<Event> prefill_events(const Rig& rig, std::uint64_t id) {
+    return rig.events_of(id, Event::Kind::Prefill);
+}
+
+void test_layer_slices_run_a_neighbour_between_slices() {
+    Rig rig({.chunk = 1024, .lanes = 2, .layer_slices = 4});
+    auto stream = rig.run(1, 64, kLongOutput);
+    require(decoding(rig, 3), "the neighbour never started decoding\n" + rig.dump());
+    auto prompt = rig.run(2, 4096, 1);
+    require(finished(prompt), "the long prompt did not finish\n" + rig.dump());
+    (void)prompt.get();
+
+    const auto steps = prefill_events(rig, 2);
+    require(steps.size() == 16, "four chunks of four slices were expected\n" + rig.dump());
+    for (std::size_t i = 0; i < steps.size(); ++i) {
+        const bool last = i % 4 == 3;
+        require(steps[i].slice == i % 4 && steps[i].partial == !last,
+                "slice order or partial flag is wrong\n" + rig.dump());
+        require(steps[i].tokens == (last ? 1024U : 0U) && steps[i].position == (i / 4) * 1024U,
+                "a slice processed tokens, or a chunk started at the wrong place\n" + rig.dump());
+    }
+    // Between consecutive slices the neighbour got a decode round.
+    const auto gaps = decode_rounds_between_steps(rig, 2);
+    require(gaps.size() == 15, "unexpected number of gaps");
+    for (const std::size_t rounds : gaps) {
+        require(rounds >= 1, "two slices ran back to back with the neighbour waiting\n" + rig.dump());
+    }
+    const auto stats = rig.core().runtime_stats();
+    require(stats.sliced_prefill_steps == 4 && stats.prefill_slice_boundaries == 12,
+            "sliced steps or boundaries were miscounted");
+    (void)stream.wait_for(std::chrono::seconds(30));
+}
+
+// A chunk that the stall cap narrowed and that then runs in slices still counts as one paced step with
+// its deferred tokens: the cap is applied on the first call and reported by the last.
+void test_a_capped_sliced_chunk_counts_as_paced_once() {
+    // 10 ms + 0.1 ms/token: an 80 ms budget fits 700 tokens, so each 1024-token chunk runs as 640.
+    Rig rig({.chunk = 1024, .lanes = 2, .stall_budget = 80, .layer_slices = 4});
+    auto stream = rig.run(1, 64, kLongOutput);
+    require(decoding(rig, 3), "the neighbour never started decoding\n" + rig.dump());
+    auto prompt = rig.run(2, 4096, 1);
+    require(finished(prompt), "the long prompt did not finish\n" + rig.dump());
+    const auto stats = rig.core().runtime_stats();
+    // Chunks of a 4,096-token prompt at 640 a step: planned 1024 (x5, 384 deferred each), then 896
+    // (256 deferred), then a 256-token tail the cap does not narrow. All seven run in slices.
+    require(stats.sliced_prefill_steps == 7, "the chunks were not all sliced: " +
+                                                 std::to_string(stats.sliced_prefill_steps));
+    require(stats.paced_prefill_steps == 6,
+            "a capped sliced chunk was not counted as paced exactly once: " +
+                std::to_string(stats.paced_prefill_steps));
+    require(stats.paced_prefill_deferred_tokens == 5U * 384U + 256U,
+            "the deferred tokens of the capped sliced chunks are wrong (an underflow, or lost): " +
+                std::to_string(stats.paced_prefill_deferred_tokens));
+    drain(stream, std::chrono::seconds(30));
+}
+
+void test_layer_slices_need_a_neighbour() {
+    Rig rig({.chunk = 1024, .lanes = 2, .layer_slices = 4});
+    auto prompt = rig.run(1, 4096, 1);
+    require(finished(prompt), "the prompt did not finish\n" + rig.dump());
+    (void)prompt.get();
+    for (const Event& step : prefill_events(rig, 1)) {
+        require(!step.partial && step.tokens == 1024, "a lone prefill was sliced\n" + rig.dump());
+    }
+    require(rig.core().runtime_stats().sliced_prefill_steps == 0, "a step was counted as sliced");
+}
+
+void test_a_sliced_chunk_is_not_interleaved_with_another_prefill() {
+    // Two prompts prefill next to a stream: a chunk that has begun finishes before the other
+    // lane's chunk starts, because the Program has one parking buffer for the residual.
+    Rig rig({.chunk = 1024, .lanes = 3, .layer_slices = 4});
+    auto stream = rig.run(1, 64, kLongOutput);
+    require(decoding(rig, 3), "the neighbour never started decoding\n" + rig.dump());
+    auto first  = rig.run(2, 4096, 1);
+    auto second = rig.run(3, 4096, 1);
+    require(finished(first) && finished(second), "a prompt did not finish\n" + rig.dump());
+    std::optional<std::uint64_t> open;
+    for (const Event& event : rig.events()) {
+        if (event.kind != Event::Kind::Prefill || event.request == 1) { continue; }
+        if (open) {
+            require(event.request == *open, "another lane's chunk started inside a sliced chunk\n" +
+                                                rig.dump());
+        }
+        open = event.partial ? std::optional<std::uint64_t>(event.request) : std::nullopt;
+    }
+    require(!open, "a sliced chunk never finished");
+    (void)stream.wait_for(std::chrono::seconds(30));
+}
+
+void test_a_pause_waits_for_a_sliced_chunk() {
+    // A short request arrives while the long prefill is part-way through a chunk. It cannot pause
+    // the prefill there; it does at the next chunk boundary.
+    Rig rig({.chunk = 1024, .lanes = 2, .yield_ms = 100, .layer_slices = 4});
+    auto stream = rig.run(1, 64, kLongOutput);
+    require(decoding(rig, 3), "the neighbour never started decoding\n" + rig.dump());
+    rig.hold_at([](const Event& e) {
+        return e.kind == Event::Kind::Prefill && e.request == 2 && e.position == 2048 && e.slice == 1;
+    });
+    auto long_result = rig.run(2, 16384, 1);
+    require(rig.wait_held(), "the long prompt never reached its third chunk\n" + rig.dump());
+    auto short_result = rig.run(3, 100, 1);
+    rig.release();
+    require(finished(short_result), "the short request did not finish\n" + rig.dump());
+    require(finished(long_result), "the long prompt did not finish\n" + rig.dump());
+
+    require(rig.count(Event::Kind::PauseStart) == 1, "the long prefill was not paused once\n" + rig.dump());
+    bool mid_chunk = false;
+    for (const Event& event : rig.events()) {
+        if (event.kind == Event::Kind::Prefill && event.request == 2) { mid_chunk = event.partial; }
+        require(!(event.kind == Event::Kind::PauseStart && mid_chunk),
+                "a prefill was paused part-way through a chunk\n" + rig.dump());
+    }
+    (void)stream.wait_for(std::chrono::seconds(30));
+}
+
+void test_cancelling_a_sliced_chunk_leaves_the_engine_working() {
+    Rig rig({.chunk = 1024, .lanes = 2, .layer_slices = 4});
+    auto stream = rig.run(1, 64, kLongOutput);
+    require(decoding(rig, 3), "the neighbour never started decoding\n" + rig.dump());
+    rig.hold_at([](const Event& e) {
+        return e.kind == Event::Kind::Prefill && e.request == 2 && e.position == 1024 && e.slice == 1;
+    });
+    auto cancel      = std::make_shared<std::atomic<bool>>(false);
+    auto cancelled   = rig.run(2, 8192, 1, cancel);
+    require(rig.wait_held(), "the long prompt never reached its second chunk\n" + rig.dump());
+    cancel->store(true, std::memory_order_release);
+    rig.release();
+    require(finished(cancelled), "the cancelled request did not finish\n" + rig.dump());
+    require(rig.count(Event::Kind::Abort) >= 1, "the cancelled lane was not released\n" + rig.dump());
+    // The Engine still works: a new prompt prefills (in slices again) and finishes.
+    auto next = rig.run(3, 2048, 1);
+    require(finished(next), "a request after the cancellation did not finish\n" + rig.dump());
+    (void)stream.wait_for(std::chrono::seconds(30));
+}
+
 } // namespace
 
 int main() {
@@ -552,5 +696,17 @@ int main() {
     run("a prefill with little left is not paused", test_a_prefill_with_little_left_is_not_paused);
     run("backlog gauge tracks queued and resident prefill",
         test_backlog_gauge_tracks_queued_and_resident_prefill);
+    run("layer slices run a neighbour between slices",
+        test_layer_slices_run_a_neighbour_between_slices);
+    run("a capped sliced chunk counts as paced once",
+        test_a_capped_sliced_chunk_counts_as_paced_once);
+    run("a capped sliced chunk counts as paced once",
+        test_a_capped_sliced_chunk_counts_as_paced_once);
+    run("layer slices need a neighbour", test_layer_slices_need_a_neighbour);
+    run("a sliced chunk is not interleaved with another prefill",
+        test_a_sliced_chunk_is_not_interleaved_with_another_prefill);
+    run("a pause waits for a sliced chunk", test_a_pause_waits_for_a_sliced_chunk);
+    run("cancelling a sliced chunk leaves the engine working",
+        test_cancelling_a_sliced_chunk_leaves_the_engine_working);
     return failures == 0 ? 0 : 1;
 }

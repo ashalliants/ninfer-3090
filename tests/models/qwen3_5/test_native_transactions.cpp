@@ -2186,6 +2186,249 @@ void capped_prefill_steps(DeviceContext& device, const qwen::execution::Paramete
     }
 }
 
+// A chunk run in layer slices does the same work as one run whole: the slices cut the layer loop
+// and park the residual stream in between, and neither changes a value. So the first sampled token
+// is identical, a lane part-way through a chunk refuses to pause, and aborting it releases
+// everything.
+void sliced_prefill_matches_whole(DeviceContext& device, const qwen::execution::Parameters& parameters,
+                                  qwen::Frontend& frontend, EngineOptions options) {
+    constexpr std::uint32_t kPrompt = 2 * kChunk + 40;
+    options.max_context                       = kCapacity;
+    options.kv_capacity                       = KvCapacityPolicy::explicit_capacity(kCapacity);
+    options.prefill_chunk                     = kChunk;
+    options.max_concurrency                   = 1;
+    options.context_cache.enabled             = false;
+    options.context_cache.device_state_slots  = 0;
+    options.context_cache.host_capacity_bytes = 0;
+    auto planner = qwen::detail::make_sequence_planner_impl(parameters, device, options);
+    // The explicit capacity fixes the page count; the page size depends on the KV storage.
+    const std::uint32_t pages = planner->curve.minimum_main_page_groups;
+    auto plan                 = qwen::detail::finalize_sequence_plan_impl(std::move(planner), pages);
+    qwen::detail::ProgramImpl program(parameters, *plan, device, {});
+    const auto empty = program.physical_usage().occupied;
+
+    const auto settle = [&]() {
+        std::atomic<bool> flag{false};
+        for (unsigned step = 0; step < 8; ++step) {
+            device.synchronize();
+            CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+            auto progress = program.poll_context({&flag});
+            if (progress.complete) { return progress; }
+        }
+        throw std::runtime_error("sliced prefill transaction did not settle");
+    };
+    std::vector<TokenId> ids(kPrompt);
+    for (std::uint32_t i = 0; i < kPrompt; ++i) { ids[i] = 100 + static_cast<TokenId>((i * 37) % 900); }
+
+    struct Outcome {
+        TokenId first = -1;
+        std::uint32_t partial_calls = 0;
+        std::uint32_t processed     = 0;
+    };
+    const auto run = [&](std::uint32_t slices, bool abort_part_way) {
+        runtime::ResolvedExecutionOptions request;
+        request.requested_output_tokens = 8;
+        auto base = program.plan_request(
+            qwen::PreparedPromptAccess::take(frontend.prepare_tokens(ids)), request);
+        const auto root = program.inspect_source(base, std::nullopt);
+        require(root.has_value(), "sliced prefill request has no root source");
+        require(static_cast<bool>(program.start_binding(
+                    base, {0}, *root, nullptr, qwen::ExecutionUnitKind::Prefill, 0)),
+                "sliced prefill could not bind its request");
+        const auto bound = settle();
+        require(bound.sequence.has_value(), "sliced prefill binding did not publish");
+        const auto sequence = *bound.sequence;
+
+        Outcome outcome;
+        for (unsigned call = 0; call < 64 && outcome.processed < kPrompt; ++call) {
+            const std::array<qwen::ExecutionUnit, 1> units{
+                {{sequence, qwen::ExecutionUnitKind::Prefill}}};
+            require(static_cast<bool>(program.reserve_units(units)),
+                    "sliced prefill could not reserve its unit");
+            auto step = program.advance_prefill(sequence, nullptr, nullptr, 0, slices);
+            if (step.partial) {
+                ++outcome.partial_calls;
+                require(step.processed_prompt_tokens == 0 && !step.complete && !step.pending,
+                        "a partial slice reported progress");
+                // A lane part-way through a chunk has no consistent frontier to pause at.
+                require(!program.start_pause(sequence, true, nullptr),
+                        "a lane part-way through a sliced chunk could be paused");
+                if (abort_part_way) {
+                    require(program.abort(sequence).status == runtime::ConsumeStatus::Consumed,
+                            "a lane part-way through a sliced chunk could not be aborted");
+                    require(program.physical_usage().occupied == empty,
+                            "aborting a sliced chunk leaked physical resources");
+                    return outcome;
+                }
+                continue;
+            }
+            outcome.processed += step.processed_prompt_tokens;
+            if (step.pending) {
+                outcome.first = step.pending->tokens().front();
+                const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
+                (void)program.commit(std::move(*step.pending), accepted, {}, nullptr);
+            }
+        }
+        require(outcome.processed == kPrompt, "sliced prefill did not cover the prompt");
+        require(program.abort(sequence).status == runtime::ConsumeStatus::Consumed,
+                "sliced prefill retained its execution resources");
+        require(program.physical_usage().occupied == empty, "sliced prefill leaked physical resources");
+        return outcome;
+    };
+
+    const Outcome whole = run(0, false);
+    require(whole.partial_calls == 0 && whole.first >= 0, "the unsliced reference run is wrong");
+    for (const std::uint32_t slices : {2U, 3U, 5U}) {
+        const Outcome sliced = run(slices, false);
+        // Three chunks (128, 128, 40 tokens), each with slices-1 partial calls.
+        require(sliced.partial_calls == 3 * (slices - 1),
+                "a chunk did not run in the requested number of slices");
+        require(sliced.first == whole.first,
+                "a sliced prefill sampled a different first token than the same chunks run whole");
+    }
+    (void)run(4, true);
+}
+
+// A sibling decodes between the slices of another lane's chunk. The sliced lane's residual waits in
+// prefill_hidden while the sibling's decode round uses the same workspace and device stream, so this
+// is the resume-after-a-sibling's-decode path: the sliced lane must still sample the token an
+// unsliced run samples, and the sibling must decode the tokens it decodes with nobody beside it.
+void sliced_prefill_beside_a_decoding_lane(DeviceContext& device,
+                                           const qwen::execution::Parameters& parameters,
+                                           qwen::Frontend& frontend, EngineOptions options) {
+    constexpr std::uint32_t kLongPrompt  = 2 * kChunk + 40;
+    // 62 tokens: the sibling's third decode round needs a new KV page (64 tokens per page), so it
+    // takes a page from the pool while the sliced lane's chunk is part-way through.
+    constexpr std::uint32_t kShortPrompt = 62;
+    constexpr unsigned kRounds           = 12;
+    options.max_context                       = kCapacity;
+    options.kv_capacity                       = KvCapacityPolicy::explicit_capacity(kCapacity);
+    options.prefill_chunk                     = kChunk;
+    options.max_concurrency                   = 2;
+    options.context_cache.enabled             = false;
+    options.context_cache.device_state_slots  = 0;
+    options.context_cache.host_capacity_bytes = 0;
+    auto planner = qwen::detail::make_sequence_planner_impl(parameters, device, options);
+    const std::uint32_t pages = planner->curve.minimum_main_page_groups;
+    auto plan                 = qwen::detail::finalize_sequence_plan_impl(std::move(planner), pages);
+    qwen::detail::ProgramImpl program(parameters, *plan, device, {});
+    const auto empty = program.physical_usage().occupied;
+
+    const auto settle = [&]() {
+        std::atomic<bool> flag{false};
+        for (unsigned step = 0; step < 8; ++step) {
+            device.synchronize();
+            CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+            auto progress = program.poll_context({&flag});
+            if (progress.complete) { return progress; }
+        }
+        throw std::runtime_error("two-lane sliced prefill transaction did not settle");
+    };
+    const auto make_ids = [](std::uint32_t count, std::uint32_t salt) {
+        std::vector<TokenId> ids(count);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            ids[i] = 100 + static_cast<TokenId>((i * 37 + salt) % 900);
+        }
+        return ids;
+    };
+    const auto bind = [&](const std::vector<TokenId>& ids, std::uint32_t lane) {
+        runtime::ResolvedExecutionOptions request;
+        request.requested_output_tokens = 64;
+        auto base = program.plan_request(
+            qwen::PreparedPromptAccess::take(frontend.prepare_tokens(ids)), request);
+        const auto root = program.inspect_source(base, std::nullopt);
+        require(root.has_value(), "two-lane request has no root source");
+        require(static_cast<bool>(program.start_binding(
+                    base, {lane}, *root, nullptr, qwen::ExecutionUnitKind::Prefill, 0)),
+                "two-lane request could not bind");
+        const auto bound = settle();
+        require(bound.sequence.has_value(), "two-lane binding did not publish");
+        return *bound.sequence;
+    };
+    // Runs `sequence`'s prefill to its first token, whole or in `slices`; `between` runs after every
+    // partial call (the sibling's decode round). Returns the first sampled token.
+    const auto prefill = [&](qwen::SequenceHandle sequence, std::uint32_t prompt_tokens,
+                             std::uint32_t slices, const std::function<void()>& between) {
+        TokenId first = -1;
+        std::uint32_t processed = 0;
+        for (unsigned call = 0; call < 64 && processed < prompt_tokens; ++call) {
+            const std::array<qwen::ExecutionUnit, 1> units{
+                {{sequence, qwen::ExecutionUnitKind::Prefill}}};
+            require(static_cast<bool>(program.reserve_units(units)),
+                    "two-lane prefill could not reserve its unit");
+            auto step = program.advance_prefill(sequence, nullptr, nullptr, 0, slices);
+            if (step.partial) {
+                between();
+                continue;
+            }
+            processed += step.processed_prompt_tokens;
+            if (step.pending) {
+                first = step.pending->tokens().front();
+                const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
+                (void)program.commit(std::move(*step.pending), accepted, {}, nullptr);
+            }
+        }
+        require(processed == prompt_tokens && first >= 0, "two-lane prefill did not finish");
+        return first;
+    };
+    // One decode round for `sequence`; returns the token it produced.
+    const auto decode_round = [&](qwen::SequenceHandle sequence) {
+        const std::array<qwen::ExecutionUnit, 1> units{
+            {{sequence, qwen::ExecutionUnitKind::Decode, 64}}}; // 64: remaining output budget
+        require(static_cast<bool>(program.reserve_units(units)),
+                "the sibling could not reserve a decode unit");
+        const std::array<qwen::SequenceHandle, 1> rows{sequence};
+        const std::array<runtime::RoundBudget, 1> budgets{{{.generated_tokens_remaining = 64}}};
+        auto pending = program.decode(rows, budgets, nullptr, nullptr);
+        const TokenId token = pending.tokens().front();
+        const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
+        (void)program.commit(std::move(pending), accepted, {}, nullptr);
+        return token;
+    };
+
+    const auto long_ids  = make_ids(kLongPrompt, 0);
+    const auto short_ids = make_ids(kShortPrompt, 7);
+    struct Outcome {
+        TokenId long_first = -1;
+        std::vector<TokenId> sibling;
+    };
+    // `sliced` > 0: the long lane runs in slices and the sibling decodes after every partial call.
+    // Otherwise the long lane runs whole and the sibling decodes alone afterwards.
+    const auto run = [&](std::uint32_t slices, bool with_long) {
+        Outcome outcome;
+        const auto sibling = bind(short_ids, 1);
+        (void)prefill(sibling, kShortPrompt, 0, [] {});
+        std::optional<qwen::SequenceHandle> long_lane;
+        if (with_long) { long_lane = bind(long_ids, 0); }
+        const auto one_round = [&] {
+            if (outcome.sibling.size() < kRounds) { outcome.sibling.push_back(decode_round(sibling)); }
+        };
+        if (with_long) { outcome.long_first = prefill(*long_lane, kLongPrompt, slices, one_round); }
+        while (outcome.sibling.size() < kRounds) { one_round(); }
+        if (long_lane) {
+            require(program.abort(*long_lane).status == runtime::ConsumeStatus::Consumed,
+                    "the long lane retained its resources");
+        }
+        require(program.abort(sibling).status == runtime::ConsumeStatus::Consumed,
+                "the sibling retained its resources");
+        require(program.physical_usage().occupied == empty,
+                "the two-lane scenario leaked physical resources");
+        return outcome;
+    };
+
+    const Outcome alone = run(0, false);
+    const Outcome whole = run(0, true);
+    require(alone.sibling == whole.sibling,
+            "a sibling decoded different tokens when a whole chunk ran beside it");
+    for (const std::uint32_t slices : {2U, 3U, 4U}) {
+        const Outcome sliced = run(slices, true);
+        require(sliced.long_first == whole.long_first,
+                "a sliced prefill beside a decoding lane sampled a different first token");
+        require(sliced.sibling == alone.sibling,
+                "a sibling decoded different tokens between another lane's slices");
+    }
+}
+
 // The admission fit check on real KV pools (--admission-fit-check): whether a fresh prompt's whole
 // KV need can ever fit beside the pages the resident requests hold. Pure arithmetic is covered by
 // the CPU scheduler test; this checks the Program's own accounting of mapped pages, live reservations
@@ -2529,6 +2772,8 @@ int main(int argc, char** argv) {
         progress_anchor_planning(device, parameters, frontend, options);
         prompt_fits_beside_residents_on_real_pools(device, parameters, frontend, options);
         capped_prefill_steps(device, parameters, frontend, options);
+        sliced_prefill_matches_whole(device, parameters, frontend, options);
+        sliced_prefill_beside_a_decoding_lane(device, parameters, frontend, options);
         replay_sampling_counts(device, parameters, frontend, options);
         std::cout << "OK native transaction cancellation, paused ownership and replay recovery\n";
         return 0;

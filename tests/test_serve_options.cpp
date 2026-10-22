@@ -442,6 +442,18 @@ int main() {
         } catch (const std::invalid_argument&) { oversized_share_rejected = true; }
         failures += check(oversized_share_rejected, "--prefill-decode-share accepted more than 90");
     }
+    failures += check(defaults.prefill_schedule.layer_slices == 0,
+                      "layer slicing is not off by default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--prefill-layer-slices", "4"})
+                              .prefill_schedule.layer_slices == 4,
+                      "--prefill-layer-slices did not reach serving options");
+    {
+        bool oversized_slices_rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--prefill-layer-slices", "17"});
+        } catch (const std::invalid_argument&) { oversized_slices_rejected = true; }
+        failures += check(oversized_slices_rejected, "--prefill-layer-slices accepted more than 16");
+    }
     {
         bool oversized_budget_rejected = false;
         try {

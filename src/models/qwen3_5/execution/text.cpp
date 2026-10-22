@@ -1128,10 +1128,13 @@ GdnReplayRecordLayer TextContext::replay_layer(std::uint32_t layer, std::int32_t
 
 // The layers of one stage, in order. On one device this is the whole model.
 template <class Tap>
-void TextContext::run_stage_layers(std::size_t stage, Tensor& x, Phase ph, Tap& tap) {
+void TextContext::run_stage_layers(std::size_t stage, Tensor& x, Phase ph, Tap& tap,
+                                   std::uint32_t first, std::uint32_t last) {
     const bool prefill      = ph == Phase::Prefill;
     const std::uint32_t end = parameters_.text.stage_end(stage);
-    for (std::uint32_t layer = parameters_.text.stage_begin[stage]; layer < end; ++layer) {
+    const std::uint32_t run_begin = first == UINT32_MAX ? parameters_.text.stage_begin[stage] : first;
+    const std::uint32_t run_end   = last == UINT32_MAX ? end : last;
+    for (std::uint32_t layer = run_begin; layer < run_end; ++layer) {
         const auto& block  = parameters_.text.layers[layer];
         const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
         const auto compact = dimension(config_.compact_layer_indices[layer]);
@@ -1467,6 +1470,14 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         mtp_proposal_extent_ > static_cast<std::uint32_t>(io_.mtp->draft_tokens.ne[0])) {
         throw std::logic_error("MTP proposal extent exceeds the configured draft window");
     }
+    // Sliced execution (PrefillSliceState): text-only, single-device chunks with a parking buffer.
+    // A DFlash feature tap keeps per-chunk state across layers that a slice boundary would have to
+    // carry, so a chunk with one runs whole.
+    const bool sliced = prefill_slice_ != nullptr && prefill_slice_->count > 1 &&
+                        multimodal == nullptr && !Tap::enabled && prefill_hidden_.data != nullptr &&
+                        !parameters_.text.split_execution();
+    const bool slice_first = !sliced || prefill_slice_->index == 0;
+    const bool slice_last  = !sliced || prefill_slice_->index + 1 >= prefill_slice_->count;
     int t0 = 0;
     for (; t0 < T;) {
         int len = std::min(chunk, T - t0);
@@ -1513,7 +1524,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 work_, config_, len, rope_axes,
                 static_cast<std::int32_t>(local_scatter_indices.size()), overlay_staging);
             Tensor ids_device = roots.ids;
-            copy_i32(ids.data() + t0, ids_device, s);
+            if (slice_first) { copy_i32(ids.data() + t0, ids_device, s); }
 
             Tensor positions = roots.positions;
             ops::fill_i32_positions(positions, base_i + t0, s);
@@ -1542,7 +1553,16 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             ScopedEnvelope scoped_envelope(active_causal_attention_envelope_, chunk_envelope);
 
             Tensor x = roots.residual;
-            embed_tokens(ids_device, *embed_, parameters_.text.token_embedding_signs, x, s);
+            if (slice_first) {
+                embed_tokens(ids_device, *embed_, parameters_.text.token_embedding_signs, x, s);
+            } else {
+                // The residual stream was parked in prefill_hidden when the last slice ended.
+                Tensor parked = matrix_window(prefill_hidden_, len);
+                if (!x.is_contiguous() || !parked.is_contiguous() || parked.bytes() != x.bytes()) {
+                    throw std::logic_error("a parked prefill residual does not match its chunk");
+                }
+                CUDA_CHECK(cudaMemcpyAsync(x.data, parked.data, x.bytes(), cudaMemcpyDeviceToDevice, s));
+            }
             if (!local_scatter_indices.empty()) {
                 Tensor indices_device = roots.scatter_indices;
                 copy_i32(local_scatter_indices.data(), indices_device, s);
@@ -1573,7 +1593,43 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 ops::scatter(embeddings, indices_device, x, s);
             }
             if constexpr (Tap::enabled) { tap.begin(x); }
-            run_layers(x, Phase::Prefill, tap);
+            if (sliced) {
+                const std::uint32_t stage_first = parameters_.text.stage_begin[0];
+                const std::uint32_t layers      = parameters_.text.stage_end(0) - stage_first;
+                const std::uint32_t index       = prefill_slice_->index;
+                const std::uint32_t count       = prefill_slice_->count;
+                if (slice_first) {
+                    // A Host restore still landing is waited for here, whole, rather than layer by
+                    // layer: the Program hands the events to the first call only.
+                    for (const cudaEvent_t event : layer_ready_) {
+                        CUDA_CHECK(cudaStreamWaitEvent(s, event, 0));
+                    }
+                    layer_ready_ = {};
+                }
+                run_stage_layers(0, x, Phase::Prefill, tap, stage_first + layers * index / count,
+                                 stage_first + layers * (index + 1) / count);
+                if (!slice_last) {
+                    Tensor parked = matrix_window(prefill_hidden_, len);
+                    if (!x.is_contiguous() || !parked.is_contiguous() || parked.bytes() != x.bytes()) {
+                        throw std::logic_error("a prefill residual cannot be parked");
+                    }
+                    CUDA_CHECK(cudaMemcpyAsync(parked.data, x.data, x.bytes(),
+                                               cudaMemcpyDeviceToDevice, s));
+                    ++prefill_slice_->index;
+                    prefill_split_frontier_ = -1;
+                    if (prefill_gpu_timer_) { prefill_gpu_timer_->record_stop(); }
+                    timing.begin_wait();
+                    ctx_.synchronize();
+                    timing.end_wait();
+                    if (prefill_gpu_timer_) {
+                        prefill_slice_->gpu_ns += static_cast<std::uint64_t>(
+                            static_cast<double>(prefill_gpu_timer_->elapsed_ms()) * 1.0e6 + 0.5);
+                    }
+                    return PrefillChunkResult{.partial = true, .timing = timing.finish()};
+                }
+            } else {
+                run_layers(x, Phase::Prefill, tap);
+            }
             if constexpr (requires { tap.capture_positions(positions, s); }) {
                 tap.capture_positions(positions, s);
             }
@@ -1717,10 +1773,13 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     ctx_.synchronize();
     timing.end_wait();
     if (prefill_gpu_timer_) {
-        timing.include({.gpu_elapsed_ns = static_cast<std::uint64_t>(
-                            static_cast<double>(prefill_gpu_timer_->elapsed_ms()) * 1.0e6 + 0.5)});
+        const std::uint64_t earlier = sliced ? prefill_slice_->gpu_ns : 0;
+        timing.include({.gpu_elapsed_ns =
+                            earlier + static_cast<std::uint64_t>(
+                                          static_cast<double>(prefill_gpu_timer_->elapsed_ms()) * 1.0e6 + 0.5)});
     }
     work_.reset();
+    if (sliced) { *prefill_slice_ = PrefillSliceState{.count = prefill_slice_->count}; }
     return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(t0),
                               .finalized        = finalize_at_end && t0 == T,
                               .timing           = timing.finish()};

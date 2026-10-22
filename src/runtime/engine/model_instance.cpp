@@ -257,6 +257,9 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     if (options.prefill_schedule.decode_share_percent > kMaximumPrefillDecodeSharePercent) {
         throw std::invalid_argument("prefill_schedule.decode_share_percent must be at most 90");
     }
+    if (options.prefill_schedule.layer_slices > kMaximumPrefillLayerSlices) {
+        throw std::invalid_argument("prefill_schedule.layer_slices must be at most 16");
+    }
     ContextCacheOptions& cache      = options.context_cache;
     const std::uint32_t concurrency = options.max_concurrency;
     // Each direct graft is installed as a pinned context-cache checkpoint that holds one StateImage

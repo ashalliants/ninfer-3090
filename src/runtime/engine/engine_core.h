@@ -108,6 +108,7 @@ public:
               .decode_share_percent = options.prefill_schedule.decode_share_percent}),
           yield_min_remaining_ns_(
               static_cast<std::uint64_t>(options.prefill_schedule.yield_remaining_ms) * 1'000'000ULL),
+          layer_slices_(options.prefill_schedule.layer_slices),
           progress_anchor_tokens_(options.progress_anchors_shared ? options.progress_anchor_tokens : 0),
           fault_listener_(options.fault_listener),
           resources_(options.context_cache.enabled, std::move(context_cost)) {
@@ -1748,15 +1749,22 @@ private:
         auto* provider   = request->output.constrained() ? &masks : nullptr;
         // While another lane decodes, a step that would run for longer than the stall budget is
         // cut down to what the cost model predicts fits it (PrefillScheduleOptions).
-        const bool pacing_on           = pacing_.options().active();
-        const bool streaming_neighbour = pacing_on && other_lane_streaming(lane);
+        const bool pacing_on     = pacing_.options().active();
+        const bool any_neighbour = (pacing_on || layer_slices_ > 1) && other_lane_streaming(lane);
+        const bool streaming_neighbour = pacing_on && any_neighbour;
+        // A chunk that has begun in slices keeps going whether or not the neighbour still decodes:
+        // the Program holds its residual until the last slice. A new one starts only for a neighbour.
+        const std::uint32_t slices =
+            layer_slices_ > 1 && (request->slice_in_flight || any_neighbour) ? layer_slices_ : 0U;
+        // A slice that follows a decode round is a boundary the neighbour decoded across.
+        if (request->slice_in_flight && decode_ran) { ++cumulative_stats_.prefill_slice_boundaries; }
         std::uint32_t planned_tokens = 0;
         std::uint32_t step_cap       = 0;
         std::uint32_t step_prefix    = 0;
         bool          have_position  = false;
         // The position is read whenever pacing is on, so an uncontended step still calibrates the
         // cost model; only the cap itself waits for a neighbour.
-        if (pacing_on) {
+        if (pacing_on && !request->slice_in_flight) {
             if (const auto position = sibling_cursor(*request)) {
                 const std::uint32_t prompt_tokens = request->base_plan->summary().prompt_tokens;
                 have_position  = true;
@@ -1770,9 +1778,50 @@ private:
         ProgramCallScope program_call(*this);
         const Clock::time_point step_started = Clock::now();
         auto progress = instance_.program->advance_prefill(
-            *request->sequence, &program_call.failed_timing(), provider, step_cap);
+            *request->sequence, &program_call.failed_timing(), provider, step_cap, slices);
         program_call.finish(progress.timing);
         const std::uint64_t step_wall_ns = elapsed_ns(step_started, Clock::now());
+        if (!progress.landed_transfers.empty()) {
+            typename ModelContract::ContextProgress landed;
+            landed.transfers = std::move(progress.landed_transfers);
+            record_context_work(landed, request);
+        }
+        if (progress.partial) {
+            // Some layers ran. The step is not done: nothing is resolved, the lane stays first in
+            // line for the next prefill turn, and the cycle's decode round runs before it.
+            if (!request->slice_in_flight) {
+                request->slice_in_flight = true;
+                request->slice_elapsed_ns = 0;
+                request->slice_planned_tokens = planned_tokens;
+                request->slice_wall_ns    = 0;
+                request->slice_prefix     = sibling_cursor(*request).value_or(0U);
+                ++cumulative_stats_.sliced_prefill_steps;
+            }
+            request->slice_elapsed_ns += progress.timing.elapsed_ns();
+            request->slice_wall_ns += step_wall_ns;
+            cumulative_stats_.prefill_seconds_total +=
+                static_cast<double>(progress.timing.elapsed_ns()) * 1e-9;
+            if (!request->first_output_timing) {
+                record_execution_work(request->prefill_work, progress.timing);
+            }
+            consume_armed_worker_failure();
+            publish_runtime_stats();
+            return;
+        }
+        // The step's whole cost, for the pacing model: the earlier slices plus this one.
+        std::uint64_t step_elapsed_ns = progress.timing.elapsed_ns();
+        std::uint64_t step_wall_total = step_wall_ns;
+        if (request->slice_in_flight) {
+            step_elapsed_ns += request->slice_elapsed_ns;
+            step_wall_total += request->slice_wall_ns;
+            step_prefix    = request->slice_prefix;
+            planned_tokens = request->slice_planned_tokens;
+            have_position = pacing_on;
+            request->slice_in_flight = false;
+            // The lane can be paused again. Whatever was refused while it was part-way (a short
+            // request that wanted its lane) is looked at again, because nothing else would.
+            request_admission_check();
+        }
         // A media step ignores the cap and is priced by a text-only model, so it must not teach the
         // correction factor; a step cut short by a capture or rewrite frontier did not run at the
         // cap either. The cap counts as honored only when the step ran exactly that wide.
@@ -1781,17 +1830,12 @@ private:
             pacing_.prefill_step_done(
                 predicted_prefill_step_ns(resources_.costs(), step_prefix,
                                           progress.processed_prompt_tokens),
-                progress.timing.elapsed_ns(), decode_ran, step_wall_ns);
+                step_elapsed_ns, decode_ran, step_wall_total);
             if (progress.cap_applied) {
                 ++cumulative_stats_.paced_prefill_steps;
                 cumulative_stats_.paced_prefill_deferred_tokens +=
                     planned_tokens - progress.processed_prompt_tokens;
             }
-        }
-        if (!progress.landed_transfers.empty()) {
-            typename ModelContract::ContextProgress landed;
-            landed.transfers = std::move(progress.landed_transfers);
-            record_context_work(landed, request);
         }
         cumulative_stats_.prefill_seconds_total +=
             static_cast<double>(progress.timing.elapsed_ns()) * 1e-9;
@@ -2023,6 +2067,7 @@ private:
     // resource pressure and not for a pause that only serves the queue.
     bool pause_resident(std::uint32_t lane, bool require_snapshot = false) {
         if (instance_.program->has_context_transaction()) { return false; }
+        if (slots_[lane] && slots_[lane]->slice_in_flight) { return false; }
         // An admission that pauses a resident has touched another request: a failure from here
         // on is no longer confined to the request being admitted.
         admission_subject_.reset();
@@ -2115,6 +2160,11 @@ private:
 
     // A wait must save at least this much prefill over the best source available now.
     static constexpr std::uint32_t kSiblingWaitMinimumTokens = 1024;
+
+    [[nodiscard]] bool slice_in_flight_any() const noexcept {
+        return std::any_of(slots_.begin(), slots_.begin() + max_concurrency_,
+                           [](const auto& request) { return request && request->slice_in_flight; });
+    }
 
     // Whether a lane other than `lane` is generating: its next token waits behind this lane's
     // prefill step.
@@ -2283,7 +2333,8 @@ private:
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& resident = slots_[lane];
             if (!resident || !resident->is_prefilling() || resident->capture_pending ||
-                resident->prompt_summary.has_media || !resident->base_plan) {
+                resident->slice_in_flight || resident->prompt_summary.has_media ||
+                !resident->base_plan) {
                 continue;
             }
             if (const auto cursor = sibling_cursor(*resident)) {
@@ -2755,6 +2806,9 @@ private:
                     // failed rows wait or yield their own lane; they cannot block ready rows.
                     // The same shortage has already exhausted cache and paused snapshots.
                     if (pause_reclaim_victim(request->id)) { break; }
+                    // A lane part-way through a sliced chunk cannot be paused. The chunk finishes
+                    // within a few cycles; this unit is tried again then.
+                    if (slice_in_flight_any()) { break; }
                     throw std::logic_error("oldest resident cannot obtain its legal unit");
                 }
                 if (oldest != lane && (!blocked || request->id > slots_[*blocked]->id)) {
@@ -3954,8 +4008,11 @@ private:
                 auto controls = scheduler_.build_control_membership(slots_, max_concurrency_);
                 ControlMembership selected_control;
                 selected_control.row_stride = controls.row_stride;
+                // Forced tokens run through the prefill path and write the buffer a sliced chunk
+                // parks its residual in, so they wait until that chunk is done.
+                const bool hold_controls = slice_in_flight_any();
                 for (std::size_t row = 0; row < controls.size; ++row) {
-                    if (!runnable_units_[controls.lanes[row]] ||
+                    if (hold_controls || !runnable_units_[controls.lanes[row]] ||
                         slots_[controls.lanes[row]]->cancelled.load(std::memory_order_acquire)) {
                         continue;
                     }
@@ -4130,6 +4187,8 @@ private:
     PrefillPacing pacing_;
     // Zero: a long prefill is never paused for a waiting request.
     const std::uint64_t yield_min_remaining_ns_;
+    // Layer slices per prefill chunk while a neighbour decodes; 0 or 1: whole chunks.
+    const std::uint32_t layer_slices_;
     // The request a prefill was last paused for, so it cannot pause a second one for the same
     // newcomer, and the hold that keeps the paused prefill from being restored ahead of it.
     std::uint64_t yield_beneficiary_ = 0;

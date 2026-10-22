@@ -224,6 +224,15 @@ struct RequestRecord {
     // beside the resident requests (EngineOptions::admission_fit_check).
     bool fit_deferred = false;
 
+    // A prefill chunk is part-way through its layers (PrefillScheduleOptions::layer_slices): the
+    // lane must be advanced again before anything else claims the Program's parking buffer, and
+    // cannot be paused until it finishes. `slice_elapsed_ns` and `slice_prefix` describe the step
+    // for the pacing model, which sees the step whole.
+    bool slice_in_flight                   = false;
+    std::uint64_t slice_elapsed_ns         = 0;
+    std::uint64_t slice_wall_ns            = 0;
+    std::uint32_t slice_planned_tokens     = 0; // the chunk's planned width before a stall cap // worker wall time of the slices so far
+    std::uint32_t slice_prefix             = 0;
     bool recovery_pending                  = false;
     std::uint64_t committed_decode_tokens  = 0;
     GenerationRecoveryRoute recovery_route = GenerationRecoveryRoute::None;

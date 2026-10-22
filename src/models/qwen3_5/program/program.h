@@ -318,6 +318,8 @@ struct PrefillProgress {
     runtime::BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
+    // Some layers of the step's chunk ran and the rest wait for the next call (layer_slices).
+    bool partial = false;
     bool cap_applied                      = false; // see runtime::PrefillStepResult
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
@@ -562,10 +564,17 @@ public:
     // caller's choice of multiple of 128; a step that has to cover a media item ignores it.
     // The unit's reservation was made for the whole chunk, so a shorter step simply leaves part of
     // it unused, as a step cut at a capture frontier does.
+    // `layer_slices` (0 or 1: none) runs the step's chunk as that many slices of consecutive layers,
+    // one per call: every call but the last returns `partial` with nothing processed, and the
+    // caller may run other lanes' units before the next. The slice count is fixed by the call that
+    // starts the chunk. A lane mid-chunk must be advanced again before it can be paused or captured
+    // (the Program refuses both until the chunk completes); aborting it is always allowed. Only
+    // text-only chunks without a DFlash tap on a single device are sliced; any other runs whole.
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   runtime::ExecutionTiming* failed_timing = nullptr,
                                                   runtime::TokenMaskProvider* masks = nullptr,
-                                                  std::uint32_t max_tokens = 0);
+                                                  std::uint32_t max_tokens = 0,
+                                                  std::uint32_t layer_slices = 0);
     [[nodiscard]] ReplayProgress advance_replay(SequenceHandle sequence,
                                                 runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,

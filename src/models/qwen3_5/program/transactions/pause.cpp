@@ -132,6 +132,9 @@ bool ProgramImpl::start_pause(SequenceHandle handle, bool save_snapshot,
     const auto lane = ContractAccess::lane(handle).value;
     auto& state     = sequences[lane];
     auto& control   = requests[lane];
+    // A chunk run in slices has advanced some layers' state in place: until its remaining slices
+    // run there is no consistent frontier to save, so the lane cannot pause yet.
+    if (control.prefill && control.prefill->slice.index != 0) { return false; }
     if (control.lifecycle != Lifecycle::Active && control.lifecycle != Lifecycle::Prefilling &&
         control.lifecycle != Lifecycle::Replaying) {
         throw std::logic_error("pause requires a committed boundary");
