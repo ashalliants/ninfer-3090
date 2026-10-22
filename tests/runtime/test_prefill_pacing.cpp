@@ -29,9 +29,8 @@ ContextMachineCostModel model() {
     return costs;
 }
 
-// The same table is asserted by `test_step_cap_matches_the_expected_values_of_the_cpp_policy` in
-// tools/bench/test_prefill_time_model.py, which keeps the Python time model on this policy: change a
-// value here and the other test fails until it is changed there too.
+// The Python time model in tools/bench (PR #353) is held to the same table by its own test, so the
+// two copies of the policy cannot drift apart unnoticed: change a value here and update it there.
 void test_step_cap_expected_values() {
     ContextMachineCostModel costs;
     costs.prefill.chunk_ns              = 100'000'000;
@@ -161,6 +160,13 @@ void test_reset_forgets_debt_and_keeps_calibration() {
     require(pacing.correction() == correction, "the reset discarded the stall-budget calibration");
 }
 
+void test_share_is_owed_on_the_wall_clock_when_given() {
+    PrefillPacing pacing(PrefillPacingOptions{.decode_share_percent = 50});
+    pacing.prefill_step_done(1, 1'000'000'000, true, 1'500'000'000);
+    require(pacing.decode_debt_ns() == 1'500'000'000,
+            "the debt did not follow the worker's wall time around the step");
+}
+
 void test_share_owes_decode_time_after_a_step() {
     PrefillPacing pacing(PrefillPacingOptions{.decode_share_percent = 50});
     pacing.prefill_step_done(1, 1'000'000'000, true);
@@ -235,6 +241,7 @@ int main() {
         test_correction_is_bounded();
         test_share_off_never_defers();
         test_share_owes_decode_time_after_a_step();
+        test_share_is_owed_on_the_wall_clock_when_given();
         test_reset_forgets_debt_and_keeps_calibration();
         test_share_ratio();
         test_share_ignores_steps_nobody_waited_on();
