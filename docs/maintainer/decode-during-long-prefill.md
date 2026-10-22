@@ -1,8 +1,15 @@
 # Decode during a long prefill: what is built, what is not, and what decides the rest
 
-Status: design note. It was written without a GPU. The options it describes are implemented in separate PRs (#340-#344 and #352); their GPU tests and measurements are recorded there and in the handoff note of #353, not in this note. Numbers are
-from `docs/serving.md`, `docs/performance.md` and the source comments they cite, and say so. Delete or
-fold into `docs/serving.md` once the open question below is settled.
+Status: design note, written without a GPU. **The question it ends on has since been decided**: the
+experiments below were run on an RTX 3090 on 2026-10-22 and the results are in
+`docs/maintainer/long-prefill-handoff.md` (PR #353), with each option's tests and numbers in its own PR
+(#340-#344, #352). In short, layer slices cut the neighbouring stream's worst gap from 2.93 s to 402 ms for
+8% more prompt time, against 528 ms for 28% more with the stall budget, and the decode share made the
+prompt 2.5x slower. Those figures are quoted from that note and cannot be checked from this PR's tree
+alone. This note is kept as the design reasoning that came before the measurements; the sections below
+are written in the future tense they had then. Numbers in them are from `docs/serving.md`,
+`docs/performance.md` and the source comments they cite, and say so. Delete it or fold what is useful
+into `docs/serving.md` once the stack has merged.
 
 ## The problem
 
@@ -112,7 +119,7 @@ measurements are recorded with the implementation (PR #352). How it works and wh
 Its cost is the decode round it adds at each boundary (tens of ms, while the neighbour lasts) and the
 two residual copies per boundary (under a millisecond), against a prompt that runs at full chunk speed.
 
-## What would decide it
+## What would decide it (as planned; the results are in the handoff note)
 
 All on the 3090, with a long prompt and streams that are decoding, using the two-lane profile
 (`NINFER_SPEC=mtp`, the one with a second lane; the default one-lane DFlash2 profile never slices).
