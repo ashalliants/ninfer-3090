@@ -342,6 +342,13 @@ public:
         return published_stats_;
     }
 
+    // An Engine-wide failure: every queued request failed, every new one is refused, and the
+    // Engine never recovers. A stop or a held suspend is not a failure.
+    [[nodiscard]] bool has_failed() const {
+        std::lock_guard lock(queue_mutex_);
+        return failed_;
+    }
+
     [[nodiscard]] bool is_available() const {
         std::lock_guard lock(queue_mutex_);
         // A suspended model that resumes on demand still serves; one held suspended does not.
