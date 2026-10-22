@@ -26,6 +26,24 @@ else()
   set(NINFER_FFMPEG_TARGET PkgConfig::FFMPEG)
 endif()
 
+# zstd compresses context-store chunks. vcpkg exposes it as a CMake package (the target is
+# zstd::libzstd, or zstd::libzstd_shared/_static in older ports); Linux uses pkg-config.
+if(WIN32 OR DEFINED VCPKG_TARGET_TRIPLET)
+  find_package(zstd CONFIG REQUIRED)
+  foreach(candidate zstd::libzstd zstd::libzstd_shared zstd::libzstd_static)
+    if(TARGET ${candidate})
+      set(NINFER_ZSTD_TARGET ${candidate})
+      break()
+    endif()
+  endforeach()
+  if(NOT NINFER_ZSTD_TARGET)
+    message(FATAL_ERROR "find_package(zstd) found no libzstd target")
+  endif()
+else()
+  pkg_check_modules(LIBZSTD REQUIRED IMPORTED_TARGET libzstd>=1.4.0)
+  set(NINFER_ZSTD_TARGET PkgConfig::LIBZSTD)
+endif()
+
 # Repository-pinned header dependencies. No configure-time downloads.
 add_library(ninfer::json INTERFACE IMPORTED GLOBAL)
 target_include_directories(ninfer::json INTERFACE

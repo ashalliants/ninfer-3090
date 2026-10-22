@@ -234,5 +234,41 @@ int main() {
               constrained.find("ninfer_constraint_mask_upload_bytes_total 128\n") !=
                   std::string::npos,
           "interrupted complete constraint lost its state or actual work");
+
+    // GPU gauges come from the sampler; a field it cannot read is dropped, never reported as 0.
+    double energy = 5000.0; // joules; an NVML counter starts at driver load, not at zero
+    metrics.set_gpu_sampler([&energy] {
+        GpuSample gpu;
+        gpu.energy_joules          = energy;
+        gpu.utilization_percent    = 87;
+        gpu.memory_used_bytes      = 21474836480ULL;
+        gpu.memory_total_bytes     = 25769803776ULL;
+        gpu.temperature_celsius    = 71;
+        gpu.power_watts            = 312.5;
+        return gpu;
+    });
+    const auto gpu_body = metrics.render(running, true, 0);
+    check(has_line(gpu_body, "ninfer_gpu_utilization_percent 87") &&
+              has_line(gpu_body, "ninfer_gpu_memory_used_bytes 21474836480") &&
+              has_line(gpu_body, "ninfer_gpu_memory_total_bytes 25769803776") &&
+              has_line(gpu_body, "ninfer_gpu_temperature_celsius 71") &&
+              has_line(gpu_body, "ninfer_gpu_power_watts 312.5"),
+          "GPU gauges must be reported from the sampler");
+    check(gpu_body.find("ninfer_gpu_memory_utilization_percent") == std::string::npos,
+          "an unknown GPU reading must be omitted, not reported as zero");
+    check(has_line(gpu_body, "ninfer_gpu_energy_joules_total 0"),
+          "the energy counter must count from attachment, not from driver load");
+    energy = 5312.5;
+    check(has_line(metrics.render(running, true, 0), "ninfer_gpu_energy_joules_total 312.5"),
+          "the energy counter must report the change since attachment");
+    energy = 40.0; // NVML's counter restarted (driver reset): never negative, never going back
+    check(has_line(metrics.render(running, true, 0), "ninfer_gpu_energy_joules_total 352.5"),
+          "an NVML counter reset must add the energy since the reset, not subtract the baseline");
+    energy = 100.0;
+    check(has_line(metrics.render(running, true, 0), "ninfer_gpu_energy_joules_total 412.5"),
+          "the energy counter must keep accumulating after a reset");
+    metrics.set_gpu_sampler(nullptr);
+    check(metrics.render(running, true, 0).find("ninfer_gpu_") == std::string::npos,
+          "without a sampler no GPU series is exported");
     return failures == 0 ? 0 : 1;
 }

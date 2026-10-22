@@ -1,3 +1,5 @@
+#include "runtime/contract/progress_anchors.h"
+#include "runtime/engine/pause_policy.h"
 #include "runtime/engine/scheduler.h"
 
 #include <algorithm>
@@ -334,6 +336,38 @@ void test_decode_and_control_membership() {
             "compact control membership changed committed control spans or request order");
 }
 
+void test_progress_anchor_frontiers() {
+    using ninfer::runtime::progress_anchor_frontiers;
+    using Frontiers = std::vector<std::uint32_t>;
+    require(progress_anchor_frontiers(10000, 4096) == Frontiers({4096, 8192}),
+            "anchors fall on every multiple of the spacing inside the prompt");
+    require(progress_anchor_frontiers(8192, 4096) == Frontiers({4096}),
+            "the prompt end is the InputReplay point, not a progress anchor");
+    require(progress_anchor_frontiers(4096, 4096).empty() &&
+                progress_anchor_frontiers(100, 4096).empty(),
+            "a prompt no longer than the spacing needs no anchor");
+    require(progress_anchor_frontiers(100000, 0).empty(), "zero spacing turns anchors off");
+    require(progress_anchor_frontiers(0xFFFFFFFFU, 0x80000000U) == Frontiers({0x80000000U}),
+            "the frontier arithmetic does not overflow near the 32-bit limit");
+}
+
+void test_pause_host_target() {
+    using ninfer::runtime::next_pause_host_target;
+    // Enough bytes free but no run for the image: ask for another image's worth.
+    require(next_pause_host_target(300, 150, 1000) == std::optional<std::size_t>(450),
+            "an unplaced state image asks the victim search for one more image of free bytes");
+    require(next_pause_host_target(300, 0, 1000) == std::nullopt,
+            "a placed state image needs no further eviction");
+    require(next_pause_host_target(900, 150, 1000) == std::optional<std::size_t>(1000),
+            "near the budget the target clamps to it, so evicting the rest can still coalesce a run");
+    require(next_pause_host_target(1000, 150, 1000) == std::nullopt,
+            "a fully free Host that still has no run cannot be helped by more eviction");
+    require(next_pause_host_target(0, 2000, 1000) == std::nullopt,
+            "an image larger than the whole Host budget can never be saved");
+    require(next_pause_host_target(850, 150, 1000) == std::optional<std::size_t>(1000),
+            "a target that exactly fills the budget is still reachable");
+}
+
 } // namespace
 
 int main() {
@@ -345,6 +379,8 @@ int main() {
         test_restore_events();
         test_prefill_replay_round_robin();
         test_decode_and_control_membership();
+        test_progress_anchor_frontiers();
+        test_pause_host_target();
         std::cout << "ok\n";
         return 0;
     } catch (const std::exception& error) {

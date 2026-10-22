@@ -120,6 +120,9 @@ void validate(const EngineOptions& options) {
         throw std::invalid_argument("Qwen3.8-Flash-Next: " + why);
     };
     validate_engine_options(options);
+    if (options.progress_anchor_tokens != 0) {
+        refuse("does not support progress anchors: remove --progress-anchor-tokens");
+    }
     if (options.purpose != EnginePurpose::Generation) {
         refuse("serves generation only (perplexity scoring is not available for this model yet)");
     }
