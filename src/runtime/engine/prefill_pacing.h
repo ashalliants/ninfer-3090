@@ -93,8 +93,12 @@ public:
     // step actually ran (0 when the caller has no prediction); the ratio keeps the budget honest on
     // a card the presets were not fitted to. `decode_waiting` is whether a lane was decoding while
     // the step ran, which is what makes the decode share owe it time.
+    //
+    // `wall_ns`, when given, is the worker's wall time around the step and is what the decode share
+    // owes: the decode rounds that repay it are timed on the worker's clock, so both sides of the
+    // P/(100-P) ratio must be. It defaults to `elapsed_ns` (the Program's own timing).
     void prefill_step_done(std::uint64_t predicted_ns, std::uint64_t elapsed_ns,
-                           bool decode_waiting) noexcept {
+                           bool decode_waiting, std::uint64_t wall_ns = 0) noexcept {
         if (predicted_ns != 0 && elapsed_ns != 0 && predicted_ns != UINT64_MAX) {
             const long double ratio =
                 static_cast<long double>(elapsed_ns) / static_cast<long double>(predicted_ns);
@@ -103,7 +107,8 @@ public:
         }
         if (options_.decode_share_percent != 0 && decode_waiting) {
             const std::uint64_t share = options_.decode_share_percent;
-            const std::uint64_t owed  = elapsed_ns / (100U - share) * share;
+            const std::uint64_t basis = wall_ns != 0 ? wall_ns : elapsed_ns;
+            const std::uint64_t owed  = basis / (100U - share) * share;
             debt_ns_                  = std::min(kMaximumDecodeDebtNs, debt_ns_ + owed);
         }
     }

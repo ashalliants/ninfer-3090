@@ -276,8 +276,9 @@ std::vector<ContextRelease> Program::plan_releases(std::span<const CheckpointHan
     return impl_->plan_releases(allowed, excluded, shortage);
 }
 
-bool Program::start_pause(SequenceHandle h, bool save, runtime::ExecutionTiming* timing) {
-    return impl_->start_pause(h, save, timing);
+bool Program::start_pause(SequenceHandle h, bool save, runtime::ExecutionTiming* timing,
+                          bool require_snapshot) {
+    return impl_->start_pause(h, save, timing, require_snapshot);
 }
 
 ContextProgress Program::poll_context(runtime::CancellationFlagView c) {

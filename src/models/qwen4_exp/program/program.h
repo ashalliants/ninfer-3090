@@ -461,7 +461,8 @@ public:
     [[nodiscard]] bool start_demote(const ContextDemotion&) { return false; }
     // One lane and a whole-extent reservation at admission: there is never a younger resident to
     // pause, so pausing is refused.
-    [[nodiscard]] bool start_pause(SequenceHandle, bool, runtime::ExecutionTiming* = nullptr) { return false; }
+    [[nodiscard]] bool start_pause(SequenceHandle, bool, runtime::ExecutionTiming* = nullptr,
+                                   bool = false) { return false; }
     [[nodiscard]] ContextProgress poll_context(runtime::CancellationFlagView cancellation);
     [[nodiscard]] bool has_context_transaction() const noexcept;
     [[nodiscard]] bool context_blocks(SequenceHandle) const noexcept { return false; }

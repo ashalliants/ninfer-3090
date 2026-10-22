@@ -1745,9 +1745,11 @@ private:
             }
         }
         ProgramCallScope program_call(*this);
+        const Clock::time_point step_started = Clock::now();
         auto progress = instance_.program->advance_prefill(
             *request->sequence, &program_call.failed_timing(), provider, step_cap, slices);
         program_call.finish(progress.timing);
+        const std::uint64_t step_wall_ns = elapsed_ns(step_started, Clock::now());
         if (!progress.landed_transfers.empty()) {
             typename ModelContract::ContextProgress landed;
             landed.transfers = std::move(progress.landed_transfers);
@@ -1759,10 +1761,12 @@ private:
             if (!request->slice_in_flight) {
                 request->slice_in_flight = true;
                 request->slice_elapsed_ns = 0;
+                request->slice_wall_ns    = 0;
                 request->slice_prefix     = sibling_cursor(*request).value_or(0U);
                 ++cumulative_stats_.sliced_prefill_steps;
             }
             request->slice_elapsed_ns += progress.timing.elapsed_ns();
+            request->slice_wall_ns += step_wall_ns;
             cumulative_stats_.prefill_seconds_total +=
                 static_cast<double>(progress.timing.elapsed_ns()) * 1e-9;
             if (!request->first_output_timing) {
@@ -1774,8 +1778,10 @@ private:
         }
         // The step's whole cost, for the pacing model: the earlier slices plus this one.
         std::uint64_t step_elapsed_ns = progress.timing.elapsed_ns();
+        std::uint64_t step_wall_total = step_wall_ns;
         if (request->slice_in_flight) {
             step_elapsed_ns += request->slice_elapsed_ns;
+            step_wall_total += request->slice_wall_ns;
             step_prefix   = request->slice_prefix;
             have_position = pacing_on;
             request->slice_in_flight = false;
@@ -1783,14 +1789,17 @@ private:
             // request that wanted its lane) is looked at again, because nothing else would.
             request_admission_check();
         }
-        if (have_position && progress.processed_prompt_tokens != 0) {
+        // A media step ignores the cap and is priced by a text-only model, so it must not teach the
+        // correction factor; a step cut short by a capture or rewrite frontier did not run at the
+        // cap either. The cap counts as honored only when the step ran exactly that wide.
+        if (have_position && progress.processed_prompt_tokens != 0 &&
+            !request->prompt_summary.has_media) {
             pacing_.prefill_step_done(
                 predicted_prefill_step_ns(resources_.costs(), step_prefix,
                                           progress.processed_prompt_tokens),
-                step_elapsed_ns, decode_ran);
-            // Count a step as paced only when the stall cap, not a capture or rewrite frontier,
-            // made it smaller than planned; the deferred tokens are what the cap took off.
-            if (step_cap != 0 && step_cap < planned_tokens) {
+                step_elapsed_ns, decode_ran, step_wall_total);
+            if (step_cap != 0 && step_cap < planned_tokens &&
+                progress.processed_prompt_tokens == step_cap) {
                 ++cumulative_stats_.paced_prefill_steps;
                 cumulative_stats_.paced_prefill_deferred_tokens += planned_tokens - step_cap;
             }
@@ -2090,7 +2099,7 @@ private:
         ProgramCallScope call(*this);
         const auto pause_started = Clock::now();
         if (!instance_.program->start_pause(*request->sequence, save_snapshot,
-                                            &call.failed_timing())) {
+                                            &call.failed_timing(), require_snapshot)) {
             return false;
         }
         call.finish(call.failed_timing());
@@ -4036,10 +4045,12 @@ private:
                     unit = "prefill";
                     if (request->is_replaying()) {
                         ProgramCallScope call(*this);
+                        const Clock::time_point replay_started = Clock::now();
                         auto progress = instance_.program->advance_replay(*request->sequence,
                                                                           &call.failed_timing());
                         call.finish(progress.timing);
-                        pacing_.prefill_step_done(0, progress.timing.elapsed_ns(), decode_ran);
+                        pacing_.prefill_step_done(0, progress.timing.elapsed_ns(), decode_ran,
+                                                  elapsed_ns(replay_started, Clock::now()));
                         if (!request->first_output_timing) {
                             record_execution_work(request->replay_work, progress.timing);
                         }

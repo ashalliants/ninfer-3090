@@ -125,7 +125,7 @@ bool ProgramImpl::prepare_backup(ContextTransaction& tx, CheckpointState& record
 }
 
 bool ProgramImpl::start_pause(SequenceHandle handle, bool save_snapshot,
-                              runtime::ExecutionTiming* observation) {
+                              runtime::ExecutionTiming* observation, bool require_snapshot) {
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, observation);
     if (context_transaction_ || pending_transaction_) { return false; }
     if (!valid_sequence(handle)) { throw std::logic_error("pause has a stale sequence"); }
@@ -138,6 +138,19 @@ bool ProgramImpl::start_pause(SequenceHandle handle, bool save_snapshot,
     if (control.lifecycle != Lifecycle::Active && control.lifecycle != Lifecycle::Prefilling &&
         control.lifecycle != Lifecycle::Replaying) {
         throw std::logic_error("pause requires a committed boundary");
+    }
+    if (require_snapshot) {
+        // Refuse before anything is touched where the progress cannot be saved: a replaying lane
+        // has no snapshot to keep, and a chunk part-way through a Vision item cannot be restored.
+        if (control.lifecycle == Lifecycle::Replaying) { return false; }
+        const std::uint32_t frontier = control.lifecycle == Lifecycle::Prefilling
+                                           ? control.prefill->cursor
+                                           : state.execution_frontier;
+        if (control.base->vision_control_plan) {
+            for (const auto& item : control.base->vision_control_plan->items) {
+                if (item.token_begin < frontier && frontier < item.token_end) { return false; }
+            }
+        }
     }
     timing.begin_wait();
     device.synchronize();

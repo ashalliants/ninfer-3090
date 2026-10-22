@@ -350,7 +350,8 @@ public:
                                                             std::span<const CheckpointHandle>,
                                                             runtime::ContextResourceUsage) const;
     [[nodiscard]] bool start_demote(const ContextDemotion&);
-    [[nodiscard]] bool start_pause(SequenceHandle, bool save_snapshot, runtime::ExecutionTiming*);
+    [[nodiscard]] bool start_pause(SequenceHandle, bool save_snapshot, runtime::ExecutionTiming*,
+                                   bool require_snapshot = false);
     [[nodiscard]] ContextProgress poll_context(runtime::CancellationFlagView);
 
     [[nodiscard]] bool has_context_transaction() const noexcept {

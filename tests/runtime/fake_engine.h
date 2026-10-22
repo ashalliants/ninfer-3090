@@ -602,7 +602,9 @@ public:
         transaction_ = tx;
         return {.reserved = true};
     }
-    [[nodiscard]] bool start_pause(SequenceHandle sequence, bool save_snapshot, ExecutionTiming* = nullptr) {
+    [[nodiscard]] bool start_pause(SequenceHandle sequence, bool save_snapshot, ExecutionTiming* = nullptr,
+                                   bool require_snapshot = false) {
+        (void)require_snapshot; // the fake always has room for the snapshot
         if (transaction_ || !valid(sequence)) { return false; }
         // Like the real Program: a chunk part-way through its layers has no frontier to save.
         if (lanes_[sequence.lane].slice_count != 0) { return false; }
