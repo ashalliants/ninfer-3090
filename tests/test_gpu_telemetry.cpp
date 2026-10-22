@@ -1,4 +1,4 @@
-#include "core/gpu_telemetry.h"
+#include "core/nvml.h"
 
 #include <iostream>
 #include <map>
@@ -88,7 +88,7 @@ int main() {
 
     reset();
     { // every symbol resolves: fields decode, and the bus id reaches the driver
-        GpuTelemetry telemetry("00000000:01:00.0", lookup_in(full_table()));
+        Nvml telemetry("00000000:01:00.0", lookup_in(full_table()));
         check(telemetry.available(), "a complete driver must open the device");
         check(g_bus_id == "00000000:01:00.0",
               "the PCI bus id must reach nvmlDeviceGetHandleByPciBusId_v2");
@@ -107,7 +107,7 @@ int main() {
     reset();
     { // one query failing drops that field only
         g_temperature_result = 3;
-        GpuTelemetry telemetry("x", lookup_in(full_table()));
+        Nvml telemetry("x", lookup_in(full_table()));
         const GpuSample sample = telemetry.sample();
         check(!sample.temperature_celsius && sample.utilization_percent && sample.power_watts,
               "a failing query must leave only its own field unknown");
@@ -118,7 +118,7 @@ int main() {
         auto table = full_table();
         table.erase("nvmlDeviceGetPowerUsage");
         table.erase("nvmlDeviceGetMemoryInfo");
-        GpuTelemetry telemetry("x", lookup_in(table));
+        Nvml telemetry("x", lookup_in(table));
         const GpuSample sample = telemetry.sample();
         check(telemetry.available() && !sample.power_watts && !sample.memory_used_bytes &&
                   sample.utilization_percent,
@@ -130,7 +130,7 @@ int main() {
         reset();
         auto table = full_table();
         table.erase(required);
-        GpuTelemetry telemetry("x", lookup_in(table));
+        Nvml telemetry("x", lookup_in(table));
         check(!telemetry.available() && !telemetry.sample().utilization_percent,
               "a missing required symbol must leave the sampler unavailable");
     }
@@ -138,7 +138,7 @@ int main() {
     reset();
     { // init fails: unavailable, and nothing is shut down that never started
         g_init_result = 1;
-        GpuTelemetry telemetry("x", lookup_in(full_table()));
+        Nvml telemetry("x", lookup_in(full_table()));
         check(!telemetry.available(), "a failed nvmlInit must leave the sampler unavailable");
     }
     check(g_shutdown_calls == 0, "a failed nvmlInit must not be followed by nvmlShutdown");
@@ -146,7 +146,7 @@ int main() {
     reset();
     { // unknown bus id: NVML was initialised, so it is shut down again
         g_handle_result = 2;
-        GpuTelemetry telemetry("x", lookup_in(full_table()));
+        Nvml telemetry("x", lookup_in(full_table()));
         check(!telemetry.available(), "an unknown device must leave the sampler unavailable");
         check(g_shutdown_calls == 1, "an unknown device must release the initialised driver");
     }

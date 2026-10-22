@@ -600,7 +600,6 @@ int main() {
              std::vector<std::string>{"--max-cache-markers-per-request", "4"},
              std::vector<std::string>{"--auto-long-anchors", "2"},
              std::vector<std::string>{"--auto-prefix-grid"},
-             std::vector<std::string>{"--progress-anchor-tokens", "4096"},
              std::vector<std::string>{"--max-prefill-lanes", "2"},
              std::vector<std::string>{"--prefill-max-skip", "8"},
              std::vector<std::string>{"--decode-rounds-per-prefill", "4"},
@@ -642,6 +641,24 @@ int main() {
                              "--context-store-compress"})
                           .context_store_compress,
                       "--context-store-compress did not reach serving options");
+    const ServeOptions peered = parse({"ninfer-serve", "model.ninfer", "--context-store", "cache0",
+                                       "--context-store-peer", "cache1", "--context-store-peer",
+                                       "cache2", "--context-store-peer-poll-ms", "40"});
+    failures += check(peered.context_store_peers.size() == 2 &&
+                          peered.context_store_peers[0] == "cache1" &&
+                          peered.context_store_peers[1] == "cache2" &&
+                          peered.context_store_peer_poll_ms == 40,
+                      "--context-store-peer options did not reach serving options");
+    failures += check(no_store.context_store_peers.empty() && no_store.context_store_peer_poll_ms == 250,
+                      "context store peers were on by default");
+    failures += check(rejected({"ninfer-serve", "model.ninfer", "--context-store-peer", "cache1"}),
+                      "--context-store-peer was accepted without --context-store");
+    failures += check(rejected({"ninfer-serve", "model.ninfer", "--context-store", "cache0",
+                                "--context-store-peer", "cache0"}),
+                      "a store was accepted as its own peer");
+    failures += check(rejected({"ninfer-serve", "model.ninfer", "--context-store", "cache0",
+                                "--context-store-peer-poll-ms", "0"}),
+                      "a zero --context-store-peer-poll-ms was accepted");
     failures += check(rejected({"ninfer-serve", "model.ninfer", "--context-store-compress"}),
                       "--context-store-compress was accepted without --context-store");
     failures += check(rejected({"ninfer-serve", "model.ninfer", "--context-store-max-gib", "4"}),
@@ -683,6 +700,33 @@ int main() {
     failures += check(!rejected({"ninfer-serve", "model.ninfer", "--model-suspend", "--vision",
                                  "--vision-residency", "overlay"}),
                       "--model-suspend was refused with overlay Vision");
+
+    // Router mode: no artifact, models from a directory or a preset; every other option goes on to
+    // each model, the router's own options do not.
+    const ServeOptions routed =
+        parse({"ninfer-serve", "--models-dir", "models", "--models-max", "2", "--kv-dtype", "rk8v4",
+               "--sleep-idle-seconds", "60", "--unload-idle-seconds", "600", "--no-models-autoload",
+               "--model-suspend"});
+    failures += check(routed.router() && routed.models_dir && *routed.models_dir == "models" &&
+                          routed.models_max == 2 && !routed.models_autoload &&
+                          routed.sleep_idle_seconds == 60 && routed.unload_idle_seconds == 600 &&
+                          routed.artifact_path.empty(),
+                      "the router options were not parsed");
+    failures += check(routed.model_arguments ==
+                          std::vector<std::string>{"--kv-dtype", "rk8v4", "--model-suspend"},
+                      "the router's own options leaked into the per-model arguments");
+    failures += check(!defaults.router() && defaults.models_max == 1 && defaults.models_autoload,
+                      "router mode must be off by default");
+    failures += check(rejected({"ninfer-serve", "--port", "9000"}),
+                      "no artifact and no router models was accepted");
+    failures += check(rejected({"ninfer-serve", "model.ninfer", "--models-dir", "models"}),
+                      "an artifact path was accepted together with --models-dir");
+    for (const char* flag : {"--models-max", "--unload-idle-seconds"}) {
+        failures += check(rejected({"ninfer-serve", "model.ninfer", flag, "2"}),
+                          "a router-only flag was silently accepted in single-model mode");
+    }
+    failures += check(rejected({"ninfer-serve", "model.ninfer", "--no-models-autoload"}),
+                      "--no-models-autoload was silently accepted in single-model mode");
     // The S3 copy of the context store is off unless both the endpoint and the bucket are given,
     // needs the store, and normalises its key prefix.
     const ServeOptions s3 = parse({"ninfer-serve", "model.ninfer", "--context-store", "dir",
