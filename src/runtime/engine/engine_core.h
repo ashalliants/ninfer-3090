@@ -1791,6 +1791,7 @@ private:
             if (!request->slice_in_flight) {
                 request->slice_in_flight = true;
                 request->slice_elapsed_ns = 0;
+                request->slice_planned_tokens = planned_tokens;
                 request->slice_wall_ns    = 0;
                 request->slice_prefix     = sibling_cursor(*request).value_or(0U);
                 ++cumulative_stats_.sliced_prefill_steps;
@@ -1812,7 +1813,8 @@ private:
         if (request->slice_in_flight) {
             step_elapsed_ns += request->slice_elapsed_ns;
             step_wall_total += request->slice_wall_ns;
-            step_prefix   = request->slice_prefix;
+            step_prefix    = request->slice_prefix;
+            planned_tokens = request->slice_planned_tokens;
             have_position = pacing_on;
             request->slice_in_flight = false;
             // The lane can be paused again. Whatever was refused while it was part-way (a short

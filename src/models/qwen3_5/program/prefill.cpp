@@ -616,6 +616,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             if (!resuming && sliced_call) {
                 staged.slice        = execution::PrefillSliceState{.count = layer_slices, .index = 0};
                 staged.slice_tokens = nominal;
+                staged.slice_cap_applied = cap_shortened;
             }
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
@@ -744,7 +745,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 return runtime::PrefillStepResult{
                     .summary                 = summary,
                     .processed_prompt_tokens = processed_prompt_tokens,
-                    .cap_applied             = cap_shortened && remaining == 0,
+                    .cap_applied             = (resuming ? staged.slice_cap_applied : cap_shortened) &&
+                                       remaining == 0,
                     .timing                  = timing.finish(),
                 };
             }

@@ -227,7 +227,8 @@ struct RequestRecord {
     // for the pacing model, which sees the step whole.
     bool slice_in_flight                   = false;
     std::uint64_t slice_elapsed_ns         = 0;
-    std::uint64_t slice_wall_ns            = 0; // worker wall time of the slices so far
+    std::uint64_t slice_wall_ns            = 0;
+    std::uint32_t slice_planned_tokens     = 0; // the chunk's planned width before a stall cap // worker wall time of the slices so far
     std::uint32_t slice_prefix             = 0;
     bool recovery_pending                  = false;
     std::uint64_t committed_decode_tokens  = 0;

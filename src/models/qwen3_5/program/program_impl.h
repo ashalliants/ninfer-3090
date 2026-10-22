@@ -253,6 +253,8 @@ struct RequestControl {
         // tokens it covers, so a call that resumes it finishes the same chunk.
         execution::PrefillSliceState slice;
         std::uint32_t slice_tokens = 0;
+    // Whether the stall cap narrowed this chunk when its first slice was planned; reported by the last.
+    bool slice_cap_applied = false;
     };
 
     std::optional<Prefill> prefill;

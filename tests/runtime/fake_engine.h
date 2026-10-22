@@ -687,6 +687,7 @@ public:
                 lane.slice_count  = layer_slices;
                 lane.slice_index  = 0;
                 lane.slice_tokens = step;
+                lane.slice_cap_applied = cap_narrowed;
             }
         }
         const bool sliced = lane.slice_count != 0;
@@ -709,7 +710,7 @@ public:
         lane.slice_count = 0;
         lane.slice_index = 0;
         progress.processed_prompt_tokens = step;
-        progress.cap_applied             = cap_narrowed;
+        progress.cap_applied             = resuming ? lane.slice_cap_applied : cap_narrowed;
         lane.cursor += step;
         record(event);
         if (lane.cursor >= lane.prompt) {
@@ -828,6 +829,7 @@ private:
         std::uint32_t slice_count  = 0; // slices of the chunk in progress; 0: not part-way
         std::uint32_t slice_index  = 0;
         std::uint32_t slice_tokens = 0;
+        bool slice_cap_applied = false;
     };
     struct Transaction {
         ContextOperationKind kind = ContextOperationKind::Bind;

@@ -502,6 +502,29 @@ void test_layer_slices_run_a_neighbour_between_slices() {
     (void)stream.wait_for(std::chrono::seconds(30));
 }
 
+// A chunk that the stall cap narrowed and that then runs in slices still counts as one paced step with
+// its deferred tokens: the cap is applied on the first call and reported by the last.
+void test_a_capped_sliced_chunk_counts_as_paced_once() {
+    // 10 ms + 0.1 ms/token: an 80 ms budget fits 700 tokens, so each 1024-token chunk runs as 640.
+    Rig rig({.chunk = 1024, .lanes = 2, .stall_budget = 80, .layer_slices = 4});
+    auto stream = rig.run(1, 64, kLongOutput);
+    require(decoding(rig, 3), "the neighbour never started decoding\n" + rig.dump());
+    auto prompt = rig.run(2, 4096, 1);
+    require(finished(prompt), "the long prompt did not finish\n" + rig.dump());
+    const auto stats = rig.core().runtime_stats();
+    // Chunks of a 4,096-token prompt at 640 a step: planned 1024 (x5, 384 deferred each), then 896
+    // (256 deferred), then a 256-token tail the cap does not narrow. All seven run in slices.
+    require(stats.sliced_prefill_steps == 7, "the chunks were not all sliced: " +
+                                                 std::to_string(stats.sliced_prefill_steps));
+    require(stats.paced_prefill_steps == 6,
+            "a capped sliced chunk was not counted as paced exactly once: " +
+                std::to_string(stats.paced_prefill_steps));
+    require(stats.paced_prefill_deferred_tokens == 5U * 384U + 256U,
+            "the deferred tokens of the capped sliced chunks are wrong (an underflow, or lost): " +
+                std::to_string(stats.paced_prefill_deferred_tokens));
+    drain(stream, std::chrono::seconds(30));
+}
+
 void test_layer_slices_need_a_neighbour() {
     Rig rig({.chunk = 1024, .lanes = 2, .layer_slices = 4});
     auto prompt = rig.run(1, 4096, 1);
@@ -614,6 +637,10 @@ int main() {
         test_backlog_gauge_tracks_queued_and_resident_prefill);
     run("layer slices run a neighbour between slices",
         test_layer_slices_run_a_neighbour_between_slices);
+    run("a capped sliced chunk counts as paced once",
+        test_a_capped_sliced_chunk_counts_as_paced_once);
+    run("a capped sliced chunk counts as paced once",
+        test_a_capped_sliced_chunk_counts_as_paced_once);
     run("layer slices need a neighbour", test_layer_slices_need_a_neighbour);
     run("a sliced chunk is not interleaved with another prefill",
         test_a_sliced_chunk_is_not_interleaved_with_another_prefill);
