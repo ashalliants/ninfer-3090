@@ -410,6 +410,11 @@ struct EngineOptions {
     std::uint32_t fit_context_floor    = 0;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
+    // Admission normally reserves only a fresh prompt's first prefill chunk. When on, a prompt
+    // whose whole KV need cannot fit beside the pages resident requests hold waits in the queue
+    // instead of starting: it would fill the pool, be paused, and (without a Host snapshot)
+    // recompute its history. Off by default; a request is always admitted when none is resident.
+    bool admission_fit_check           = false;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
     // Zero (off), or a multiple of prefill_chunk: a long prefill leaves a private LongAnchor
@@ -1468,6 +1473,8 @@ struct RuntimeStats {
     std::uint64_t active_captures_completed = 0;
     std::uint64_t active_captures_aborted   = 0;
     std::uint64_t preemptions               = 0;
+    // Fresh requests held back once because their whole prompt could not fit beside residents.
+    std::uint64_t admission_fit_deferrals   = 0;
     std::uint64_t snapshot_restores         = 0;
     std::uint64_t replay_restores           = 0;
     std::uint64_t replayed_tokens           = 0;

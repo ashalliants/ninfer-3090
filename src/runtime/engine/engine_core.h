@@ -98,6 +98,7 @@ public:
                ContextMachineCostModel context_cost)
         : instance_(instance), device_(device), max_context_(options.max_context),
           max_concurrency_(options.max_concurrency),
+          admission_fit_check_(options.admission_fit_check),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
@@ -2424,6 +2425,7 @@ private:
             auto& decision = *admission_decision_;
             ContextResourceUsage shortage;
             bool deferred = false;
+            std::optional<std::size_t> first_unfit;
             while (decision.current < decision.sources.size()) {
                 auto& choice            = decision.sources[decision.current];
                 const bool own_snapshot = restoring && request->suspended->has_snapshot();
@@ -2449,6 +2451,16 @@ private:
                 // checked. The replacement is retained before any old point is released.
                 if (resources_.has_source_record(request->id)) {
                     retain_admission_source(request, choice, restoring);
+                }
+                if (!restoring && admission_fit_check_ && !resident_empty() &&
+                    !instance_.program->prompt_fits_beside_residents(*request->base_plan,
+                                                                    choice.source)) {
+                    // Starting would fill the pool beside older requests, get this one paused and
+                    // recompute its history later. Try the remaining sources (a cheaper reuse or a
+                    // root start may fit); queue it only when none does.
+                    if (!first_unfit) { first_unfit = decision.current; }
+                    ++decision.current;
+                    continue;
                 }
                 auto binding_started = Clock::now();
                 const auto bind      = [&](const auto& source) {
@@ -2563,6 +2575,15 @@ private:
                     publish_generation_start(request, begin);
                 }
                 return true;
+            }
+            if (!deferred && first_unfit) {
+                // No source fits beside the residents; keep the preferred one and wait.
+                retain_admission_source(request, decision.sources[*first_unfit], restoring);
+                if (!request->fit_deferred) {
+                    request->fit_deferred = true;
+                    ++cumulative_stats_.admission_fit_deferrals;
+                }
+                deferred = true;
             }
             admission_decision_.reset();
             if (deferred) {
@@ -4102,6 +4123,7 @@ private:
     Device& device_;
     const std::uint32_t max_context_;
     const std::uint32_t max_concurrency_;
+    const bool admission_fit_check_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
     const std::uint32_t prefill_chunk_;
