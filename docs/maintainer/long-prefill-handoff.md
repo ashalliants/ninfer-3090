@@ -1,6 +1,6 @@
 # Long uncached prefill: handoff for the first session that has a 3090
 
-Written 2026-10-21 by a session with **no GPU**. Everything below was built, reasoned and CPU-tested
+Written 2026-10-21 by a session with **no GPU**; the first GPU session (2026-10-22, rented RTX 3090) ran the plan and its results are in "Results of the first GPU session" at the end. Everything below was built, reasoned and CPU-tested
 without running a kernel. This page is for an agent (or person) with no prior context who is about to
 sit in front of the RTX 3090 and finish the job. Read it top to bottom once, then work the plan in
 "What to do, in order".
@@ -55,7 +55,7 @@ Linear order: #341 -> #343 -> #344 -> #342 -> #351 -> #352. Others hang off mast
 | #344 | feat/prefill-backlog-metric | `ninfer_prefill_backlog_seconds` gauge + `/v1/load` field | - | CPU-tested only |
 | #342 | feat/prefill-decode-share | decode rounds get a % of prefill time (debt cap 10 s) | `--prefill-decode-share` | CPU-tested only |
 | #351 | test/engine-fake-harness | GPU-free fake-model `EngineCore<Instance>` harness, 16 scheduling scenarios on the real worker loop | tests/runtime/fake_engine.h | passes on CPU |
-| #352 | feat/prefill-layer-slices | residual parked in `prefill_hidden`, decode rounds between layer groups of one chunk | `--prefill-layer-slices` | **GPU path never run** |
+| #352 | feat/prefill-layer-slices | residual parked in `prefill_hidden`, decode rounds between layer groups of one chunk | `--prefill-layer-slices` | GPU path run 2026-10-22, see Results |
 | #345 | bench/prefill-stall-probe | `tools/bench/run_prefill_stall.py`: what a long prompt does to a stream next to it | - | the experiment runner |
 | #346 | docs/decode-during-long-prefill | design note, why fusing decode into the prefill step was NOT built | - | doc |
 | this PR | feat/long-prefill-handoff | `tools/bench/prefill_time_model.py`, `run_prefill_depth_sweep.py` and tests, this page | - | CPU tests pass |
@@ -136,3 +136,44 @@ holds control batches while a sliced chunk is in flight; check that hold is enou
 - `tools/bench/run_prefill_depth_sweep.py`, `test_prefill_depth_sweep.py` (`ninfer_prefill_depth_sweep_test`)
 - `tests/cmake/BenchSupportTests.cmake`, `TestGpuClasses.cmake` (both tests are `cpu`)
 - this page
+
+## Results of the first GPU session
+
+2026-10-22, a rented RTX 3090 (24 GB, Linux, CUDA 12.8), Qwen3.8-27B (`qwen3_8_27b.ninfer`), `--prefill-cublas
+--kv-dtype int8 --max-concurrency 2 --prefill-chunk 4096`, the rebased stack. One run per row, a fresh server each.
+`run_prefill_stall.py`: a stream at 48 events/s, then one 108K-token uncached prompt.
+
+| setting | worst neighbour gap | 108K prompt | model said (100K) |
+|---|---|---|---|
+| none | 2930 ms | 56.1 s | 3108 ms / 55.0 s |
+| `--prefill-stall-budget-ms 500` | 528 ms | 72.1 s | 544 ms / 73.1 s |
+| `--prefill-layer-slices 8` | 402 ms | 60.8 s | 428 ms / 62.9 s |
+| `--prefill-stall-budget-ms 500 --prefill-decode-share 50` | 538 ms (p50 20 ms) | 138.5 s | - |
+
+- The model agrees with the measurements to 3-6%. `run_prefill_depth_sweep.py` (4K to 100K, chunk 4096): measured
+  1.27 s / 5.5 s / 12.2 s / 28.5 s / 50.4 s for 4K / 16K / 32K / 64K / 100K tokens; fitted scales 0.97 for the
+  per-step and per-token cost and 0.89 for attention (the Engine's pair cost is slightly pessimistic at depth).
+  Attention is 40% of the 100K prompt.
+- **Layer slices are the best of the options for the neighbour**: a 7x smaller worst gap than baseline for 8% more
+  prompt time, against 2.6x smaller for 28% more with the stall budget. `sliced_prefill_matches_whole` passes bit-exact on the
+  GPU (it did not before: see below), and greedy output of a 56K prompt, a stream and a short request is
+  token-identical with every flag (and with all four together).
+- **Yield**: a short request sent 10 s into the 108K prompt got its first token after 0.77 s with
+  `--yield-long-prefill-ms 5000`, against 46.5 s with no flag; the long prompt took 57.2 s instead of 56.3 s.
+- **Shared progress anchors (#340)**: cancel the prompt at 35 s and resubmit: the retry took 24.5 s with
+  `--progress-anchor-tokens 8192 --progress-anchors-shared` (73,728 tokens reused), against 57.8 s with no anchors
+  and 58.1 s with private anchors.
+- **Admission fit check (#337)**: two 50K-token prompts into a 70K-token pool: without the flag one preemption and the
+  first prompt took 27.3 s; with it one deferral, no preemption, the first prompt took 20.5 s and the pair finished
+  in the same 40.8 s.
+- **Backlog gauge (#344)**: `/v1/load` `prefill_backlog_seconds` read 0 idle and 24.9 s with one 50K prompt running
+  and a second queued.
+
+What broke and was fixed: three GPU test fixtures written without a card passed a hard-coded page count of 2 where
+the explicit capacity needs 8 at 64 tokens a page (`progress_anchor_planning`, `capped_prefill_steps`,
+`sliced_prefill_matches_whole`), and the last two asked for a capacity above what `max_concurrency 1` allows. The
+engine code was right. `ninfer_model_registry_test` did not link on Linux (spdlog include path).
+
+Not run: the combined stall budget + slices + share + yield under a real mixed load (only for output equality),
+chunk sizes other than 4096, `--prefill-layer-slices` with DFlash or media (refused by design), and the second
+card cases. The decode share costs 2.5x on the prompt at 50%: leave it off unless the neighbour must see no gap at all.
