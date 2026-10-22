@@ -27,9 +27,8 @@ ContextMachineCostModel model() {
     return costs;
 }
 
-// The same table is asserted by `test_step_cap_matches_the_expected_values_of_the_cpp_policy` in
-// tools/bench/test_prefill_time_model.py, which keeps the Python time model on this policy: change a
-// value here and the other test fails until it is changed there too.
+// The Python time model in tools/bench (PR #353) is held to the same table by its own test, so the
+// two copies of the policy cannot drift apart unnoticed: change a value here and update it there.
 void test_step_cap_expected_values() {
     ContextMachineCostModel costs;
     costs.prefill.chunk_ns              = 100'000'000;

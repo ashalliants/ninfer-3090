@@ -1726,14 +1726,17 @@ private:
         auto progress = instance_.program->advance_prefill(
             *request->sequence, &program_call.failed_timing(), provider, step_cap);
         program_call.finish(progress.timing);
-        if (have_position && progress.processed_prompt_tokens != 0) {
+        // A media step ignores the cap and is priced by a text-only model, so it must not teach the
+        // correction factor; a step cut short by a capture or rewrite frontier did not run at the
+        // cap either. The cap counts as honored only when the step ran exactly that wide.
+        if (have_position && progress.processed_prompt_tokens != 0 &&
+            !request->prompt_summary.has_media) {
             pacing_.prefill_step_done(
                 predicted_prefill_step_ns(resources_.costs(), step_prefix,
                                           progress.processed_prompt_tokens),
                 progress.timing.elapsed_ns());
-            // Count a step as paced only when the stall cap, not a capture or rewrite frontier,
-            // made it smaller than planned; the deferred tokens are what the cap took off.
-            if (step_cap != 0 && step_cap < planned_tokens) {
+            if (step_cap != 0 && step_cap < planned_tokens &&
+                progress.processed_prompt_tokens == step_cap) {
                 ++cumulative_stats_.paced_prefill_steps;
                 cumulative_stats_.paced_prefill_deferred_tokens += planned_tokens - step_cap;
             }
