@@ -150,7 +150,8 @@ holds control batches while a sliced chunk is in flight; check that hold is enou
 | `--prefill-layer-slices 8` | 402 ms | 60.8 s | 428 ms / 62.9 s |
 | `--prefill-stall-budget-ms 500 --prefill-decode-share 50` | 538 ms (p50 20 ms) | 138.5 s | - |
 
-- The model agrees with the measurements to 3-6%. `run_prefill_depth_sweep.py` (4K to 100K, chunk 4096): measured
+- The model agrees with the measurements to 3-6%. (The default `bench/fixtures/bench_corpus.ids` holds 65,536 token ids,
+  so `ninfer_bench` refuses `pp100000`: tile it into a longer file and pass `-- --corpus FILE`. Tiled text is fine for prefill timing.) `run_prefill_depth_sweep.py` (4K to 100K, chunk 4096): measured
   1.27 s / 5.5 s / 12.2 s / 28.5 s / 50.4 s for 4K / 16K / 32K / 64K / 100K tokens; fitted scales 0.97 for the
   per-step and per-token cost and 0.89 for attention (the Engine's pair cost is slightly pessimistic at depth).
   Attention is 40% of the 100K prompt.
