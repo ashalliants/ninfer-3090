@@ -2203,7 +2203,12 @@ void prompt_fits_beside_residents_on_real_pools(DeviceContext& device,
     options.context_cache.device_state_slots  = 0;
     options.context_cache.host_capacity_bytes = 0;
     auto planner = qwen::detail::make_sequence_planner_impl(parameters, device, options);
-    const std::uint32_t pages = planner->curve.minimum_main_page_groups;
+    // Not the curve minimum (8 pages, one request's worth): the pool this test needs is the 15 pages
+    // of the explicit capacity, which the curve allows between one request and max_concurrency of them.
+    constexpr std::uint32_t pages = kPoolTokens / 64;
+    require(pages >= planner->curve.minimum_main_page_groups &&
+                pages <= planner->curve.maximum_main_page_groups,
+            "the fit test's pool is outside the capacity curve");
     auto plan                 = qwen::detail::finalize_sequence_plan_impl(std::move(planner), pages);
     qwen::detail::ProgramImpl program(parameters, *plan, device, {});
     const auto empty = program.physical_usage().occupied;
