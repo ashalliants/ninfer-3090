@@ -118,6 +118,7 @@ struct RequestRecord {
     using BasePlan       = typename ModelContract::RequestBasePlan;
     using SequenceHandle = typename ModelContract::SequenceHandle;
     using ResumeState    = typename ModelContract::ResumeState;
+    using Checkpoint     = typename ModelContract::CheckpointHandle;
     using StreamEvent = std::variant<GenerationTimingObservation, GenerationFirstTokenObservation,
                                      OutputDelta, std::unique_ptr<GenerationSchedulingObservation>>;
 
@@ -194,6 +195,9 @@ struct RequestRecord {
     std::optional<BasePlan> base_plan;
     std::optional<ResumeState> suspended;
     ContinuationOwnerToken continuation_owner = 0;
+    // Shared checkpoints this request published at its progress anchors, oldest first. Only the
+    // newest few are kept (EngineCore::trim_progress_anchors).
+    std::vector<Checkpoint> progress_anchors;
     std::uint64_t device_to_host_bytes        = 0;
     std::uint64_t host_to_device_bytes        = 0;
     EngineRequestState resume_phase           = EngineRequestState::Prefill;

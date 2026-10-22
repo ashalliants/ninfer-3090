@@ -3,6 +3,8 @@
 
 #include "core/vram_budget.h"
 
+#include "core/nvml.h"
+
 #include <cuda_runtime.h>
 
 #include <cstdio>
@@ -17,8 +19,6 @@
 #endif
 #include <windows.h>
 #include <dxgi1_6.h>
-#else
-#include <dlfcn.h>
 #endif
 
 namespace ninfer {
@@ -34,96 +34,16 @@ std::function<VramSnapshot()>& fake_source() {
     return fake;
 }
 
-// NVML through the driver's library, loaded at runtime so its absence never stops startup.
-class Nvml {
-public:
-    explicit Nvml(const cudaDeviceProp& props) {
-#ifdef _WIN32
-        library_ = ::LoadLibraryA("nvml.dll");
-        if (library_ == nullptr) { return; }
-        const auto symbol = [&](const char* name) { return reinterpret_cast<void*>(::GetProcAddress(library_, name)); };
-#else
-        library_ = ::dlopen("libnvidia-ml.so.1", RTLD_LAZY | RTLD_LOCAL);
-        if (library_ == nullptr) { return; }
-        const auto symbol = [&](const char* name) { return ::dlsym(library_, name); };
-#endif
-        init_         = reinterpret_cast<int (*)()>(symbol("nvmlInit_v2"));
-        shutdown_     = reinterpret_cast<int (*)()>(symbol("nvmlShutdown"));
-        by_pci_       = reinterpret_cast<int (*)(const char*, void**)>(symbol("nvmlDeviceGetHandleByPciBusId_v2"));
-        display_      = reinterpret_cast<int (*)(void*, int*)>(symbol("nvmlDeviceGetDisplayActive"));
-        memory_       = reinterpret_cast<int (*)(void*, MemoryV2*)>(symbol("nvmlDeviceGetMemoryInfo_v2"));
-        if (init_ == nullptr || shutdown_ == nullptr || by_pci_ == nullptr || display_ == nullptr ||
-            init_() != 0) {
-            release();
-            return;
-        }
-        initialized_ = true;
-        char bus[32];
-        std::snprintf(bus, sizeof(bus), "%08x:%02x:%02x.0", props.pciDomainID, props.pciBusID, props.pciDeviceID);
-        if (by_pci_(bus, &device_) != 0) { device_ = nullptr; }
-    }
-
-    ~Nvml() { release(); }
-
-    Nvml(const Nvml&)            = delete;
-    Nvml& operator=(const Nvml&) = delete;
-
-    // Physical device memory less the driver's reserve (nvmlDeviceGetMemoryInfo_v2); 0 unknown.
-    [[nodiscard]] std::uint64_t usable_bytes() const {
-        if (device_ == nullptr || memory_ == nullptr) { return 0; }
-        MemoryV2 memory{};
-        memory.version = static_cast<unsigned>(sizeof(MemoryV2)) | (2U << 24U);
-        if (memory_(device_, &memory) != 0 || memory.reserved > memory.total) { return 0; }
-        return memory.total - memory.reserved;
-    }
-
-    // 1 active, 0 inactive, -1 unknown.
-    [[nodiscard]] int display_active() const {
-        if (device_ == nullptr) { return -1; }
-        int active = 0;
-        return display_(device_, &active) == 0 ? (active != 0 ? 1 : 0) : -1;
-    }
-
-private:
-    struct MemoryV2 { // nvmlMemory_v2_t
-        unsigned version;
-        unsigned long long total, reserved, free, used;
-    };
-
-    void release() noexcept {
-        if (initialized_) { (void)shutdown_(); }
-        initialized_ = false;
-        device_      = nullptr;
-        if (library_ == nullptr) { return; }
-#ifdef _WIN32
-        ::FreeLibrary(library_);
-#else
-        ::dlclose(library_);
-#endif
-        library_ = nullptr;
-    }
-
-#ifdef _WIN32
-    HMODULE library_ = nullptr;
-#else
-    void* library_ = nullptr;
-#endif
-    int (*init_)()                         = nullptr;
-    int (*shutdown_)()                     = nullptr;
-    int (*by_pci_)(const char*, void**)    = nullptr;
-    int (*display_)(void*, int*)           = nullptr;
-    int (*memory_)(void*, MemoryV2*)       = nullptr;
-    void* device_                          = nullptr;
-    bool initialized_                      = false;
-};
-
 class DeviceSource final : public VramBudgetSource {
 public:
     DeviceSource(int device, bool past_budget) : device_(device) {
         if (cudaGetDeviceProperties(&props_, device) != cudaSuccess) {
             throw std::runtime_error("VRAM budget: cannot read the device's properties");
         }
-        nvml_ = std::make_unique<Nvml>(props_);
+        char bus[32];
+        std::snprintf(bus, sizeof(bus), "%08x:%02x:%02x.0", props_.pciDomainID, props_.pciBusID,
+                      props_.pciDeviceID);
+        nvml_ = std::make_unique<Nvml>(bus);
 #ifdef _WIN32
         budget_event_ = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
         open_adapter();

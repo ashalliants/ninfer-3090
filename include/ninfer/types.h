@@ -196,6 +196,11 @@ struct ContextStoreOptions {
     std::string remote_prefix;
     // How long shutdown waits for the uploads still queued.
     std::chrono::seconds remote_flush_budget{120};
+    // Other engines' store directories on the same volume (read, never written): their sessions
+    // are imported by hard link within `peer_poll`, so an engine on another GPU of the same box
+    // resumes a conversation this one finished without a bucket round trip. See ContextStore.
+    std::vector<std::filesystem::path> peers;
+    std::chrono::milliseconds peer_poll{250};
     // Called on the writer thread after each session is written. Exceptions are ignored.
     std::function<void(const ContextStoreWriteEvent& event)> listener;
 
@@ -381,6 +386,11 @@ struct EngineOptions {
     // the nearest anchor instead of from the root. Needs the context cache; each owner keeps its
     // newest four anchors. Qwen3.5-family models only.
     std::uint32_t progress_anchor_tokens = 0;
+    // With progress_anchor_tokens: publish the anchors as SharedPrefix checkpoints instead of private
+    // ones, so a request that is cancelled part-way (a client timeout or disconnect) leaves its work
+    // for the retry, or for any request with the same prefix. A request keeps its two newest anchors
+    // and releases an older one unless something has reused it. Off by default.
+    bool progress_anchors_shared = false;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
@@ -1537,6 +1547,12 @@ struct RuntimeStats {
     std::uint64_t context_store_remote_downloads         = 0;
     std::uint64_t context_store_remote_download_bytes    = 0;
     std::uint64_t context_store_remote_download_failures = 0;
+    // With peers: images imported from another engine's directory, the chunk bytes hard-linked
+    // (not copied), images skipped, and links that failed.
+    std::uint64_t context_store_peer_images        = 0;
+    std::uint64_t context_store_peer_bytes_linked  = 0;
+    std::uint64_t context_store_peer_skipped       = 0;
+    std::uint64_t context_store_peer_link_failures = 0;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {

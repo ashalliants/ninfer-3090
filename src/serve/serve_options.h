@@ -41,6 +41,7 @@ struct ServeOptions {
     std::uint32_t pending_timeout_ms   = 600000;
     std::uint32_t prefill_chunk        = 1024;
     std::uint32_t progress_anchor_tokens = 0;
+    bool progress_anchors_shared         = false;
     std::filesystem::path context_cost_presets;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;
@@ -83,6 +84,23 @@ struct ServeOptions {
     // --sleep-idle-seconds N: suspend the model after N seconds with no request (needs
     // --model-suspend). 0 leaves suspending to the HTTP API.
     std::uint32_t sleep_idle_seconds = 0;
+    // Router mode (several models behind one server): no artifact argument; --models-dir and/or
+    // --models-preset name the models, which load on demand. Every other option on the command line
+    // applies to each model. Adapted from NInfer-all 0dcb1da9 (Apache-2.0).
+    std::optional<std::filesystem::path> models_dir;
+    std::optional<std::filesystem::path> models_preset;
+    // Models loaded at once; zero means no limit.
+    std::uint32_t models_max = 1;
+    // A request for a model that is not loaded loads it.
+    bool models_autoload = true;
+    // --unload-idle-seconds N: unload a model that has been idle that long (router mode); zero keeps
+    // it loaded.
+    std::uint32_t unload_idle_seconds = 0;
+    // The arguments after the artifact path, router options removed: what router mode starts each
+    // model with.
+    std::vector<std::string> model_arguments;
+
+    [[nodiscard]] bool router() const noexcept { return models_dir || models_preset; }
     // --context-store DIR: keep retained sessions on disk so a restart or crash does not lose the
     // context cache. Empty disables it.
     std::filesystem::path context_store_path;
@@ -94,6 +112,10 @@ struct ServeOptions {
     std::uint32_t context_store_flush_seconds   = 60;
     // --context-store-compress: write new chunks zstd-compressed (disk and bucket).
     bool context_store_compress                 = false;
+    // --context-store-peer DIR (repeatable): another engine's store directory on the same volume,
+    // imported by hard link; --context-store-peer-poll-ms N: how often they are looked at.
+    std::vector<std::filesystem::path> context_store_peers;
+    std::uint32_t context_store_peer_poll_ms    = 250;
     // --context-store-s3-endpoint URL / --context-store-s3-bucket NAME: keep a copy of the store in
     // an S3-compatible bucket (credentials come from the environment, never the command line).
     std::string context_store_s3_endpoint;

@@ -34,14 +34,6 @@ bool is_openai_path(std::string_view path) {
     return path.starts_with("/v1/") && !is_anthropic_path(path);
 }
 
-void ensure_http_request_id(const httplib::Request& request, httplib::Response& response) {
-    if (is_anthropic_path(request.path) && !response.has_header("request-id")) {
-        response.set_header("request-id", new_anthropic_request_id());
-    } else if (is_openai_path(request.path) && !response.has_header("x-request-id")) {
-        response.set_header("x-request-id", new_openai_request_id());
-    }
-}
-
 ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
                                         const ninfer::RuntimeStats& current,
                                         double interval_seconds) {
@@ -137,6 +129,14 @@ std::string response_request_id(const httplib::Response& response) {
 
 } // namespace
 
+void ensure_http_request_id(const httplib::Request& request, httplib::Response& response) {
+    if (is_anthropic_path(request.path) && !response.has_header("request-id")) {
+        response.set_header("request-id", new_anthropic_request_id());
+    } else if (is_openai_path(request.path) && !response.has_header("x-request-id")) {
+        response.set_header("x-request-id", new_openai_request_id());
+    }
+}
+
 void write_openai_error(httplib::Response& response, const ApiError& error) {
     response.status = error.status;
     response.set_content(make_error_body(error), "application/json");
@@ -216,9 +216,14 @@ bool matches_bearer_credential(std::string_view authorization, std::string_view 
     return authorization.substr(position, end - position) == api_key;
 }
 
-HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger)
-    : options_(std::move(options)), openai_responses_store_(options_.response_store_max_records,
-                                                            options_.response_store_max_bytes),
+HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger,
+                       std::shared_ptr<OpenAIResponsesStore> responses_store)
+    : options_(std::move(options)),
+      responses_store_(responses_store ? std::move(responses_store)
+                                       : std::make_shared<OpenAIResponsesStore>(
+                                             options_.response_store_max_records,
+                                             options_.response_store_max_bytes)),
+      openai_responses_store_(*responses_store_),
       operational_log_(logger),
       request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger)) {
     // cpp-httplib is thread-per-connection: a worker is held for a connection's whole
@@ -717,6 +722,11 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
 }
 
 bool HttpServer::bind() { return server_.bind_to_port(options_.host, options_.port); }
+
+int HttpServer::bind_any_port() {
+    const int port = server_.bind_to_any_port(options_.host);
+    return port > 0 ? port : 0;
+}
 
 void HttpServer::start_serving_during_startup() {
     if (startup_listener_.joinable()) {
