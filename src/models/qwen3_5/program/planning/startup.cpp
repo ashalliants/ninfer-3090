@@ -995,6 +995,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->max_concurrency      = inputs.max_concurrency;
     impl->prefill_chunk        = inputs.prefill_chunk;
     impl->progress_anchor_tokens = inputs.progress_anchor_tokens;
+    impl->progress_anchors_shared = inputs.progress_anchors_shared;
     impl->draft_window         = inputs.draft_window;
     impl->ngram_draft_tokens   = inputs.ngram_draft_tokens;
     impl->ngram_min_match      = inputs.ngram_min_match;
@@ -1162,6 +1163,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .max_concurrency      = options.max_concurrency,
         .prefill_chunk        = std::min(options.prefill_chunk, options.max_context),
         .progress_anchor_tokens = options.progress_anchor_tokens,
+        .progress_anchors_shared = options.progress_anchors_shared,
         .draft_window         = options.speculative.draft_tokens,
         .ngram_draft_tokens   = options.speculative.ngram_draft_tokens,
         .ngram_min_match      = options.speculative.ngram_min_match,
