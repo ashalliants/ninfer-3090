@@ -180,9 +180,9 @@ private:
 };
 
 // A tool result holding a JSON record, which the answer returns under a schema. The record is
-// serialized the way constrained JSON output is (compact separators, the schema's property order),
-// so the answer can copy it run by run; under any other layout the grammar rejects the copied
-// separators and greedy output stops following the record at all.
+// serialized compactly in the schema's property order, so the answer can copy it run by run. The
+// grammar licenses any layout of the same value (insignificant whitespace, runs of at most 32), so
+// a copy is no longer forced to be compact; this fixture is the layout most likely to be copied.
 nlohmann::ordered_json pump_record() {
     return nlohmann::ordered_json{
         {"name", "inlet pump"},
