@@ -2110,14 +2110,16 @@ void capped_prefill_steps(DeviceContext& device, const qwen::execution::Paramete
     constexpr std::uint32_t kStepChunk = 2 * kChunk;
     constexpr std::uint32_t kPrompt    = 3 * kChunk;
     options.max_context                       = kCapacity;
-    options.kv_capacity                       = KvCapacityPolicy::explicit_capacity(2 * kCapacity);
+    options.kv_capacity                       = KvCapacityPolicy::explicit_capacity(kCapacity);
     options.prefill_chunk                     = kStepChunk;
     options.max_concurrency                   = 1;
     options.context_cache.enabled             = false;
     options.context_cache.device_state_slots  = 0;
     options.context_cache.host_capacity_bytes = 0;
     auto planner = qwen::detail::make_sequence_planner_impl(parameters, device, options);
-    auto plan    = qwen::detail::finalize_sequence_plan_impl(std::move(planner), 2);
+    // The explicit capacity fixes the page count; the page size depends on the KV storage.
+    const std::uint32_t pages = planner->curve.minimum_main_page_groups;
+    auto plan                 = qwen::detail::finalize_sequence_plan_impl(std::move(planner), pages);
     qwen::detail::ProgramImpl program(parameters, *plan, device, {});
     const auto empty = program.physical_usage().occupied;
 

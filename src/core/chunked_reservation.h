@@ -26,12 +26,18 @@ template <class Item, class Reserve, class Accept>
         // for the largest one that still fits, so a run that holds 6 of 8 items is not left using
         // only 4. A reservation is released before a larger one is tried (the larger one may need
         // the very run it holds), so the size already known to fit is re-reserved on a miss.
-        auto held          = reserve(chunk(count));
+        auto held = reserve(chunk(count));
+        // A reservation may be move-constructible but not move-assignable (an optional of it is
+        // then not either), so a result replaces `held` by reset and emplace.
+        const auto replace = [&held](auto&& next) {
+            held.reset();
+            if (next) { held.emplace(std::move(*next)); }
+        };
         std::size_t failed = remaining + 1;
         while (!held && count) {
             failed = count;
             count /= 2;
-            if (count) { held = reserve(chunk(count)); }
+            if (count) { replace(reserve(chunk(count))); }
         }
         if (!held) { return false; }
         auto high = failed - 1;
@@ -40,11 +46,11 @@ template <class Item, class Reserve, class Accept>
             held.reset();
             auto larger = reserve(chunk(mid));
             if (larger) {
-                held  = std::move(larger);
+                replace(std::move(larger));
                 count = mid;
             } else {
                 high = mid - 1;
-                held = reserve(chunk(count));
+                replace(reserve(chunk(count)));
                 if (!held) { return false; }
             }
         }
