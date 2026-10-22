@@ -1,6 +1,6 @@
 # Decode during a long prefill: what is built, what is not, and what decides the rest
 
-Status: design note. Nothing here was measured; the host this was written on has no GPU, and the layer-sliced prefill described below is GPU code that has not run. Numbers are
+Status: design note. It was written without a GPU; the options it describes were then run on an RTX 3090 on 2026-10-22 and the measurements are in `docs/maintainer/long-prefill-handoff.md` (PR #353) (layer slices: worst neighbour gap 2.93 s to 402 ms for 8% more prompt time). Numbers are
 from `docs/serving.md`, `docs/performance.md` and the source comments they cite, and say so. Delete or
 fold into `docs/serving.md` once the open question below is settled.
 
