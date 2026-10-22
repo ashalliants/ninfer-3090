@@ -1061,6 +1061,35 @@ void test_progress_anchor_retirement_keeps_whatever_was_used() {
             "a retired anchor is still offered as a source");
 }
 
+// A hold that refused a retirement must not turn it into a permanent keep: the anchor goes when the
+// holder is cancelled (release_source) or moves to another source (retain_source).
+void test_held_progress_anchor_is_retired_when_the_hold_ends() {
+    Fixture f(64);
+    const auto held_a = f.program.add({1, 2}, {f.program.host_block(8)});
+    const auto held_b = f.program.add({3, 4}, {f.program.host_block(8)});
+    const auto other  = f.program.add({5, 6}, {f.program.host_block(8)});
+    f.publish(held_a);
+    f.publish(held_b);
+    f.publish(other);
+    const Base waiting_a{.tokens = {1, 2, 3}};
+    const Base waiting_b{.tokens = {3, 4, 5}};
+    f.cache.retain_source(f.program, 10, f.source(waiting_a, held_a));
+    f.cache.retain_source(f.program, 11, f.source(waiting_b, held_b));
+    require(!f.cache.retire_unreused_shared(f.program, held_a) && f.program.valid_checkpoint(held_a) &&
+                !f.cache.retire_unreused_shared(f.program, held_b) && f.program.valid_checkpoint(held_b),
+            "a held anchor was retired while its waiter held it");
+
+    f.cache.release_source(f.program, 10); // the waiter is cancelled
+    require(!f.program.valid_checkpoint(held_a),
+            "an anchor stayed after the waiter that held it was cancelled");
+    require(f.program.valid_checkpoint(held_b), "an anchor was retired while still held");
+
+    f.cache.retain_source(f.program, 11, f.source(Base{.tokens = {5, 6, 7}}, other)); // source replaced
+    require(!f.program.valid_checkpoint(held_b),
+            "an anchor stayed after its waiter moved to another source");
+    require(f.program.valid_checkpoint(other), "the waiter's new source was retired");
+}
+
 void test_pinned_shared_prefix_survives_reclaim_and_cache_clear() {
     Fixture f(64);
     const auto graft = f.program.add({7, 7, 7}, {f.program.host_block(16)});
@@ -2415,6 +2444,7 @@ int main() {
     try {
         test_direct_victim_release_offers_the_continuation_first();
         test_progress_anchor_retirement_keeps_whatever_was_used();
+        test_held_progress_anchor_is_retired_when_the_hold_ends();
         test_candidate_memo_cuts_victim_selection_work();
         test_candidate_memo_changes_no_decision();
         test_pinned_shared_prefix_survives_reclaim_and_cache_clear();
