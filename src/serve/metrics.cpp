@@ -107,7 +107,7 @@ void Metrics::configure(std::string model, const EngineOptions& options,
     const int primary_device = options.devices.empty() ? options.device : options.devices.front();
     char bus_id[32] = {};
     if (cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), primary_device) == cudaSuccess) {
-        auto telemetry = std::make_shared<GpuTelemetry>(bus_id);
+        auto telemetry = std::make_shared<Nvml>(bus_id);
         if (telemetry->available()) {
             set_gpu_sampler([telemetry] { return telemetry->sample(); });
         }
@@ -115,7 +115,10 @@ void Metrics::configure(std::string model, const EngineOptions& options,
 }
 
 void Metrics::set_gpu_sampler(std::function<GpuSample()> sampler) {
-    gpu_sampler_ = std::move(sampler);
+    std::lock_guard lock(gpu_mutex_);
+    gpu_sampler_      = std::move(sampler);
+    gpu_energy_last_  = gpu_sampler_ ? gpu_sampler_().energy_joules : std::nullopt;
+    gpu_energy_total_ = 0.0;
 }
 
 void Metrics::first_token(const GenerationFirstTokenObservation& observation) {
@@ -226,6 +229,7 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
     counter("constraint_draft_wait_seconds_total", stats.host_work.constraint_draft_wait_ns * 1e-9,
             baseline_.host_work.constraint_draft_wait_ns * 1e-9,
             "Draft-ready wait, counted once per batch.");
+    std::lock_guard gpu_lock(gpu_mutex_);
     if (gpu_sampler_) {
         const GpuSample gpu = gpu_sampler_();
         const auto optional_gauge = [&](std::string_view name, const auto& value,
@@ -243,6 +247,16 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
                        "Device memory installed.");
         optional_gauge("gpu_temperature_celsius", gpu.temperature_celsius, "GPU core temperature.");
         optional_gauge("gpu_power_watts", gpu.power_watts, "Board power draw.");
+        // Needs a starting reading: NVML counts from driver load, so a reading first seen later
+        // would otherwise report the whole uptime of the machine.
+        if (gpu.energy_joules && gpu_energy_last_) {
+            const double reading = *gpu.energy_joules;
+            gpu_energy_total_ += reading >= *gpu_energy_last_ ? reading - *gpu_energy_last_ : reading;
+            gpu_energy_last_ = reading;
+            counter("gpu_energy_joules_total", gpu_energy_total_, 0.0,
+                    "Board energy used since attachment. Its rate is the mean power over any "
+                    "window, which the power gauge's instantaneous reading cannot give.");
+        }
     }
     gauge("engine_ready", ready ? 1 : 0, "Whether Engine can accept work.");
     gauge("server_start_time_seconds", start_seconds_,
@@ -420,6 +434,14 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
     COUNTER(context_store_remote_download_failures,
             "context_store_remote_download_failures_total",
             "Remote listings or fetches that failed or returned damaged data.");
+    COUNTER(context_store_peer_images, "context_store_peer_images_total",
+            "Sessions imported from another engine's store directory (--context-store-peer).");
+    COUNTER(context_store_peer_bytes_linked, "context_store_peer_bytes_linked_total",
+            "Chunk bytes hard-linked from peer directories (shared on disk, not copied).");
+    COUNTER(context_store_peer_skipped, "context_store_peer_skipped_total",
+            "Peer sessions not imported: damaged, expired, over budget or gone mid-import.");
+    COUNTER(context_store_peer_link_failures, "context_store_peer_link_failures_total",
+            "Chunks of a peer session that could not be linked (removed by the peer, or another volume).");
 #undef GAUGE
 #undef COUNTER
 

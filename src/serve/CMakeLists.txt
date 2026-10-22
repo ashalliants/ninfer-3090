@@ -24,6 +24,10 @@ add_library(ninfer_serve STATIC
   load_report.cpp
   openai_responses_http.cpp
   serve_options.cpp
+  model_catalog.cpp
+  model_registry.cpp
+  routed_model.cpp
+  router_server.cpp
 )
 ninfer_internal_includes(ninfer_serve)
 target_link_libraries(ninfer_serve

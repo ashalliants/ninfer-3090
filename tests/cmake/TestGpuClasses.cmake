@@ -78,6 +78,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_s3_object_store_test
   ninfer_sampling_defaults_test
   ninfer_scheduler_test
+  ninfer_model_registry_test
   ninfer_serve_options_test
   ninfer_tensor_test
   ninfer_tool_call_parser_test
