@@ -409,6 +409,20 @@ int main() {
                           context_cache.context_cache.host_capacity_bytes == (64ULL << 20),
                       "context-cache capacities did not reach serving options");
 
+    failures += check(defaults.prefill_schedule.stall_budget_ms == 0,
+                      "the prefill stall budget is not off by default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--prefill-stall-budget-ms", "300"})
+                              .prefill_schedule.stall_budget_ms == 300,
+                      "--prefill-stall-budget-ms did not reach serving options");
+    {
+        bool oversized_budget_rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--prefill-stall-budget-ms", "60001"});
+        } catch (const std::invalid_argument&) { oversized_budget_rejected = true; }
+        failures += check(oversized_budget_rejected,
+                          "--prefill-stall-budget-ms accepted more than a minute");
+    }
+
     const ServeOptions zero_host_context =
         parse({"ninfer-serve", "model.ninfer", "--host-context-mib", "0"});
     failures += check(zero_host_context.context_cache.enabled &&

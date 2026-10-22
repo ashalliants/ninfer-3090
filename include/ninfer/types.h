@@ -66,6 +66,8 @@ inline constexpr std::size_t kDefaultKvCapacityHeadroomBytes = 1024ULL * 1024ULL
 // the card into paging, and the step between fitted contexts.
 inline constexpr std::size_t kFitContextHeadroomBytes = 256ULL * 1024ULL * 1024ULL;
 inline constexpr std::uint32_t kFitContextStepTokens  = 1024;
+// PrefillScheduleOptions::stall_budget_ms: a minute is far past any step the engine runs.
+inline constexpr std::uint32_t kMaximumPrefillStallBudgetMs = 60'000;
 
 struct KvCapacityPolicy {
     KvCapacityMode mode                  = KvCapacityMode::Explicit;
@@ -262,6 +264,18 @@ struct ContextCacheOptions {
     std::optional<std::uint32_t> host_cache_percent;
 };
 
+// How a long prefill shares the GPU with lanes that are already generating. Off by default.
+struct PrefillScheduleOptions {
+    // The Engine runs one prefill step per worker cycle, so a stream that decodes next to a prefill
+    // is paused for a whole step (about 1.5 s at --prefill-chunk 4096 on a 3090). A nonzero budget
+    // cuts a step's size, whenever another lane is decoding, so the cost model predicts it to take
+    // at most this many milliseconds. Steps run in multiples of 128 tokens and never below 512.
+    // A smaller step is slower per token (the cuBLAS prefill route's dequantise pass is
+    // weight-sized), so this trades the prompt's own speed for the other streams' latency.
+    // 0 (the default) always runs the planned --prefill-chunk. At most 60,000.
+    std::uint32_t stall_budget_ms = 0;
+};
+
 struct ContextCostOptions {
     // Empty selects generic defaults plus any matching values compiled into the binary. A
     // nonempty runtime preset independently overrides its matching machine transfer and
@@ -438,6 +452,7 @@ struct EngineOptions {
     bool use_cuda_graph                    = true;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
+    PrefillScheduleOptions prefill_schedule;
     // Prompt grafts a request may select by name through PromptOptions::graft. Each is loaded and
     // validated against the resident model at construction.
     std::vector<GraftSource> grafts;
@@ -1436,6 +1451,10 @@ struct RuntimeStats {
     // Requests cancelled while their prompt was prefilling and the prompt tokens they had computed.
     std::uint64_t cancelled_prefills                = 0;
     std::uint64_t cancelled_prefill_computed_tokens = 0;
+    // Prefill steps cut short by PrefillScheduleOptions::stall_budget_ms, and the prompt tokens
+    // those steps left for later steps.
+    std::uint64_t paced_prefill_steps               = 0;
+    std::uint64_t paced_prefill_deferred_tokens     = 0;
 
     std::uint64_t root_selections               = 0;
     std::uint64_t checkpoint_selections         = 0;

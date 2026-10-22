@@ -813,6 +813,7 @@ server restarts.
 | `ninfer_{preemptions,snapshot_restores,replay_restores}_total` | resource-pressure pauses and recovery routes |
 | `ninfer_waiting_cancelled_requests_total`, `ninfer_waiting_expired_requests_total`, `ninfer_waiting_abandoned_seconds_total` | requests the client cancelled, or the pending timeout expired, before admission, and the total time they had waited (a client that gives up after 60 s shows up here) |
 | `ninfer_cancelled_prefills_total`, `ninfer_cancelled_prefill_computed_tokens_total` | requests cancelled while prefilling, and the prompt tokens they had computed |
+| `ninfer_paced_prefill_steps_total`, `ninfer_paced_prefill_deferred_tokens_total` | prefill steps cut short by `--prefill-stall-budget-ms` because another lane was decoding, and the prompt tokens they pushed to later steps |
 | `ninfer_engine_recoveries_total` | host-side worker failures the server survived by failing the in-flight requests and clearing the context cache |
 | `ninfer_device_kv_{used,capacity}_pages`, `ninfer_device_backend_kv_used_pages`, `ninfer_device_state_{used,capacity}_slots` | physical Main KV, speculative backend KV and StateImage occupancy; retained history also occupies these pools |
 | `ninfer_host_context_{used,reserved,capacity,peak}_bytes`, `ninfer_host_state_images`, `ninfer_host_kv_used_bytes` | unified Host backing; reserved bytes, StateImages and KV bytes are breakdowns already included in used bytes |
@@ -1950,6 +1951,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--suspend-snapshot pageable\|pinned` | where the retained state waits in host memory while suspended | `pageable` |
 | `--suspend-weights artifact\|host` | where a resume takes the weights from: the artifact again, or a host copy taken at suspend (weight-sized host memory, faster wake) | `artifact` |
 | `--no-auto-resume` | a request while suspended fails (503) instead of resuming the model | requests resume it |
+| `--prefill-stall-budget-ms N` | while another lane decodes, cut each prefill step so it is predicted to take at most N ms; see [execution behavior](#execution-behavior) | off |
 | `--sleep-idle-seconds N` | suspend the model after N seconds with no request; needs `--model-suspend` (with a router, sleeps idle models that were started with it) | off |
 | `--models-dir DIR` | [router mode](#several-models-router): serve every `.ninfer` in DIR; give no artifact path | off |
 | `--models-preset FILE` | router mode: INI presets, `[id]` sections with `model = PATH` and options without dashes; `[*]` applies to all | off |
@@ -2202,6 +2204,21 @@ measured 1,043 ms at chunk 1024, 515 ms at 512, and 312 ms at 256, against an 82
 interval; the ingesting request's own prefill rate fell only from 1,135 to 1,130 to 1,110 tok/s.
 Prefill units of different requests are never batched together, so a smaller chunk trades almost no
 ingestion throughput for a proportionally smaller stall. The shipped concurrent launcher uses 512.
+
+`--prefill-stall-budget-ms N` makes that choice per step instead of per server. While another lane is
+decoding, the Engine cuts a prefill step so the context-cost model predicts it to take at most N ms,
+in multiples of 128 tokens and never below 512; with nobody decoding a step keeps the full
+`--prefill-chunk`, so a lone long prompt prefills at full speed. The prediction is the machine's
+fitted per-step, per-token and per-attention-pair costs, scaled by how long recent steps actually
+took against what the model said, so it follows a card that runs slower than the preset. A step deep
+into a long prompt costs more attention than an early one and is cut harder for the same budget.
+A smaller step is slower per token: at `--prefill-cublas` the weight dequantise pass is paid once per
+step: measured end to end on the 27B, the route runs 1.22x the integer route's speed at chunk 512 and
+1.59x at 4096 (`src/ops/linear_swiglu/q4cublas/w4_cublas_prefill.h`). Pick a chunk near the largest you
+want and let the budget shorten it only when somebody is waiting. `ninfer_paced_prefill_steps_total`
+and `ninfer_paced_prefill_deferred_tokens_total` count the steps it cut and the tokens it pushed to
+later steps. Off by default; it does nothing at `--max-concurrency 1`, where no other lane decodes.
+Qwen3.8-Flash-Next sizes its own prefill calls and refuses the flag.
 
 Input memory is bounded by the outstanding-request count and the per-request
 `--max-request-mib` limit. Media preparation uses a shared permit pool sized from `--media-live-mib`

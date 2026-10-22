@@ -318,6 +318,7 @@ struct PrefillProgress {
     runtime::BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
+    bool cap_applied                      = false; // see runtime::PrefillStepResult
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     bool capture_ready = false;
@@ -547,9 +548,14 @@ public:
     // Waits for an open window's encode and returns its pages; the embeddings stay with the
     // sequence. Called before any shortage is answered by eviction or preemption.
     bool drain_vision_window();
+    // Runs one prefill step. `max_tokens` (0: none) caps the step below the planned chunk, in the
+    // caller's choice of multiple of 128; a step that has to cover a media item ignores it.
+    // The unit's reservation was made for the whole chunk, so a shorter step simply leaves part of
+    // it unused, as a step cut at a capture frontier does.
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   runtime::ExecutionTiming* failed_timing = nullptr,
-                                                  runtime::TokenMaskProvider* masks = nullptr);
+                                                  runtime::TokenMaskProvider* masks = nullptr,
+                                                  std::uint32_t max_tokens = 0);
     [[nodiscard]] ReplayProgress advance_replay(SequenceHandle sequence,
                                                 runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,

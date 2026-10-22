@@ -46,6 +46,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_openai_responses_test
   ninfer_openai_schema_test
   ninfer_perplexity_evaluation_test
+  ninfer_prefill_pacing_test
   ninfer_prefill_depth_sweep_test
   ninfer_prefill_time_model_test
   ninfer_pretty_logging_test
