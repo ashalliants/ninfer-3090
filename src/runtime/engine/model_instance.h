@@ -16,6 +16,7 @@ namespace ninfer::runtime {
 
 struct ModelInstance {
     using ModelContract = models::qwen3_5::RuntimeTypes;
+    using Device        = DeviceContext;
 
     std::unique_ptr<models::qwen3_5::Model> model;
     const models::qwen3_5::execution::Parameters parameters;

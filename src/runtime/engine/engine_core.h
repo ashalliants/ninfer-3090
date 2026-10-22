@@ -52,6 +52,9 @@ class EngineCore {
 
 public:
     using ModelContract      = typename Instance::ModelContract;
+    // The device the worker thread binds and synchronizes. Instances name it so a test can supply
+    // one that needs no GPU; production instances use DeviceContext.
+    using Device             = typename Instance::Device;
     using ExecutionUnit      = typename ModelContract::ExecutionUnit;
     using UnitKind           = typename ModelContract::ExecutionUnitKind;
     using Checkpoint         = typename ModelContract::CheckpointHandle;
@@ -69,7 +72,7 @@ public:
     // Model suspend is implemented by the instance that owns suspendable device memory (the
     // Qwen3.5 ModelInstance). For any other, enabling it is refused at construction.
     static constexpr bool kInstanceSuspendable =
-        requires(Instance& instance, DeviceContext& device, DeviceSnapshot& snapshot) {
+        requires(Instance& instance, Device& device, DeviceSnapshot& snapshot) {
             instance.suspend(device, snapshot, &snapshot);
         };
 
@@ -91,7 +94,7 @@ public:
         }
     };
 
-    EngineCore(Instance& instance, DeviceContext& device, const EngineOptions& options,
+    EngineCore(Instance& instance, Device& device, const EngineOptions& options,
                ContextMachineCostModel context_cost)
         : instance_(instance), device_(device), max_context_(options.max_context),
           max_concurrency_(options.max_concurrency),
@@ -158,7 +161,12 @@ public:
         }
     }
 
-    ~EngineCore() noexcept {
+    ~EngineCore() noexcept { stop_worker(); }
+
+    // Stops the worker, failing whatever is still waiting, and leaves the Engine alive so that a
+    // thread woken by that can finish its callbacks (Submission::wait ends in release_consumer)
+    // before the Engine is destroyed. Idempotent; the destructor calls it.
+    void stop_worker() noexcept {
         {
             std::lock_guard lock(queue_mutex_);
             stopping_ = true;
@@ -4091,7 +4099,7 @@ private:
     }
 
     Instance& instance_;
-    DeviceContext& device_;
+    Device& device_;
     const std::uint32_t max_context_;
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
