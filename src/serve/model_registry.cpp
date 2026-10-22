@@ -346,6 +346,11 @@ void ModelRegistry::make_loaded_locked(std::unique_lock<std::mutex>& lock, std::
                                   "' failed to load (see the server log or GET /models)");
         }
         if (created) { done.service = std::move(created); }
+        if (done.service) {
+            if (const auto effective = done.service->effective_max_context(); effective != 0) {
+                done.effective_context = effective;
+            }
+        }
         done.state  = ModelState::Loaded;
         done.failed = false;
         done.last_error.clear();
@@ -475,7 +480,8 @@ ModelStatusSnapshot ModelRegistry::snapshot_locked(const Slot& slot) const {
                                .aliases    = slot.definition.aliases,
                                .state      = slot.state,
                                .arguments  = slot.definition.arguments,
-                               .max_context = slot.definition.options.max_context,
+                               .max_context = slot.effective_context != 0 ? slot.effective_context
+                                                         : slot.definition.options.max_context,
                                .vision      = slot.definition.options.enable_vision,
                                .failed     = slot.failed,
                                .last_error = slot.last_error,

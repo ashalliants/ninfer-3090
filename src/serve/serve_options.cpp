@@ -140,6 +140,10 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
+           " (--models-dir DIR | --models-preset FILE) [--models-max N] [--no-models-autoload] "
+           "[options passed to every model]    (router mode: several models, no artifact path)\n"
+           "   or: " +
+           argv0 +
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--fit-context MIN] "
            "[--max-concurrency N] "

@@ -89,6 +89,9 @@ public:
 
     // The model's Engine failed Engine-wide and never recovers: only a reload serves it again.
     [[nodiscard]] virtual bool failed() const { return false; }
+
+    // The context limit the Engine started with, after context fitting; zero when not known.
+    [[nodiscard]] virtual std::uint32_t effective_max_context() const { return 0; }
 };
 
 using ModelServiceFactory =
@@ -112,6 +115,10 @@ public:
     void resume() override { (void)service_->resume(); }
 
     [[nodiscard]] bool failed() const override { return service_->has_failed(); }
+
+    [[nodiscard]] std::uint32_t effective_max_context() const override {
+        return service_->options().max_context;
+    }
 
 private:
     std::unique_ptr<GenerationService> service_;
@@ -234,6 +241,8 @@ private:
         bool failed = false;
         std::string last_error;
         bool held = false;
+        // The context limit of the last load, kept after unload; zero until one succeeds.
+        std::uint32_t effective_context = 0;
     };
 
     [[nodiscard]] ModelStatusSnapshot snapshot_locked(const Slot& slot) const;

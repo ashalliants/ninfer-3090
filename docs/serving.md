@@ -650,7 +650,9 @@ path, `alias` a comma-separated list, `load-on-startup` a boolean, every other k
 without its leading dashes). A section named after a model found in `--models-dir` needs no path.
 The command line wins over a preset where they repeat an option. Comments sit on lines of their own
 (`;` or `#` first). The router's own options (`models-max`, `models-autoload`, `sleep-idle-seconds`,
-`unload-idle-seconds`) are command-line only: a preset that sets one is rejected at startup. With
+`unload-idle-seconds`) are command-line only, as are the options the router overrides for every
+model (`api-key`, `host`, `port`, `model-id`): a preset that sets one is rejected at startup. A model
+id may not contain `/`, `?`, `#`, `%` or `\`. With
 `--context-store DIR` each model keeps its store in `DIR/<model id>` (and under `<prefix><model id>/`
 in S3; characters other than letters, digits, `-` and `_` are written as `%XX`). `--request-log-jsonl`
 may not name any model's artifact, n-gram volume or expert state, whether it comes from the command

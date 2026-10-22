@@ -66,6 +66,13 @@ void check_key(const std::string& section, const std::string& key) {
         throw std::invalid_argument("preset [" + section + "]: option '" + key +
                                     "' must be written without leading dashes");
     }
+    // The router decides these for every model (main.cpp overwrites them), so a preset value
+    // would be dropped silently -- an api-key most of all, leaving the router open.
+    if (key == "api-key" || key == "host" || key == "port" || key == "model-id") {
+        throw std::invalid_argument("preset [" + section + "]: '" + key +
+                                    "' is owned by the router; give it on the command line"
+                                    " (a model's id is its section name)");
+    }
     if (router_key(key)) {
         throw std::invalid_argument("preset [" + section + "]: '" + key +
                                     "' is a router option; give it on the command line");
@@ -245,6 +252,14 @@ std::vector<CatalogModel> build_catalog(const std::optional<std::filesystem::pat
     if (models.empty()) {
         throw std::invalid_argument(
             "router mode found no models in --models-dir or --models-preset");
+    }
+    // An id travels in URL paths (the model's residency endpoint, /v1/models/{id}), so the
+    // characters that would end or split a path segment are refused rather than escaped.
+    for (const CatalogModel& model : models) {
+        if (model.id.find_first_of("/?#%\\") != std::string::npos) {
+            throw std::invalid_argument("model id '" + model.id +
+                                        "' must not contain any of / ? # % \\");
+        }
     }
     return models;
 }
