@@ -88,10 +88,17 @@ function Test-CudaToolkit {
 # device") and install nothing. The toolkit components are plain directories in the archive, so
 # copying them is the same result without the installer. 7zr.exe is a 600 KB standalone download.
 function Expand-CudaToolkit([string]$Installer, [string]$Destination) {
+    # Pinned release and digest: this runs elevated, so a cached or downloaded copy is checked every time.
+    $sevenZipSha256 = '9bf582b894dfa665f852d7e9112b02290a1c303c2d95a21fcdc41ffcb03143b7'
     $sevenZip = Join-Path $WorkDir '7zr.exe'
-    if (-not (Test-Path -LiteralPath $sevenZip)) {
-        & curl.exe -L --fail --retry 5 -o $sevenZip 'https://www.7-zip.org/a/7zr.exe'
+    if (-not (Test-Path -LiteralPath $sevenZip) -or (Get-FileHash -LiteralPath $sevenZip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $sevenZipSha256) {
+        & curl.exe -L --fail --retry 5 -o $sevenZip 'https://github.com/ip7z/7zip/releases/download/26.05/7zr.exe'
         if ($LASTEXITCODE -ne 0) { throw "7zr download failed ($LASTEXITCODE)" }
+    }
+    $actual = (Get-FileHash -LiteralPath $sevenZip -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actual -ne $sevenZipSha256) {
+        Remove-Item -LiteralPath $sevenZip -Force
+        throw "7zr.exe checksum mismatch (expected $sevenZipSha256, got $actual)"
     }
     $stage = Join-Path $WorkDir 'cuda-extract'
     if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
