@@ -13,9 +13,21 @@ set -euo pipefail
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd -- "${1:-$HOME/ash/ninfer-3090}" && pwd)"
 
+# The archive is `git archive HEAD` on the instance: uncommitted edits to VERSION or the notes would be
+# synced but not archived, and the packager would then build a different release than the one named.
+if [[ -n "$(git -C "$repo" status --porcelain)" ]]; then
+  echo "Refusing to release from a dirty tree: commit (or stash) first. Ignored files are fine." >&2
+  exit 1
+fi
+commit="$(git -C "$repo" rev-parse HEAD)"
+
 echo "==> Syncing the release commit to the instance"
 "$root/vast-dev-sync.sh" "$repo"
-commit="$(git -C "$repo" rev-parse HEAD)"
+remote_head="$("$root/vast-dev-ssh.sh" 'git -C /root/ninfer-3090 rev-parse HEAD' | tr -d '\r\n')"
+if [[ "$remote_head" != "$commit" ]]; then
+  echo "The instance is at ${remote_head:-<unknown>}, not the release commit $commit; not building." >&2
+  exit 1
+fi
 
 echo "==> Writing the release script on the instance"
 "$root/vast-dev-ssh.sh" 'cat > /root/release-linux.sh && chmod +x /root/release-linux.sh' <<'REMOTE_EOF'
