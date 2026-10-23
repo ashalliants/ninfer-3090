@@ -83,6 +83,34 @@ function Test-CudaToolkit {
     return @($missing)
 }
 
+# The NVIDIA installer is a 7z self-extractor. On a machine with no NVIDIA GPU its silent mode has
+# been seen to exit after about two seconds (right after "No driver installed for the display
+# device") and install nothing. The toolkit components are plain directories in the archive, so
+# copying them is the same result without the installer. 7zr.exe is a 600 KB standalone download.
+function Expand-CudaToolkit([string]$Installer, [string]$Destination) {
+    $sevenZip = Join-Path $WorkDir '7zr.exe'
+    if (-not (Test-Path -LiteralPath $sevenZip)) {
+        & curl.exe -L --fail --retry 5 -o $sevenZip 'https://www.7-zip.org/a/7zr.exe'
+        if ($LASTEXITCODE -ne 0) { throw "7zr download failed ($LASTEXITCODE)" }
+    }
+    $stage = Join-Path $WorkDir 'cuda-extract'
+    if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
+    # Package directory in the archive -> merged into the toolkit root. EULA.txt sits at the archive root.
+    $packages = @('cuda_nvcc\nvcc', 'cuda_cudart\cudart', 'libcublas\cublas', 'libcublas\cublas_dev', 'cuda_cccl\thrust',
+                  'cuda_nvrtc\nvrtc', 'cuda_nvrtc\nvrtc_dev', 'cuda_nvtx\nvtx', 'cuda_profiler_api\cuda_profiler_api',
+                  'cuda_nvml_dev\nvml_dev', 'cuda_cuobjdump\cuobjdump', 'cuda_nvdisasm\nvdisasm', 'cuda_cuxxfilt\cuxxfilt',
+                  'cuda_nvprune\nvprune')
+    $include = @('EULA.txt') + ($packages | ForEach-Object { "$_\*" })
+    & $sevenZip x -y "-o$stage" $Installer @include | Out-Null
+    if ($LASTEXITCODE -gt 1) { throw "7zr extraction failed ($LASTEXITCODE)" }   # 1 is a warning (the SFX stub)
+    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+    Copy-Item -LiteralPath (Join-Path $stage 'EULA.txt') -Destination $Destination -Force
+    foreach ($package in $packages) {
+        Copy-Item -Path (Join-Path $stage "$package\*") -Destination $Destination -Recurse -Force
+    }
+    Remove-Item -LiteralPath $stage -Recurse -Force
+}
+
 function Install-Cuda {
     $installer = Join-Path $WorkDir "cuda_${CudaVersion}_windows.exe"
     if (-not (Test-Path -LiteralPath $installer) -or (Get-Item -LiteralPath $installer).Length -ne $CudaInstallerBytes) {
@@ -101,6 +129,10 @@ function Install-Cuda {
     }
     # Installer exit codes are unreliable; the file check below is the real test.
     Write-Host "CUDA installer exited $($proc.ExitCode)"
+    if ((Test-CudaToolkit).Count -gt 0) {
+        Write-Host 'The installer left the toolkit incomplete; unpacking the components from the installer instead.'
+        Expand-CudaToolkit $installer $CudaRoot
+    }
 }
 
 try {
