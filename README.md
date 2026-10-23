@@ -3,6 +3,10 @@
 [![Release](https://img.shields.io/github/v/release/ashalliants/ninfer-3090?label=release&color=2a78d6)](https://github.com/ashalliants/ninfer-3090/releases/latest)
 [![License](https://img.shields.io/github/license/ashalliants/ninfer-3090?color=2a78d6)](LICENSE)
 [![Host checks](https://github.com/ashalliants/ninfer-3090/actions/workflows/host-checks.yml/badge.svg)](https://github.com/ashalliants/ninfer-3090/actions/workflows/host-checks.yml)
+[![Stars](https://img.shields.io/github/stars/ashalliants/ninfer-3090?style=flat&color=2a78d6)](https://github.com/ashalliants/ninfer-3090/stargazers)
+[![Downloads](https://img.shields.io/github/downloads/ashalliants/ninfer-3090/total?color=2a78d6)](https://github.com/ashalliants/ninfer-3090/releases)
+[![Decode, one RTX 3090](https://img.shields.io/badge/decode-140%20tok%2Fs%20(DFlash2)-2a78d6)](#performance-on-an-rtx-3090)
+[![Models on Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20models-WarlaxZ-2a78d6)](https://huggingface.co/WarlaxZ)
 
 [![Illustrative animation: NInfer-3090 decodes Qwen3.8-27B 2.1x faster than llama.cpp on the same RTX 3090. Click for the MP4.](docs/assets/ninfer-demo.gif)](docs/assets/ninfer-demo.mp4)
 
