@@ -9,6 +9,7 @@ its own repo. --check fails when a copy has drifted or has no source. --publish 
 write access to the WarlaxZ organisation in HF_TOKEN.
 """
 import argparse
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -18,6 +19,7 @@ CARDS = ROOT / "model-cards"
 SOURCE_ASSETS = ROOT / "docs" / "assets"
 HF_ORG = "WarlaxZ"
 OWN_CARD_SUFFIX = "-NInfer-3090"  # the other cards describe upstream's repos, not ours
+ASSET_REF = re.compile(r"""(?<![\w/.-])assets/([^\s)"'<>#?]+)""")  # assets/<file> in a README
 
 
 def own_cards():
@@ -27,6 +29,10 @@ def own_cards():
 def check():
     problems = []
     for card in own_cards():
+        readme = (card / "README.md").read_text(encoding="utf-8")
+        for name in sorted(set(ASSET_REF.findall(readme))):
+            if not (card / "assets" / name).is_file():
+                problems.append(f"{card.relative_to(ROOT)}/README.md: references assets/{name}, which is missing")
         for copy in sorted((card / "assets").glob("*")):
             source = SOURCE_ASSETS / copy.name
             if not source.is_file():
