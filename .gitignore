@@ -76,3 +76,6 @@ dist/*
 # committed: they are whole real prompts, so they carry third-party system-prompt text and are
 # large (100 KB+ each) for something only the person who captured them can act on.
 repro/
+
+# Dependencies installed to render the README animation (tools/docs/render_demo.mjs)
+tools/docs/node_modules/
