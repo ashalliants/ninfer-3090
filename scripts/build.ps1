@@ -22,13 +22,17 @@
 #   .\scripts\build.ps1 -Benchmarks      ... include bench\ (implied by -Package)
 #   .\scripts\build.ps1 -Clean           delete the build directory first
 #   .\scripts\build.ps1 -Target ninfer-serve
+#   .\scripts\build.ps1 -Target ninfer,ninfer-serve   several targets
+#
+# Set VCPKG_ROOT to a bootstrapped vcpkg checkout and the configure step uses it (the pinned
+# vcpkg.json manifest then supplies FFmpeg, curl and zstd). scripts\release-windows.ps1 does this.
 [CmdletBinding()]
 param(
     [switch]$Test,
     [switch]$Package,
     [switch]$Clean,
     [switch]$Benchmarks,
-    [string]$Target,
+    [string[]]$Target,
     [string]$BuildDir,
     [ValidateSet('80', '86', '89')][string]$Arch = '86'
 )
@@ -100,12 +104,20 @@ try {
     # Quote the -D arguments: PowerShell does not reliably expand a variable inside a bare token
     # that begins with "-D", and cmake then sees the literal "$Arch".
     $BenchmarksOption = if ($BuildBenchmarks) { 'ON' } else { 'OFF' }
-    cmake -S . -B $BuildDir -G Ninja '-DCMAKE_BUILD_TYPE=Release' "-DCMAKE_CUDA_ARCHITECTURES=$Arch" `
-          "-DNINFER_BUILD_BENCHMARKS=$BenchmarksOption"
+    $configureArgs = @('-S', '.', '-B', $BuildDir, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
+                       "-DCMAKE_CUDA_ARCHITECTURES=$Arch", "-DNINFER_BUILD_BENCHMARKS=$BenchmarksOption")
+    if ($env:VCPKG_ROOT) {
+        $configureArgs += @("-DCMAKE_TOOLCHAIN_FILE=$($env:VCPKG_ROOT)/scripts/buildsystems/vcpkg.cmake",
+                            '-DVCPKG_TARGET_TRIPLET=x64-windows')
+    }
+    cmake @configureArgs
     if ($LASTEXITCODE -ne 0) { throw "configure failed ($LASTEXITCODE)" }
 
     $buildArgs = @('--build', $BuildDir)
-    if ($Target) { $buildArgs += @('--target', $Target) }
+    # A release is exactly these three products; building `all` also compiles tools the archive
+    # does not ship.
+    if (-not $Target -and $Package) { $Target = @('ninfer', 'ninfer-serve', 'ninfer_bench') }
+    if ($Target) { $buildArgs += @('--target') + $Target }
     cmake @buildArgs
     if ($LASTEXITCODE -ne 0) { throw "build failed ($LASTEXITCODE)" }
 
