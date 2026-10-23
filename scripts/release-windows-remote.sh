@@ -33,7 +33,7 @@ if [[ -z "$remote_name" ]]; then
   exit 1
 fi
 git -C "$repo_root" fetch --quiet "$remote_name" 2>/dev/null || true
-if [[ -z "$(git -C "$repo_root" branch -r --contains "$commit" 2>/dev/null | grep -E "^\s*${remote_name}/")" ]]; then
+if [[ -z "$(git -C "$repo_root" branch -r --contains "$commit" 2>/dev/null | grep -E "^[[:space:]]*${remote_name}/")" ]]; then
   echo "Commit ${commit:0:12} is not on the $remote_name remote ($remote_url); the Windows box fetches from there. Push it first." >&2
   exit 1
 fi
@@ -58,14 +58,16 @@ ssh "${ssh_opts[@]}" "$host" powershell -NoProfile -NonInteractive -ExecutionPol
 
 echo "==> Pulling the archive back to $repo_root/dist"
 mkdir -p "$repo_root/dist"
-names="$(ssh "${ssh_opts[@]}" "$host" powershell -NoProfile -NonInteractive -Command \
-  "Get-ChildItem '$remote_dir/dist' -File | Where-Object { \$_.Name -like '*windows*' } | ForEach-Object Name" | tr -d '\r')"
-[[ -n "$names" ]] || { echo "No Windows archive found in $remote_dir/dist on $host." >&2; exit 1; }
-while IFS= read -r name; do
-  scp "${ssh_opts[@]}" "$host:$remote_dir/dist/$name" "$repo_root/dist/$name"
-done <<< "$names"
+# Only this release's pair: the box keeps earlier archives in dist/, and the pull must not mix versions.
+release_tag="$(git -C "$repo_root" show "$commit:VERSION" | tr -d '\r\n')"
+archive="ninfer-rtx3090-windows-x64-${release_tag}.zip"
+checksums="SHA256SUMS-v${release_tag%%-*}-windows.txt"
+for name in "$archive" "$checksums"; do
+  scp "${ssh_opts[@]}" "$host:$remote_dir/dist/$name" "$repo_root/dist/$name" \
+    || { echo "$name not found in $remote_dir/dist on $host." >&2; exit 1; }
+done
 
-( cd "$repo_root/dist" && for sums in SHA256SUMS-v*-windows.txt; do shasum -a 256 -c "$sums"; done )
+( cd "$repo_root/dist" && shasum -a 256 -c "$checksums" )
 ls -l "$repo_root/dist"
 echo "Release commit: $commit"
 echo "REMINDER: the Windows executables were NOT run (no NVIDIA driver on the build box). Say so in the release notes."

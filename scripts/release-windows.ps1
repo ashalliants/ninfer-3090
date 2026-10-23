@@ -151,8 +151,8 @@ function Install-Cuda {
 
 try {
     Write-Step "release commit $(git -C $RepoRoot rev-parse HEAD)"
-    if (git -C $RepoRoot status --porcelain --untracked-files=no) {
-        throw 'The checkout has uncommitted changes to tracked files. Release builds come from a clean commit.'
+    if (git -C $RepoRoot status --porcelain) {
+        throw 'The checkout has uncommitted or untracked files (ignored files such as dist are fine). Release builds come from a clean commit.'
     }
     $ReleaseTag = (Get-Content -LiteralPath (Join-Path $RepoRoot 'VERSION') -Raw).Trim()
     Write-Host "VERSION: $ReleaseTag"
