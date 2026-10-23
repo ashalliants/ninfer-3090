@@ -95,3 +95,6 @@ vast_api_key*
 vast-instance*.json
 .vast-*
 .vast_instance_id
+
+# Dependencies installed to render the README animation (tools/docs/render_demo.mjs)
+tools/docs/node_modules/

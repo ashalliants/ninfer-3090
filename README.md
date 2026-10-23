@@ -8,6 +8,14 @@
 [![Decode, one RTX 3090](https://img.shields.io/badge/decode-140%20tok%2Fs%20(DFlash2)-2a78d6)](#performance-on-an-rtx-3090)
 [![Models on Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20models-WarlaxZ-2a78d6)](https://huggingface.co/WarlaxZ)
 
+[![Illustrative animation: NInfer-3090 decodes Qwen3.8-27B 2.1x faster than llama.cpp on an RTX 3090, from published figures. Click for the MP4.](docs/assets/ninfer-demo.gif)](docs/assets/ninfer-demo.mp4)
+
+*Illustrative animation, drawn at published decode speeds. The llama.cpp figure is a third party's, from a
+different machine and prompt set, so read the ratio as indicative. The measurements and caveats are in the
+[Qwen3.8-27B model card](model-cards/Qwen3.8-27B-NInfer-3090/README.md).*
+
+**[Download](https://github.com/ashalliants/ninfer-3090/releases/latest)** · [Quick start](#quick-start) · [Models](#models) · [Benchmarks](#performance-on-an-rtx-3090) · [Documentation](docs/README.md) · [Hugging Face](https://huggingface.co/WarlaxZ)
+
 ![NInfer-3090 throughput on one RTX 3090](docs/assets/perf-banner.svg)
 
 NInfer-3090 is a specialized C++20/CUDA inference engine for **Qwen3.8-27B**, Qwen3.6 and, as a
@@ -27,57 +35,9 @@ concurrent cohorts through **C8**.
 | **Decode**, one stream | **140 tok/s** (DFlash2) | **295 tok/s** (MTP3 + draft head) |
 | **Decode**, all lanes | **477 tok/s** at C8 (MTP3) | **383 tok/s** at C6 (MTP3) |
 
-**Qwen3.8-Flash-Next (preview, Windows), same card.** A 512-expert MoE at 2 bits per weight, with all
-33 GiB of experts pinned in host RAM: **1.15-1.18x Strata's plain decode** (81 / 80 / 78 tok/s after
-a 1K / 8K / 32K prompt against 71 / 70 / 66), **109-113 tok/s with MTP** (the launcher default, same
-tokens as plain decoding; 102.6 after a 128K prompt, in a separate run with the context raised above this release's 32K default) and **2,345 tok/s prefill** at 4K, 1.23x Strata's,
-when the n-gram volume sits on NVMe. One request at a time by default (two lanes opt-in with `NINFER_CONCURRENCY=2`), 32K context in this release. Details
-[below](#qwen38-flash-next-preview).
-
-Re-measured on the v0.16.0 release binaries through `ninfer-serve` (2026-10-14, launcher flags, real
-text, medians of four requests): **112 / 113 / 104 tok/s decode with MTP** after a 1.3K / 8.8K /
-29K-token prompt against 84 / 82 / 83 without (1.34x to 1.38x at the shorter two, 1.26x at 29K), at
-1,281 to 2,328 tok/s prefill, and a repeated 29K prompt answers its first word in 0.14 s. Measure
-only after the model and `.ngram` volume have been read from disk once: a first run after clearing
-RAM read 93 tok/s decode and a third of the prefill speed. Prefix reuse also works across forked
-conversations on both Flash-Next and the 27B: after a 1+2 conversation was continued as 1+2+3 and
-forked as 1+2+4, each branch could be continued again and reused its whole shared prefix, so a
-14K-token branch step reached its first word in about 1.3-1.6 s against 5.7-6.5 s cold.
-[Details](docs/performance.md#v0160-release-binaries-all-three-models-2026-10-14).
-
-![Qwen3.8-Flash-Next on one RTX 3090: NInfer-3090 against Strata 0.1.38 on the same GGUF](docs/assets/flash-next-speed.svg)
-
-The 27B speed rows were re-measured on 2026-10-02 for the 3090 conversion `download-model` now
-fetches, in one sitting with upstream's artifact on the same binaries. Decode is
-`tools/bench/run_chat_decode.py` on syv-ai's eight thinking-off prompts (1,024 tokens, INT8 KV,
-greedy), where upstream's artifact gives 127 tok/s at C1 and 482 at C8; prefill is `ninfer_bench`
-pp4096 on the cuBLAS route the launcher enables, `rk4v4` KV (upstream 3,196, a tie; +0.156%
-perplexity for the route). The earlier 187 and 523 came from runs whose workload was not recorded
-and that this harness does not reproduce on either artifact. The 35B prefill was measured the same day with its launcher settings (cuBLAS route, chunk 4096, `rk4v4`; 5,470 tok/s on the previous default-route chunk 512); its decode rows were not re-measured.
-The 27B's 262,144 was measured with MTP3 and the draft head; the default DFlash2 profile reaches it
-on a headless card by extrapolation, and the server fits the context to the free memory where it
-does not. Sources and conditions are in
-[Performance on an RTX 3090](#performance-on-an-rtx-3090).
-
-### Faster than v0.15.1
-
-![Qwen3.8-27B on one RTX 3090: v0.15.1 against this release](docs/assets/perf-uplift.svg)
-
-Measured 2026-10-13 on one RTX 3090, with the launcher's settings, as interleaved runs in one
-sitting (so the pairs compare; the headline table above is an earlier session's absolute figures):
-
-- **Long prompts are read faster.** A 16K prompt prefills 6% faster, 32K 12% and 64K 19%
-  (1,823 to 2,172 tok/s). Prompts of 4K and below gain 1-2%.
-- **Agent turns that write a file back decode faster.** Text copied from the prompt decodes at
-  454 tok/s against 243 at 2K context (+87%) and 403 against 254 at 32K (+59%). That is the best
-  case; a replay of whole agent sessions (four sessions of Read, Edit and explain turns, up to
-  117K tokens) gained 42% decode at one lane, with turns that explain rather than copy unchanged
-  to 5% slower. Method and tables: [performance](docs/performance.md#n-gram-copy-drafting-rtx-3090-qwen38-27b).
-- **Unchanged:** decode of text that is not a copy (-0.2% to -0.4%, same cost per round), and
-  memory, apart from 18 MiB more reserved for copying.
-
-Full table, method and what was not measured:
-[performance/qwen3.8-27b](docs/performance/qwen3.8-27b.md#v0151-against-master-on-rtx-3090-2026-10-13).
+**Qwen3.8-Flash-Next (preview, Windows)** runs on the same card too: a 512-expert MoE at 2 bits per
+weight with its experts pinned in host RAM, at **1.15-1.18x Strata's plain decode** and
+**109-113 tok/s with MTP**. [Details](#qwen38-flash-next-preview) · [every re-measurement](#latest-benchmarks)
 
 ![Qwen3.8-27B on one RTX 3090: llama.cpp against NInfer-3090 (llama.cpp figures from a third party's published run)](docs/assets/llamacpp-vs-ninfer-27b.svg)
 
@@ -98,30 +58,6 @@ requests are not guaranteed.
 > your desktop's GPU? Plans start with a day pass, and every verified account gets a few free
 > requests a day. Thank you to NeverMetered for supporting this project.
 
-**v0.14.2:** `--host-cache-max-mib` caps the RAM cache on shared machines. This release also
-added `--max-prefill-lanes` and `GET /slots`, which the current engine no longer provides
-(see [docs/serving.md](docs/serving.md)). See the [v0.14.2 release notes](RELEASE_NOTES_0.14.2.md).
-
-**v0.14.1:** a stability fix for `ninfer-serve`. A large or unplannable request no longer fails
-every running request (`internal error generation`) or clears the context cache; only that request
-fails, and a latched engine now exits so a supervisor can restart it. See the
-[v0.14.1 release notes](RELEASE_NOTES_0.14.1.md).
-
-**v0.14.0: `--auto-host-cache`.** One flag now sizes the RAM tier of the context cache from
-the machine, so a server that exists to serve long agent conversations keeps them cached after they
-leave the GPU instead of re-reading them from scratch. It replaces four hand-tuned flags and respects
-a container's memory limit. Also: vision together with a multi-GPU `--devices` split, a
-`download-model` step that fetches the `godmode` graft when you have access, a repetition guard in
-the tuned launcher profiles, and a compiler cache that cuts a full rebuild from over ten minutes to
-about one and a half. 5 merged PRs — see the [v0.14.0 release notes](RELEASE_NOTES_0.14.0.md) for what
-each does and what was not verified.
-
-Previous: [v0.13.0](RELEASE_NOTES_0.13.0.md) (a smaller, closer-to-Q8 Qwen3.8-27B, per-request
-`thinking_budget`), [v0.12.0](RELEASE_NOTES_0.12.0.md) (real multi-GPU, structured JSON output, a
-self-healing engine), [v0.11.0](RELEASE_NOTES_0.11.0.md) (prefill roughly 2x faster, DFlash2 the recommended
-decode backend), [v0.10.0](RELEASE_NOTES_0.10.0.md) (tensor-core small-T kernels: MTP3 decode 1.5x
-at C1 and 1.7x at C8), [v0.9.1](RELEASE_NOTES_0.9.1.md), [v0.9.0](RELEASE_NOTES_0.9.0.md).
-
 > **Model files are v3.** A v2 `.ninfer` from an earlier release is refused at load. Upgrade it
 > instead of re-downloading — see [Models](#models).
 
@@ -131,10 +67,11 @@ at C1 and 1.7x at C8), [v0.9.1](RELEASE_NOTES_0.9.1.md), [v0.9.0](RELEASE_NOTES_
 - [Building from source](#building-from-source)
 - [Features](#features) and [serving APIs](#serving-apis)
 - [Models](#models)
-- [Performance on an RTX 3090](#performance-on-an-rtx-3090)
+- [Performance on an RTX 3090](#performance-on-an-rtx-3090), starting with the [latest benchmarks](#latest-benchmarks)
 - [Choosing a KV format](#choosing-a-kv-format)
 - [Several GPUs](#several-gpus-pipeline-stages---devices-ab)
 - [Current limits](#current-limits)
+- [Release history](#release-history)
 - [Upstream, contributors and contributing](#upstream)
 
 ## Quick start
@@ -549,6 +486,59 @@ Headline numbers; the full measurements, methods, rejected experiments and earli
 [performance](docs/performance.md#rtx-3090-sm_86-findings--this-fork). Upstream's per-model pages
 under `docs/performance/` were measured on an RTX 5090 and are not a statement about this fork.
 
+### Latest benchmarks
+
+**Qwen3.8-Flash-Next (preview, Windows), same card.** A 512-expert MoE at 2 bits per weight, with all
+33 GiB of experts pinned in host RAM: **1.15-1.18x Strata's plain decode** (81 / 80 / 78 tok/s after
+a 1K / 8K / 32K prompt against 71 / 70 / 66), **109-113 tok/s with MTP** (the launcher default, same
+tokens as plain decoding; 102.6 after a 128K prompt, in a separate run with the context raised above this release's 32K default) and **2,345 tok/s prefill** at 4K, 1.23x Strata's,
+when the n-gram volume sits on NVMe. One request at a time by default (two lanes opt-in with `NINFER_CONCURRENCY=2`), 32K context in this release. Details
+[below](#qwen38-flash-next-preview).
+
+Re-measured on the v0.16.0 release binaries through `ninfer-serve` (2026-10-14, launcher flags, real
+text, medians of four requests): **112 / 113 / 104 tok/s decode with MTP** after a 1.3K / 8.8K /
+29K-token prompt against 84 / 82 / 83 without (1.34x to 1.38x at the shorter two, 1.26x at 29K), at
+1,281 to 2,328 tok/s prefill, and a repeated 29K prompt answers its first word in 0.14 s. Measure
+only after the model and `.ngram` volume have been read from disk once: a first run after clearing
+RAM read 93 tok/s decode and a third of the prefill speed. Prefix reuse also works across forked
+conversations on both Flash-Next and the 27B: after a 1+2 conversation was continued as 1+2+3 and
+forked as 1+2+4, each branch could be continued again and reused its whole shared prefix, so a
+14K-token branch step reached its first word in about 1.3-1.6 s against 5.7-6.5 s cold.
+[Details](docs/performance.md#v0160-release-binaries-all-three-models-2026-10-14).
+
+![Qwen3.8-Flash-Next on one RTX 3090: NInfer-3090 against Strata 0.1.38 on the same GGUF](docs/assets/flash-next-speed.svg)
+
+The 27B speed rows were re-measured on 2026-10-02 for the 3090 conversion `download-model` now
+fetches, in one sitting with upstream's artifact on the same binaries. Decode is
+`tools/bench/run_chat_decode.py` on syv-ai's eight thinking-off prompts (1,024 tokens, INT8 KV,
+greedy), where upstream's artifact gives 127 tok/s at C1 and 482 at C8; prefill is `ninfer_bench`
+pp4096 on the cuBLAS route the launcher enables, `rk4v4` KV (upstream 3,196, a tie; +0.156%
+perplexity for the route). The earlier 187 and 523 came from runs whose workload was not recorded
+and that this harness does not reproduce on either artifact. The 35B prefill was measured the same day with its launcher settings (cuBLAS route, chunk 4096, `rk4v4`; 5,470 tok/s on the previous default-route chunk 512); its decode rows were not re-measured.
+The 27B's 262,144 was measured with MTP3 and the draft head; the default DFlash2 profile reaches it
+on a headless card by extrapolation, and the server fits the context to the free memory where it
+does not. Sources and conditions are in the sections below.
+
+#### Faster than v0.15.1
+
+![Qwen3.8-27B on one RTX 3090: v0.15.1 against this release](docs/assets/perf-uplift.svg)
+
+Measured 2026-10-13 on one RTX 3090, with the launcher's settings, as interleaved runs in one
+sitting (so the pairs compare; the headline table above is an earlier session's absolute figures):
+
+- **Long prompts are read faster.** A 16K prompt prefills 6% faster, 32K 12% and 64K 19%
+  (1,823 to 2,172 tok/s). Prompts of 4K and below gain 1-2%.
+- **Agent turns that write a file back decode faster.** Text copied from the prompt decodes at
+  454 tok/s against 243 at 2K context (+87%) and 403 against 254 at 32K (+59%). That is the best
+  case; a replay of whole agent sessions (four sessions of Read, Edit and explain turns, up to
+  117K tokens) gained 42% decode at one lane, with turns that explain rather than copy unchanged
+  to 5% slower. Method and tables: [performance](docs/performance.md#n-gram-copy-drafting-rtx-3090-qwen38-27b).
+- **Unchanged:** decode of text that is not a copy (-0.2% to -0.4%, same cost per round), and
+  memory, apart from 18 MiB more reserved for copying.
+
+Full table, method and what was not measured:
+[performance/qwen3.8-27b](docs/performance/qwen3.8-27b.md#v0151-against-master-on-rtx-3090-2026-10-13).
+
 ### Qwen3.8-27B
 
 **Decode by speculative backend and concurrency.** Aggregate decode tok/s through the serving
@@ -806,6 +796,32 @@ and the design are in `docs/maintainer/pipeline-parallel-plan.md`.
 - `sm_80` (Ampere GA100, e.g. an unlocked NVIDIA CMP 170HX) is an added but **unmeasured**
   compatibility target: it shares sm_86's instruction set and runs Qwen3.8-27B correctly at roughly
   3090-like speed with no route tables tuned for it yet.
+
+## Release history
+
+**v0.14.2:** `--host-cache-max-mib` caps the RAM cache on shared machines. This release also
+added `--max-prefill-lanes` and `GET /slots`, which the current engine no longer provides
+(see [docs/serving.md](docs/serving.md)). See the [v0.14.2 release notes](RELEASE_NOTES_0.14.2.md).
+
+**v0.14.1:** a stability fix for `ninfer-serve`. A large or unplannable request no longer fails
+every running request (`internal error generation`) or clears the context cache; only that request
+fails, and a latched engine now exits so a supervisor can restart it. See the
+[v0.14.1 release notes](RELEASE_NOTES_0.14.1.md).
+
+**v0.14.0: `--auto-host-cache`.** One flag now sizes the RAM tier of the context cache from
+the machine, so a server that exists to serve long agent conversations keeps them cached after they
+leave the GPU instead of re-reading them from scratch. It replaces four hand-tuned flags and respects
+a container's memory limit. Also: vision together with a multi-GPU `--devices` split, a
+`download-model` step that fetches the `godmode` graft when you have access, a repetition guard in
+the tuned launcher profiles, and a compiler cache that cuts a full rebuild from over ten minutes to
+about one and a half. 5 merged PRs — see the [v0.14.0 release notes](RELEASE_NOTES_0.14.0.md) for what
+each does and what was not verified.
+
+Previous: [v0.13.0](RELEASE_NOTES_0.13.0.md) (a smaller, closer-to-Q8 Qwen3.8-27B, per-request
+`thinking_budget`), [v0.12.0](RELEASE_NOTES_0.12.0.md) (real multi-GPU, structured JSON output, a
+self-healing engine), [v0.11.0](RELEASE_NOTES_0.11.0.md) (prefill roughly 2x faster, DFlash2 the recommended
+decode backend), [v0.10.0](RELEASE_NOTES_0.10.0.md) (tensor-core small-T kernels: MTP3 decode 1.5x
+at C1 and 1.7x at C8), [v0.9.1](RELEASE_NOTES_0.9.1.md), [v0.9.0](RELEASE_NOTES_0.9.0.md).
 
 ## Upstream
 
