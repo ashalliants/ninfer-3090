@@ -25,9 +25,16 @@ if [[ -n "$(git -C "$repo_root" status --porcelain --untracked-files=no)" ]]; th
   echo "Refusing to release from a dirty tree: commit or stash first." >&2
   exit 1
 fi
-git -C "$repo_root" fetch --quiet fork 2>/dev/null || true
-if [[ -z "$(git -C "$repo_root" branch -r --contains "$commit" 2>/dev/null | grep -E '^\s*fork/')" ]]; then
-  echo "Commit ${commit:0:12} is not on the fork remote; the Windows box fetches from GitHub. Push it first." >&2
+# The Windows box fetches from $remote_url, so the commit must be on the remote that points at it (any
+# name: origin, fork, ...), not on a remote that merely has the same branch.
+remote_name="$(git -C "$repo_root" remote -v | awk -v u="${remote_url%.git}" '$3 == "(fetch)" { x = $2; sub(/\.git$/, "", x); if (x == u) { print $1; exit } }')"
+if [[ -z "$remote_name" ]]; then
+  echo "No git remote points at $remote_url; add one, or set NINFER_RELEASE_REPO_URL to a URL one of your remotes uses." >&2
+  exit 1
+fi
+git -C "$repo_root" fetch --quiet "$remote_name" 2>/dev/null || true
+if [[ -z "$(git -C "$repo_root" branch -r --contains "$commit" 2>/dev/null | grep -E "^\s*${remote_name}/")" ]]; then
+  echo "Commit ${commit:0:12} is not on the $remote_name remote ($remote_url); the Windows box fetches from there. Push it first." >&2
   exit 1
 fi
 

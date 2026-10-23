@@ -34,6 +34,9 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 $CudaVersion = '12.8.1'
 $CudaDriverVersion = '572.61'
 $CudaInstallerBytes = 3369253408
+# SHA-256 of the installer at the URL below, computed from the copy used for the v0.16.1 build. NVIDIA's page
+# lists no SHA-256, so this pins what was fetched over TLS; it is checked before the installer is run elevated.
+$CudaInstallerSha256 = '19392bbffd0ad4ee7cb295a181e87f682187f17653679c1c548c263b7e1cd9a6'
 $CudaInstallerUrl = "https://developer.download.nvidia.com/compute/cuda/$CudaVersion/local_installers/cuda_${CudaVersion}_${CudaDriverVersion}_windows.exe"
 $CudaRoot = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8'
 # Compiler and library components only. The display driver is the one thing left out on purpose.
@@ -127,6 +130,10 @@ function Install-Cuda {
         if ((Get-Item -LiteralPath $installer).Length -ne $CudaInstallerBytes) {
             throw "CUDA installer is the wrong size: expected $CudaInstallerBytes bytes. Delete $installer and re-run."
         }
+    }
+    $actualSha256 = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actualSha256 -ne $CudaInstallerSha256) {
+        throw "CUDA installer checksum mismatch (expected $CudaInstallerSha256, got $actualSha256). Delete $installer and re-run; do not run it."
     }
     Write-Step 'installing CUDA components (no driver)'
     $proc = Start-Process -FilePath $installer -ArgumentList (@('-s') + $CudaComponents) -PassThru
