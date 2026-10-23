@@ -109,7 +109,9 @@ and record them here.
 - **Windows archive: any x64 Windows machine, no NVIDIA GPU needed.** `scripts/release-windows.ps1`
   installs the toolchain (VS 2022 Build Tools, CMake, Ninja, CUDA 12.8.1 without the driver, vcpkg at the
   manifest baseline, ccache), builds the three products and runs the packager.
-  `scripts/release-windows-remote.sh <ssh-host>` drives it over SSH and pulls the zip back. The first
+  `scripts/release-windows-remote.sh <ssh-host>` drives it over SSH and pulls the zip back. The first run installs the toolchain and so needs an elevated
+  session (an SSH login as an Administrators user is one); later runs can set `NINFER_SKIP_BOOTSTRAP=1` to build and
+  package without elevation. The first
   run builds ffmpeg through vcpkg and compiles every kernel cold, so it is slow; later runs are
   incremental.
 - **What the Windows box cannot verify.** With no driver there is no `nvcuda.dll`, which every

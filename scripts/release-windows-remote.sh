@@ -53,8 +53,13 @@ git -C '$remote_dir' log --oneline -1
 EOF
 
 echo "==> Running release-windows.ps1 (this is the long step; log is on the box at C:\\ninfer-release\\release-windows.log)"
+# The first run installs the toolchain, which needs an elevated session: an SSH login as an Administrators
+# user is one (see the one-time setup in docs/maintainer/release-process.md). Once the toolchain is in
+# place, NINFER_SKIP_BOOTSTRAP=1 runs only the build and package phase, which needs no elevation.
+bootstrap_args=()
+[[ "${NINFER_SKIP_BOOTSTRAP:-}" == 1 ]] && bootstrap_args=(-SkipBootstrap)
 ssh "${ssh_opts[@]}" "$host" powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass \
-  -File "$remote_dir/scripts/release-windows.ps1"
+  -File "$remote_dir/scripts/release-windows.ps1" ${bootstrap_args[@]+"${bootstrap_args[@]}"}
 
 echo "==> Pulling the archive back to $repo_root/dist"
 mkdir -p "$repo_root/dist"
