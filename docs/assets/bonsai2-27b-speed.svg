@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 300" width="960" height="300" role="img"
+     aria-label="Ternary Bonsai 2 27B against this fork&#8217;s 6-bit Qwen3.8-27B on one RTX 3090: weights 6.70 against 14.6 GiB; plain decode 88 against 48 tok/s; DFlash2 decode 297 against 195 tok/s on a coding prompt">
+  <title>Ternary Bonsai 2 27B on one RTX 3090</title>
+  <style>
+    .nb-surface  { fill: #fcfcfb; }
+    .nb-border   { stroke: rgba(11,11,11,0.10); }
+    .nb-primary  { fill: #0b0b0b; }
+    .nb-secondary{ fill: #52514e; }
+    .nb-muted    { fill: #898781; }
+    .nb-hair     { stroke: #e1e0d9; }
+    .nb-baseline { stroke: #c3c2b7; }
+    .nb-old      { fill: #c3c2b7; }
+    .nb-new      { fill: #2a78d6; }
+    .nb-good     { fill: #1f8a4c; }
+    text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+    @media (prefers-color-scheme: dark) {
+      .nb-surface  { fill: #1a1a19; }
+      .nb-border   { stroke: rgba(255,255,255,0.10); }
+      .nb-primary  { fill: #ffffff; }
+      .nb-secondary{ fill: #c3c2b7; }
+      .nb-muted    { fill: #898781; }
+      .nb-hair     { stroke: #2c2c2a; }
+      .nb-baseline { stroke: #383835; }
+      .nb-old      { fill: #4a4a46; }
+      .nb-new      { fill: #3987e5; }
+      .nb-good     { fill: #4cc27f; }
+    }
+  </style>
+
+  <rect x="1" y="1" width="958" height="298" rx="16" class="nb-surface nb-border" stroke-width="1"/>
+
+  <text x="36" y="38" font-size="17" font-weight="650" class="nb-primary">Ternary Bonsai 2 27B: half the weights, nearly twice the speed</text>
+  <rect x="604" y="25" width="14" height="14" rx="3" class="nb-old"/>
+  <text x="624" y="36" font-size="12" class="nb-secondary">Qwen3.8-27B, 6-bit</text>
+  <rect x="764" y="25" width="14" height="14" rx="3" class="nb-new"/>
+  <text x="784" y="36" font-size="12" class="nb-secondary">Ternary Bonsai 2 27B</text>
+  <text x="36" y="58" font-size="12" class="nb-muted">Both run on NInfer-3090, one RTX 3090 (24 GB), greedy decoding, one stream.</text>
+  <line x1="36" y1="72" x2="924" y2="72" class="nb-hair" stroke-width="1"/>
+
+  <!-- Panel 1: weights (lower is better) -->
+  <g>
+    <text x="36" y="104" font-size="14" font-weight="600" class="nb-primary">Weights on the GPU</text>
+    <text x="36" y="120" font-size="11" class="nb-muted">GiB &#183; lower is better</text>
+    <line x1="36" y1="132" x2="36" y2="190" class="nb-baseline" stroke-width="1"/>
+    <rect x="36" y="138" width="220" height="22" rx="4" class="nb-old"/>
+    <text x="264" y="153" font-size="12" class="nb-secondary">14.6</text>
+    <rect x="36" y="166" width="101" height="22" rx="4" class="nb-new"/>
+    <text x="145" y="181" font-size="12" font-weight="600" class="nb-primary">6.70</text>
+    <text x="36" y="226" font-size="20" font-weight="700" class="nb-good">2.2&#215; smaller</text>
+    <text x="36" y="244" font-size="11" class="nb-muted">7.28 GiB with the MTP drafter</text>
+  </g>
+
+  <!-- Panel 2: plain decode -->
+  <g>
+    <text x="344" y="104" font-size="14" font-weight="600" class="nb-primary">Plain decode</text>
+    <text x="344" y="120" font-size="11" class="nb-muted">tok/s &#183; higher is better</text>
+    <line x1="344" y1="132" x2="344" y2="190" class="nb-baseline" stroke-width="1"/>
+    <rect x="344" y="138" width="121" height="22" rx="4" class="nb-old"/>
+    <text x="473" y="153" font-size="12" class="nb-secondary">48</text>
+    <rect x="344" y="166" width="220" height="22" rx="4" class="nb-new"/>
+    <text x="572" y="181" font-size="12" font-weight="600" class="nb-primary">88</text>
+    <text x="344" y="226" font-size="20" font-weight="700" class="nb-good">1.8&#215; faster</text>
+    <text x="344" y="244" font-size="11" class="nb-muted">decode is bound by weight bytes</text>
+  </g>
+
+  <!-- Panel 3: DFlash2 -->
+  <g>
+    <text x="652" y="104" font-size="14" font-weight="600" class="nb-primary">DFlash2, 7 drafts</text>
+    <text x="652" y="120" font-size="11" class="nb-muted">tok/s, coding prompt &#183; higher is better</text>
+    <line x1="652" y1="132" x2="652" y2="190" class="nb-baseline" stroke-width="1"/>
+    <rect x="652" y="138" width="145" height="22" rx="4" class="nb-old"/>
+    <text x="805" y="153" font-size="12" class="nb-secondary">195</text>
+    <rect x="652" y="166" width="220" height="22" rx="4" class="nb-new"/>
+    <text x="880" y="181" font-size="12" font-weight="600" class="nb-primary">297</text>
+    <text x="652" y="226" font-size="20" font-weight="700" class="nb-good">+52%</text>
+    <text x="652" y="244" font-size="11" class="nb-muted">249.9 tok/s mean over four varied prompts</text>
+  </g>
+
+  <text x="36" y="278" font-size="11" class="nb-muted">Source: model-cards/Ternary-Bonsai-2-27B-NInfer-3090 and docs/performance/bonsai2-27b-rtx3090.md. Few-prompt measurements: indicative.</text>
+  <text x="924" y="278" font-size="11" text-anchor="end" class="nb-secondary">ashalliants/ninfer-3090</text>
+</svg>

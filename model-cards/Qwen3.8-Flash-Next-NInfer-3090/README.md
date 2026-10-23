@@ -20,6 +20,10 @@ tags:
 
 # Qwen3.8-Flash-Next for NInfer on the RTX 3090
 
+> **Maintained at [ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090)**: the engine, converter and release builds these artifacts are made and tested with. Releases, issues and updates live there, and a star helps others find it.
+
+![Qwen3.8-Flash-Next on one RTX 3090: NInfer-3090 against Strata on the same GGUF](assets/flash-next-speed.svg)
+
 This model card is the version-controlled source for
 [WarlaxZ/Qwen3.8-Flash-Next-NInfer-3090](https://huggingface.co/WarlaxZ/Qwen3.8-Flash-Next-NInfer-3090).
 
@@ -276,3 +280,7 @@ DASLab GGUF repository and its IQ2_XS files declare `apache-2.0`; its mmproj dec
 `qwen-community-1.0`; Strata's `mtp-q2_0.gguf` carries no license metadata and holds tensors taken
 from Qwen's checkpoint. A quantization does not change the license of the weights it encodes, so
 this artifact follows the base model's license.
+
+---
+
+Built and maintained by [ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090). Development is sponsored by [NeverMetered](https://nevermetered.com/?ref=ninfer-3090-hf), hosted Qwen3.8-27B for coding agents.
