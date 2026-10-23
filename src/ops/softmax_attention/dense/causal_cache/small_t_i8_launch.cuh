@@ -33,16 +33,17 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     const bool packed_keys   = cache_k.dtype == DType::U8;
     auto launch = [&]<int WarpsPerCta, int MinBlocksPerSm, int KeyBlock, bool DynamicArena>() {
         const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
-        constexpr std::size_t kDynamicBytes =
-            DynamicArena ? static_cast<std::size_t>(4 * KeyBlock * kCausalHeadDim) : 0u;
         auto issue = [&]<bool PackedValues, bool PackedKeys>() {
+            constexpr std::size_t kDynamicBytes =
+                DynamicArena ? static_cast<std::size_t>(4 * KeyBlock * kCausalHeadDim) : 0u;
             if constexpr (DynamicArena) {
-                configure_cuda_device_once([&] {
+                configure_cuda_device_once([] {
                     return cudaFuncSetAttribute(
                         causal_attention_small_t_i8_tiled_kernel<
                             Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm, KeyBlock, DynamicArena,
                             MultiBatch, Masked, CacheInput, PackedValues, PackedKeys>,
-                        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        static_cast<int>(4 * KeyBlock * kCausalHeadDim));
                 });
             }
             causal_attention_small_t_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
