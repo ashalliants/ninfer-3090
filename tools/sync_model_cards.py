@@ -19,7 +19,7 @@ CARDS = ROOT / "model-cards"
 SOURCE_ASSETS = ROOT / "docs" / "assets"
 HF_ORG = "WarlaxZ"
 OWN_CARD_SUFFIX = "-NInfer-3090"  # the other cards describe upstream's repos, not ours
-ASSET_REF = re.compile(r"""(?<![\w/.-])assets/([^\s)"'<>#?]+)""")  # assets/<file> in a README
+ASSET_REF = re.compile(r"""(?<![\w/.-])(?:\./)?assets/([^\s)"'<>#?]+)""")  # assets/<file> or ./assets/<file> in a README
 
 
 def own_cards():
