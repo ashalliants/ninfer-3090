@@ -126,11 +126,19 @@ cudaGraphNode_t find_memcpy(cudaGraph_t graph, cudaMemcpyKind kind, const void* 
 
 bool depends_on(cudaGraph_t graph, cudaGraphNode_t from, cudaGraphNode_t to) {
     std::size_t edges = 0;
+#if CUDART_VERSION >= 13000
+    CUDA_CHECK(cudaGraphGetEdges(graph, nullptr, nullptr, nullptr, &edges));
+#else
     CUDA_CHECK(cudaGraphGetEdges(graph, nullptr, nullptr, &edges));
+#endif
     std::vector<cudaGraphNode_t> sources(edges);
     std::vector<cudaGraphNode_t> destinations(edges);
     if (edges != 0) {
+#if CUDART_VERSION >= 13000
+        CUDA_CHECK(cudaGraphGetEdges(graph, sources.data(), destinations.data(), nullptr, &edges));
+#else
         CUDA_CHECK(cudaGraphGetEdges(graph, sources.data(), destinations.data(), &edges));
+#endif
     }
     std::deque<cudaGraphNode_t> pending{from};
     std::vector<cudaGraphNode_t> seen{from};
