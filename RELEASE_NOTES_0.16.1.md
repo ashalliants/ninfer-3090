@@ -2,7 +2,7 @@
 
 **A long prompt no longer has to freeze the streams next to it: five new opt-in controls cut the stall from about 3 seconds to about 0.4 seconds or let a short request jump the queue, constrained JSON output stops coming back corrupted, and one server can now hold several models. Nothing changes unless you turn something on, with one exception: JSON output layout (below).**
 
-About 35 merged pull requests since v0.16.0 (#291 to #359). This release ships a **Linux x86-64 archive only**; there is no Windows build for it. Windows users stay on v0.16.0 (or build from source); nothing in this release removes a flag, a launcher variable or a metric.
+About 35 merged pull requests since v0.16.0 (#291 to #359). This release ships a Linux x86-64 archive and a Windows x64 archive. **The Windows archive was built on a machine with no NVIDIA GPU or driver and has never been run** (see "Windows archive: built, not run" below). Windows users who want a tested build can stay on v0.16.0. Nothing in this release removes a flag, a launcher variable or a metric.
 
 ## Behaviour that changed
 
@@ -65,7 +65,7 @@ Output is unchanged: greedy text of a 56K-token prompt beside a stream and a sho
 
 ## Not verified in this release
 
-- Windows: no Windows archive was built or run for this release.
+- Windows: the archive was built and its dependencies checked, but **none of its executables were started** and nothing was served on Windows for this release. See "Windows archive: built, not run".
 - The model suspend, router, Bonsai, peer store, compression and GPU metrics numbers above come from their pull requests, which measured them with the Windows build; they were not re-measured on Linux for this release. The long-prompt numbers (the table, yield, anchors, admission fit) were measured on Linux on a 3090 for this release or on the branches merged into it.
 - Pipeline stages and router mode on two physical GPUs, and model suspend with a cold page cache.
 - A before/after for #334 (fragmented Host arena) and for the context-store changes on Flash-Next.
@@ -76,12 +76,17 @@ Output is unchanged: greedy text of a 56K-token prompt beside a stream and a sho
 
 Checked on 2026-10-22 on a rented RTX 3090 (24 GB, Ubuntu 24.04, CUDA 12.8.1, GCC 13), against the release commit, before publishing:
 
-- **Build:** a clean `git archive` of the VERSION commit, `-DCMAKE_CUDA_ARCHITECTURES=86 -DBUILD_TESTING=OFF`, targets `ninfer`, `ninfer-serve`, `ninfer_bench`; `ninfer-serve --version` prints `0.16.1-rtx3090`.
+- **Windows:** built and dependency-checked only (see above); not run.
+- **Build (Linux):** a clean `git archive` of the VERSION commit, `-DCMAKE_CUDA_ARCHITECTURES=86 -DBUILD_TESTING=OFF`, targets `ninfer`, `ninfer-serve`, `ninfer_bench`; `ninfer-serve --version` prints `0.16.1-rtx3090`.
 - **Linux archive:** the outer and inner checksums match; a fresh unpack runs `./ninfer-serve --version`, `./ninfer-serve --help` and `./run.sh --help`; `scripts/check-linux-scripts.sh` passes; `ldd` reports no unresolved library for the three executables. The dependency list was not diffed against v0.16.0's, only checked against `docs/release-archive-linux.md`.
 - **Real-card smoke test:** the unpacked archive's own `./run.sh qwen38-27b` (Qwen3.8-27B) was ready in 15 s with context 262,144, `/health` reported `0.16.1-rtx3090`, and a chat completion answered ("Hello there, how are you?" after 60 reasoning tokens).
 - **Tests on a 3090 (27B artifact), on the pull-request branches that were then merged, plus the checks after the last merge noted below:** the CPU suite passed (76 tests; the known `ninfer_qwen4_exp_ngram_volume_test` timing check aside); `ninfer_qwen3_5_native_transactions_test`, which now includes a sliced prefill beside a decoding lane (it failed on a real KV bug in the first version of #352 and passes with the fix, see #352), the admission-fit check against real KV pools (#337), progress anchors and capped, sliced steps; `ninfer_qwen3_5_ngram_real_test`, `_context_store_ngram_real_test` and `_grammar_real_test`. After the final merges the transactions test and the engine scheduling test were re-run on the merged branch; the other real-model tests were not repeated on the release commit itself.
 - **Serving checks** with the options above and the numbers in this note: stream-gap and prompt-time measurements, the short-request yield, and identical greedy output with each option and with all of them.
 
+
+## Windows archive: built, not run
+
+`ninfer-rtx3090-windows-x64-0.16.1-rtx3090.zip` was compiled with CUDA 12.8.1 and Visual Studio 2022 on a Windows machine that has no NVIDIA GPU, so the programs could not be started there. It is the same source as the Linux archive (the `v0.16.1-rtx3090` code plus release tooling that does not touch the product). What was checked: the zip matches its SHA-256 (`472fd93d603425e2f5f39ae65723594fbef288fb4fbfa38ea1d65ec87dc5794e`), and every DLL the programs import is either shipped in the zip, a Windows system DLL or an NVIDIA driver DLL. The build should work, but starting the programs, `run.bat` and a real chat completion on an RTX 3090 have **not** been tested. If it fails to start for you, please report it, and v0.16.0 remains the last Windows archive that was run on a card. The `RELEASE_NOTES_0.16.1.md` file inside the zip predates this section.
 
 ## Install and upgrade
 
