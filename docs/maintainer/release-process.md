@@ -97,8 +97,8 @@ Start the launcher with nothing overridden and confirm it serves a request.
 ## Building the release without the RTX 3090 PC
 
 Compiling needs the CUDA toolkit, not a card, so a release can be cut with the 3090 PC off. Written
-for being away from it (a handoff for a fresh agent is in `release-away-from-3090.md`); **none of this has been run end to end yet**, so expect to fix a snag or two
-the first time and record them here.
+for being away from it (a handoff for a fresh agent is in `release-away-from-3090.md`); the Windows half was run end to end for v0.16.1 (below); the Vast half has not been run yet, so expect a snag or two there
+and record them here.
 
 - **Linux archive: a rented Vast 3090.** `scripts/vast/vast-release-linux.sh <repo>` (copy it into the `vast-ninfer` scripts
   directory, beside `vast-dev-launch.sh`) syncs the committed release commit to the dev instance,
@@ -121,6 +121,39 @@ the first time and record them here.
   dependency-checked but not run, and the first chance to run it should be taken.
 - **Using CUDA 12.8.1 on both platforms** keeps one cuBLAS to reason about. Do not move the Windows build
   to a newer toolkit for speed without measuring it on the card.
+
+### Windows without a card: what the v0.16.1 run needed
+
+The v0.16.1 Windows zip (1.5 GB, built in about 35 minutes cold, including ffmpeg through vcpkg) came from
+`scripts/release-windows.ps1 -SkipBootstrap` on the GPU-less GMKtec box, driven from a WSL session on that
+same machine (WSL can run `powershell.exe`, so no SSH was needed). To do it again:
+
+1. **Checkout.** `release-windows.ps1` wants a clean checkout of the commit to build. Clone to
+   `C:\ninfer-release\src` and check out the release tag. Until the tooling is on `master`, merge it on top
+   locally and confirm the product directories did not change:
+   `git diff --stat <tag> HEAD -- src include apps CMakeLists.txt` must print nothing.
+2. **Toolchain, once, elevated.** Needs admin and nothing else does. Install VS 2022 Build Tools (C++ workload and
+   the Windows 11 SDK), CMake and Ninja with `winget`, and put CUDA 12.8 in
+   `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8`. Run the rest as a normal user.
+3. **CUDA without a card.** The NVIDIA installer's silent mode exits after about two seconds with exit code
+   -522190823 and installs nothing when there is no NVIDIA GPU (its log stops after "No driver installed for
+   the display device"). `Expand-CudaToolkit` in `release-windows.ps1` is the fallback: the installer is a
+   7z archive, so it unpacks the compiler and library packages with the standalone `7zr.exe` and copies them
+   into the toolkit root (nvcc, cudart, cuBLAS, CCCL, NVRTC, NVTX, NVML headers, profiler API). It runs
+   automatically after a failed install. It needs admin because it writes under Program Files; if you
+   unpack by hand instead, stage the tree elsewhere and `robocopy /E` it in from an elevated shell. This
+   toolkit has no Visual Studio CUDA integration, which the Ninja build does not use.
+4. **Build.** From a shell that has the new machine `PATH` (a shell opened before the installs does not see
+   CMake or Ninja; read `Machine` and `User` from `[Environment]::GetEnvironmentVariable('Path', ...)`):
+   `powershell -File scripts\release-windows.ps1 -SkipBootstrap`. It checks `STATUS.txt` for `DONE`, runs
+   the packager's import-table check and prints the zip hash.
+5. **Publish.** Upload the zip and its `SHA256SUMS-vX.Y.Z-windows.txt` to the release with
+   `gh release upload ... -R ashalliants/ninfer-3090`, and say in the notes that it was built and
+   dependency-checked, not run.
+
+Snags: the `7zr` fallback was tested by itself against the real installer, but the installer-fails-then-fallback path
+inside `Install-Cuda` was exercised by hand (the unpack and copy), not by a fresh machine run. The bootstrap script's last
+log line can fail with "file in use" because the transcript still holds the log; it is harmless.
 
 One-time OpenSSH setup on the Windows box (elevated PowerShell), so `release-windows-remote.sh` can drive it:
 
