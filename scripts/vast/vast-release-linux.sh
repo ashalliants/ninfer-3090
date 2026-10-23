@@ -90,20 +90,25 @@ fi
 
 echo "==> [$(date -Is)] smoke test: default profile, one chat completion on the real card"
 [[ -f /root/.model-ready ]] || { echo "model not ready (/root/.model-ready missing)"; exit 1; }
-(cd "$dir" && NINFER_MODEL_DIR=/root/models nohup ./run.sh qwen38-27b > /root/smoke-serve.log 2>&1 & echo $! > /root/smoke-serve.pid)
+# A port of this run's own: with the default 8080, any other server already listening there would answer
+# the readiness probe and the chat request, and the smoke test would pass without touching the archive.
+port=$(( 20000 + RANDOM % 20000 ))
+while ss -ltn "sport = :$port" | grep -q LISTEN; do port=$(( 20000 + RANDOM % 20000 )); done
+echo "smoke test port: $port"
+(cd "$dir" && NINFER_PORT="$port" NINFER_MODEL_DIR=/root/models nohup ./run.sh qwen38-27b > /root/smoke-serve.log 2>&1 & echo $! > /root/smoke-serve.pid)
 pid="$(cat /root/smoke-serve.pid)"
 stop_server() { pkill -P "$pid" 2>/dev/null || true; kill "$pid" 2>/dev/null || true; }
 trap 'rc=$?; stop_server; if (( rc != 0 )); then echo FAILED >> "$status"; fi' EXIT
 ready=0
 for _ in $(seq 1 120); do
-  if curl -fs http://127.0.0.1:8080/v1/models > /root/smoke-models.json 2>/dev/null; then ready=1; break; fi
+  if curl -fs http://127.0.0.1:$port/v1/models > /root/smoke-models.json 2>/dev/null; then ready=1; break; fi
   kill -0 "$pid" 2>/dev/null || { echo "server exited early:"; tail -40 /root/smoke-serve.log; exit 1; }
   sleep 5
 done
 (( ready )) || { echo "server not ready after 10 minutes:"; tail -40 /root/smoke-serve.log; exit 1; }
 model_id="$(jq -r '.data[0].id' /root/smoke-models.json)"
 echo "served model id: $model_id"
-reply="$(curl -fs http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
+reply="$(curl -fs http://127.0.0.1:$port/v1/chat/completions -H 'Content-Type: application/json' \
   -d "{\"model\":\"$model_id\",\"max_tokens\":200,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello in five words.\"}]}")"
 echo "$reply" | jq '{finish: .choices[0].finish_reason, content: .choices[0].message.content, reasoning: (.choices[0].message.reasoning_content // "" | .[0:200])}'
 echo "$reply" | jq -e '(.choices[0].message.content // "") + (.choices[0].message.reasoning_content // "") | length > 0' >/dev/null \
@@ -134,11 +139,13 @@ done
 
 echo "==> Pulling the archive back to $repo/dist"
 mkdir -p "$repo/dist"
-for name in $("$root/vast-dev-ssh.sh" 'cd /root/ninfer-rel/dist && ls *linux*.tar.gz SHA256SUMS-*linux.txt'); do
+names="$("$root/vast-dev-ssh.sh" 'cd /root/ninfer-rel/dist && ls *linux*.tar.gz SHA256SUMS-*linux.txt' | tr -d '\r')"
+for name in $names; do
   "$root/vast-dev-ssh.sh" "cat /root/ninfer-rel/dist/$name" > "$repo/dist/$name"
 done
 "$root/vast-dev-ssh.sh" 'cat /root/release-ldd.txt' > "$repo/dist/release-ldd-linux.txt"
-( cd "$repo/dist" && for sums in SHA256SUMS-v*-linux.txt; do shasum -a 256 -c "$sums"; done )
+# Only the pair just pulled: dist/ may hold older releases' files, whose archives are not there.
+( cd "$repo/dist" && for sums in $(printf '%s\n' $names | grep '^SHA256SUMS-'); do shasum -a 256 -c "$sums"; done )
 ls -l "$repo/dist"
 echo "Release commit: $commit"
 echo "Linux archive built, checked and smoke-tested on the real card. Destroy the instance with ./vast-destroy.sh when you are done."
