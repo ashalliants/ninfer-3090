@@ -94,3 +94,4 @@ administrators_authorized_keys
 vast_api_key*
 vast-instance*.json
 .vast-*
+.vast_instance_id
