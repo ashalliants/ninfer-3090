@@ -18,6 +18,10 @@ tags:
 
 # Ternary Bonsai 2 27B for NInfer on the RTX 3090
 
+> **Maintained at [ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090)**: the engine, converter and release builds these artifacts are made and tested with. Releases, issues and updates live there, and a star helps others find it.
+
+![Ternary Bonsai 2 27B on one RTX 3090: half the weights, nearly twice the speed](assets/bonsai2-27b-speed.svg)
+
 This model card is the version-controlled source for
 [WarlaxZ/Ternary-Bonsai-2-27B-NInfer-3090](https://huggingface.co/WarlaxZ/Ternary-Bonsai-2-27B-NInfer-3090).
 
@@ -151,3 +155,7 @@ and every source hash. The ternary import and the Hadamard-rotated runtime follo
 Apache License 2.0, matching [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B),
 [Ternary Bonsai 2 27B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf) (copyright Prism
 ML, Inc.) and the ProCreations MTP and DFlash2 heads.
+
+---
+
+Built and maintained by [ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090). Development is sponsored by [NeverMetered](https://nevermetered.com/?ref=ninfer-3090-hf), hosted Qwen3.8-27B for coding agents.

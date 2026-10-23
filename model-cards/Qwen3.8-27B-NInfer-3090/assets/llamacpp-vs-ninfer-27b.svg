@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 404" width="960" height="404" role="img"
+     aria-label="Qwen3.8-27B decode on one RTX 3090, llama.cpp against NInfer-3090: plain 41.55 against 49.2 tok/s; MTP 66.39 against 115.4 tok/s; DFlash2 63.13 against 133.5 tok/s">
+  <title>Qwen3.8-27B on one RTX 3090: llama.cpp against NInfer-3090</title>
+  <style>
+    .nb-surface  { fill: #fcfcfb; }
+    .nb-border   { stroke: rgba(11,11,11,0.10); }
+    .nb-primary  { fill: #0b0b0b; }
+    .nb-secondary{ fill: #52514e; }
+    .nb-muted    { fill: #898781; }
+    .nb-hair     { stroke: #e1e0d9; }
+    .nb-baseline { stroke: #c3c2b7; }
+    .nb-old      { fill: #c3c2b7; }
+    .nb-new      { fill: #2a78d6; }
+    .nb-good     { fill: #1f8a4c; }
+    text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+    @media (prefers-color-scheme: dark) {
+      .nb-surface  { fill: #1a1a19; }
+      .nb-border   { stroke: rgba(255,255,255,0.10); }
+      .nb-primary  { fill: #ffffff; }
+      .nb-secondary{ fill: #c3c2b7; }
+      .nb-muted    { fill: #898781; }
+      .nb-hair     { stroke: #2c2c2a; }
+      .nb-baseline { stroke: #383835; }
+      .nb-old      { fill: #4a4a46; }
+      .nb-new      { fill: #3987e5; }
+      .nb-good     { fill: #4cc27f; }
+    }
+  </style>
+
+  <rect x="1" y="1" width="958" height="402" rx="16" class="nb-surface nb-border" stroke-width="1"/>
+
+  <text x="36" y="38" font-size="17" font-weight="650" class="nb-primary">Qwen3.8-27B on one RTX 3090: up to 2.1&#215; llama.cpp&#8217;s decode speed</text>
+  <rect x="660" y="25" width="14" height="14" rx="3" class="nb-old"/>
+  <text x="680" y="36" font-size="12" class="nb-secondary">llama.cpp</text>
+  <rect x="768" y="25" width="14" height="14" rx="3" class="nb-new"/>
+  <text x="788" y="36" font-size="12" class="nb-secondary">NInfer-3090</text>
+  <text x="36" y="58" font-size="12" class="nb-muted">Decode, tok/s, one stream, greedy, 8K context &#183; higher is better. llama.cpp figures are a third party&#8217;s, on a different 3090 machine.</text>
+  <line x1="36" y1="72" x2="924" y2="72" class="nb-hair" stroke-width="1"/>
+
+  <!-- Plain decode -->
+  <g>
+    <text x="36" y="112" font-size="14" font-weight="600" class="nb-primary">Plain decode</text>
+    <text x="36" y="129" font-size="11" class="nb-muted">no speculation</text>
+    <line x1="200" y1="92" x2="200" y2="156" class="nb-baseline" stroke-width="1"/>
+    <rect x="200" y="96" width="162" height="22" rx="4" class="nb-old"/>
+    <text x="370" y="111" font-size="12" class="nb-secondary">41.55</text>
+    <rect x="200" y="126" width="192" height="22" rx="4" class="nb-new"/>
+    <text x="400" y="141" font-size="12" font-weight="600" class="nb-primary">49.2</text>
+    <text x="800" y="119" font-size="20" font-weight="700" class="nb-good">1.18&#215;</text>
+  </g>
+
+  <!-- MTP -->
+  <g>
+    <text x="36" y="196" font-size="14" font-weight="600" class="nb-primary">MTP</text>
+    <text x="36" y="213" font-size="11" class="nb-muted">2 drafts &#183; 3 drafts</text>
+    <line x1="200" y1="176" x2="200" y2="240" class="nb-baseline" stroke-width="1"/>
+    <rect x="200" y="180" width="259" height="22" rx="4" class="nb-old"/>
+    <text x="467" y="195" font-size="12" class="nb-secondary">66.39</text>
+    <rect x="200" y="210" width="450" height="22" rx="4" class="nb-new"/>
+    <text x="658" y="225" font-size="12" font-weight="600" class="nb-primary">115.4</text>
+    <text x="800" y="203" font-size="20" font-weight="700" class="nb-good">1.74&#215;</text>
+  </g>
+
+  <!-- DFlash2 -->
+  <g>
+    <text x="36" y="280" font-size="14" font-weight="600" class="nb-primary">DFlash2</text>
+    <text x="36" y="297" font-size="11" class="nb-muted">4 drafts &#183; 7 drafts</text>
+    <line x1="200" y1="260" x2="200" y2="324" class="nb-baseline" stroke-width="1"/>
+    <rect x="200" y="264" width="246" height="22" rx="4" class="nb-old"/>
+    <text x="454" y="279" font-size="12" class="nb-secondary">63.13</text>
+    <rect x="200" y="294" width="521" height="22" rx="4" class="nb-new"/>
+    <text x="729" y="309" font-size="12" font-weight="600" class="nb-primary">133.5</text>
+    <text x="800" y="287" font-size="20" font-weight="700" class="nb-good">2.1&#215;</text>
+  </g>
+
+  <line x1="36" y1="340" x2="924" y2="340" class="nb-hair" stroke-width="1"/>
+  <text x="36" y="358" font-size="11" class="nb-muted">llama.cpp: Unsloth UD-Q4_K_XL, best draft count per mode, 25 prompts &#215; 5 passes (Hsiu-Chi Tsai, 2026-08-29).</text>
+  <text x="36" y="373" font-size="11" class="nb-muted">NInfer-3090: this fork&#8217;s 6-bit artifact; plain decode from ninfer_bench, speculative rows over 24 chat prompts.</text>
+  <text x="36" y="388" font-size="11" class="nb-muted">Different machines and prompts, so indicative. Unsloth&#8217;s file is closer to Q8_0 (KL divergence 0.0156 against 0.0318).</text>
+  <text x="924" y="388" font-size="11" text-anchor="end" class="nb-secondary">ashalliants/ninfer-3090</text>
+</svg>

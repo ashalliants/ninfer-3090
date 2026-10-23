@@ -75,6 +75,8 @@ sitting (so the pairs compare; the headline table above is an earlier session's 
 Full table, method and what was not measured:
 [performance/qwen3.8-27b](docs/performance/qwen3.8-27b.md#v0151-against-master-on-rtx-3090-2026-10-13).
 
+![Qwen3.8-27B on one RTX 3090: llama.cpp against NInfer-3090 (llama.cpp figures from a third party's published run)](docs/assets/llamacpp-vs-ninfer-27b.svg)
+
 ![Qwen3.8-27B: upstream artifact vs this fork's 3090 conversion](docs/assets/qwen38-artifact-gains.svg)
 
 The default 27B is this fork's own conversion ([model card](model-cards/Qwen3.8-27B-NInfer-3090/README.md)):

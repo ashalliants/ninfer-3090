@@ -16,6 +16,14 @@ tags:
 
 # Qwen3.8-27B for NInfer on the RTX 3090
 
+> **Maintained at [ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090)**: the engine, converter and release builds these artifacts are made and tested with. Releases, issues and updates live there, and a star helps others find it.
+
+![Qwen3.8-27B on one RTX 3090: llama.cpp against NInfer-3090, up to 2.1x the decode speed](assets/llamacpp-vs-ninfer-27b.svg)
+
+![Qwen3.8-27B on one RTX 3090: this fork's artifact against upstream's, smaller, closer to full precision and faster](assets/qwen38-artifact-gains.svg)
+
+![Qwen3.8-27B on one RTX 3090: prefill and agent-turn decode gains from NInfer-3090 v0.15.1](assets/perf-uplift.svg)
+
 This model card is the version-controlled source for
 [WarlaxZ/Qwen3.8-27B-NInfer-3090](https://huggingface.co/WarlaxZ/Qwen3.8-27B-NInfer-3090).
 
@@ -121,6 +129,23 @@ Before the small-T Q6 kernel, the 6-bit head's 8-token verify took 2.56 ms again
 upstream's 8-bit head and cancelled DFlash2's gain (−0.6% on the bench); with it the head reads
 at about 850 GB/s from 3 to 8 tokens.
 
+**Against llama.cpp.** Decode speed on one RTX 3090, one stream, greedy, 8K context. The llama.cpp
+figures are not ours: they are Hsiu-Chi Tsai's
+[published measurements](https://hackmd.io/@thc1006/qwen3-8-27b-speculative-decoding-rtx-3090)
+(2026-08-29, Debian, i9-13900, Unsloth `UD-Q4_K_XL`, 25 prompts times 5 passes, best draft count per
+mode). Ours are the rows above, on a different machine and a different prompt set, so read the ratios
+as indicative rather than exact.
+
+| Mode | llama.cpp | NInfer-3090 | Ratio |
+|---|---:|---:|---:|
+| Plain decode | 41.55 tok/s | 49.2 tok/s (`ninfer_bench`) | 1.18x |
+| MTP | 66.39 tok/s (2 drafts) | 115.4 tok/s (3 drafts, 24 chat prompts) | 1.74x |
+| DFlash2 | 63.13 tok/s (4 drafts) | 133.5 tok/s (7 drafts, 24 chat prompts) | 2.1x |
+
+Unsloth's file is closer to Q8_0 than this artifact (KL divergence 0.0156 against 0.0318), so this
+is a speed comparison, not one at equal quality. The same post notes llama.cpp's MTP output did not
+match serial greedy decoding byte for byte.
+
 **Memory.** Started back to back through `run.bat qwen38-27b` on the same desktop. The earlier
 `run.bat` transcoded upstream's embedding to 4 bits at load, so the saving is smaller than the file
 size difference:
@@ -189,3 +214,7 @@ already stored in those formats.
 
 Apache License 2.0, matching [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B), the DFlash2
 companion weights and Unsloth's importance matrix.
+
+---
+
+Built and maintained by [ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090). Development is sponsored by [NeverMetered](https://nevermetered.com/?ref=ninfer-3090-hf), hosted Qwen3.8-27B for coding agents.

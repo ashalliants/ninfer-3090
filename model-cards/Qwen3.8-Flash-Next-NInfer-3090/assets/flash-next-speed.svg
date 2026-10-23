@@ -1,0 +1,120 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 452" width="960" height="452" role="img"
+     aria-label="Qwen3.8-Flash-Next IQ2_XS on one RTX 3090, NInfer-3090 against Strata 0.1.38 on the same GGUF. Decode after a 1K, 8K and 32K prompt: plain 81.4, 80.2 and 78.2 tok/s against Strata 71, 70 and 66; with MTP 109.1, 111.2 and 113.0 against Strata 105, 112 and 107. Prefill at 4K, 32K and 128K: 2,345, 2,422 and 2,372 tok/s against Strata 1,912, 2,397 and 2,184.">
+  <title>Qwen3.8-Flash-Next on one RTX 3090: NInfer-3090 vs Strata</title>
+  <style>
+    .nb-surface  { fill: #fcfcfb; }
+    .nb-border   { stroke: rgba(11,11,11,0.10); }
+    .nb-primary  { fill: #0b0b0b; }
+    .nb-secondary{ fill: #52514e; }
+    .nb-muted    { fill: #898781; }
+    .nb-hair     { stroke: #e1e0d9; }
+    .nb-baseline { stroke: #c3c2b7; }
+    .nb-ref-a    { fill: #d9d8cf; }
+    .nb-ref-b    { fill: #a9a79e; }
+    .nb-new-a    { fill: #8bb7ec; }
+    .nb-new-b    { fill: #2a78d6; }
+    .nb-good     { fill: #1f8a4c; }
+    text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+    @media (prefers-color-scheme: dark) {
+      .nb-surface  { fill: #1a1a19; }
+      .nb-border   { stroke: rgba(255,255,255,0.10); }
+      .nb-primary  { fill: #ffffff; }
+      .nb-secondary{ fill: #c3c2b7; }
+      .nb-muted    { fill: #898781; }
+      .nb-hair     { stroke: #2c2c2a; }
+      .nb-baseline { stroke: #383835; }
+      .nb-ref-a    { fill: #3d3d3a; }
+      .nb-ref-b    { fill: #5f5e59; }
+      .nb-new-a    { fill: #2d5f9f; }
+      .nb-new-b    { fill: #3987e5; }
+      .nb-good     { fill: #4cc27f; }
+    }
+  </style>
+
+  <rect x="1" y="1" width="958" height="450" rx="16" class="nb-surface nb-border" stroke-width="1"/>
+
+  <text x="36" y="38" font-size="17" font-weight="650" class="nb-primary">Qwen3.8-Flash-Next: a 512-expert MoE on one RTX 3090</text>
+  <text x="36" y="58" font-size="12" class="nb-muted">Same IQ2_XS GGUF, same card, 33 GiB of experts pinned in RAM. NInfer-3090 against Strata 0.1.38. Higher is better.</text>
+  <line x1="36" y1="72" x2="924" y2="72" class="nb-hair" stroke-width="1"/>
+
+  <!-- legend -->
+  <rect x="36" y="86" width="12" height="12" rx="3" class="nb-ref-a"/>
+  <text x="54" y="96" font-size="11" class="nb-secondary">Strata plain</text>
+  <rect x="140" y="86" width="12" height="12" rx="3" class="nb-ref-b"/>
+  <text x="158" y="96" font-size="11" class="nb-secondary">Strata MTP</text>
+  <rect x="244" y="86" width="12" height="12" rx="3" class="nb-new-a"/>
+  <text x="262" y="96" font-size="11" class="nb-secondary">NInfer plain</text>
+  <rect x="352" y="86" width="12" height="12" rx="3" class="nb-new-b"/>
+  <text x="370" y="96" font-size="11" class="nb-secondary">NInfer MTP (launcher default)</text>
+
+  <!-- decode panel -->
+  <text x="36" y="132" font-size="15" font-weight="600" class="nb-primary">Decode</text>
+  <text x="96" y="132" font-size="11" class="nb-muted">tok/s after a prompt of this length</text>
+
+  <text x="36" y="180" font-size="13" font-weight="600" class="nb-primary">1K</text>
+  <line x1="76" y1="146" x2="76" y2="218" class="nb-baseline" stroke-width="1"/>
+  <rect x="76" y="146" width="213.0" height="14" rx="3" class="nb-ref-a"/>
+  <text x="295.0" y="157" font-size="11" font-weight="400" class="nb-secondary">71</text>
+  <rect x="76" y="164" width="315.0" height="14" rx="3" class="nb-ref-b"/>
+  <text x="397.0" y="175" font-size="11" font-weight="400" class="nb-secondary">105</text>
+  <rect x="76" y="182" width="244.2" height="14" rx="3" class="nb-new-a"/>
+  <text x="326.2" y="193" font-size="11" font-weight="600" class="nb-secondary">81.4</text>
+  <rect x="76" y="200" width="327.3" height="14" rx="3" class="nb-new-b"/>
+  <text x="409.3" y="211" font-size="11" font-weight="700" class="nb-primary">109.1</text>
+  <text x="470" y="186" font-size="12" font-weight="650" class="nb-good">1.15x plain</text>
+  <text x="470" y="204" font-size="12" font-weight="650" class="nb-good">1.04x MTP</text>
+  <text x="36" y="268" font-size="13" font-weight="600" class="nb-primary">8K</text>
+  <line x1="76" y1="234" x2="76" y2="306" class="nb-baseline" stroke-width="1"/>
+  <rect x="76" y="234" width="210.0" height="14" rx="3" class="nb-ref-a"/>
+  <text x="292.0" y="245" font-size="11" font-weight="400" class="nb-secondary">70</text>
+  <rect x="76" y="252" width="336.0" height="14" rx="3" class="nb-ref-b"/>
+  <text x="418.0" y="263" font-size="11" font-weight="400" class="nb-secondary">112</text>
+  <rect x="76" y="270" width="240.6" height="14" rx="3" class="nb-new-a"/>
+  <text x="322.6" y="281" font-size="11" font-weight="600" class="nb-secondary">80.2</text>
+  <rect x="76" y="288" width="333.6" height="14" rx="3" class="nb-new-b"/>
+  <text x="415.6" y="299" font-size="11" font-weight="700" class="nb-primary">111.2</text>
+  <text x="470" y="274" font-size="12" font-weight="650" class="nb-good">1.15x plain</text>
+  <text x="470" y="292" font-size="12" font-weight="650" class="nb-secondary">0.99x MTP</text>
+  <text x="36" y="356" font-size="13" font-weight="600" class="nb-primary">32K</text>
+  <line x1="76" y1="322" x2="76" y2="394" class="nb-baseline" stroke-width="1"/>
+  <rect x="76" y="322" width="198.0" height="14" rx="3" class="nb-ref-a"/>
+  <text x="280.0" y="333" font-size="11" font-weight="400" class="nb-secondary">66</text>
+  <rect x="76" y="340" width="321.0" height="14" rx="3" class="nb-ref-b"/>
+  <text x="403.0" y="351" font-size="11" font-weight="400" class="nb-secondary">107</text>
+  <rect x="76" y="358" width="234.6" height="14" rx="3" class="nb-new-a"/>
+  <text x="316.6" y="369" font-size="11" font-weight="600" class="nb-secondary">78.2</text>
+  <rect x="76" y="376" width="339.0" height="14" rx="3" class="nb-new-b"/>
+  <text x="421.0" y="387" font-size="11" font-weight="700" class="nb-primary">113.0</text>
+  <text x="470" y="362" font-size="12" font-weight="650" class="nb-good">1.18x plain</text>
+  <text x="470" y="380" font-size="12" font-weight="650" class="nb-good">1.06x MTP</text>
+
+  <!-- prefill panel -->
+  <text x="600" y="132" font-size="15" font-weight="600" class="nb-primary">Prefill</text>
+  <text x="662" y="132" font-size="11" class="nb-muted">tok/s, warm, n-gram volume on NVMe</text>
+  <text x="600" y="176" font-size="13" font-weight="600" class="nb-primary">4K</text>
+  <line x1="640" y1="146" x2="640" y2="218" class="nb-baseline" stroke-width="1"/>
+  <rect x="640" y="150" width="162.5" height="22" rx="4" class="nb-ref-a"/>
+  <text x="808.5" y="165" font-size="12" font-weight="400" class="nb-secondary">1,912</text>
+  <rect x="640" y="180" width="199.3" height="22" rx="4" class="nb-new-b"/>
+  <text x="845.3" y="195" font-size="12" font-weight="700" class="nb-primary">2,345</text>
+  <text x="924" y="182" font-size="14" font-weight="650" text-anchor="end" class="nb-good">1.23x</text>
+  <text x="600" y="264" font-size="13" font-weight="600" class="nb-primary">32K</text>
+  <line x1="640" y1="234" x2="640" y2="306" class="nb-baseline" stroke-width="1"/>
+  <rect x="640" y="238" width="203.7" height="22" rx="4" class="nb-ref-a"/>
+  <text x="849.7" y="253" font-size="12" font-weight="400" class="nb-secondary">2,397</text>
+  <rect x="640" y="268" width="205.9" height="22" rx="4" class="nb-new-b"/>
+  <text x="851.9" y="283" font-size="12" font-weight="700" class="nb-primary">2,422</text>
+  <text x="924" y="270" font-size="14" font-weight="650" text-anchor="end" class="nb-good">1.01x</text>
+  <text x="600" y="352" font-size="13" font-weight="600" class="nb-primary">128K</text>
+  <line x1="640" y1="322" x2="640" y2="394" class="nb-baseline" stroke-width="1"/>
+  <rect x="640" y="326" width="185.6" height="22" rx="4" class="nb-ref-a"/>
+  <text x="831.6" y="341" font-size="12" font-weight="400" class="nb-secondary">2,184</text>
+  <rect x="640" y="356" width="201.6" height="22" rx="4" class="nb-new-b"/>
+  <text x="847.6" y="371" font-size="12" font-weight="700" class="nb-primary">2,372</text>
+  <text x="924" y="358" font-size="14" font-weight="650" text-anchor="end" class="nb-good">1.09x</text>
+
+  <line x1="36" y1="406" x2="924" y2="406" class="nb-hair" stroke-width="1"/>
+  <text x="36" y="426" font-size="12" font-weight="600" class="nb-primary">Plain decode 1.15&#8211;1.18x Strata &#183; MTP decode level with it or up to 1.06x &#183; prefill 1.01&#8211;1.23x &#183; 102.6 tok/s after a 128K prompt (MTP)</text>
+  <text x="36" y="443" font-size="10" class="nb-muted">Windows preview, one request at a time, 64 GB RAM. Measured 2026-10-12 (medians of 12), sources in the model card. MTP gives the same tokens as plain decoding.</text>
+  <text x="924" y="443" font-size="10" text-anchor="end" class="nb-muted">ashalliants/ninfer-3090</text>
+</svg>
