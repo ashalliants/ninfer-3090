@@ -8,9 +8,10 @@
 [![Decode, one RTX 3090](https://img.shields.io/badge/decode-140%20tok%2Fs%20(DFlash2)-2a78d6)](#performance-on-an-rtx-3090)
 [![Models on Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20models-WarlaxZ-2a78d6)](https://huggingface.co/WarlaxZ)
 
-[![Illustrative animation: NInfer-3090 decodes Qwen3.8-27B 2.1x faster than llama.cpp on the same RTX 3090. Click for the MP4.](docs/assets/ninfer-demo.gif)](docs/assets/ninfer-demo.mp4)
+[![Illustrative animation: NInfer-3090 decodes Qwen3.8-27B 2.1x faster than llama.cpp on an RTX 3090, from published figures. Click for the MP4.](docs/assets/ninfer-demo.gif)](docs/assets/ninfer-demo.mp4)
 
-*Illustrative animation, drawn at the published decode speeds. The measurements behind it are in the
+*Illustrative animation, drawn at published decode speeds. The llama.cpp figure is a third party's, from a
+different machine and prompt set, so read the ratio as indicative. The measurements and caveats are in the
 [Qwen3.8-27B model card](model-cards/Qwen3.8-27B-NInfer-3090/README.md).*
 
 **[Download](https://github.com/ashalliants/ninfer-3090/releases/latest)** · [Quick start](#quick-start) · [Models](#models) · [Benchmarks](#performance-on-an-rtx-3090) · [Documentation](docs/README.md) · [Hugging Face](https://huggingface.co/WarlaxZ)
