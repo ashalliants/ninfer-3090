@@ -63,3 +63,13 @@ jobs:
             fi
           done < <(git ls-files '*.sh')
           exit $status
+
+  model-cards:
+    name: Model card charts match docs/assets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Each card carries its own copy of its charts so the Hugging Face page can load them. A copy
+      # that no longer matches docs/assets would publish an out-of-date chart.
+      - name: Run tools/sync_model_cards.py --check
+        run: python3 tools/sync_model_cards.py --check

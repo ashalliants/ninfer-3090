@@ -1,0 +1,39 @@
+# Push the model cards in model-cards/ to their Hugging Face repos whenever they change on master,
+# so the two never drift apart. Needs a repository secret HF_TOKEN with write access to the
+# WarlaxZ organisation; without it the job fails loudly instead of skipping.
+name: Publish model cards
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'model-cards/**'
+      - 'tools/sync_model_cards.py'
+  workflow_dispatch:
+
+concurrency:
+  group: publish-model-cards
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Upload cards to Hugging Face
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install the Hugging Face CLI
+        run: python3 -m pip install 'huggingface_hub[cli]'
+      - name: Check the charts match docs/assets
+        run: python3 tools/sync_model_cards.py --check
+      - name: Upload README.md and assets/ for each card
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "::error::The HF_TOKEN repository secret is not set (needs write access to the WarlaxZ org)"
+            exit 1
+          fi
+          python3 tools/sync_model_cards.py --publish

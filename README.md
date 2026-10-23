@@ -850,6 +850,13 @@ See [CONTRIBUTORS.md](CONTRIBUTORS.md) for the complete, maintained credit list.
   vision prompts in [PR #138](https://github.com/ashalliants/ninfer-3090/pull/138); its
   KV-lending gate was kept in [PR #145](https://github.com/ashalliants/ninfer-3090/pull/145).
 
+## Support the project
+
+If NInfer-3090 saved you time or got more out of your RTX 3090, please
+[star the repository](https://github.com/ashalliants/ninfer-3090). It helps other 3090 owners find a
+build that is maintained, benchmarked and released from one place. Bug reports and measurements from
+other cards are just as welcome.
+
 ## Contributing
 
 Please read the [Pull Request Policy](PR_POLICY.md) before opening an issue or pull request.
