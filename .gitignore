@@ -76,3 +76,21 @@ dist/*
 # committed: they are whole real prompts, so they carry third-party system-prompt text and are
 # large (100 KB+ each) for something only the person who captured them can act on.
 repro/
+
+# Credentials and rented-machine state. None of these belong in the repo: the Vast scripts read keys
+# from the maintainer's own ~/.ssh and environment, never from a file here.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+authorized_keys
+administrators_authorized_keys
+.vast_api_key
+vast_api_key*
+vast-instance*.json
+.vast-*
