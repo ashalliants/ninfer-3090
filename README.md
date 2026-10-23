@@ -4,6 +4,12 @@
 [![License](https://img.shields.io/github/license/ashalliants/ninfer-3090?color=2a78d6)](LICENSE)
 [![Host checks](https://github.com/ashalliants/ninfer-3090/actions/workflows/host-checks.yml/badge.svg)](https://github.com/ashalliants/ninfer-3090/actions/workflows/host-checks.yml)
 
+[![Illustrative animation: NInfer-3090 decodes Qwen3.8-27B 2.1x faster than llama.cpp on the same RTX 3090. Click for the MP4.](docs/assets/ninfer-demo.gif)](docs/assets/ninfer-demo.mp4)
+
+*Illustrative animation, drawn at the published decode speeds. The measurements behind it are in the
+[Qwen3.8-27B model card](model-cards/Qwen3.8-27B-NInfer-3090/README.md); rebuild it with
+[`tools/docs/render_demo.mjs`](tools/docs/render_demo.mjs).*
+
 ![NInfer-3090 throughput on one RTX 3090](docs/assets/perf-banner.svg)
 
 NInfer-3090 is a specialized C++20/CUDA inference engine for **Qwen3.8-27B**, Qwen3.6 and, as a

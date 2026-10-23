@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>NInfer-3090 demo animation</title>
+<!--
+  The README demo animation. An ILLUSTRATION: it streams a made-up answer at decode speeds this
+  project and a third party measured, so the two engines can be compared by eye. It is not a
+  recording and not a new measurement, and every frame says so.
+
+  The whole picture is a pure function of time: window.renderAt(seconds). tools/docs/render_demo.mjs
+  steps it frame by frame in headless Chrome and encodes the result, so the output is identical on
+  every run. Open this file in a browser to watch it live (add ?loop=0 to play once).
+-->
+<style>
+  :root {
+    --bg0: #0b0e13; --bg1: #131a26; --panel: #171e2b; --border: #2b3547;
+    --text: #e8ebf0; --muted: #8590a2; --blue: #4692ee; --blue2: #7cc0ff;
+    --green: #54ca88; --grey: #767c86;
+    --sans: Inter, -apple-system, "SF Pro Display", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 960px; height: 540px; overflow: hidden; background: var(--bg0); }
+  body { position: relative; font-family: var(--sans); color: var(--text); -webkit-font-smoothing: antialiased; }
+  #bg { position: absolute; inset: 0; background: linear-gradient(180deg, var(--bg0), var(--bg1)); }
+  #grid { position: absolute; inset: 0; opacity: .5;
+    background-image: linear-gradient(rgba(70,146,238,.06) 1px, transparent 1px), linear-gradient(90deg, rgba(70,146,238,.06) 1px, transparent 1px);
+    background-size: 48px 48px; mask-image: radial-gradient(ellipse at 50% 45%, #000 20%, transparent 75%); }
+  .glow { position: absolute; border-radius: 50%; filter: blur(70px); will-change: opacity; }
+  canvas { position: absolute; inset: 0; width: 960px; height: 540px; }
+  .scene { position: absolute; inset: 0; opacity: 0; }
+
+  /* hook */
+  #hook { display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
+  #hook h1 { font-size: 78px; line-height: 1.04; font-weight: 800; letter-spacing: -2.2px; }
+  #hook .l1 { display: block; }
+  #hook .l2 { display: block; background: linear-gradient(90deg, var(--blue), var(--blue2) 60%, var(--blue)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  #hook .rule { height: 5px; border-radius: 3px; margin: 22px 0 18px; background: linear-gradient(90deg, transparent, var(--blue), var(--blue2), var(--blue), transparent); }
+  #hook .sub { font-size: 23px; color: var(--muted); letter-spacing: .2px; }
+  #hook .sub b { color: var(--text); font-weight: 600; }
+
+  /* race */
+  #race h2 { position: absolute; left: 36px; top: 16px; font-size: 29px; font-weight: 750; letter-spacing: -.4px; }
+  #race .prompt { position: absolute; left: 36px; top: 58px; font: 15px var(--mono); color: var(--muted); }
+  #race .prompt i { color: var(--blue); font-style: normal; }
+  .gpu { position: absolute; right: 150px; top: 17px; font-size: 13px; font-weight: 650; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 6px 12px; background: rgba(23,30,43,.7); }
+  .gpu b { color: var(--green); font-weight: 650; }
+  .card { position: absolute; left: 36px; right: 36px; height: 192px; border-radius: 18px; background: var(--panel); border: 1.5px solid var(--border); padding: 16px 24px; overflow: hidden; }
+  .card.win { border-color: var(--blue); box-shadow: 0 0 0 1px rgba(70,146,238,.25), 0 10px 50px rgba(70,146,238,.22); }
+  .card .name { font-size: 26px; font-weight: 750; letter-spacing: -.3px; display: flex; align-items: center; gap: 12px; }
+  .card.win .name { color: var(--blue); }
+  .card .detail { font-size: 14px; color: var(--muted); margin-top: 4px; }
+  .done { display: inline-flex; align-items: center; gap: 6px; font-size: 17px; font-weight: 700; color: var(--green); opacity: 0; }
+  .done svg { width: 17px; height: 17px; }
+  .rate { position: absolute; right: 24px; top: 8px; text-align: right; }
+  .rate .n { font-size: 52px; font-weight: 800; letter-spacing: -1.5px; font-variant-numeric: tabular-nums; line-height: 1.1; }
+  .rate .n small { font-size: 19px; font-weight: 600; color: var(--muted); letter-spacing: 0; margin-left: 5px; }
+  .card.win .rate .n { color: var(--blue2); text-shadow: 0 0 28px rgba(70,146,238,.55); }
+  .rate .cnt { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; margin-top: -2px; }
+  .out { position: absolute; left: 24px; right: 24px; top: 82px; height: 74px; overflow: hidden; font: 15px/24.5px var(--mono); color: var(--text); }
+  .out .in { position: absolute; left: 0; right: 0; bottom: 0; }
+  .out .in .fade { color: rgba(232,235,240,.5); }
+  .cursor { display: inline-block; width: 8px; height: 17px; margin-left: 2px; vertical-align: -3px; background: var(--grey); }
+  .card.win .cursor { background: var(--blue2); }
+  .bar { position: absolute; left: 24px; right: 24px; bottom: 18px; height: 8px; border-radius: 4px; background: rgba(43,53,71,.7); overflow: hidden; }
+  .bar i { display: block; height: 100%; width: 0; border-radius: 4px; background: var(--grey); }
+  .card.win .bar i { background: linear-gradient(90deg, var(--blue), var(--blue2)); box-shadow: 0 0 14px var(--blue); }
+  #chip { position: absolute; left: 50%; top: 290px; transform: translate(-50%, -50%) scale(0); font-size: 20px; font-weight: 800; letter-spacing: -.2px; color: #06210f; background: linear-gradient(90deg, #6ee7a4, #4fd18a); border-radius: 999px; padding: 8px 20px; box-shadow: 0 8px 30px rgba(84,202,136,.45); white-space: nowrap; }
+
+  /* call to action */
+  #cta { display: flex; flex-direction: column; align-items: center; text-align: center; padding-top: 28px; }
+  #cta .big { font-size: 128px; line-height: 1; font-weight: 850; letter-spacing: -5px; background: linear-gradient(180deg, #a5d4ff, var(--blue) 70%); -webkit-background-clip: text; background-clip: text; color: transparent; filter: drop-shadow(0 0 34px rgba(70,146,238,.5)); }
+  #cta .than { font-size: 30px; font-weight: 500; margin-top: 4px; }
+  #cta .than b { color: var(--blue2); font-weight: 700; }
+  #cta .pills { display: flex; gap: 12px; margin-top: 22px; }
+  #cta .pill { font-size: 16px; font-weight: 650; padding: 9px 18px; border-radius: 999px; background: rgba(23,30,43,.85); border: 1px solid var(--border); }
+  #cta .btn { position: relative; margin-top: 30px; overflow: hidden; font-size: 30px; font-weight: 800; letter-spacing: -.4px; color: #fff; padding: 17px 44px; border-radius: 999px; background: linear-gradient(180deg, #5aa3f5, #3a7fdc); box-shadow: 0 12px 40px rgba(70,146,238,.5); display: flex; align-items: center; gap: 14px; }
+  #cta .btn svg { width: 30px; height: 30px; }
+  #cta .btn .shine { position: absolute; top: 0; bottom: 0; width: 90px; background: linear-gradient(100deg, transparent, rgba(255,255,255,.4), transparent); transform: skewX(-18deg); }
+  #cta .repo { margin-top: 18px; font: 700 23px var(--mono); letter-spacing: -.3px; }
+  #cta .free { margin-top: 8px; font-size: 17px; color: var(--muted); }
+  #cta .spon { position: absolute; bottom: 38px; font-size: 12px; color: var(--muted); opacity: .8; }
+  #cta .spon b { color: var(--text); font-weight: 600; }
+
+  /* always on */
+  #marks { position: absolute; inset: 0; pointer-events: none; }
+  #marks .illus { position: absolute; left: 36px; bottom: 12px; font-size: 12px; color: rgba(133,144,162,.75); }
+  #marks .wm { position: absolute; right: 36px; bottom: 10px; font: 700 15px var(--mono); color: rgba(232,235,240,.62); display: flex; align-items: center; gap: 7px; }
+  #marks .wm svg { width: 15px; height: 15px; }
+  #marks .logo { position: absolute; right: 36px; top: 20px; font-size: 14px; font-weight: 800; letter-spacing: .4px; color: rgba(232,235,240,.5); }
+</style>
+</head>
+<body>
+  <div id="bg"></div><div id="grid"></div>
+  <div class="glow" id="glow1" style="width:760px;height:300px;left:100px;top:110px;background:#2d6fcf"></div>
+  <div class="glow" id="glow2" style="width:820px;height:200px;left:70px;top:150px;background:#2fbf7a"></div>
+  <canvas id="fx"></canvas>
+
+  <section class="scene" id="hook">
+    <h1><span class="l1" id="h1a">Your RTX 3090</span><span class="l2" id="h1b">is faster than you think.</span></h1>
+    <div class="rule" id="rule"></div>
+    <div class="sub" id="hsub">Qwen3.8-27B &nbsp;·&nbsp; <b>one card</b> &nbsp;·&nbsp; no cloud &nbsp;·&nbsp; no per-token bill</div>
+  </section>
+
+  <section class="scene" id="race">
+    <h2>Same model. Same card. Same prompt.</h2>
+    <div class="prompt"><i>&gt;</i> Explain how hash tables handle collisions and resizing.</div>
+    <div class="gpu"><b>●</b> One RTX 3090 · 24 GB</div>
+    <div class="card win" id="c1" style="top:92px">
+      <div class="name"><span>NInfer-3090</span><span class="done"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5l4.5 4.5L17 5"/></svg><span class="dt"></span></span></div>
+      <div class="detail">DFlash2, 7 drafts · Qwen3.8-27B</div>
+      <div class="rate"><div class="n"><span class="v">0.0</span><small>tok/s</small></div><div class="cnt"></div></div>
+      <div class="out"><div class="in"></div></div>
+      <div class="bar"><i></i></div>
+    </div>
+    <div class="card" id="c2" style="top:296px">
+      <div class="name"><span>llama.cpp</span><span class="done"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5l4.5 4.5L17 5"/></svg><span class="dt"></span></span></div>
+      <div class="detail">DFlash2, 4 drafts (its best) · Qwen3.8-27B</div>
+      <div class="rate"><div class="n"><span class="v">0.0</span><small>tok/s</small></div><div class="cnt"></div></div>
+      <div class="out"><div class="in"></div></div>
+      <div class="bar"><i></i></div>
+    </div>
+    <div id="chip">2.1× faster</div>
+  </section>
+
+  <section class="scene" id="cta">
+    <div class="big" id="big">2.1× faster</div>
+    <div class="than" id="than">than <b>llama.cpp</b> on the same RTX 3090</div>
+    <div class="pills" id="pills">
+      <span class="pill">Windows + Linux builds</span><span class="pill">OpenAI + Anthropic APIs</span><span class="pill">Up to 262K context</span><span class="pill">Vision</span>
+    </div>
+    <div class="btn" id="btn"><svg viewBox="0 0 24 24" fill="#fff"><path d="M12 2.2l2.9 6.3 6.9.8-5.1 4.7 1.4 6.8L12 17.3 5.9 20.8l1.4-6.8L2.2 9.3l6.9-.8z"/></svg>Star it on GitHub<span class="shine" id="shine"></span></div>
+    <div class="repo" id="repo">github.com/ashalliants/ninfer-3090</div>
+    <div class="free" id="free">Free download for Windows and Linux in Releases</div>
+    <div class="spon" id="spon">Development sponsored by <b>NeverMetered</b></div>
+  </section>
+
+  <div id="marks">
+    <div class="logo">NInfer-3090</div>
+    <div class="illus">Illustrative animation. Speeds are published measurements (see README), not a live run.</div>
+    <div class="wm"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.2l2.9 6.3 6.9.8-5.1 4.7 1.4 6.8L12 17.3 5.9 20.8l1.4-6.8L2.2 9.3l6.9-.8z"/></svg>github.com/ashalliants/ninfer-3090</div>
+  </div>
+
+<script>
+// Decode speeds, tok/s, Qwen3.8-27B on one RTX 3090: model-cards/Qwen3.8-27B-NInfer-3090/README.md,
+// "Against llama.cpp" (llama.cpp's figure is a third party's published run).
+const NINFER_TPS = 133.5, LLAMA_TPS = 63.13;
+const ANSWER = "A hash table maps keys to buckets with a hash function, so a lookup usually touches one slot instead of scanning every item. When two keys land in the same bucket you have a collision. Chaining keeps a small list in each bucket and walks it on lookup. Open addressing stores everything in the array itself and probes the next free slot, which is faster for small values because the memory is contiguous. As the table fills, collisions get more likely, so implementations track the load factor, the ratio of items to buckets. Past a threshold, commonly 0.75, the table doubles its bucket array and reinserts every key. That resize is expensive, but it happens rarely enough that the average cost of an insert stays constant. In the worst case every key hashes to the same bucket and a lookup degrades to a linear scan, which is why good hash functions and randomised seeds matter. A balanced tree gives up the constant average case in exchange for ordered keys and a guaranteed logarithmic worst case, so pick the tree when you need range queries or cannot tolerate a slow lookup, and the hash table when you want the fastest average access to individual keys.";
+const WORDS = ANSWER.split(" "), TOKENS_PER_WORD = 1.3, N = Math.round(WORDS.length * TOKENS_PER_WORD);
+const START_DELAY = 0.35;
+const T_HOOK = 2.8, T_RACE = 6.6, T_CTA = 4.4;
+window.DURATION = T_HOOK + T_RACE + T_CTA;
+
+const $ = (id) => document.getElementById(id);
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const easeOut = (x) => 1 - Math.pow(1 - clamp(x), 3);
+const easeBack = (x) => { x = clamp(x); const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2); };
+const seeded = (i) => { const s = Math.sin(i * 127.1 + 311.7) * 43758.5453; return s - Math.floor(s); };
+
+const canvas = $("fx"), dpr = window.devicePixelRatio || 1;
+canvas.width = 960 * dpr; canvas.height = 540 * dpr;
+const ctx = canvas.getContext("2d");
+
+function streaks(t, count, y0, y1, alpha) {
+  for (let i = 0; i < count; i++) {
+    const r = seeded(i + 1), y = y0 + (y1 - y0) * ((i * 0.618) % 1);
+    const len = 90 + 240 * r, speed = 420 + 560 * seeded(i + 40);
+    const x = ((t * speed + r * (960 + len)) % (960 + len)) - len;
+    const g = ctx.createLinearGradient(x, 0, x + len, 0);
+    g.addColorStop(0, "rgba(124,192,255,0)"); g.addColorStop(1, `rgba(124,192,255,${alpha * (0.4 + r)})`);
+    ctx.fillStyle = g; ctx.fillRect(x, y, len, 2);
+  }
+}
+function star(cx, cy, r, rot) {
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) { const a = rot - Math.PI / 2 + i * Math.PI / 5, rr = i % 2 ? r * 0.42 : r; ctx.lineTo(cx + rr * Math.cos(a), cy + rr * Math.sin(a)); }
+  ctx.closePath(); ctx.fill();
+}
+function sparkles(t, alpha) {
+  for (let i = 0; i < 16; i++) {
+    const r = seeded(i + 90), x = 30 + 900 * ((i * 0.381) % 1);
+    const y = ((t * (40 + 90 * r) + r * 600) % 600) - 30;
+    ctx.fillStyle = `rgba(150,205,255,${alpha * (0.18 + 0.4 * r)})`;
+    star(x, 540 - y, 3 + 6 * r, t * (0.8 + r));
+  }
+}
+
+function setCard(card, rate, race) {
+  const tokens = clamp(rate * (race - START_DELAY), 0, N), doneAt = START_DELAY + N / rate;
+  const finished = race >= doneAt;
+  const shownRate = rate * easeOut((race - START_DELAY) / 0.5);
+  card.querySelector(".v").textContent = shownRate.toFixed(1);
+  card.querySelector(".cnt").textContent = `${Math.floor(tokens)} / ${N} tokens`;
+  card.querySelector(".bar i").style.width = `${(tokens / N) * 100}%`;
+  const words = Math.floor(tokens / TOKENS_PER_WORD);
+  const inner = card.querySelector(".in");
+  inner.innerHTML = WORDS.slice(0, words).join(" ") + (finished ? "" : '<span class="cursor"></span>');
+  const done = card.querySelector(".done");
+  done.style.opacity = finished ? clamp((race - doneAt) / 0.25) : 0;
+  card.querySelector(".dt").textContent = `done in ${(N / rate).toFixed(1)} s`;
+  return doneAt;
+}
+
+window.renderAt = function (t) {
+  const tHook = t, tRace = t - T_HOOK, tCta = t - T_HOOK - T_RACE;
+  const inHook = t < T_HOOK, inRace = tRace >= 0 && tRace < T_RACE, inCta = tCta >= 0;
+  $("hook").style.opacity = inHook ? Math.min(1, (T_HOOK - t) / 0.3) : 0;
+  $("race").style.opacity = inRace ? Math.min(1, tRace / 0.25, (T_RACE - tRace) / 0.3) : 0;
+  $("cta").style.opacity = inCta ? Math.min(1, tCta / 0.25) : 0;
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, 960, 540);
+  $("glow1").style.opacity = inHook ? 0.34 + 0.05 * Math.sin(t * 5) : inRace ? 0.12 : 0.36 + 0.05 * Math.sin(t * 4);
+  $("glow1").style.top = inCta ? "-60px" : "110px";
+  $("glow2").style.opacity = 0;
+
+  if (inHook) {
+    for (const [id, start] of [["h1a", 0.15], ["h1b", 0.7]]) {
+      const p = easeOut((tHook - start) / 0.5); $(id).style.opacity = p; $(id).style.transform = `translateY(${(1 - p) * 30}px)`;
+    }
+    const sweep = easeOut((tHook - 1.2) / 0.7); $("rule").style.width = `${620 * sweep}px`; $("rule").style.opacity = sweep;
+    const sub = easeOut((tHook - 1.5) / 0.5); $("hsub").style.opacity = sub; $("hsub").style.transform = `translateY(${(1 - sub) * 12}px)`;
+    streaks(t, 18, 40, 480, 0.35);
+  }
+  if (inRace) {
+    const finish = START_DELAY + N / NINFER_TPS;
+    setCard($("c1"), NINFER_TPS, tRace); setCard($("c2"), LLAMA_TPS, tRace);
+    if (tRace < finish) streaks(t, 12, 100, 280, 0.32);
+    const chip = easeBack((tRace - finish - 0.15) / 0.45);
+    $("chip").style.transform = `translate(-50%, -50%) scale(${chip})`;
+    $("glow2").style.opacity = tRace > finish ? 0.16 * clamp(1 - (tRace - finish) / 1.6) : 0;
+    $("glow2").style.top = "70px";
+  }
+  if (inCta) {
+    const pop = easeBack(tCta / 0.6);
+    $("big").style.transform = `scale(${0.35 + 0.65 * pop})`; $("big").style.opacity = clamp(tCta / 0.2);
+    const than = easeOut((tCta - 0.5) / 0.4); $("than").style.opacity = than; $("than").style.transform = `translateY(${(1 - than) * 14}px)`;
+    const pills = $("pills").children;
+    for (let i = 0; i < pills.length; i++) { const p = easeOut((tCta - 0.9 - i * 0.12) / 0.35); pills[i].style.opacity = p; pills[i].style.transform = `translateY(${(1 - p) * 14}px)`; }
+    const b = easeBack((tCta - 1.5) / 0.5);
+    $("btn").style.opacity = clamp((tCta - 1.5) / 0.2); $("btn").style.transform = `scale(${(0.6 + 0.4 * b) * (1 + 0.018 * Math.sin(tCta * 6))})`;
+    $("shine").style.left = `${-120 + 640 * (((tCta - 1.9) * 0.55) % 1.6)}px`;
+    for (const [id, start] of [["repo", 1.9], ["free", 2.1], ["spon", 2.4]]) { const p = easeOut((tCta - start) / 0.4); $(id).style.opacity = p * (id === "spon" ? 0.8 : 1); }
+    sparkles(t, clamp(tCta / 0.6));
+  }
+};
+
+const params = new URLSearchParams(location.search);
+if (!params.has("capture")) {
+  const loop = params.get("loop") !== "0", started = performance.now();
+  (function tick() {
+    let t = (performance.now() - started) / 1000;
+    if (loop) t %= window.DURATION + 1; else t = Math.min(t, window.DURATION);
+    window.renderAt(Math.min(t, window.DURATION));
+    requestAnimationFrame(tick);
+  })();
+} else {
+  window.renderAt(0);
+}
+</script>
+</body>
+</html>
