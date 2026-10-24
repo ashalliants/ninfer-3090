@@ -23,6 +23,8 @@ Steps (each writes into --work):
   capture  run mlx-community/Qwen3.8-27B-4bit over held-out text and save every probed
            projection's input. Needs mlx and mlx-lm; the 4-bit model's activations stand in
            for BF16's, which is fine for outlier statistics.
+  capture-torch  the same without MLX: stream the BF16 model through transformers on the CPU, one
+           decoder layer at a time (about 54 GB of shards on disk, a few GB of RAM).
   analyze  quantize and score every arm; prints a table and writes results.json.
 
     python tools/rotation_quant_probe.py fetch   --work /tmp/hq
@@ -139,6 +141,80 @@ def _texts(tokens_per_domain: int, tokenizer) -> list[list[int]]:
             raise ValueError(f"{domain}: only {len(ids)} tokens")
         sequences.append(ids[:tokens_per_domain])
     return sequences
+
+
+def capture_torch(work: Path, tokens_per_domain: int) -> None:
+    """The MLX-free capture: stream the BF16 model through transformers' own decoder layers.
+
+    The full model (about 54 GB) does not have to fit in RAM: the five held-out sequences run as
+    one batch, one decoder layer at a time, each built from its own tensors in FP32 and freed
+    before the next. Only the shards are downloaded in full."""
+
+    from huggingface_hub import hf_hub_download
+    from safetensors import safe_open
+    from transformers import AutoConfig, AutoTokenizer
+    from transformers.models.qwen3_5.modeling_qwen3_5 import (
+        Qwen3_5DecoderLayer,
+        Qwen3_5TextRotaryEmbedding,
+    )
+
+    torch.set_grad_enabled(False)
+    torch.manual_seed(0)
+    config = AutoConfig.from_pretrained(SOURCE).text_config
+    config._attn_implementation = "sdpa"
+    tokenizer = AutoTokenizer.from_pretrained(SOURCE)
+    ids = torch.tensor(_texts(tokens_per_domain, tokenizer))
+    weight_map = json.loads(Path(hf_hub_download(SOURCE, "model.safetensors.index.json")).read_text())["weight_map"]
+
+    def tensors(prefix: str) -> dict[str, torch.Tensor]:
+        found = {}
+        for name, shard in weight_map.items():
+            if name.startswith(prefix):
+                with safe_open(hf_hub_download(SOURCE, shard), "pt") as f:
+                    found[name[len(prefix):]] = f.get_tensor(name).float()
+        return found
+
+    embed = tensors("model.language_model.embed_tokens.")["weight"]
+    hidden = embed[ids]
+    del embed
+    position_ids = torch.arange(ids.shape[1]).view(1, 1, -1).expand(3, ids.shape[0], -1)
+    rotary = Qwen3_5TextRotaryEmbedding(config=config)
+    position_embeddings = rotary(hidden, position_ids)
+    store: dict[tuple[int, str], np.ndarray] = {}
+
+    for layer in range(config.num_hidden_layers):
+        with torch.device("meta"):
+            block = Qwen3_5DecoderLayer(config, layer)
+        block.load_state_dict(tensors(f"{PREFIX}.{layer}."), assign=True)
+        probed = layer in LAYERS
+        handles = []
+        if probed:
+            mixer = block.self_attn if _attention(layer) else block.linear_attn
+            first = mixer.q_proj if _attention(layer) else mixer.in_proj_qkv
+            for key, module in (
+                ("mixer_in", first),
+                ("mixer_out", mixer.o_proj if _attention(layer) else mixer.out_proj),
+                ("mlp_in", block.mlp.gate_proj),
+                ("down_in", block.mlp.down_proj),
+            ):
+                def hook(_module, args, key=key):
+                    store[(layer, key)] = args[0].reshape(-1, args[0].shape[-1]).half().numpy()
+
+                handles.append(module.register_forward_pre_hook(hook))
+        hidden = block(
+            hidden,
+            position_embeddings=position_embeddings,
+            attention_mask=None,
+            position_ids=position_ids[0],
+        )
+        for handle in handles:
+            handle.remove()
+        del block
+        print(f"layer {layer} done{' (probed)' if probed else ''}", flush=True)
+    out = work / "activations"
+    out.mkdir(parents=True, exist_ok=True)
+    for (layer, name), values in store.items():
+        np.save(out / f"{layer}.{name}.npy", values)
 
 
 def capture(work: Path, tokens_per_domain: int) -> None:
@@ -332,7 +408,7 @@ def _line(row) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("step", choices=("fetch", "capture", "analyze"))
+    parser.add_argument("step", choices=("fetch", "capture", "capture-torch", "analyze"))
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--tokens-per-domain", type=int, default=512)
     parser.add_argument("--tokens", type=int, help="analyze only the first N captured tokens")
@@ -343,6 +419,8 @@ def main() -> None:
         fetch(args.work)
     elif args.step == "capture":
         capture(args.work, args.tokens_per_domain)
+    elif args.step == "capture-torch":
+        capture_torch(args.work, args.tokens_per_domain)
     else:
         analyze(args.work, args.device, args.tokens)
 
