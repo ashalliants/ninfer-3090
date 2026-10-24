@@ -52,11 +52,16 @@ Known limit (#375): deleting a superseded session from the bucket is best effort
 
 ## Verification
 
-VERIFICATION_PLACEHOLDER
+Checked on 2026-10-24 on a rented RTX 3090 (24 GB, Ubuntu 24.04, CUDA 12.8.1, GCC 13), against the release commit's code, before publishing:
+
+- **Build (Linux):** a clean `git archive` of the VERSION commit, `-DCMAKE_CUDA_ARCHITECTURES=86 -DBUILD_TESTING=OFF`, targets `ninfer`, `ninfer-serve`, `ninfer_bench`; `ninfer-serve --version` prints `0.16.2-rtx3090`.
+- **Linux archive:** the outer and inner checksums match; a fresh unpack runs `./ninfer-serve --version`, `./ninfer-serve --help` and `./run.sh --help`; `scripts/check-linux-scripts.sh` passes; `ldd` reports no unresolved library for the three executables. The dependency list was not diffed against v0.16.1's.
+- **Real-card smoke test:** the unpacked archive's own `./run.sh qwen38-27b` (Qwen3.8-27B) was ready in 19 s, `/health` reported `0.16.2-rtx3090`, and a chat completion answered ("Hello there, how are you"). The context-store bucket paths were not exercised (no bucket flag was set).
+- **Tests:** none were run for this release; it builds the three products only. The pull requests carry their own CPU tests (see their descriptions).
 
 ## Windows archive: built, not run
 
-`ninfer-rtx3090-windows-x64-0.16.2-rtx3090.zip` was compiled with CUDA 12.8.1 and Visual Studio 2022 on a Windows machine that has no NVIDIA GPU, so the programs could not be started there. WINDOWS_CHECKS_PLACEHOLDER If it fails to start for you, please report it; v0.16.0 remains the last Windows archive that was run on a card.
+`ninfer-rtx3090-windows-x64-0.16.2-rtx3090.zip` was compiled with CUDA 12.8.1 and Visual Studio 2022 on a Windows machine that has no NVIDIA GPU, so the programs could not be started there. It is the same source as the Linux archive. What was checked: the zip matches the SHA-256 in `SHA256SUMS-v0.16.2-windows.txt`, and every DLL the 13 programs and libraries import is either shipped in the zip, a Windows system DLL or an NVIDIA driver DLL. Starting the programs, `run.bat` and a real chat completion on an RTX 3090 have **not** been tested. If it fails to start for you, please report it; v0.16.0 remains the last Windows archive that was run on a card.
 
 ## Install and upgrade
 
