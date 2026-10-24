@@ -55,6 +55,7 @@ command -v jq >/dev/null || { apt-get update -qq && apt-get install --yes --no-i
 mem_gib=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) / 1048576 ))
 jobs=$(( mem_gib / 4 ))
 (( jobs > $(nproc) )) && jobs=$(nproc)
+(( jobs > 32 )) && jobs=32   # nproc reports the host's cores, not the share this container gets
 (( jobs < 1 )) && jobs=1
 
 echo "==> [$(date -Is)] configuring (-j$jobs)"
@@ -145,7 +146,7 @@ for name in $names; do
 done
 "$root/vast-dev-ssh.sh" 'cat /root/release-ldd.txt' > "$repo/dist/release-ldd-linux.txt"
 # Only the pair just pulled: dist/ may hold older releases' files, whose archives are not there.
-( cd "$repo/dist" && for sums in $(printf '%s\n' $names | grep '^SHA256SUMS-'); do shasum -a 256 -c "$sums"; done )
+( cd "$repo/dist" && for sums in $(printf '%s\n' $names | grep '^SHA256SUMS-'); do { sha256sum -c "$sums" 2>/dev/null || shasum -a 256 -c "$sums"; }; done )
 ls -l "$repo/dist"
 echo "Release commit: $commit"
 echo "Linux archive built, checked and smoke-tested on the real card. Destroy the instance with ./vast-destroy.sh when you are done."
