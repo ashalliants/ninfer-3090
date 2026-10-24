@@ -2089,7 +2089,13 @@ void ContextStore::settle_failed_fetch(const std::string& id, std::uint64_t gene
 
 std::size_t ContextStore::refresh_remote(std::chrono::steady_clock::time_point deadline) {
     if (!options_.remote) { return 0; }
-    std::scoped_lock refreshing(refresh_mutex_);
+    const auto asked = std::chrono::steady_clock::now();
+    // The wait for another refresh counts against the deadline too.
+    std::unique_lock refreshing(refresh_mutex_, std::defer_lock);
+    if (!refreshing.try_lock_until(deadline)) { return 0; }
+    // One that finished while this waited (the refresh queued at start-up) listed the bucket after
+    // this was asked for: listing it again would only repeat that work.
+    if (last_refresh_ >= asked) { return 0; }
     return refresh_remote_locked(deadline);
 }
 

@@ -227,7 +227,8 @@ public:
     // With a remote: lists it now and registers images it holds that this store does not. Also done
     // in the background every remote_refresh. Returns the number of images added.
     // Lists the bucket and registers images other engines left there. Stops reading manifests at
-    // `deadline`; an incomplete listing never removes anything from the index.
+    // `deadline`, waiting for another refresh counted; an incomplete listing never removes anything
+    // from the index. Returns 0 without listing when one that finished while it waited already did.
     std::size_t refresh_remote(std::chrono::steady_clock::time_point deadline =
                                    std::chrono::steady_clock::time_point::max());
     // A refresh for a request that found nothing: skipped when one finished within `fresh` (many
