@@ -699,6 +699,101 @@ void test_shared_prefix_outlives_the_conversations_on_it() {
     check(store.find("c0")->fetch_bytes == 3 * 1024, "an evicted conversation would download its shared prefix again");
 }
 
+// A conversation on a shared prefix moves from engine A to engine B (sticky routing changed), the
+// two sharing a bucket and a binding. B already holds the prefix, finds the conversation with one
+// listing on demand, sees only its latest turn, and downloads only the conversation's own bytes.
+// B's next write supersedes A's image and deletes its manifest, so the fleet keeps one image of
+// the conversation. A manifest whose deletion was lost (an engine killed before it ran) is
+// registered again, and the conversation's next write supersedes and deletes it again.
+void test_conversation_moves_between_engines_on_a_shared_prefix() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore a(remote_options(a_directory.path(), remote));
+    ContextStore b(remote_options(b_directory.path(), remote));
+    check(drained(a) && drained(b), "the start-up refreshes did not finish");
+
+    const auto header = pseudo_random(30, 9);
+    const auto prefix = pseudo_random(5 * 1024, 1); // five whole chunks
+    const auto own    = pseudo_random(8 * 1024, 2); // turn k holds the first k * 1024 bytes
+    std::vector<std::array<std::uint64_t, 2>> digests;
+    for (std::uint64_t frontier = 0; frontier <= 1000; ++frontier) { digests.push_back({frontier, 0xc0de}); }
+    auto shared           = describe("5a", 100);
+    shared.shared         = true;
+    shared.checkpoints[0] = {.frontier = 100, .digests = digests[100], .identity_tag = 7};
+    (void)a.put(shared, concat({header, prefix}), std::array{ContextStore::Region{30, prefix.size()}});
+    check(drained(a), "the prefix upload");
+    // B serves other conversations on the same prefix, so it holds the prefix already.
+    (void)b.refresh_remote();
+    check(b.load("5a").has_value(), "B could not fetch the shared prefix");
+
+    const auto put_turn_on = [&](ContextStore& store, std::uint32_t turn) {
+        remote->clock += 10;
+        const std::uint32_t tokens = 100 + 100 * turn;
+        auto conversation           = describe(std::string("c") + static_cast<char>('0' + turn), tokens);
+        conversation.checkpoints[0] = {.frontier = tokens, .digests = digests[tokens], .identity_tag = 7};
+        // A span: the digests it views must outlive the put.
+        const std::vector<std::array<std::uint64_t, 2>> prefix_digests(digests.begin(),
+                                                                       digests.begin() + tokens + 1);
+        conversation.prefix_digests = prefix_digests;
+        const std::vector<std::uint8_t> mine(own.begin(), own.begin() + 1024 * turn);
+        (void)store.put(conversation, concat({header, prefix, mine}),
+                        std::array{ContextStore::Region{30, prefix.size() + mine.size()}});
+        check(drained(store), "a turn's upload");
+    };
+    const auto manifest_ids = [&] {
+        std::scoped_lock lock(remote->mutex);
+        std::vector<std::string> ids;
+        for (const auto& [key, value] : remote->objects) {
+            const auto at = key.find("manifests/");
+            if (at != std::string::npos) { ids.push_back(key.substr(at + 10, key.find('.', at) - at - 10)); }
+        }
+        return ids;
+    };
+
+    for (std::uint32_t turn = 1; turn <= 3; ++turn) { put_turn_on(a, turn); }
+    check(manifest_ids() == std::vector<std::string>{"5a", "c3"}, "A's superseded turns stayed in the bucket");
+
+    // The conversation moves: B's lookup finds nothing, lists the bucket once, and finds turn 3.
+    check(!b.find("c3"), "B knew the conversation before listing");
+    (void)b.refresh_remote_since(std::chrono::steady_clock::now(),
+                                 std::chrono::steady_clock::now() + std::chrono::seconds(10));
+    const auto offered = b.find("c3");
+    check(offered && !offered->local, "B's lookup did not find the conversation in the bucket");
+    check(!b.find("c1") && !b.find("c2"), "B registered turns A had superseded");
+    check(offered && offered->fetch_bytes == 3 * 1024,
+          "B would download the shared prefix it holds, not only the conversation's own bytes");
+    const auto before = b.stats();
+    const auto loaded = b.load("c3");
+    const std::vector<std::uint8_t> mine3(own.begin(), own.begin() + 3 * 1024);
+    check(loaded && *loaded == concat({header, prefix, mine3}), "B fetched a different conversation");
+    check(b.stats().remote_download_bytes - before.remote_download_bytes == 3 * 1024,
+          "B downloaded more than the conversation's unique bytes");
+
+    // B continues the conversation: its write supersedes A's image and deletes A's manifest.
+    put_turn_on(b, 4);
+    check(manifest_ids() == std::vector<std::string>{"5a", "c4"},
+          "B's write did not delete the manifest A wrote");
+    check(b.stats().remote_retired >= 1, "the deletion was not counted");
+
+    // A deletion lost to a crash leaves turn 3's manifest in the bucket. A third engine puts it
+    // back the same way: it writes turn 3 exactly as A did (a shorter image supersedes nothing).
+    TempDirectory c_directory;
+    {
+        ContextStore c(remote_options(c_directory.path(), remote));
+        check(drained(c), "C's start-up refresh");
+        (void)c.load("5a");
+        put_turn_on(c, 3);
+    }
+    check(manifest_ids() == std::vector<std::string>{"5a", "c3", "c4"}, "the stale manifest was not planted");
+    (void)b.refresh_remote();
+    check(b.find("c3").has_value(), "B did not register the stale manifest");
+    // The conversation's next write supersedes the stale entry along with B's own last turn.
+    put_turn_on(b, 5);
+    check(manifest_ids() == std::vector<std::string>{"5a", "c5"},
+          "the next write did not delete a manifest whose deletion was lost");
+}
+
 // An image evicted while its upload waits keeps the files the upload needs; once the upload is
 // done a later eviction frees them, so the directory comes back within its budget.
 void test_eviction_waits_for_a_queued_upload() {
@@ -2249,6 +2344,7 @@ int main() {
     test_content_cuts_resynchronise_after_an_insertion();
     test_fetch_bytes_and_refresh_on_demand();
     test_shared_prefix_outlives_the_conversations_on_it();
+    test_conversation_moves_between_engines_on_a_shared_prefix();
     test_failed_upload_keeps_the_local_copy_and_releases_superseded();
     test_publication_survives_restart();
     test_load_reports_its_download();
