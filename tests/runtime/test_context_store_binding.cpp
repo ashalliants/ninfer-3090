@@ -14,6 +14,23 @@ int check(bool condition, const char* message) {
     return 1;
 }
 
+// A unique directory removed on scope exit, including when a check throws.
+struct TempDir {
+    std::filesystem::path path;
+    TempDir()
+        : path(std::filesystem::temp_directory_path() /
+               ("ninfer_context_store_binding_" +
+                std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()))) {
+        std::filesystem::create_directories(path);
+    }
+    ~TempDir() {
+        std::error_code ignored;
+        std::filesystem::remove_all(path, ignored);
+    }
+    TempDir(const TempDir&)            = delete;
+    TempDir& operator=(const TempDir&) = delete;
+};
+
 } // namespace
 
 // A stored session binds to the artifact's id (LoadSummary::artifact_id, which construct_model and
@@ -26,7 +43,9 @@ int main() {
     load.model_name   = "model";
     load.artifact_id  = "71" + std::string(30, '0');
 
-    const auto path = std::filesystem::temp_directory_path() / "ninfer_context_store_binding.bin";
+    // A directory of its own, named by the clock, so a parallel run never shares or removes it.
+    const TempDir dir;
+    const auto path = dir.path / "artifact.bin";
     { std::ofstream(path) << "x"; }
     ninfer::EngineOptions options;
     options.artifact_path = path;
@@ -50,6 +69,5 @@ int main() {
     failures += check(context_store_binding(options, other) != written,
                       "an empty artifact id shared the binding of a filled one");
 
-    std::filesystem::remove(path);
     return failures;
 }
