@@ -592,6 +592,23 @@ void test_header_is_stored_as_a_delta() {
     check(loaded && *loaded == concat({second, kv}), "a content-chunked header did not round-trip");
 }
 
+// Content-defined cuts resynchronise: bytes inserted at the front of the header shift everything
+// after them, yet the cuts after the insertion land where they did before and the rest is reused.
+void test_content_cuts_resynchronise_after_an_insertion() {
+    TempDirectory directory;
+    ContextStore store(options_for(directory.path()));
+    const auto header   = pseudo_random(1U << 20U, 21);
+    const auto inserted = concat({pseudo_random(100, 22), header});
+    const auto tail     = pseudo_random(2000, 23);
+    (void)store.put(describe("0a"), concat({header, tail}),
+                    std::array{ContextStore::Region{header.size(), tail.size()}});
+    const auto result = store.put(describe("0b"), concat({inserted, tail}),
+                                  std::array{ContextStore::Region{inserted.size(), tail.size()}});
+    // Only the chunk or two around the insertion are new (cuts are 16-256 KiB apart).
+    check(result.chunk_bytes_reused >= header.size() - (512U << 10U),
+          "the bytes after an insertion were not reused: the cuts did not resynchronise");
+}
+
 // Each state its own region: a state put again behind a newer one, at another offset, is reused
 // whole, although its size is no multiple of the chunk size.
 void test_regions_are_chunked_from_their_own_start() {
@@ -625,12 +642,17 @@ void test_fetch_bytes_and_refresh_on_demand() {
         check(drained(store), "upload");
     }
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    const auto asked    = std::chrono::steady_clock::now();
     const int lists     = remote->lists;
-    check(other.refresh_remote_unless_fresh(std::chrono::milliseconds(0), deadline) == 1,
+    check(other.refresh_remote_since(asked, deadline) == 1,
           "a refresh on demand did not register the image");
-    check(other.refresh_remote_unless_fresh(std::chrono::seconds(60), deadline) == 0 &&
-              remote->lists == lists + 1,
-          "a refresh just after another listed the bucket again");
+    // Asked before that listing was taken: it already shows the bucket as of then.
+    check(other.refresh_remote_since(asked, deadline) == 0 && remote->lists == lists + 1,
+          "a request asking before a complete listing listed the bucket again");
+    // Asked after it: a listing taken earlier may miss what was uploaded since, so it lists again.
+    check(other.refresh_remote_since(std::chrono::steady_clock::now(), deadline) == 0 &&
+              remote->lists == lists + 2,
+          "a request asking after the last listing was not given a new one");
     const auto info = other.find("0a");
     check(info && !info->local && info->fetch_bytes == 3000, "the bytes to fetch were not reported");
     (void)other.load("0a");
@@ -2224,6 +2246,7 @@ int main() {
     test_eviction_waits_for_a_queued_upload();
     test_header_is_stored_as_a_delta();
     test_regions_are_chunked_from_their_own_start();
+    test_content_cuts_resynchronise_after_an_insertion();
     test_fetch_bytes_and_refresh_on_demand();
     test_shared_prefix_outlives_the_conversations_on_it();
     test_failed_upload_keeps_the_local_copy_and_releases_superseded();

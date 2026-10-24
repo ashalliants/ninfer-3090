@@ -224,17 +224,17 @@ public:
     // `final_flush`, queued refreshes, prefetches and touches are dropped first so only uploads use
     // the budget.
     bool flush_remote(std::chrono::steady_clock::time_point deadline, bool final_flush = false);
-    // With a remote: lists it now and registers images it holds that this store does not. Also done
-    // in the background every remote_refresh. Returns the number of images added.
-    // Lists the bucket and registers images other engines left there. Stops reading manifests at
-    // `deadline`, waiting for another refresh counted; an incomplete listing never removes anything
-    // from the index. Returns 0 without listing when one that finished while it waited already did.
+    // With a remote: lists the bucket and registers images other engines left there that this
+    // store does not hold. Also done in the background every remote_refresh. Returns the number of
+    // images added. Stops reading manifests at `deadline`, waiting for another refresh counted; an
+    // incomplete listing never removes anything from the index.
     std::size_t refresh_remote(std::chrono::steady_clock::time_point deadline =
                                    std::chrono::steady_clock::time_point::max());
-    // A refresh for a request that found nothing: skipped when one finished within `fresh` (many
-    // requests arriving together list the bucket once). Refreshes never run two at a time.
-    std::size_t refresh_remote_unless_fresh(std::chrono::milliseconds fresh,
-                                            std::chrono::steady_clock::time_point deadline);
+    // The same, for a caller that needs the bucket as of `asked` (a request that found nothing):
+    // skipped when a complete listing taken at or after `asked` exists, as when one ran while this
+    // waited, so requests arriving together list the bucket once. Refreshes never run two at a time.
+    std::size_t refresh_remote_since(std::chrono::steady_clock::time_point asked,
+                                     std::chrono::steady_clock::time_point deadline);
     // With a remote: fetches the image's missing chunks in the background so a later load() is
     // local. False when there is nothing to do.
     bool prefetch(const std::string& id);
@@ -461,7 +461,7 @@ private:
     std::unordered_map<std::string, RemoteFailure> remote_failed_;
     // Superseded manifests whose deletion from the bucket failed: retried after the next upload.
     std::vector<std::string> retire_backlog_;
-    // Serializes refreshes; `last_refresh_` is when the last complete one finished. Timed, so a
+    // Serializes refreshes; `last_refresh_` is when the last complete one took its listing. Timed, so a
     // request waiting for a listing gives up at its deadline rather than behind a slow refresh.
     std::timed_mutex refresh_mutex_;
     std::chrono::steady_clock::time_point last_refresh_{};

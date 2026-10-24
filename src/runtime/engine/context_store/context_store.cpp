@@ -1930,11 +1930,16 @@ void ContextStore::touch_remote_image(const std::string& id) {
         }
         if (complete) {
             {
-                // Every chunk and the manifest are confirmed in the bucket.
+                // Every chunk and the manifest are confirmed in the bucket; recorded on disk too, so
+                // a restart still knows (the manifest touched or put back is the one on disk).
+                std::scoped_lock io(io_mutex_);
                 std::scoped_lock lock(mutex_);
                 const auto found = entries_.find(id);
                 if (found != entries_.end() && found->second.generation == generation) {
                     found->second.published = true;
+                    try {
+                        write_published_locked(id, read_whole_file(manifest_path(id)));
+                    } catch (const std::exception&) {}
                 }
             }
             std::scoped_lock lock(remote_mutex_);
@@ -2088,30 +2093,26 @@ void ContextStore::settle_failed_fetch(const std::string& id, std::uint64_t gene
 }
 
 std::size_t ContextStore::refresh_remote(std::chrono::steady_clock::time_point deadline) {
+    return refresh_remote_since(std::chrono::steady_clock::now(), deadline);
+}
+
+std::size_t ContextStore::refresh_remote_since(std::chrono::steady_clock::time_point asked,
+                                               std::chrono::steady_clock::time_point deadline) {
     if (!options_.remote) { return 0; }
-    const auto asked = std::chrono::steady_clock::now();
     // The wait for another refresh counts against the deadline too.
     std::unique_lock refreshing(refresh_mutex_, std::defer_lock);
     if (!refreshing.try_lock_until(deadline)) { return 0; }
-    // One that finished while this waited (the refresh queued at start-up) listed the bucket after
-    // this was asked for: listing it again would only repeat that work.
+    // A complete listing taken after `asked` (one that ran while this waited) already shows
+    // everything this one would; one taken before it may not, however recently it finished.
     if (last_refresh_ >= asked) { return 0; }
-    return refresh_remote_locked(deadline);
-}
-
-std::size_t ContextStore::refresh_remote_unless_fresh(std::chrono::milliseconds fresh,
-                                                      std::chrono::steady_clock::time_point deadline) {
-    if (!options_.remote) { return 0; }
-    std::unique_lock refreshing(refresh_mutex_, std::defer_lock);
-    if (!refreshing.try_lock_until(deadline)) { return 0; }
-    // Waiting for the lock may have been waiting for exactly the refresh asked for.
-    if (std::chrono::steady_clock::now() - last_refresh_ < fresh) { return 0; }
     return refresh_remote_locked(deadline);
 }
 
 std::size_t ContextStore::refresh_remote_locked(std::chrono::steady_clock::time_point deadline) {
     std::size_t added = 0;
     bool truncated    = false;
+    // The listing shows the bucket as it was when it was asked for, not when it ends.
+    const auto listed_at = std::chrono::steady_clock::now();
     try {
         const std::string manifests = options_.remote_prefix + "manifests/";
         const std::vector<ObjectInfo> objects = options_.remote->list(manifests);
@@ -2192,7 +2193,7 @@ std::size_t ContextStore::refresh_remote_locked(std::chrono::steady_clock::time_
         for (const std::string& id : gone) { remove_entry_locked(id, false); }
         stats_.remote_removed += gone.size();
         ++stats_.remote_refreshes;
-        if (!truncated) { last_refresh_ = std::chrono::steady_clock::now(); }
+        if (!truncated) { last_refresh_ = listed_at; }
     } catch (const std::exception&) {
         std::scoped_lock lock(mutex_);
         ++stats_.remote_download_failures;

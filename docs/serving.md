@@ -623,8 +623,8 @@ The local directory becomes a cache of the bucket.
   exception is a configured prompt graft: it is matched by its file's size and modification time, so
   sessions that start from a graft pass between engines only when the graft file is the same copy.
 - A request that finds nothing usable, and has more than about two seconds of prefill ahead, has
-  the bucket listed once more before it prefills (at most once every two seconds for all such
-  requests together, waiting at most five seconds), in case another engine stored the session
+  the bucket listed once more before it prefills (waiting at most five seconds; requests that
+  arrive while a listing is taken share the next one), in case another engine stored the session
   since the last listing: a conversation that just moved here is found.
 - A request that would resume from a session only the bucket holds waits for it like any stored
   session (see above): the background reader downloads the missing chunks (several at a time, each

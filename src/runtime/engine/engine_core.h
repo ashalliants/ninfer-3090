@@ -3547,8 +3547,6 @@ private:
 
     // A request that would prefill for less than this does not wait for a bucket listing.
     static constexpr auto kStoreLookupMinimumPrefill = std::chrono::seconds(2);
-    // Requests arriving within this of a listing use it rather than list the bucket again.
-    static constexpr auto kStoreLookupFresh = std::chrono::seconds(2);
     // The longest a request waits for the listing.
     static constexpr auto kStoreLookupBudget = std::chrono::seconds(5);
 
@@ -3688,9 +3686,10 @@ private:
             if (const auto started = Clock::now(); started < task.request->hydration_deadline) {
                 try {
                     if (task.lookup) {
-                        (void)store_.store->refresh_remote_unless_fresh(
-                            std::chrono::duration_cast<std::chrono::milliseconds>(kStoreLookupFresh),
-                            task.request->hydration_deadline);
+                        // The bucket as of when the request looked: a listing taken since (for
+                        // another request) serves it too.
+                        (void)store_.store->refresh_remote_since(task.request->hydration_started,
+                                                                 task.request->hydration_deadline);
                     } else {
                         task.bytes = store_.store->load(task.id, false, &task.fetch);
                     }
@@ -3831,18 +3830,25 @@ private:
         }
         for (auto& task : done) {
             const auto& request = task.request;
-            if (!request->hydrating) { continue; } // gave up at its deadline
-            if (task.lookup) {
-                finish_store_lookup(request);
-                continue;
+            // A completed fetch measures the fetch rate whatever then becomes of the request
+            // (gone, already covered, or an import without room).
+            if (task.bytes && task.fetch.fetched_bytes > 0) {
+                observe_remote_fetch(task.fetch.fetched_bytes, task.fetch.fetch_ns);
             }
+            if (!request->hydrating) { continue; } // gave up at its deadline
             bool waiting = false;
             {
                 std::lock_guard lock(queue_mutex_);
                 waiting = std::find(pending_.begin(), pending_.end(), request) != pending_.end();
             }
             if (!waiting) {
-                request->hydrating = false;
+                // Cancelled or failed meanwhile: settle nothing for it, lookup or read.
+                request->hydrating    = false;
+                request->store_lookup = false;
+                continue;
+            }
+            if (task.lookup) {
+                finish_store_lookup(request);
                 continue;
             }
             if (task.bytes && cache_covers_hydration(request)) {
@@ -3858,9 +3864,8 @@ private:
                     imported = import_for_request(request, *task.bytes, task.id);
                 } catch (const std::invalid_argument&) { imported = false; }
                 if (imported) {
-                    // The download teaches the download rate; the rest of the read (the local
+                    // The fetch taught the fetch rate above; the rest of the read (the local
                     // files read, verified and reassembled) and the import teach the disk's.
-                    observe_remote_fetch(task.fetch.fetched_bytes, task.fetch.fetch_ns);
                     observe_store_read(task.bytes->size(),
                                        task.read_ns - std::min(task.read_ns, task.fetch.fetch_ns) +
                                            static_cast<std::uint64_t>(
