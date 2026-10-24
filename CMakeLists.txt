@@ -14,7 +14,16 @@ if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^(80|86|89)$")
     "'${CMAKE_CUDA_ARCHITECTURES}'")
 endif()
 
-project(ninfer LANGUAGES C CXX CUDA)
+# NINFER_HOST_ONLY configures a tree with no CUDA compiler: only the tests listed in
+# tests/cmake/HostOnlyTests.cmake, which need no kernels, are built (host code against the CUDA
+# headers and runtime), so CI can run them on a machine with the CUDA runtime package and no nvcc.
+# See "Host-only builds" in docs/maintainer/build-system.md.
+option(NINFER_HOST_ONLY "Configure without a CUDA compiler and build only the host-only tests" OFF)
+
+project(ninfer LANGUAGES C CXX)
+if(NOT NINFER_HOST_ONLY)
+  enable_language(CUDA)
+endif()
 
 # Before any target exists, so every target picks up the compiler launcher.
 include(cmake/CompilerCache.cmake)
@@ -109,10 +118,16 @@ if(CMAKE_GENERATOR MATCHES "Ninja")
   set(CMAKE_JOB_POOL_LINK ninfer_link)
 endif()
 
-if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.8)
+if(NOT NINFER_HOST_ONLY AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.8)
   message(FATAL_ERROR
     "NInfer requires CUDA 12.8 or newer; found CUDA compiler "
     "${CMAKE_CUDA_COMPILER_VERSION}")
+endif()
+if(NINFER_HOST_ONLY)
+  # The apps and benchmarks link the kernels. (Plain variables: the cached options keep their
+  # values for when the tree is configured normally again.)
+  set(NINFER_BUILD_APPS OFF)
+  set(NINFER_BUILD_BENCHMARKS OFF)
 endif()
 
 # Tests also exercise product input, logging and protocol adapters.
@@ -125,7 +140,12 @@ include(cmake/Dependencies.cmake)
 include(cmake/NinferTargets.cmake)
 
 # --- Subdirectories ----------------------------------------------------------
-add_subdirectory(src)
+if(NINFER_HOST_ONLY)
+  # Only what the host-only tests link is built; the rest (the kernels above all) cannot be.
+  add_subdirectory(src EXCLUDE_FROM_ALL)
+else()
+  add_subdirectory(src)
+endif()
 if(NINFER_BUILD_APPS)
   add_subdirectory(apps)
   add_subdirectory(tools)

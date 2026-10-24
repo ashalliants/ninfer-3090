@@ -11,6 +11,8 @@
 # a skip. Exit code 0 is not enough: ninfer_multi_gpu_test prints "SKIP: no usable CUDA device"
 # and still exits 0, and ninfer_vocabulary_transcode_test skips only its GPU half. Also check the
 # test's sources for CUDA calls (cuda*, DeviceBuffer, PinnedHostBuffer, kernel launches).
+#
+# A cpu test that links no kernel also belongs on HostOnlyTests.cmake, which CI builds without nvcc.
 set(NINFER_CPU_ONLY_TESTS
   ninfer_anthropic_schema_test
   ninfer_artifact_reader_test
@@ -98,9 +100,15 @@ foreach(test IN LISTS NINFER_CPU_ONLY_TESTS)
     message(FATAL_ERROR "NINFER_CPU_ONLY_TESTS names ${test}, which is not a registered test")
   endif()
 endforeach()
+foreach(test IN LISTS NINFER_HOST_ONLY_TESTS)
+  if(NOT test IN_LIST NINFER_CPU_ONLY_TESTS)
+    message(FATAL_ERROR "NINFER_HOST_ONLY_TESTS names ${test}, which is not on the cpu list")
+  endif()
+endforeach()
 
 foreach(test IN LISTS ninfer_all_tests)
-  if(test IN_LIST NINFER_CPU_ONLY_TESTS)
+  # A host-only tree registers every test but builds only its own: only those are cpu there.
+  if(test IN_LIST NINFER_CPU_ONLY_TESTS AND (NOT NINFER_HOST_ONLY OR test IN_LIST NINFER_HOST_ONLY_TESTS))
     set_property(TEST ${test} APPEND PROPERTY LABELS cpu)
     set_property(TEST ${test} APPEND PROPERTY ENVIRONMENT CUDA_VISIBLE_DEVICES=-1)
   else()

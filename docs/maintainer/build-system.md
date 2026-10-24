@@ -19,6 +19,7 @@ The default configuration is Release. Ninja links and archives share the single-
 | `BUILD_TESTING` | OFF | C++ tests and registered Python interoperability tests |
 | `NINFER_BUILD_BENCHMARKS` | OFF | Op, model, Engine and context-cost benchmarks |
 | `NINFER_COMPILER_CACHE` | ON | route C, C++ and CUDA compilation through ccache when it is installed; see [compiler cache](#compiler-cache) |
+| `NINFER_HOST_ONLY` | OFF | configure without a CUDA compiler and build only the host-only tests; see [host-only builds](#host-only-builds) |
 
 Apps or tests enable the internal product support components: media acquisition, prompt input,
 logging and serving. This is one derived condition, not a separate user option. FFmpeg belongs
@@ -65,6 +66,27 @@ placeholder with the interpreter from the selected environment:
 Configure that environment with `cmake --preset local`. Compiler paths may also be supplied here;
 changing compilers requires a fresh build directory. There is no tools option, installed SDK,
 package export or configure-time dependency download.
+
+## Host-only builds
+
+`-DNINFER_HOST_ONLY=ON -DBUILD_TESTING=ON` configures C and C++ only, with no `nvcc`. It builds
+the cpu tests that link no kernel, listed in `tests/cmake/HostOnlyTests.cmake`, against the CUDA
+headers, runtime and driver stub. That is what CI runs on a hosted runner (the `host-tests` job in
+`.github/workflows/host-checks.yml`): a cold build takes about half a minute on 12 cores.
+
+- `find_package(CUDAToolkit)` still runs. Without `nvcc` it needs `CUDAToolkit_ROOT` and a
+  `version.json` (or `version.txt`) in that root.
+- `src/` is `EXCLUDE_FROM_ALL`, so only the libraries those tests link are built. `ninfer_core`
+  and `ninfer_artifact` compile their host-code `.cu` files as C++ and leave out the files that
+  define kernels (`ninfer_host_only_sources` in `cmake/NinferTargets.cmake`).
+- Every other test is still declared and registered, so the registrations that configure it keep
+  working, but it is never built and is labelled `gpu`. In this tree `ctest -L cpu` runs exactly
+  the host-only tests.
+- Apps and benchmarks are forced off.
+
+A normal configuration is unaffected: the option changes nothing unless it is ON. A cpu test
+belongs on the host-only list when nothing it links needs a kernel (not `ninfer_ops` or the model,
+engine or serve libraries above it). One that does fails to link in the host-only tree.
 
 ## Compiler cache
 
