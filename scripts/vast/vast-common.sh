@@ -16,5 +16,12 @@ vast_ssh_target() {
   vast_user="${url%%@*}"; local hostport="${url#*@}"
   vast_host="${hostport%:*}"; vast_port="${hostport##*:}"
 }
-vast_ssh_opts=(-i "${NINFER_VAST_KEY:-$HOME/.ssh/id_ed25519}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-               -o LogLevel=ERROR -o ConnectTimeout=25 -o ServerAliveInterval=30)
+# The key Vast has for this account: NINFER_VAST_KEY, else ~/.ssh/id_rsa_ash (the one release-away-from-3090.md
+# documents), else ~/.ssh/id_ed25519. IdentityAgent=none and IdentitiesOnly stop ssh offering other keys.
+vast_key="${NINFER_VAST_KEY:-}"
+if [[ -z "$vast_key" ]]; then
+  for k in "$HOME/.ssh/id_rsa_ash" "$HOME/.ssh/id_ed25519"; do [[ -f "$k" ]] && { vast_key="$k"; break; }; done
+fi
+[[ -f "$vast_key" ]] || { echo "No ssh key for Vast: set NINFER_VAST_KEY." >&2; return 1 2>/dev/null || exit 1; }
+vast_ssh_opts=(-i "$vast_key" -o IdentityAgent=none -o IdentitiesOnly=yes -o StrictHostKeyChecking=no
+               -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=25 -o ServerAliveInterval=30)

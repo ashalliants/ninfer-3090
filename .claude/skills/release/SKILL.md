@@ -146,10 +146,11 @@ ask the user up front, in one `AskUserQuestion`, how Linux is built (Vast, the d
 is built via `powershell.exe` from WSL, and that a **new** Vast instance is to be rented and destroyed
 afterwards (existing instances may be serving live traffic: never touch them; `scripts/vast/` only ever
 touches the instance in its own state file).
-- Windows: `scripts/release-windows-wsl.sh` (committed HEAD). Start it in the background right after the
-  VERSION commit, with the notes already committed if you can; see "Windows without a card, from WSL" in
+- Windows: `scripts/release-windows-wsl.sh` (committed HEAD; it refuses unless `RELEASE_NOTES_X.Y.Z.md` is
+  committed in it). Order: VERSION commit, then a notes commit (a draft is fine; verification text can be
+  refined and the zip repackaged), then start it in the background; see "Windows without a card, from WSL" in
   `docs/maintainer/release-process.md`.
-- Linux: `scripts/vast/vast-up.sh`, then `vast-release-linux.sh <repo>`, then `vast-destroy.sh`.
+- Linux: `scripts/vast/vast-up.sh <repo>` (failures destroy the instance), then `vast-release-linux.sh <repo>`, then `vast-destroy.sh`.
   Put a backstop (`send_later`) to destroy the instance too.
 - The Windows archive then cannot be run: the notes' Verification section must say built and
   dependency-checked only, and step 6's stripped-`PATH` and card smoke tests for Windows are unverified.

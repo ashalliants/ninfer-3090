@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Rent a Vast RTX 3090 for a Linux release build, install the build dependencies, arm an on-box kill
 # switch, and fetch the 27B model the smoke test serves. Returns when the instance is ready.
-#   ./vast-up.sh [kill-after-hours]      (default 3; the box destroys itself after that, whatever happens)
+#   ./vast-up.sh [repo-dir] [kill-after-hours]   (repo-dir defaults to this repository; the box destroys
+#                                                itself after the hours, default 3, whatever happens)
 # Needs the `vastai` CLI logged in. Cost is about $0.4/hour; a release takes about an hour. Destroy it
 # with ./vast-destroy.sh as soon as the archive is back.
 set -euo pipefail
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "$root/vast-common.sh"
-hours="${1:-3}"
+repo="$(cd -- "${1:-$root/../..}" && pwd)"
+hours="${2:-3}"
 
 if [[ -s "$state_file" ]]; then
   echo "Instance $(cat "$state_file") is already tracked; destroy it first (vast-destroy.sh)." >&2; exit 1
@@ -32,7 +34,8 @@ cat > /root/killswitch.sh <<'KS'
 #!/bin/bash
 sleep $(( hours * 3600 ))
 for i in 1 2 3 4 5; do
-  curl -s -X DELETE "https://console.vast.ai/api/v0/instances/\$CONTAINER_ID/" -H "Authorization: Bearer \$CONTAINER_API_KEY" && break
+  curl -fsS --connect-timeout 10 --max-time 30 -X DELETE "https://console.vast.ai/api/v0/instances/\$CONTAINER_ID/" \\
+    -H "Authorization: Bearer \$CONTAINER_API_KEY" && break
   sleep 10
 done
 poweroff -f || halt -f
@@ -52,6 +55,8 @@ new="$(vastai create instance "$offer" --image vastai/base-image:cuda-12.8.1-aut
   --onstart "$onstart" --label ninfer-release --raw | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["new_contract"])')"
 rm -f "$onstart"
 echo "$new" > "$state_file"
+# From here on any failure destroys the instance: it bills, and the state file would block a retry.
+trap 'rc=$?; if (( rc != 0 )); then echo "vast-up failed: destroying instance $new" >&2; echo y | vastai destroy instance "$new" >&2 || true; rm -f "$state_file"; fi' EXIT
 echo "Rented instance $new. Kill switch: ${hours} h. Waiting for it to boot..."
 
 # A host that never leaves "loading" burns money: give up after 8 minutes (destroy and re-run).
@@ -60,14 +65,16 @@ for i in $(seq 1 32); do
   [[ "$status" == running ]] && break
   sleep 15
 done
-[[ "$status" == running ]] || { echo "Instance still '$status' after 8 minutes: ./vast-destroy.sh and try again." >&2; exit 1; }
+[[ "$status" == running ]] || { echo "Instance still '$status' after 8 minutes; destroying it. Run vast-up.sh again (the host is the problem)." >&2; exit 1; }
 for i in $(seq 1 60); do "$root/vast-dev-ssh.sh" 'test -f /root/deps.done' 2>/dev/null && break; sleep 10; done
 "$root/vast-dev-ssh.sh" 'test -f /root/deps.done' || { echo "Dependencies did not install (see /root/onstart log)." >&2; exit 1; }
 "$root/vast-dev-ssh.sh" 'nvidia-smi -L; nproc'
 
 echo "==> Fetching the 27B model for the smoke test (about 19 GB)"
-"$root/vast-dev-ssh.sh" 'rm -f /root/.model-ready; mkdir -p /root/models /root/dl && cd /root/dl &&
-  curl -fsSL https://raw.githubusercontent.com/ashalliants/ninfer-3090/master/scripts/download-model.sh -o download-model.sh &&
-  NINFER_MODEL_DIR=/root/models bash download-model.sh qwen38-27b > /root/model-dl.log 2>&1 && touch /root/.model-ready'
-"$root/vast-dev-ssh.sh" 'test -f /root/.model-ready' || { echo "Model download failed: tail /root/model-dl.log on the instance." >&2; exit 1; }
+# The downloader comes from the release commit in repo-dir, not from a branch on GitHub: the release is the
+# only source of release-time behaviour, and nothing mutable is executed as root on the box.
+git -C "$repo" show HEAD:scripts/download-model.sh | "$root/vast-dev-ssh.sh" 'rm -f /root/.model-ready; mkdir -p /root/models /root/dl && cat > /root/dl/download-model.sh'
+"$root/vast-dev-ssh.sh" 'cd /root/dl && NINFER_MODEL_DIR=/root/models bash download-model.sh qwen38-27b > /root/model-dl.log 2>&1 && touch /root/.model-ready' || true
+"$root/vast-dev-ssh.sh" 'test -f /root/.model-ready' || { echo "Model download failed (tail /root/model-dl.log on the instance, now destroyed)." >&2; exit 1; }
 echo "Ready. Next: ./vast-release-linux.sh <repo-dir>"
+trap - EXIT

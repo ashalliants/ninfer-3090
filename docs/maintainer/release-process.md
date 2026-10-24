@@ -103,9 +103,9 @@ and record them here.
 - **Linux archive: a rented Vast 3090.** Run from `scripts/vast/` (all four scripts below use a state file,
   `~/.cache/ninfer-release/instance_id`, so they can only touch the instance they rented, never another box
   on the same account that may be serving traffic):
-  1. `./vast-up.sh [hours]` rents the cheapest verified 3090 with at least 16 effective cores, installs the
+  1. `./vast-up.sh [repo-dir] [hours]` rents the cheapest verified 3090 with at least 16 effective cores, installs the
      build dependencies, arms an on-box kill switch (default 3 h) and downloads the 27B model for the smoke
-     test. About 5 minutes, about $0.4/hour. A host stuck in "loading" is destroyed and re-rented.
+     test. About 5 minutes, about $0.4/hour. A host stuck in "loading", or any failure after the rental, destroys the instance; run it again. The ssh key is `NINFER_VAST_KEY`, else `~/.ssh/id_rsa_ash`, else `~/.ssh/id_ed25519`, always with `IdentityAgent=none`. The model downloader sent to the box is the one in the release commit.
   2. `./vast-release-linux.sh <repo>` (the release commit checked out and clean) syncs the commit, builds
      `ninfer ninfer-serve ninfer_bench` from a `git archive` of it, runs `package-release.sh`, checks
      `--version`, `ldd` and the checksums, serves one chat completion with the default profile on the real

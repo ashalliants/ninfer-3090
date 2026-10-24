@@ -19,7 +19,9 @@ work=/mnt/c/ninfer-release
 [[ -z "$(git -C "$repo" status --porcelain --untracked-files=no)" ]] || { echo "Tracked changes in $repo: commit them first." >&2; exit 1; }
 commit="$(git -C "$repo" rev-parse HEAD)"
 version="$(tr -d '\r\n' < "$repo/VERSION")"
-[[ -f "$repo/RELEASE_NOTES_${version%%-*}.md" ]] || { echo "Missing RELEASE_NOTES_${version%%-*}.md in the commit." >&2; exit 1; }
+# In the commit, not just on disk: an untracked file passes a filesystem test but is absent from the bundle.
+git -C "$repo" cat-file -e "$commit:RELEASE_NOTES_${version%%-*}.md" 2>/dev/null ||
+  { echo "RELEASE_NOTES_${version%%-*}.md is not committed in $commit: commit it first." >&2; exit 1; }
 mkdir -p "$work"
 
 git -C "$repo" bundle create "$work/release.bundle" HEAD >/dev/null 2>&1
