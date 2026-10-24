@@ -149,8 +149,10 @@ counters, so the gateway's view of usage does not change.
 Runs layers `0 .. L-1` over `U` in prefill chunks, attending to `C`'s exact KV for the attention layers
 below `L` and starting from `C`'s GDN state. At the filter layer `L` (a full-attention layer; the 27B has
 them at 3, 7, 11, 15, ...) it computes only K for every token of `U` and Q for the last `q` tokens of the
-prompt, and accumulates per-key attention mass: softmax over all keys of `C ∪ U` per query row and head,
-summed over the `q` rows and all heads. Layers above `L`, the MLP of layer `L`, and the LM head do not run.
+prompt, and accumulates per-key attention mass: softmax over the keys of `U` per query row and head,
+summed over the `q` rows and all heads. (`C` is always kept, so its keys are left out of the scoring; this
+also means the scoring never reads the cache's KV dtype. The layer-`L` keys of `U` go to a BF16 scratch
+buffer, 2 KB/token, ~200 MB at 100K. My call, made while planning.) Layers above `L`, the MLP of layer `L`, and the LM head do not run.
 
 - The scout must leave **no trace** in the sequence: `C`'s GDN state and KV are what the main pass starts
   from. Its KV rows for layers `< L` and its GDN states go to scratch that is released when the pass ends.
@@ -158,6 +160,11 @@ summed over the `q` rows and all heads. Layers above `L`, the MLP of layer `L`, 
   `L`=15, ~25% of a full prefill's KV), not a full prefill's. If the builder finds per-layer scratch
   impractical, the fallback of reserving full pages for `U` during the scout is acceptable for the first
   version only if it is recorded as a known gap.
+  **v1 takes the fallback (my call, made while planning):** a page group holds every Main layer
+  (`paged-kv-cache.md`, page-group IDs), so per-layer scratch needs a multi-plane KV view that does not
+  exist. The scout writes its attention layers' KV into the sequence's own pages; pages above the kept
+  frontier are released when the scout ends. Peak KV is today's, held for the ~15 s scout instead of
+  ~55 s, then ~20%. Only the GDN states of layers `< L` are copied to scratch (~40 MB) and restored.
 - Scout chunks are ordinary prefill steps for the scheduler (stall budget, yield, layer slices apply as
   they do for any text prefill), and the backlog gauge predicts scout plus main pass.
 
