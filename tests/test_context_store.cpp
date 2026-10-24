@@ -387,6 +387,7 @@ public:
         gate();
         std::scoped_lock lock(mutex);
         if (down) { throw std::runtime_error("the bucket is unreachable"); }
+        ++lists;
         std::vector<ninfer::ObjectInfo> out;
         for (const auto& [key, value] : objects) {
             if (key.rfind(prefix, 0) == 0) {
@@ -435,6 +436,7 @@ public:
     int touches        = 0;
     int chunk_gets     = 0;
     int manifest_gets  = 0;
+    int lists          = 0;
 
 private:
     void gate() {
@@ -535,6 +537,143 @@ void test_upload_delay_uploads_a_burst_of_turns_once() {
     const auto loaded = other.load("d");
     check(loaded && *loaded == store.load("d").value_or(std::vector<std::uint8_t>{}),
           "the coalesced upload is incomplete");
+}
+
+// A session header as the models write one: per-token tables one after another (token ids, types,
+// three position axes, rewrite frontiers, digests), each `tokens` long, so a later turn grows every
+// table at its end and moves every table after the first.
+std::vector<std::uint8_t> session_header(std::uint32_t tokens) {
+    std::vector<std::uint8_t> out;
+    const auto table = [&](std::size_t bytes_per_token, std::uint32_t seed) {
+        const auto all = pseudo_random(200'000 * bytes_per_token, seed); // the same stream every turn
+        out.insert(out.end(), all.begin(), all.begin() + static_cast<std::ptrdiff_t>(tokens * bytes_per_token));
+    };
+    table(4, 11);
+    table(1, 12);
+    table(4, 13);
+    table(4, 14);
+    table(4, 15);
+    table(4, 16);
+    table(16, 17);
+    return out;
+}
+
+// The header between the regions is cut by content: a turn that adds 1 % of tokens writes a few
+// chunks of it, not all of it, and the manifest stays a few KB however long the session is.
+void test_header_is_stored_as_a_delta() {
+    TempDirectory directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore store(remote_options(directory.path(), remote));
+    const auto kv     = pseudo_random(6000, 3);
+    const auto first  = session_header(50'000); // 1.85 MB
+    const auto second = session_header(50'500);
+    const auto put    = [&](const std::string& id, const std::vector<std::uint8_t>& header) {
+        return store.put(describe(id), concat({header, kv}),
+                         std::array{ContextStore::Region{header.size(), kv.size()}});
+    };
+    (void)put("0a", first);
+    check(drained(store), "the first turn did not upload");
+    const auto uploaded_before = store.stats().remote_upload_bytes;
+    // About two chunks around the end of each of the seven tables (~0.5 MB a turn whatever the
+    // header's size; here, at 50k tokens, about a quarter of it).
+    const auto written = put("0b", second);
+    check(written.chunk_bytes_written < second.size() / 3,
+          "a turn that grew the header by 1 % rewrote most of it");
+    check(drained(store), "the second turn did not upload");
+    check(store.stats().remote_upload_bytes - uploaded_before < second.size() / 3,
+          "a turn that grew the header by 1 % uploaded most of it");
+    std::size_t manifest_bytes = 0;
+    for (const auto& [key, value] : remote->objects) {
+        if (key.find("0b.manifest") != std::string::npos) { manifest_bytes = value.first.size(); }
+    }
+    check(manifest_bytes > 0 && manifest_bytes < 4096, "the manifest carries the header");
+    const auto loaded = store.load("0b");
+    check(loaded && *loaded == concat({second, kv}), "a content-chunked header did not round-trip");
+}
+
+// Each state its own region: a state put again behind a newer one, at another offset, is reused
+// whole, although its size is no multiple of the chunk size.
+void test_regions_are_chunked_from_their_own_start() {
+    TempDirectory directory;
+    ContextStore store(options_for(directory.path())); // 1 KiB chunks
+    const auto a = pseudo_random(2500, 1);
+    const auto b = pseudo_random(2500, 2);
+    const auto c = pseudo_random(2500, 3);
+    (void)store.put(describe("0a"), concat({pseudo_random(30, 9), a, b}),
+                    std::array{ContextStore::Region{30, 2500}, ContextStore::Region{2530, 2500}});
+    const auto result =
+        store.put(describe("0b"), concat({pseudo_random(30, 9), c, a, b}),
+                  std::array{ContextStore::Region{30, 2500}, ContextStore::Region{2530, 2500},
+                             ContextStore::Region{5030, 2500}});
+    check(result.chunk_bytes_written == 2500 && result.chunk_bytes_reused == 5000,
+          "states that moved were written again");
+}
+
+// An image only the bucket holds reports the bytes a load would download; a refresh asked for
+// by a request lists the bucket once however many ask together.
+void test_fetch_bytes_and_refresh_on_demand() {
+    TempDirectory directory;
+    TempDirectory other_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore other(remote_options(other_directory.path(), remote));
+    check(drained(other), "the start-up refresh did not finish");
+    {
+        ContextStore store(remote_options(directory.path(), remote));
+        (void)store.put(describe("0a"), concat({pseudo_random(30, 1), pseudo_random(3000, 2)}),
+                        std::array{ContextStore::Region{30, 3000}});
+        check(drained(store), "upload");
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    const int lists     = remote->lists;
+    check(other.refresh_remote_unless_fresh(std::chrono::milliseconds(0), deadline) == 1,
+          "a refresh on demand did not register the image");
+    check(other.refresh_remote_unless_fresh(std::chrono::seconds(60), deadline) == 0 &&
+              remote->lists == lists + 1,
+          "a refresh just after another listed the bucket again");
+    const auto info = other.find("0a");
+    check(info && !info->local && info->fetch_bytes == 3000, "the bytes to fetch were not reported");
+    (void)other.load("0a");
+    check(other.find("0a")->fetch_bytes == 0 && other.find("0a")->local, "a fetched image still has bytes to fetch");
+}
+
+// Many different conversations on one shared prefix (an agent's system and tools prompt): the
+// prefix's chunks are stored once, every conversation written counts as a use of the prefix, and
+// when the directory is too small for all of them the conversations go first, oldest first, while
+// the prefix stays whole for the next conversation to start from.
+void test_shared_prefix_outlives_the_conversations_on_it() {
+    TempDirectory directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore::Options options = remote_options(directory.path(), remote);
+    options.max_bytes             = 14'000; // the prefix and about two conversations
+    ContextStore store(options);
+    const auto prefix = pseudo_random(5 * 1024, 1); // five whole chunks
+    std::vector<std::array<std::uint64_t, 2>> digests;
+    for (std::uint64_t frontier = 0; frontier <= 400; ++frontier) { digests.push_back({frontier, 0xc0de}); }
+    auto shared            = describe("5a", 100);
+    shared.shared          = true;
+    shared.checkpoints[0]  = {.frontier = 100, .digests = digests[100], .identity_tag = 7};
+    (void)store.put(shared, concat({pseudo_random(30, 9), prefix}),
+                    std::array{ContextStore::Region{30, prefix.size()}});
+    std::int64_t last_write_ms = 0;
+    for (std::uint32_t user = 0; user < 4; ++user) {
+        remote->clock += 10;
+        last_write_ms = remote->clock; // the store's clock; uploads advance it after the put
+        auto conversation           = describe(std::string("c") + static_cast<char>('0' + user), 300);
+        conversation.checkpoints[0] = {.frontier = 300, .digests = {user + 1U, 0xfeed}, .identity_tag = 7};
+        conversation.prefix_digests = digests; // starts with the shared prefix, then its own
+        const auto own    = pseudo_random(3 * 1024, 100 + user);
+        const auto result = store.put(conversation, concat({pseudo_random(30, 9), prefix, own}),
+                                      std::array{ContextStore::Region{30, prefix.size() + own.size()}});
+        check(result.chunk_bytes_reused >= prefix.size(), "a conversation stored the shared prefix again");
+        check(drained(store), "upload");
+    }
+    const auto kept = store.find("5a");
+    check(kept && kept->local, "the shared prefix was evicted before the conversations on it");
+    check(kept && kept->last_used_ms == last_write_ms,
+          "a conversation written did not count as a use of its prefix");
+    check(store.find("c3") && store.find("c3")->local, "the newest conversation was evicted");
+    check(store.find("c0") && !store.find("c0")->local, "the oldest conversation kept its files over budget");
+    check(store.find("c0")->fetch_bytes == 3 * 1024, "an evicted conversation would download its shared prefix again");
 }
 
 // An image evicted while its upload waits keeps the files the upload needs; once the upload is
@@ -1940,6 +2079,10 @@ int main() {
     test_superseded_images_leave_the_bucket();
     test_upload_delay_uploads_a_burst_of_turns_once();
     test_eviction_waits_for_a_queued_upload();
+    test_header_is_stored_as_a_delta();
+    test_regions_are_chunked_from_their_own_start();
+    test_fetch_bytes_and_refresh_on_demand();
+    test_shared_prefix_outlives_the_conversations_on_it();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

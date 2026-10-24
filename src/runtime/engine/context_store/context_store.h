@@ -130,6 +130,8 @@ public:
         std::vector<CheckpointKey> checkpoints;
         // Every chunk of the image is in the directory, so load() does not touch the network.
         bool local  = true;
+        // Bytes load() would download first: the chunks the directory lacks (0 when local).
+        std::uint64_t fetch_bytes = 0;
         bool shared = false;
     };
 
@@ -219,6 +221,10 @@ public:
     // `deadline`; an incomplete listing never removes anything from the index.
     std::size_t refresh_remote(std::chrono::steady_clock::time_point deadline =
                                    std::chrono::steady_clock::time_point::max());
+    // A refresh for a request that found nothing: skipped when one finished within `fresh` (many
+    // requests arriving together list the bucket once). Refreshes never run two at a time.
+    std::size_t refresh_remote_unless_fresh(std::chrono::milliseconds fresh,
+                                            std::chrono::steady_clock::time_point deadline);
     // With a remote: fetches the image's missing chunks in the background so a later load() is
     // local. False when there is nothing to do.
     bool prefetch(const std::string& id);
@@ -358,6 +364,8 @@ private:
     // For each chunk, how many images held whole use it.
     [[nodiscard]] std::unordered_map<std::string, std::uint32_t> whole_image_holders_locked() const;
     [[nodiscard]] bool entry_local_locked(const Entry& entry) const;
+    // Raw bytes of the entry's chunks the directory lacks (each counted once).
+    [[nodiscard]] std::uint64_t fetch_bytes_locked(const Entry& entry) const;
     [[nodiscard]] bool entry_has_local_bytes_locked(const Entry& entry) const;
 
     // The remote tier (all no-ops without options_.remote).
@@ -423,6 +431,11 @@ private:
         std::int64_t failed_ms          = 0;
     };
     std::unordered_map<std::string, RemoteFailure> remote_failed_;
+    // Serializes refreshes; `last_refresh_` is when the last complete one finished. Timed, so a
+    // request waiting for a listing gives up at its deadline rather than behind a slow refresh.
+    std::timed_mutex refresh_mutex_;
+    std::chrono::steady_clock::time_point last_refresh_{};
+    std::size_t refresh_remote_locked(std::chrono::steady_clock::time_point deadline);
     std::int64_t last_prune_ms_ = 0; // remote worker thread only
 
     // Peer import. `owner_` holds the exclusive lock on options_.directory for the store's life.

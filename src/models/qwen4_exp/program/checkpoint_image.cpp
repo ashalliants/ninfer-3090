@@ -286,7 +286,11 @@ qwen3_5::CheckpointImage export_checkpoint_image(const HostCheckpointStore& stor
     const std::size_t image_offset = writer.reserve(images.size() * layout.image_bytes());
     const std::size_t checksum_at  = writer.reserve(sizeof(std::uint64_t));
     if (!page_slabs.empty()) { image.regions.push_back({pages_offset, page_slabs.size() * page_bytes}); }
-    image.regions.push_back({image_offset, images.size() * layout.image_bytes()});
+    // One region per state image: a store chunks each region from its own start, so an image that did
+    // not change hashes to the same chunks wherever it sits and is not stored or uploaded again.
+    for (std::size_t index = 0; index < images.size(); ++index) {
+        image.regions.push_back({image_offset + index * layout.image_bytes(), layout.image_bytes()});
+    }
 
     const std::size_t slab_bytes = layout.slab_bytes;
     std::vector<std::byte> buffer(std::max<std::size_t>(kSlabsPerTransfer, layout.image_slabs) * slab_bytes);

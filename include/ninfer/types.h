@@ -1602,6 +1602,11 @@ struct RuntimeStats {
     std::uint64_t context_store_hydrated_tokens    = 0;
     std::uint64_t context_store_hydration_failures = 0;
     double context_store_hydration_seconds         = 0.0;
+    // With a bucket: listings refreshed for a request that found nothing stored (and the time
+    // requests spent waiting for them), and the download rate the store's cost model assumes.
+    std::uint64_t context_store_lookups                = 0;
+    double context_store_lookup_seconds                = 0.0;
+    double context_store_remote_fetch_bytes_per_second = 0.0;
     // The rate the cost model currently assumes for reading a stored image back into the Host tier
     // (store read and import), learned from the reads observed so far; prices every hydration.
     double context_store_read_bytes_per_second = 0.0;

@@ -47,6 +47,49 @@ constexpr std::uint32_t kMaximumCheckpoints    = 1024;
 constexpr std::uint32_t kMaximumSegments       = 1U << 16U;
 // Threads that read and verify the chunks of one image (load).
 constexpr std::size_t kLoadThreads = 8;
+// Chunks of one image downloaded at a time (fetch_image_chunks): enough to hide the round trip
+// of each request, few enough to keep the memory in flight (up to this many chunks) modest.
+constexpr std::size_t kFetchThreads = 8;
+
+// Bytes outside the declared regions at least this long are chunked by content (see put());
+// shorter ones travel inside the manifest.
+constexpr std::size_t kContentChunkMinimumSegment = 64U << 10U;
+// Content-defined chunks: never shorter or longer than these (except a segment's last), about
+// 64 KiB past the minimum on average.
+constexpr std::size_t kContentChunkMinimum = 16U << 10U;
+constexpr std::size_t kContentChunkMaximum = 256U << 10U;
+constexpr std::uint64_t kContentChunkMask  = 0xffffULL << 48U; // 16 bits: 1 in 65536 positions
+
+// A gear hash (as in FastCDC): each byte shifts the hash and adds a fixed random word, so bit k
+// depends on the last k + 1 bytes and the top bits on a 64-byte window. The table is fixed
+// (splitmix64 from a constant seed): changing it changes every cut, so chunks written before
+// would no longer be reused.
+constexpr std::array<std::uint64_t, 256> make_gear_table() {
+    std::array<std::uint64_t, 256> table{};
+    std::uint64_t state = 0x6e696e6665722d63ULL; // "ninfer-c"
+    for (auto& entry : table) {
+        state += 0x9e3779b97f4a7c15ULL;
+        std::uint64_t z = state;
+        z               = (z ^ (z >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+        z               = (z ^ (z >> 27U)) * 0x94d049bb133111ebULL;
+        entry           = z ^ (z >> 31U);
+    }
+    return table;
+}
+constexpr std::array<std::uint64_t, 256> kGearTable = make_gear_table();
+
+// Length of the first content-defined chunk of `bytes`: the same content gives the same cuts
+// wherever it sits, so a stretch an edit did not touch is cut, and hashed, as it was before.
+std::size_t content_defined_cut(std::span<const std::uint8_t> bytes) {
+    if (bytes.size() <= kContentChunkMinimum) { return bytes.size(); }
+    const std::size_t end = std::min(bytes.size(), kContentChunkMaximum);
+    std::uint64_t gear    = 0;
+    for (std::size_t at = kContentChunkMinimum - 64; at < end; ++at) {
+        gear = (gear << 1U) + kGearTable[bytes[at]];
+        if (at >= kContentChunkMinimum && (gear & kContentChunkMask) == 0) { return at + 1; }
+    }
+    return end;
+}
 
 // xxHash64 (Yann Collet, BSD-2-Clause), little-endian hosts. Two independently seeded passes give
 // the 128-bit chunk name. This is a content address for trusted local files, not a security
@@ -803,13 +846,17 @@ bool ContextStore::entry_has_local_bytes_locked(const Entry& entry) const {
 }
 
 bool ContextStore::evict_oldest_locked(const std::string* protect) {
+    // Shared prefixes go last: each serves every conversation that starts with it, and its chunks
+    // are most of theirs. Otherwise the least recently used first.
+    const auto evict_before = [](const Entry& a, const Entry& b) {
+        if (a.info.shared != b.info.shared) { return !a.info.shared; }
+        return a.info.last_used_ms < b.info.last_used_ms;
+    };
     if (!options_.remote) {
         const Entry* oldest = nullptr;
         for (const auto& [id, entry] : entries_) {
             if (protect != nullptr && id == *protect) { continue; }
-            if (oldest == nullptr || entry.info.last_used_ms < oldest->info.last_used_ms) {
-                oldest = &entry;
-            }
+            if (oldest == nullptr || evict_before(entry, *oldest)) { oldest = &entry; }
         }
         if (oldest == nullptr) { return false; }
         const std::string id = oldest->info.id; // the entry, and its id, go with the removal
@@ -824,9 +871,8 @@ bool ContextStore::evict_oldest_locked(const std::string* protect) {
     for (auto& [id, entry] : entries_) {
         if (protect == nullptr || id != *protect) { order.push_back(&entry); }
     }
-    std::sort(order.begin(), order.end(), [](const Entry* a, const Entry* b) {
-        return a->info.last_used_ms < b->info.last_used_ms;
-    });
+    std::sort(order.begin(), order.end(),
+              [&](const Entry* a, const Entry* b) { return evict_before(*a, *b); });
     const auto holders = whole_image_holders_locked();
     for (Entry* entry : order) {
         const EvictionYield yield = evict_to_remote_locked(*entry, holders, false);
@@ -949,53 +995,70 @@ ContextStore::PutResult ContextStore::put(const Description& description,
     std::uint64_t stored_written = 0;
     std::unordered_set<std::string> seen_in_put;
     try {
-        const auto add_inline = [&](std::uint64_t begin, std::uint64_t end) {
+        // Stores `bytes` as one chunk of `segment`, writing it only when the directory lacks it.
+        const auto add_chunk = [&](Segment& segment, std::span<const std::uint8_t> bytes) {
+            ChunkRef chunk{.hash = hash(bytes), .length = static_cast<std::uint32_t>(bytes.size())};
+            const std::string key = hex_key(chunk.hash);
+            bool present;
+            bool known;
+            {
+                std::scoped_lock lock(mutex_);
+                const auto found = chunks_.find(key);
+                known            = found != chunks_.end();
+                // An image registered from the bucket names chunks the directory does not hold.
+                present = known && found->second.present;
+            }
+            if (!present && seen_in_put.find(key) == seen_in_put.end()) {
+                const auto [path, stored] = write_chunk(chunk, bytes);
+                written.push_back(path);
+                if (known) { refilled.emplace_back(key, stored.bytes); }
+                result.chunk_bytes_written += bytes.size();
+                stored_written += stored.bytes;
+            } else {
+                result.chunk_bytes_reused += bytes.size();
+            }
+            seen_in_put.insert(key);
+            segment.chunks.push_back(chunk);
+            all_chunks.push_back(chunk);
+        };
+        // The bytes between regions (the image's header: its token ledger and identity, several
+        // MB for a deep context) change a little at many places each turn, as every per-token table
+        // in it grows. Beyond a small size they are cut where their content says (not at fixed
+        // offsets), so an unchanged stretch keeps its chunks however much the tables before it
+        // grew, and the manifest itself stays small.
+        const auto add_between = [&](std::uint64_t begin, std::uint64_t end) {
             if (end <= begin) { return; }
             Segment segment;
             segment.length = end - begin;
-            segment.inline_bytes.assign(image.begin() + static_cast<std::ptrdiff_t>(begin),
-                                        image.begin() + static_cast<std::ptrdiff_t>(end));
+            const std::span<const std::uint8_t> bytes =
+                image.subspan(static_cast<std::size_t>(begin), static_cast<std::size_t>(end - begin));
+            if (bytes.size() < kContentChunkMinimumSegment) {
+                segment.inline_bytes.assign(bytes.begin(), bytes.end());
+            } else {
+                segment.chunked = true;
+                for (std::size_t done = 0; done < bytes.size();) {
+                    const std::size_t size = content_defined_cut(bytes.subspan(done));
+                    add_chunk(segment, bytes.subspan(done, size));
+                    done += size;
+                }
+            }
             segments.push_back(std::move(segment));
         };
         std::uint64_t position = 0;
         for (const Region& region : regions) {
-            add_inline(position, region.offset);
+            add_between(position, region.offset);
             Segment segment;
             segment.chunked = true;
             segment.length  = region.length;
             for (std::uint64_t done = 0; done < region.length; done += options_.chunk_bytes) {
                 const std::uint64_t size = std::min(options_.chunk_bytes, region.length - done);
-                const std::span<const std::uint8_t> bytes =
-                    image.subspan(static_cast<std::size_t>(region.offset + done),
-                                  static_cast<std::size_t>(size));
-                ChunkRef chunk{.hash = hash(bytes), .length = static_cast<std::uint32_t>(size)};
-                const std::string key = hex_key(chunk.hash);
-                bool present;
-                bool known;
-                {
-                    std::scoped_lock lock(mutex_);
-                    const auto found = chunks_.find(key);
-                    known            = found != chunks_.end();
-                    // An image registered from the bucket names chunks the directory does not hold.
-                    present = known && found->second.present;
-                }
-                if (!present && seen_in_put.find(key) == seen_in_put.end()) {
-                    const auto [path, stored] = write_chunk(chunk, bytes);
-                    written.push_back(path);
-                    if (known) { refilled.emplace_back(key, stored.bytes); }
-                    result.chunk_bytes_written += size;
-                    stored_written += stored.bytes;
-                } else {
-                    result.chunk_bytes_reused += size;
-                }
-                seen_in_put.insert(key);
-                segment.chunks.push_back(chunk);
-                all_chunks.push_back(chunk);
+                add_chunk(segment, image.subspan(static_cast<std::size_t>(region.offset + done),
+                                                 static_cast<std::size_t>(size)));
             }
             segments.push_back(std::move(segment));
             position = region.offset + region.length;
         }
-        add_inline(position, image.size());
+        add_between(position, image.size());
 
         Writer manifest;
         const std::int64_t now = now_ms();
@@ -1082,13 +1145,12 @@ ContextStore::PutResult ContextStore::put(const Description& description,
         if (had_previous) { release_references(replaced); }
         write_used(description.id, now);
         std::vector<std::string> superseded;
+        std::vector<std::string> prefixes_used;
         if (!description.prefix_digests.empty()) {
-            for (const auto& [other_id, other] : entries_) {
-                // Every conversation reproduces the shared prefix it started from; that prefix
-                // still serves the other conversations, so it is never superseded by one.
+            for (auto& [other_id, other] : entries_) {
                 if (other_id == description.id || other.info.binding != description.binding ||
-                    other.info.shared || description.shared ||
-                    other.info.tokens > description.tokens || other.info.checkpoints.empty()) {
+                    description.shared || other.info.tokens > description.tokens ||
+                    other.info.checkpoints.empty()) {
                     continue;
                 }
                 const CheckpointKey& endpoint = other.info.checkpoints.front();
@@ -1096,9 +1158,27 @@ ContextStore::PutResult ContextStore::put(const Description& description,
                     endpoint.identity_tag != description.checkpoints.front().identity_tag) {
                     continue;
                 }
-                if (endpoint.frontier < description.prefix_digests.size() &&
-                    description.prefix_digests[endpoint.frontier] == endpoint.digests) {
-                    superseded.push_back(other_id);
+                if (endpoint.frontier >= description.prefix_digests.size() ||
+                    description.prefix_digests[endpoint.frontier] != endpoint.digests) {
+                    continue;
+                }
+                if (other.info.shared) {
+                    // Every conversation reproduces the shared prefix it started from; that prefix
+                    // still serves the other conversations, so it is never superseded by one. Its
+                    // conversations reuse it from memory without loading it, so this write is
+                    // its use: otherwise it would age as unused and be the first image evicted
+                    // (or expire, here and in the bucket) while every conversation relies on it.
+                    other.info.last_used_ms = now;
+                    write_used(other_id, now);
+                    prefixes_used.push_back(other_id);
+                    continue;
+                }
+                superseded.push_back(other_id);
+            }
+            if (options_.remote) {
+                // Restarts the bucket copy's age (at most once a day per image).
+                for (const std::string& prefix : prefixes_used) {
+                    enqueue_remote({RemoteTask::Kind::Touch, prefix, {}, {}, {}, {}});
                 }
             }
             for (const std::string& other_id : superseded) {
@@ -1300,7 +1380,8 @@ std::vector<ContextStore::Info> ContextStore::list() const {
     out.reserve(entries_.size());
     for (const auto& [id, entry] : entries_) {
         out.push_back(entry.info);
-        out.back().local = entry_local_locked(entry);
+        out.back().fetch_bytes = fetch_bytes_locked(entry);
+        out.back().local       = out.back().fetch_bytes == 0 && entry_local_locked(entry);
     }
     std::sort(out.begin(), out.end(), [](const Info& left, const Info& right) {
         return left.last_used_ms > right.last_used_ms;
@@ -1312,9 +1393,23 @@ std::optional<ContextStore::Info> ContextStore::find(const std::string& id) cons
     std::scoped_lock lock(mutex_);
     const auto found = entries_.find(id);
     if (found == entries_.end()) { return std::nullopt; }
-    Info info  = found->second.info;
-    info.local = entry_local_locked(found->second);
+    Info info        = found->second.info;
+    info.fetch_bytes = fetch_bytes_locked(found->second);
+    info.local       = info.fetch_bytes == 0 && entry_local_locked(found->second);
     return info;
+}
+
+std::uint64_t ContextStore::fetch_bytes_locked(const Entry& entry) const {
+    std::uint64_t bytes = 0;
+    std::unordered_set<std::string> seen;
+    for (const ChunkRef& chunk : entry.chunks) {
+        std::string key  = hex_key(chunk.hash);
+        const auto found = chunks_.find(key);
+        if ((found == chunks_.end() || !found->second.present) && seen.insert(std::move(key)).second) {
+            bytes += chunk.length;
+        }
+    }
+    return bytes;
 }
 
 bool ContextStore::erase(const std::string& id) {
@@ -1738,50 +1833,77 @@ ContextStore::FetchStatus ContextStore::fetch_image_chunks(const std::string& id
         std::scoped_lock lock(mutex_);
         const auto found = entries_.find(id);
         if (found == entries_.end()) { return FetchStatus::Corrupt; }
-        chunks     = found->second.chunks;
+        // Each missing chunk once.
+        std::unordered_set<std::string> seen;
+        for (const ChunkRef& chunk : found->second.chunks) {
+            std::string key   = hex_key(chunk.hash);
+            const auto held   = chunks_.find(key);
+            if ((held == chunks_.end() || !held->second.present) && seen.insert(std::move(key)).second) {
+                chunks.push_back(chunk);
+            }
+        }
         generation = found->second.generation;
     }
-    for (const ChunkRef& chunk : chunks) {
-        {
-            std::scoped_lock lock(mutex_);
-            const auto found = chunks_.find(hex_key(chunk.hash));
-            if (found != chunks_.end() && found->second.present) { continue; }
-        }
-        std::optional<std::vector<std::uint8_t>> data;
-        bool compressed = false;
-        try {
-            // Whichever form an engine uploaded; the form this store writes is tried first.
-            for (const bool form : {options_.compress_chunks, !options_.compress_chunks}) {
-                data = options_.remote->get(remote_chunk_key(chunk.hash, form));
-                if (data) {
-                    compressed = form;
-                    break;
+    // A request may be waiting on this: the chunks are fetched several at a time, so a session of
+    // a few hundred objects costs a few round trips, not a few hundred. The first failure stops the
+    // others; a damaged chunk outranks a transient error.
+    std::atomic<std::size_t> next{0};
+    std::atomic<bool> transient{false};
+    std::atomic<bool> corrupt{false};
+    const auto fetch_chunks = [&] {
+        for (std::size_t index = next++; index < chunks.size() && !transient && !corrupt;
+             index = next++) {
+            const ChunkRef& chunk = chunks[index];
+            std::optional<std::vector<std::uint8_t>> data;
+            bool compressed = false;
+            try {
+                // Whichever form an engine uploaded; the form this store writes is tried first.
+                for (const bool form : {options_.compress_chunks, !options_.compress_chunks}) {
+                    data = options_.remote->get(remote_chunk_key(chunk.hash, form));
+                    if (data) {
+                        compressed = form;
+                        break;
+                    }
+                }
+            } catch (const std::exception&) {
+                std::scoped_lock lock(mutex_);
+                ++stats_.remote_download_failures;
+                transient = true;
+                return;
+            }
+            bool intact = false;
+            if (data) {
+                if (compressed) {
+                    std::vector<std::uint8_t> raw(chunk.length);
+                    intact = decompress_memory(*data, raw) && hash(raw) == chunk.hash;
+                } else {
+                    intact = data->size() == chunk.length && hash(*data) == chunk.hash;
                 }
             }
-        } catch (const std::exception&) {
-            std::scoped_lock lock(mutex_);
-            ++stats_.remote_download_failures;
-            return FetchStatus::Transient;
-        }
-        bool intact = false;
-        if (data) {
-            if (compressed) {
-                std::vector<std::uint8_t> raw(chunk.length);
-                intact = decompress_memory(*data, raw) && hash(raw) == chunk.hash;
-            } else {
-                intact = data->size() == chunk.length && hash(*data) == chunk.hash;
+            if (!intact) {
+                std::scoped_lock lock(mutex_);
+                ++stats_.remote_download_failures;
+                corrupt = true;
+                return;
             }
-        }
-        if (!intact) {
+            if (!install_chunk(chunk, compressed, *data)) {
+                corrupt = true;
+                return;
+            }
             std::scoped_lock lock(mutex_);
-            ++stats_.remote_download_failures;
-            return FetchStatus::Corrupt;
+            ++stats_.remote_downloads;
+            stats_.remote_download_bytes += data->size();
         }
-        if (!install_chunk(chunk, compressed, *data)) { return FetchStatus::Corrupt; }
-        std::scoped_lock lock(mutex_);
-        ++stats_.remote_downloads;
-        stats_.remote_download_bytes += data->size();
-    }
+    };
+    const std::size_t threads = std::min(chunks.size(), kFetchThreads);
+    std::vector<std::thread> fetchers;
+    try {
+        for (std::size_t t = 1; t < threads; ++t) { fetchers.emplace_back(fetch_chunks); }
+    } catch (...) {} // fewer threads: the calling thread still fetches every chunk
+    fetch_chunks();
+    for (auto& fetcher : fetchers) { fetcher.join(); }
+    if (corrupt) { return FetchStatus::Corrupt; }
+    if (transient) { return FetchStatus::Transient; }
     std::scoped_lock lock(mutex_);
     const auto found = entries_.find(id);
     // Whole again: it is evicted like any image the directory holds.
@@ -1824,6 +1946,21 @@ void ContextStore::settle_failed_fetch(const std::string& id, std::uint64_t gene
 
 std::size_t ContextStore::refresh_remote(std::chrono::steady_clock::time_point deadline) {
     if (!options_.remote) { return 0; }
+    std::scoped_lock refreshing(refresh_mutex_);
+    return refresh_remote_locked(deadline);
+}
+
+std::size_t ContextStore::refresh_remote_unless_fresh(std::chrono::milliseconds fresh,
+                                                      std::chrono::steady_clock::time_point deadline) {
+    if (!options_.remote) { return 0; }
+    std::unique_lock refreshing(refresh_mutex_, std::defer_lock);
+    if (!refreshing.try_lock_until(deadline)) { return 0; }
+    // Waiting for the lock may have been waiting for exactly the refresh asked for.
+    if (std::chrono::steady_clock::now() - last_refresh_ < fresh) { return 0; }
+    return refresh_remote_locked(deadline);
+}
+
+std::size_t ContextStore::refresh_remote_locked(std::chrono::steady_clock::time_point deadline) {
     std::size_t added = 0;
     bool truncated    = false;
     try {
@@ -1904,6 +2041,7 @@ std::size_t ContextStore::refresh_remote(std::chrono::steady_clock::time_point d
         for (const std::string& id : gone) { remove_entry_locked(id, false); }
         stats_.remote_removed += gone.size();
         ++stats_.remote_refreshes;
+        if (!truncated) { last_refresh_ = std::chrono::steady_clock::now(); }
     } catch (const std::exception&) {
         std::scoped_lock lock(mutex_);
         ++stats_.remote_download_failures;
