@@ -435,6 +435,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     LoadSummary summary;
     summary.architecture         = std::string(models::architecture_name(models::Architecture::Qwen4Exp));
     summary.model_name           = instance->model->info().name;
+    summary.artifact_id          = artifact::artifact_id_hex(instance->model->info().artifact_id);
     summary.load_seconds         = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     summary.upload_seconds       = stats.upload_seconds;
     summary.artifact_bytes_read  = stats.read_bytes;

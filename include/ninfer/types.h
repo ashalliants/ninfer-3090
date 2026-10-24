@@ -1655,6 +1655,8 @@ struct ContextCostSummary {
 struct LoadSummary {
     std::string architecture;
     std::string model_name;
+    // The artifact's id (artifact::artifact_id_hex): the same for every copy of one conversion.
+    std::string artifact_id;
     std::string cuda_sync_mode;
     std::vector<std::string> weight_formats;
     std::string prefill_signature;

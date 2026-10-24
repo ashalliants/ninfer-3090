@@ -106,14 +106,10 @@ std::string context_store_binding(const EngineOptions& options, const LoadSummar
                std::to_string(static_cast<unsigned>(options.speculative.proposal_head)) + ',' +
                (options.gdn_state_fp16 ? "gdn-fp16" : "gdn-fp32") + ',' +
                (options.enable_vision ? "vision" : "text") + '\n';
-    std::error_code size_error;
-    const std::uintmax_t size = std::filesystem::file_size(options.artifact_path, size_error);
-    binding += size_error ? std::string("?") : std::to_string(size);
-    // A re-converted artifact can have the same size; its modification time tells it apart.
-    std::error_code time_error;
-    const auto written = std::filesystem::last_write_time(options.artifact_path, time_error);
-    binding += '\n';
-    binding += time_error ? std::string("?") : std::to_string(written.time_since_epoch().count());
+    // The artifact by the id its conversion wrote: a re-converted artifact never matches, and every
+    // copy of the same one does, on any machine. Not its file time: a download stamps the copy with
+    // when it finished, so no two machines sharing a bucket would ever agree.
+    binding += load.artifact_id;
     // Prompt grafts: a stored session that starts from a graft holds that graft's installed K/V and
     // state under its placeholder ids, so a changed graft file must not match it. Any change to
     // the configured grafts makes the store's images misses.
