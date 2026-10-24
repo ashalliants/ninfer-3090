@@ -1573,7 +1573,7 @@ void ContextStore::enqueue_upload(const std::string& id, std::uint64_t generatio
                 ready = std::min(ready, it->ready);
                 retire.insert(retire.end(), it->retire.begin(), it->retire.end());
                 unused.insert(unused.end(), it->chunks.begin(), it->chunks.end());
-                ++stats_.remote_uploads_skipped;
+                ++stats_.remote_uploads_skipped; // stats_ is guarded by mutex_, which put() holds
                 it = remote_queue_.erase(it);
             }
             retire.insert(retire.end(), superseded.begin(), superseded.end());
@@ -2020,8 +2020,10 @@ ContextStore::FetchStatus ContextStore::fetch_image_chunks(const std::string& id
             }
             std::scoped_lock lock(mutex_);
             ++stats_.remote_downloads;
-            stats_.remote_download_bytes += data->size();
-            fetched_bytes += data->size();
+            stats_.remote_download_bytes += data->size(); // what crossed the network
+            // Raw bytes, the unit Info::fetch_bytes prices a fetch in, so the rate learned from
+            // this report applies to it whether or not the chunk travelled compressed.
+            fetched_bytes += chunk.length;
         }
     };
     const auto fetch_chunks = [&] {

@@ -754,6 +754,30 @@ void test_load_reports_its_download() {
     ContextStore::LoadReport again;
     check(other.load("0a", false, &again).has_value() && again.fetched_bytes == 0 && again.fetch_ns == 0,
           "a local load reported a download");
+
+    // Compressed chunks: the report gives raw bytes, the unit fetch_bytes prices fetches in,
+    // though fewer bytes crossed the network.
+    TempDirectory packed_directory;
+    TempDirectory reader_directory;
+    auto packed = std::make_shared<MemoryObjectStore>();
+    ContextStore::Options compressing = remote_options(packed_directory.path(), packed);
+    compressing.compress_chunks       = true;
+    // Two bits of entropy a byte: compresses well, and no two chunks are alike.
+    std::vector<std::uint8_t> compressible = pseudo_random(3000, 3);
+    for (auto& byte : compressible) { byte &= 0x03; }
+    {
+        ContextStore store(compressing);
+        (void)store.put(describe("0b"), concat({pseudo_random(30, 1), compressible}),
+                        std::array{ContextStore::Region{30, 3000}});
+        check(drained(store), "upload");
+    }
+    ContextStore reader(remote_options(reader_directory.path(), packed));
+    check(drained(reader) && reader.find("0b") && reader.find("0b")->fetch_bytes == 3000,
+          "the compressed image was not registered with its raw size");
+    ContextStore::LoadReport compressed;
+    check(reader.load("0b", false, &compressed).has_value(), "the compressed image did not load");
+    check(compressed.fetched_bytes == 3000 && reader.stats().remote_download_bytes < 3000,
+          "the report did not give raw bytes for compressed chunks");
 }
 
 // A chunk that downloads but cannot be installed (the directory refuses the write, as on a full

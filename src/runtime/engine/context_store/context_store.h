@@ -200,7 +200,8 @@ public:
     // once it has actually used the image.
     // What a load fetched from the bucket first, and how long the fetch took: the missing chunks
     // downloaded, verified and installed (what a waiting request waits for), not the local read
-    // and reassembly that follow.
+    // and reassembly that follow. Bytes are the chunks' raw length (as Info::fetch_bytes), not
+    // what crossed the network, which is smaller for compressed chunks.
     struct LoadReport {
         std::uint64_t fetched_bytes = 0;
         std::uint64_t fetch_ns      = 0;
