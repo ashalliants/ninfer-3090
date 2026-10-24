@@ -14,7 +14,7 @@ unless stated. The artifact is `bonsai2_27b.ninfer` (8.87 GiB, SHA-256 `97512677
 | Weights on the device | 6.70 GiB (7.28 with MTP) | 14.6 GiB (17.0 with DFlash2) |
 | Plain decode | 88 tok/s | 48 tok/s |
 | DFlash2, 7 drafts, one coding prompt | 297 tok/s | 195 tok/s |
-| Prefill, 1k / 4k / 16k | 2,853 / 2,776 / 2,576 tok/s | 1,717 / 1,687 / 1,615 tok/s |
+| Prefill, 1k / 4k / 16k | 2,905 / 2,820 / 2,618 tok/s (2026-10-24, stock 350 W) | 1,717 / 1,687 / 1,615 tok/s |
 | `--prefill-cublas --prefill-chunk 4096`, 1k / 4k / 16k | 2,791 / 2,447 / 2,294 tok/s | 2,421 / 3,093 / 2,869 tok/s |
 | Quick-corpus perplexity | 5.627 | n/a (a different model) |
 
