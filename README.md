@@ -7,6 +7,7 @@
 [![Downloads](https://img.shields.io/github/downloads/ashalliants/ninfer-3090/total?color=2a78d6)](https://github.com/ashalliants/ninfer-3090/releases)
 [![Decode, one RTX 3090](https://img.shields.io/badge/decode-140%20tok%2Fs%20(DFlash2)-2a78d6)](#performance-on-an-rtx-3090)
 [![Models on Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20models-WarlaxZ-2a78d6)](https://huggingface.co/WarlaxZ)
+[![Fit calculator: try it live](https://img.shields.io/badge/fit%20calculator-try%20it%20live-2a78d6)](https://ashalliants.github.io/ninfer-3090/config-calculator.html)
 
 [![Illustrative animation: NInfer-3090 decodes Qwen3.8-27B 2.1x faster than llama.cpp on an RTX 3090, from published figures. Click for the MP4.](docs/assets/ninfer-demo.gif)](docs/assets/ninfer-demo.mp4)
 
@@ -175,11 +176,19 @@ fails loudly; `NINFER_FALLBACK=off` makes the profile's context exact. Directly,
 `ninfer-serve --max-context N --fit-context MIN` does the same. By hand, drop a lane first, then
 speculation (worth 992 MiB on the 35B-A3B), and vision last.
 
-**To size a profile that is not listed, open [`docs/config-calculator.html`](docs/config-calculator.html)
-in a browser.** It is a single self-contained file with no network access that takes a model, a
-KV format and a context length and tells you whether it fits in 24 GiB, the largest context you
-could run instead, and what the choice costs in decode speed and perplexity. Every constant in it
-is measured on an RTX 3090 against this fork.
+**To size a profile that is not listed, [open the fit calculator](https://ashalliants.github.io/ninfer-3090/config-calculator.html).** It
+takes a model, a KV format and a context length and tells you whether it fits in 24 GiB, the
+largest context you could run instead, and what the choice costs in decode speed and perplexity.
+Every constant in it is measured on an RTX 3090 against this fork. It is a single self-contained
+file with no network access, so [`docs/config-calculator.html`](docs/config-calculator.html) also
+works opened straight from a checkout.
+
+<a href="https://ashalliants.github.io/ninfer-3090/config-calculator.html">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/config-calculator-dark.png">
+    <img alt="The fit calculator: Qwen3.8-27B with an int8 KV cache at 32,768 tokens fits in 17.27 of 22.50 GiB, with a memory budget bar and the largest context that fits. Click to open the live page." src="docs/assets/config-calculator-light.png" width="840">
+  </picture>
+</a>
 
 The measurement history behind every default is in
 [launcher profiles](docs/maintainer/launcher-profiles.md).
@@ -667,8 +676,8 @@ fell about 5%, from 81.61 tok/s to 77.39, because acceptance dropped from 71.27%
 an accuracy effect on speculation rather than a slower kernel. Use `int8` when decode throughput
 under speculation matters more than context.
 
-Per-format numbers for the 35B-A3B and a fit calculator are in
-[`docs/config-calculator.html`](docs/config-calculator.html). NVFP4 A4 and FP8 A8 *weight and
+Per-format numbers for the 35B-A3B, with a calculator for any setup, are in the
+[fit calculator](https://ashalliants.github.io/ninfer-3090/config-calculator.html). NVFP4 A4 and FP8 A8 *weight and
 activation* kernels are a separate axis and need Blackwell; see [Current limits](#current-limits).
 
 ### RotorQuant (`rk8v4`)

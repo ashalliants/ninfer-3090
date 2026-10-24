@@ -827,7 +827,7 @@ function render() {
   const ppl = DATA.perplexity[kv];
   const base = DATA.perplexity.bf16;
   const delta = ((ppl - base) / base) * 100;
-  $("out-ppl").firstChild.nodeValue = delta === 0 ? "baseline" : "+" + delta.toFixed(4) + "%";
+  $("out-ppl").firstChild.nodeValue = delta === 0 ? "baseline" : (delta > 0 ? "+" : "") + delta.toFixed(4) + "%";
   /* Perplexity was measured once, on the 27B, across all seven formats. Say so rather than let the
      figure read as a property of whichever model is selected. */
   $("out-ppl-sub").textContent = ppl.toFixed(6) + " vs bf16 " + base.toFixed(6) +
@@ -892,7 +892,7 @@ function buildKvTable() {
       '<td class="' + (r.ctx === bestCtx ? "best" : "") + '">' +
         (r.ctx === null ? "—" : fmtInt(r.ctx) + (r.capped ? " (max)" : "")) + "</td>" +
       "<td>" + r.ppl.toFixed(6) + "</td>" +
-      "<td>" + (delta === 0 ? "—" : "+" + delta.toFixed(4) + "%") + "</td>" +
+      "<td>" + (delta === 0 ? "—" : (delta > 0 ? "+" : "") + delta.toFixed(4) + "%") + "</td>" +
       '<td class="' + (r.deep && r.deep === bestSpeed ? "best" : "") + '">' +
         (r.deep === null ? "—" : r.deep.toFixed(2)) + "</td>" +
       "</tr>";
