@@ -1,8 +1,12 @@
 # The checks that do not need a GPU.
 #
-# Building this repository needs CUDA 12.8 and its tests need a real sm_86 device, so the suite
-# cannot run on a GitHub-hosted runner. Two things can, and both exist in the tree already without
-# anything invoking them:
+# Building the kernels needs CUDA 12.8's nvcc and most tests need a real sm_86 device, so the full
+# suite cannot run on a GitHub-hosted runner. What can:
+#
+#   * The host-only tests (tests/cmake/HostOnlyTests.cmake) -- the cpu tests that link no kernel.
+#     A tree configured with NINFER_HOST_ONLY builds them with g++ against the CUDA headers and
+#     runtime, with no nvcc, in a few minutes. The other cpu tests link the kernels and still need
+#     the full build (tools/run-tests.ps1 -CpuOnly runs all of them).
 #
 #   * docs/config-calculator.test.mjs -- pins the published calculator's arithmetic against the
 #     engine's own figures. It passed when it landed and nothing has run it since, which makes it
@@ -13,6 +17,8 @@
 #     launchers once shipped with CRLF that made them unparseable on Linux, and every tool on the
 #     Windows box called the tree clean because Git Bash strips CR on read. Only real Linux bash
 #     saw it.
+#
+# Both of those exist in the tree already without anything else invoking them.
 name: Host checks
 
 on:
@@ -73,3 +79,85 @@ jobs:
       # that no longer matches docs/assets would publish an out-of-date chart.
       - name: Run tools/sync_model_cards.py --check
         run: python3 tools/sync_model_cards.py --check
+
+  host-tests:
+    name: Host-only tests (no nvcc)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CUDA_ROOT: /usr/local/cuda-12.8
+      CCACHE_DIR: ${{ github.workspace }}/../ccache
+      CCACHE_MAXSIZE: 500M
+    steps:
+      - uses: actions/checkout@v4
+
+      # The CUDA packages come from NVIDIA's repository: about 100 MB, so keep the .deb files
+      # between runs rather than download them each time.
+      - name: Restore downloaded packages
+        uses: actions/cache@v4
+        with:
+          path: ~/apt-archives
+          key: apt-host-tests-ubuntu-24.04-${{ hashFiles('.github/workflows/host-checks.yml') }}
+
+      # The CUDA headers, runtime and driver stub, but no nvcc: what a host-only tree needs.
+      - name: Install the CUDA runtime headers and build dependencies
+        run: |
+          mkdir -p ~/apt-archives/partial
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          rm cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -q
+          sudo apt-get -o Dir::Cache::Archives="$HOME/apt-archives" install -y -q --no-install-recommends \
+            cuda-cudart-dev-12-8 cuda-crt-12-8 cuda-nvtx-12-8 \
+            ccache ninja-build pkg-config libavcodec-dev libavformat-dev libavutil-dev \
+            libswscale-dev libcurl4-openssl-dev libzstd-dev
+          # The cache step runs as the runner user; apt left the files root's.
+          sudo chown -R "$USER" ~/apt-archives
+          rm -rf ~/apt-archives/partial ~/apt-archives/lock
+          test ! -e "$CUDA_ROOT/bin/nvcc"
+          # FindCUDAToolkit takes the version from version.json when there is no nvcc to ask, and
+          # none of these packages ships it.
+          if [ ! -e "$CUDA_ROOT/version.json" ]; then
+            version=$(dpkg-query -W -f='${Version}' cuda-cudart-dev-12-8 | cut -d- -f1)
+            echo "{\"cuda\": {\"name\": \"CUDA SDK\", \"version\": \"$version\"}}" |
+              sudo tee "$CUDA_ROOT/version.json"
+          fi
+          # The tests link libcuda; with no driver installed, the toolkit's stub stands in for it.
+          # It answers every call with an error, and these tests make none.
+          mkdir -p ~/cuda-stub
+          ln -sf "$CUDA_ROOT/lib64/stubs/libcuda.so" ~/cuda-stub/libcuda.so.1
+
+      # master's cache serves every pull request; a cold build takes only a few minutes, so pull
+      # requests do not keep caches of their own.
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-host-tests-${{ github.sha }}
+          restore-keys: ccache-host-tests-
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DNINFER_HOST_ONLY=ON -DBUILD_TESTING=ON -DCUDAToolkit_ROOT="$CUDA_ROOT"
+
+      - name: Build
+        run: |
+          ccache --zero-stats
+          cmake --build build --parallel "$(nproc)"
+          ccache --show-stats
+
+      - name: Save ccache
+        if: github.event_name == 'push'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-host-tests-${{ github.sha }}
+
+      # -L cpu in a host-only tree is exactly the host-only tests; each runs with the device hidden.
+      # A timing test gets one retry on a busy shared runner.
+      - name: Run the host-only tests
+        run: |
+          export LD_LIBRARY_PATH="$HOME/cuda-stub${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          ctest --test-dir build -L cpu --output-on-failure --parallel "$(nproc)" \
+            --timeout 600 --repeat until-pass:2

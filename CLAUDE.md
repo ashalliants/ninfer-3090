@@ -44,6 +44,11 @@ Every test carries one of two labels, set in `tests/cmake/TestGpuClasses.cmake`:
   skip**: exit code 0 is not enough (`ninfer_multi_gpu_test` prints `SKIP: no usable CUDA device`
   and still exits 0).
 
+A `cpu` test that links no kernel (not `ninfer_ops`, nor the model, engine or serve libraries) also
+goes on `tests/cmake/HostOnlyTests.cmake`. CI builds those without `nvcc` and runs them on every
+pull request (the `host-tests` job in `.github/workflows/host-checks.yml`; see "Host-only builds"
+in `docs/maintainer/build-system.md`).
+
 ```powershell
 pwsh tools/run-tests.ps1                      # everything: cpu tests in parallel, then gpu tests
 pwsh tools/run-tests.ps1 -CpuOnly             # seconds, no GPU, no lock

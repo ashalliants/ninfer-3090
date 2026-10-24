@@ -1,5 +1,7 @@
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+# Before any test is declared: a host-only tree builds only these.
+include(cmake/HostOnlyTests.cmake)
 include(cmake/NinferTests.cmake)
 include(cmake/CoreTests.cmake)
 include(artifact/tests.cmake)
