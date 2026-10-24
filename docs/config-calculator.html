@@ -211,19 +211,36 @@
   tr.is-current td { background: var(--accent-soft); }
   .best { color: var(--ok); font-weight: 600; }
   .bad  { color: var(--over); }
-  caption { caption-side: bottom; padding: 10px 12px; text-align: left; font-size: 12.5px;
-            color: var(--muted); }
+  /* The first column stays put while a wide table scrolls under it on a narrow screen. */
+  tbody td:first-child, thead th:first-child { position: sticky; left: 0; z-index: 1; }
+  tbody td:first-child { background: var(--surface); }
+  tr.is-current td:first-child { background: var(--accent-soft); }
+  tr.group th {
+    position: sticky; left: 0; text-align: left; font-family: var(--mono); font-size: 12.5px;
+    background: var(--sunken); border-bottom: 1px solid var(--line);
+  }
+  .tablenote { margin: 8px 2px 0; font-size: 12.5px; color: var(--muted); max-width: 90ch; }
 
   .prose { max-width: 74ch; }
   .prose p { margin: 0 0 12px; }
   .prose code, .inline-code {
     font-family: var(--mono); font-size: 12.5px; background: var(--sunken);
-    padding: 1px 5px; border-radius: 3px;
+    padding: 1px 5px; border-radius: 3px; overflow-wrap: anywhere;
   }
   .prose ul { margin: 0 0 12px; padding-left: 20px; }
   .prose li { margin-bottom: 6px; }
   footer { margin-top: 40px; padding-top: 16px; border-top: 1px solid var(--line);
            font-size: 12.5px; color: var(--muted); }
+  /* Phones. 16px form text stops iOS zooming the page when a control is tapped. */
+  @media (max-width: 560px) {
+    .wrap { padding: 20px 12px 48px; }
+    .panel { padding: 16px 14px; }
+    select, input[type="number"] { font-size: 16px; }
+    th, td { padding: 7px 9px; }
+    table { font-size: 13px; }
+    #spec-table tbody td:first-child { white-space: normal; min-width: 10.5em; }
+    section { margin-top: 28px; }
+  }
 </style>
 
 <div class="wrap">
@@ -244,6 +261,7 @@
       <div class="field">
         <label for="model">Model</label>
         <select id="model"></select>
+        <p class="hint" id="model-hint"></p>
       </div>
       <div class="field">
         <label for="kv">KV cache format</label>
@@ -267,9 +285,9 @@
         <label for="reserve">Reserved for the OS</label>
         <select id="reserve">
           <option value="307">Headless Linux &mdash; 0.3 GiB</option>
-          <option value="1536" selected>Windows / Linux desktop &mdash; 1.5 GiB</option>
-          <option value="2560">Desktop with a browser open &mdash; 2.5 GiB</option>
-          <option value="0">Nothing &mdash; the whole 24 GiB</option>
+          <option value="1536" selected>Desktop &mdash; 1.5 GiB</option>
+          <option value="2560">Desktop + browser &mdash; 2.5 GiB</option>
+          <option value="0">None &mdash; all 24 GiB</option>
         </select>
       </div>
     </div>
@@ -323,9 +341,9 @@
         </tr>
       </thead>
       <tbody></tbody>
-      <caption id="kv-caption"></caption>
     </table>
   </div>
+  <p class="tablenote" id="kv-caption"></p>
 </section>
 
 <section>
@@ -334,14 +352,14 @@
     <table id="depth-table">
       <thead><tr id="depth-head"></tr></thead>
       <tbody></tbody>
-      <caption>
+    </table>
+  </div>
+  <p class="tablenote">
         Decode tokens/second, no speculation. Attention re-reads the whole cache every step, so a
         format's cost only appears at depth &mdash; measuring at a shallow cache would show almost
         no difference between any of these. Each figure is the mean of three timed repetitions
         after one warm-up.
-      </caption>
-    </table>
-  </div>
+  </p>
 </section>
 
 <section>
@@ -349,17 +367,17 @@
   <div class="tablewrap">
     <table id="spec-table">
       <thead>
-        <tr><th>Model</th><th>Mode</th><th>Weights</th><th>Decode</th><th>Acceptance</th></tr>
+        <tr><th>Mode</th><th>Weights</th><th>Decode</th><th>Acceptance</th></tr>
       </thead>
       <tbody></tbody>
-      <caption>
+    </table>
+  </div>
+  <p class="tablenote">
         Measured at an 8,192-token context with INT8 KV. Speculation is only worth its weight when
         the draft is accepted often: on the 35B, MTP3 with the draft head accepts 59.4% and pays
         back handsomely, while DFlash2 on the 27B accepts 10.8% and is a net loss against no
         speculation at all.
-      </caption>
-    </table>
-  </div>
+  </p>
 </section>
 
 <section class="prose">
@@ -479,6 +497,7 @@ const DATA = {
          (weights_id "groupwise-int"). The runtime also recognizes other weight profiles (see
          src/runtime/engine/context_cache/context_cost_defaults.cpp), with different resident weightsBytes;
          these figures do not apply to a differently-quantized weight artifact of this model. */
+      name: "Qwen3.8-27B",
       label: "Qwen3.8-27B (dense, groupwise-int weights)",
       weightsBytes: 17093490688,
       workspaceBytes: 159981568,
@@ -517,6 +536,7 @@ const DATA = {
     "35b": {
       /* Measured against the pinned 560f227e groupwise-int artifact fetched by
          download-model.{sh,bat} qwen36-35b-a3b; see the note on the 27B entry above. */
+      name: "Qwen3.6-35B-A3B",
       label: "Qwen3.6-35B-A3B (MoE, groupwise-int weights)",
       weightsBytes: 21038469632,
       workspaceBytes: 109453312,
@@ -838,6 +858,7 @@ function render() {
   $("overhead-note").textContent =
     (specMode.seqFixedBytes / MIB).toFixed(1) + " MiB fixed + " +
     (specMode.seqPerToken === 0.0625 ? "1/16" : "1/8") + " B per token";
+  $("model-hint").textContent = model.label.replace(/^[^(]*\((.*)\)$/, (_, d) => d[0].toUpperCase() + d.slice(1) + ".");
   $("kv-hint").textContent = DATA.kvNotes[kv];
   $("spec-hint").textContent = (spec.accept !== null
     ? "Measured draft acceptance " + (spec.accept * 100).toFixed(1) + "% on this model. "
@@ -937,7 +958,8 @@ function buildSpecTable() {
     for (const sk of Object.keys(m.spec)) {
       const s = m.spec[sk];
       const rel = ((s.decode - baseDecode) / baseDecode) * 100;
-      out.push("<tr><td>" + m.label + "</td><td>" + s.label + "</td>" +
+      if (sk === "none") out.push('<tr class="group"><th colspan="4" scope="rowgroup">' + m.name + "</th></tr>");
+      out.push("<tr><td>" + s.label + "</td>" +
         "<td>" + s.weightsGiB.toFixed(2) + " GiB</td>" +
         '<td class="' + (rel < 0 ? "bad" : rel > 20 ? "best" : "") + '">' +
           s.decode.toFixed(2) + (sk === "none" ? "" : " (" + (rel > 0 ? "+" : "") +
@@ -950,7 +972,7 @@ function buildSpecTable() {
 
 function buildControls() {
   $("model").innerHTML = Object.keys(DATA.models)
-    .map((k) => '<option value="' + k + '">' + DATA.models[k].label + "</option>").join("");
+    .map((k) => '<option value="' + k + '">' + DATA.models[k].name + "</option>").join("");
   $("kv").innerHTML = KV_ORDER
     .map((k) => '<option value="' + k + '">' + DATA.kvLabels[k] + "</option>").join("");
   $("kv").value = "int8";
