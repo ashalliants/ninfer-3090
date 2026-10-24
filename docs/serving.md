@@ -606,6 +606,11 @@ The local directory becomes a cache of the bucket.
   fetching their chunks (every chunk is verified, a damaged one makes the session a miss and it is
   not offered again). A new engine, a replacement box or a second engine therefore starts warm from
   what the others wrote, without sharing a disk.
+- Sessions pass between engines that load the same artifact (by the id its conversion wrote, so any
+  copy of it, whenever it was downloaded) with the same KV, recurrent-state, speculative and vision
+  settings. A session written under anything else is never read; it is a miss, and ages out. The
+  exception is a configured prompt graft: it is matched by its file's size and modification time, so
+  sessions that start from a graft pass between engines only when the graft file is the same copy.
 - A request that would resume from a session only the bucket holds waits for it like any stored
   session (see above): the background reader fetches the missing chunks, within the same deadline,
   without holding up the Engine worker or other requests.

@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
+#include <filesystem>
 #include <iostream>
 #include <string>
 
@@ -53,6 +55,20 @@ void file_set_and_bindings() {
     require(plan.device_objects.size() == 1 && plan.device_capacity(0) == 528 &&
                 plan.host_objects.size() == 1,
             "selected parent deduplication or residency failed");
+}
+
+// The context store binds stored conversations to the artifact's id, so every copy of one artifact
+// must report the same id however its file time differs: a download stamps the copy with when it
+// finished, and machines sharing a bucket must still agree.
+void artifact_id_ignores_file_time() {
+    Fixture fixture;
+    fixture.write(true);
+    const auto written = artifact_id_hex(Reader(fixture.entry).artifact_id());
+    require(written == "71" + std::string(30, '0'), "artifact id is not its 16 header bytes in hex");
+    std::filesystem::last_write_time(fixture.entry, std::filesystem::last_write_time(fixture.entry) -
+                                                        std::chrono::hours(24 * 365));
+    require(artifact_id_hex(Reader(fixture.entry).artifact_id()) == written,
+            "the file's modification time changed the artifact id");
 }
 
 void geometry_and_views() {
@@ -314,6 +330,7 @@ void invalid_directories() {
 int main(int argc, char** argv) {
     try {
         file_set_and_bindings();
+        artifact_id_ignores_file_time();
         geometry_and_views();
         ggml_geometry();
         invalid_directories();

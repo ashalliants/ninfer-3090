@@ -20,6 +20,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_cli_options_test
   ninfer_context_cost_measure_test
   ninfer_context_cost_test
+  ninfer_context_store_binding_test
   ninfer_context_store_test
   ninfer_device_sync_invalid_test
   ninfer_effective_thinking_budget_test

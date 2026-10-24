@@ -570,6 +570,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     LoadSummary summary;
     summary.architecture = models::architecture_name(instance->model->config().text.architecture);
     summary.model_name   = instance->model->info().name;
+    summary.artifact_id  = artifact::artifact_id_hex(instance->model->info().artifact_id);
     summary.prefill_signature = signature;
     std::set<std::string> formats;
     for (const auto& weight : instance->model->weight_data()) {
