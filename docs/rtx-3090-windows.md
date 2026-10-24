@@ -117,7 +117,8 @@ boundary from 171,648 to 226,560 tokens at 1 GiB headroom, for 5.51 GiB of KV ag
 
 That context gain has a measured quality cost of **+0.148% perplexity** on the Qwen3.8-27B
 `download-model` fetches (`ninfer-perplexity`, `ninfer-ppl-1m-v1` quick, 261,167 scored tokens:
-4.302505 on INT8 against 4.308870 on rk8v4, 2026-10-24). Values are not rotated, so there is no
+4.302505 on INT8 against 4.308870 on rk8v4, measured 2026-10-24 under Linux; perplexity does not
+depend on the OS). Values are not rotated, so there is no
 inverse-rotation pass over the attention output. Values do use a finer group than keys, 32 against
 64, which halved the penalty when it was introduced (+0.146% to +0.082% on upstream's weights) at
 no cost in context.
@@ -125,13 +126,13 @@ no cost in context.
 Decode speed barely depends on the choice. Without speculation `rk8v4` is the faster of the two at
 every depth (46.3 against 45.9 tok/s at a 32K cache); with MTP3 and the draft head INT8 leads by 2.4%
 after a 4K prompt (157.7 against 154.0 tok/s) and the two are level after 32K (`ninfer_bench`,
-2026-10-24, an RTX 3090 at its stock 350 W). Prefer `rk8v4` when context is the binding constraint,
+2026-10-24, an RTX 3090 at its stock 350 W under Linux, not this Windows setup). Prefer `rk8v4` when context is the binding constraint,
 and INT8 when the last few percent of speculative decode matter more.
 
 ## Measured 35B capacity
 
 Aggregate decode with the artifact `download-model qwen36-35b-a3b` fetches, measured 2026-10-24 on
-an otherwise idle RTX 3090 at its stock 350 W: `ninfer_bench --concurrency N`, 128 output tokens per
+an otherwise idle RTX 3090 at its stock 350 W under Linux, not Windows: `ninfer_bench --concurrency N`, 128 output tokens per
 request, MTP3, INT8 KV, a 4,096-token context:
 
 | Concurrency | Aggregate decode | MTP acceptance |

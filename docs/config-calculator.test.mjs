@@ -134,7 +134,7 @@ check("decodeAtDepth: past the deepest measured point extrapolates", () => {
 // (2026-10-24; Qwen3.6-27B, same geometry, is refused for exactly the same figure). The page's own terms (KV + fixed sequence state + per-token remainder + workspace +
 // graph allowance, excluding weights) are stated to sum to exactly that. Reproducing it here pins
 // that agreement as a regression instead of a one-off manual check.
-check("golden: 262144-token int8, no speculation, 27B matches the engine's own refusal figure", () => {
+check("golden: 262144-token int8, no speculation, 27B matches the engine's reported reservation", () => {
   const model = model27b;
   const ctx = 262144;
   const none = model.spec.none;
@@ -169,6 +169,38 @@ check("golden: 262144-token int8 with MTP3 + draft head is within 0.1% of the en
   const error = Math.abs(reservation - engine) / engine;
   assert.ok(error < 0.001, `reservation ${reservation} vs engine ${engine} (${(error * 100).toFixed(3)}%)`);
 });
+
+// --- the same two cross-checks for Bonsai and Qwen3.6-27B ---------------------------------------
+// Both measured 2026-10-24 in the calculator's session. Qwen3.6-27B does not fit 262,144 int8
+// beside its weights, so its figures are the engine's refusals:
+//
+//   ninfer_bench --weights qwen3_6_27b.ninfer --kv-dtype int8 --max-ctx 262144 -n 1
+//   error: requested Engine runtime reservation requires 9181618688 bytes
+//   ... --spec mtp --draft-tokens 3 --lm-head-draft
+//   error: requested Engine runtime reservation requires 9822361600 bytes
+//
+// Bonsai's weights are 8.9 GiB lighter, so both configurations fit and the figures are its reported
+// reservation (sequence + workspace + graph allowance): 9,183,478,272 and 9,824,221,184 bytes.
+// No speculation reproduces to the byte; MTP3 + draft head is within the same 0.021% of allocator
+// page rounding as the 27B above.
+function reservationAt262k(model, specKey) {
+  const ctx = 262144;
+  const spec = model.spec[specKey];
+  const kvBytes = (model.kv.int8 * spec.kvRatio + spec.kvExtraPerToken) * pageRoundUp(ctx);
+  const ovhBytes = spec.seqFixedBytes + spec.seqPerToken * ctx;
+  return kvBytes + ovhBytes + model.workspaceBytes + graphBytes(spec, ctx);
+}
+for (const [key, none, mtp] of [["bonsai", 9183478272, 9824221184],
+                                ["q36-27b", 9181618688, 9822361600]]) {
+  check(`golden: 262144-token int8, no speculation, ${key} matches the engine exactly`, () => {
+    assert.equal(reservationAt262k(DATA.models[key], "none"), none);
+  });
+  check(`golden: 262144-token int8 with MTP3 + draft head, ${key} is within 0.1% of the engine`, () => {
+    const reservation = reservationAt262k(DATA.models[key], "mtp3+head");
+    const error = Math.abs(reservation - mtp) / mtp;
+    assert.ok(error < 0.001, `reservation ${reservation} vs engine ${mtp} (${(error * 100).toFixed(3)}%)`);
+  });
+}
 
 // --- DFlash v1 on the 35B, which the model reproduces exactly ----------------------------------
 // The strongest cross-check available, and the one that settles how DFlash should be modelled:

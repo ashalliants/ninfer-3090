@@ -1005,7 +1005,7 @@ more unless `NINFER_NGRAM=on` (see [launcher profiles](maintainer/launcher-profi
 ### Choosing a KV format (RTX 3090, Qwen3.8-27B)
 
 All seven SM86 KV formats, measured on Qwen3.8-27B (this fork's 3090 conversion), 2026-10-24, in
-one session on an RTX 3090 at its stock 350 W.
+one session on an RTX 3090 at its stock 350 W under Linux.
 
 | KV profile | Bytes/token | KV at 2,048 tokens | Perplexity | vs `bf16` | Decode at 32K depth |
 |---|---:|---:|---:|---:|---:|

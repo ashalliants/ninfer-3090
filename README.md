@@ -522,13 +522,13 @@ fetches, in one sitting with upstream's artifact on the same binaries. Decode is
 `tools/bench/run_chat_decode.py` on syv-ai's eight thinking-off prompts (1,024 tokens, INT8 KV,
 greedy), where upstream's artifact gives 127 tok/s at C1 and 482 at C8. The 27B prefill is
 `ninfer_bench` pp4096 on the cuBLAS route the launcher enables, chunk 4096, `rk4v4` KV, re-measured
-2026-10-24 on an RTX 3090 at its stock 350 W (+0.156% perplexity for the route). The earlier 187 and
+2026-10-24 on an RTX 3090 at its stock 350 W under Linux (+0.156% perplexity for the route). The earlier 187 and
 523 came from runs whose workload was not recorded and that this harness does not reproduce on
 either artifact. The 35B prefill was measured on 2026-10-02 with its launcher settings (cuBLAS
 route, chunk 4096, `rk4v4`; 5,470 tok/s on the previous default-route chunk 512). Its one-stream
 decode is `ninfer_bench` tg512 with MTP3 and the draft head, `rk8v4` KV, on the v0.16.0 release
 binaries (2026-10-14); its all-lanes figure is `ninfer_bench` with six concurrent requests of 128
-tokens each, MTP3, INT8 KV and a 4,096-token context (2026-10-24, stock 350 W).
+tokens each, MTP3, INT8 KV and a 4,096-token context (2026-10-24, stock 350 W, Linux).
 The 27B's 262,144 was measured with MTP3 and the draft head; the default DFlash2 profile reaches it
 on a headless card by extrapolation, and the server fits the context to the free memory where it
 does not. Sources and conditions are in the sections below.
@@ -643,7 +643,7 @@ smallest formats are not the fastest.
 | `nvfp4` | 18,432 | 36.00 MiB | 4.312298 | +0.227% | 39.33 tok/s |
 | `rk4v4` | **17,920** | **35.00 MiB** | 4.311406 | +0.207% | 45.64 tok/s |
 
-Measured 2026-10-24 in one session on an RTX 3090 at its stock 350 W. Perplexity is
+Measured 2026-10-24 in one session on an RTX 3090 at its stock 350 W under Linux. Perplexity is
 `ninfer-perplexity` on the fixed `ninfer-ppl-1m-v1` corpus, `--quick`, context/stride 4096/2048,
 261,167 scored tokens — the same corpus and window for every row. Decode is `ninfer_bench -pg
 32768,128`: 128 timed steps on top of a 32,768-token prefill, no speculation, the mean of three
@@ -701,7 +701,7 @@ the packed keys into registers ahead of use and expand them with byte permutes s
 existing INT8 key tile, which adds no shared memory; that is what keeps it off the slow path the
 `nvfp4` and `k8v4` kernels take (see [TODO.md](TODO.md), "KV decode falloff").
 
-Measured together on one RTX 3090 (stock 350 W), Qwen3.8-27B, this fork's 3090 conversion, 2026-10-24:
+Measured together on one RTX 3090 (stock 350 W, Linux), Qwen3.8-27B, this fork's 3090 conversion, 2026-10-24:
 
 | KV profile | Bytes/token | Perplexity | vs `int8` | Decode 4K / 16K / 32K | Prefill at 32K |
 |---|---:|---:|---:|---|---:|

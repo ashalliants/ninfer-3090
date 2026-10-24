@@ -389,7 +389,7 @@
   <h2>How these numbers were taken</h2>
   <p>
     All measurements were taken on 2026-10-24 in one session on an RTX 3090 at its stock 350 W
-    (24 GiB, sm_86, CUDA 12.8) on this fork, with <code>ninfer_bench</code> and
+    (24 GiB, sm_86, CUDA 12.8, Linux) on this fork, with <code>ninfer_bench</code> and
     <code>ninfer-perplexity</code>, against the artifact each model's download script fetches.
   </p>
   <ul>
@@ -499,7 +499,7 @@ const DATA = {
   cardMiB: 24576,
 
   models: {
-    /* All four measured 2026-10-24 in one session on an RTX 3090 at its stock 350 W (CUDA 12.8,
+    /* All four measured 2026-10-24 in one session on an RTX 3090 at its stock 350 W (Linux, CUDA 12.8,
        build 1d3e508f), with the same ninfer_bench arguments as
        scripts/sweeps/{kv-decode-vs-depth,speculative-memory-terms,speculation-matrix}.ps1.
        Workspace is the largest the engine reported across formats and contexts (it is up to 37 MB
@@ -512,7 +512,7 @@ const DATA = {
          "linear_topk: unsupported head profile". */
       name: "Qwen3.8-27B",
       label: "Qwen3.8-27B (dense, this fork's 3090 conversion)",
-      about: "This fork's 3090 conversion, the one download-model qwen38-27b fetches. Measured 2026-10-24 on an RTX 3090 at its stock 350 W.",
+      about: "This fork's 3090 conversion, the one download-model qwen38-27b fetches. Measured 2026-10-24 on an RTX 3090 at its stock 350 W, Linux.",
       nativeMaxContext: 262144,
       weightsBytes: 15638427648,
       workspaceBytes: 144179200,
@@ -539,7 +539,7 @@ const DATA = {
          read 1.388 on int8 and 1.711 on nvfp4), so it is kvExtraPerToken rather than kvRatio. */
       name: "Qwen3.6-35B-A3B",
       label: "Qwen3.6-35B-A3B (MoE, groupwise-int weights)",
-      about: "Mixture of experts, 3B active per token, groupwise-int weights (download-model qwen36-35b-a3b). Measured 2026-10-24 on an RTX 3090 at its stock 350 W.",
+      about: "Mixture of experts, 3B active per token, groupwise-int weights (download-model qwen36-35b-a3b). Measured 2026-10-24 on an RTX 3090 at its stock 350 W, Linux.",
       nativeMaxContext: 262144,
       weightsBytes: 21038469632,
       workspaceBytes: 112135680,
@@ -567,7 +567,7 @@ const DATA = {
          27B, so the same KV bytes per token, with 8.9 GiB less in weights. */
       name: "Ternary Bonsai 2 27B",
       label: "Ternary Bonsai 2 27B (dense, ternary weights)",
-      about: "Prism ML's ternary Qwen3.8-27B, 2.125 bits per weight (download-model bonsai2-27b). Measured 2026-10-24 on an RTX 3090 at its stock 350 W.",
+      about: "Prism ML's ternary Qwen3.8-27B, 2.125 bits per weight (download-model bonsai2-27b). Measured 2026-10-24 on an RTX 3090 at its stock 350 W, Linux.",
       nativeMaxContext: 262144,
       weightsBytes: 7189829632,
       workspaceBytes: 146038784,
@@ -594,7 +594,7 @@ const DATA = {
       /* Upstream's Qwen3.6-27B. Its artifact carries no DFlash2 bundle, so only MTP is offered. */
       name: "Qwen3.6-27B",
       label: "Qwen3.6-27B (dense, groupwise-int weights)",
-      about: "The earlier dense 27B, groupwise-int weights (download-model qwen36-27b). MTP only: it has no DFlash2 bundle. Measured 2026-10-24 on an RTX 3090 at its stock 350 W.",
+      about: "The earlier dense 27B, groupwise-int weights (download-model qwen36-27b). MTP only: it has no DFlash2 bundle. Measured 2026-10-24 on an RTX 3090 at its stock 350 W, Linux.",
       nativeMaxContext: 262144,
       weightsBytes: 16378329088,
       workspaceBytes: 144179200,

@@ -85,8 +85,8 @@ are single-card, few-prompt measurements: treat them as indicative.
 reference implementation this port follows (pxzleo/ninfer-all) reports 5.631 for the same artifact
 and protocol.
 
-**Prefill**, `ninfer_bench`, 1,024-token chunks (re-measured 2026-10-24 on an RTX 3090 at its stock
-350 W):
+**Prefill**, `ninfer_bench`, 1,024-token chunks. Unlike the rest of this section, re-measured
+2026-10-24 under **Linux** on an RTX 3090 at its stock 350 W (CUDA 12.8, build `1d3e508f`):
 
 | Prompt | 1k | 4k | 16k |
 |---|---:|---:|---:|
