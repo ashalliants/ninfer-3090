@@ -469,6 +469,10 @@ public:
         std::chrono::milliseconds idle_persist{0};
         // The longest a request waits for its stored session to be read back.
         std::chrono::milliseconds hydration_budget{0};
+        // The store keeps a copy in a bucket: a request that finds nothing has the listing
+        // refreshed once before it prefills, and a session only the bucket holds is downloaded
+        // when the download fits in the request's wait.
+        bool remote = false;
     };
 
     void set_context_store(ContextStoreHooks hooks) {
@@ -477,7 +481,10 @@ public:
         store_removals_seen_  = store_removal_count();
         store_failures_seen_  = store_.failures ? store_.failures() : 0;
         if (store_.store && !hydration_reader_.joinable()) {
-            hydration_reader_ = std::thread([this] { hydration_reader_loop(); });
+            hydration_reader_ = std::thread([this] { hydration_reader_loop(hydration_queue_); });
+        }
+        if (store_.store && store_.remote && !lookup_reader_.joinable()) {
+            lookup_reader_ = std::thread([this] { hydration_reader_loop(lookup_queue_); });
         }
         typename ResourceManagement::Durability durability;
         if (store_.store) {
@@ -3532,7 +3539,24 @@ private:
         std::optional<std::vector<std::uint8_t>> bytes;
         // Wall time of the store read, for the cost model's read rate.
         std::uint64_t read_ns = 0;
+        // What the read downloaded from the bucket first, and how long the download alone took.
+        ContextStore::LoadReport fetch;
+        // Not a read: refresh the store's listing of the bucket, then consult the store again.
+        bool lookup = false;
     };
+
+    // A request that would prefill for less than this does not wait for a bucket listing.
+    static constexpr auto kStoreLookupMinimumPrefill = std::chrono::seconds(2);
+    // The longest a request waits for the listing.
+    static constexpr auto kStoreLookupBudget = std::chrono::seconds(5);
+
+    // Time to fetch `bytes` of missing chunks from the bucket, at the rate the last fetches
+    // achieved. A fetch is download, verification and installation together (what a waiting
+    // request waits for), so that is what the rate measures, not the network alone.
+    [[nodiscard]] std::uint64_t remote_fetch_ns(std::uint64_t bytes) const noexcept {
+        const double ns = static_cast<double>(bytes) * remote_ns_per_byte_;
+        return ns >= static_cast<double>(UINT64_MAX) ? UINT64_MAX : static_cast<std::uint64_t>(ns);
+    }
 
     // Before admission: when the store holds a checkpoint of this very prompt deeper than anything
     // the cache offers, and reading it back, copying it to the device and prefilling the rest is
@@ -3556,6 +3580,19 @@ private:
         }
         const auto& base         = *request->base_plan;
         const auto prompt_tokens = base.summary().prompt_tokens;
+        // The prefill this request faces from what is resident.
+        const auto full_prefill =
+            resources_.prefill_ns(instance_.program->prefill_work(base, resident, prompt_tokens));
+        // A download from the bucket is not weighed against the prefill it saves: it only makes
+        // this request wait, while a prefill holds the GPU every other lane shares. It has to fit
+        // in the wait, though (at the rate downloads have achieved), or it would time out anyway.
+        // The wait is the read's deadline below: the budget, or less when the request has less
+        // left before its own deadline.
+        const auto now     = Clock::now();
+        const auto left    = std::max<Clock::duration>(request->deadline - now, Clock::duration::zero());
+        const auto wait    = std::min<Clock::duration>(store_.hydration_budget, left);
+        const auto wait_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(wait).count());
         std::string best_id;
         std::uint32_t best_frontier = resident;
         try {
@@ -3563,6 +3600,7 @@ private:
                 // The binding does not include the context length: an image deeper than this
                 // Engine's context could never be restored, and reading it would only cost time.
                 if (info.binding != store_.binding || info.tokens > max_context_) { continue; }
+                if (info.fetch_bytes > 0 && remote_fetch_ns(info.fetch_bytes) >= wait_ns) { continue; }
                 const auto restore = resources_.store_restore_ns(info.image_bytes);
                 if (restore >= best_cost) { continue; }
                 for (const ContextStore::CheckpointKey& key : info.checkpoints) {
@@ -3582,8 +3620,31 @@ private:
                 }
             }
         } catch (...) { return false; }
-        if (best_id.empty()) { return false; }
-        const auto now                   = Clock::now();
+        if (best_id.empty()) {
+            // Nothing here, but another engine may have stored this session since the bucket was
+            // last listed (the conversation moved here a moment ago). A request with a long
+            // prefill ahead lists it once and looks again; a short one is not worth the wait.
+            if (!store_.remote || request->store_looked_up ||
+                full_prefill < static_cast<std::uint64_t>(
+                                   std::chrono::nanoseconds(kStoreLookupMinimumPrefill).count())) {
+                return false;
+            }
+            request->store_looked_up    = true;
+            request->store_lookup       = true;
+            request->hydrating          = true;
+            request->hydration_started  = now;
+            request->hydration_deadline = std::min(request->deadline, now + kStoreLookupBudget);
+            {
+                std::lock_guard lock(hydration_mutex_);
+                HydrationTask task;
+                task.request = request;
+                task.lookup  = true;
+                lookup_queue_.push_back(std::move(task));
+            }
+            // Two threads wait on this condition variable, each for its own queue.
+            hydration_cv_.notify_all();
+            return true;
+        }
         request->hydrating               = true;
         request->hydration_frontier      = best_frontier;
         request->hydration_reuse_before  = resident;
@@ -3591,26 +3652,51 @@ private:
         request->hydration_deadline      = std::min(request->deadline, now + store_.hydration_budget);
         {
             std::lock_guard lock(hydration_mutex_);
-            hydration_queue_.push_back({request, std::move(best_id), std::nullopt});
+            HydrationTask task;
+            task.request = request;
+            task.id      = std::move(best_id);
+            hydration_queue_.push_back(std::move(task));
         }
-        hydration_cv_.notify_one();
+        hydration_cv_.notify_all();
         return true;
     }
 
-    void hydration_reader_loop() noexcept {
+    // A bucket lookup settled (or ran out of time): the request consults the store again, now
+    // with whatever the listing found, and is offered for admission as usual.
+    void finish_store_lookup(const std::shared_ptr<Request>& request) {
+        request->store_lookup = false;
+        request->hydrating    = false;
+        request->store_probed = false;
+        cumulative_stats_.context_store_lookup_seconds +=
+            std::chrono::duration<double>(Clock::now() - request->hydration_started).count();
+        ++cumulative_stats_.context_store_lookups;
+        request->admission_generation = 0;
+        request_admission_check();
+    }
+
+    // Runs the tasks of one queue: reads on the hydration reader, bucket lookups on their own
+    // thread, so a lookup stalled on the network never holds up a read (or the reverse). The
+    // waiting request is released at its deadline either way (process_hydrations).
+    void hydration_reader_loop(std::deque<HydrationTask>& queue) noexcept {
         for (;;) {
             HydrationTask task;
             {
                 std::unique_lock lock(hydration_mutex_);
-                hydration_cv_.wait(lock,
-                                   [&] { return hydration_stop_ || !hydration_queue_.empty(); });
+                hydration_cv_.wait(lock, [&] { return hydration_stop_ || !queue.empty(); });
                 if (hydration_stop_) { return; }
-                task = std::move(hydration_queue_.front());
-                hydration_queue_.pop_front();
+                task = std::move(queue.front());
+                queue.pop_front();
             }
             if (const auto started = Clock::now(); started < task.request->hydration_deadline) {
                 try {
-                    task.bytes = store_.store->load(task.id, false);
+                    if (task.lookup) {
+                        // The bucket as of when the request looked: a listing taken since (for
+                        // another request) serves it too.
+                        (void)store_.store->refresh_remote_since(task.request->hydration_started,
+                                                                 task.request->hydration_deadline);
+                    } else {
+                        task.bytes = store_.store->load(task.id, false, &task.fetch);
+                    }
                 } catch (...) { task.bytes.reset(); }
                 task.read_ns = static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started)
@@ -3631,6 +3717,7 @@ private:
         }
         hydration_cv_.notify_all();
         if (hydration_reader_.joinable()) { hydration_reader_.join(); }
+        if (lookup_reader_.joinable()) { lookup_reader_.join(); }
     }
 
     void observe_store_read(std::uint64_t image_bytes, std::uint64_t nanoseconds) noexcept {
@@ -3747,6 +3834,11 @@ private:
         }
         for (auto& task : done) {
             const auto& request = task.request;
+            // A completed fetch measures the fetch rate whatever then becomes of the request
+            // (gone, already covered, or an import without room).
+            if (task.bytes && task.fetch.fetched_bytes > 0) {
+                observe_remote_fetch(task.fetch.fetched_bytes, task.fetch.fetch_ns);
+            }
             if (!request->hydrating) { continue; } // gave up at its deadline
             bool waiting = false;
             {
@@ -3754,7 +3846,13 @@ private:
                 waiting = std::find(pending_.begin(), pending_.end(), request) != pending_.end();
             }
             if (!waiting) {
-                request->hydrating = false;
+                // Cancelled or failed meanwhile: settle nothing for it, lookup or read.
+                request->hydrating    = false;
+                request->store_lookup = false;
+                continue;
+            }
+            if (task.lookup) {
+                finish_store_lookup(request);
                 continue;
             }
             if (task.bytes && cache_covers_hydration(request)) {
@@ -3770,8 +3868,10 @@ private:
                     imported = import_for_request(request, *task.bytes, task.id);
                 } catch (const std::invalid_argument&) { imported = false; }
                 if (imported) {
+                    // The fetch taught the fetch rate above; the rest of the read (the local
+                    // files read, verified and reassembled) and the import teach the disk's.
                     observe_store_read(task.bytes->size(),
-                                       task.read_ns +
+                                       task.read_ns - std::min(task.read_ns, task.fetch.fetch_ns) +
                                            static_cast<std::uint64_t>(
                                                std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                    Clock::now() - started)
@@ -3790,7 +3890,22 @@ private:
                 }
             }
         }
-        for (const auto& request : expired) { finish_hydration(request, true); }
+        for (const auto& request : expired) {
+            if (request->store_lookup) {
+                finish_store_lookup(request);
+            } else {
+                finish_hydration(request, true);
+            }
+        }
+    }
+
+    // Moves the download rate towards what one download achieved (half the way: it follows a
+    // changed link within a few downloads without swinging on one slow one).
+    void observe_remote_fetch(std::uint64_t bytes, std::uint64_t nanoseconds) noexcept {
+        if (bytes == 0 || nanoseconds == 0) { return; }
+        const double observed = static_cast<double>(nanoseconds) / static_cast<double>(bytes);
+        remote_ns_per_byte_   = 0.5 * remote_ns_per_byte_ + 0.5 * observed;
+        cumulative_stats_.context_store_remote_fetch_bytes_per_second = 1e9 / remote_ns_per_byte_;
     }
 
     // Counts a read-back once its request is admitted: only if the admission resumes from (at
@@ -4256,9 +4371,14 @@ private:
     std::mutex hydration_mutex_;
     std::condition_variable hydration_cv_;
     std::deque<HydrationTask> hydration_queue_;
+    std::deque<HydrationTask> lookup_queue_; // bucket lookups, run on lookup_reader_
     std::deque<HydrationTask> hydration_done_;
+    // Nanoseconds per byte downloaded from the bucket: assumed 100 MB/s until a download says
+    // otherwise. Engine worker only.
+    double remote_ns_per_byte_ = 10.0;
     bool hydration_stop_ = false;
     std::thread hydration_reader_;
+    std::thread lookup_reader_;
 
     // Model residency. The snapshots exist only when suspend is enabled and are touched under the
     // execution mutex; the flags are also read by submit and is_available without it.

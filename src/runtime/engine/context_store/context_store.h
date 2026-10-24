@@ -69,6 +69,12 @@ public:
         std::string remote_prefix; // prepended to every key, e.g. "ninfer/"
         std::chrono::seconds remote_refresh{60};
         std::chrono::seconds remote_touch_interval{24 * 3600};
+        // How long a written image waits before it is uploaded. A conversation is written after
+        // every turn, and each write supersedes the one before: a write superseded while it waits
+        // is never uploaded, so a burst of turns costs one upload. Waits whose image is superseded
+        // pass their start on, so a conversation that keeps going is still uploaded this often.
+        // flush_remote() uploads without waiting.
+        std::chrono::seconds remote_upload_delay{0};
 
         // Directories of other engines' stores on the same volume, read but never written. Every
         // `peer_poll` the manifests there that this store does not hold are imported by hard-linking
@@ -124,6 +130,8 @@ public:
         std::vector<CheckpointKey> checkpoints;
         // Every chunk of the image is in the directory, so load() does not touch the network.
         bool local  = true;
+        // Bytes load() would download first: the chunks the directory lacks (0 when local).
+        std::uint64_t fetch_bytes = 0;
         bool shared = false;
     };
 
@@ -158,6 +166,13 @@ public:
         std::uint64_t remote_download_bytes  = 0;
         std::uint64_t remote_download_failures = 0;
         std::uint64_t remote_refreshes       = 0;
+        // Manifests a refresh downloaded to register images (not counted in remote_downloads).
+        std::uint64_t remote_manifest_downloads      = 0;
+        std::uint64_t remote_manifest_download_bytes = 0;
+        // Superseded images whose manifests were deleted from the bucket, and queued uploads that
+        // a newer write of the same conversation made unnecessary.
+        std::uint64_t remote_retired          = 0;
+        std::uint64_t remote_uploads_skipped  = 0;
         // With peers: images imported from them, the chunk bytes linked (not copied), images
         // skipped (damaged, expired, over budget, or gone mid-import) and links that failed.
         std::uint64_t peer_images       = 0;
@@ -183,8 +198,17 @@ public:
     // image is removed so it is not offered again. Counts as a use.
     // `touch` false reads without refreshing the image's last use; the caller then calls touch()
     // once it has actually used the image.
+    // What a load fetched from the bucket first, and how long the fetch took: the missing chunks
+    // downloaded, verified and installed (what a waiting request waits for), not the local read
+    // and reassembly that follow. Bytes are the chunks' raw length (as Info::fetch_bytes), not
+    // what crossed the network, which is smaller for compressed chunks.
+    struct LoadReport {
+        std::uint64_t fetched_bytes = 0;
+        std::uint64_t fetch_ns      = 0;
+    };
     [[nodiscard]] std::optional<std::vector<std::uint8_t>> load(const std::string& id,
-                                                                bool touch = true);
+                                                                bool touch          = true,
+                                                                LoadReport* report = nullptr);
 
     [[nodiscard]] std::vector<Info> list() const;
     [[nodiscard]] std::optional<Info> find(const std::string& id) const;
@@ -200,12 +224,17 @@ public:
     // `final_flush`, queued refreshes, prefetches and touches are dropped first so only uploads use
     // the budget.
     bool flush_remote(std::chrono::steady_clock::time_point deadline, bool final_flush = false);
-    // With a remote: lists it now and registers images it holds that this store does not. Also done
-    // in the background every remote_refresh. Returns the number of images added.
-    // Lists the bucket and registers images other engines left there. Stops reading manifests at
-    // `deadline`; an incomplete listing never removes anything from the index.
+    // With a remote: lists the bucket and registers images other engines left there that this
+    // store does not hold. Also done in the background every remote_refresh. Returns the number of
+    // images added. Stops reading manifests at `deadline`, waiting for another refresh counted; an
+    // incomplete listing never removes anything from the index.
     std::size_t refresh_remote(std::chrono::steady_clock::time_point deadline =
                                    std::chrono::steady_clock::time_point::max());
+    // The same, for a caller that needs the bucket as of `asked` (a request that found nothing):
+    // skipped when a complete listing taken at or after `asked` exists, as when one ran while this
+    // waited, so requests arriving together list the bucket once. Refreshes never run two at a time.
+    std::size_t refresh_remote_since(std::chrono::steady_clock::time_point asked,
+                                     std::chrono::steady_clock::time_point deadline);
     // With a remote: fetches the image's missing chunks in the background so a later load() is
     // local. False when there is nothing to do.
     bool prefetch(const std::string& id);
@@ -240,6 +269,19 @@ private:
         // The bucket's modified time of the manifest this entry was imported from (0: written or
         // loaded here). Compared only with other bucket times, never with the local clock.
         std::int64_t remote_modified_ms = 0;
+        // With a remote: evicted for space or age. Its chunk files are gone, except those that
+        // images still held here share, but the entry and manifest stay, so the image is still
+        // offered and its chunks are fetched from the bucket when it is loaded. Dropping the entry
+        // instead would make the next refresh download the manifest again.
+        bool evicted = false;
+        // With a remote: the bucket is known to hold this generation's manifest (an upload of it
+        // succeeded, a touch found it, or it was registered from a listing). Only such an image is
+        // evicted to the remote; one the bucket may lack is removed whole, as without a remote,
+        // rather than kept as an entry whose chunks exist nowhere.
+        bool published = false;
+        // When this store last confirmed that (default: before any listing, as for a restart). A
+        // complete listing taken after it that omits the manifest proves the bucket lost it.
+        std::chrono::steady_clock::time_point published_at{};
         // Set on an image whose manifest was imported from a peer: the peer_skipped_ key and
         // manifest time to restore if the manifest proves damaged. Such an image is the peer's to
         // upload, so a use here never puts it in the bucket.
@@ -273,10 +315,22 @@ private:
         // or evicted since), with its chunk files pinned until the upload ends.
         std::vector<std::uint8_t> manifest;
         std::vector<ChunkRef> chunks;
+        // Upload: images this one superseded, whose manifests are deleted from the bucket once
+        // this one's manifest is there.
+        std::vector<std::string> retire;
+        // Upload: not started before this, unless a flush is waiting.
+        std::chrono::steady_clock::time_point ready{};
+        // Upload: the entry generation the manifest describes; that entry is marked published when
+        // the upload succeeds.
+        std::uint64_t generation = 0;
     };
 
     [[nodiscard]] std::filesystem::path manifest_path(const std::string& id) const;
     [[nodiscard]] std::filesystem::path used_path(const std::string& id) const;
+    // Holds the checksum of the manifest last published to the bucket: a restart marks the entry
+    // published only when its manifest on disk is that one (not a newer write still to upload).
+    [[nodiscard]] std::filesystem::path published_path(const std::string& id) const;
+    void write_published_locked(const std::string& id, std::span<const std::uint8_t> manifest) const;
     [[nodiscard]] std::filesystem::path chunk_path(const std::array<std::uint64_t, 2>& hash) const;
     [[nodiscard]] std::filesystem::path
     compressed_chunk_path(const std::array<std::uint64_t, 2>& hash) const;
@@ -321,7 +375,22 @@ private:
     [[nodiscard]] std::uint64_t used_bytes_locked() const;
     void maintain_locked(const std::string* protect);
     bool evict_oldest_locked(const std::string* protect);
+    // Gives up the entry's local chunk files (keeping those another image held here still uses, and
+    // those a queued upload pins) and keeps the entry, which is then fetched from the bucket when
+    // it is loaded. With `apply` false only counts. `holders` is whole_image_holders_locked().
+    struct EvictionYield {
+        std::uint64_t freed  = 0; // bytes of the image's own files removed
+        std::uint64_t pinned = 0; // bytes of its own files a queued upload still needs
+    };
+    EvictionYield evict_to_remote_locked(
+        Entry& entry, const std::unordered_map<std::string, std::uint32_t>& holders, bool apply);
+    // Every chunk of the image is in the directory, and it was not evicted to the remote.
+    [[nodiscard]] bool held_whole_locked(const Entry& entry) const;
+    // For each chunk, how many images held whole use it.
+    [[nodiscard]] std::unordered_map<std::string, std::uint32_t> whole_image_holders_locked() const;
     [[nodiscard]] bool entry_local_locked(const Entry& entry) const;
+    // Raw bytes of the entry's chunks the directory lacks (each counted once).
+    [[nodiscard]] std::uint64_t fetch_bytes_locked(const Entry& entry) const;
     [[nodiscard]] bool entry_has_local_bytes_locked(const Entry& entry) const;
 
     // The remote tier (all no-ops without options_.remote).
@@ -333,8 +402,14 @@ private:
     [[nodiscard]] std::optional<std::pair<std::string, bool>>
     find_remote_chunk(const std::array<std::uint64_t, 2>& hash);
     void enqueue_remote(RemoteTask task);
-    void enqueue_upload(const std::string& id, std::vector<std::uint8_t> manifest,
-                        std::vector<ChunkRef> chunks);
+    // `superseded`: images this write superseded. Their queued uploads are dropped and their
+    // manifests are deleted from the bucket after this upload.
+    void enqueue_upload(const std::string& id, std::uint64_t generation,
+                        std::vector<std::uint8_t> manifest, std::vector<ChunkRef> chunks,
+                        std::vector<std::string> superseded);
+    // A replacement that will not be published (its upload failed or was dropped): the images it
+    // was to retire may be registered from the bucket again. Called with remote_mutex_ held.
+    void release_retirements_locked(const std::vector<std::string>& ids);
     void unpin_chunks_locked(const std::vector<ChunkRef>& chunks);
     void remote_loop();
     void upload_image(RemoteTask& task);
@@ -344,7 +419,9 @@ private:
     void prune_remote_state();
     enum class FetchStatus : std::uint8_t { Complete, Transient, Corrupt };
     // `generation` receives the generation of the entry the fetch worked from.
-    [[nodiscard]] FetchStatus fetch_image_chunks(const std::string& id, std::uint64_t& generation);
+    // `fetched` (optional) accumulates the bytes downloaded.
+    [[nodiscard]] FetchStatus fetch_image_chunks(const std::string& id, std::uint64_t& generation,
+                                                 std::uint64_t* fetched = nullptr);
     // A fetch of `generation` found the image damaged or gone in the bucket: drop it and do not
     // offer it again, unless the entry has been replaced since.
     void settle_failed_fetch(const std::string& id, std::uint64_t generation);
@@ -372,6 +449,7 @@ private:
     std::deque<RemoteTask> remote_queue_;
     bool remote_busy_     = false;
     bool remote_stopping_ = false;
+    std::uint32_t remote_flushes_ = 0; // flush_remote() calls waiting: delayed uploads run now
     // Chunk keys last confirmed in the bucket, and when: a lifecycle rule may have expired them
     // since, so the confirmation is trusted for remote_touch_interval only.
     std::unordered_map<std::string, std::int64_t> uploaded_;
@@ -384,6 +462,13 @@ private:
         std::int64_t failed_ms          = 0;
     };
     std::unordered_map<std::string, RemoteFailure> remote_failed_;
+    // Superseded manifests whose deletion from the bucket failed: retried after the next upload.
+    std::vector<std::string> retire_backlog_;
+    // Serializes refreshes; `last_refresh_` is when the last complete one took its listing. Timed, so a
+    // request waiting for a listing gives up at its deadline rather than behind a slow refresh.
+    std::timed_mutex refresh_mutex_;
+    std::chrono::steady_clock::time_point last_refresh_{};
+    std::size_t refresh_remote_locked(std::chrono::steady_clock::time_point deadline);
     std::int64_t last_prune_ms_ = 0; // remote worker thread only
 
     // Peer import. `owner_` holds the exclusive lock on options_.directory for the store's life.

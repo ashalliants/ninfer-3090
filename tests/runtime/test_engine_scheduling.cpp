@@ -7,7 +7,10 @@
 
 #include "runtime/fake_engine.h"
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <filesystem>
 #include <future>
 #include <iostream>
 #include <map>
@@ -42,6 +45,7 @@ struct Settings {
     std::chrono::microseconds prefill_sleep{0};
     std::uint32_t layer_slices = 0;
     bool admission_fit_check = false;
+    std::uint32_t pending_timeout_ms = 60'000;
 };
 
 class Rig {
@@ -60,7 +64,7 @@ public:
         options.max_context           = 1U << 20;
         options.max_concurrency       = settings.lanes;
         options.max_pending_requests  = 8;
-        options.pending_timeout_ms    = 60'000;
+        options.pending_timeout_ms    = settings.pending_timeout_ms;
         options.prefill_chunk         = settings.chunk;
         options.context_cache.enabled = false;
         options.admission_fit_check   = settings.admission_fit_check;
@@ -110,6 +114,14 @@ public:
             } catch (...) { promise->set_exception(std::current_exception()); }
         });
         return result;
+    }
+
+    // Gives the Engine a context store backed by a bucket. The store must outlive the Rig.
+    void attach_store(ContextStore& store, std::chrono::milliseconds hydration_budget) {
+        core_->set_context_store({.store            = &store,
+                                  .binding          = "fake-binding",
+                                  .hydration_budget = hydration_budget,
+                                  .remote           = true});
     }
 
     fake::Program& program() { return *instance_.program; }
@@ -659,6 +671,253 @@ void test_cancelling_a_sliced_chunk_leaves_the_engine_working() {
     (void)stream.wait_for(std::chrono::seconds(30));
 }
 
+// ---- context store with a bucket -------------------------------------------------------------
+//
+// The Engine's request-time path against a real ContextStore and an in-memory bucket: a request
+// that finds nothing has the bucket listed once, then is offered what the listing found. The fake
+// imports nothing, so a fetched session is not restored and the request prefills; these tests
+// check what the Engine asks of the store, not the restore.
+
+// An in-memory bucket. While `hold` is set every call waits, as a stalled link would.
+class MemoryBucket final : public ObjectStore {
+public:
+    void put(const std::string& key, std::span<const std::uint8_t> bytes) override {
+        gate();
+        std::scoped_lock lock(mutex_);
+        objects_[key] = {std::vector<std::uint8_t>(bytes.begin(), bytes.end()), clock_};
+    }
+    std::optional<std::vector<std::uint8_t>> get(const std::string& key) override {
+        gate();
+        std::scoped_lock lock(mutex_);
+        const auto found = objects_.find(key);
+        if (found == objects_.end()) { return std::nullopt; }
+        return found->second.first;
+    }
+    bool exists(const std::string& key) override {
+        gate();
+        std::scoped_lock lock(mutex_);
+        return objects_.contains(key);
+    }
+    std::vector<ObjectInfo> list(const std::string& prefix) override {
+        gate();
+        std::scoped_lock lock(mutex_);
+        ++lists;
+        std::vector<ObjectInfo> out;
+        for (const auto& [key, value] : objects_) {
+            if (key.starts_with(prefix)) { out.push_back({key, value.first.size(), value.second}); }
+        }
+        return out;
+    }
+    bool touch(const std::string& key) override {
+        std::scoped_lock lock(mutex_);
+        return objects_.contains(key);
+    }
+    void remove(const std::string& key) override {
+        std::scoped_lock lock(mutex_);
+        objects_.erase(key);
+    }
+    void interrupt() noexcept override { set_hold(false); }
+
+    void set_hold(bool value) {
+        {
+            std::scoped_lock lock(mutex_);
+            hold_ = value;
+        }
+        cv_.notify_all();
+    }
+    [[nodiscard]] std::int64_t clock() const noexcept { return clock_; }
+
+    std::atomic<int> lists{0};
+
+private:
+    void gate() {
+        std::unique_lock lock(mutex_);
+        cv_.wait(lock, [&] { return !hold_; });
+    }
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::map<std::string, std::pair<std::vector<std::uint8_t>, std::int64_t>> objects_;
+    std::int64_t clock_ = 1'000'000'000'000;
+    bool hold_          = false;
+};
+
+class StoreDirectory {
+public:
+    StoreDirectory() {
+        static std::atomic<int> counter{0};
+        path_ = std::filesystem::temp_directory_path() /
+                ("ninfer_engine_store_test_" + std::to_string(counter.fetch_add(1)) + "_" +
+                 std::to_string(Clock::now().time_since_epoch().count() & 0xffffff));
+        std::filesystem::remove_all(path_);
+        std::filesystem::create_directories(path_);
+    }
+    ~StoreDirectory() {
+        std::error_code ignored;
+        std::filesystem::remove_all(path_, ignored);
+    }
+    [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
+
+private:
+    std::filesystem::path path_;
+};
+
+ContextStore::Options bucket_store_options(const std::filesystem::path& directory,
+                                           const std::shared_ptr<MemoryBucket>& bucket) {
+    ContextStore::Options options;
+    options.directory      = directory;
+    options.chunk_bytes    = 4096;
+    options.remote         = bucket;
+    options.remote_prefix  = "ninfer/";
+    options.remote_refresh = std::chrono::seconds(3600); // only the Engine's lookups list it
+    options.clock          = [bucket] { return bucket->clock(); };
+    return options;
+}
+
+bool store_drained(ContextStore& store) {
+    return store.flush_remote(Clock::now() + std::chrono::seconds(10));
+}
+
+// Another engine stores a session of prompt `id` (the fake's shortlist key is {id, 0} at every
+// frontier) up to `frontier`, with `bytes` of state, and uploads it.
+void store_session_elsewhere(const std::shared_ptr<MemoryBucket>& bucket, std::uint64_t id,
+                             std::uint32_t frontier, std::size_t bytes) {
+    StoreDirectory directory;
+    ContextStore other(bucket_store_options(directory.path(), bucket));
+    ContextStore::Description description;
+    description.id      = "5e55" + std::to_string(id);
+    description.binding = "fake-binding";
+    description.tokens  = frontier;
+    description.checkpoints.push_back({.frontier = frontier, .digests = {id, 0}, .identity_tag = 0});
+    std::vector<std::uint8_t> image(64 + bytes);
+    std::uint32_t state = static_cast<std::uint32_t>(id) * 2654435761U + 1U;
+    for (auto& byte : image) {
+        state = state * 1664525U + 1013904223U;
+        byte  = static_cast<std::uint8_t>(state >> 24U);
+    }
+    (void)other.put(description, image, std::array{ContextStore::Region{64, bytes}});
+    require(store_drained(other), "the other engine's upload did not finish");
+}
+
+// 10 ms + 0.1 ms per token: a 40,000-token prompt faces 4 s of prefill, past the 2 s a request
+// needs ahead of it before it waits for a listing.
+constexpr std::uint32_t kLongPrompt = 40'000;
+
+void test_a_request_that_finds_nothing_lists_the_bucket_once_and_fetches() {
+    auto bucket = std::make_shared<MemoryBucket>();
+    StoreDirectory directory;
+    ContextStore store(bucket_store_options(directory.path(), bucket));
+    require(store_drained(store), "the start-up refresh did not finish");
+    // Uploaded after this engine's last listing: only a lookup can find it.
+    store_session_elsewhere(bucket, 7, 30'000, 64 * 1024);
+    const int lists = bucket->lists;
+    {
+        Rig rig({.chunk = 1024, .lanes = 1});
+        rig.attach_store(store, std::chrono::seconds(2));
+        auto result = rig.run(7, kLongPrompt, 1);
+        require(finished(result), "the request did not finish\n" + rig.dump());
+        const auto stats = rig.core().runtime_stats();
+        require(stats.context_store_lookups == 1,
+                "the request did not look the bucket up exactly once: " +
+                    std::to_string(stats.context_store_lookups));
+        require(bucket->lists == lists + 1, "the lookup did not list the bucket exactly once");
+        require(store.stats().remote_download_bytes == 64 * 1024,
+                "the session the lookup found was not fetched: " +
+                    std::to_string(store.stats().remote_download_bytes) + " bytes");
+        require(rig.wait_for([&] {
+                    return rig.core().runtime_stats().context_store_remote_fetch_bytes_per_second > 0;
+                }),
+                "the fetch did not teach the fetch rate");
+        // The fake imports nothing: the fetched session is a failed hydration, and it prefilled.
+        require(rig.core().runtime_stats().context_store_hydration_failures == 1,
+                "the fetched session was not offered for import");
+        // A second request for the same prompt finds the session without a listing.
+        auto again = rig.run(7, kLongPrompt, 1);
+        require(finished(again), "the second request did not finish\n" + rig.dump());
+        require(rig.core().runtime_stats().context_store_lookups == 1 && bucket->lists == lists + 1,
+                "a request that found a session listed the bucket again");
+    }
+}
+
+void test_a_short_prefill_does_not_wait_for_a_listing() {
+    auto bucket = std::make_shared<MemoryBucket>();
+    StoreDirectory directory;
+    ContextStore store(bucket_store_options(directory.path(), bucket));
+    require(store_drained(store), "the start-up refresh did not finish");
+    const int lists = bucket->lists;
+    {
+        Rig rig({.chunk = 1024, .lanes = 1});
+        rig.attach_store(store, std::chrono::seconds(2));
+        auto result = rig.run(8, 4000, 1); // 0.41 s of prefill
+        require(finished(result), "the request did not finish\n" + rig.dump());
+        require(rig.core().runtime_stats().context_store_lookups == 0 && bucket->lists == lists,
+                "a short prefill waited for a bucket listing");
+    }
+}
+
+void test_a_fetch_that_cannot_fit_the_wait_is_not_started() {
+    auto bucket = std::make_shared<MemoryBucket>();
+    StoreDirectory directory;
+    ContextStore store(bucket_store_options(directory.path(), bucket));
+    require(store_drained(store), "the start-up refresh did not finish");
+    // 4 MiB at the assumed 100 MB/s is 42 ms, past a 20 ms wait.
+    store_session_elsewhere(bucket, 9, 30'000, 4 << 20);
+    {
+        Rig rig({.chunk = 1024, .lanes = 1});
+        rig.attach_store(store, std::chrono::milliseconds(20));
+        auto result = rig.run(9, kLongPrompt, 1);
+        require(finished(result), "the request did not finish\n" + rig.dump());
+        require(rig.core().runtime_stats().context_store_lookups == 1, "the request did not look");
+        const auto info = store.find("5e559");
+        require(info && !info->local, "the lookup did not register the session");
+        require(store.stats().remote_downloads == 0,
+                "a fetch that could not fit the request's wait was started");
+    }
+}
+
+// The wait a fetch must fit is the request's own: a request with less left before its deadline than
+// the hydration budget does not start a fetch it would be released from before it ends.
+void test_a_fetch_must_fit_the_requests_remaining_deadline() {
+    auto bucket = std::make_shared<MemoryBucket>();
+    StoreDirectory directory;
+    ContextStore store(bucket_store_options(directory.path(), bucket));
+    require(store_drained(store), "the start-up refresh did not finish");
+    // 16 MiB at the assumed 100 MB/s is 168 ms: inside the 10 s budget, past the 100 ms deadline.
+    store_session_elsewhere(bucket, 11, 30'000, 16 << 20);
+    (void)store.refresh_remote(); // already registered: no lookup
+    {
+        Rig rig({.chunk = 1024, .lanes = 1, .pending_timeout_ms = 100});
+        rig.attach_store(store, std::chrono::seconds(10));
+        auto result = rig.run(11, kLongPrompt, 1);
+        require(finished(result), "the request did not finish\n" + rig.dump());
+        require(store.stats().remote_downloads == 0,
+                "a fetch longer than the request's remaining deadline was started");
+    }
+}
+
+void test_a_stalled_listing_releases_the_request_at_its_budget() {
+    auto bucket = std::make_shared<MemoryBucket>();
+    StoreDirectory directory;
+    ContextStore store(bucket_store_options(directory.path(), bucket));
+    require(store_drained(store), "the start-up refresh did not finish");
+    {
+        Rig rig({.chunk = 1024, .lanes = 1});
+        rig.attach_store(store, std::chrono::seconds(2));
+        bucket->set_hold(true);
+        const auto started = Clock::now();
+        auto result        = rig.run(10, kLongPrompt, 1);
+        const bool done    = finished(result, std::chrono::seconds(15));
+        const auto waited  = Clock::now() - started;
+        // Let the lookup thread's listing end before the Engine joins it.
+        bucket->set_hold(false);
+        require(done, "a stalled listing held the request past its budget\n" + rig.dump());
+        require(waited >= std::chrono::milliseconds(4500) && waited < std::chrono::seconds(10),
+                "the request was not released at the 5 s lookup budget: " +
+                    std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(waited).count()) +
+                    " ms");
+        require(rig.core().runtime_stats().context_store_lookups == 1, "the lookup was not counted");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -708,5 +967,14 @@ int main() {
     run("a pause waits for a sliced chunk", test_a_pause_waits_for_a_sliced_chunk);
     run("cancelling a sliced chunk leaves the engine working",
         test_cancelling_a_sliced_chunk_leaves_the_engine_working);
+    run("a request that finds nothing lists the bucket once and fetches",
+        test_a_request_that_finds_nothing_lists_the_bucket_once_and_fetches);
+    run("a short prefill does not wait for a listing", test_a_short_prefill_does_not_wait_for_a_listing);
+    run("a fetch that cannot fit the wait is not started",
+        test_a_fetch_that_cannot_fit_the_wait_is_not_started);
+    run("a fetch must fit the request's remaining deadline",
+        test_a_fetch_must_fit_the_requests_remaining_deadline);
+    run("a stalled listing releases the request at its budget",
+        test_a_stalled_listing_releases_the_request_at_its_budget);
     return failures == 0 ? 0 : 1;
 }

@@ -417,6 +417,14 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
             "Hydrations that failed; the request was prefilled normally.");
     COUNTER(context_store_hydration_seconds, "context_store_hydration_seconds_total",
             "Time requests waited for stored sessions to be read back, failed reads included.");
+    COUNTER(context_store_lookups, "context_store_lookups_total",
+            "Bucket listings refreshed for a request that found nothing stored.");
+    COUNTER(context_store_lookup_seconds, "context_store_lookup_seconds_total",
+            "Time requests waited for those listings.");
+    GAUGE(context_store_remote_fetch_bytes_per_second, "context_store_remote_fetch_bytes_per_second",
+          "Rate at which missing chunks are fetched from the bucket and installed in the store "
+          "directory (download, verification and write together, the time a request waits), "
+          "learned from fetches.");
     COUNTER(context_store_eviction_writes, "context_store_eviction_writes_total",
             "Conversations written to the store as the cache evicted them (write-on-evict).");
     COUNTER(context_store_eviction_export_seconds, "context_store_eviction_export_seconds_total",
@@ -442,6 +450,16 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
     COUNTER(context_store_remote_download_failures,
             "context_store_remote_download_failures_total",
             "Remote listings or fetches that failed or returned damaged data.");
+    COUNTER(context_store_remote_manifest_downloads,
+            "context_store_remote_manifest_downloads_total",
+            "Session manifests a bucket refresh downloaded to register sessions other engines wrote.");
+    COUNTER(context_store_remote_manifest_download_bytes,
+            "context_store_remote_manifest_download_bytes_total",
+            "Bytes of session manifests a bucket refresh downloaded (not in remote_download_bytes).");
+    COUNTER(context_store_remote_retired, "context_store_remote_retired_total",
+            "Superseded sessions (earlier turns of a conversation) deleted from the bucket.");
+    COUNTER(context_store_remote_uploads_skipped, "context_store_remote_uploads_skipped_total",
+            "Queued uploads dropped because a newer write of the conversation superseded them.");
     COUNTER(context_store_peer_images, "context_store_peer_images_total",
             "Sessions imported from another engine's store directory (--context-store-peer).");
     COUNTER(context_store_peer_bytes_linked, "context_store_peer_bytes_linked_total",

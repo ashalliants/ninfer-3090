@@ -271,14 +271,17 @@ public:
                 std::chrono::steady_clock::now() + options.context_store.flush_budget;
             stop_writer(deadline);
             flush_context_store(deadline);
-        }
-        core.emplace<std::monostate>();
-        // Everything written is queued for upload by now; give the uploads their budget.
-        if (store) {
+            // Everything written is queued for upload by now (the writer is stopped, so nothing
+            // else is written); give the uploads their budget.
             (void)store->flush_remote(std::chrono::steady_clock::now() +
                                           options.context_store.remote_flush_budget,
                                       true);
+            // Then cut the bucket off before the core goes: a request-time listing or fetch
+            // still running on its readers fails at once, so joining them does not wait out a
+            // stalled transfer. The store is not used for the bucket after this.
+            if (options.context_store.remote) { options.context_store.remote->interrupt(); }
         }
+        core.emplace<std::monostate>();
         try {
             device.synchronize();
         } catch (...) {}
@@ -309,6 +312,10 @@ public:
         out.context_store_remote_downloads         = s.remote_downloads;
         out.context_store_remote_download_bytes    = s.remote_download_bytes;
         out.context_store_remote_download_failures = s.remote_download_failures;
+        out.context_store_remote_manifest_downloads      = s.remote_manifest_downloads;
+        out.context_store_remote_manifest_download_bytes = s.remote_manifest_download_bytes;
+        out.context_store_remote_retired                 = s.remote_retired;
+        out.context_store_remote_uploads_skipped         = s.remote_uploads_skipped;
         out.context_store_peer_images        = s.peer_images;
         out.context_store_peer_bytes_linked  = s.peer_bytes_linked;
         out.context_store_peer_skipped       = s.peer_skipped;
@@ -416,6 +423,7 @@ private:
                 std::chrono::duration_cast<std::chrono::milliseconds>(options.context_store.idle_persist),
             .hydration_budget =
                 std::chrono::duration_cast<std::chrono::milliseconds>(options.context_store.restore_budget),
+            .remote = options.context_store.remote != nullptr,
         });
     }
 
@@ -453,14 +461,27 @@ private:
         store_options.compress_chunks = config.compress_chunks;
         store_options.peers           = config.peers;
         store_options.peer_poll       = config.peer_poll;
+        store_binding = context_store_binding(options, load);
         store_options.remote        = config.remote;
-        store_options.remote_prefix = config.remote_prefix;
+        store_options.remote_prefix = config.remote_prefix + remote_binding_scope(store_binding);
+        store_options.remote_upload_delay = config.remote_upload_delay;
         store         = std::make_unique<runtime::ContextStore>(std::move(store_options));
         if (config.remote) {
-            // Images other engines left in the bucket become restorable before start-up restores.
+            // Images other engines left in the bucket are known before the first request, which
+            // can then find its session there. Only the manifests are read, not the sessions.
             (void)store->refresh_remote(std::chrono::steady_clock::now() + config.restore_budget);
         }
-        store_binding = context_store_binding(options, load);
+    }
+
+    // The bucket keys of one model and configuration sit under their own folder, named by a hash
+    // of the binding: an engine lists only sessions it could use, and sessions of another model,
+    // configuration or release are never listed, downloaded or offered.
+    static std::string remote_binding_scope(const std::string& binding) {
+        const auto digest = runtime::ContextStore::hash(std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(binding.data()), binding.size()));
+        char text[24];
+        std::snprintf(text, sizeof(text), "b%016llx/", static_cast<unsigned long long>(digest[0]));
+        return text;
     }
 
     // Lowercase hex of the image's endpoint key: an image of the same endpoint replaces it. A
@@ -537,6 +558,9 @@ private:
                     if (info.binding != store_binding || info.tokens > options.max_context) {
                         continue;
                     }
+                    // Only what the directory holds: a session only the bucket has is fetched when
+                    // a request asks for it, not at start-up on the chance one might.
+                    if (!info.local) { continue; }
                     // The payload is nearly all of an image: one larger than the free Host space
                     // cannot fit, and reading it would only spend the budget.
                     if (info.image_bytes > generation.free_host_bytes()) { continue; }

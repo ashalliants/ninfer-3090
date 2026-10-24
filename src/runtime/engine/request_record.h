@@ -209,6 +209,10 @@ struct RequestRecord {
     // Context store hydration: the store is consulted once per request. While `hydrating`, a host
     // worker reads the stored image and the request is not offered for admission.
     bool store_probed                   = false;
+    // With a bucket: the store found nothing, so its listing is being refreshed (once per request)
+    // in case another engine stored this session since; the store is then consulted again.
+    bool store_lookup                   = false;
+    bool store_looked_up                = false;
     bool hydrating                      = false;
     bool hydrated                       = false;
     std::uint32_t hydration_frontier    = 0;

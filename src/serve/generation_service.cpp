@@ -389,6 +389,8 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
         }
         engine_options.context_store.remote        = product::make_s3_object_store(std::move(s3));
         engine_options.context_store.remote_prefix = options.context_store_s3_prefix;
+        engine_options.context_store.remote_upload_delay =
+            std::chrono::seconds(options.context_store_s3_upload_delay_seconds);
     }
     engine_options.devices                  = options.devices;
     engine_options.stage_layers             = options.stage_layers;

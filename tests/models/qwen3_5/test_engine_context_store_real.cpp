@@ -509,8 +509,9 @@ int exercise_recovery(const char* artifact, const fs::path& root, const Control&
 }
 
 // With an S3-compatible bucket (NINFER_TEST_S3_ENDPOINT, NINFER_TEST_S3_BUCKET; credentials from
-// AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY): a second Engine with an empty directory starts warm
-// from what the first uploaded at shutdown.
+// AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY): a second Engine with an empty directory downloads
+// nothing at start-up, then fetches the session the first uploaded at shutdown when the next turn
+// asks for it, and continues exactly as the warm control.
 int exercise_bucket(const char* artifact, const fs::path& root, const Control& control) {
     const char* endpoint = std::getenv("NINFER_TEST_S3_ENDPOINT");
     const char* bucket   = std::getenv("NINFER_TEST_S3_BUCKET");
@@ -543,22 +544,35 @@ int exercise_bucket(const char* artifact, const fs::path& root, const Control& c
         uploaded = engine.runtime_stats().context_store_remote_uploads;
     }
     ninfer::Engine engine(options(root / "bucket-reader"));
-    const auto stats = engine.runtime_stats();
-    if (stats.context_store_restored != 1 || stats.context_store_remote_downloads == 0) {
-        std::cerr << "bucket: a fresh directory did not restore from the bucket: restored="
-                  << stats.context_store_restored
-                  << " downloads=" << stats.context_store_remote_downloads
-                  << " failures=" << stats.context_store_remote_download_failures << '\n';
+    const auto started = engine.runtime_stats();
+    if (started.context_store_restored != 0 || started.context_store_remote_downloads != 0) {
+        std::cerr << "bucket: start-up downloaded from the bucket: restored="
+                  << started.context_store_restored
+                  << " downloads=" << started.context_store_remote_downloads << '\n';
+        return 1;
+    }
+    // The start-up listing registers the session (a short turn does not wait for a listing).
+    if (!wait_for([&] { return engine.runtime_stats().context_store_remote_images >= 1; },
+                  std::chrono::seconds(60))) {
+        std::cerr << "bucket: the start-up listing did not register the uploaded session\n";
         return 1;
     }
     const auto next = engine.generate(
         engine.prepare(conversation(next_turn(kShortFirst, control.reply, kShortQuestion))),
         greedy(continuation_tokens()));
+    const auto stats = engine.runtime_stats();
+    if (stats.context_store_hydrations != 1 || stats.context_store_hydration_failures != 0 ||
+        stats.context_store_remote_download_bytes == 0) {
+        std::cerr << "bucket: the next turn did not fetch the session: hydrations="
+                  << stats.context_store_hydrations
+                  << " failures=" << stats.context_store_hydration_failures
+                  << " downloaded=" << stats.context_store_remote_download_bytes
+                  << " download failures=" << stats.context_store_remote_download_failures << '\n';
+        return 1;
+    }
     if (check_continuation(next, control, "bucket") != 0) { return 1; }
-    std::cout << "bucket: restored " << stats.context_store_restored_bytes << " bytes ("
-              << stats.context_store_remote_download_bytes << " downloaded) in "
-              << stats.context_store_restore_seconds << " s; writer uploads before shutdown "
-              << uploaded << '\n';
+    std::cout << "bucket: fetched " << stats.context_store_remote_download_bytes
+              << " bytes for the next turn; writer uploads before shutdown " << uploaded << '\n';
     return 0;
 }
 

@@ -759,9 +759,18 @@ int main() {
                           s3.context_store_s3_bucket == "cache" &&
                           s3.context_store_s3_prefix == "prod/" &&
                           s3.context_store_s3_region == "us-east-1" &&
+                          s3.context_store_s3_upload_delay_seconds == 30 &&
                           parse({"ninfer-serve", "model.ninfer", "--context-store", "dir"})
                               .context_store_s3_endpoint.empty(),
                       "S3 context store options were not parsed or are not off by default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--context-store", "dir",
+                             "--context-store-s3-endpoint", "https://s3.example.com",
+                             "--context-store-s3-bucket", "cache",
+                             "--context-store-s3-upload-delay-seconds", "0"})
+                              .context_store_s3_upload_delay_seconds == 0 &&
+                          rejected({"ninfer-serve", "model.ninfer", "--context-store", "dir",
+                                    "--context-store-s3-upload-delay-seconds", "5"}),
+                      "--context-store-s3-upload-delay-seconds was not parsed or needs no bucket");
     failures += check(
         rejected({"ninfer-serve", "model.ninfer", "--context-store", "dir",
                   "--context-store-s3-endpoint", "https://s3.example.com"}) &&

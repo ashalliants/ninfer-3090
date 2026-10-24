@@ -123,6 +123,8 @@ struct ServeOptions {
     std::string context_store_s3_bucket;
     std::string context_store_s3_prefix; // "" or ending in '/'
     std::string context_store_s3_region = "us-east-1";
+    // --context-store-s3-upload-delay-seconds N: how long a written session waits before upload.
+    std::uint32_t context_store_s3_upload_delay_seconds = 30;
     // Exit non-zero shortly after the Engine latches unavailable after a worker failure, so a
     // supervisor restarts the process instead of leaving it holding VRAM and answering 503.
     bool exit_on_engine_failure = true;

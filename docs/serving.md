@@ -599,22 +599,48 @@ The local directory becomes a cache of the bucket.
 
 - Every session written to the directory is also uploaded in the background, chunks first and its
   manifest last, so another engine never sees a session whose chunks are missing. A chunk the bucket
-  already holds is not sent again, so a conversation that grows uploads only what changed. Shutdown
-  waits up to two minutes for the uploads still queued.
+  already holds is not sent again, so a conversation that grows uploads only what changed: its new
+  KV pages, its new recurrent states (each saved state is chunked on its own, so one that did not
+  change is never sent again wherever it sits in the session), and the few pieces of its per-token
+  header that grew (cut by content, about 0.5 MB a turn). A manifest is a few KB. Conversations that
+  start with the same shared prefix (an agent's system and tools prompt) share its chunks, here and
+  in the bucket, so the prefix is stored and sent once. Shutdown waits up to two minutes for the
+  uploads still queued.
+- A written session waits `--context-store-s3-upload-delay-seconds` (default 30) before it is
+  uploaded. Each turn's write supersedes the one before, and a superseded write still waiting is
+  never sent, so a burst of turns (a short `--context-store-idle-seconds` writes several per
+  request) costs one upload. A conversation that keeps going is still uploaded at least that often.
+  Once a session is in the bucket, the earlier turns it superseded are deleted from it, so the
+  bucket holds one session per conversation and a new engine lists only those.
+- The bucket's keys sit under a folder named by a hash of the model, configuration and artifact
+  (the store's binding), so an engine lists only sessions it could use.
 - At start-up, and every minute after, the engine lists the bucket and registers sessions it does
-  not have. They appear in the store as not local; start-up restores the most recently used ones,
-  fetching their chunks (every chunk is verified, a damaged one makes the session a miss and it is
-  not offered again). A new engine, a replacement box or a second engine therefore starts warm from
-  what the others wrote, without sharing a disk.
+  not have, reading only their manifests. They appear in the store as not local. Start-up restores
+  only sessions the directory holds: nothing is downloaded on the chance a request might want it.
 - Sessions pass between engines that load the same artifact (by the id its conversion wrote, so any
   copy of it, whenever it was downloaded) with the same KV, recurrent-state, speculative and vision
   settings. A session written under anything else is never read; it is a miss, and ages out. The
   exception is a configured prompt graft: it is matched by its file's size and modification time, so
   sessions that start from a graft pass between engines only when the graft file is the same copy.
+- A request that finds nothing usable, and has more than about two seconds of prefill ahead, has
+  the bucket listed once more before it prefills (waiting at most five seconds; requests that
+  arrive while a listing is taken share the next one), in case another engine stored the session
+  since the last listing: a conversation that just moved here is found.
 - A request that would resume from a session only the bucket holds waits for it like any stored
-  session (see above): the background reader fetches the missing chunks, within the same deadline,
-  without holding up the Engine worker or other requests.
-- A session evicted from the directory for space stays in the bucket and comes back the same way.
+  session (see above): the background reader downloads the missing chunks (several at a time, each
+  verified; a damaged one makes the session a miss and it is not offered again), within the same
+  deadline, without holding up the Engine worker or other requests. The download is not weighed
+  against the prefill it saves, since only this request waits for it while a prefill holds the
+  GPU for everyone, but it must fit in the wait at the rate fetches (download, verification and
+  write together) have achieved (`ninfer_context_store_remote_fetch_bytes_per_second`). Chunks the
+  directory already holds, such as a shared prefix's, are not downloaded. Listings for requests
+  run on their own thread, so a slow bucket never holds up reading a stored session.
+- A session evicted from the directory for space (or age) gives up its chunk files, except those an
+  image still held whole shares, but stays in the index, since the bucket still holds it, and is
+  fetched back the same way when it is needed. Its manifest is not downloaded again. Shared
+  prefixes are evicted last, and every conversation written that starts with one counts as a use
+  of it (here and in the bucket), so a prefix many conversations rely on is not evicted or expired
+  as unused while they reuse it from memory.
 - Credentials come from the environment, never the command line: `NINFER_S3_ACCESS_KEY_ID` and
   `NINFER_S3_SECRET_ACCESS_KEY` (or `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`; an
   `AWS_SESSION_TOKEN` is honoured). `--context-store-s3-region` (default `us-east-1`) names the
@@ -861,6 +887,10 @@ server restarts.
 | `ninfer_context_store_remote_images` | gauge: with a bucket, sessions it holds that the directory does not hold in full |
 | `ninfer_context_store_remote_uploads_total`, `_remote_upload_bytes_total`, `_remote_upload_failures_total` | objects and bytes uploaded to the bucket, and uploads that failed |
 | `ninfer_context_store_remote_downloads_total`, `_remote_download_bytes_total`, `_remote_download_failures_total` | chunks and bytes fetched from the bucket, and listings or fetches that failed or returned damaged data |
+| `ninfer_context_store_remote_manifest_downloads_total`, `_remote_manifest_download_bytes_total` | session manifests a bucket listing downloaded to register sessions other engines wrote (not in the chunk counters above) |
+| `ninfer_context_store_lookups_total`, `_lookup_seconds_total` | bucket listings refreshed for a request that found nothing stored, and the time requests waited for them |
+| `ninfer_context_store_remote_fetch_bytes_per_second` | the rate the store assumes for fetching a session's missing chunks (downloaded, verified and written to the directory together: the wait a fetch adds), learned from fetches; a session whose fetch would not fit in a request's wait is not chosen |
+| `ninfer_context_store_remote_retired_total`, `_remote_uploads_skipped_total` | earlier turns deleted from the bucket once a later one was uploaded, and queued uploads a later write made unnecessary |
 
 Histograms expose `_bucket`, `_sum` and `_count`. Metrics have bounded labels; they do not retain
 request IDs or request text. Rates are calculated by the consumer, for example:
@@ -1988,13 +2018,14 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--context-store-max-gib N` | bound the store; the least recently used sessions are removed beyond it. Requires `--context-store` | half the volume's free space |
 | `--context-store-ttl-hours N` | remove sessions unused this long; `0` keeps them until space is needed | `168` |
 | `--context-store-idle-seconds N` | write a session unused this long, and changed since it was last written, in the background; `0` writes only at shutdown | `30` |
-| `--context-store-restore-seconds N` | time budget for restoring sessions at start-up, and the longest a request waits for its stored session to be read back | `120` |
+| `--context-store-restore-seconds N` | time budget for restoring sessions at start-up (only those the directory holds; a bucket's are downloaded on request), and the longest a request waits for its stored session to be read back, a download included | `120` |
 | `--context-store-flush-seconds N` | time budget for writing sessions that are not yet stored at shutdown | `60` |
 | `--context-store-peer DIR` | import the sessions another engine on this box keeps in its store directory, by hard link (repeatable; same volume; each engine needs its own `--context-store`); see [Two engines on one box](#two-engines-on-one-box). Requires `--context-store` | none |
 | `--context-store-peer-poll-ms N` | how often peer directories are looked at (at least 1) | `250` |
 | `--context-store-compress` | write new chunks zstd-compressed, in the directory and the bucket (about 8 % smaller; chunks of both forms are always read); see [Context store](#context-store). Requires `--context-store` | off |
 | `--context-store-s3-endpoint URL`, `--context-store-s3-bucket NAME` | keep a copy of the store in an S3-compatible bucket (both required together; credentials from `NINFER_S3_ACCESS_KEY_ID` / `NINFER_S3_SECRET_ACCESS_KEY` or the `AWS_` equivalents); see [Keeping a copy in a bucket](#keeping-a-copy-in-a-bucket). Requires `--context-store` | off |
 | `--context-store-s3-prefix P`, `--context-store-s3-region R` | key prefix inside the bucket, and the signing region | none, `us-east-1` |
+| `--context-store-s3-upload-delay-seconds N` | how long a written session waits before it is uploaded; a newer write of the conversation within it replaces it, so a burst of turns is uploaded once. Shutdown uploads at once | `30` |
 | `--no-exit-on-engine-failure` | stay alive (answering 503) when the engine latches unavailable, instead of logging FATAL and exiting with status 3 after 5 s | exit |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |

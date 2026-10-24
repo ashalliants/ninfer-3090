@@ -562,7 +562,13 @@ CheckpointImage ProgramImpl::export_checkpoints(std::span<const CheckpointHandle
         image.regions.push_back(
             {backend_offset, backend_table.handles.size() * config.backend_page_stride});
     }
-    image.regions.push_back({state_offset, states.size() * state_layout.image_bytes});
+    // One region per state: a store chunks each region from its own start, so a state that did not
+    // change hashes to the same chunks wherever it sits, and is not stored or uploaded again when a
+    // newer state is put before it or an older one is dropped.
+    for (std::size_t index = 0; index < states.size(); ++index) {
+        image.regions.push_back(
+            {state_offset + index * state_layout.image_bytes, state_layout.image_bytes});
+    }
 
     // The pages and images are immutable and no transaction is open, but the unit that last wrote
     // them may still be in flight on the compute stream, which also orders these copies behind it.
