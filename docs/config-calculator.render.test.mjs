@@ -64,7 +64,13 @@ for (const modelKey of Object.keys(DATA.models)) {
         el("kv").value = kv;
         el("ctx").value = String(ctx);
         el("reserve").value = "307";
-        try { render(); buildKvTable(); runs++; }
+        try {
+          render(); buildKvTable(); runs++;
+          // A measured perplexity can come in under the bf16 baseline; it must read "-0.0021%",
+          // not "+-0.0021%".
+          const ppl = el("out-ppl").firstChild.nodeValue;
+          if (ppl.includes("+-")) throw new Error(`perplexity cost reads "${ppl}"`);
+        }
         catch (e) {
           failures++;
           if (failures <= 3) console.log(`FAIL ${modelKey}/${specKey}/${kv}/${ctx}: ${e.message}`);
