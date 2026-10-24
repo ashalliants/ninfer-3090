@@ -141,12 +141,19 @@ launch fails instantly with exit 127 (it still looks "completed"; read the outpu
 
 Do not wait idle on one while the other builds; check both logs when notified.
 
-**Away from the 3090 PC** (only a Mac, no local GPU): build Linux on the Vast dev instance with
-`vast-release-linux.sh`, and Windows on a GPU-less Windows box with `scripts/release-windows-remote.sh
-<ssh-host>`. See "Building the release without the RTX 3090 PC" in `docs/maintainer/release-process.md`.
-The Windows archive then cannot be run, so the notes' Verification section must say it was built and
-dependency-checked only, and step 6's stripped-`PATH` and real-card smoke tests for Windows are
-unverified. Say so in the final report.
+**No local CUDA / no 3090 (this WSL host has neither, and only the GPU-less Windows toolchain)**:
+ask the user up front, in one `AskUserQuestion`, how Linux is built (Vast, the default here), that Windows
+is built via `powershell.exe` from WSL, and that a **new** Vast instance is to be rented and destroyed
+afterwards (existing instances may be serving live traffic: never touch them; `scripts/vast/` only ever
+touches the instance in its own state file).
+- Windows: `scripts/release-windows-wsl.sh` (committed HEAD). Start it in the background right after the
+  VERSION commit, with the notes already committed if you can; see "Windows without a card, from WSL" in
+  `docs/maintainer/release-process.md`.
+- Linux: `scripts/vast/vast-up.sh`, then `vast-release-linux.sh <repo>`, then `vast-destroy.sh`.
+  Put a backstop (`send_later`) to destroy the instance too.
+- The Windows archive then cannot be run: the notes' Verification section must say built and
+  dependency-checked only, and step 6's stripped-`PATH` and card smoke tests for Windows are unverified.
+  Say so in the final report.
 
 ## 5. Package
 
@@ -221,7 +228,8 @@ hit, and clean `dist/` and the `~/ninfer-rel-*` export only after the release is
 - **Package twice.** The archives embed `RELEASE_NOTES_X.Y.Z.md`. Package once to run the checks, then fill
   in the Verification section, commit it, and repackage both (delete the old `dist/*X.Y.Z*` outputs
   first). The Linux export needs the final notes copied in before it is repackaged.
-- **Smoke test launch:** `Start-Process cmd -ArgumentList '/c', '"<dir>un.bat" qwen38-27b'
+- **Smoke test launch:** `Start-Process cmd -ArgumentList '/c', '"<dir>
+un.bat" qwen38-27b'
   -RedirectStandardOutput ... -RedirectStandardError ...`. A `> log` inside the argument string silently
   fails and nothing starts. The request `model` is the served id from `/v1/models` (`qwen3.8-27b`), not
   the profile name `qwen38-27b`. Loading took about two minutes. Stop it by matching command lines that
@@ -258,3 +266,17 @@ hit, and clean `dist/` and the `~/ninfer-rel-*` export only after the release is
   hash changes, so do not reuse the first `SHA256SUMS`.
 - **Do not compare the Linux `ldd` list by eye.** Save the previous release's list and `diff` it, or say
   in the report that it was not compared.
+
+
+## Traps hit in v0.16.2
+
+- **Commit the notes before the Windows build**, or the packager fails after a 25-minute compile
+  ("Missing RELEASE_NOTES"); rerunning is incremental.
+- **Git on `/mnt/c` from WSL hangs.** Drive git on `C:\ninfer-release\src` through `powershell.exe`.
+- **Ask everything up front** (user's rule): versions, how each platform builds, Vast rental and teardown,
+  and what ships. Existing Vast instances can carry live traffic; rent a new one.
+- **Breaking-change audit:** the numbered output of `git grep | sort -u` can come back with line numbers
+  from a shell hook; strip them (`sed -E 's/^ *[0-9]+[ \t]*//'`) before `comm`.
+- **The Windows zip hash changes when the notes change**: write the Windows checks in the notes without the
+  hash (it is in `SHA256SUMS-*-windows.txt`), so the zip need not be rebuilt for a notes edit.
+- Merging the release PR with `--merge` gives the merge commit to tag; `gh release create ... --verify-tag`.
