@@ -1768,7 +1768,8 @@ void ContextStore::upload_image(RemoteTask& task) {
             std::scoped_lock lock(mutex_);
             const auto found = entries_.find(task.id);
             if (found != entries_.end() && found->second.generation == task.generation) {
-                found->second.published = true;
+                found->second.published    = true;
+                found->second.published_at = std::chrono::steady_clock::now();
                 write_published_locked(task.id, task.manifest);
             }
         }
@@ -1936,7 +1937,8 @@ void ContextStore::touch_remote_image(const std::string& id) {
                 std::scoped_lock lock(mutex_);
                 const auto found = entries_.find(id);
                 if (found != entries_.end() && found->second.generation == generation) {
-                    found->second.published = true;
+                    found->second.published    = true;
+                    found->second.published_at = std::chrono::steady_clock::now();
                     try {
                         write_published_locked(id, read_whole_file(manifest_path(id)));
                     } catch (const std::exception&) {}
@@ -2184,9 +2186,17 @@ std::size_t ContextStore::refresh_remote_locked(std::chrono::steady_clock::time_
         std::vector<std::string> gone;
         // A listing cut short by the deadline is incomplete, so it proves nothing is gone.
         if (!truncated) {
-            for (const auto& [id, entry] : entries_) {
-                if (listed.count(id) == 0 && !entry_has_local_bytes_locked(entry)) {
+            for (auto& [id, entry] : entries_) {
+                if (listed.count(id) != 0) { continue; }
+                if (!entry_has_local_bytes_locked(entry)) {
                     gone.push_back(id);
+                } else if (entry.published && entry.published_at < listed_at) {
+                    // Kept for its local bytes, but no longer in the bucket: eviction must remove
+                    // it whole, not keep an entry whose chunks would exist nowhere. (A manifest
+                    // published after the listing began may be missing from it, so that one
+                    // proves nothing.)
+                    entry.published = false;
+                    remove_quietly(published_path(id));
                 }
             }
         }

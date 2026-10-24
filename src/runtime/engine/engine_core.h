@@ -3586,8 +3586,13 @@ private:
         // A download from the bucket is not weighed against the prefill it saves: it only makes
         // this request wait, while a prefill holds the GPU every other lane shares. It has to fit
         // in the wait, though (at the rate downloads have achieved), or it would time out anyway.
+        // The wait is the read's deadline below: the budget, or less when the request has less
+        // left before its own deadline.
+        const auto now     = Clock::now();
+        const auto left    = std::max<Clock::duration>(request->deadline - now, Clock::duration::zero());
+        const auto wait    = std::min<Clock::duration>(store_.hydration_budget, left);
         const auto wait_ns = static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(store_.hydration_budget).count());
+            std::chrono::duration_cast<std::chrono::nanoseconds>(wait).count());
         std::string best_id;
         std::uint32_t best_frontier = resident;
         try {
@@ -3615,7 +3620,6 @@ private:
                 }
             }
         } catch (...) { return false; }
-        const auto now = Clock::now();
         if (best_id.empty()) {
             // Nothing here, but another engine may have stored this session since the bucket was
             // last listed (the conversation moved here a moment ago). A request with a long

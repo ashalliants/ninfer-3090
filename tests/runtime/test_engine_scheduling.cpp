@@ -45,6 +45,7 @@ struct Settings {
     std::chrono::microseconds prefill_sleep{0};
     std::uint32_t layer_slices = 0;
     bool admission_fit_check = false;
+    std::uint32_t pending_timeout_ms = 60'000;
 };
 
 class Rig {
@@ -63,7 +64,7 @@ public:
         options.max_context           = 1U << 20;
         options.max_concurrency       = settings.lanes;
         options.max_pending_requests  = 8;
-        options.pending_timeout_ms    = 60'000;
+        options.pending_timeout_ms    = settings.pending_timeout_ms;
         options.prefill_chunk         = settings.chunk;
         options.context_cache.enabled = false;
         options.admission_fit_check   = settings.admission_fit_check;
@@ -873,6 +874,26 @@ void test_a_fetch_that_cannot_fit_the_wait_is_not_started() {
     }
 }
 
+// The wait a fetch must fit is the request's own: a request with less left before its deadline than
+// the hydration budget does not start a fetch it would be released from before it ends.
+void test_a_fetch_must_fit_the_requests_remaining_deadline() {
+    auto bucket = std::make_shared<MemoryBucket>();
+    StoreDirectory directory;
+    ContextStore store(bucket_store_options(directory.path(), bucket));
+    require(store_drained(store), "the start-up refresh did not finish");
+    // 16 MiB at the assumed 100 MB/s is 168 ms: inside the 10 s budget, past the 100 ms deadline.
+    store_session_elsewhere(bucket, 11, 30'000, 16 << 20);
+    (void)store.refresh_remote(); // already registered: no lookup
+    {
+        Rig rig({.chunk = 1024, .lanes = 1, .pending_timeout_ms = 100});
+        rig.attach_store(store, std::chrono::seconds(10));
+        auto result = rig.run(11, kLongPrompt, 1);
+        require(finished(result), "the request did not finish\n" + rig.dump());
+        require(store.stats().remote_downloads == 0,
+                "a fetch longer than the request's remaining deadline was started");
+    }
+}
+
 void test_a_stalled_listing_releases_the_request_at_its_budget() {
     auto bucket = std::make_shared<MemoryBucket>();
     StoreDirectory directory;
@@ -951,6 +972,8 @@ int main() {
     run("a short prefill does not wait for a listing", test_a_short_prefill_does_not_wait_for_a_listing);
     run("a fetch that cannot fit the wait is not started",
         test_a_fetch_that_cannot_fit_the_wait_is_not_started);
+    run("a fetch must fit the request's remaining deadline",
+        test_a_fetch_must_fit_the_requests_remaining_deadline);
     run("a stalled listing releases the request at its budget",
         test_a_stalled_listing_releases_the_request_at_its_budget);
     return failures == 0 ? 0 : 1;

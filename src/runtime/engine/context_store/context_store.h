@@ -279,6 +279,9 @@ private:
         // evicted to the remote; one the bucket may lack is removed whole, as without a remote,
         // rather than kept as an entry whose chunks exist nowhere.
         bool published = false;
+        // When this store last confirmed that (default: before any listing, as for a restart). A
+        // complete listing taken after it that omits the manifest proves the bucket lost it.
+        std::chrono::steady_clock::time_point published_at{};
         // Set on an image whose manifest was imported from a peer: the peer_skipped_ key and
         // manifest time to restore if the manifest proves damaged. Such an image is the peer's to
         // upload, so a use here never puts it in the bucket.

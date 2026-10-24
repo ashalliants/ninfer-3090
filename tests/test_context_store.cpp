@@ -794,6 +794,37 @@ void test_conversation_moves_between_engines_on_a_shared_prefix() {
           "the next write did not delete a manifest whose deletion was lost");
 }
 
+// A complete listing that no longer shows a published image's manifest (removed by another engine
+// or a person) keeps the entry for its local bytes but withdraws its publication: eviction then
+// removes it whole instead of keeping an entry whose chunks exist nowhere, and a restart does not
+// bring the publication back.
+void test_a_listing_without_the_manifest_withdraws_publication() {
+    TempDirectory directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore::Options options = remote_options(directory.path(), remote);
+    {
+        ContextStore store(options);
+        check(drained(store), "the start-up refresh did not finish");
+        (void)store.put(describe("0a"), concat({pseudo_random(30, 1), pseudo_random(5000, 2)}),
+                        std::array{ContextStore::Region{30, 5000}});
+        check(drained(store), "upload");
+        {
+            std::scoped_lock lock(remote->mutex);
+            remote->objects.erase("ninfer/manifests/0a.manifest");
+        }
+        (void)store.refresh_remote();
+        const auto kept = store.find("0a");
+        check(kept && kept->local, "an image with local bytes was dropped by the listing");
+    }
+    options.max_bytes = 8000; // room for one image
+    ContextStore store(options);
+    check(drained(store), "the start-up refresh after the restart did not finish");
+    remote->clock += 10;
+    (void)store.put(describe("0b"), concat({pseudo_random(30, 3), pseudo_random(5000, 4)}),
+                    std::array{ContextStore::Region{30, 5000}});
+    check(!store.find("0a"), "an image the bucket lost was kept as fetchable after eviction");
+}
+
 // An image evicted while its upload waits keeps the files the upload needs; once the upload is
 // done a later eviction frees them, so the directory comes back within its budget.
 void test_eviction_waits_for_a_queued_upload() {
@@ -2345,6 +2376,7 @@ int main() {
     test_fetch_bytes_and_refresh_on_demand();
     test_shared_prefix_outlives_the_conversations_on_it();
     test_conversation_moves_between_engines_on_a_shared_prefix();
+    test_a_listing_without_the_manifest_withdraws_publication();
     test_failed_upload_keeps_the_local_copy_and_releases_superseded();
     test_publication_survives_restart();
     test_load_reports_its_download();
