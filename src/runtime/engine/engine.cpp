@@ -271,14 +271,17 @@ public:
                 std::chrono::steady_clock::now() + options.context_store.flush_budget;
             stop_writer(deadline);
             flush_context_store(deadline);
-        }
-        core.emplace<std::monostate>();
-        // Everything written is queued for upload by now; give the uploads their budget.
-        if (store) {
+            // Everything written is queued for upload by now (the writer is stopped, so nothing
+            // else is written); give the uploads their budget.
             (void)store->flush_remote(std::chrono::steady_clock::now() +
                                           options.context_store.remote_flush_budget,
                                       true);
+            // Then cut the bucket off before the core goes: a request-time listing or fetch
+            // still running on its readers fails at once, so joining them does not wait out a
+            // stalled transfer. The store is not used for the bucket after this.
+            if (options.context_store.remote) { options.context_store.remote->interrupt(); }
         }
+        core.emplace<std::monostate>();
         try {
             device.synchronize();
         } catch (...) {}
