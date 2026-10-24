@@ -1,4 +1,9 @@
 find_package(CUDAToolkit REQUIRED)
+if(NINFER_HOST_ONLY AND NOT TARGET CUDA::cublas)
+  # Only the kernels link cuBLAS, and a host-only tree never builds them. The placeholder keeps
+  # their target definitions valid without installing it.
+  add_library(CUDA::cublas INTERFACE IMPORTED)
+endif()
 find_package(Threads REQUIRED)
 
 # Windows links the static CUDA runtime so shipped binaries do not depend on a cudart DLL.
