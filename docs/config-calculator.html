@@ -133,6 +133,7 @@
   .ctx-row { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; }
   .ctx-row input[type="number"] { width: 11ch; }
   .hint { font-size: 12.5px; color: var(--muted); margin: 0; }
+  a { color: var(--accent); }
 
   /* The one deliberately bold element: the card's memory budget, drawn to scale. */
   .bar {
@@ -262,6 +263,9 @@
         <label for="model">Model</label>
         <select id="model"></select>
         <p class="hint" id="model-hint"></p>
+        <p class="hint">Qwen3.8-Flash-Next is not listed: it keeps its experts in system RAM, so
+          whether it runs depends on having 64 GB of RAM rather than on this card.
+          <a href="https://github.com/ashalliants/ninfer-3090/blob/master/model-cards/Qwen3.8-Flash-Next-NInfer-3090/README.md#hardware">Its hardware notes</a>.</p>
       </div>
       <div class="field">
         <label for="kv">KV cache format</label>
@@ -373,18 +377,20 @@
     </table>
   </div>
   <p class="tablenote">
-        Measured at an 8,192-token context with INT8 KV. Speculation is only worth its weight when
-        the draft is accepted often: on the 35B, MTP3 with the draft head accepts 59.4% and pays
-        back handsomely, while DFlash2 on the 27B accepts 10.8% and is a net loss against no
-        speculation at all.
+        Measured at an 8,192-token context with INT8 KV, decoding 128 tokens from a one-token
+        prompt. That is free-running text, so acceptance here is a floor: MTP3 roughly doubles all
+        three dense models, and on the 35B the draft head lifts it to 301 tok/s. DFlash2
+        drafts much better on real prompts than in this test; its chat-prompt speeds are in the
+        model cards and the README.
   </p>
 </section>
 
 <section class="prose">
   <h2>How these numbers were taken</h2>
   <p>
-    All measurements are from one RTX 3090 (24 GiB, sm_86, CUDA 12.8) on this fork, with
-    <code>ninfer_bench</code> and <code>ninfer-perplexity</code>.
+    All measurements were taken on 2026-10-24 in one session on an RTX 3090 at its stock 350 W
+    (24 GiB, sm_86, CUDA 12.8, Linux) on this fork, with <code>ninfer_bench</code> and
+    <code>ninfer-perplexity</code>, against the artifact each model's download script fetches.
   </p>
   <ul>
     <li>
@@ -408,9 +414,10 @@
       <code>ninfer-ppl-1m-v1</code> corpus with <code>--quick</code>, context/stride 4096/2048,
       261,167 scored tokens &mdash; the same corpus and window for all seven formats, so the
       differences are comparable to each other. Absolute values are not comparable to perplexity
-      numbers from other tools. All seven are on <strong>Qwen3.8-27B</strong> (the rk4v4 figure is ratio-derived from a later session, not read directly): the ranking
-      is a property of how each format quantizes, so it carries across models, but the absolute
-      figures are the 27B's and are shown as such when another model is selected.
+      numbers from other tools. All seven are on <strong>Qwen3.8-27B</strong> (this fork's 3090
+      conversion), read directly in the same session: the ranking is a property of how each format
+      quantizes, so it carries across models, but the absolute figures are the 27B's and are shown as
+      such when another model is selected.
     </li>
     <li>
       <strong>Decode speed</strong> is a <code>-pg P,128</code> run: prefill <em>P</em> tokens, then
@@ -419,14 +426,15 @@
     </li>
   </ul>
   <p>
-    <strong>The model is checked against the engine, not just against itself.</strong> Asking for a
-    262,144-token INT8 context on the 27B is refused with
-    <code>minimum Engine runtime reservation requires 9197389568 bytes in addition to 1073741824
-    bytes of automatic headroom</code>. Adding this page's own terms &mdash;
-    262,144&nbsp;&times;&nbsp;33,792 for the cache, 166,438,656 fixed, 16,384 for the per-token
-    remainder, 159,981,568 of workspace and 12,582,912 of graph allowance &mdash; gives
-    9,197,389,568. An exact match, so the arithmetic here is the arithmetic the engine actually
-    applies.
+    <strong>The model is checked against the engine, not just against itself.</strong> A
+    262,144-token INT8 context on the 27B fits a headless card, and the engine reports its runtime
+    reservation as 9,181,618,688 bytes. Adding this page's own terms &mdash;
+    262,144&nbsp;&times;&nbsp;33,792 for the cache, 166,470,144 fixed, 16,384 for the per-token
+    remainder, 144,179,200 of workspace and 12,582,912 of graph allowance &mdash; gives
+    9,181,618,688. An exact match, so the arithmetic here is the arithmetic the engine actually
+    applies. Qwen3.6-27B, the same geometry with heavier weights, is refused with
+    <code>requested Engine runtime reservation requires 9181618688 bytes</code>, and Bonsai's
+    reported reservation matches the page to the byte as well.
   </p>
   <p>
     One difference worth knowing: <code>--kv-capacity auto</code> holds back a further 1 GiB of
@@ -447,24 +455,23 @@
     <strong>Speculative modes are now modelled per mode, and cross-checked against the engine.</strong>
     Every term — resident weights, CUDA graph allowance, the fixed and per-token parts of the
     non-KV sequence block, and the extra cache each backend reserves — is measured separately for
-    each speculation option by <code>scripts/sweeps/speculative-memory-terms.ps1</code>. Two
-    configurations are pinned against the engine's own refusal arithmetic: MTP3 with the draft head
-    on the 27B at a 262,144-token context agrees to 0.044%, and DFlash-3 on the 35B agrees
-    <em>exactly</em>. Before this, the page reused the 12 MiB no-speculation graph allowance and
-    added no extra cache for any mode, which understated that DFlash-3 case by 1,289 MiB.
+    each speculation option with the arguments of
+    <code>scripts/sweeps/speculative-memory-terms.ps1</code>. Two configurations are pinned
+    against the engine's own arithmetic: MTP3 with the draft head on the 27B at a 262,144-token
+    context agrees to 0.021%, and DFlash-3 on the 35B agrees <em>exactly</em>.
   </p>
   <p>
     The two backends behave differently and the page reflects that. MTP buffers extra draft tokens
-    in the KV format, so its cost is a multiplier — +6.30% per token on the 27B, +10.08% on the
-    35B — identical across storage formats. DFlash v1 instead reserves a fixed 4,096 bytes per
+    in the KV format, so its cost is a multiplier — +6.27% per token on the 27B-class models, +10.04%
+    on the 35B — identical across storage formats. DFlash v1 instead reserves a fixed 4,096 bytes per
     token regardless of format, which as a ratio would read as +38.8% on <code>int8</code> and
     +71.1% on <code>nvfp4</code>. DFlash2 costs nothing per token and pays entirely in a graph
-    allowance that is itself context-dependent: 288 MiB up to 8,192 tokens and 384 MiB beyond,
+    allowance that is itself context-dependent: 392 MiB up to 8,192 tokens and 584 MiB beyond,
     against 12 MiB with speculation off.
   </p>
   <p>
-    <strong>Weight profile.</strong> Every model here is measured against the one
-    groupwise-int-quantized weight artifact its download script fetches. The runtime also accepts
+    <strong>Weight profile.</strong> Every model here is measured against the one weight artifact
+    its download script fetches. The runtime also accepts
     other weight profiles for the same model family with different resident sizes (see
     <code>src/runtime/engine/context_cache/context_cost_defaults.cpp</code>); these figures do not apply to a
     differently-quantized weight artifact.
@@ -492,97 +499,135 @@ const DATA = {
   cardMiB: 24576,
 
   models: {
+    /* All four measured 2026-10-24 in one session on an RTX 3090 at its stock 350 W (Linux, CUDA 12.8,
+       build 1d3e508f), with the same ninfer_bench arguments as
+       scripts/sweeps/{kv-decode-vs-depth,speculative-memory-terms,speculation-matrix}.ps1.
+       Workspace is the largest the engine reported across formats and contexts (it is up to 37 MB
+       smaller for bf16/fp8/k8v4/nvfp4, and on the 35B grows with context until 32K), so a reported
+       largest context can be about 1k tokens conservative. Engine cross-checks at 262,144 int8 are in
+       docs/config-calculator.test.mjs. */
     "27b": {
-      /* Measured against the official groupwise-int artifact fetched by download-model qwen38-27b
-         (weights_id "groupwise-int"). The runtime also recognizes other weight profiles (see
-         src/runtime/engine/context_cache/context_cost_defaults.cpp), with different resident weightsBytes;
-         these figures do not apply to a differently-quantized weight artifact of this model. */
+      /* This fork's 3090 conversion, the artifact download-model qwen38-27b fetches. DFlash2 without
+         the draft head is absent: this artifact's 6-bit head stops the engine with
+         "linear_topk: unsupported head profile". */
       name: "Qwen3.8-27B",
-      label: "Qwen3.8-27B (dense, groupwise-int weights)",
-      weightsBytes: 17093490688,
-      workspaceBytes: 159981568,
+      label: "Qwen3.8-27B (dense, this fork's 3090 conversion)",
+      about: "This fork's 3090 conversion, the one download-model qwen38-27b fetches. Measured 2026-10-24 on an RTX 3090 at its stock 350 W, Linux.",
       nativeMaxContext: 262144,
-      /* Non-KV sequence state, = sequence capacity - KV payload. Measured at four context lengths:
-         it is a fixed block plus 1/16 byte per token, not a per-token cost. Solved exactly from
-         8k/16k/32k/64k, which reproduce all four measurements to the byte. */
-      /* KV payload bytes per token, = kv_payload_bytes / max_context. */
+      weightsBytes: 15638427648,
+      workspaceBytes: 144179200,
       kv: { bf16: 65536, int8: 33792, fp8: 33024, rk8v4: 26112, rk4v4: 17920, k8v4: 25728, nvfp4: 18432 },
-      /* decode tok/s, no speculation, at these cache depths */
       depths: [4096, 16384, 32768],
-      /* Mean of two independent runs each, September 2026. Two runs because this card is
-         power-capped at 315 W of a 350 W default and the SM clock drifts 1,665-1,755 MHz with
-         temperature: single 27B runs vary by up to 5%, far more than the within-run stddev
-         suggests. */
       speed: {
-        bf16:  [36.58, 34.34, 31.93],
-        int8:  [35.31, 34.34, 33.63],
-        fp8:   [35.05, 33.09, 30.34],
-        rk8v4: [35.65, 34.73, 33.17],
-        /* rk4v4 was measured on a later build (2026-09-23), interleaved with rk8v4 twice: within
-           +-1% of rk8v4 at every depth against the card's thermal drift, so it carries rk8v4's row
-           rather than numbers from a build these columns do not describe. */
-        rk4v4: [35.65, 34.73, 33.17],
-        k8v4:  [34.22, 31.83, 28.90],
-        nvfp4: [35.37, 32.78, 29.86]
+        bf16:  [46.52, 46.05, 44.03],
+        int8:  [48.09, 46.77, 45.91],
+        fp8:   [47.16, 43.17, 39.92],
+        rk8v4: [49.26, 47.73, 46.29],
+        rk4v4: [49.12, 47.31, 45.64],
+        k8v4:  [46.99, 41.42, 36.22],
+        nvfp4: [47.30, 43.22, 39.33]
       },
       spec: {
-        none:          { label: "None",                weightsGiB: 15.92, decode: 34.41, accept: null, graphBytes: 12582912, seqFixedBytes: 166438656, seqPerToken: 0.0625, kvRatio: 1, kvExtraPerToken: 0 },
-        mtp3:          { label: "MTP, 3 draft tokens", weightsGiB: 16.34, decode: 39.90, accept: null, graphBytes: 90177536, seqFixedBytes: 175693056, seqPerToken: 0.125, kvRatio: 1.062988281, kvExtraPerToken: 0 },
-        "mtp3+head":   { label: "MTP3 + draft head",   weightsGiB: 16.67, decode: 42.33, accept: 0.302, graphBytes: 90177536, seqFixedBytes: 175693056, seqPerToken: 0.125, kvRatio: 1.062988281, kvExtraPerToken: 0 },
-        "dflash2-7":   { label: "DFlash2, 7 tokens",   weightsGiB: 17.99, decode: 27.57, accept: 0.108, graphBytes: [[8192, 301989888], [Infinity, 402653184]], seqFixedBytes: 279090432, seqPerToken: 0.0625, kvRatio: 1, kvExtraPerToken: 0 },
-        "dflash2-7+head": { label: "DFlash2-7 + draft head", weightsGiB: 18.33, decode: 28.33, accept: null, graphBytes: [[8192, 301989888], [Infinity, 402653184]], seqFixedBytes: 279090432, seqPerToken: 0.0625, kvRatio: 1, kvExtraPerToken: 0 }
+        none:             { label: "None", weightsGiB: 14.56, decode: 48.20, accept: null, graphBytes: 12582912, seqFixedBytes: 166470144, seqPerToken: 0.0625, kvRatio: 1, kvExtraPerToken: 0 },
+        mtp3:             { label: "MTP, 3 draft tokens", weightsGiB: 14.98, decode: 93.44, accept: 0.537, graphBytes: 90177536, seqFixedBytes: 175818752, seqPerToken: 0.125, kvRatio: 1.062744141, kvExtraPerToken: 0 },
+        "mtp3+head":      { label: "MTP3 + draft head", weightsGiB: 15.32, decode: 105.34, accept: 0.556, graphBytes: 90177536, seqFixedBytes: 175818752, seqPerToken: 0.125, kvRatio: 1.062744141, kvExtraPerToken: 0 },
+        "dflash2-7+head": { label: "DFlash2-7 + draft head", weightsGiB: 16.97, decode: 73.96, accept: 0.155, graphBytes: [[8192, 411041792], [Infinity, 612368384]], seqFixedBytes: 279339776, seqPerToken: 0.0625, kvRatio: 1, kvExtraPerToken: 0 }
       }
     },
     "35b": {
-      /* Measured against the pinned 560f227e groupwise-int artifact fetched by
-         download-model.{sh,bat} qwen36-35b-a3b; see the note on the 27B entry above. */
+      /* DFlash v1's extra cache is a flat 4,096 bytes per token in every format (as a ratio it would
+         read 1.388 on int8 and 1.711 on nvfp4), so it is kvExtraPerToken rather than kvRatio. */
       name: "Qwen3.6-35B-A3B",
       label: "Qwen3.6-35B-A3B (MoE, groupwise-int weights)",
-      weightsBytes: 21038469632,
-      workspaceBytes: 109453312,
+      about: "Mixture of experts, 3B active per token, groupwise-int weights (download-model qwen36-35b-a3b). Measured 2026-10-24 on an RTX 3090 at its stock 350 W, Linux.",
       nativeMaxContext: 262144,
+      weightsBytes: 21038469632,
+      workspaceBytes: 112135680,
       kv: { bf16: 20480, int8: 10560, fp8: 10320, rk8v4: 8160, rk4v4: 5600, k8v4: 8040, nvfp4: 5760 },
       depths: [4096, 16384, 32768],
-      /* Mean of two independent runs each, September 2026; see the note on the 27B rows. On this
-         model rk8v4 is the fastest format at every depth measured, ahead of int8. */
       speed: {
-        bf16:  [166.16, 156.00, 142.99],
-        int8:  [171.76, 165.02, 154.88],
-        fp8:   [166.01, 148.82, 132.00],
-        rk8v4: [175.15, 168.50, 158.47],
-        /* rk4v4: rk8v4's row scaled by their interleaved ratio on the 2026-09-23 build; see the
-           27B note. */
-        rk4v4: [174.76, 168.30, 157.70],
-        k8v4:  [165.66, 143.58, 122.78],
-        nvfp4: [169.04, 151.81, 131.75]
+        bf16:  [202.17, 189.98, 176.52],
+        int8:  [198.50, 188.08, 182.41],
+        fp8:   [195.24, 174.00, 157.58],
+        rk8v4: [202.89, 194.71, 187.62],
+        rk4v4: [199.66, 191.16, 182.85],
+        k8v4:  [190.93, 164.68, 145.91],
+        nvfp4: [192.29, 172.76, 157.47]
       },
       spec: {
-        none:          { label: "None",                weightsGiB: 19.59, decode: 178.00, accept: null, graphBytes: 12582912, seqFixedBytes: 70579968, seqPerToken: 0.0625, kvRatio: 1, kvExtraPerToken: 0 },
-        mtp3:          { label: "MTP, 3 draft tokens", weightsGiB: 20.43, decode: 214.37, accept: null, graphBytes: 90177536, seqFixedBytes: 76086528, seqPerToken: 0.125, kvRatio: 1.10078125, kvExtraPerToken: 0 },
-        "mtp3+head":   { label: "MTP3 + draft head",   weightsGiB: 20.56, decode: 256.03, accept: 0.594, graphBytes: 90177536, seqFixedBytes: 76086528, seqPerToken: 0.125, kvRatio: 1.10078125, kvExtraPerToken: 0 },
-        "dflash-3":    { label: "DFlash, 3 tokens",    weightsGiB: 19.98, decode: 173.73, accept: null, graphBytes: 167772160, seqFixedBytes: 193136896, seqPerToken: 0.125, kvRatio: 1, kvExtraPerToken: 4096 },
-        "dflash-3+head": { label: "DFlash-3 + draft head", weightsGiB: 20.11, decode: 196.65, accept: 0.379, graphBytes: 167772160, seqFixedBytes: 193136896, seqPerToken: 0.125, kvRatio: 1, kvExtraPerToken: 4096 }
+        none:             { label: "None", weightsGiB: 19.59, decode: 204.39, accept: null, graphBytes: 12582912, seqFixedBytes: 70611456, seqPerToken: 0.0625, kvRatio: 1, kvExtraPerToken: 0 },
+        mtp3:             { label: "MTP, 3 draft tokens", weightsGiB: 20.43, decode: 239.60, accept: 0.513, graphBytes: 90177536, seqFixedBytes: 76212224, seqPerToken: 0.125, kvRatio: 1.100390625, kvExtraPerToken: 0 },
+        "mtp3+head":      { label: "MTP3 + draft head", weightsGiB: 20.56, decode: 301.16, accept: 0.607, graphBytes: 90177536, seqFixedBytes: 76212224, seqPerToken: 0.125, kvRatio: 1.100390625, kvExtraPerToken: 0 },
+        "dflash-3":       { label: "DFlash, 3 tokens", weightsGiB: 19.98, decode: 202.18, accept: 0.328, graphBytes: 276824064, seqFixedBytes: 193262080, seqPerToken: 0.125, kvRatio: 1, kvExtraPerToken: 4096 },
+        "dflash-3+head":  { label: "DFlash-3 + draft head", weightsGiB: 20.11, decode: 218.79, accept: 0.339, graphBytes: 276824064, seqFixedBytes: 193262080, seqPerToken: 0.125, kvRatio: 1, kvExtraPerToken: 4096 }
+      }
+    },
+    "bonsai": {
+      /* Prism ML's ternary Qwen3.8-27B in this fork's 3090 conversion. Same attention geometry as the
+         27B, so the same KV bytes per token, with 8.9 GiB less in weights. */
+      name: "Ternary Bonsai 2 27B",
+      label: "Ternary Bonsai 2 27B (dense, ternary weights)",
+      about: "Prism ML's ternary Qwen3.8-27B, 2.125 bits per weight (download-model bonsai2-27b). Measured 2026-10-24 on an RTX 3090 at its stock 350 W, Linux.",
+      nativeMaxContext: 262144,
+      weightsBytes: 7189829632,
+      workspaceBytes: 146038784,
+      kv: { bf16: 65536, int8: 33792, fp8: 33024, rk8v4: 26112, rk4v4: 17920, k8v4: 25728, nvfp4: 18432 },
+      depths: [4096, 16384, 32768],
+      speed: {
+        bf16:  [85.59, 81.05, 73.92],
+        int8:  [86.12, 81.82, 78.05],
+        fp8:   [79.98, 72.78, 64.01],
+        rk8v4: [88.35, 83.90, 79.94],
+        rk4v4: [88.20, 83.04, 78.30],
+        k8v4:  [82.50, 68.01, 57.95],
+        nvfp4: [84.47, 71.55, 63.30]
+      },
+      spec: {
+        none:             { label: "None", weightsGiB: 6.70, decode: 87.76, accept: null, graphBytes: 12582912, seqFixedBytes: 166470144, seqPerToken: 0.0625, kvRatio: 1, kvExtraPerToken: 0 },
+        mtp3:             { label: "MTP, 3 draft tokens", weightsGiB: 7.12, decode: 178.58, accept: 0.587, graphBytes: 90177536, seqFixedBytes: 175818752, seqPerToken: 0.125, kvRatio: 1.062744141, kvExtraPerToken: 0 },
+        "mtp3+head":      { label: "MTP3 + draft head", weightsGiB: 7.28, decode: 147.72, accept: 0.397, graphBytes: 90177536, seqFixedBytes: 175818752, seqPerToken: 0.125, kvRatio: 1.062744141, kvExtraPerToken: 0 },
+        "dflash2-7":      { label: "DFlash2, 7 tokens", weightsGiB: 7.99, decode: 112.37, accept: 0.119, graphBytes: [[8192, 411041792], [Infinity, 612368384]], seqFixedBytes: 279339776, seqPerToken: 0.0625, kvRatio: 1, kvExtraPerToken: 0 },
+        "dflash2-7+head": { label: "DFlash2-7 + draft head", weightsGiB: 8.16, decode: 110.24, accept: 0.108, graphBytes: [[8192, 411041792], [Infinity, 612368384]], seqFixedBytes: 279339776, seqPerToken: 0.0625, kvRatio: 1, kvExtraPerToken: 0 }
+      }
+    },
+    "q36-27b": {
+      /* Upstream's Qwen3.6-27B. Its artifact carries no DFlash2 bundle, so only MTP is offered. */
+      name: "Qwen3.6-27B",
+      label: "Qwen3.6-27B (dense, groupwise-int weights)",
+      about: "The earlier dense 27B, groupwise-int weights (download-model qwen36-27b). MTP only: it has no DFlash2 bundle. Measured 2026-10-24 on an RTX 3090 at its stock 350 W, Linux.",
+      nativeMaxContext: 262144,
+      weightsBytes: 16378329088,
+      workspaceBytes: 144179200,
+      kv: { bf16: 65536, int8: 33792, fp8: 33024, rk8v4: 26112, rk4v4: 17920, k8v4: 25728, nvfp4: 18432 },
+      depths: [4096, 16384, 32768],
+      speed: {
+        bf16:  [47.77, 45.55, 43.24],
+        int8:  [47.87, 46.27, 44.84],
+        fp8:   [46.46, 42.35, 38.99],
+        rk8v4: [47.77, 46.38, 45.02],
+        rk4v4: [47.70, 45.98, 44.47],
+        k8v4:  [45.77, 40.37, 36.14],
+        nvfp4: [46.32, 41.95, 38.84]
+      },
+      spec: {
+        none:             { label: "None", weightsGiB: 15.25, decode: 48.33, accept: null, graphBytes: 12582912, seqFixedBytes: 166470144, seqPerToken: 0.0625, kvRatio: 1, kvExtraPerToken: 0 },
+        mtp3:             { label: "MTP, 3 draft tokens", weightsGiB: 15.67, decode: 104.75, accept: 0.651, graphBytes: 90177536, seqFixedBytes: 175818752, seqPerToken: 0.125, kvRatio: 1.062744141, kvExtraPerToken: 0 },
+        "mtp3+head":      { label: "MTP3 + draft head", weightsGiB: 16.01, decode: 111.56, accept: 0.629, graphBytes: 90177536, seqFixedBytes: 175818752, seqPerToken: 0.125, kvRatio: 1.062744141, kvExtraPerToken: 0 }
       }
     }
   },
 
-  /* Perplexity is model-independent in the sense that it was measured once, on the 27B, over the
-     same corpus and window for all seven formats. */
-  /* Re-measured September 2026. The fp8, k8v4 and nvfp4 figures published before that were
-     scored through a data race in the quantized attention kernels that corrupted every prefill
-     output column but the last; all three now reproduce bit-identically run to run. nvfp4 moved
-     -0.154% and fp8 -0.057%, against a 0.019% drift on the three formats the fix did not touch.
-     One consequence for anyone reading the table: fp8 now has *better* perplexity than rk8v4. */
+  /* Perplexity is model-independent in the sense that it was measured once, on the 27B (this fork's
+     3090 conversion), over the same corpus and window for all seven formats: ninfer-perplexity
+     --quick on ninfer-ppl-1m-v1, context/stride 4096/2048, 261,167 scored tokens, 2026-10-24. */
   perplexity: {
-    bf16:  4.342517,
-    int8:  4.342425,
-    fp8:   4.344724,
-    rk8v4: 4.346413,
-    /* Measured 4.352432 on 2026-09-23 in a session where int8 measured 4.343155; stated here
-       against this table's int8 anchor (+0.2136%) so the column stays one comparison. */
-    rk4v4: 4.351701,
-    k8v4:  4.347258,
-    nvfp4: 4.352201
+    bf16:  4.302517,
+    int8:  4.302505,
+    fp8:   4.302770,
+    rk8v4: 4.308870,
+    rk4v4: 4.311406,
+    k8v4:  4.307089,
+    nvfp4: 4.312298
   },
   kvLabels: {
     bf16:  "bf16 — full precision reference",
@@ -595,23 +640,20 @@ const DATA = {
   },
   kvNotes: {
     bf16:  "The reference. Twice the cache of int8 for a perplexity difference too small to " +
-           "measure, and slower at depth. Useful for comparison, rarely the right choice.",
-    int8:  "The quality default: +0.0009% perplexity is effectively free, and it holds its decode " +
-           "rate at depth better than anything except rk8v4.",
-    fp8:   "No longer dominated on all three axes: it now has *better* perplexity than rk8v4, by " +
-           "0.039%. That edge costs 26% more KV memory per token and 8.5% of decode speed at 32K " +
-           "depth -- a genuine trade, and a bad one for almost everyone, but a trade rather than " +
-           "a strict loss.",
-    rk8v4: "The best all-round choice. 23% smaller than int8, the flattest decode curve of any " +
-           "format measured, and +0.08% perplexity.",
-    rk4v4: "The context choice. 31% smaller than rk8v4 and within 3% of nvfp4, with better " +
-           "perplexity than nvfp4 (+0.21% against int8) and rk8v4's decode and prefill speed. " +
-           "Measured on a newer build than the other rows, so its speed and perplexity here are " +
-           "that session's ratios to rk8v4 and int8 applied to their rows, not a direct reading.",
-    k8v4:  "Within 1.5% of rk8v4's size but the worst decode falloff measured (-25% by 32k) and " +
-           "slightly worse quality. Prefer rk8v4.",
-    nvfp4: "Maximum context: 45% smaller than int8. You pay about 15% of decode speed at a 32k " +
-           "cache and +0.36% perplexity for it."
+           "measure. Useful for comparison, rarely the right choice.",
+    int8:  "The quality default: perplexity indistinguishable from bf16 (-0.0003%) and the " +
+           "flattest decode curve on the 27B, -4.5% from 4K to 32K.",
+    fp8:   "Within 0.006% of bf16's perplexity, better than any smaller format, but 26% more " +
+           "cache than rk8v4 and 14% slower than it at a 32K cache.",
+    rk8v4: "The fastest format at depth on both the 27B and the 35B, 23% smaller than int8, " +
+           "for +0.15% perplexity.",
+    rk4v4: "The context choice, and what the launchers use: 31% smaller than rk8v4 and 3% " +
+           "smaller than nvfp4, with better perplexity than nvfp4 (+0.21%) and 16% faster " +
+           "decode than it at a 32K cache.",
+    k8v4:  "Within 1.5% of rk8v4's size with slightly better perplexity (+0.11%), but the " +
+           "worst decode falloff measured: -23% by 32K on both models. Prefer rk8v4.",
+    nvfp4: "Superseded by rk4v4, which is smaller, scores better and decodes 16% faster at a " +
+           "32K cache."
   }
 };
 
@@ -636,12 +678,12 @@ function modelOf() { return DATA.models[$("model").value]; }
    Both move with the speculation mode, and the two speculative backends move them differently --
    which is why TODO.md section 2b's "one constant multiplier" only ever fit MTP.
      MTP buffers extra draft tokens *in the KV format*, so its cost is multiplicative and identical
-   across formats: +6.2988% per token on the 27B, +10.078% on the 35B (both confirmed against a
-   second format, nvfp4, to within page rounding).
+   across formats: +6.2744% per token on the 27B-class models, +10.039% on the 35B (both confirmed
+   against a second format, nvfp4, to within page rounding).
      DFlash v1 instead reserves a fixed scratch region per token, measured at exactly 4,096 bytes
    and independent of the format. Modelling that as a ratio is what made it look format-dependent:
    4,096 bytes is +38.8% on int8's 10,560 but +71.1% on nvfp4's 5,760.
-     DFlash2 on the 27B costs nothing per token at all and pays entirely in its graph allowance. */
+     DFlash2 costs nothing per token at all and pays entirely in its graph allowance. */
 function perToken(model, kv, specKey) {
   const k = model.kv[kv];
   if (k === null) return null;
@@ -651,8 +693,8 @@ function perToken(model, kv, specKey) {
 
 
 /* The CUDA graph allowance is per speculative backend, and for DFlash2 it is per context as well.
-   Measured with scripts/sweeps/speculative-memory-terms.ps1 at 8,192/16,384/32,768: DFlash2 asks
-   288 MiB at 8,192 and 384 MiB at both deeper points, so it is modelled as a step. Only three
+   Measured with scripts/sweeps/speculative-memory-terms.ps1's arguments at 8,192/16,384/32,768:
+   DFlash2 asks 392 MiB at 8,192 and 584 MiB at both deeper points, so it is modelled as a step. Only three
    contexts were measured, so treat a value between them as the higher of the two. */
 function graphBytes(spec, ctx) {
   const g = spec.graphBytes;
@@ -858,7 +900,7 @@ function render() {
   $("overhead-note").textContent =
     (specMode.seqFixedBytes / MIB).toFixed(1) + " MiB fixed + " +
     (specMode.seqPerToken === 0.0625 ? "1/16" : "1/8") + " B per token";
-  $("model-hint").textContent = model.label.replace(/^[^(]*\((.*)\)$/, (_, d) => d[0].toUpperCase() + d.slice(1) + ".");
+  $("model-hint").textContent = model.about;
   $("kv-hint").textContent = DATA.kvNotes[kv];
   $("spec-hint").textContent = (spec.accept !== null
     ? "Measured draft acceptance " + (spec.accept * 100).toFixed(1) + "% on this model. "

@@ -115,34 +115,35 @@ recommended default. On the development RTX 3090, `rk8v4` raises the measured au
 boundary from 171,648 to 226,560 tokens at 1 GiB headroom, for 5.51 GiB of KV against INT8's
 5.40 GiB.
 
-Since the port onto the `kv_cache_append` Op, that context gain has a measured quality cost of
-**+0.092% perplexity** (`ninfer-perplexity`, `ninfer-ppl-1m-v1` quick, 261,167 scored tokens:
-4.342425 on INT8 against 4.346413 on rk8v4; both re-measured September 2026 and both
-bit-reproducible run to run). Values are not rotated, so there is no
+That context gain has a measured quality cost of **+0.148% perplexity** on the Qwen3.8-27B
+`download-model` fetches (`ninfer-perplexity`, `ninfer-ppl-1m-v1` quick, 261,167 scored tokens:
+4.302505 on INT8 against 4.308870 on rk8v4, measured 2026-10-24 under Linux; perplexity does not
+depend on the OS). Values are not rotated, so there is no
 inverse-rotation pass over the attention output. Values do use a finer group than keys, 32 against
-64, which halved that penalty from +0.146% at no cost in context.
+64, which halved the penalty when it was introduced (+0.146% to +0.082% on upstream's weights) at
+no cost in context.
 
-Decode cost depends on speculation. Without it the packed value plane is within about 1% of INT8,
-because halved value traffic and the added unpack nearly cancel. With MTP3, C1 decode falls about
-5%, from a mean 81.61 tok/s across three runs to 77.39, because the lower value precision reduces
-draft acceptance from 71.27% to 65.86%. The finer value group does not fix that: it recovers 44% of
-the perplexity penalty but only about 15% of the acceptance loss, because acceptance turns on exact
-token agreement rather than on mean error. Prefer `rk8v4` when context is the binding constraint,
-and INT8 when decode throughput under speculation matters more.
+Decode speed barely depends on the choice. Without speculation `rk8v4` is the faster of the two at
+every depth (46.3 against 45.9 tok/s at a 32K cache); with MTP3 and the draft head INT8 leads by 2.4%
+after a 4K prompt (157.7 against 154.0 tok/s) and the two are level after 32K (`ninfer_bench`,
+2026-10-24, an RTX 3090 at its stock 350 W under Linux, not this Windows setup). Prefer `rk8v4` when context is the binding constraint,
+and INT8 when the last few percent of speculative decode matter more.
 
 ## Measured 35B capacity
 
-These results used the compact 20.84 GiB artifact on an otherwise idle RTX 3090:
+Aggregate decode with the artifact `download-model qwen36-35b-a3b` fetches, measured 2026-10-24 on
+an otherwise idle RTX 3090 at its stock 350 W under Linux, not Windows: `ninfer_bench --concurrency N`, 128 output tokens per
+request, MTP3, INT8 KV, a 4,096-token context:
 
-| Workload | Concurrency | Aggregate decode | Peak VRAM |
-|---|---:|---:|---:|
-| 128 output tokens/request | 1 | 162.7 tok/s | 21.90 GiB |
-| 128 output tokens/request | 2 | 267.9 tok/s | 22.21 GiB |
-| 128 output tokens/request | 4 | 366.2 tok/s | 22.83 GiB |
-| 128 output tokens/request | 6 | 383.4 tok/s | 23.47 GiB |
-| 512 output tokens/request | 2 | 399.1 tok/s | within 24 GB |
+| Concurrency | Aggregate decode | MTP acceptance |
+|---:|---:|---:|
+| 1 | 231.1 tok/s | 51.3% |
+| 2 | 323.0 tok/s | 56.3% |
+| 4 | 411.3 tok/s | 56.1% |
+| 6 | **452.8 tok/s** | 55.3% |
 
-Concurrency 8 was rejected by admission rather than overcommitting the GPU. Repeating a compatible
+That run did not record peak VRAM. An earlier run on the compact 20.84 GiB artifact peaked at 23.47
+GiB at concurrency 6, and rejected concurrency 8 at admission rather than overcommitting the GPU. Repeating a compatible
 26-token prompt reused 24 prefix tokens and reduced measured prefill from 371 ms to 10 ms.
 
 ## Build from source
