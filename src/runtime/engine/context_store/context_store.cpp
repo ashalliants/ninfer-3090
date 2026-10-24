@@ -477,6 +477,22 @@ fs::path ContextStore::manifest_path(const std::string& id) const {
     return options_.directory / "manifests" / (id + ".manifest");
 }
 
+fs::path ContextStore::published_path(const std::string& id) const {
+    return options_.directory / "manifests" / (id + ".published");
+}
+
+void ContextStore::write_published_locked(const std::string& id,
+                                          std::span<const std::uint8_t> manifest) const {
+    // The manifest's own checksum, its last 8 bytes, names exactly the manifest published.
+    if (manifest.size() < sizeof(std::uint64_t)) { return; }
+    try {
+        write_atomically(published_path(id), manifest.subspan(manifest.size() - sizeof(std::uint64_t)));
+    } catch (const std::exception&) {
+        // Without the marker a restart only treats the image as unpublished: removed whole on
+        // eviction instead of kept for the bucket.
+    }
+}
+
 fs::path ContextStore::used_path(const std::string& id) const {
     return options_.directory / "manifests" / (id + ".used");
 }
@@ -644,6 +660,7 @@ void ContextStore::remove_entry_locked(const std::string& id, bool corrupt) {
     }
     remove_quietly(manifest_path(id));
     remove_quietly(used_path(id));
+    remove_quietly(published_path(id));
 }
 
 void ContextStore::quarantine_peers_locked(Entry& entry, const std::vector<ChunkRef>* damaged) {
@@ -775,9 +792,22 @@ void ContextStore::scan() {
         if (!valid_id(id) || !read_manifest(path, entry, nullptr) || entry.info.id != id) {
             remove_quietly(path);
             remove_quietly(used_path(id));
+            remove_quietly(published_path(id));
             continue;
         }
         entry.info.last_used_ms = entry.info.created_ms;
+        if (options_.remote) {
+            // Published before the restart, and this manifest is the one published (not a newer
+            // write of the id whose upload never ran).
+            try {
+                const std::vector<std::uint8_t> marker   = read_whole_file(published_path(id));
+                const std::vector<std::uint8_t> manifest = read_whole_file(path);
+                entry.published = marker.size() == sizeof(std::uint64_t) &&
+                                  manifest.size() >= marker.size() &&
+                                  std::equal(marker.begin(), marker.end(),
+                                             manifest.end() - static_cast<std::ptrdiff_t>(marker.size()));
+            } catch (const std::exception&) {}
+        }
         try {
             const std::vector<std::uint8_t> used = read_whole_file(used_path(id));
             const std::string text(used.begin(), used.end());
@@ -1227,8 +1257,23 @@ ContextStore::PutResult ContextStore::put(const Description& description,
     return result;
 }
 
-std::optional<std::vector<std::uint8_t>> ContextStore::load(const std::string& id, bool touch) {
+std::optional<std::vector<std::uint8_t>> ContextStore::load(const std::string& id, bool touch,
+                                                            LoadReport* report) {
     if (!valid_id(id)) { return std::nullopt; }
+    // Downloads only, timed apart from reading and reassembling the local files.
+    const auto fetch = [&](std::uint64_t& generation) {
+        const auto started  = std::chrono::steady_clock::now();
+        std::uint64_t bytes = 0;
+        const FetchStatus status = fetch_image_chunks(id, generation, &bytes);
+        if (report != nullptr) {
+            report->fetched_bytes += bytes;
+            report->fetch_ns += static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - started)
+                    .count());
+        }
+        return status;
+    };
     if (options_.remote) {
         bool needs_fetch = false;
         {
@@ -1239,7 +1284,7 @@ std::optional<std::vector<std::uint8_t>> ContextStore::load(const std::string& i
         if (needs_fetch) {
             // Network time: no lock is held, so puts and lookups carry on meanwhile.
             std::uint64_t generation = 0;
-            const FetchStatus status = fetch_image_chunks(id, generation);
+            const FetchStatus status = fetch(generation);
             if (status != FetchStatus::Complete) {
                 {
                     std::scoped_lock lock(mutex_);
@@ -1373,7 +1418,7 @@ std::optional<std::vector<std::uint8_t>> ContextStore::load(const std::string& i
             }
         }
         std::uint64_t generation = 0;
-        const FetchStatus status = fetch_image_chunks(id, generation);
+        const FetchStatus status = fetch(generation);
         if (status != FetchStatus::Complete) {
             {
                 std::scoped_lock lock(mutex_);
@@ -1719,10 +1764,12 @@ void ContextStore::upload_image(RemoteTask& task) {
     if (succeeded) {
         {
             // Only now may the directory give this image's chunks up to the bucket.
+            std::scoped_lock io(io_mutex_);
             std::scoped_lock lock(mutex_);
             const auto found = entries_.find(task.id);
             if (found != entries_.end() && found->second.generation == task.generation) {
                 found->second.published = true;
+                write_published_locked(task.id, task.manifest);
             }
         }
         // The images this one superseded leave the bucket, or every engine keeps registering
@@ -1897,9 +1944,19 @@ void ContextStore::touch_remote_image(const std::string& id) {
 }
 
 ContextStore::FetchStatus ContextStore::fetch_image_chunks(const std::string& id,
-                                                           std::uint64_t& generation) {
+                                                           std::uint64_t& generation,
+                                                           std::uint64_t* fetched) {
     std::vector<ChunkRef> chunks;
     generation = 0;
+    std::atomic<std::uint64_t> fetched_bytes{0};
+    // However this returns, report what was downloaded.
+    struct ReportFetched {
+        std::atomic<std::uint64_t>& bytes;
+        std::uint64_t* out;
+        ~ReportFetched() {
+            if (out != nullptr) { *out += bytes.load(); }
+        }
+    } report_fetched{fetched_bytes, fetched};
     {
         std::scoped_lock lock(mutex_);
         const auto found = entries_.find(id);
@@ -1964,6 +2021,7 @@ ContextStore::FetchStatus ContextStore::fetch_image_chunks(const std::string& id
             std::scoped_lock lock(mutex_);
             ++stats_.remote_downloads;
             stats_.remote_download_bytes += data->size();
+            fetched_bytes += data->size();
         }
     };
     const std::size_t threads = std::min(chunks.size(), kFetchThreads);
@@ -2087,6 +2145,7 @@ std::size_t ContextStore::refresh_remote_locked(std::chrono::steady_clock::time_
             std::scoped_lock lock(mutex_);
             if (entries_.find(id) != entries_.end()) { continue; }
             write_atomically(manifest_path(id), *data);
+            write_published_locked(id, *data);
             manifest_total_bytes_ += entry.manifest_bytes;
             add_references(entry);
             // The listing shows the manifest, not its chunks (a lifecycle rule or a person may have

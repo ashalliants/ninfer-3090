@@ -705,6 +705,57 @@ void test_eviction_waits_for_a_queued_upload() {
     check(back && *back == a, "the evicted image could not be fetched back");
 }
 
+// Publication survives a restart, for exactly the manifest published: an image uploaded before the
+// restart is evicted to the bucket after it (kept, fetched on demand); one whose upload never
+// happened is removed whole.
+void test_publication_survives_restart() {
+    TempDirectory directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore::Options options = remote_options(directory.path(), remote);
+    {
+        ContextStore store(options);
+        (void)store.put(describe("0a"), concat({pseudo_random(30, 1), pseudo_random(5000, 2)}),
+                        std::array{ContextStore::Region{30, 5000}});
+        check(drained(store), "upload before the restart");
+        remote->down = true;
+        (void)store.put(describe("0c"), concat({pseudo_random(30, 5), pseudo_random(5000, 6)}),
+                        std::array{ContextStore::Region{30, 5000}});
+        check(drained(store), "the failed upload did not settle");
+        remote->down = false;
+    }
+    options.max_bytes = 8000; // room for one image
+    ContextStore store(options);
+    check(drained(store), "the start-up refresh did not finish");
+    remote->clock += 10;
+    (void)store.put(describe("0b"), concat({pseudo_random(30, 3), pseudo_random(5000, 4)}),
+                    std::array{ContextStore::Region{30, 5000}});
+    const auto published = store.find("0a");
+    check(published && !published->local, "an image published before the restart was not kept for the bucket");
+    const auto unpublished = store.find("0c");
+    check(!unpublished || unpublished->local, "an image never uploaded was evicted to the bucket after a restart");
+}
+
+// A load reports the download alone: its bytes and time, not the local read that follows.
+void test_load_reports_its_download() {
+    TempDirectory directory;
+    TempDirectory other_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    {
+        ContextStore store(remote_options(directory.path(), remote));
+        (void)store.put(describe("0a"), concat({pseudo_random(30, 1), pseudo_random(3000, 2)}),
+                        std::array{ContextStore::Region{30, 3000}});
+        check(drained(store), "upload");
+    }
+    ContextStore other(remote_options(other_directory.path(), remote));
+    check(drained(other) && other.find("0a"), "the image was not registered");
+    ContextStore::LoadReport report;
+    check(other.load("0a", false, &report).has_value(), "the remote image did not load");
+    check(report.fetched_bytes == 3000 && report.fetch_ns > 0, "the download was not reported");
+    ContextStore::LoadReport again;
+    check(other.load("0a", false, &again).has_value() && again.fetched_bytes == 0 && again.fetch_ns == 0,
+          "a local load reported a download");
+}
+
 // An image whose upload failed is never evicted to the remote: the bucket does not hold it, so
 // keeping its manifest while deleting its chunks would lose the only copy. And the images it
 // superseded may be registered from the bucket again, since no replacement was published.
@@ -2127,6 +2178,8 @@ int main() {
     test_fetch_bytes_and_refresh_on_demand();
     test_shared_prefix_outlives_the_conversations_on_it();
     test_failed_upload_keeps_the_local_copy_and_releases_superseded();
+    test_publication_survives_restart();
+    test_load_reports_its_download();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

@@ -198,8 +198,14 @@ public:
     // image is removed so it is not offered again. Counts as a use.
     // `touch` false reads without refreshing the image's last use; the caller then calls touch()
     // once it has actually used the image.
+    // What a load downloaded from the bucket first, and how long that download alone took.
+    struct LoadReport {
+        std::uint64_t fetched_bytes = 0;
+        std::uint64_t fetch_ns      = 0;
+    };
     [[nodiscard]] std::optional<std::vector<std::uint8_t>> load(const std::string& id,
-                                                                bool touch = true);
+                                                                bool touch          = true,
+                                                                LoadReport* report = nullptr);
 
     [[nodiscard]] std::vector<Info> list() const;
     [[nodiscard]] std::optional<Info> find(const std::string& id) const;
@@ -314,6 +320,10 @@ private:
 
     [[nodiscard]] std::filesystem::path manifest_path(const std::string& id) const;
     [[nodiscard]] std::filesystem::path used_path(const std::string& id) const;
+    // Holds the checksum of the manifest last published to the bucket: a restart marks the entry
+    // published only when its manifest on disk is that one (not a newer write still to upload).
+    [[nodiscard]] std::filesystem::path published_path(const std::string& id) const;
+    void write_published_locked(const std::string& id, std::span<const std::uint8_t> manifest) const;
     [[nodiscard]] std::filesystem::path chunk_path(const std::array<std::uint64_t, 2>& hash) const;
     [[nodiscard]] std::filesystem::path
     compressed_chunk_path(const std::array<std::uint64_t, 2>& hash) const;
@@ -402,7 +412,9 @@ private:
     void prune_remote_state();
     enum class FetchStatus : std::uint8_t { Complete, Transient, Corrupt };
     // `generation` receives the generation of the entry the fetch worked from.
-    [[nodiscard]] FetchStatus fetch_image_chunks(const std::string& id, std::uint64_t& generation);
+    // `fetched` (optional) accumulates the bytes downloaded.
+    [[nodiscard]] FetchStatus fetch_image_chunks(const std::string& id, std::uint64_t& generation,
+                                                 std::uint64_t* fetched = nullptr);
     // A fetch of `generation` found the image damaged or gone in the bucket: drop it and do not
     // offer it again, unless the entry has been replaced since.
     void settle_failed_fetch(const std::string& id, std::uint64_t generation);

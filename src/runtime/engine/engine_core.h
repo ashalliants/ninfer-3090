@@ -3536,8 +3536,8 @@ private:
         std::optional<std::vector<std::uint8_t>> bytes;
         // Wall time of the store read, for the cost model's read rate.
         std::uint64_t read_ns = 0;
-        // Bytes the read downloads from the bucket first (its time is mostly that download).
-        std::uint64_t fetch_bytes = 0;
+        // What the read downloaded from the bucket first, and how long the download alone took.
+        ContextStore::LoadReport fetch;
         // Not a read: refresh the store's listing of the bucket, then consult the store again.
         bool lookup = false;
     };
@@ -3587,7 +3587,6 @@ private:
             std::chrono::duration_cast<std::chrono::nanoseconds>(store_.hydration_budget).count());
         std::string best_id;
         std::uint32_t best_frontier = resident;
-        std::uint64_t best_fetch    = 0;
         try {
             for (const ContextStore::Info& info : store_.store->list()) {
                 // The binding does not include the context length: an image deeper than this
@@ -3609,7 +3608,6 @@ private:
                         best_id       = info.id;
                         best_frontier = key.frontier;
                         best_cost     = cost;
-                        best_fetch    = info.fetch_bytes;
                     }
                 }
             }
@@ -3647,9 +3645,8 @@ private:
         {
             std::lock_guard lock(hydration_mutex_);
             HydrationTask task;
-            task.request     = request;
-            task.id          = std::move(best_id);
-            task.fetch_bytes = best_fetch;
+            task.request = request;
+            task.id      = std::move(best_id);
             hydration_queue_.push_back(std::move(task));
         }
         hydration_cv_.notify_one();
@@ -3687,7 +3684,7 @@ private:
                             std::chrono::duration_cast<std::chrono::milliseconds>(kStoreLookupFresh),
                             task.request->hydration_deadline);
                     } else {
-                        task.bytes = store_.store->load(task.id, false);
+                        task.bytes = store_.store->load(task.id, false, &task.fetch);
                     }
                 } catch (...) { task.bytes.reset(); }
                 task.read_ns = static_cast<std::uint64_t>(
@@ -3851,12 +3848,12 @@ private:
                 try {
                     imported = import_for_request(request, *task.bytes, task.id);
                 } catch (const std::invalid_argument&) { imported = false; }
-                if (imported && task.fetch_bytes > 0) {
-                    // Mostly a download: it teaches the download rate, not the disk's.
-                    observe_remote_fetch(task.fetch_bytes, task.read_ns);
-                } else if (imported) {
+                if (imported) {
+                    // The download teaches the download rate; the rest of the read (the local
+                    // files read, verified and reassembled) and the import teach the disk's.
+                    observe_remote_fetch(task.fetch.fetched_bytes, task.fetch.fetch_ns);
                     observe_store_read(task.bytes->size(),
-                                       task.read_ns +
+                                       task.read_ns - std::min(task.read_ns, task.fetch.fetch_ns) +
                                            static_cast<std::uint64_t>(
                                                std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                    Clock::now() - started)
