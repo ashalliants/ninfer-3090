@@ -264,6 +264,11 @@ private:
         // offered and its chunks are fetched from the bucket when it is loaded. Dropping the entry
         // instead would make the next refresh download the manifest again.
         bool evicted = false;
+        // With a remote: the bucket is known to hold this generation's manifest (an upload of it
+        // succeeded, a touch found it, or it was registered from a listing). Only such an image is
+        // evicted to the remote; one the bucket may lack is removed whole, as without a remote,
+        // rather than kept as an entry whose chunks exist nowhere.
+        bool published = false;
         // Set on an image whose manifest was imported from a peer: the peer_skipped_ key and
         // manifest time to restore if the manifest proves damaged. Such an image is the peer's to
         // upload, so a use here never puts it in the bucket.
@@ -302,6 +307,9 @@ private:
         std::vector<std::string> retire;
         // Upload: not started before this, unless a flush is waiting.
         std::chrono::steady_clock::time_point ready{};
+        // Upload: the entry generation the manifest describes; that entry is marked published when
+        // the upload succeeds.
+        std::uint64_t generation = 0;
     };
 
     [[nodiscard]] std::filesystem::path manifest_path(const std::string& id) const;
@@ -379,8 +387,12 @@ private:
     void enqueue_remote(RemoteTask task);
     // `superseded`: images this write superseded. Their queued uploads are dropped and their
     // manifests are deleted from the bucket after this upload.
-    void enqueue_upload(const std::string& id, std::vector<std::uint8_t> manifest,
-                        std::vector<ChunkRef> chunks, std::vector<std::string> superseded);
+    void enqueue_upload(const std::string& id, std::uint64_t generation,
+                        std::vector<std::uint8_t> manifest, std::vector<ChunkRef> chunks,
+                        std::vector<std::string> superseded);
+    // A replacement that will not be published (its upload failed or was dropped): the images it
+    // was to retire may be registered from the bucket again. Called with remote_mutex_ held.
+    void release_retirements_locked(const std::vector<std::string>& ids);
     void unpin_chunks_locked(const std::vector<ChunkRef>& chunks);
     void remote_loop();
     void upload_image(RemoteTask& task);
@@ -431,6 +443,8 @@ private:
         std::int64_t failed_ms          = 0;
     };
     std::unordered_map<std::string, RemoteFailure> remote_failed_;
+    // Superseded manifests whose deletion from the bucket failed: retried after the next upload.
+    std::vector<std::string> retire_backlog_;
     // Serializes refreshes; `last_refresh_` is when the last complete one finished. Timed, so a
     // request waiting for a listing gives up at its deadline rather than behind a slow refresh.
     std::timed_mutex refresh_mutex_;

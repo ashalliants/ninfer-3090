@@ -431,12 +431,13 @@ public:
     std::mutex mutex;
     std::map<std::string, std::pair<std::vector<std::uint8_t>, std::int64_t>> objects;
     std::int64_t clock = 1'000'000'000'000;
-    bool down          = false;
+    // Set and read by tests while the store's threads use the bucket.
+    std::atomic<bool> down{false};
     int puts           = 0;
     int touches        = 0;
     int chunk_gets     = 0;
     int manifest_gets  = 0;
-    int lists          = 0;
+    std::atomic<int> lists{0};
 
 private:
     void gate() {
@@ -692,12 +693,54 @@ void test_eviction_waits_for_a_queued_upload() {
                     std::array{ContextStore::Region{30, 5000}});
     check(store.stats().used_bytes > options.max_bytes,
           "files a queued upload needs were removed");
+    // Not yet in the bucket, so not kept as an entry whose chunks would exist nowhere.
+    check(!store.find("0a"), "an image the bucket may lack was kept as remote-only");
     check(drained(store), "the uploads did not run");
     store.maintain();
     check(store.stats().used_bytes <= options.max_bytes,
           "the files an upload held stayed after it finished");
+    // Uploaded from its pinned files after all: the next listing offers it again.
+    (void)store.refresh_remote();
     const auto back = store.load("0a");
     check(back && *back == a, "the evicted image could not be fetched back");
+}
+
+// An image whose upload failed is never evicted to the remote: the bucket does not hold it, so
+// keeping its manifest while deleting its chunks would lose the only copy. And the images it
+// superseded may be registered from the bucket again, since no replacement was published.
+void test_failed_upload_keeps_the_local_copy_and_releases_superseded() {
+    TempDirectory directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore::Options options = remote_options(directory.path(), remote);
+    ContextStore store(options);
+    put_turn(store, 1);
+    check(drained(store), "the first turn did not upload");
+    remote->down = true;
+    put_turn(store, 2); // supersedes turn 1 ("a"); its upload fails
+    check(drained(store), "the failed upload did not settle");
+    check(store.stats().remote_upload_failures >= 1, "the upload did not fail");
+    remote->down = false;
+    // Turn 1's manifest is still the bucket's latest: a refresh may register it again.
+    check(store.refresh_remote() == 1 && store.find("a"), "a superseded image stayed blocked after its replacement failed");
+    check(store.find("b") && store.find("b")->local, "the unpublished image lost files");
+
+    // Under space pressure an image whose upload failed is removed whole, as without a remote,
+    // never kept as a manifest pointing at a bucket copy that does not exist.
+    TempDirectory tight_directory;
+    auto down = std::make_shared<MemoryObjectStore>();
+    ContextStore::Options tight = remote_options(tight_directory.path(), down);
+    tight.max_bytes             = 8000; // room for one image
+    ContextStore squeezed(tight);
+    down->down = true;
+    (void)squeezed.put(describe("0a"), concat({pseudo_random(30, 1), pseudo_random(5000, 2)}),
+                       std::array{ContextStore::Region{30, 5000}});
+    check(drained(squeezed), "the failed upload did not settle");
+    down->clock += 10;
+    (void)squeezed.put(describe("0b"), concat({pseudo_random(30, 3), pseudo_random(5000, 4)}),
+                       std::array{ContextStore::Region{30, 5000}});
+    const auto evicted = squeezed.find("0a");
+    check(!evicted || evicted->local, "an image the bucket lacks was evicted to it");
+    check(squeezed.stats().evicted_for_space >= 1, "the limit evicted nothing");
 }
 
 void test_remote_upload_and_second_engine() {
@@ -2083,6 +2126,7 @@ int main() {
     test_regions_are_chunked_from_their_own_start();
     test_fetch_bytes_and_refresh_on_demand();
     test_shared_prefix_outlives_the_conversations_on_it();
+    test_failed_upload_keeps_the_local_copy_and_releases_superseded();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
