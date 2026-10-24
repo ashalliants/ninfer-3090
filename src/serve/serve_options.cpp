@@ -163,7 +163,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--context-store-flush-seconds N] [--context-store-compress] "
            "[--context-store-peer DIR]... [--context-store-peer-poll-ms N] "
            "[--context-store-s3-endpoint URL --context-store-s3-bucket NAME "
-           "[--context-store-s3-prefix P] [--context-store-s3-region R]]] "
+           "[--context-store-s3-prefix P] [--context-store-s3-region R] "
+           "[--context-store-s3-upload-delay-seconds N]]] "
            "[--no-exit-on-engine-failure] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4] "
@@ -290,7 +291,10 @@ std::string serve_usage_text(const char* argv0) {
            "AWS_SECRET_ACCESS_KEY; AWS_SESSION_TOKEN is honoured), never from the command line. "
            "--context-store-s3-prefix P namespaces the keys (a shared bucket); "
            "--context-store-s3-region R defaults to us-east-1. Expiry is the bucket's lifecycle "
-           "rule: use a 7-day expiration on the prefix\n"
+           "rule: use a 7-day expiration on the prefix. "
+           "--context-store-s3-upload-delay-seconds N waits that long before uploading a written "
+           "session (default 30): each turn's write supersedes the last, so a burst of turns is "
+           "uploaded once, and earlier turns are deleted from the bucket; shutdown uploads at once\n"
            "       --no-exit-on-engine-failure keeps the process alive when the Engine latches "
            "unavailable after repeated worker failures; by default it logs FATAL and exits with "
            "status 3 after a short grace period so a supervisor can restart it\n"
@@ -724,6 +728,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--context-store-s3-region") {
             options.context_store_s3_region = require_value("--context-store-s3-region");
             context_store_tuning            = true;
+        } else if (arg == "--context-store-s3-upload-delay-seconds") {
+            options.context_store_s3_upload_delay_seconds =
+                static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--context-store-s3-upload-delay-seconds"),
+                    "context-store-s3-upload-delay-seconds"));
+            context_store_tuning = true;
         } else if (arg == "--no-exit-on-engine-failure") {
             options.exit_on_engine_failure = false;
         } else if (arg == "--lm-head-draft") {
@@ -903,9 +913,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.context_store_s3_endpoint.empty() &&
         (!options.context_store_s3_prefix.empty() ||
-         options.context_store_s3_region != "us-east-1")) {
-        throw std::invalid_argument("--context-store-s3-prefix and --context-store-s3-region "
-                                    "require --context-store-s3-endpoint");
+         options.context_store_s3_region != "us-east-1" ||
+         options.context_store_s3_upload_delay_seconds != 30)) {
+        throw std::invalid_argument("--context-store-s3-prefix, --context-store-s3-region and "
+                                    "--context-store-s3-upload-delay-seconds require "
+                                    "--context-store-s3-endpoint");
     }
     if (!options.context_store_s3_endpoint.empty()) {
         const std::string& endpoint = options.context_store_s3_endpoint;

@@ -372,6 +372,7 @@ public:
         std::scoped_lock lock(mutex);
         if (down) { throw std::runtime_error("the bucket is unreachable"); }
         if (key.find("chunks/") != std::string::npos) { ++chunk_gets; }
+        if (key.find("manifests/") != std::string::npos) { ++manifest_gets; }
         const auto found = objects.find(key);
         if (found == objects.end()) { return std::nullopt; }
         return found->second.first;
@@ -433,6 +434,7 @@ public:
     int puts           = 0;
     int touches        = 0;
     int chunk_gets     = 0;
+    int manifest_gets  = 0;
 
 private:
     void gate() {
@@ -459,6 +461,104 @@ ContextStore::Options remote_options(const fs::path& directory,
 
 bool drained(ContextStore& store) {
     return store.flush_remote(std::chrono::steady_clock::now() + std::chrono::seconds(10));
+}
+
+// Turn `turn` (1-based) of one conversation: image id "a", "b", ... of 10 * turn tokens whose prefix
+// digests reproduce every earlier turn's endpoint key, so it supersedes them.
+void put_turn(ContextStore& store, std::uint32_t turn) {
+    static const auto kv = pseudo_random(8000, 1);
+    std::vector<std::array<std::uint64_t, 2>> digests;
+    const std::uint32_t tokens = 10 * turn;
+    for (std::uint64_t frontier = 0; frontier <= tokens; ++frontier) {
+        digests.push_back({frontier, 0x5eed});
+    }
+    auto description           = describe(std::string(1, static_cast<char>('a' + turn - 1)), tokens);
+    description.checkpoints[0] = {.frontier = tokens, .digests = digests[tokens], .identity_tag = 7};
+    description.prefix_digests = digests;
+    (void)store.put(description,
+                    concat({pseudo_random(30, turn),
+                            std::vector<std::uint8_t>(kv.begin(), kv.begin() + 1000 * turn)}),
+                    std::array{ContextStore::Region{30, 1000ULL * turn}});
+}
+
+std::size_t remote_manifests(MemoryObjectStore& remote) {
+    std::scoped_lock lock(remote.mutex);
+    std::size_t manifests = 0;
+    for (const auto& [key, value] : remote.objects) {
+        if (key.find("manifests/") != std::string::npos) { ++manifests; }
+    }
+    return manifests;
+}
+
+// A conversation saved turn after turn: each image supersedes the one before. The superseded
+// manifests must leave the bucket and must not be fetched back by the next refresh, or every refresh
+// downloads the whole history of every conversation again.
+void test_superseded_images_leave_the_bucket() {
+    TempDirectory directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore store(remote_options(directory.path(), remote));
+    for (std::uint32_t turn = 1; turn <= 6; ++turn) {
+        put_turn(store, turn);
+        check(drained(store), "the upload did not drain");
+        (void)store.refresh_remote();
+    }
+    check(store.list().size() == 1, "superseded images came back from the bucket");
+    check(remote->manifest_gets == 0, "a refresh downloaded manifests this store wrote or superseded");
+    check(remote_manifests(*remote) == 1, "superseded manifests stayed in the bucket");
+    check(store.stats().remote_retired == 5, "the deleted manifests were not counted");
+    // A new engine sees only the latest state of the conversation.
+    TempDirectory other_directory;
+    ContextStore other(remote_options(other_directory.path(), remote));
+    check(drained(other) && other.list().size() == 1 && other.list()[0].id == "f",
+          "a new engine did not see exactly the latest image");
+}
+
+// With an upload delay, turns written in quick succession are uploaded once: each write supersedes
+// the queued one before it. A flush uploads at once.
+void test_upload_delay_uploads_a_burst_of_turns_once() {
+    TempDirectory directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore::Options options = remote_options(directory.path(), remote);
+    options.remote_upload_delay   = std::chrono::seconds(3600);
+    ContextStore store(options);
+    check(drained(store), "the start-up refresh did not finish");
+    for (std::uint32_t turn = 1; turn <= 4; ++turn) { put_turn(store, turn); }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    check(remote->puts == 0, "an upload ran before its delay");
+    check(drained(store), "a flush did not upload the delayed image");
+    check(store.stats().remote_uploads_skipped == 3, "superseded queued uploads were not skipped");
+    check(remote_manifests(*remote) == 1 && store.list().size() == 1 && store.list()[0].id == "d",
+          "the bucket does not hold exactly the latest turn");
+    TempDirectory other_directory;
+    ContextStore other(remote_options(other_directory.path(), remote));
+    check(drained(other) && other.list().size() == 1, "a new engine did not see the latest turn");
+    const auto loaded = other.load("d");
+    check(loaded && *loaded == store.load("d").value_or(std::vector<std::uint8_t>{}),
+          "the coalesced upload is incomplete");
+}
+
+// An image evicted while its upload waits keeps the files the upload needs; once the upload is
+// done a later eviction frees them, so the directory comes back within its budget.
+void test_eviction_waits_for_a_queued_upload() {
+    TempDirectory directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore::Options options = remote_options(directory.path(), remote);
+    options.max_bytes             = 8000; // room for one image
+    options.remote_upload_delay   = std::chrono::seconds(3600);
+    ContextStore store(options);
+    const auto a = concat({pseudo_random(30, 1), pseudo_random(5000, 2)});
+    (void)store.put(describe("0a"), a, std::array{ContextStore::Region{30, 5000}});
+    remote->clock += 10;
+    (void)store.put(describe("0b"), concat({pseudo_random(30, 3), pseudo_random(5000, 4)}),
+                    std::array{ContextStore::Region{30, 5000}});
+    check(store.stats().used_bytes > options.max_bytes,
+          "files a queued upload needs were removed");
+    check(drained(store), "the uploads did not run");
+    store.maintain();
+    check(store.stats().used_bytes <= options.max_bytes,
+          "the files an upload held stayed after it finished");
+    const auto back = store.load("0a");
+    check(back && *back == a, "the evicted image could not be fetched back");
 }
 
 void test_remote_upload_and_second_engine() {
@@ -493,6 +593,10 @@ void test_remote_upload_and_second_engine() {
           "an image fetched from the remote differs from what was stored");
     check(other.list()[0].local && other.stats().remote_images == 0, "a fetched image is still remote");
     check(other.stats().remote_downloads == 6, "the fetch did not count its chunks");
+    // At least once: the refresh every store queues at start-up may read it too.
+    check(other.stats().remote_manifest_downloads >= 1 &&
+              other.stats().remote_manifest_download_bytes > 0,
+          "the refresh did not count the manifest it downloaded");
 }
 
 void test_remote_survives_local_eviction() {
@@ -509,13 +613,14 @@ void test_remote_survives_local_eviction() {
     (void)store.put(describe("0b"), b, std::array{ContextStore::Region{30, 5000}});
     check(drained(store), "upload b");
     check(!store.list().empty() && store.stats().evicted_for_space >= 1, "the local limit evicted nothing");
-    // 0a was evicted locally; the remote still holds it and a refresh brings it back.
+    // 0a's chunk files went; the remote still holds it, so it is still offered, without a refresh
+    // having to download its manifest again.
+    const auto evicted = store.find("0a");
+    check(evicted && !evicted->local, "an image evicted locally is no longer offered through the remote");
+    check(store.stats().used_bytes <= options.max_bytes, "the eviction freed too little");
     (void)store.refresh_remote();
-    bool found = false;
-    for (const auto& info : store.list()) {
-        if (info.id == "0a") { found = true; }
-    }
-    check(found, "an image evicted locally was not found again through the remote");
+    check(remote->manifest_gets == 0 && store.stats().remote_manifest_downloads == 0,
+          "a refresh downloaded the manifest of an image evicted here");
     const auto back = store.load("0a");
     check(back && *back == a, "an image evicted locally could not be fetched back");
     check(store.stats().remote_downloads > 0, "the evicted image was not fetched from the remote");
@@ -569,6 +674,10 @@ void test_remote_refresh_respects_its_deadline() {
     TempDirectory directory;
     TempDirectory other_directory;
     auto remote = std::make_shared<MemoryObjectStore>();
+    // Opened first, so the refresh every store queues at start-up finds the bucket empty and cannot
+    // register the images before the refreshes under test do.
+    ContextStore other(remote_options(other_directory.path(), remote));
+    check(drained(other), "the start-up refresh did not finish");
     {
         ContextStore store(remote_options(directory.path(), remote));
         (void)store.put(describe("0a"), concat({pseudo_random(30, 1), pseudo_random(3000, 2)}),
@@ -577,7 +686,6 @@ void test_remote_refresh_respects_its_deadline() {
                         std::array{ContextStore::Region{30, 3000}});
         check(drained(store), "upload before the deadline test");
     }
-    ContextStore other(remote_options(other_directory.path(), remote));
     const auto expired = std::chrono::steady_clock::now() - std::chrono::seconds(1);
     check(other.refresh_remote(expired) == 0 && other.list().empty(),
           "a refresh past its deadline still read manifests");
@@ -756,6 +864,9 @@ void test_remote_listing_does_not_confirm_chunks() {
     TempDirectory other_directory;
     auto remote = std::make_shared<MemoryObjectStore>();
     const std::vector<std::uint8_t> shared = pseudo_random(3000, 2);
+    // Opened first, so its start-up refresh finds the bucket empty and the one below registers.
+    ContextStore other(remote_options(other_directory.path(), remote));
+    check(drained(other), "the start-up refresh did not finish");
     {
         ContextStore store(remote_options(directory.path(), remote));
         (void)store.put(describe("0a"), concat({pseudo_random(30, 1), shared}),
@@ -763,7 +874,6 @@ void test_remote_listing_does_not_confirm_chunks() {
         check(drained(store), "upload before the listing test");
     }
     const std::size_t complete = chunk_objects(*remote);
-    ContextStore other(remote_options(other_directory.path(), remote));
     check(other.refresh_remote() == 1, "the image was not registered from the listing");
     {
         std::scoped_lock lock(remote->mutex);
@@ -1827,6 +1937,9 @@ int main() {
     test_local_ttl_does_not_hide_remote_images();
     test_shutdown_interrupts_a_blocked_transfer();
     test_final_flush_drops_best_effort_tasks();
+    test_superseded_images_leave_the_bucket();
+    test_upload_delay_uploads_a_burst_of_turns_once();
+    test_eviction_waits_for_a_queued_upload();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

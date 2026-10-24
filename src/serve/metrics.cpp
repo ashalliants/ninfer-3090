@@ -442,6 +442,16 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
     COUNTER(context_store_remote_download_failures,
             "context_store_remote_download_failures_total",
             "Remote listings or fetches that failed or returned damaged data.");
+    COUNTER(context_store_remote_manifest_downloads,
+            "context_store_remote_manifest_downloads_total",
+            "Session manifests a bucket refresh downloaded to register sessions other engines wrote.");
+    COUNTER(context_store_remote_manifest_download_bytes,
+            "context_store_remote_manifest_download_bytes_total",
+            "Bytes of session manifests a bucket refresh downloaded (not in remote_download_bytes).");
+    COUNTER(context_store_remote_retired, "context_store_remote_retired_total",
+            "Superseded sessions (earlier turns of a conversation) deleted from the bucket.");
+    COUNTER(context_store_remote_uploads_skipped, "context_store_remote_uploads_skipped_total",
+            "Queued uploads dropped because a newer write of the conversation superseded them.");
     COUNTER(context_store_peer_images, "context_store_peer_images_total",
             "Sessions imported from another engine's store directory (--context-store-peer).");
     COUNTER(context_store_peer_bytes_linked, "context_store_peer_bytes_linked_total",

@@ -406,7 +406,7 @@ ContextStore::ContextStore(Options options) : options_(std::move(options)) {
     }
     if (options_.remote) {
         remote_thread_ = std::thread([this] { remote_loop(); });
-        enqueue_remote({RemoteTask::Kind::Refresh, std::string(), {}, {}});
+        enqueue_remote({RemoteTask::Kind::Refresh, std::string(), {}, {}, {}, {}});
     }
     if (!options_.peers.empty()) { peer_thread_ = std::thread([this] { peer_loop(); }); }
 }
@@ -803,21 +803,85 @@ bool ContextStore::entry_has_local_bytes_locked(const Entry& entry) const {
 }
 
 bool ContextStore::evict_oldest_locked(const std::string* protect) {
-    const Entry* oldest = nullptr;
+    if (!options_.remote) {
+        const Entry* oldest = nullptr;
+        for (const auto& [id, entry] : entries_) {
+            if (protect != nullptr && id == *protect) { continue; }
+            if (oldest == nullptr || entry.info.last_used_ms < oldest->info.last_used_ms) {
+                oldest = &entry;
+            }
+        }
+        if (oldest == nullptr) { return false; }
+        const std::string id = oldest->info.id; // the entry, and its id, go with the removal
+        remove_entry_locked(id, false);
+        ++stats_.evicted_for_space;
+        return true;
+    }
+    // With a remote the least recently used image with files of its own gives them up and stays
+    // offered. Files a queued upload pins stay until it is done; an image evicted before is taken
+    // again only for files it can free now, so every eviction makes progress.
+    std::vector<Entry*> order;
+    for (auto& [id, entry] : entries_) {
+        if (protect == nullptr || id != *protect) { order.push_back(&entry); }
+    }
+    std::sort(order.begin(), order.end(), [](const Entry* a, const Entry* b) {
+        return a->info.last_used_ms < b->info.last_used_ms;
+    });
+    const auto holders = whole_image_holders_locked();
+    for (Entry* entry : order) {
+        const EvictionYield yield = evict_to_remote_locked(*entry, holders, false);
+        if (yield.freed == 0 && (entry->evicted || yield.pinned == 0)) { continue; }
+        (void)evict_to_remote_locked(*entry, holders, true);
+        ++stats_.evicted_for_space;
+        return true;
+    }
+    return false;
+}
+
+bool ContextStore::held_whole_locked(const Entry& entry) const {
+    return !entry.evicted && entry_local_locked(entry);
+}
+
+std::unordered_map<std::string, std::uint32_t> ContextStore::whole_image_holders_locked() const {
+    std::unordered_map<std::string, std::uint32_t> holders;
     for (const auto& [id, entry] : entries_) {
-        if (protect != nullptr && id == *protect) { continue; }
-        // An image the directory holds no chunk of costs only its manifest; dropping it frees
-        // nothing and the next refresh would register it again.
-        if (options_.remote && !entry_has_local_bytes_locked(entry)) { continue; }
-        if (oldest == nullptr || entry.info.last_used_ms < oldest->info.last_used_ms) {
-            oldest = &entry;
+        if (!held_whole_locked(entry)) { continue; }
+        std::unordered_set<std::string> seen;
+        for (const ChunkRef& chunk : entry.chunks) {
+            std::string key = hex_key(chunk.hash);
+            if (seen.insert(key).second) { ++holders[std::move(key)]; }
         }
     }
-    if (oldest == nullptr) { return false; }
-    const std::string id = oldest->info.id;
-    remove_entry_locked(id, false);
-    ++stats_.evicted_for_space;
-    return true;
+    return holders;
+}
+
+ContextStore::EvictionYield ContextStore::evict_to_remote_locked(
+    Entry& entry, const std::unordered_map<std::string, std::uint32_t>& holders, bool apply) {
+    EvictionYield yield;
+    const std::uint32_t self = held_whole_locked(entry) ? 1U : 0U;
+    std::unordered_set<std::string> seen;
+    for (const ChunkRef& chunk : entry.chunks) {
+        const std::string key = hex_key(chunk.hash);
+        if (!seen.insert(key).second) { continue; }
+        // Chunk files another image the directory still holds whole also uses stay.
+        const auto held            = holders.find(key);
+        const std::uint32_t others = (held == holders.end() ? 0U : held->second) - self;
+        const auto found = chunks_.find(key);
+        if (found == chunks_.end() || !found->second.present || others != 0) { continue; }
+        // A queued upload still reads a pinned file: a later eviction takes it.
+        if (found->second.pins != 0) {
+            yield.pinned += found->second.stored;
+            continue;
+        }
+        yield.freed += found->second.stored;
+        if (!apply) { continue; }
+        remove_chunk_files(chunk.hash);
+        chunk_total_bytes_ -= found->second.stored;
+        found->second.present = false;
+        found->second.stored  = 0;
+    }
+    if (apply) { entry.evicted = true; }
+    return yield;
 }
 
 void ContextStore::maintain_locked(const std::string* protect) {
@@ -827,13 +891,20 @@ void ContextStore::maintain_locked(const std::string* protect) {
         for (const auto& [id, entry] : entries_) {
             // An image only the bucket holds ages there, by its lifecycle rule, not by this
             // directory's TTL; the next refresh drops it from the index when the bucket does.
-            if (options_.remote && !entry_has_local_bytes_locked(entry)) { continue; }
+            if (options_.remote && (entry.evicted || !entry_has_local_bytes_locked(entry))) {
+                continue;
+            }
             if ((protect == nullptr || id != *protect) && entry.info.last_used_ms < horizon) {
                 expired.push_back(id);
             }
         }
         for (const std::string& id : expired) {
-            remove_entry_locked(id, false);
+            // With a remote only the directory's copy goes: the bucket's is still offered.
+            if (options_.remote) {
+                (void)evict_to_remote_locked(entries_.at(id), whole_image_holders_locked(), true);
+            } else {
+                remove_entry_locked(id, false);
+            }
             ++stats_.expired;
         }
     }
@@ -1010,8 +1081,8 @@ ContextStore::PutResult ContextStore::put(const Description& description,
         }
         if (had_previous) { release_references(replaced); }
         write_used(description.id, now);
+        std::vector<std::string> superseded;
         if (!description.prefix_digests.empty()) {
-            std::vector<std::string> superseded;
             for (const auto& [other_id, other] : entries_) {
                 // Every conversation reproduces the shared prefix it started from; that prefix
                 // still serves the other conversations, so it is never superseded by one.
@@ -1034,6 +1105,14 @@ ContextStore::PutResult ContextStore::put(const Description& description,
                 remove_entry_locked(other_id, false);
                 ++stats_.superseded;
             }
+            if (options_.remote && !superseded.empty()) {
+                // Until this image's upload deletes their manifests from the bucket, a refresh
+                // must not register them again.
+                std::scoped_lock remote_lock(remote_mutex_);
+                for (const std::string& other_id : superseded) {
+                    remote_failed_[other_id] = {std::numeric_limits<std::int64_t>::max(), now};
+                }
+            }
         }
         ++stats_.puts;
         stats_.bytes_written += result.chunk_bytes_written;
@@ -1044,7 +1123,7 @@ ContextStore::PutResult ContextStore::put(const Description& description,
         result.evicted_images = stats_.evicted_for_space + stats_.expired - evictions_before;
         if (options_.remote) {
             enqueue_upload(description.id, std::vector<std::uint8_t>(manifest.out.begin(), manifest.out.end()),
-                           std::move(upload_chunks));
+                           std::move(upload_chunks), std::move(superseded));
         }
     } catch (...) {
         for (const fs::path& path : written) { remove_quietly(path); }
@@ -1182,7 +1261,7 @@ std::optional<std::vector<std::uint8_t>> ContextStore::load(const std::string& i
                 }
                 // Only a use restarts the age of the bucket's copy: a probe or a restore that is
                 // abandoned (touch false) must not keep a session alive there.
-                if (touch) { enqueue_remote({RemoteTask::Kind::Touch, id, {}, {}}); }
+                if (touch) { enqueue_remote({RemoteTask::Kind::Touch, id, {}, {}, {}, {}}); }
                 return image;
             }
             // Discard the damaged local copies; the remote holds the good ones. A peer that linked
@@ -1254,7 +1333,7 @@ void ContextStore::touch(const std::string& id) {
     if (found == entries_.end()) { return; }
     found->second.info.last_used_ms = now_ms();
     write_used(id, found->second.info.last_used_ms);
-    enqueue_remote({RemoteTask::Kind::Touch, id, {}, {}});
+    enqueue_remote({RemoteTask::Kind::Touch, id, {}, {}, {}, {}});
 }
 
 ContextStore::Stats ContextStore::stats() const {
@@ -1315,7 +1394,7 @@ void ContextStore::enqueue_remote(RemoteTask task) {
 // newer write of the image replaces it. Each queued upload keeps its chunk files on disk, so the
 // queue is bounded and the oldest is given up beyond it (its image is uploaded again by its next write).
 void ContextStore::enqueue_upload(const std::string& id, std::vector<std::uint8_t> manifest,
-                                  std::vector<ChunkRef> chunks) {
+                                  std::vector<ChunkRef> chunks, std::vector<std::string> superseded) {
     constexpr std::size_t kMaximumQueuedUploads = 16;
     std::vector<ChunkRef> unused;
     bool queued = false;
@@ -1324,14 +1403,35 @@ void ContextStore::enqueue_upload(const std::string& id, std::vector<std::uint8_
         if (remote_stopping_) {
             unused = std::move(chunks);
         } else {
+            auto ready = std::chrono::steady_clock::now() + options_.remote_upload_delay;
+            // A queued upload of an image this write superseded is not needed: this one has
+            // everything it has. Its wait and the manifests it was to delete pass to this one.
+            std::vector<std::string> retire;
+            for (auto it = remote_queue_.begin(); it != remote_queue_.end();) {
+                const bool replaced = it->kind == RemoteTask::Kind::Upload &&
+                                      std::find(superseded.begin(), superseded.end(), it->id) !=
+                                          superseded.end();
+                if (!replaced) {
+                    ++it;
+                    continue;
+                }
+                ready = std::min(ready, it->ready);
+                retire.insert(retire.end(), it->retire.begin(), it->retire.end());
+                unused.insert(unused.end(), it->chunks.begin(), it->chunks.end());
+                ++stats_.remote_uploads_skipped;
+                it = remote_queue_.erase(it);
+            }
+            retire.insert(retire.end(), superseded.begin(), superseded.end());
             std::size_t uploads = 0;
             for (RemoteTask& task : remote_queue_) {
                 if (task.kind != RemoteTask::Kind::Upload) { continue; }
                 ++uploads;
                 if (task.id == id) {
-                    unused        = std::move(task.chunks);
+                    unused.insert(unused.end(), task.chunks.begin(), task.chunks.end());
                     task.manifest = std::move(manifest);
                     task.chunks   = std::move(chunks);
+                    task.retire.insert(task.retire.end(), retire.begin(), retire.end());
+                    task.ready    = std::min(task.ready, ready);
                     queued        = true;
                     break;
                 }
@@ -1340,14 +1440,14 @@ void ContextStore::enqueue_upload(const std::string& id, std::vector<std::uint8_
                 if (uploads >= kMaximumQueuedUploads) {
                     for (auto it = remote_queue_.begin(); it != remote_queue_.end(); ++it) {
                         if (it->kind == RemoteTask::Kind::Upload) {
-                            unused = std::move(it->chunks);
+                            unused.insert(unused.end(), it->chunks.begin(), it->chunks.end());
                             remote_queue_.erase(it);
                             break;
                         }
                     }
                 }
-                remote_queue_.push_back(
-                    RemoteTask{RemoteTask::Kind::Upload, id, std::move(manifest), std::move(chunks)});
+                remote_queue_.push_back(RemoteTask{RemoteTask::Kind::Upload, id, std::move(manifest),
+                                                   std::move(chunks), std::move(retire), ready});
                 queued = true;
             }
         }
@@ -1359,14 +1459,26 @@ void ContextStore::enqueue_upload(const std::string& id, std::vector<std::uint8_
 void ContextStore::remote_loop() {
     auto next_refresh = std::chrono::steady_clock::now() + options_.remote_refresh;
     std::unique_lock lock(remote_mutex_);
+    // The first task that may run now: an upload waits out its delay unless a flush is waiting.
+    const auto runnable = [&] {
+        const auto now = std::chrono::steady_clock::now();
+        return std::find_if(remote_queue_.begin(), remote_queue_.end(), [&](const RemoteTask& task) {
+            return task.kind != RemoteTask::Kind::Upload || remote_flushes_ != 0 || task.ready <= now;
+        });
+    };
     for (;;) {
-        remote_cv_.wait_until(lock, next_refresh,
-                              [&] { return remote_stopping_ || !remote_queue_.empty(); });
+        // Woken by a new task, a flush, or the earliest delayed upload coming due.
+        while (!remote_stopping_ && runnable() == remote_queue_.end() &&
+               std::chrono::steady_clock::now() < next_refresh) {
+            auto wake = next_refresh;
+            for (const RemoteTask& queued : remote_queue_) { wake = std::min(wake, queued.ready); }
+            remote_cv_.wait_until(lock, wake);
+        }
         if (remote_stopping_) { break; }
-        RemoteTask task{RemoteTask::Kind::Refresh, std::string(), {}, {}};
-        if (!remote_queue_.empty()) {
-            task = std::move(remote_queue_.front());
-            remote_queue_.pop_front();
+        RemoteTask task{RemoteTask::Kind::Refresh, std::string(), {}, {}, {}, {}};
+        if (const auto next = runnable(); next != remote_queue_.end()) {
+            task = std::move(*next);
+            remote_queue_.erase(next);
         } else if (std::chrono::steady_clock::now() >= next_refresh) {
             next_refresh = std::chrono::steady_clock::now() + options_.remote_refresh;
         } else {
@@ -1422,8 +1534,13 @@ bool ContextStore::flush_remote(std::chrono::steady_clock::time_point deadline, 
         std::erase_if(remote_queue_,
                       [](const RemoteTask& task) { return task.kind != RemoteTask::Kind::Upload; });
     }
-    return remote_idle_cv_.wait_until(
+    // Delayed uploads run now.
+    ++remote_flushes_;
+    remote_cv_.notify_all();
+    const bool drained = remote_idle_cv_.wait_until(
         lock, deadline, [&] { return remote_queue_.empty() && !remote_busy_; });
+    --remote_flushes_;
+    return drained;
 }
 
 bool ContextStore::prefetch(const std::string& id) {
@@ -1433,7 +1550,7 @@ bool ContextStore::prefetch(const std::string& id) {
         const auto found = entries_.find(id);
         if (found == entries_.end() || entry_local_locked(found->second)) { return false; }
     }
-    enqueue_remote({RemoteTask::Kind::Prefetch, id, {}, {}});
+    enqueue_remote({RemoteTask::Kind::Prefetch, id, {}, {}, {}, {}});
     return true;
 }
 
@@ -1473,6 +1590,21 @@ void ContextStore::upload_image(RemoteTask& task) {
         ++objects;
         bytes += task.manifest.size();
         succeeded = true;
+        // The images this one superseded leave the bucket, or every engine keeps registering
+        // them and a new one downloads every turn of every conversation at start-up. Their
+        // chunks are mostly this image's too; the rest expire under the bucket's lifecycle rule.
+        for (const std::string& retired : task.retire) {
+            {
+                std::scoped_lock lock(mutex_);
+                // Written here again since: that write is the bucket's copy now.
+                if (entries_.find(retired) != entries_.end()) { continue; }
+            }
+            options_.remote->remove(remote_manifest_key(retired));
+            std::scoped_lock lock(mutex_);
+            ++stats_.remote_retired;
+            std::scoped_lock remote_lock(remote_mutex_);
+            remote_failed_.erase(retired);
+        }
     } catch (const std::exception&) {}
     std::scoped_lock io(io_mutex_);
     std::scoped_lock lock(mutex_);
@@ -1650,6 +1782,12 @@ ContextStore::FetchStatus ContextStore::fetch_image_chunks(const std::string& id
         ++stats_.remote_downloads;
         stats_.remote_download_bytes += data->size();
     }
+    std::scoped_lock lock(mutex_);
+    const auto found = entries_.find(id);
+    // Whole again: it is evicted like any image the directory holds.
+    if (found != entries_.end() && found->second.generation == generation) {
+        found->second.evicted = false;
+    }
     return FetchStatus::Complete;
 }
 
@@ -1724,6 +1862,11 @@ std::size_t ContextStore::refresh_remote(std::chrono::steady_clock::time_point d
             }
             const std::optional<std::vector<std::uint8_t>> data = options_.remote->get(object.key);
             if (!data) { continue; }
+            {
+                std::scoped_lock lock(mutex_);
+                ++stats_.remote_manifest_downloads;
+                stats_.remote_manifest_download_bytes += data->size();
+            }
             Entry entry;
             if (!parse_manifest(*data, entry, nullptr) || entry.info.id != id) {
                 std::scoped_lock lock(remote_mutex_);

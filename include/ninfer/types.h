@@ -204,6 +204,10 @@ struct ContextStoreOptions {
     std::string remote_prefix;
     // How long shutdown waits for the uploads still queued.
     std::chrono::seconds remote_flush_budget{120};
+    // How long a written session waits before it is uploaded. A conversation is written after every
+    // turn and each write supersedes the last, so a burst of turns within this costs one upload.
+    // A conversation that keeps going is still uploaded this often, and shutdown uploads at once.
+    std::chrono::seconds remote_upload_delay{30};
     // Other engines' store directories on the same volume (read, never written): their sessions
     // are imported by hard link within `peer_poll`, so an engine on another GPU of the same box
     // resumes a conversation this one finished without a bucket round trip. See ContextStore.
@@ -1617,6 +1621,12 @@ struct RuntimeStats {
     std::uint64_t context_store_remote_downloads         = 0;
     std::uint64_t context_store_remote_download_bytes    = 0;
     std::uint64_t context_store_remote_download_failures = 0;
+    // Manifests a bucket refresh downloaded (not in remote_downloads), superseded sessions deleted
+    // from the bucket, and queued uploads a newer write of the conversation made unnecessary.
+    std::uint64_t context_store_remote_manifest_downloads      = 0;
+    std::uint64_t context_store_remote_manifest_download_bytes = 0;
+    std::uint64_t context_store_remote_retired                 = 0;
+    std::uint64_t context_store_remote_uploads_skipped         = 0;
     // With peers: images imported from another engine's directory, the chunk bytes hard-linked
     // (not copied), images skipped, and links that failed.
     std::uint64_t context_store_peer_images        = 0;

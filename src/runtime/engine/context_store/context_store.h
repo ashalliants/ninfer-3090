@@ -69,6 +69,12 @@ public:
         std::string remote_prefix; // prepended to every key, e.g. "ninfer/"
         std::chrono::seconds remote_refresh{60};
         std::chrono::seconds remote_touch_interval{24 * 3600};
+        // How long a written image waits before it is uploaded. A conversation is written after
+        // every turn, and each write supersedes the one before: a write superseded while it waits
+        // is never uploaded, so a burst of turns costs one upload. Waits whose image is superseded
+        // pass their start on, so a conversation that keeps going is still uploaded this often.
+        // flush_remote() uploads without waiting.
+        std::chrono::seconds remote_upload_delay{0};
 
         // Directories of other engines' stores on the same volume, read but never written. Every
         // `peer_poll` the manifests there that this store does not hold are imported by hard-linking
@@ -158,6 +164,13 @@ public:
         std::uint64_t remote_download_bytes  = 0;
         std::uint64_t remote_download_failures = 0;
         std::uint64_t remote_refreshes       = 0;
+        // Manifests a refresh downloaded to register images (not counted in remote_downloads).
+        std::uint64_t remote_manifest_downloads      = 0;
+        std::uint64_t remote_manifest_download_bytes = 0;
+        // Superseded images whose manifests were deleted from the bucket, and queued uploads that
+        // a newer write of the same conversation made unnecessary.
+        std::uint64_t remote_retired          = 0;
+        std::uint64_t remote_uploads_skipped  = 0;
         // With peers: images imported from them, the chunk bytes linked (not copied), images
         // skipped (damaged, expired, over budget, or gone mid-import) and links that failed.
         std::uint64_t peer_images       = 0;
@@ -240,6 +253,11 @@ private:
         // The bucket's modified time of the manifest this entry was imported from (0: written or
         // loaded here). Compared only with other bucket times, never with the local clock.
         std::int64_t remote_modified_ms = 0;
+        // With a remote: evicted for space or age. Its chunk files are gone, except those that
+        // images still held here share, but the entry and manifest stay, so the image is still
+        // offered and its chunks are fetched from the bucket when it is loaded. Dropping the entry
+        // instead would make the next refresh download the manifest again.
+        bool evicted = false;
         // Set on an image whose manifest was imported from a peer: the peer_skipped_ key and
         // manifest time to restore if the manifest proves damaged. Such an image is the peer's to
         // upload, so a use here never puts it in the bucket.
@@ -273,6 +291,11 @@ private:
         // or evicted since), with its chunk files pinned until the upload ends.
         std::vector<std::uint8_t> manifest;
         std::vector<ChunkRef> chunks;
+        // Upload: images this one superseded, whose manifests are deleted from the bucket once
+        // this one's manifest is there.
+        std::vector<std::string> retire;
+        // Upload: not started before this, unless a flush is waiting.
+        std::chrono::steady_clock::time_point ready{};
     };
 
     [[nodiscard]] std::filesystem::path manifest_path(const std::string& id) const;
@@ -321,6 +344,19 @@ private:
     [[nodiscard]] std::uint64_t used_bytes_locked() const;
     void maintain_locked(const std::string* protect);
     bool evict_oldest_locked(const std::string* protect);
+    // Gives up the entry's local chunk files (keeping those another image held here still uses, and
+    // those a queued upload pins) and keeps the entry, which is then fetched from the bucket when
+    // it is loaded. With `apply` false only counts. `holders` is whole_image_holders_locked().
+    struct EvictionYield {
+        std::uint64_t freed  = 0; // bytes of the image's own files removed
+        std::uint64_t pinned = 0; // bytes of its own files a queued upload still needs
+    };
+    EvictionYield evict_to_remote_locked(
+        Entry& entry, const std::unordered_map<std::string, std::uint32_t>& holders, bool apply);
+    // Every chunk of the image is in the directory, and it was not evicted to the remote.
+    [[nodiscard]] bool held_whole_locked(const Entry& entry) const;
+    // For each chunk, how many images held whole use it.
+    [[nodiscard]] std::unordered_map<std::string, std::uint32_t> whole_image_holders_locked() const;
     [[nodiscard]] bool entry_local_locked(const Entry& entry) const;
     [[nodiscard]] bool entry_has_local_bytes_locked(const Entry& entry) const;
 
@@ -333,8 +369,10 @@ private:
     [[nodiscard]] std::optional<std::pair<std::string, bool>>
     find_remote_chunk(const std::array<std::uint64_t, 2>& hash);
     void enqueue_remote(RemoteTask task);
+    // `superseded`: images this write superseded. Their queued uploads are dropped and their
+    // manifests are deleted from the bucket after this upload.
     void enqueue_upload(const std::string& id, std::vector<std::uint8_t> manifest,
-                        std::vector<ChunkRef> chunks);
+                        std::vector<ChunkRef> chunks, std::vector<std::string> superseded);
     void unpin_chunks_locked(const std::vector<ChunkRef>& chunks);
     void remote_loop();
     void upload_image(RemoteTask& task);
@@ -372,6 +410,7 @@ private:
     std::deque<RemoteTask> remote_queue_;
     bool remote_busy_     = false;
     bool remote_stopping_ = false;
+    std::uint32_t remote_flushes_ = 0; // flush_remote() calls waiting: delayed uploads run now
     // Chunk keys last confirmed in the bucket, and when: a lifecycle rule may have expired them
     // since, so the confirmation is trusted for remote_touch_interval only.
     std::unordered_map<std::string, std::int64_t> uploaded_;

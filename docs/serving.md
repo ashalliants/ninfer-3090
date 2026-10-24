@@ -601,6 +601,12 @@ The local directory becomes a cache of the bucket.
   manifest last, so another engine never sees a session whose chunks are missing. A chunk the bucket
   already holds is not sent again, so a conversation that grows uploads only what changed. Shutdown
   waits up to two minutes for the uploads still queued.
+- A written session waits `--context-store-s3-upload-delay-seconds` (default 30) before it is
+  uploaded. Each turn's write supersedes the one before, and a superseded write still waiting is
+  never sent, so a burst of turns (a short `--context-store-idle-seconds` writes several per
+  request) costs one upload. A conversation that keeps going is still uploaded at least that often.
+  Once a session is in the bucket, the earlier turns it superseded are deleted from it, so the
+  bucket holds one session per conversation and a new engine lists only those.
 - At start-up, and every minute after, the engine lists the bucket and registers sessions it does
   not have. They appear in the store as not local; start-up restores the most recently used ones,
   fetching their chunks (every chunk is verified, a damaged one makes the session a miss and it is
@@ -614,7 +620,9 @@ The local directory becomes a cache of the bucket.
 - A request that would resume from a session only the bucket holds waits for it like any stored
   session (see above): the background reader fetches the missing chunks, within the same deadline,
   without holding up the Engine worker or other requests.
-- A session evicted from the directory for space stays in the bucket and comes back the same way.
+- A session evicted from the directory for space (or age) gives up its chunk files but stays in
+  the index, since the bucket still holds it, and is fetched back the same way when it is needed.
+  Its manifest is not downloaded again.
 - Credentials come from the environment, never the command line: `NINFER_S3_ACCESS_KEY_ID` and
   `NINFER_S3_SECRET_ACCESS_KEY` (or `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`; an
   `AWS_SESSION_TOKEN` is honoured). `--context-store-s3-region` (default `us-east-1`) names the
@@ -861,6 +869,8 @@ server restarts.
 | `ninfer_context_store_remote_images` | gauge: with a bucket, sessions it holds that the directory does not hold in full |
 | `ninfer_context_store_remote_uploads_total`, `_remote_upload_bytes_total`, `_remote_upload_failures_total` | objects and bytes uploaded to the bucket, and uploads that failed |
 | `ninfer_context_store_remote_downloads_total`, `_remote_download_bytes_total`, `_remote_download_failures_total` | chunks and bytes fetched from the bucket, and listings or fetches that failed or returned damaged data |
+| `ninfer_context_store_remote_manifest_downloads_total`, `_remote_manifest_download_bytes_total` | session manifests a bucket listing downloaded to register sessions other engines wrote (not in the chunk counters above) |
+| `ninfer_context_store_remote_retired_total`, `_remote_uploads_skipped_total` | earlier turns deleted from the bucket once a later one was uploaded, and queued uploads a later write made unnecessary |
 
 Histograms expose `_bucket`, `_sum` and `_count`. Metrics have bounded labels; they do not retain
 request IDs or request text. Rates are calculated by the consumer, for example:
@@ -1995,6 +2005,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--context-store-compress` | write new chunks zstd-compressed, in the directory and the bucket (about 8 % smaller; chunks of both forms are always read); see [Context store](#context-store). Requires `--context-store` | off |
 | `--context-store-s3-endpoint URL`, `--context-store-s3-bucket NAME` | keep a copy of the store in an S3-compatible bucket (both required together; credentials from `NINFER_S3_ACCESS_KEY_ID` / `NINFER_S3_SECRET_ACCESS_KEY` or the `AWS_` equivalents); see [Keeping a copy in a bucket](#keeping-a-copy-in-a-bucket). Requires `--context-store` | off |
 | `--context-store-s3-prefix P`, `--context-store-s3-region R` | key prefix inside the bucket, and the signing region | none, `us-east-1` |
+| `--context-store-s3-upload-delay-seconds N` | how long a written session waits before it is uploaded; a newer write of the conversation within it replaces it, so a burst of turns is uploaded once. Shutdown uploads at once | `30` |
 | `--no-exit-on-engine-failure` | stay alive (answering 503) when the engine latches unavailable, instead of logging FATAL and exiting with status 3 after 5 s | exit |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |

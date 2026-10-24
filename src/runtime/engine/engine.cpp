@@ -309,6 +309,10 @@ public:
         out.context_store_remote_downloads         = s.remote_downloads;
         out.context_store_remote_download_bytes    = s.remote_download_bytes;
         out.context_store_remote_download_failures = s.remote_download_failures;
+        out.context_store_remote_manifest_downloads      = s.remote_manifest_downloads;
+        out.context_store_remote_manifest_download_bytes = s.remote_manifest_download_bytes;
+        out.context_store_remote_retired                 = s.remote_retired;
+        out.context_store_remote_uploads_skipped         = s.remote_uploads_skipped;
         out.context_store_peer_images        = s.peer_images;
         out.context_store_peer_bytes_linked  = s.peer_bytes_linked;
         out.context_store_peer_skipped       = s.peer_skipped;
@@ -455,6 +459,7 @@ private:
         store_options.peer_poll       = config.peer_poll;
         store_options.remote        = config.remote;
         store_options.remote_prefix = config.remote_prefix;
+        store_options.remote_upload_delay = config.remote_upload_delay;
         store         = std::make_unique<runtime::ContextStore>(std::move(store_options));
         if (config.remote) {
             // Images other engines left in the bucket become restorable before start-up restores.
