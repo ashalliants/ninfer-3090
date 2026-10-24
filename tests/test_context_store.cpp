@@ -756,6 +756,31 @@ void test_load_reports_its_download() {
           "a local load reported a download");
 }
 
+// A chunk that downloads but cannot be installed (the directory refuses the write, as on a full
+// disk) fails the load, it does not escape a fetch thread and end the process; a later load
+// succeeds once the directory takes writes again.
+void test_fetch_install_failure_is_a_miss() {
+    TempDirectory directory;
+    TempDirectory other_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    const auto image = concat({pseudo_random(30, 1), pseudo_random(6000, 2)}); // several chunks
+    {
+        ContextStore store(remote_options(directory.path(), remote));
+        (void)store.put(describe("0a"), image, std::array{ContextStore::Region{30, 6000}});
+        check(drained(store), "upload");
+    }
+    ContextStore other(remote_options(other_directory.path(), remote));
+    check(drained(other) && other.find("0a"), "the image was not registered");
+    const fs::path chunks = other_directory.path() / "chunks";
+    for (const auto& shard : fs::directory_iterator(chunks)) { fs::remove_all(shard.path()); }
+    fs::permissions(chunks, fs::perms::owner_read | fs::perms::owner_exec);
+    check(!other.load("0a").has_value(), "a chunk that could not be installed was served");
+    check(other.stats().remote_download_failures >= 1, "the install failure was not counted");
+    fs::permissions(chunks, fs::perms::owner_all);
+    const auto loaded = other.load("0a");
+    check(loaded && *loaded == image, "the load did not succeed once the directory took writes");
+}
+
 // An image whose upload failed is never evicted to the remote: the bucket does not hold it, so
 // keeping its manifest while deleting its chunks would lose the only copy. And the images it
 // superseded may be registered from the bucket again, since no replacement was published.
@@ -2180,6 +2205,7 @@ int main() {
     test_failed_upload_keeps_the_local_copy_and_releases_superseded();
     test_publication_survives_restart();
     test_load_reports_its_download();
+    test_fetch_install_failure_is_a_miss();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

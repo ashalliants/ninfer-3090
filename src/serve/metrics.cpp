@@ -422,7 +422,9 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
     COUNTER(context_store_lookup_seconds, "context_store_lookup_seconds_total",
             "Time requests waited for those listings.");
     GAUGE(context_store_remote_fetch_bytes_per_second, "context_store_remote_fetch_bytes_per_second",
-          "Download rate from the bucket the cache cost model assumes, learned from downloads.");
+          "Rate at which missing chunks are fetched from the bucket and installed in the store "
+          "directory (download, verification and write together, the time a request waits), "
+          "learned from fetches.");
     COUNTER(context_store_eviction_writes, "context_store_eviction_writes_total",
             "Conversations written to the store as the cache evicted them (write-on-evict).");
     COUNTER(context_store_eviction_export_seconds, "context_store_eviction_export_seconds_total",

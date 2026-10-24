@@ -1603,7 +1603,8 @@ struct RuntimeStats {
     std::uint64_t context_store_hydration_failures = 0;
     double context_store_hydration_seconds         = 0.0;
     // With a bucket: listings refreshed for a request that found nothing stored (and the time
-    // requests spent waiting for them), and the download rate the store's cost model assumes.
+    // requests spent waiting for them), and the rate the store assumes for fetching missing
+    // chunks (downloaded, verified and installed: the wait a fetch adds to a request).
     std::uint64_t context_store_lookups                = 0;
     double context_store_lookup_seconds                = 0.0;
     double context_store_remote_fetch_bytes_per_second = 0.0;

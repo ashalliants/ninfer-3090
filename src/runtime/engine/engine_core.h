@@ -481,7 +481,10 @@ public:
         store_removals_seen_  = store_removal_count();
         store_failures_seen_  = store_.failures ? store_.failures() : 0;
         if (store_.store && !hydration_reader_.joinable()) {
-            hydration_reader_ = std::thread([this] { hydration_reader_loop(); });
+            hydration_reader_ = std::thread([this] { hydration_reader_loop(hydration_queue_); });
+        }
+        if (store_.store && store_.remote && !lookup_reader_.joinable()) {
+            lookup_reader_ = std::thread([this] { hydration_reader_loop(lookup_queue_); });
         }
         typename ResourceManagement::Durability durability;
         if (store_.store) {
@@ -3549,7 +3552,9 @@ private:
     // The longest a request waits for the listing.
     static constexpr auto kStoreLookupBudget = std::chrono::seconds(5);
 
-    // Download time of `bytes` from the bucket, at the rate the last downloads achieved.
+    // Time to fetch `bytes` of missing chunks from the bucket, at the rate the last fetches
+    // achieved. A fetch is download, verification and installation together (what a waiting
+    // request waits for), so that is what the rate measures, not the network alone.
     [[nodiscard]] std::uint64_t remote_fetch_ns(std::uint64_t bytes) const noexcept {
         const double ns = static_cast<double>(bytes) * remote_ns_per_byte_;
         return ns >= static_cast<double>(UINT64_MAX) ? UINT64_MAX : static_cast<std::uint64_t>(ns);
@@ -3632,9 +3637,10 @@ private:
                 HydrationTask task;
                 task.request = request;
                 task.lookup  = true;
-                hydration_queue_.push_back(std::move(task));
+                lookup_queue_.push_back(std::move(task));
             }
-            hydration_cv_.notify_one();
+            // Two threads wait on this condition variable, each for its own queue.
+            hydration_cv_.notify_all();
             return true;
         }
         request->hydrating               = true;
@@ -3649,7 +3655,7 @@ private:
             task.id      = std::move(best_id);
             hydration_queue_.push_back(std::move(task));
         }
-        hydration_cv_.notify_one();
+        hydration_cv_.notify_all();
         return true;
     }
 
@@ -3666,16 +3672,18 @@ private:
         request_admission_check();
     }
 
-    void hydration_reader_loop() noexcept {
+    // Runs the tasks of one queue: reads on the hydration reader, bucket lookups on their own
+    // thread, so a lookup stalled on the network never holds up a read (or the reverse). The
+    // waiting request is released at its deadline either way (process_hydrations).
+    void hydration_reader_loop(std::deque<HydrationTask>& queue) noexcept {
         for (;;) {
             HydrationTask task;
             {
                 std::unique_lock lock(hydration_mutex_);
-                hydration_cv_.wait(lock,
-                                   [&] { return hydration_stop_ || !hydration_queue_.empty(); });
+                hydration_cv_.wait(lock, [&] { return hydration_stop_ || !queue.empty(); });
                 if (hydration_stop_) { return; }
-                task = std::move(hydration_queue_.front());
-                hydration_queue_.pop_front();
+                task = std::move(queue.front());
+                queue.pop_front();
             }
             if (const auto started = Clock::now(); started < task.request->hydration_deadline) {
                 try {
@@ -3706,6 +3714,7 @@ private:
         }
         hydration_cv_.notify_all();
         if (hydration_reader_.joinable()) { hydration_reader_.join(); }
+        if (lookup_reader_.joinable()) { lookup_reader_.join(); }
     }
 
     void observe_store_read(std::uint64_t image_bytes, std::uint64_t nanoseconds) noexcept {
@@ -4353,12 +4362,14 @@ private:
     std::mutex hydration_mutex_;
     std::condition_variable hydration_cv_;
     std::deque<HydrationTask> hydration_queue_;
+    std::deque<HydrationTask> lookup_queue_; // bucket lookups, run on lookup_reader_
     std::deque<HydrationTask> hydration_done_;
     // Nanoseconds per byte downloaded from the bucket: assumed 100 MB/s until a download says
     // otherwise. Engine worker only.
     double remote_ns_per_byte_ = 10.0;
     bool hydration_stop_ = false;
     std::thread hydration_reader_;
+    std::thread lookup_reader_;
 
     // Model residency. The snapshots exist only when suspend is enabled and are touched under the
     // execution mutex; the flags are also read by submit and is_available without it.

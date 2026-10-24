@@ -631,9 +631,10 @@ The local directory becomes a cache of the bucket.
   verified; a damaged one makes the session a miss and it is not offered again), within the same
   deadline, without holding up the Engine worker or other requests. The download is not weighed
   against the prefill it saves, since only this request waits for it while a prefill holds the
-  GPU for everyone, but it must fit in the wait at the rate downloads have achieved
-  (`ninfer_context_store_remote_fetch_bytes_per_second`). Chunks the directory already holds, such
-  as a shared prefix's, are not downloaded.
+  GPU for everyone, but it must fit in the wait at the rate fetches (download, verification and
+  write together) have achieved (`ninfer_context_store_remote_fetch_bytes_per_second`). Chunks the
+  directory already holds, such as a shared prefix's, are not downloaded. Listings for requests
+  run on their own thread, so a slow bucket never holds up reading a stored session.
 - A session evicted from the directory for space (or age) gives up its chunk files, except those an
   image still held whole shares, but stays in the index, since the bucket still holds it, and is
   fetched back the same way when it is needed. Its manifest is not downloaded again. Shared
@@ -888,7 +889,7 @@ server restarts.
 | `ninfer_context_store_remote_downloads_total`, `_remote_download_bytes_total`, `_remote_download_failures_total` | chunks and bytes fetched from the bucket, and listings or fetches that failed or returned damaged data |
 | `ninfer_context_store_remote_manifest_downloads_total`, `_remote_manifest_download_bytes_total` | session manifests a bucket listing downloaded to register sessions other engines wrote (not in the chunk counters above) |
 | `ninfer_context_store_lookups_total`, `_lookup_seconds_total` | bucket listings refreshed for a request that found nothing stored, and the time requests waited for them |
-| `ninfer_context_store_remote_fetch_bytes_per_second` | the download rate from the bucket the store assumes, learned from downloads; a session whose download would not fit in a request's wait is not chosen |
+| `ninfer_context_store_remote_fetch_bytes_per_second` | the rate the store assumes for fetching a session's missing chunks (downloaded, verified and written to the directory together: the wait a fetch adds), learned from fetches; a session whose fetch would not fit in a request's wait is not chosen |
 | `ninfer_context_store_remote_retired_total`, `_remote_uploads_skipped_total` | earlier turns deleted from the bucket once a later one was uploaded, and queued uploads a later write made unnecessary |
 
 Histograms expose `_bucket`, `_sum` and `_count`. Metrics have bounded labels; they do not retain

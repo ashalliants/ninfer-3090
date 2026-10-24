@@ -198,7 +198,9 @@ public:
     // image is removed so it is not offered again. Counts as a use.
     // `touch` false reads without refreshing the image's last use; the caller then calls touch()
     // once it has actually used the image.
-    // What a load downloaded from the bucket first, and how long that download alone took.
+    // What a load fetched from the bucket first, and how long the fetch took: the missing chunks
+    // downloaded, verified and installed (what a waiting request waits for), not the local read
+    // and reassembly that follow.
     struct LoadReport {
         std::uint64_t fetched_bytes = 0;
         std::uint64_t fetch_ns      = 0;

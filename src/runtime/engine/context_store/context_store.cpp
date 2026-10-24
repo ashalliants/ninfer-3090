@@ -1978,7 +1978,7 @@ ContextStore::FetchStatus ContextStore::fetch_image_chunks(const std::string& id
     std::atomic<std::size_t> next{0};
     std::atomic<bool> transient{false};
     std::atomic<bool> corrupt{false};
-    const auto fetch_chunks = [&] {
+    const auto fetch_chunk_range = [&] {
         for (std::size_t index = next++; index < chunks.size() && !transient && !corrupt;
              index = next++) {
             const ChunkRef& chunk = chunks[index];
@@ -2022,6 +2022,18 @@ ContextStore::FetchStatus ContextStore::fetch_image_chunks(const std::string& id
             ++stats_.remote_downloads;
             stats_.remote_download_bytes += data->size();
             fetched_bytes += data->size();
+        }
+    };
+    const auto fetch_chunks = [&] {
+        // Runs on its own thread: nothing may escape it (that would terminate the process). A
+        // failure here that is not the bucket's (a full disk installing the chunk, an allocation)
+        // makes the fetch fail like a transfer error, and a later load retries.
+        try {
+            fetch_chunk_range();
+        } catch (...) {
+            transient = true;
+            std::scoped_lock lock(mutex_);
+            ++stats_.remote_download_failures;
         }
     };
     const std::size_t threads = std::min(chunks.size(), kFetchThreads);
