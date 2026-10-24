@@ -32,9 +32,9 @@ concurrent cohorts through **C8**.
 | | Qwen3.8-27B (dense) | Qwen3.6-35B-A3B (MoE) |
 |---|---:|---:|
 | **Max context** | **262,144** tokens (native) | **262,144** tokens (native), shared by 3 lanes |
-| **Prefill**, 4K prompt | **3,185 tok/s** | **8,848 tok/s** |
-| **Decode**, one stream | **140 tok/s** (DFlash2) | **295 tok/s** (MTP3 + draft head) |
-| **Decode**, all lanes | **477 tok/s** at C8 (MTP3) | **383 tok/s** at C6 (MTP3) |
+| **Prefill**, 4K prompt | **3,222 tok/s** | **8,848 tok/s** |
+| **Decode**, one stream | **140 tok/s** (DFlash2) | **313 tok/s** (MTP3 + draft head) |
+| **Decode**, all lanes | **477 tok/s** at C8 (MTP3) | **453 tok/s** at C6 (MTP3) |
 
 **Qwen3.8-Flash-Next (preview, Windows)** runs on the same card too: a 512-expert MoE at 2 bits per
 weight with its experts pinned in host RAM, at **1.15-1.18x Strata's plain decode** and
@@ -456,7 +456,7 @@ a 24 GB card and the server can reuse fast CUDA Graphs instead of rebuilding wor
 | Model | Artifact | Size | Notes |
 |---|---|---:|---|
 | **Qwen3.8-27B** | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Qwen3.8-27B-NInfer-3090/tree/d47f2732d369acaec76dc44228f67c72b081df2f) | 17.68 GiB | **Recommended.** Validated at C1–C8 with ReplaySSM. This fork's [3090 conversion](model-cards/Qwen3.8-27B-NInfer-3090/README.md): imatrix-weighted encoder, 4-bit embedding, 6-bit head. Carries vision, MTP and the DFlash2 bundle for `--spec dflash2` |
-| Ternary Bonsai 2 27B | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Ternary-Bonsai-2-27B-NInfer-3090/tree/983a9be22f3623f3a2799655741d2a92db86d37d) | 8.87 GiB | Prism ML's ternary Qwen3.8-27B (2.125 bits per weight), this fork's [3090 conversion](model-cards/Ternary-Bonsai-2-27B-NInfer-3090/README.md) with vision, MTP, DFlash2 and a proposal head. 6.7 GiB of weights; on one RTX 3090 about 88 tok/s plain and 250-300 with `--spec dflash2 --draft-tokens 7`, prefill about 2.8k tok/s, quick-corpus perplexity 5.627. Run it with `ninfer` or `ninfer-serve` directly: it has no `run.bat` profile yet |
+| Ternary Bonsai 2 27B | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Ternary-Bonsai-2-27B-NInfer-3090/tree/983a9be22f3623f3a2799655741d2a92db86d37d) | 8.87 GiB | Prism ML's ternary Qwen3.8-27B (2.125 bits per weight), this fork's [3090 conversion](model-cards/Ternary-Bonsai-2-27B-NInfer-3090/README.md) with vision, MTP, DFlash2 and a proposal head. 6.7 GiB of weights; on one RTX 3090 about 88 tok/s plain and 250-300 with `--spec dflash2 --draft-tokens 7`, prefill 2.8-2.9k tok/s, quick-corpus perplexity 5.627. Run it with `ninfer` or `ninfer-serve` directly: it has no `run.bat` profile yet |
 | Qwen3.6-35B-A3B | [pinned v3 artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/tree/ee4495803bc4f8015b8a7e22d4cf9b67de8e27c6) | 21.23 GiB | Carries the DFlash bundle for `--spec dflash` |
 | Qwen3.6-27B | [pinned v3 artifact](https://huggingface.co/neroued/Qwen3.6-27B-NInfer/tree/3e3d9a3951c452c1ca80bd7a2860c7f3bfc5a829) | 16.29 GiB | Supported with more runtime headroom |
 | Qwen3.8-Flash-Next (preview) | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Qwen3.8-Flash-Next-NInfer-3090/tree/c7dfb9694fc3cb3d40298afbfe2e3a8c172241fa) | 38.20 GiB in two files + 27.13 GiB n-gram volume | Windows, one request at a time (two lanes opt-in), 64 GB RAM. This fork's [exact conversion](model-cards/Qwen3.8-Flash-Next-NInfer-3090/README.md) of the GSQ-RCO IQ2_XS GGUF with the MTP drafter and vision tower. Keep the n-gram volume on NVMe |
@@ -520,10 +520,15 @@ forked as 1+2+4, each branch could be continued again and reused its whole share
 The 27B speed rows were re-measured on 2026-10-02 for the 3090 conversion `download-model` now
 fetches, in one sitting with upstream's artifact on the same binaries. Decode is
 `tools/bench/run_chat_decode.py` on syv-ai's eight thinking-off prompts (1,024 tokens, INT8 KV,
-greedy), where upstream's artifact gives 127 tok/s at C1 and 482 at C8; prefill is `ninfer_bench`
-pp4096 on the cuBLAS route the launcher enables, `rk4v4` KV (upstream 3,196, a tie; +0.156%
-perplexity for the route). The earlier 187 and 523 came from runs whose workload was not recorded
-and that this harness does not reproduce on either artifact. The 35B prefill was measured the same day with its launcher settings (cuBLAS route, chunk 4096, `rk4v4`; 5,470 tok/s on the previous default-route chunk 512); its decode rows were not re-measured.
+greedy), where upstream's artifact gives 127 tok/s at C1 and 482 at C8. The 27B prefill is
+`ninfer_bench` pp4096 on the cuBLAS route the launcher enables, chunk 4096, `rk4v4` KV, re-measured
+2026-10-24 on an RTX 3090 at its stock 350 W (+0.156% perplexity for the route). The earlier 187 and
+523 came from runs whose workload was not recorded and that this harness does not reproduce on
+either artifact. The 35B prefill was measured on 2026-10-02 with its launcher settings (cuBLAS
+route, chunk 4096, `rk4v4`; 5,470 tok/s on the previous default-route chunk 512). Its one-stream
+decode is `ninfer_bench` tg512 with MTP3 and the draft head, `rk8v4` KV, on the v0.16.0 release
+binaries (2026-10-14); its all-lanes figure is `ninfer_bench` with six concurrent requests of 128
+tokens each, MTP3, INT8 KV and a 4,096-token context (2026-10-24, stock 350 W).
 The 27B's 262,144 was measured with MTP3 and the draft head; the default DFlash2 profile reaches it
 on a headless card by extrapolation, and the server fits the context to the free memory where it
 does not. Sources and conditions are in the sections below.
@@ -587,20 +592,20 @@ for a small, oracle-bounded change in output;
 
 ### Qwen3.6-35B-A3B
 
-Measured with the compact 20.84 GiB 35B-A3B artifact, a 4K shared INT8 paged KV pool, CUDA Graphs,
-MTP3, greedy decoding, and no competing GPU workload:
+Aggregate decode with several requests at once, measured 2026-10-24 on an RTX 3090 at its stock
+350 W: `ninfer_bench --concurrency N`, 128 output tokens per request from a one-token prompt, MTP3,
+INT8 KV, a 4,096-token context, greedy, mean of three repetitions after a warm-up:
 
-| Concurrent requests | 128 output tokens each | Observed VRAM |
+| Concurrent requests | Aggregate decode | MTP acceptance |
 |---:|---:|---:|
-| 1 | 162.7 aggregate tok/s | 22,427 MiB |
-| 2 | 267.9 aggregate tok/s | 22,743 MiB |
-| 4 | 366.2 aggregate tok/s | 23,377 MiB |
-| 6 | 383.4 aggregate tok/s | 24,038 MiB |
-| 8 | rejected at startup | about 503 MiB over the safe reservation limit |
+| 1 | 231.1 tok/s | 51.3% |
+| 2 | 323.0 tok/s | 56.3% |
+| 4 | 411.3 tok/s | 56.1% |
+| 6 | **452.8 tok/s** | 55.3% |
 
-Single-stream decode with the launcher's speculation (MTP3, draft head, `--mtp-experts-q4
---gdn-state-fp16`) measures **294.9 tok/s** in `ninfer_bench` tg512 with `rk8v4` KV, against 183.5
-without speculation ([launcher profiles](docs/maintainer/launcher-profiles.md#qwen36-35b-a3b-tuned)).
+Single-stream decode with the launcher's speculation (MTP3 and the draft head) measures
+**311.0 tok/s** in `ninfer_bench` tg512 with `rk8v4` KV on the same card and day, against 199.4
+without speculation.
 Re-measured on the v0.16.0 release binaries (2026-10-14): prefill **8,468 tok/s at 4K** and 7,749 at
 16K (`ninfer_bench`, `rk8v4`, cuBLAS route); through `ninfer-serve` with the launcher's settings, 5,351
 to 7,481 tok/s prefill and **272-286 tok/s decode** at 1.3K to 29K-token prompts, and 312.7 tok/s in
@@ -624,61 +629,52 @@ The artifacts also declare multi-image and video support; these tests validated 
 
 ## Choosing a KV format
 
-All seven SM86 KV formats, measured on Qwen3.8-27B. Size and perplexity are what most people weigh;
-the decode column is the one that surprises, because the smallest formats are not the fastest.
+All seven SM86 KV formats, measured on Qwen3.8-27B (this fork's 3090 conversion). Size and
+perplexity are what most people weigh; the decode column is the one that surprises, because the
+smallest formats are not the fastest.
 
 | KV profile | Bytes/token | KV at 2,048 tokens | Perplexity | vs `bf16` | Decode at 32K depth |
 |---|---:|---:|---:|---:|---:|
-| `bf16` | 65,536 | 128.00 MiB | 4.342517 | — | 31.93 tok/s |
-| `int8` | 33,792 | 66.00 MiB | 4.342425 | −0.0021% | **33.63 tok/s** |
-| `fp8` | 33,024 | 64.50 MiB | 4.344724 | +0.0508% | 30.34 tok/s |
-| `rk8v4` | 26,112 | 51.00 MiB | 4.346413 | +0.0897% | 33.17 tok/s |
-| `k8v4` | 25,728 | 50.25 MiB | 4.347258 | +0.1092% | 28.90 tok/s |
-| `nvfp4` | 18,432 | 36.00 MiB | 4.352201 | +0.2229% | 29.86 tok/s |
-| `rk4v4` | **17,920** | **35.00 MiB** | see [below](#lloyd-max-4-bit-keys-rk4v4) | +0.214% vs `int8` | ≈ `rk8v4` |
+| `bf16` | 65,536 | 128.00 MiB | 4.302517 | — | 44.03 tok/s |
+| `int8` | 33,792 | 66.00 MiB | **4.302505** | −0.0003% | 45.91 tok/s |
+| `fp8` | 33,024 | 64.50 MiB | 4.302770 | +0.0059% | 39.92 tok/s |
+| `rk8v4` | 26,112 | 51.00 MiB | 4.308870 | +0.148% | **46.29 tok/s** |
+| `k8v4` | 25,728 | 50.25 MiB | 4.307089 | +0.106% | 36.22 tok/s |
+| `nvfp4` | 18,432 | 36.00 MiB | 4.312298 | +0.227% | 39.33 tok/s |
+| `rk4v4` | **17,920** | **35.00 MiB** | 4.311406 | +0.207% | 45.64 tok/s |
 
-Perplexity is `ninfer-perplexity` on the fixed `ninfer-ppl-1m-v1` corpus, `--quick`, context/stride
-4096/2048, 261,167 scored tokens — the same corpus and window for every row. Decode is 128 timed
-steps on top of a 32,768-token prefill, no speculation, and is the **mean of two independent runs**
-because this card is power-capped at 315 W and the SM clock drifts 1,665–1,755 MHz with
-temperature; single runs on the 27B vary by up to 5%. Attention re-reads the whole cache each step,
-so a format's cost only shows at depth. The `rk4v4` row was measured in a later session on a newer
-build, so it is stated against `int8` and `rk8v4` from that session rather than mixed into these
-columns.
+Measured 2026-10-24 in one session on an RTX 3090 at its stock 350 W. Perplexity is
+`ninfer-perplexity` on the fixed `ninfer-ppl-1m-v1` corpus, `--quick`, context/stride 4096/2048,
+261,167 scored tokens — the same corpus and window for every row. Decode is `ninfer_bench -pg
+32768,128`: 128 timed steps on top of a 32,768-token prefill, no speculation, the mean of three
+repetitions after a warm-up. Attention re-reads the whole cache each step, so a format's cost only
+shows at depth. The [fit calculator](https://ashalliants.github.io/ninfer-3090/config-calculator.html)
+has the 4K and 16K points and the same sweep for the 35B-A3B, Bonsai and Qwen3.6-27B.
 
 **Which to use:**
 
-- **`int8`** is the quality default. Its perplexity is indistinguishable from `bf16` — within 0.0001,
-  below this harness's own reproducibility — and it has the flattest decode curve on the 27B (−4.8%
-  from 4K to 32K).
-- **`rk4v4`** is what the launchers use, for context: 31% smaller than `rk8v4` at the same decode and
-  prefill speed, for +0.214% perplexity over `int8`. It is the format that reaches the native
-  262,144-token context on the 27B, even alongside MTP3 and the draft head.
-- **`rk8v4`** sits between them: 23% smaller than `int8` for +0.09% perplexity, the flattest curve on
-  the 35B (−9.5%), and on that model the fastest format at every depth measured.
-- **`nvfp4`** is superseded by `rk4v4`, which is 3% smaller, has better perplexity, and decodes 19%
-  faster on the 35B at 32K.
-- **`fp8`** has slightly better perplexity than `rk8v4` (4.344724 against 4.346413, a real and
-  reproducible 0.039%) for 26% more KV and 8.5% less decode speed at 32K — a genuine trade, and a
-  bad one for almost everyone.
-- **`k8v4`** is dominated: 1.5% smaller than `rk8v4`, with 13% less decode speed at depth, the worst
-  falloff on the 35B (−25.9%), and slightly worse perplexity.
+- **`int8`** is the quality default. Its perplexity is indistinguishable from `bf16` — within
+  0.00002, below this harness's own reproducibility — and it has the flattest decode curve on the
+  27B (−4.5% from 4K to 32K).
+- **`rk4v4`** is what the launchers use, for context: 31% smaller than `rk8v4` at nearly the same
+  decode and prefill speed, for +0.21% perplexity over `int8`. It is the format that reaches the
+  native 262,144-token context on the 27B, even alongside MTP3 and the draft head.
+- **`rk8v4`** is the fastest format at a 32K cache on both the 27B (46.3 tok/s) and the 35B
+  (187.6 tok/s), 23% smaller than `int8`, for +0.15% perplexity.
+- **`nvfp4`** is superseded by `rk4v4`, which is 3% smaller, scores better, and decodes 16% faster
+  at 32K on both models.
+- **`fp8`** scores within 0.006% of `bf16`, better than any smaller format, but costs 26% more KV
+  than `rk8v4` and 14% of its decode speed at 32K.
+- **`k8v4`** is 1.5% smaller than `rk8v4` with slightly better perplexity, but has the worst falloff
+  measured: −23% from 4K to 32K on both models.
 
-**These numbers were re-measured in September 2026.** `fp8`, `nvfp4` and `k8v4` had their perplexity
-scored through a data race in the quantized attention kernels that corrupted every prefill output
-column except the last. Greedy generation was unaffected, which is why it went unnoticed. With that
-fixed, `nvfp4` improved by 0.154% and `fp8` by 0.057%, against a 0.019% drift on the formats the fix
-did not touch, and all three now reproduce bit-identically run to run.
+**With speculation the gap stays small.** With MTP3 and the draft head (`ninfer_bench -pg P,128`,
+same session), `int8` decodes 157.7 tok/s after a 4K prompt against 154.0 on `rk8v4` and 153.0 on
+`rk4v4`, and all three are level after 32K (143.3-145.0 tok/s). Pick the format for context and
+quality; under speculation it moves decode speed by 3% at most.
 
-**Speculation shifts the trade.** Lower value precision lowers draft acceptance. Without
-speculation, decode measured 39.07 tok/s on `int8` against 38.91 on `rk8v4`. With MTP3, C1 decode
-fell about 5%, from 81.61 tok/s to 77.39, because acceptance dropped from 71.27% to 65.86%. That is
-an accuracy effect on speculation rather than a slower kernel. Use `int8` when decode throughput
-under speculation matters more than context.
-
-Per-format numbers for the 35B-A3B, with a calculator for any setup, are in the
-[fit calculator](https://ashalliants.github.io/ninfer-3090/config-calculator.html). NVFP4 A4 and FP8 A8 *weight and
-activation* kernels are a separate axis and need Blackwell; see [Current limits](#current-limits).
+NVFP4 A4 and FP8 A8 *weight and activation* kernels are a separate axis and need Blackwell; see
+[Current limits](#current-limits).
 
 ### RotorQuant (`rk8v4`)
 
@@ -705,24 +701,21 @@ the packed keys into registers ahead of use and expand them with byte permutes s
 existing INT8 key tile, which adds no shared memory; that is what keeps it off the slow path the
 `nvfp4` and `k8v4` kernels take (see [TODO.md](TODO.md), "KV decode falloff").
 
-Measured together on one RTX 3090 (315 W cap), Qwen3.8-27B groupwise-int, 2026-09-23:
+Measured together on one RTX 3090 (stock 350 W), Qwen3.8-27B, this fork's 3090 conversion, 2026-10-24:
 
 | KV profile | Bytes/token | Perplexity | vs `int8` | Decode 4K / 16K / 32K | Prefill at 32K |
 |---|---:|---:|---:|---|---:|
-| `int8` | 33,792 | 4.343155 | — | 44.6 / 43.1 / 41.5 tok/s | 1,363 tok/s |
-| `rk8v4` | 26,112 | 4.347943 | +0.110% | 46.1 / 44.5 / 42.4 tok/s | 1,377 tok/s |
-| **`rk4v4`** | **17,920** | 4.352432 | +0.214% | 45.1 / 43.7 / 41.9 tok/s | 1,361 tok/s |
-| `nvfp4` | 18,432 | 4.353589 | +0.240% | 43.8 / 40.7 / 36.3 tok/s | 895 tok/s |
+| `int8` | 33,792 | 4.302505 | — | 48.1 / 46.8 / 45.9 tok/s | 1,610 tok/s |
+| `rk8v4` | 26,112 | 4.308870 | +0.148% | 49.3 / 47.7 / 46.3 tok/s | 1,608 tok/s |
+| **`rk4v4`** | **17,920** | 4.311406 | +0.207% | 49.1 / 47.3 / 45.6 tok/s | 1,597 tok/s |
+| `nvfp4` | 18,432 | 4.312298 | +0.228% | 47.3 / 43.2 / 39.3 tok/s | 941 tok/s |
 
 Perplexity is `ninfer-perplexity --quick` on `ninfer-ppl-1m-v1` (4096/2048). Decode is
-`ninfer_bench -pg P,128`, no speculation, the mean of two interleaved runs for `rk8v4` and `rk4v4`;
-the card slows about 0.4 tok/s per run as it heats, and against that drift `rk4v4` sits within ±1% of
-`rk8v4` at every depth. `int8` and `nvfp4` are single runs taken last, so they read slightly low.
-Qwen3.6-35B-A3B, same protocol: `rk4v4` decodes at 99.5-99.9% of `rk8v4` at 4K-32K (172.5 against
-173.4 tok/s at 32K) and 19% faster than `nvfp4` (144.9). With MTP3 and the draft head on the 27B,
-`rk4v4` is within about 0.5% of `rk8v4` at 32K; on four real prompts (greedy, 400 tokens) its draft
-acceptance was 65.8% against `rk8v4`'s 67.2% and `int8`'s 63.2%. Across the attention op
-benchmark's 18 decode/verify shapes it is at a geometric mean of 1.001x `rk8v4`'s time and 2-3x
+`ninfer_bench -pg P,128`, no speculation, the mean of three repetitions after a warm-up; prefill is
+the same runs' 32,768-token prompt on the default route. `rk4v4` decodes within 1.5% of `rk8v4` at
+every depth and prefills within 1%. Qwen3.6-35B-A3B, same protocol: `rk4v4` decodes at 97-98% of
+`rk8v4` (182.9 against 187.6 tok/s at 32K) and 16% faster than `nvfp4` (157.5). Across the attention
+op benchmark's 18 decode/verify shapes it is at a geometric mean of 1.001x `rk8v4`'s time and 2-3x
 faster than `nvfp4` at 32K.
 
 **Context on Qwen3.8-27B**, measured with `--kv-capacity auto` and the standard 1 GiB headroom with a

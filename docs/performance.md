@@ -19,6 +19,38 @@
 
 ## RTX 3090 (`sm_86`) findings — this fork
 
+### Re-measured on a stock-power RTX 3090 (2026-10-24)
+
+One session on a rented RTX 3090 at its stock 350 W (Linux, CUDA 12.8, driver 615.71, build
+`1d3e508f`), against the artifacts `download-model` fetches. Earlier sections were measured on the
+fork host's card, capped at 315 W; the same `ninfer_bench` int8 depth sweep on the 35B read 14-18%
+faster here than in September, which is the power limit plus decode work since then. The README
+headline carries whichever of a figure's measurements is higher, each with its own date.
+
+| Figure | Model | Method | Result |
+|---|---|---|---:|
+| Prefill, 4K prompt | Qwen3.8-27B | `ninfer_bench -p 4096 --prefill-cublas --prefill-chunk 4096 --kv-dtype rk4v4 -r 3 --warmup 1` | **3,222 tok/s** |
+| Prefill, 4K prompt | Qwen3.6-35B-A3B | same | 8,762 tok/s |
+| Decode, one stream | Qwen3.6-35B-A3B | `ninfer_bench -n 512 --kv-dtype rk8v4 --spec mtp --draft-tokens 3 --lm-head-draft -r 3 --warmup 1` | 311.0 tok/s (199.4 without speculation) |
+| Decode, C1 / C2 / C4 / C6 | Qwen3.6-35B-A3B | `ninfer_bench --concurrency N -n 128 --kv-dtype int8 --max-ctx 4096 --spec mtp --draft-tokens 3 -r 3 --warmup 1` | 231.1 / 323.0 / 411.3 / **452.8 tok/s** aggregate |
+| Prefill, 1K / 4K / 16K | Ternary Bonsai 2 27B | the model card's command (`-p 1024,4096,16384 -n 16 --kv-dtype int8 --max-ctx 20480`) | 2,905 / 2,820 / 2,618 tok/s |
+| Decode, tg128 / pp4096, 8K context, `rk4v4` | Qwen3.8-27B | the model card's `ninfer_bench` protocol | 48.7 / 1,771 tok/s |
+| Decode, pp2048+tg256, MTP3 + head / DFlash2 K=7 + head | Qwen3.8-27B | same | 150.8 / 262.4 tok/s |
+| Chat decode C1, DFlash2 K=7 | Qwen3.8-27B | `tools/bench/run_chat_decode.py`, syv-ai's 8 prompts, 1,024 tokens, INT8, greedy, 2 reps | 136.9 tok/s, 40.8% acceptance |
+| Chat decode C1 / C8, MTP3 | Qwen3.8-27B | same | 116.7 / 433.5 tok/s |
+| Chat decode C1, DFlash2 K=7 / MTP3 | Qwen3.8-27B | `run_chat_decode.py`, `bench/fixtures/chat_prompts.jsonl` (24), 512 tokens, `rk4v4` | 120.9 / 111.0 tok/s |
+
+The chat-prompt rows came in 2-10% below the README's 2026-10-02 figures (140, 118.9 and 477 on
+syv-ai's prompts; 133.5 and 115.4 on the 24 prompts), so the README keeps those. The KV-format
+sweep, perplexity and every memory term behind the fit calculator were measured in the same session;
+the calculator's engine cross-checks (to the byte without speculation, 0.021% with MTP3 and the
+draft head, exact for DFlash-3 on the 35B) are in `docs/config-calculator.test.mjs`.
+
+**Found on the way:** on the 3090 conversion of Qwen3.8-27B, `--spec dflash2` *without*
+`--lm-head-draft` stops at load with `linear_topk: unsupported head profile` (its 6-bit output head
+has no top-k kernel); with the draft head, as the launchers run it, it works. Qwen3.6-27B's artifact
+has no DFlash2 bundle.
+
 ### v0.16.0 release binaries, all three models (2026-10-14)
 
 Measured on the **published v0.16.0 Windows zip** (`ninfer-serve.exe` and `ninfer_bench.exe` from the
@@ -141,7 +173,7 @@ cause. Treat `ninfer_bench` MTP rows as comparable only between runs that use th
 - `ninfer_bench` has no `--mtp-experts-q4` or `--gdn-state-fp16`, so the 35B rows above run without
   those two launcher flags; the HTTP table runs with them. Both flags are in the HTTP row.
 - 27B prefill at 4,096 tokens (3,143 tok/s) sits between the 3,044 of the v0.15.1 comparison
-  (master, 2026-10-13) and the 3,185 of the README headline table. Prefill at 16,384 (2,893) is 2.8%
+  (master, 2026-10-13) and the 3,222 of the README headline table (2026-10-24). Prefill at 16,384 (2,893) is 2.8%
   above the 2,815 recorded for master on 2026-10-13.
 - 35B prefill at 4K is 8,468 tok/s here against 8,848 in the README headline table (4.3% lower); the
   README's 35B section said no 3090 prefill figure had been measured.
@@ -972,30 +1004,26 @@ more unless `NINFER_NGRAM=on` (see [launcher profiles](maintainer/launcher-profi
 
 ### Choosing a KV format (RTX 3090, Qwen3.8-27B)
 
-All seven SM86 KV formats, measured on Qwen3.8-27B.
+All seven SM86 KV formats, measured on Qwen3.8-27B (this fork's 3090 conversion), 2026-10-24, in
+one session on an RTX 3090 at its stock 350 W.
 
 | KV profile | Bytes/token | KV at 2,048 tokens | Perplexity | vs `bf16` | Decode at 32K depth |
 |---|---:|---:|---:|---:|---:|
-| `bf16` | 65,536 | 128.00 MiB | 4.342517 | — | 31.93 tok/s |
-| `int8` | 33,792 | 66.00 MiB | 4.342425 | −0.0021% | **33.63 tok/s** |
-| `fp8` | 33,024 | 64.50 MiB | 4.344724 | +0.0508% | 30.34 tok/s |
-| `rk8v4` | 26,112 | 51.00 MiB | 4.346413 | +0.0897% | 33.17 tok/s |
-| `k8v4` | 25,728 | 50.25 MiB | 4.347258 | +0.1092% | 28.90 tok/s |
-| `nvfp4` | 18,432 | 36.00 MiB | 4.352201 | +0.2229% | 29.86 tok/s |
-| `rk4v4` | **17,920** | **35.00 MiB** | 4.352432 | +0.214% vs `int8` | ≈ `rk8v4` |
+| `bf16` | 65,536 | 128.00 MiB | 4.302517 | — | 44.03 tok/s |
+| `int8` | 33,792 | 66.00 MiB | **4.302505** | −0.0003% | 45.91 tok/s |
+| `fp8` | 33,024 | 64.50 MiB | 4.302770 | +0.0059% | 39.92 tok/s |
+| `rk8v4` | 26,112 | 51.00 MiB | 4.308870 | +0.148% | **46.29 tok/s** |
+| `k8v4` | 25,728 | 50.25 MiB | 4.307089 | +0.106% | 36.22 tok/s |
+| `nvfp4` | 18,432 | 36.00 MiB | 4.312298 | +0.227% | 39.33 tok/s |
+| `rk4v4` | **17,920** | **35.00 MiB** | 4.311406 | +0.207% | 45.64 tok/s |
 
 Perplexity is `ninfer-perplexity` on the fixed `ninfer-ppl-1m-v1` corpus, `--quick`, context/stride
-4096/2048, 261,167 scored tokens. Decode is 128 timed steps on top of a 32,768-token prefill, no
-speculation, mean of two independent runs; attention re-reads the whole cache each step, so a
-format's cost only shows at depth. These are the September 2026 re-measurements after the fix for
-a data race in the quantized attention kernels, which had corrupted every prefill output column
-except the last and inflated the perplexity of `fp8`, `nvfp4` and `k8v4` (greedy generation was
-unaffected). An earlier revision of this table carried the pre-fix scores, including `nvfp4` at
-+0.36%.
-The `rk4v4` row comes from a later session and build (2026-09-23), where `int8` measured 4.343155,
-`rk8v4` 4.347943 and `nvfp4` 4.353589, and `rk4v4` decoded within ±1% of `rk8v4` at 4K-32K; its
-figures are stated against those rather than this table's. See the README's
-[`rk4v4` section](../README.md#lloyd-max-4-bit-keys-rk4v4).
+4096/2048, 261,167 scored tokens. Decode is `ninfer_bench -pg 32768,128` (the arguments of
+`scripts/sweeps/kv-decode-vs-depth.ps1`): 128 timed steps on top of a 32,768-token prefill, no
+speculation, mean of three repetitions after a warm-up; attention re-reads the whole cache each
+step, so a format's cost only shows at depth. The 4K and 16K points and the same sweep for the
+35B-A3B, Bonsai and Qwen3.6-27B are in the
+[fit calculator](https://ashalliants.github.io/ninfer-3090/config-calculator.html).
 See [the README](../README.md#choosing-a-kv-format) for the fuller writeup and recommendations.
 
 **Not built: `rk2v4-e8` (2-bit E8 root keys).** The sibling RTX 4090 forks ship an `rk2v4-e8` mode:
