@@ -2,7 +2,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace ninfer::perplexity {
@@ -27,5 +29,61 @@ struct ScoreAggregate {
     [[nodiscard]] double mean_nll() const;
     [[nodiscard]] double ppl() const;
 };
+
+// ---------------------------------------------------------------------------------------------
+// Quality gate against a llama.cpp KL-divergence base (`llama-perplexity --kl-divergence-base`).
+//
+// File layout (native little-endian): the 8 bytes "_logits_", n_ctx (u32), n_vocab (i32),
+// n_chunk (i32), the n_chunk * n_ctx evaluation tokens (i32), then per chunk the
+// rows = n_ctx - 1 - n_ctx/2 scored rows (positions n_ctx/2 .. n_ctx-2). A row is
+// row_u16 = 2*((n_vocab+1)/2) + 4 uint16 slots: scale (f32), min log-prob (f32), n_vocab quantized
+// log-probs q (log-prob = scale*q + min), zero padding to an even count.
+// ---------------------------------------------------------------------------------------------
+
+struct KldBase {
+    std::uint32_t n_ctx  = 0;
+    std::int32_t n_vocab = 0;
+    std::int32_t n_chunk = 0;
+    std::vector<std::int32_t> tokens; // n_chunk * n_ctx, chunk-major
+    std::filesystem::path path;
+};
+
+// Reads the header and the tokens only. Throws std::runtime_error naming the file on a missing
+// file, a bad magic, a truncated header or a file whose size is not what the header implies.
+[[nodiscard]] KldBase read_kld_base(const std::filesystem::path& path);
+
+// One scored row of one chunk, decoded to n_vocab log-probs. Positional read; never loads the file.
+// Throws std::out_of_range for a chunk or row outside the base, std::runtime_error on a read failure.
+[[nodiscard]] std::vector<double> kld_base_logprobs(const KldBase& base, int chunk, int row);
+
+struct ScoredRow {
+    double nll         = 0.0; // test model: -log p(target)
+    double nll_base    = 0.0; // base model: -log p(target)
+    double kld         = 0.0; // KL(base || test)
+    bool same_top1     = false;
+    double dlogp_top1  = 0.0; // |log p_test(base top-1) - log p_base(base top-1)|
+};
+
+// FP64 log-softmax of the test logits over [0, valid_vocab), compared with the base log-probs.
+// KLD skips terms with base log-prob <= -16. Top-1 ties go to the lower id.
+[[nodiscard]] ScoredRow score_row(std::span<const float> test_logits,
+                                  std::span<const double> base_logprobs, std::int32_t target,
+                                  std::int32_t valid_vocab);
+
+struct KldSummary {
+    double ppl        = 0.0;
+    double ppl_err    = 0.0; // PPL times the standard error of the mean NLL
+    double kld_mean   = 0.0;
+    double kld_median = 0.0; // nearest rank
+    double kld_p99    = 0.0; // nearest rank
+    double kld_max    = 0.0;
+    double same_top1  = 0.0; // fraction of rows
+    std::size_t rows  = 0;
+};
+
+[[nodiscard]] KldSummary summarize(std::span<const ScoredRow> rows);
+
+// Half-open windows covering [first, end) in order, each at most `width` long, the last partial.
+[[nodiscard]] std::vector<std::pair<int, int>> decode_windows(int first, int end, int width);
 
 } // namespace ninfer::perplexity
