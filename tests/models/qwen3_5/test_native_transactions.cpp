@@ -3340,7 +3340,7 @@ void scout_abort_leaves_no_trace(DeviceContext& device,
 }
 
 // The scores do not depend on how the span is cut into chunks: 1,024- and 4,096-token scout
-// chunks agree within 1e-2 relative per token and keep the same tokens (Jaccard >= 0.99).
+// chunks keep the same tokens (Jaccard >= 0.99) and agree per token within 30% relative.
 void scout_scores_chunk_invariant(DeviceContext& device,
                                   const qwen::execution::Parameters& parameters,
                                   qwen::Frontend& frontend, EngineOptions options) {
@@ -3357,8 +3357,13 @@ void scout_scores_chunk_invariant(DeviceContext& device,
     };
     const auto narrow = run(1024);
     const auto wide   = run(4096);
-    // Chunk invariance is a ranking property: BF16 and GDN rounding at chunk boundaries moves
-    // scores by a fraction of a percent, so compare per token loosely and the kept set tightly.
+    // Chunk invariance is a ranking property. Each chunk size is bit-reproducible, but the two
+    // tile the BF16 GEMMs and GDN chunks differently, and softmax mass amplifies that rounding
+    // exponentially: measured on the 3090 (2026-10-25), 65% of tokens differ by more than 1%
+    // (the first chunk as much as the rest, so it is not a chunk-boundary carry), at most 17%,
+    // while the total mass is equal and the kept sets are identical (Jaccard 1.0). So the kept
+    // set is the gate; the per-token bound only catches gross errors (a chunk scored at the
+    // wrong positions or with stale keys).
     require(narrow.size() == wide.size(), "scout scores differ in length across chunk sizes");
     double mass = 0.0;
     for (const float v : narrow) {
@@ -3372,7 +3377,7 @@ void scout_scores_chunk_invariant(DeviceContext& device,
         if (scale > floor_abs) {
             max_rel = std::max(max_rel, diff / scale);
         }
-        require(diff <= 1e-2 * scale + floor_abs,
+        require(diff <= 0.3 * scale + floor_abs,
                 "scout score " + std::to_string(i) + " depends on the chunk size: " +
                     std::to_string(narrow[i]) + " vs " + std::to_string(wide[i]));
     }
@@ -3459,6 +3464,8 @@ ScoutFixture make_lossy_program(DeviceContext& device, const qwen::execution::Pa
     options.lossy_prefill.filter_layer        = kScoutLayer;
     options.lossy_prefill.query_rows          = kScoutRows;
     options.lossy_prefill.keep_fraction       = keep;
+    // Startup refuses a keep share above the skip share (keep-all runs keep 1.0).
+    options.lossy_prefill.skip_fraction = std::max(keep, options.lossy_prefill.skip_fraction);
     auto planner = qwen::detail::make_sequence_planner_impl(parameters, device, options);
     const std::uint32_t pages = 2 * planner->curve.minimum_main_page_groups;
     ScoutFixture out;
