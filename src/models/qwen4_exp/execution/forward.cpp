@@ -348,7 +348,7 @@ std::size_t Forward::hc_fused_read_workspace_bytes(const TextConfig& c, std::int
     const auto h         = dim(c.hidden_size);
     return aligned(std::size_t(c.hc.streams) * static_cast<std::size_t>(t) * sizeof(float)) +
            aligned(ops::hc_fused_read_a8_code_bytes(h, t)) + aligned(ops::hc_fused_read_a8_scale_bytes(h, t)) +
-           aligned(ops::kHcFusedReadExtraWorkspaceBytes);
+           aligned(ops::hc_fused_read_workspace_capacity_bytes(dim(c.hc.streams), dim(c.hc.rank), t));
 }
 
 std::size_t Forward::shared_expert_workspace_bytes(const TextConfig& c, std::int32_t columns) {
@@ -554,9 +554,13 @@ Forward::MoeRead Forward::read_moe(const HyperConnectionParameters& mixer, const
                                 .a8_scales = scales};
     const HcInt8Mixer& copies = hc_int8_->at(mixer);
     const Tensor* rows[]      = {&router, &shared_score};
-    ops::hc_fused_read(residual, y, inject, mixer.norm, copies.down, copies.up, S, dim(config_.hc.rank),
-                       config_.rms_norm_eps, rows, K, out, *work_, device_.stream,
-                       side_ != nullptr ? side_->fork : nullptr);
+    // The Op's own workspace stays in use until its routing kernel ends, after the fork event it
+    // records: a carve held for the layer (past the side stream's join), never a released scope the
+    // shared expert's allocations could reuse.
+    const std::int32_t rank = dim(config_.hc.rank);
+    WorkspaceArena held(work_->alloc_bytes(ops::hc_fused_read_workspace_capacity_bytes(S, rank, T)));
+    ops::hc_fused_read(residual, y, inject, mixer.norm, copies.down, copies.up, S, rank, config_.rms_norm_eps, rows,
+                       K, out, held, device_.stream, side_ != nullptr ? side_->fork : nullptr);
     return read;
 }
 

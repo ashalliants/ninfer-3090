@@ -121,6 +121,10 @@ __global__ void collapse_kernel(const bf16* __restrict__ logits, const bf16* __r
         __float2bfloat16_rn(sum / static_cast<float>(streams));
 }
 
+// r + inject * v compiles to one FFMA (nvcc's default --fmad=true contraction; cuobjdump shows
+// FFMA). hc_fused_read's fold computes __fmaf_rn(inject, v, r) and its bitwise equality with this
+// kernel depends on that contraction; writing __fmaf_rn here changes this kernel's SASS, so it is
+// left as is (ninfer_hyper_connection_test compares the two bitwise).
 __global__ void inject_kernel(const bf16* __restrict__ y, const float* __restrict__ inject,
                               int hidden, int streams, int columns, bf16* __restrict__ residual) {
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
