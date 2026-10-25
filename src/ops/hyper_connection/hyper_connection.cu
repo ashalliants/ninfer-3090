@@ -1,7 +1,7 @@
 // Adapted from Infernix a3edb450 src/ops/hyper_connection/hyper_connection.cu (Apache-2.0).
 // Modified for NInfer-3090: the composed route's norm multiplies by the stored FP32 norm weight
-// (no unit offset), the namespaces and includes are NInfer's, and the int8 form (--hc-int8) takes
-// the int8 fused route at T <= 16 and otherwise the composed route on its weights rounded to BF16.
+// (no unit offset), the namespaces and includes are NInfer's, and the int8 form (--hc-int8) runs
+// the int8 fused route (T <= 16 only).
 
 #include "ninfer/ops/hyper_connection.h"
 
@@ -201,24 +201,6 @@ bool int8_weights(const HcInt8Weights& w) {
            w.n > 0 && w.k > 0 && w.k % kHcInt8Group == 0;
 }
 
-// A contiguous BF16 [n, k] at `data` (the int8 form's weights rounded to BF16, or a shape alone).
-Weight bf16_matrix(const void* data, std::int32_t n, std::int32_t k) {
-    Weight w;
-    w.payload         = data;
-    w.payload_bytes   = static_cast<std::uint64_t>(n) * k * 2;
-    w.qtype           = QType::BF16;
-    w.layout          = QuantLayout::Contiguous;
-    w.shape[0]        = n;
-    w.shape[1]        = k;
-    w.padded_shape[0] = n;
-    w.padded_shape[1] = k;
-    w.ndim            = 2;
-    w.qdata           = data;
-    w.n               = n;
-    w.k               = k;
-    return w;
-}
-
 } // namespace
 
 void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, const Weight& down,
@@ -283,9 +265,9 @@ std::size_t hyper_connection_mix_workspace_capacity_bytes(const Weight& down, co
 }
 
 void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight,
-                          const HcInt8Weights& down, const HcInt8Weights& up, LinearPolicy policy,
-                          std::int32_t streams, std::int32_t rank, float eps, Tensor& x,
-                          Tensor* inject, WorkspaceArena& workspace, cudaStream_t stream) {
+                          const HcInt8Weights& down, const HcInt8Weights& up, std::int32_t streams,
+                          std::int32_t rank, float eps, Tensor& x, Tensor* inject,
+                          WorkspaceArena& workspace, cudaStream_t stream) {
     require(contiguous_2d(residual, DType::BF16) && contiguous_2d(x, DType::BF16) &&
                 norm_weight.data != nullptr && norm_weight.dtype == DType::FP32 &&
                 norm_weight.is_contiguous() && streams > 0 && rank > 0,
@@ -306,47 +288,26 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight,
                 "mix inject output must be FP32 [S, T]");
     }
     require(eps > 0, "mix epsilon must be positive");
-    require(valid_linear_policy(policy), "mix requires a valid LinearPolicy");
-    auto scope = workspace.scope();
-    if (detail::hc_mix_int8_fused_supported(down, up, hidden, streams, rank, T)) {
-        const DeviceSpan partials =
-            workspace.alloc_bytes(detail::hc_mix_fused_workspace_bytes(down.n, streams, T));
-        detail::hc_mix_int8_fused(residual, norm_weight, down, up, streams, rank, eps, x, inject,
-                                  partials.data, stream);
-        return;
-    }
-    // The composed route on the represented weights rounded to BF16.
-    const DeviceSpan down16 = workspace.alloc_bytes(static_cast<std::size_t>(down.n) * down.k * 2);
-    const DeviceSpan up16   = workspace.alloc_bytes(static_cast<std::size_t>(up.n) * up.k * 2);
-    detail::hc_int8_dequantize_bf16(down, down16.data, stream);
-    detail::hc_int8_dequantize_bf16(up, up16.data, stream);
-    hyper_connection_mix(residual, norm_weight, bf16_matrix(down16.data, down.n, down.k),
-                         bf16_matrix(up16.data, up.n, up.k), policy, streams, rank, eps, x, inject,
-                         workspace, stream);
+    require(detail::hc_mix_int8_fused_supported(down, up, hidden, streams, rank, T),
+            "the int8 mix serves S = 4, H = 2560, rank a multiple of 32 up to 512 and 1..16 "
+            "columns (wider calls use the BF16 weights)");
+    auto scope                = workspace.scope();
+    const DeviceSpan partials =
+        workspace.alloc_bytes(detail::hc_mix_fused_workspace_bytes(down.n, streams, T));
+    detail::hc_mix_int8_fused(residual, norm_weight, down, up, streams, rank, eps, x, inject,
+                              partials.data, stream);
 }
 
 std::size_t hyper_connection_mix_workspace_capacity_bytes(const HcInt8Weights& down,
                                                           const HcInt8Weights& up,
-                                                          LinearPolicy policy, std::int32_t streams,
-                                                          std::int32_t rank,
+                                                          std::int32_t streams, std::int32_t rank,
                                                           std::int32_t max_tokens) {
-    require(max_tokens > 0 && streams > 0 && rank > 0,
-            "mix workspace needs positive T, streams and rank");
-    require(valid_linear_policy(policy), "mix requires a valid LinearPolicy");
+    require(max_tokens > 0 && max_tokens <= kHcInt8MaxColumns && streams > 0 && rank > 0 &&
+                down.n > 0 && up.n > 0,
+            "int8 mix workspace needs T in [1, 16] and positive streams and rank");
     std::size_t bytes = 0;
-    for (std::int32_t T = 1; T <= std::min(max_tokens, detail::kHcMixFusedMaxColumns); ++T) {
+    for (std::int32_t T = 1; T <= max_tokens; ++T) {
         bytes = std::max(bytes, detail::hc_mix_fused_workspace_bytes(down.n, streams, T));
-    }
-    const std::int32_t hidden = streams > 0 ? up.n / streams : 0;
-    if (max_tokens > detail::kHcMixFusedMaxColumns ||
-        !detail::hc_mix_int8_fused_supported(down, up, hidden, streams, rank, 1)) {
-        // Both matrices in BF16, then the BF16 form's own need.
-        bytes = std::max(bytes, align256(static_cast<std::size_t>(down.n) * down.k * 2) +
-                                    align256(static_cast<std::size_t>(up.n) * up.k * 2) +
-                                    hyper_connection_mix_workspace_capacity_bytes(
-                                        bf16_matrix(nullptr, down.n, down.k),
-                                        bf16_matrix(nullptr, up.n, up.k), policy, streams, rank,
-                                        max_tokens));
     }
     return bytes;
 }

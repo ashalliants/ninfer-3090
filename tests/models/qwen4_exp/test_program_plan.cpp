@@ -16,7 +16,7 @@
 // --gdn-async-commit: no device memory; only a verification commit the row continues from folds on
 // the side stream; MTP off is refused.
 // --hc-int8: the int8 copies are a named term, the size of the copies of the mixers the Program
-// binds (97, or 100 with the drafter), zero when off; the wide-call workspace term.
+// binds (97, or 100 with the drafter), zero when off.
 
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/program/program.h"
@@ -158,9 +158,6 @@ void hc_int8_plan_bytes() {
         std::printf("--hc-int8 %s: %zu mixers, %.1f MiB of copies\n", tag.c_str(), mixers.size(),
                     static_cast<double>(planned) / (1 << 20));
     }
-    // A call past 16 columns rounds the widest mixer's copies to BF16 in the workspace.
-    check(ex::Forward::hc_int8_workspace_bytes(c) == 2ULL * (kRank + kStreams) * kWidth + 2ULL * kWidth * kRank,
-          "the wide-call workspace holds a block mixer's two matrices in BF16");
 }
 
 int main() {

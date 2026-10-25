@@ -20,6 +20,8 @@ namespace ninfer::ops {
 
 /// Values per binary16 scale of an int8 hyper-connection matrix.
 inline constexpr std::int32_t kHcInt8Group = 32;
+/// The most columns hyper_connection_mix's int8 form serves (wider calls use the BF16 weights).
+inline constexpr std::int32_t kHcInt8MaxColumns = 16;
 
 /// The int8 copy of a hyper-connection matrix [N, K] (hc_int8_quantize): codes int8 [N, K], row r
 /// at codes + r * K; scales binary16 bits [N, K / kHcInt8Group], row r at scales + r * K / 32.
@@ -63,8 +65,8 @@ struct HcInt8Weights {
  *
  * Numeric:
  *   Exact: the codes and scales are the bits of the formula (ops/hyper_connection/hc_int8_codec.h
- *   is its host form). A group with an infinite or NaN value, or whose a exceeds 127 * 65504 (the
- *   scale would be infinite), is refused: its codes and scale are written as zero.
+ *   is its host form). A group with an infinite or NaN value, or with f32(a / 127) >= 65520 (its
+ *   binary16 rounding would be infinite), is refused: its codes and scale are written as zero.
  *
  * Effects:
  *   Writes codes and scales; writes a nonzero value to *status when a group is refused (it never
@@ -98,19 +100,20 @@ void hc_int8_quantize(const Weight& w, DeviceSpan codes, DeviceSpan scales, Devi
  * Supported domain:
  *   BF16 form: down and up are contiguous BF16 weights registered with Linear for their [N, K];
  *   every T. The geometry S = 4, H = 2560, rank a multiple of 8 up to 512 is the one served
- *   without Linear at T <= 16. Int8 form: down and up are HcInt8Weights (hc_int8_quantize) whose
- *   BF16 [N, K] Linear registers, codes and scales 16-byte aligned, rank a multiple of 32; every T.
- *   The geometry S = 4, H = 2560, rank up to 512 is the one served without Linear at T <= 16.
- *   residual is 16-byte aligned; eps > 0.
+ *   without Linear at T <= 16. Int8 form: down and up are HcInt8Weights (hc_int8_quantize) with
+ *   16-byte aligned codes and scales, at S = 4, H = 2560, rank a multiple of 32 up to 512 and
+ *   1 <= T <= kHcInt8MaxColumns only (a caller runs wider calls on the BF16 weights); anything
+ *   else is refused. residual is 16-byte aligned; eps > 0.
  *
  * Numeric:
  *   Arithmetic is FP32 from the represented inputs; the int8 form's weights are the codes' values
  *   q * s (exact in FP32). Two profiles: at T <= 16 with the S = 4, H = 2560 geometry every
  *   intermediate (Rn, z, m, u) stays FP32 and only x is rounded to BF16, so a column's x and inject
- *   do not depend on T within 1..16 (the int8 form takes W_up m from an FP16 high and low split of
- *   m, products and sums in FP32: below 2^-20 of |W_up| |m|); otherwise Rn, z, m and u are rounded
- *   to BF16 (the composed profile; the int8 form first rounds q * s to BF16) and Linear's BF16
- *   criterion applies to z and u. The oracle is the formula in FP64 on the represented weights.
+ *   do not depend on T within 1..16; otherwise Rn, z, m and u are rounded to BF16 (the composed
+ *   profile) and Linear's BF16 criterion applies to z and u. The int8 form (the first profile)
+ *   takes W_up m from an FP16 high and low split of m with products and sums in FP32: each m[k]
+ *   enters as hi + lo within max(2^-22 |m[k]|, 2^-25) of m[k], for |m[k]| < 65520 (beyond, hi
+ *   overflows to infinity). The oracle is the formula in FP64 on the represented weights.
  *
  * Effects:
  *   Writes x and, when requested, inject. residual and the weights are read only. No output may
@@ -128,18 +131,20 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, con
                           std::int32_t rank, float eps, Tensor& x, Tensor* inject,
                           WorkspaceArena& workspace, cudaStream_t stream);
 void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight,
-                          const HcInt8Weights& down, const HcInt8Weights& up, LinearPolicy policy,
-                          std::int32_t streams, std::int32_t rank, float eps, Tensor& x,
-                          Tensor* inject, WorkspaceArena& workspace, cudaStream_t stream);
+                          const HcInt8Weights& down, const HcInt8Weights& up, std::int32_t streams,
+                          std::int32_t rank, float eps, Tensor& x, Tensor* inject,
+                          WorkspaceArena& workspace, cudaStream_t stream);
 
-/// The workspace hyper_connection_mix needs for every T in [1, max_tokens].
+/// The workspace hyper_connection_mix needs for every T in [1, max_tokens] (the int8 form:
+/// max_tokens <= kHcInt8MaxColumns).
 [[nodiscard]] std::size_t hyper_connection_mix_workspace_capacity_bytes(
     const Weight& down, const Weight& up, LinearPolicy policy, std::int32_t streams,
     std::int32_t rank, std::int32_t max_tokens);
-[[nodiscard]] std::size_t
-hyper_connection_mix_workspace_capacity_bytes(const HcInt8Weights& down, const HcInt8Weights& up,
-                                              LinearPolicy policy, std::int32_t streams,
-                                              std::int32_t rank, std::int32_t max_tokens);
+[[nodiscard]] std::size_t hyper_connection_mix_workspace_capacity_bytes(const HcInt8Weights& down,
+                                                                        const HcInt8Weights& up,
+                                                                        std::int32_t streams,
+                                                                        std::int32_t rank,
+                                                                        std::int32_t max_tokens);
 
 /**
  * Op: hyper_connection_inject

@@ -82,7 +82,8 @@ NINFER_HD float dequant(std::int8_t q, std::uint16_t s) {
 //   a = max |w|;  s = f16(f32(a / 127)), raised to the next binary16 when 127.5 * s < a;
 //   q = clamp(rint(f32(w / s)), -127, 127), every q = 0 when s = 0 (exactly when a = 0).
 // f32() and f16() round to nearest even and rint rounds half to even. Returns false, with every
-// code and the scale zero, when a value is not finite or s would be infinite (a > 127 * 65504).
+// code and the scale zero, when a value is not finite or s would be infinite
+// (f32(a / 127) >= 65520).
 NINFER_HD bool quantize_group(const std::uint16_t* w, std::int8_t* q, std::uint16_t* s) {
     float amax  = 0.0F;
     bool finite = true;

@@ -464,8 +464,8 @@ struct ProgramOptions {
     bool gdn_async_commit = false;
     // FlashNextOptions::hc_int8: the Program makes int8 copies of every mixer's hyper-connection
     // matrices at construction (execution::HcInt8Copies, ProgramDevicePlan::hc_int8_bytes) and the
-    // forward's mixers read them (execution::ForwardOptions::hc_int8). Changes the numerics; the
-    // workspace terms include the BF16 rounding of a wide call (Forward::hc_int8_workspace_bytes).
+    // forward's decode-width mixer calls read them (execution::ForwardOptions::hc_int8; prefill
+    // keeps the BF16 weights). Changes the numerics; no workspace.
     bool hc_int8 = false;
 };
 

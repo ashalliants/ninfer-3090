@@ -2,9 +2,10 @@
 
 // --hc-int8: int8 copies (ops::hc_int8_quantize, Basalt's group rule) of the hyper-connection
 // matrices of every mixer a Forward runs, made once from the BF16 weights, which stay loaded. The
-// mixers then read the copies (ops::hyper_connection_mix's int8 form): about 0.54 of the bytes per
-// decode mixer, and different numerics (each weight rounded to an int8 code times its group's
-// binary16 scale), so the option is judged by the decode-path KLD gate, not by bitwise identity.
+// mixers' calls of up to 16 columns then read the copies (ops::hyper_connection_mix's int8 form):
+// about 0.53 of the bytes per call, and different numerics (each weight rounded to an int8 code
+// times its group's binary16 scale), so the option is judged by the decode-path KLD gate, not by
+// bitwise identity. Wider calls (prefill) read the BF16 weights.
 
 #include "core/arena.h"
 #include "models/qwen4_exp/execution/parameters.h"

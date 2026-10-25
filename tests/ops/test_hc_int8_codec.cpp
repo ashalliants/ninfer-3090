@@ -210,8 +210,15 @@ void codec_subnormal_and_inf() {
     refused(inf, "a NaN value");
     Group huge{};
     huge.fill(bf16(1.0F));
-    huge[0] = bf16(9e6F); // a / 127 > 65504
+    huge[0] = bf16(9e6F); // a / 127 > 65520
     refused(huge, "a scale past binary16's range");
+    // The threshold: refused exactly when f32(a / 127) >= 65520. 253 * 2^15 and 254 * 2^15 are
+    // adjacent BF16 values on either side of it (a / 127 = 65278.0..., 65536.0...).
+    huge[0] = bf16(253.0F * 32768.0F);
+    check(code(huge).ok && hc::f16_to_f32(code(huge).s) == 65280.0F,
+          "a / 127 = 65278 is accepted (scale 65280)");
+    huge[0] = bf16(254.0F * 32768.0F);
+    refused(huge, "a / 127 = 65536");
 }
 
 void codec_matches_basalt_rule() {

@@ -583,9 +583,6 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     d.work = execution::Forward::workspace_bytes(c, std::max(d.chunk, static_cast<std::int32_t>(d.lanes)), d.pages * kPagedKVPageSize,
                                                  DeviceExecutionView{nullptr, sms}, o.moe_precast_input) +
              ops::sampling_workspace_capacity_bytes(d.token_domain, 1, static_cast<std::int32_t>(d.lanes));
-    // --hc-int8: a call past 16 columns (a prefill chunk, a drafter's prefill cells) rounds a
-    // mixer's int8 copies to BF16 in the workspace.
-    const std::size_t hc_int8_work = o.hc_int8 ? execution::Forward::hc_int8_workspace_bytes(c) : 0;
     if (d.drafts > 0) {
         // A drafter step (one column and the head's logits), and a prefill call's drafter cells: a
         // sub-chunk's residual rows beside the call's residual. Acceptance's workspace.
@@ -595,12 +592,10 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
         d.work = std::max(d.work, step) + std::size_t(c.residual_width()) * execution::kMtpChunkColumns * 2 * 3 +
                  ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(d.token_domain, 1, d.drafts, 1, 1);
     }
-    d.work += hc_int8_work;
     d.sms       = sms;
     d.wide_work = execution::Forward::workspace_bytes(c, d.wide_chunk, d.pages * kPagedKVPageSize,
                                                       DeviceExecutionView{nullptr, sms}, o.moe_precast_input) +
-                  (o.shared_expert_stream ? execution::Forward::shared_expert_workspace_bytes(c, d.wide_chunk) : 0) +
-                  hc_int8_work;
+                  (o.shared_expert_stream ? execution::Forward::shared_expert_workspace_bytes(c, d.wide_chunk) : 0);
     d.vmm = VmmArena::supported(o.device);
 
     auto& b     = d.bytes;
@@ -3093,8 +3088,7 @@ private:
             plan_.wide_work,
             execution::Forward::workspace_bytes(c_, widest, keys, DeviceExecutionView{nullptr, plan_.sms},
                                                 options_.moe_precast_input) +
-                (options_.shared_expert_stream ? forward_->max_shared_expert_scratch_bytes(widest) : 0) +
-                (options_.hc_int8 ? execution::Forward::hc_int8_workspace_bytes(c_) : 0));
+                (options_.shared_expert_stream ? forward_->max_shared_expert_scratch_bytes(widest) : 0));
         const std::uint64_t stride  = residency_->frame_stride();
         const std::size_t tables    = align(stream_->table_bytes());
         const auto work_frames      = static_cast<std::uint32_t>((tables + work + stride - 1) / stride);

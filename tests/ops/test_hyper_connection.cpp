@@ -23,10 +23,11 @@
 // scale bitwise against the host codec (hc_int8_codec.h, the exact oracle), a refused group (an
 // infinite weight) and refused sources; then hyper_connection_mix's int8 form against the FP64
 // oracle on the copies' represented weights q * s (decoded on the host from the copied bits) at
-// T = 1, 2, 4, 8, 9, 16 (the int8 fused route: the mma's one and two column tiles) and 17, 64 (the
-// composed route on the copies rounded to BF16), with the fused and composed criteria above (the
-// int8 fused route's FP16 split of m is below 2^-20 of its terms); column invariance, graph
-// capture and the workspace capacity as for the BF16 form; misaligned copies are refused.
+// T = 1, 2, 4, 8, 9, 16 (the mma's one- and two-column-tile kernels) with the fused criterion
+// above: the FP16 high and low split of m represents each m[k] within max(2^-22 |m[k]|, 2^-25),
+// far below the BF16 rounding of x. Column invariance, graph capture and the workspace capacity
+// as for the BF16 form; T = 17 (wider calls take the BF16 weights in the forward) and misaligned
+// copies are refused.
 
 #include "ninfer/ops/hyper_connection.h"
 
@@ -300,9 +301,8 @@ Result run(Problem& p, const std::vector<std::uint16_t>& r, int T, bool inject,
     Tensor inj(id.p, DType::FP32, {kS, T});
     const auto call = [&] {
         if (int8.down != nullptr) {
-            ninfer::ops::hyper_connection_mix(R, w, int8.down->weights, int8.up->weights,
-                                              ninfer::ops::LinearPolicy::A16Only, kS, kRank, kEps,
-                                              x, inject ? &inj : nullptr, ws, stream);
+            ninfer::ops::hyper_connection_mix(R, w, int8.down->weights, int8.up->weights, kS, kRank,
+                                              kEps, x, inject ? &inj : nullptr, ws, stream);
             return;
         }
         ninfer::ops::hyper_connection_mix(R, w, p.down_w, p.up_w, ninfer::ops::LinearPolicy::A16Only,
@@ -379,12 +379,12 @@ void int8_form(bool inject, cudaStream_t stream) {
     const Int8Copy up     = make_int8(p.up, p.up_w, stream, tag + " up copy");
     const Int8Pair pair{&down, &up};
     const std::size_t capacity = ninfer::ops::hyper_connection_mix_workspace_capacity_bytes(
-        down.weights, up.weights, ninfer::ops::LinearPolicy::A16Only, kS, kRank, 64);
+        down.weights, up.weights, kS, kRank, ninfer::ops::kHcInt8MaxColumns);
     ninfer::WorkspaceArena ws(capacity);
-    for (const int T : {1, 2, 4, 8, 9, 16, 17, 64}) {
+    for (const int T : {1, 2, 4, 8, 9, 16}) {
         const auto r     = residual(T, 2000U + static_cast<std::uint32_t>(T));
         const Result got = run(p, r, T, inject, ws, stream, false, pair);
-        compare(got, oracle(r, p.norm, down.values, p.down_rows, up.values, T), T <= 16, inject,
+        compare(got, oracle(r, p.norm, down.values, p.down_rows, up.values, T), true, inject,
                 tag + " T=" + std::to_string(T));
         check(ws.peak_used() <= capacity,
               tag + ": the workspace capacity covers T=" + std::to_string(T));
@@ -411,29 +411,38 @@ void int8_form(bool inject, cudaStream_t stream) {
               tag + ": a " + std::to_string(T) + "-column call equals the first " +
                   std::to_string(T));
     }
-    for (const int T : {5, 17}) {
+    for (const int T : {5, 9}) {
         const auto r          = residual(T, 88U + static_cast<std::uint32_t>(T));
         const Result eager    = run(p, r, T, inject, ws, stream, false, pair);
         const Result captured = run(p, r, T, inject, ws, stream, true, pair);
         check(captured.x == eager.x && captured.inject == eager.inject,
               tag + ": a graph-captured T=" + std::to_string(T) + " call equals the eager call");
     }
-    // Misaligned copies are refused.
+    // Misaligned copies and calls wider than the int8 route are refused.
     {
-        Device rd(static_cast<std::size_t>(kW) * 2), xd(kH * 2), id(kS * 4);
-        const Tensor R(rd.p, DType::BF16, {kW, 1});
+        constexpr int kWide = ninfer::ops::kHcInt8MaxColumns + 1;
+        Device rd(static_cast<std::size_t>(kW) * 2 * kWide), xd(kH * 2 * kWide), id(kS * 4 * kWide);
         const Tensor w(p.norm_device->p, DType::FP32, {kW});
-        Tensor x(xd.p, DType::BF16, {kH, 1});
-        Tensor inj(id.p, DType::FP32, {kS, 1});
+        const auto refused = [&](const ninfer::ops::HcInt8Weights& d, int T) {
+            const Tensor R(rd.p, DType::BF16, {kW, T});
+            Tensor x(xd.p, DType::BF16, {kH, T});
+            Tensor inj(id.p, DType::FP32, {kS, T});
+            try {
+                ninfer::ops::hyper_connection_mix(R, w, d, up.weights, kS, kRank, kEps, x,
+                                                  inject ? &inj : nullptr, ws, stream);
+            } catch (const std::invalid_argument&) { return true; }
+            return false;
+        };
         ninfer::ops::HcInt8Weights shifted = down.weights;
         shifted.codes += 8;
+        check(refused(shifted, 1), tag + ": codes off the 16-byte grid are refused");
+        check(refused(down.weights, kWide), tag + ": a 17-column call is refused");
         bool threw = false;
         try {
-            ninfer::ops::hyper_connection_mix(R, w, shifted, up.weights,
-                                              ninfer::ops::LinearPolicy::A16Only, kS, kRank, kEps,
-                                              x, inject ? &inj : nullptr, ws, stream);
+            (void)ninfer::ops::hyper_connection_mix_workspace_capacity_bytes(
+                down.weights, up.weights, kS, kRank, kWide);
         } catch (const std::invalid_argument&) { threw = true; }
-        check(threw, tag + ": codes off the 16-byte grid are refused");
+        check(threw, tag + ": the capacity query refuses T past 16");
     }
 }
 

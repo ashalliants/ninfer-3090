@@ -441,9 +441,10 @@ struct FlashNextOptions {
     // A commit that ends the request folds before the round is reported. The same state, bit for bit.
     bool gdn_async_commit = false;
     // Int8 copies of every hyper-connection mixer's matrices (--hc-int8), made at startup from the
-    // BF16 weights with one binary16 scale per 32 values; the mixers read them (about 0.54x the
-    // bytes per decode mixer). CHANGES THE NUMERICS (the weights are rounded); the BF16 weights stay
-    // loaded, so it costs about 0.68 GB of VRAM (fewer expert frames). Off: the BF16 weights.
+    // BF16 weights with one binary16 scale per 32 values; decode-width mixer calls (up to 16
+    // columns: decode, MTP drafts and verification) read them, about 0.53x the bytes per call, and
+    // prefill keeps the BF16 weights. CHANGES THE NUMERICS (the weights are rounded); the BF16
+    // weights stay loaded, so it costs about 0.68 GB of VRAM (fewer expert frames). Off: BF16.
     bool hc_int8 = false;
     // The context cache's NVMe tier: a scratch file of up to this many bytes holds the checkpoints,
     // with the Host context budget as its RAM cache (a zero Host budget then reuses prefixes from
