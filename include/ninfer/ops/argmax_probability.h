@@ -23,29 +23,34 @@ namespace ninfer::ops {
  *   Let l[v,t] be the FP32 value of logits[v,t] and b[v,t] = round_to_bf16_rne(l[v,t]) its BF16
  *   rounding (the rounding of ops::cast_fp32_to_bf16). Over the valid rows 0 <= v < valid_rows,
  *
- *     ids[t]   = min argmax_v b[v,t]
+ *     ids[t]   = the row selected by starting from row 0 and visiting the rows in order, a row v
+ *                replacing the current row u when b[v,t] > b[u,t]
+ *                (for keys without NaN: min argmax_v b[v,t])
  *     m[t]     = max_v l[v,t]
  *     probs[t] = exp(l[ids[t],t] - m[t]) / sum_v exp(l[v,t] - m[t]).
  *
- *   ids is therefore exactly ops::argmax(cast_fp32_to_bf16(logits), valid_rows), and probs is the
- *   softmax probability of that winner under the FP32 logits. When the BF16 winner is also the FP32
- *   maximum (always unless several FP32 values round to the same largest BF16 value), probs[t] is
- *   1 / sum_v exp(l[v,t] - m[t]).
+ *   ids is therefore exactly ops::argmax(cast_fp32_to_bf16(logits), valid_rows) for every input,
+ *   NaN and infinities included, and probs is the softmax probability of that winner under the FP32
+ *   logits. When the BF16 winner is also the FP32 maximum (always unless several FP32 values round
+ *   to the same largest BF16 value), probs[t] is 1 / sum_v exp(l[v,t] - m[t]).
  *
  * Logical shapes:
  *   logits is [physical_rows,T], ids and probs are [T], with T > 0 and
  *   1 <= valid_rows <= physical_rows. Physical rows [valid_rows,physical_rows) do not participate.
  *
  * Supported domain:
- *   logits is contiguous finite FP32; ids is contiguous I32; probs is contiguous FP32. T is any
- *   positive extent.
+ *   logits is contiguous FP32 (any values); ids is contiguous I32; probs is contiguous FP32. T is
+ *   any positive extent.
  *
  * Numeric:
  *   The BF16 rounding of the argmax key is a semantic boundary: ties between equal BF16 keys select
- *   the lowest row, so the ids are bitwise those of the BF16 argmax. probs is an FP32
- *   approximation of the formula computed from the FP32 logits; reduction association and private
- *   accumulator precision are implementation choices, and the oracle evaluates the formula in FP64.
- *   Non-finite logits are outside the domain.
+ *   the lowest row, a NaN key never replaces the current row (so a NaN at row 0 selects row 0), and
+ *   the ids are bitwise those of the BF16 argmax. probs is an FP32 approximation of the formula
+ *   computed from the FP32 logits; reduction association and private accumulator precision are
+ *   implementation choices, and the oracle evaluates the formula in FP64.
+ *   Non-finite logits: a -inf row contributes exp(-inf) = 0 while some valid logit is finite.
+ *   probs[t] is NaN when a valid logit of column t is NaN or +inf, or when every one is -inf.
+ *   ids[t] is always a row in [0, valid_rows).
  *
  * Effects:
  *   Writes every element of ids and probs and preserves logits. ids, probs and logits must not

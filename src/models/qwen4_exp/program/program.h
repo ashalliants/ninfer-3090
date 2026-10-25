@@ -389,8 +389,8 @@ struct ProgramOptions {
     // Basalt's joint-acceptance draft length (FlashNextOptions::mtp_joint_acceptance): every round
     // drafts the ceiling (mtp_draft_tokens, or less near the request's end) with each draft's
     // probability, then verifies joint_acceptance_window of them (draft_policy.h) under the lane's
-    // JointAcceptanceThreshold. It replaces the acceptance-estimate policy, mtp_fixed_drafts
-    // included. Off: the drafter graphs, the drafts and the window are as before.
+    // JointAcceptanceThreshold. It replaces the acceptance-estimate policy; with mtp_fixed_drafts
+    // it is refused. Off: the drafter graphs, the drafts and the window are as before.
     bool mtp_joint_acceptance = false;
     // Image input: the model loaded its vision tower. Prompts with media encode it into frames lent
     // by the expert cache (its io words are planned only when set).

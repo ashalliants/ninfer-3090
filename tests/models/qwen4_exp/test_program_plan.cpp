@@ -183,6 +183,27 @@ int main() {
         with_probs.io              = 500;
         with_probs.mtp_draft_probs = 28;
         check(with_probs.fixed_bytes() == 528, "fixed_bytes counts the draft probabilities");
+
+        // The joint rule chooses each round's count; mtp_fixed_drafts (--mtp-fixed) would always verify
+        // --draft-tokens. Startup refuses the pair naming both, before the device is asked anything.
+        q4::TextConfig model            = config();
+        model.vocab_size                = 248320;
+        model.max_position_embeddings   = 262144;
+        q4::ProgramOptions both;
+        both.max_context          = 32768;
+        both.mtp_draft_tokens     = 3;
+        both.mtp_joint_acceptance = true;
+        both.mtp_fixed_drafts     = true;
+        bool refused              = false;
+        try {
+            (void)q4::Program::plan_device(both, model, 248077, {});
+        } catch (const std::invalid_argument& error) {
+            const std::string what = error.what();
+            refused = what.find("--mtp-joint-acceptance") != std::string::npos &&
+                      what.find("--mtp-fixed") != std::string::npos;
+        } catch (const std::exception&) {
+        }
+        check(refused, "--mtp-joint-acceptance with --mtp-fixed is refused naming both");
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

@@ -1,10 +1,14 @@
 // argmax_probability against an independent FP64 oracle: the ids (the BF16 argmax, ties to the lower
 // row) exactly and the winner's softmax probability within 1e-6 relative, at the 248,320-row
 // vocabulary for T = 1..8 and at small and single-row vocabularies, including exact FP32 ties, BF16
-// ties between different FP32 values, a flat column, a winner at the last valid row and huge
-// excluded rows. The ids are also checked bit for bit against the existing route,
-// ops::argmax(ops::cast_fp32_to_bf16(logits)), and the Op is checked captured in a CUDA graph and
-// replayed on new logits, in a workspace of exactly its capacity query.
+// ties between different FP32 values, a flat column, a winner at the last valid row, huge excluded
+// rows, and the argument-rounding adversaries (one row high above many equal rows). Route
+// boundaries: one, two and three row tiles (2047, 2048, 2049 valid rows) and the column slicing past
+// 65,535 columns. Non-finite logits (NaN at row 0, NaN elsewhere, all NaN, a -inf tile, all -inf,
+// +inf, a finite logit whose BF16 rounding is +inf) follow the contract's policy. The ids are also
+// checked bit for bit against the existing route, ops::argmax(ops::cast_fp32_to_bf16(logits)), and
+// the Op is checked captured in a CUDA graph and replayed on new logits, in a workspace of exactly
+// its capacity query.
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/argmax_probability.h"
 #include "ninfer/ops/cast.h"
@@ -15,6 +19,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -25,8 +30,19 @@ using namespace ninfer::test;
 
 namespace {
 
-// The probability is one FP32 value per column computed from FP32 logits.
+// The probability is one FP32 value per column computed from FP32 logits. Non-finite policy: a
+// column whose FP64 oracle is NaN (a NaN or +inf valid logit, or every valid logit -inf) must give
+// NaN; every other column must give a finite value within the bound.
 constexpr PointwiseCriterion kArgmaxProbabilityCriterion{/*absolute=*/0.0, /*relative=*/1.0e-6};
+
+std::vector<std::uint32_t> bits(const std::vector<float>& values) {
+    std::vector<std::uint32_t> out(values.size());
+    std::memcpy(out.data(), values.data(), values.size() * sizeof(float));
+    return out;
+}
+
+constexpr float kNaN = std::numeric_limits<float>::quiet_NaN();
+constexpr float kInf = std::numeric_limits<float>::infinity();
 
 struct Expected {
     std::vector<std::int32_t> ids;
@@ -34,7 +50,9 @@ struct Expected {
 };
 
 // FP64 oracle over the represented FP32 logits: the key is each logit's BF16 rounding (RNE), the
-// probability exp(l[id] - max) / sum exp(l - max) over the valid rows.
+// winner starts at row 0 and a strictly greater key replaces it (so NaN never wins and a NaN at row
+// 0 stays); the probability is exp(l[id] - max) / sum exp(l - max) over the valid rows, NaN
+// propagating.
 Expected oracle(const std::vector<float>& logits, std::int32_t physical_rows, std::int32_t valid_rows,
                 std::int32_t columns) {
     Expected out;
@@ -42,14 +60,14 @@ Expected oracle(const std::vector<float>& logits, std::int32_t physical_rows, st
         const std::size_t base = static_cast<std::size_t>(t) * physical_rows;
         std::int32_t best      = 0;
         float best_key         = bf16_to_f32(f32_to_bf16(logits[base]));
-        double maximum         = logits[base];
-        for (std::int32_t v = 1; v < valid_rows; ++v) {
+        double maximum         = -std::numeric_limits<double>::infinity();
+        for (std::int32_t v = 0; v < valid_rows; ++v) {
             const float key = bf16_to_f32(f32_to_bf16(logits[base + v]));
             if (key > best_key) {
                 best_key = key;
                 best     = v;
             }
-            maximum = std::max(maximum, static_cast<double>(logits[base + v]));
+            if (static_cast<double>(logits[base + v]) > maximum) { maximum = logits[base + v]; }
         }
         double sum = 0.0;
         for (std::int32_t v = 0; v < valid_rows; ++v) { sum += std::exp(static_cast<double>(logits[base + v]) - maximum); }
@@ -68,14 +86,17 @@ float noise(std::int32_t row, std::int32_t column, std::uint32_t salt) {
     return -24.0f + 30.0f * static_cast<float>(h >> 8) * (1.0f / 16777216.0f);
 }
 
-// Column t follows pattern (t + T + salt) % 6:
+// Column t follows pattern (t + T + salt) % 8:
 //   0: one peak, its height (and so its probability) varying with the column;
 //   1: an exact FP32 tie of the maximum at two rows in different tiles (the lower wins);
 //   2: a BF16 tie: two FP32 values that round to the same BF16 maximum, the higher row's larger
 //      (the lower row wins; its own FP32 logit is below the column maximum);
 //   3: flat (every valid row equal: probability 1 / valid_rows, row 0);
 //   4: the peak at the last valid row;
-//   5: noise only.
+//   5: noise only;
+//   6, 7: one row far above every other row, all equal (9.3 over 0.3, and 8.522 over 0.1, the worst
+//      FP32 rounding of l - max found for this vocabulary): every term shares one argument, so its
+//      rounding error is coherent across the sum.
 // Rows past valid_rows hold huge values that must not participate.
 std::vector<float> make_logits(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t columns,
                                std::uint32_t salt) {
@@ -84,9 +105,10 @@ std::vector<float> make_logits(std::int32_t physical_rows, std::int32_t valid_ro
         const std::size_t base = static_cast<std::size_t>(t) * physical_rows;
         for (std::int32_t v = 0; v < valid_rows; ++v) { logits[base + v] = noise(v, t, salt); }
         for (std::int32_t v = valid_rows; v < physical_rows; ++v) { logits[base + v] = 1.0e4f + static_cast<float>(v); }
-        const std::int32_t low  = (17 + 7919 * t) % valid_rows;
-        const std::int32_t high = std::max(low, valid_rows - 1 - (65537 * t) % std::max(1, valid_rows / 2));
-        switch ((t + columns + static_cast<std::int32_t>(salt)) % 6) {
+        const auto low  = static_cast<std::int32_t>((17 + 7919LL * t) % valid_rows);
+        const auto high = std::max(low, static_cast<std::int32_t>(valid_rows - 1 -
+                                                                  (65537LL * t) % std::max(1, valid_rows / 2)));
+        switch ((t + columns + static_cast<std::int32_t>(salt)) % 8) {
         case 0: logits[base + low] = 6.0f + 3.0f * static_cast<float>(t % 6) + 0.3f; break;
         case 1:
             logits[base + low]  = 17.3f;
@@ -101,18 +123,81 @@ std::vector<float> make_logits(std::int32_t physical_rows, std::int32_t valid_ro
             for (std::int32_t v = 0; v < valid_rows; ++v) { logits[base + v] = 1.5f; }
             break;
         case 4: logits[base + valid_rows - 1] = 14.7f; break;
+        case 6:
+        case 7: {
+            const bool first = (t + columns + static_cast<std::int32_t>(salt)) % 8 == 6;
+            for (std::int32_t v = 0; v < valid_rows; ++v) { logits[base + v] = first ? 0.3f : 0.1f; }
+            logits[base + low] = first ? 9.3f : 8.522f;
+            break;
+        }
         default: break;
         }
     }
     return logits;
 }
 
-int run_case(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t columns, std::uint32_t salt,
-             bool graph) {
-    const std::string label = "argmax_probability rows=" + std::to_string(physical_rows) +
-                              " valid=" + std::to_string(valid_rows) + " T=" + std::to_string(columns) +
-                              (graph ? " graph" : "");
-    auto logits   = make_logits(physical_rows, valid_rows, columns, salt);
+// Seven columns of non-finite logits over noise:
+//   0: every valid row NaN (row 0, probability NaN);
+//   1: NaN at row 0, a finite peak elsewhere (row 0, as ops::argmax; NaN);
+//   2: NaN at a middle row, a finite peak elsewhere (the peak; NaN);
+//   3: a run of -inf rows covering whole tiles, a finite peak (the peak; finite);
+//   4: every valid row -inf (row 0; NaN);
+//   5: +inf at one row (that row; NaN);
+//   6: a finite logit whose BF16 rounding overflows to +inf (that row; the probability is 1).
+std::vector<float> make_nonfinite_logits(std::int32_t physical_rows, std::int32_t valid_rows) {
+    constexpr std::int32_t kColumns = 7;
+    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * kColumns);
+    for (std::int32_t t = 0; t < kColumns; ++t) {
+        const std::size_t base = static_cast<std::size_t>(t) * physical_rows;
+        for (std::int32_t v = 0; v < valid_rows; ++v) { logits[base + v] = noise(v, t, 11); }
+        for (std::int32_t v = valid_rows; v < physical_rows; ++v) { logits[base + v] = kNaN; }
+        const std::int32_t peak = valid_rows * 3 / 4, middle = valid_rows / 3;
+        switch (t) {
+        case 0: std::fill_n(logits.begin() + static_cast<std::ptrdiff_t>(base), valid_rows, kNaN); break;
+        case 1:
+            logits[base]        = kNaN;
+            logits[base + peak] = 12.0f;
+            break;
+        case 2:
+            logits[base + middle] = kNaN;
+            logits[base + peak]   = 12.0f;
+            break;
+        case 3: {
+            const std::int32_t from = valid_rows / 8, to = valid_rows / 2;
+            std::fill(logits.begin() + static_cast<std::ptrdiff_t>(base + from),
+                      logits.begin() + static_cast<std::ptrdiff_t>(base + to), -kInf);
+            logits[base + peak] = 12.0f;
+            break;
+        }
+        case 4: std::fill_n(logits.begin() + static_cast<std::ptrdiff_t>(base), valid_rows, -kInf); break;
+        case 5: logits[base + middle] = kInf; break;
+        default: logits[base + middle] = 3.4e38f; break;
+        }
+    }
+    return logits;
+}
+
+int verify_outputs(const std::string& label, const std::vector<std::int32_t>& ids, const std::vector<float>& probs,
+                   const Expected& expected) {
+    int failures = verify_exact((label + " ids").c_str(), ids, expected.ids);
+    std::vector<double> got, want;
+    for (std::size_t t = 0; t < probs.size(); ++t) {
+        if (std::isnan(expected.probs[t])) {
+            if (!std::isnan(probs[t])) {
+                std::cerr << label << ": column " << t << " probability " << probs[t] << ", expected NaN\n";
+                ++failures;
+            }
+        } else {
+            got.push_back(probs[t]);
+            want.push_back(expected.probs[t]);
+        }
+    }
+    if (!want.empty()) { failures += verify_pointwise(label + " probs", got, want, kArgmaxProbabilityCriterion); }
+    return failures;
+}
+
+int run_logits(const std::string& label, std::vector<float> logits, std::int32_t physical_rows,
+               std::int32_t valid_rows, std::int32_t columns, const std::vector<float>* replay) {
     auto expected = oracle(logits, physical_rows, valid_rows, columns);
 
     GuardedDeviceBuffer device_logits(logits.size() * sizeof(float));
@@ -127,7 +212,7 @@ int run_case(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t c
     // Exactly the capacity the query reports for this call.
     WorkspaceArena workspace(ops::argmax_probability_workspace_capacity_bytes(valid_rows, columns, columns));
 
-    if (!graph) {
+    if (replay == nullptr) {
         ops::argmax_probability(logits_tensor, ids_tensor, probs_tensor, valid_rows, workspace, nullptr);
         cuda_synchronize();
     } else {
@@ -142,7 +227,7 @@ int run_case(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t c
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         // A replay reads the logits at replay time.
-        logits   = make_logits(physical_rows, valid_rows, columns, salt + 1);
+        logits   = *replay;
         expected = oracle(logits, physical_rows, valid_rows, columns);
         CUDA_CHECK(cudaMemcpyAsync(device_logits.data(), logits.data(), device_logits.bytes(), cudaMemcpyHostToDevice,
                                    stream));
@@ -155,12 +240,9 @@ int run_case(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t c
 
     const auto ids   = from_device<std::int32_t>(device_ids.data(), static_cast<std::size_t>(columns));
     const auto probs = from_device<float>(device_probs.data(), static_cast<std::size_t>(columns));
-    const std::vector<double> got(probs.begin(), probs.end());
-    int failures = 0;
-    failures += verify_exact((label + " ids").c_str(), ids, expected.ids);
-    failures += verify_pointwise(label + " probs", got, expected.probs, kArgmaxProbabilityCriterion);
+    int failures     = verify_outputs(label, ids, probs, expected);
     failures += verify_exact((label + " preserves logits").c_str(),
-                             from_device<float>(device_logits.data(), logits.size()), logits);
+                             bits(from_device<float>(device_logits.data(), logits.size())), bits(logits));
 
     // The existing route on the same logits: BF16 cast, then ops::argmax. Bit for bit.
     DeviceBuffer narrow(logits.size() * sizeof(std::uint16_t));
@@ -177,6 +259,22 @@ int run_case(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t c
     failures += device_ids.verify_guards(label + " ids guards");
     failures += device_probs.verify_guards(label + " probs guards");
     return failures;
+}
+
+int run_case(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t columns, std::uint32_t salt,
+             bool graph) {
+    const std::string label = "argmax_probability rows=" + std::to_string(physical_rows) +
+                              " valid=" + std::to_string(valid_rows) + " T=" + std::to_string(columns) +
+                              (graph ? " graph" : "");
+    const auto replay = graph ? make_logits(physical_rows, valid_rows, columns, salt + 1) : std::vector<float>{};
+    return run_logits(label, make_logits(physical_rows, valid_rows, columns, salt), physical_rows, valid_rows,
+                      columns, graph ? &replay : nullptr);
+}
+
+int run_nonfinite_case(std::int32_t physical_rows, std::int32_t valid_rows) {
+    const std::string label = "argmax_probability non-finite rows=" + std::to_string(physical_rows) +
+                              " valid=" + std::to_string(valid_rows);
+    return run_logits(label, make_nonfinite_logits(physical_rows, valid_rows), physical_rows, valid_rows, 7, nullptr);
 }
 
 template <class Function>
@@ -276,6 +374,16 @@ int main() {
     failures += run_case(248320, 248077, 9, 1, false);
     failures += run_case(523, 509, 13, 2, false);
     failures += run_case(13, 1, 2, 4, false);
+    // One, two and three row tiles' boundary, and the column slicing past 65,535 columns.
+    failures += run_case(2051, 2047, 3, 0, false);
+    failures += run_case(2051, 2048, 3, 0, false);
+    failures += run_case(2051, 2049, 3, 0, false);
+    failures += run_case(1, 1, 65535, 0, false);
+    failures += run_case(1, 1, 65536, 0, false);
+    failures += run_case(1, 1, 65537, 0, false);
+    failures += run_nonfinite_case(248320, 248077);
+    failures += run_nonfinite_case(523, 509);
+    failures += run_nonfinite_case(2051, 2049);
     failures += run_validation_cases();
     std::cout << (failures ? "FAIL" : "OK") << " argmax_probability\n";
     return failures ? 1 : 0;

@@ -173,6 +173,10 @@ void validate(const EngineOptions& options) {
         refuse("--mtp-joint-acceptance chooses how many MTP drafts a round verifies and needs --spec mtp: add "
                "--spec mtp or remove --mtp-joint-acceptance");
     }
+    if (next.mtp_joint_acceptance && next.mtp_fixed_drafts) {
+        refuse("--mtp-joint-acceptance chooses how many MTP drafts each round verifies and --mtp-fixed "
+               "(mtp_fixed_drafts) always verifies --draft-tokens: use one of them");
+    }
     if (next.ram_headroom_bytes > kMaxByteOption ||
         (next.vram_headroom_bytes && *next.vram_headroom_bytes > kMaxByteOption) ||
         (next.expert_cache_bytes && *next.expert_cache_bytes > kMaxByteOption)) {
