@@ -1600,7 +1600,19 @@ int exercise_lossy_summary(const char* artifact) {
         std::cerr << "lossy summary follow-up: prompt=" << second_tokens << " submitted=" << submitted
                   << " summarised=" << summarised << " floor=" << reuse_floor
                   << " reused=" << second.reused_prompt_tokens << " computed=" << second.computed_prefill_tokens
-                  << " reused_summary=" << (second_report && second_report->summary_reused) << '\n';
+                  << " reused_summary=" << (second_report && second_report->summary_reused)
+                  << " first=" << first_tokens << " opener=" << opener_tokens
+                  << " closing=" << closing_tokens << " counted=" << engine.count_tokens(input)
+                  << " usage=" << second.prompt.prompt_tokens
+                  << " path=" << static_cast<int>(second.prefix_reuse_path) << " same_messages="
+                  << (second_report &&
+                      second_report->summarized_messages == first_report->summarized_messages)
+                  << " reused_counter="
+                  << after_second.lossy_prefill_summaries_reused -
+                         before_second.lossy_prefill_summaries_reused
+                  << " new_counter="
+                  << after_second.lossy_prefill_summaries_new - before_second.lossy_prefill_summaries_new
+                  << '\n';
         return 1;
     }
     std::cout << "lossy summary: client=" << client_size << " summarised=" << summarised << " messages=["
