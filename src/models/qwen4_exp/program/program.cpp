@@ -397,15 +397,17 @@ struct SpecLayout {
                 w_lengths = 0, w_anchors = 0, w_commit = 0, w_mtp_ids = 0, w_count = 0;
 
     static SpecLayout plan(const TextConfig& c, std::int32_t drafts, std::size_t tail_bytes, std::size_t conv_bytes,
-                           std::size_t lanes, bool gdn_head_map) {
+                           std::size_t lanes, const ProgramOptions& o) {
         SpecLayout out;
         out.drafts = drafts;
         out.width  = drafts + 1;
         const std::size_t W = static_cast<std::size_t>(out.width), w = c.residual_width();
         const std::size_t di = c.qsa.index_head_dim;
         LayoutBuilder builder;
-        out.gdn = plan_gdn_replay_records(builder, gdn_records_spec(c, out.width, gdn_head_map));
-        out.gdn_bytes = align(out.gdn.payload_bytes());
+        out.gdn = plan_gdn_replay_records(builder, gdn_records_spec(c, out.width, o.gdn_head_map));
+        // The records' share of the plan (what ninfer_qwen4_exp_program_plan_test checks); `drafts` is
+        // o.mtp_draft_tokens.
+        out.gdn_bytes = plan_gdn_record_bytes(o, c);
         std::size_t at = out.gdn_bytes;
         const auto take = [&](std::size_t bytes) {
             const std::size_t here = at;
@@ -549,7 +551,7 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
         d.slots_at    = align(at);
         d.state_total = d.slots_at + align(4ULL * d.lanes);
     }
-    if (d.drafts > 0) { d.spec = SpecLayout::plan(c, d.drafts, d.tail, d.gdn_conv, d.lanes, o.gdn_head_map); }
+    if (d.drafts > 0) { d.spec = SpecLayout::plan(c, d.drafts, d.tail, d.gdn_conv, d.lanes, o); }
     for (const std::uint64_t stride : strides) { d.frame_stride = std::max(d.frame_stride, stride); }
     if (d.frame_stride == 0) { throw std::invalid_argument("Qwen3.8-Flash-Next: no expert banks"); }
     d.staging    = static_cast<std::size_t>(kStagingSlots) * d.frame_stride;

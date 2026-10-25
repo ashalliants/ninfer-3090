@@ -211,7 +211,7 @@ int main() {
         // vocabulary startup refuses naming the flag, before the device is asked anything.
         q4::ProgramOptions hot;
         hot.max_context = 32768;
-        check(hot.hot_embedding_rows == 0, "hot embedding rows are on by default");
+        check(hot.hot_embedding_rows == 0, "hot embedding rows are off by default");
         check(q4::plan_hot_embedding(model.vocab_size, model.hidden_size, hot.hot_embedding_rows).hot == 0,
               "off plans no hot rows");
         check(q4::plan_hot_embedding(model.vocab_size, model.hidden_size, 8192).hot == 8192ULL * 1360,
@@ -232,8 +232,8 @@ int main() {
 
         // --gdn-head-map: MTP's GDN replay records hold the 16 key heads (the tiled map) instead of one
         // key head per value head (the copy route), so their key plane shrinks by two thirds. The
-        // records are the GDN share of ProgramDevicePlan::speculation (SpecLayout::plan takes the same
-        // gdn_records_spec), zero without MTP.
+        // records are the GDN share of ProgramDevicePlan::speculation (SpecLayout::plan takes its GDN
+        // bytes from plan_gdn_record_bytes and binds gdn_records_spec), zero without MTP.
         q4::TextConfig flash          = config();
         flash.gdn_layers              = 36;
         flash.gdn.key_heads           = 16;
@@ -242,7 +242,7 @@ int main() {
         flash.gdn.value_head_dim      = 128;
         q4::ProgramOptions copies;
         copies.max_context = 32768;
-        check(!copies.gdn_head_map, "the GDN head map is on by default");
+        check(!copies.gdn_head_map, "the GDN head map is off by default");
         const auto copy_spec = q4::gdn_records_spec(flash, 8, false);
         const auto map_spec  = q4::gdn_records_spec(flash, 8, true);
         check(copy_spec.qk_heads == 48 && copy_spec.head_map == ninfer::GdnHeadMap::Blocked,

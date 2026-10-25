@@ -698,9 +698,12 @@ None has been measured on the RTX 3090 yet.
 - **GDN key heads through a head map** (`--gdn-head-map`). The GGUF pairs value head h with key
   head h mod 16 (tiled order). Without the option `tile_heads` copies q and k to 48 heads, one per
   value head, before each GDN layer's recurrence: 3 `cudaMemcpy2DAsync` per tensor, 216 copy nodes
-  per decode token (0.25 ms of the "QSA, GDN, norms, copies" row above). With it the
-  GatedDeltaNet Ops take an `ops::GdnHeadMap`: `Tiled` reads key head h mod Hqk, `Blocked` (the
-  default, Qwen3.5's grouped heads) h / (Hv / Hqk). Every route Flash-Next calls takes it: the
+  per decode token (the copies' share of the "QSA, GDN, norms, copies" row above; this change is not
+  measured). With it the GatedDeltaNet Ops take an `ops::GdnHeadMap`: `Tiled` reads key head
+  h mod Hqk, `Blocked` (the default, Qwen3.5's grouped heads) h / (Hv / Hqk). The map is a
+  compile-time kernel parameter: the Blocked kernels are master's code, and the Tiled ones are
+  instantiated only for Flash-Next's calls (normalized q/k, an FP32 state, dense replay rows; other
+  combinations are refused). Every route Flash-Next calls takes it: the
   recurrent kernel (decode, prefill calls under 16 tokens), the chunked route (prefill; the Q/K
   packet is published by the first value head that reads it, h < 16), the rows route's batch update
   (two lanes), and MTP's replay record and fold.

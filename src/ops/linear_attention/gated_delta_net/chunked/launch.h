@@ -23,19 +23,20 @@ struct Arguments {
     __nv_bfloat16* out;
     int qk_heads, value_heads, tokens;
     float scale;
-    GdnHeadMap map = GdnHeadMap::Blocked;
 };
 
-// Value head `head`'s Q/K head (core/gdn_head_map.h), and whether it is the first value head
-// reading that Q/K head (the one that publishes its packet).
+// Value head `head`'s Q/K head under the compile-time map (core/gdn_head_map.h), and whether it is
+// the first value head reading that Q/K head (the one that publishes its packet).
+template <GdnHeadMap Map>
 __host__ __device__ inline int qk_head_of(const Arguments& args, int head) {
-    return args.map == GdnHeadMap::Tiled ? head % args.qk_heads
-                                         : head / (args.value_heads / args.qk_heads);
+    if constexpr (Map == GdnHeadMap::Tiled) { return head % args.qk_heads; }
+    return head / (args.value_heads / args.qk_heads);
 }
 
+template <GdnHeadMap Map>
 __host__ __device__ inline bool publishes_qk(const Arguments& args, int head) {
-    return args.map == GdnHeadMap::Tiled ? head < args.qk_heads
-                                         : head % (args.value_heads / args.qk_heads) == 0;
+    if constexpr (Map == GdnHeadMap::Tiled) { return head < args.qk_heads; }
+    return head % (args.value_heads / args.qk_heads) == 0;
 }
 
 // Q/K are independent of value-head gates. One packet is shared by every value head reading it.
@@ -86,10 +87,11 @@ inline WorkspaceLayout workspace_layout(int qk_heads, int value_heads, int token
     return layout;
 }
 
+// The tiled map is instantiated for Qwen3.8-Flash-Next's call only (normalized q/k).
 void launch_prepare(const Arguments& args, QkChunk* qk, ControlChunk* control, bool normalize_qk,
-                    cudaStream_t stream);
+                    cudaStream_t stream, GdnHeadMap map = GdnHeadMap::Blocked);
 void launch_recurrence(const Arguments& args, const QkChunk* qk, const ControlChunk* control,
-                       DeviceExecutionView execution);
+                       DeviceExecutionView execution, GdnHeadMap map = GdnHeadMap::Blocked);
 int value_tile(int value_heads, int multiprocessor_count);
 
 } // namespace ninfer::ops::detail::gated_delta_net::chunked

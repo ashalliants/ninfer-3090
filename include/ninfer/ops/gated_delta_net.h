@@ -35,6 +35,8 @@ using ninfer::GdnHeadMap;
  * Applies the Gated DeltaNet recurrence independently for each value head h. Its Q/K head is
  * qh=gdn_qk_head(h, Hv, Hqk, map) (core/gdn_head_map.h): with G=value_heads/qk_heads,
  * qh=floor(h/G) for GdnHeadMap::Blocked (the default) and qh=h mod Hqk for GdnHeadMap::Tiled.
+ * Tiled is admitted with normalize_qk and an FP32 state only (Qwen3.8-Flash-Next's call; other
+ * combinations throw std::invalid_argument), here and in gated_delta_net_batch_update.
  * Starting from S_h, for t in increasing order:
  *
  *   alpha       = exp(g[h,t])
@@ -100,7 +102,8 @@ void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor
  * gdn_qk_head(h, Hv, Hq, map) as in gated_delta_net. The ReplaySSM execution domain is B=1..8 and
  * T=2..16, with the blocked map at Hq=16 and Hv in {32,48} or at Hq=Hv=48 (Qwen3.8-Flash-Next's
  * tiled heads expanded by the caller to one q/k head per value head), or the tiled map at Hq=16
- * and Hv=48 (the same heads read in place). scale is 1/sqrt(128).
+ * and Hv=48 (the same heads read in place) with dense rows (empty valid_columns) and an FP32
+ * ssm_states. scale is 1/sqrt(128).
  *
  * valid_columns is empty for dense rows or device I32 [B], with every caller-supplied extent in
  * [1,T]. initial_state_slots is device I32 [B] containing absolute slots in [0,S). For each valid

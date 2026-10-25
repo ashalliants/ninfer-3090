@@ -171,10 +171,11 @@ struct RecurrentCoordinates {
     std::uint32_t dqk_base;
 };
 
+template <class HeadMap>
 __device__ __forceinline__ RecurrentCoordinates make_coordinates(std::int32_t batch,
                                                                  std::int32_t layer,
                                                                  std::int32_t state_tile,
-                                                                 head_map heads) {
+                                                                 HeadMap heads) {
     const int lane                 = threadIdx.x;
     const int warp                 = threadIdx.y;
     const std::uint32_t value_head = static_cast<std::uint32_t>(blockIdx.x);
@@ -247,7 +248,7 @@ struct FoldEffects {
                    std::int32_t) {}
 };
 
-template <class StateT = float>
+template <class StateT = float, GdnHeadMap Map = GdnHeadMap::Blocked>
 struct DirectAccess {
     const __nv_bfloat16* q;
     const __nv_bfloat16* k;
@@ -257,7 +258,7 @@ struct DirectAccess {
     const StateT* state_read;
     StateT* state_write;
     __nv_bfloat16* out;
-    head_map heads;
+    head_map<Map> heads;
     std::int32_t width;
     float scale;
 
@@ -306,7 +307,7 @@ struct DirectAccess {
     }
 };
 
-template <class StateT = float>
+template <class StateT = float, GdnHeadMap Map = GdnHeadMap::Blocked>
 struct BatchUpdateAccess {
     const __nv_bfloat16* q;
     const __nv_bfloat16* k;
@@ -318,7 +319,7 @@ struct BatchUpdateAccess {
     const std::int32_t* source_state_slots;
     const std::int32_t* destination_state_slots;
     __nv_bfloat16* out;
-    head_map heads;
+    head_map<Map> heads;
     std::int64_t state_slot_stride;
     float scale;
 
@@ -372,7 +373,7 @@ struct BatchUpdateAccess {
     }
 };
 
-template <bool Masked, class StateT = float>
+template <bool Masked, class StateT = float, GdnHeadMap Map = GdnHeadMap::Blocked>
 struct RecordAccess {
     const __nv_bfloat16* q;
     const __nv_bfloat16* k;
@@ -386,7 +387,7 @@ struct RecordAccess {
     __nv_bfloat16* value_record;
     uint2* gate_record;
     __nv_bfloat16* out;
-    head_map heads;
+    head_map<Map> heads;
     std::int32_t width;
     std::int64_t state_slot_stride;
     float scale;
@@ -683,7 +684,7 @@ __device__ __forceinline__ void zero_output_suffix(const Access& access,
     }
 }
 
-template <bool NormalizeInputs, class StateT>
+template <bool NormalizeInputs, class StateT, GdnHeadMap Map = GdnHeadMap::Blocked>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     recurrent_bf16_direct_kernel(const __nv_bfloat16* __restrict__ q,
                                  const __nv_bfloat16* __restrict__ k,
@@ -691,8 +692,8 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
                                  const float* __restrict__ beta,
                                  const StateT* __restrict__ state_read,
                                  StateT* __restrict__ state_write, __nv_bfloat16* __restrict__ out,
-                                 std::int32_t width, head_map heads, float scale) {
-    const DirectAccess<StateT> access{q,     k,          v,   g,     beta, state_read,
+                                 std::int32_t width, head_map<Map> heads, float scale) {
+    const DirectAccess<StateT, Map> access{q,     k,          v,   g,     beta, state_read,
                                       state_write, out, heads, width, scale};
     const RecurrentCoordinates coord = access.coordinates();
     __align__(16) float state[kDvPerWarp][kQkPerLane];
@@ -701,9 +702,9 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     store_state_tile(state, access.state_write_base(coord), coord);
 }
 
-template <bool NormalizeInputs, class StateT>
+template <bool NormalizeInputs, class StateT, GdnHeadMap Map = GdnHeadMap::Blocked>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
-    recurrent_batch_update_kernel(BatchUpdateAccess<StateT> access) {
+    recurrent_batch_update_kernel(BatchUpdateAccess<StateT, Map> access) {
     const RecurrentCoordinates coord = access.coordinates();
     __align__(16) float state[kDvPerWarp][kQkPerLane];
     load_state_tile(state, access.state_read_base(coord), coord);
@@ -737,9 +738,9 @@ __device__ __forceinline__ RawQkLane staged_qk_lane(const __nv_bfloat16 (&row)[k
     return out;
 }
 
-template <bool Masked, class StateT>
+template <bool Masked, class StateT, GdnHeadMap Map = GdnHeadMap::Blocked>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
-    recurrent_record_kernel(RecordAccess<Masked, StateT> access) {
+    recurrent_record_kernel(RecordAccess<Masked, StateT, Map> access) {
     __shared__ RecordStage stage;
     const RecurrentCoordinates coord = access.coordinates();
     const std::int32_t valid         = access.active_columns(coord);
