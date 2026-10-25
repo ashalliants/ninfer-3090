@@ -1078,11 +1078,11 @@ None has been measured on the RTX 3090 yet.
     exists before routing). Per layer `offloaded_moe::select_stream_cold` leaves out round(F × s) of
     the layer's non-resident experts, s being the number the half-ring would stream, those with the
     lowest counts (ties to the lower id); they stay -1 in the stream table, so `covers_all()` is
-    false and the call keeps its staging pass. The call's MoE then applies the share rule to its
-    misses (the cold set the call routes plus any beyond the ring), as on a static call, so the CPU
-    takes F of the routed cold experts with at most 8 columns and the GPU stages the rest. A cold
-    guess that routes many rows is staged, not computed on the CPU. `Forward::cpu_channels` no longer
-    drops the share while the stream is active.
+    false and the call keeps its staging pass. The left-out set already encodes the share, so on a
+    streamed call the Forward sets the channel's share to 1 / 1: the CPU takes every miss (the cold
+    set the call routes, plus any beyond the ring) with at most 8 columns, and the GPU stages only
+    the misses with more (a cold guess the routing gave many rows). Static calls keep the F rule.
+    `Forward::cpu_channels` no longer drops the share while the stream is active.
   - Design: the same `CpuMissService` as `--cpu-verify-misses`, started for either option, with its
     buffers sized for the larger use (`plan_cpu_misses`). `MoeCpuChannel` gains `share_num` /
     `share_den` beside `pcie_divisor`, as two 16-bit words in its tail padding, so the struct size and
@@ -1098,7 +1098,8 @@ None has been measured on the RTX 3090 yet.
     (`src/ops/offloaded_sparse_moe/cpu_share.h`, in `ninfer_moe_cpu_selection_test`). GPU
     (`ninfer_offloaded_moe_wide_test`): prefill_cpu_share (shares 3/5, 1/1 and 1/3, staged through 4
     or 64 slots and zero-copy, T in {1, 16, 65, 300, 600}) and prefill_cpu_share_streamed (a stream
-    table of cache and ring frames with the cold set left -1, 512 experts, T in {1024, 2048}), each
+    table of cache and ring frames with the 3/5 cold set left -1 and the plan share 1/1, 512 experts,
+    T in {1024, 2048}), each
     eagerly and in two graph replays: outputs against the CPU engine bit for bit, each `MissRequest`
     against `select_prefill_cpu_jobs` with compacted columns. End to end
     `ninfer_qwen4_exp_prefill_cpu_share_test` (greedy ids of 300-, 1,024- and 2,048-token prompts with a
@@ -1117,8 +1118,8 @@ None has been measured on the RTX 3090 yet.
     CPU over a hundred); the cost of `cpu_plan_kernel`'s one-CTA x publish at 1-2K columns (a few
     MiB over PCIe per layer from one CTA, and thread 0 compacts the columns serially); whether
     leaving experts out of the stream costs more staging (on the SMs, inside the layer) than the CPU
-    saves (the share of routed cold experts with more than 8 columns, and whether a share of 1 for
-    the cold set would do better); and the WDDM/TDR check of `--cpu-verify-misses` (a layer's wait
+    saves (the share of routed cold experts with more than 8 columns), and whether the cold-set size
+    F is right for streamed calls (it sets how much the CPU takes there); and the WDDM/TDR check of `--cpu-verify-misses` (a layer's wait
     here is milliseconds). Works with two lanes, MTP and vision. Not measured.
 
 ## Artifact decisions

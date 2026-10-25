@@ -69,7 +69,8 @@ inline std::vector<int> select_prefill_cpu_jobs(std::span<const std::int32_t> jo
 /// them); the stream would copy min(n, capacity) of them. Of the n, the
 /// cpu_share_take(s, s, num, den) with s = min(n, capacity) that have the lowest prior use counts
 /// (counts[e]; ties to the lower id) are predicted cold: the stream leaves them out, so they stay
-/// misses for the call, whose CPU share (the device rule above) then takes those routed few rows.
+/// misses for the call, whose channel then takes every one routed at most 8 rows (the device rule
+/// above at share 1 / 1: select_prefill_cpu_jobs(..., 1, 1, ...)).
 /// Returns their ids, ascending. num 0 returns none.
 inline std::vector<std::int32_t> select_stream_cold(std::span<const std::int32_t> frames,
                                                     std::span<const std::uint32_t> counts, int capacity, int num,

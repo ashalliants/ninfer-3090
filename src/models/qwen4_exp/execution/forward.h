@@ -73,9 +73,10 @@ struct ForwardExperts {
     // answering writes it, and the caller must fail the round. Empty: every call stays on the GPU.
     std::vector<ops::MoeCpuChannel> cpu;
     // Optional, per layer: the same service's channels with the share rule (MoeCpuChannel::share_num
-    // / share_den) for a prefill call that asks for it (ForwardBatch::cpu_share), streamed or not
-    // (a streamed call's misses are the experts the stream left out). Requires `error`, like `cpu`.
-    // Empty: prefill stays on the GPU.
+    // / share_den) for a prefill call that asks for it (ForwardBatch::cpu_share), streamed or not.
+    // A streamed call's misses are the experts the stream left out, its share already: the Forward
+    // sets the channel's share to 1 / 1 for it (every miss of at most 8 columns to the CPU).
+    // Requires `error`, like `cpu`. Empty: prefill stays on the GPU.
     std::vector<ops::MoeCpuChannel> prefill_cpu;
     // Optional prefill expert stream: while it is active the MoE reads its per-layer frame tables
     // (streamed experts resident in the ring) and orders itself with the stream's copies.

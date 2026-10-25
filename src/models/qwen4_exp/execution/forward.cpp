@@ -838,6 +838,12 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     ExpertStream* stream = experts_.stream != nullptr && experts_.stream->active() ? experts_.stream : nullptr;
     if (stream != nullptr) {
         source.frames = stream->table(layer);
+        // A streamed call's misses are the cold set its stream left out (which already encodes the
+        // prefill share) and any experts beyond the ring: the CPU takes every one of at most 8 columns.
+        if (cpu && cpu_leg == &experts_.prefill_cpu) {
+            source.cpu.share_num = 1;
+            source.cpu.share_den = 1;
+        }
         // Every non-resident expert streamed: no staging pass (one pass over every job).
         if (stream->covers_all()) { source.staging_slots = 0; }
         stream->before_experts(layer, s);
