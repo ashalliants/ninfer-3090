@@ -511,7 +511,15 @@ int main() {
             {"--lossy-prefill-strategy", "tokens"},
             {"--lossy-prefill-strategy", "Summary"},
             {"--lossy-prefill-summary-max-tokens", "0"},
+            {"--lossy-prefill-pool-window", "2"},
+            // A keep share above the skip share: the message names the keep flag.
+            {"--lossy-prefill-keep", "0.9", "--lossy-prefill-skip", "0.8"},
         };
+        // Equal shares are allowed (a selection at the skip share is not skipped).
+        failures += check(parse({"ninfer-serve", "model.ninfer", "--lossy-prefill-min-tokens", "30000",
+                                 "--lossy-prefill-keep", "0.5", "--lossy-prefill-skip", "0.5"})
+                                  .lossy_prefill.keep_fraction == 0.5F,
+                          "--lossy-prefill-keep equal to --lossy-prefill-skip was rejected");
         for (const auto& extra : bad) {
             std::vector<std::string> args = {"ninfer-serve", "model.ninfer", "--lossy-prefill-min-tokens",
                                              "30000"};

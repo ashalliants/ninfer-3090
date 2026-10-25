@@ -127,6 +127,57 @@ void test_forced_exceeds_budget() {
     for (std::uint32_t i = 7000; i < n; ++i) require(contains(r, i), "recent kept");
 }
 
+void test_skip_rule_counts_the_budget() {
+    // Forced and always-kept tokens alone stay under the skip share, but the budget does not: the
+    // selection would keep more than skip_fraction of U, so it is skipped before any block fills.
+    const std::size_t n = 10000;
+    std::vector<float> scores(n, 0.0F);
+    std::vector<std::uint8_t> forced(n, 0);
+    auto o          = make_options(0.85F, 0, 1000); // 1,000 kept, budget 8,500 > 0.8 x 10,000
+    const auto high = select_tokens({scores, forced}, o);
+    require(high.skipped && high.kept.size() == n, "a budget over the skip share skips");
+    o.keep_fraction = 0.8F; // budget 8,000: not over the share
+    const auto edge = select_tokens({scores, forced}, o);
+    require(!edge.skipped, "a budget at the skip share does not skip");
+}
+
+void test_pool_window_spreads_across_blocks() {
+    // Per-token max pooling (centred, width 33, clamped at the ends): a spike on the last token of
+    // block 5 lifts the first 16 tokens of block 6 to the spike, so block 6 outranks every other
+    // unscored block. Block budget: two blocks of 64.
+    const std::size_t n = 64 * 16;
+    std::vector<float> scores(n, 0.0F);
+    std::vector<std::uint8_t> forced(n, 0);
+    scores[6 * 64 - 1] = 1.0F;
+    auto o = make_options(2.0F * 64.0F / static_cast<float>(n), 0, 0);
+    o.pool_window = 33;
+    const auto r = select_tokens({scores, forced}, o);
+    require(r.kept.size() == 2 * 64, "two blocks kept");
+    require(contains(r, 5 * 64) && contains(r, 6 * 64 + 63), "the spike's block and its neighbour");
+    require(!contains(r, 0), "an unscored block lost to the lifted neighbour");
+    // Without pooling the neighbour is not lifted and the tie goes to block 0.
+    o.pool_window = 1;
+    const auto unpooled = select_tokens({scores, forced}, o);
+    require(contains(unpooled, 5 * 64) && contains(unpooled, 0) && !contains(unpooled, 6 * 64),
+            "no pooling: the tie goes to the lowest block");
+    // Clamped at the ends: a spike on the last token pools over the 16 tokens before it only, and
+    // nothing reads past U.
+    std::vector<float> last(n, 0.0F);
+    last[n - 1] = 1.0F;
+    o.pool_window = 33;
+    const auto back = select_tokens({last, forced}, o);
+    require(contains(back, static_cast<std::uint32_t>(n - 1)) && contains(back, 0) &&
+                !contains(back, 64),
+            "a spike at the end: the last block, then the tie to block 0");
+    // An even width is a contract violation (validation rejects it before this point).
+    o.pool_window = 32;
+    bool threw = false;
+    try {
+        (void)select_tokens({scores, forced}, o);
+    } catch (const std::invalid_argument&) { threw = true; }
+    require(threw, "an even pool window is rejected");
+}
+
 void test_kept_runs() {
     // Maximal runs of consecutive offsets, [begin, end).
     const std::vector<std::uint32_t> kept{0, 1, 2, 5, 7, 8, 63, 64, 65};
@@ -168,6 +219,8 @@ int main() {
         test_deterministic();
         test_sorted_unique();
         test_forced_exceeds_budget();
+        test_skip_rule_counts_the_budget();
+        test_pool_window_spreads_across_blocks();
         test_kept_runs();
         std::cout << "lossy selection tests passed\n";
     } catch (const std::exception& error) {

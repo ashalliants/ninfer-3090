@@ -23,10 +23,12 @@ struct SelectionResult {
     bool skipped = false;            // skip rule fired: kept == every offset
 };
 
-// Forced tokens are always kept, even past the budget. When their count exceeds
-// skip_fraction * |U| everything is kept and `skipped` is set. Otherwise whole blocks are added in
-// descending block score (ties: lower index first) until the budget ceil(keep_fraction * |U|) is
-// reached; the last block may overshoot by less than one block.
+// Forced tokens are always kept, even past the budget. When the larger of their count and the
+// budget ceil(keep_fraction * |U|) exceeds ceil(skip_fraction * |U|), everything is kept and
+// `skipped` is set. Otherwise every token's score is max-pooled over a centred window of pool_window tokens
+// (odd, clamped at the ends), a block scores the sum of its pooled tokens, and whole blocks are
+// added in descending block score (ties: lower index first) until the budget is reached; the last
+// block may overshoot by less than one block. Throws for block_tokens 0 or an even pool_window.
 [[nodiscard]] SelectionResult select_tokens(const SelectionInput& input, const LossyPrefillOptions& options);
 
 // The maximal runs of consecutive offsets in `kept` (ascending, unique), as [begin, end) pairs:

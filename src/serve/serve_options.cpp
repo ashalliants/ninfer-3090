@@ -243,8 +243,9 @@ std::string serve_usage_text(const char* argv0) {
            "gap shrinks to a slice while the chunk keeps its size (so the prompt is not slowed "
            "the way a smaller --prefill-chunk or a stall budget slows it). Not for media, DFlash "
            "or a pipeline split; 0 or 1 is off, at most 16. Off by default\n"
-           "       --lossy-prefill-min-tokens N filters a prompt whose part after the last shared "
-           "marker has at least N tokens: a scout pass scores blocks and only the kept ones are "
+           "       --lossy-prefill-min-tokens N filters a prompt whose part after the product prompt "
+           "(leading system/developer messages and tools) has more than N tokens: a scout pass "
+           "scores blocks and only the kept ones are "
            "prefilled (lossy: the dropped text is not seen by the model). Text-only Qwen3.5 dense, "
            "not for private conversation reuse. 0 (the default) is off. Tuning: "
            "--lossy-prefill-keep F (share of blocks kept, (0,1], default 0.2), "
@@ -253,8 +254,9 @@ std::string serve_usage_text(const char* argv0) {
            "--lossy-prefill-recent N (always-kept tail tokens, default 4096), "
            "--lossy-prefill-head N (always-kept head tokens, default 256), "
            "--lossy-prefill-query-rows N (1-256, default 64), "
-           "--lossy-prefill-pool-window N (odd, default 33), "
-           "--lossy-prefill-skip F (keep everything when the kept share would exceed F, (0,1], default 0.8), "
+           "--lossy-prefill-pool-window N (per-token max-pooling width, odd, default 33), "
+           "--lossy-prefill-skip F (keep everything when the kept share would exceed F, (0,1], at least "
+           "the keep share, default 0.8), "
            "--lossy-prefill-scout-a4 (int4 scout GEMMs)\n"
            "       --lossy-prefill-strategy select|summary picks how such a prompt is shortened: "
            "select (the default) is the scout and block selection above; summary replaces the "
@@ -1069,6 +1071,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         if (!(lossy.skip_fraction > 0.0F && lossy.skip_fraction <= 1.0F)) {
             throw std::invalid_argument("--lossy-prefill-skip must be in (0, 1]");
+        }
+        // A keep share above the skip share would skip every prompt after its scout.
+        if (lossy.keep_fraction > lossy.skip_fraction) {
+            throw std::invalid_argument(
+                "--lossy-prefill-keep must not exceed --lossy-prefill-skip (every prompt would be "
+                "skipped)");
         }
         if (lossy.block_tokens < 16 || lossy.block_tokens % 16 != 0) {
             throw std::invalid_argument("--lossy-prefill-block must be a multiple of 16, at least 16");

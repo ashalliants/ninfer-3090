@@ -10,7 +10,8 @@ namespace ninfer::models::qwen3_5::detail {
 
 namespace {
 
-// Centred sliding-window max of width `window` (odd; clamped at the ends), O(n).
+// Centred sliding-window max of width `window` over tokens (odd: window / 2 on each side;
+// clamped at the ends), O(n).
 std::vector<float> max_pool(std::span<const float> x, std::size_t window) {
     const std::size_t n = x.size();
     const std::size_t half = window / 2;
@@ -44,6 +45,9 @@ SelectionResult select_tokens(const SelectionInput& input, const LossyPrefillOpt
     if (options.block_tokens == 0) {
         throw std::invalid_argument("lossy selection: block_tokens must be positive");
     }
+    if (options.pool_window % 2 == 0) {
+        throw std::invalid_argument("lossy selection: pool_window must be odd");
+    }
 
     SelectionResult result;
     std::vector<std::uint8_t> keep(n, 0);
@@ -56,17 +60,22 @@ SelectionResult select_tokens(const SelectionInput& input, const LossyPrefillOpt
     std::fill(keep.end() - static_cast<std::ptrdiff_t>(recent), keep.end(), std::uint8_t{1});
 
     std::size_t kept_count = static_cast<std::size_t>(std::count(keep.begin(), keep.end(), std::uint8_t{1}));
-    if (static_cast<double>(kept_count) > static_cast<double>(options.skip_fraction) * static_cast<double>(n)) {
+    const std::size_t budget =
+        static_cast<std::size_t>(std::ceil(static_cast<double>(options.keep_fraction) * static_cast<double>(n)));
+    // The skip rule counts what the selection would keep: the forced and always-kept tokens, or the
+    // budget the blocks fill up to, whichever is larger. Both shares round up the same way, so a
+    // keep share equal to the skip share never skips on rounding alone.
+    const std::size_t skip_limit =
+        static_cast<std::size_t>(std::ceil(static_cast<double>(options.skip_fraction) * static_cast<double>(n)));
+    if (std::max(kept_count, budget) > skip_limit) {
         result.skipped = true;
         result.kept.resize(n);
         std::iota(result.kept.begin(), result.kept.end(), std::uint32_t{0});
         return result;
     }
 
-    const std::size_t budget =
-        static_cast<std::size_t>(std::ceil(static_cast<double>(options.keep_fraction) * static_cast<double>(n)));
     if (kept_count < budget) {
-        const std::vector<float> pooled = max_pool(input.scores, std::max<std::size_t>(options.pool_window, 1));
+        const std::vector<float> pooled = max_pool(input.scores, options.pool_window);
         const std::size_t block = options.block_tokens;
         const std::size_t blocks = (n + block - 1) / block;
         std::vector<double> block_score(blocks, 0.0);

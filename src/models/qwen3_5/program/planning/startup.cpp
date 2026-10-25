@@ -966,6 +966,17 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         if (options.lossy_prefill.query_rows == 0 || options.lossy_prefill.query_rows > 256) {
             throw std::invalid_argument("lossy prefill query rows must be in [1,256]");
         }
+        // Selection's own contract (selection.h), checked here so a bad option fails at startup
+        // rather than at the end of a request's scout.
+        if (options.lossy_prefill.pool_window % 2 == 0) {
+            throw std::invalid_argument("lossy prefill pool window must be odd");
+        }
+        if (options.lossy_prefill.block_tokens == 0) {
+            throw std::invalid_argument("lossy prefill block must be positive");
+        }
+        if (options.lossy_prefill.keep_fraction > options.lossy_prefill.skip_fraction) {
+            throw std::invalid_argument("lossy prefill keep share must not exceed the skip share");
+        }
         // The int4 scout replaces the integer-A8 prefill route of the Q4 matrices; with none on
         // that route (no --prefill-a8, or a build without the sm86 integer routes) it would
         // silently be the int8 scout.

@@ -292,8 +292,8 @@ enum class LossySummaryProbe : std::uint8_t { Cold, Warm, Timeout };
 // Lossy long-prompt prefill: past a threshold, a cheap scout pass scores blocks of the prompt and
 // only the kept blocks are prefilled (the rest never enter the KV cache). Off by default.
 struct LossyPrefillOptions {
-    // Prompts whose part after the last shared marker has at least this many tokens are filtered.
-    // 0 (the default) is off.
+    // Prompts whose part after the product prompt (the leading System/Developer messages and tools)
+    // has more than this many tokens are filtered. 0 (the default) is off.
     std::uint32_t min_tokens = 0;
     // Share of the filtered part's blocks to keep, in (0, 1].
     float keep_fraction = 0.2F;
@@ -306,10 +306,13 @@ struct LossyPrefillOptions {
     std::uint32_t head_tokens   = 256;
     // Trailing query rows that score the blocks, 1..256.
     std::uint32_t query_rows = 64;
-    // Score pooling window over neighbouring blocks, odd.
+    // Score pooling: each token's score becomes the max over a centred window of this many tokens
+    // (odd; clamped at the ends) before blocks are summed, so a block next to a high-scoring token
+    // ranks higher. 1 is no pooling.
     std::uint32_t pool_window = 33;
-    // Skip rule: when the kept tokens would exceed this share of the filtered part, keep everything
-    // (an ordinary full prefill after the scout). In (0, 1].
+    // Skip rule: when the kept tokens (the forced and always-kept ones, or the keep budget if
+    // larger) would exceed this share of the filtered part, keep everything (an ordinary full
+    // prefill after the scout). In (0, 1], at least keep_fraction.
     float skip_fraction = 0.8F;
     // Run the scout GEMMs with int4 activations.
     bool scout_a4 = false;
