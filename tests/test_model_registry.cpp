@@ -329,9 +329,12 @@ void shared_state_files_are_refused() {
     expect(!refused({a, b}), "a model's default n-gram volume and expert state are distinct files");
     a.options.flash_next.ngram_volume_path = "/m/a.ninfer";
     expect(refused({a, b}), "a model's n-gram volume may not land on its own artifact");
+    a.options.flash_next.ngram_volume_path.clear();
+    a.options.flash_next.default_expert_state_path = "/m/b.ninfer";
+    expect(refused({a, b}), "a model's default expert state may not land on another model's artifact");
+    a.options.flash_next.default_expert_state_path.clear();
     a.options.flash_next.save_expert_state = false;
     a.options.flash_next.expert_state_path.clear();
-    a.options.flash_next.ngram_volume_path.clear();
     a.options.request_log_jsonl = "/m/b.ninfer";
     expect(refused({a, b}), "the request log may not land on a model's artifact");
     a.options.request_log_jsonl = "/m/requests.jsonl";
