@@ -757,8 +757,9 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, std::ui
 
 const std::vector<ops::MoeCpuChannel>* Forward::cpu_channels(const ForwardBatch& batch) const noexcept {
     if (batch.verify != nullptr) { return &experts_.cpu; }
-    const bool streaming = experts_.stream != nullptr && experts_.stream->active();
-    return batch.cpu_share && !streaming ? &experts_.prefill_cpu : nullptr;
+    // A streamed call too: its misses are the experts the stream left out (beyond the ring, or the
+    // cold set ExpertStream::Share left out).
+    return batch.cpu_share ? &experts_.prefill_cpu : nullptr;
 }
 
 Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,

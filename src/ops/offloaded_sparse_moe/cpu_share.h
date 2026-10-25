@@ -5,8 +5,9 @@
 // (Basalt: llround of a double), and the rule runs on the device (cpu_plan_kernel in
 // cuda/moe_layer.cu) when a moe_experts call's channel sets share_num / share_den, so each call
 // follows its own routing without a host round trip. These pure host functions state that rule and
-// are the oracle the GPU test checks the published MissRequest against. Free of CUDA headers, so
-// host-only builds test it.
+// are the oracle the GPU test checks the published MissRequest against. select_stream_cold is the
+// streamed call's part, run on the host by the expert stream. Free of CUDA headers, so host-only
+// builds test it.
 
 #include "ops/offloaded_sparse_moe/cpu_selection.h"
 
@@ -61,6 +62,34 @@ inline std::vector<int> select_prefill_cpu_jobs(std::span<const std::int32_t> jo
     const int take = std::min(cap, cpu_share_take(misses, static_cast<int>(candidates.size()), num, den));
     candidates.resize(static_cast<std::size_t>(take));
     return candidates;
+}
+
+/// The prefill share of a streamed call, chosen before routing (the expert stream copies a layer's
+/// non-resident experts two layers ahead). frames[e] < 0 marks a layer's non-resident experts (n of
+/// them); the stream would copy min(n, capacity) of them. Of the n, the
+/// cpu_share_take(s, s, num, den) with s = min(n, capacity) that have the lowest prior use counts
+/// (counts[e]; ties to the lower id) are predicted cold: the stream leaves them out, so they stay
+/// misses for the call, whose CPU share (the device rule above) then takes those routed few rows.
+/// Returns their ids, ascending. num 0 returns none.
+inline std::vector<std::int32_t> select_stream_cold(std::span<const std::int32_t> frames,
+                                                    std::span<const std::uint32_t> counts, int capacity, int num,
+                                                    int den) {
+    if (frames.size() != counts.size() || capacity < 0) {
+        throw std::invalid_argument("select_stream_cold: frames and counts differ or the capacity is negative");
+    }
+    std::vector<std::int32_t> misses;
+    for (std::size_t e = 0; e < frames.size(); ++e) {
+        if (frames[e] < 0) { misses.push_back(static_cast<std::int32_t>(e)); }
+    }
+    const int n    = static_cast<int>(misses.size());
+    const int s    = std::min(n, capacity);
+    const int cold = cpu_share_take(s, s, num, den);
+    std::stable_sort(misses.begin(), misses.end(), [&](std::int32_t a, std::int32_t b) {
+        return counts[static_cast<std::size_t>(a)] < counts[static_cast<std::size_t>(b)];
+    });
+    misses.resize(static_cast<std::size_t>(cold));
+    std::sort(misses.begin(), misses.end());
+    return misses;
 }
 
 } // namespace ninfer::ops::offloaded_moe

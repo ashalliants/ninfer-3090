@@ -6,11 +6,19 @@
 
 #include "core/device.h"
 #include "core/pinned_upload.h"
+#include "ops/offloaded_sparse_moe/cpu_share.h"
 
 #include <algorithm>
+#include <atomic>
+#include <span>
 #include <stdexcept>
 
 namespace ninfer::models::qwen4_exp::execution {
+namespace {
+std::atomic<std::uint64_t> g_cold_experts{0}; // ExpertStream::process_cold_experts
+} // namespace
+
+std::uint64_t ExpertStream::process_cold_experts() noexcept { return g_cold_experts.load(std::memory_order_relaxed); }
 
 ExpertStream::ExpertStream(std::uint32_t layers, std::uint32_t experts, std::vector<Bank> banks,
                            std::uint8_t* frame_base, std::uint64_t frame_stride)
@@ -54,21 +62,37 @@ std::size_t ExpertStream::table_bytes() const noexcept {
 }
 
 void ExpertStream::begin(const std::int32_t* residency, std::int32_t* tables, std::uint32_t ring_first,
-                         std::uint32_t ring_frames, cudaStream_t compute) {
+                         std::uint32_t ring_frames, cudaStream_t compute, Share share) {
     if (active_) { throw std::logic_error("expert stream: a chunk is already streaming"); }
     if (ring_frames < 2 || tables == nullptr) { throw std::invalid_argument("expert stream: the ring holds no frames"); }
+    if (share.num != 0 && share.counts == nullptr) { throw std::invalid_argument("expert stream: a share without counts"); }
     half_       = ring_frames / 2;
     ring_first_ = ring_first;
     tables_     = tables;
     // The previous chunk's table upload may still read the pinned copy rewritten below.
     if (uploading_) { CUDA_CHECK(cudaEventSynchronize(uploaded_)); }
+    left_cold_ = false;
+    cold_.assign(experts_, 0);
     for (std::uint32_t l = 0; l < layers_; ++l) {
         std::int32_t* row          = tables_host_.data() + static_cast<std::size_t>(l) * experts_;
         const std::int32_t* frames = residency + static_cast<std::size_t>(l) * experts_;
         std::uint32_t taken        = 0;
+        if (share.num != 0) {
+            // The layer's predicted-cold misses stay -1 (the MoE stages them or the CPU takes them).
+            std::fill(cold_.begin(), cold_.end(), 0);
+            const auto cold = ops::offloaded_moe::select_stream_cold(
+                std::span(frames, experts_), std::span(share.counts + static_cast<std::size_t>(l) * experts_, experts_),
+                static_cast<int>(half_), share.num, share.den);
+            for (const std::int32_t e : cold) { cold_[static_cast<std::size_t>(e)] = 1; }
+            stats_.cold += cold.size();
+            g_cold_experts.fetch_add(cold.size(), std::memory_order_relaxed);
+            left_cold_ = left_cold_ || !cold.empty();
+        }
         for (std::uint32_t e = 0; e < experts_; ++e) {
             if (frames[e] >= 0) {
                 row[e] = frames[e];
+            } else if (cold_[e] != 0) {
+                row[e] = -1;
             } else if (taken < half_) {
                 row[e] = static_cast<std::int32_t>(ring_first_ + (l % 2) * half_ + taken++);
             } else {

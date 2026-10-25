@@ -83,11 +83,12 @@
 //
 // Prefill CPU share (prefill_cpu_share_matches_plain below, --prefill-cpu-share 0.6): greedy ids
 // (and with --mtp K the MTP rounds, drafts and acceptances) equal those of a GPU-only prefill, and the
-// CPU must serve an expert. The same arguments as --moe-precast-exact; the default 300-token prompt
-// is one static call (shorter than the expert stream's 512), which is what the share applies to.
+// CPU must serve an expert. The same arguments as --moe-precast-exact, plus --prompt-lengths A,B,...
+// (prompts cut from the fixtures, up to 4,096 tokens): a prompt under 512 tokens is one static call,
+// one of 512 or more one streamed call, which must leave predicted-cold experts out of the stream.
 //
 //   ninfer_qwen4_exp_engine_real_test --prefill-cpu-share-exact [--mtp K] [--expert-cache-mib N]
-//       [--max-context N] [--generate N] [TOKENS...]
+//       [--prompt-lengths A,B,...] [--max-context N] [--generate N] [TOKENS...]
 //
 // GDN commit on a side stream (gdn_async_commit_matches_serial below, --gdn-async-commit): greedy
 // ids, MTP rounds, drafts and acceptances equal those of the commit folded on the device stream, and
@@ -126,6 +127,7 @@
 // TOKENS is @FILE (ids separated by commas or whitespace) or a comma-separated id list.
 
 #include "core/vram_budget.h"
+#include "models/qwen4_exp/execution/expert_stream.h"
 #include "models/qwen4_exp/program/program.h"
 #include "ninfer/engine.h"
 #include "ninfer/ops/offloaded_sparse_moe.h"
@@ -709,6 +711,9 @@ struct BitwiseOption {
     // Optional: a process-wide count of the work only the option does; the gate fails when the
     // option's Engine leaves it unchanged (the option's route never ran).
     std::uint64_t (*exercised)() = nullptr;
+    // Optional: the same for the option's streamed-call route, required when a prompt is at least
+    // 512 tokens (one streamed call when the cache lends the stream its ring).
+    std::uint64_t (*exercised_streamed)() = nullptr;
 };
 
 int option_matches_off(const std::string& artifact, const std::vector<std::string>& args,
@@ -716,9 +721,13 @@ int option_matches_off(const std::string& artifact, const std::vector<std::strin
     std::uint32_t max_context = 8192, tokens = 128, mtp = 0;
     std::optional<std::uint64_t> cache_bytes;
     std::vector<std::string> jobs;
+    std::vector<std::size_t> lengths; // --prompt-lengths: prompts of these lengths from the fixtures
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& a = args[i];
-        if (a == "--max-context" && i + 1 < args.size()) {
+        if (a == "--prompt-lengths" && i + 1 < args.size()) {
+            std::stringstream list(args[++i]);
+            for (std::string item; std::getline(list, item, ',');) { lengths.push_back(std::stoul(item)); }
+        } else if (a == "--max-context" && i + 1 < args.size()) {
             max_context = static_cast<std::uint32_t>(std::stoul(args[++i]));
         } else if (a == "--expert-cache-mib" && i + 1 < args.size()) {
             cache_bytes = static_cast<std::uint64_t>(std::stoull(args[++i])) << 20;
@@ -732,6 +741,19 @@ int option_matches_off(const std::string& artifact, const std::vector<std::strin
     }
     std::vector<std::vector<TokenId>> prompts;
     for (const std::string& job : jobs) { prompts.push_back(parse_tokens(job)); }
+    if (!lengths.empty()) {
+        // The chat and doc fixtures one after the other (4,096 tokens), cut to each length.
+        std::vector<TokenId> pool;
+        for (const char* name : {"ppl_tokens-chat", "ppl_tokens-doc", "infernix_texts-chat", "infernix_texts-doc"}) {
+            const auto ids = parse_tokens("@" + std::string(NINFER_SOURCE_DIR) + "/tests/fixtures/qwen4_exp/" + name + ".ids");
+            pool.insert(pool.end(), ids.begin(), ids.end());
+        }
+        for (const std::size_t n : lengths) {
+            if (n == 0 || n > pool.size()) { throw std::invalid_argument("--prompt-lengths: 1.." + std::to_string(pool.size())); }
+            prompts.emplace_back(pool.begin(), pool.begin() + static_cast<std::ptrdiff_t>(n));
+            jobs.push_back("fixtures[0:" + std::to_string(n) + "]");
+        }
+    }
     if (prompts.empty()) {
         auto ids = parse_tokens("@" + std::string(NINFER_SOURCE_DIR) + "/tests/fixtures/qwen4_exp/ppl_tokens-chat.ids");
         ids.resize(std::min<std::size_t>(ids.size(), 300));
@@ -769,6 +791,7 @@ int option_matches_off(const std::string& artifact, const std::vector<std::strin
     wait_for_ram(ram_before);
     bool ok = true;
     const std::uint64_t exercised_before = option.exercised != nullptr ? option.exercised() : 0;
+    const std::uint64_t streamed_before  = option.exercised_streamed != nullptr ? option.exercised_streamed() : 0;
     Engine engine(engine_options(true));
     for (std::size_t j = 0; j < prompts.size(); ++j) {
         const Run run           = generate(engine, prompts[j], tokens);
@@ -796,6 +819,16 @@ int option_matches_off(const std::string& artifact, const std::vector<std::strin
         std::printf("%s: %llu units of the option's own work\n", option.on, static_cast<unsigned long long>(done));
         if (done == 0) {
             std::printf("FAIL: %s never ran its own route, so the identity says nothing about it\n", option.on);
+            ok = false;
+        }
+    }
+    const bool long_prompt = std::any_of(prompts.begin(), prompts.end(), [](const auto& p) { return p.size() >= 512; });
+    if (option.exercised_streamed != nullptr && long_prompt) {
+        const std::uint64_t done = option.exercised_streamed() - streamed_before;
+        std::printf("%s: %llu units of the option's streamed-call work\n", option.on, static_cast<unsigned long long>(done));
+        if (done == 0) {
+            std::printf("FAIL: %s never ran its streamed-call route (did the cache lend the stream its ring?)\n",
+                        option.on);
             ok = false;
         }
     }
@@ -860,15 +893,18 @@ int cpu_verify_misses_matches_plain(const std::string& artifact, const std::vect
 }
 
 // prefill_cpu_share_matches_plain (--prefill-cpu-share-exact, FlashNextOptions::prefill_cpu_share
-// at Basalt's 0.6): each layer of a prefill call that does not stream its experts hands the CPU miss
-// service 3 / 5 of its misses (those with the fewest columns, at most 8), computed beside the GPU's
-// staging; the greedy ids (and MTP statistics with --mtp) equal those of the GPU-only prefill, and the
-// CPU serves at least one expert. --expert-cache-mib N (both Engines) makes misses common.
+// at Basalt's 0.6): each layer of a prefill call hands the CPU miss service 3 / 5 of its misses (those
+// with the fewest columns, at most 8), computed beside the GPU's staging, a streamed call's misses
+// being the predicted-cold experts its stream left out; the greedy ids (and MTP statistics with
+// --mtp) equal those of the GPU-only prefill, the CPU serves at least one expert, and with a prompt
+// of 512 tokens or more a stream left at least one expert out. --expert-cache-mib N (both Engines)
+// makes misses common.
 int prefill_cpu_share_matches_plain(const std::string& artifact, const std::vector<std::string>& args) {
     return option_matches_off(artifact, args,
                               {"GPU prefill", "prefill CPU share 3/5", "prefill cpu share",
                                [](EngineOptions& o) { o.flash_next.prefill_cpu_share = {3, 5}; },
-                               [] { return ops::offloaded_moe::CpuMissService::process_served_experts(); }});
+                               [] { return ops::offloaded_moe::CpuMissService::process_served_experts(); },
+                               [] { return models::qwen4_exp::execution::ExpertStream::process_cold_experts(); }});
 }
 
 // gdn_async_commit_matches_serial (--gdn-async-commit-exact, FlashNextOptions::gdn_async_commit):

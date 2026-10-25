@@ -463,10 +463,11 @@ struct ProgramOptions {
     bool cpu_verify_misses           = false;
     std::uint32_t cpu_verify_workers = 6;
     // FlashNextOptions::prefill_cpu_share (num / den, num 0: off): the same service (started for
-    // either option) takes that share of each layer's misses in prefill and forced-token calls that do
-    // not stream their experts (execution::ForwardExperts::prefill_cpu, ForwardBatch::cpu_share), the
-    // fewest-column ones of at most 8 columns first, while the GPU stages and runs the rest. The same
-    // outputs, bit for bit. A call whose CPU leg times out throws (its request ends with an error);
+    // either option) takes that share of each layer's misses in prefill and forced-token calls
+    // (execution::ForwardExperts::prefill_cpu, ForwardBatch::cpu_share), the fewest-column ones of
+    // at most 8 columns first, while the GPU stages and runs the rest. A streamed call first leaves
+    // that share of each layer's experts, the lowest LFRU use counts, out of the expert stream
+    // (ExpertStream::Share), so they are misses. The same outputs, bit for bit. A call whose CPU leg times out throws (its request ends with an error);
     // once the service thread has failed, prefill stays on the GPU. 0 <= num <= den, 1 <= den <= 32767.
     std::uint32_t prefill_cpu_share_num = 0;
     std::uint32_t prefill_cpu_share_den = 1;
@@ -538,16 +539,18 @@ struct NgramFlagPlan {
 // cpu_verify_misses or MTP): verify_jobs experts per call (the service's default 4), calls of up to
 // 1 + mtp_draft_tokens columns, M / pcie_divisor misses left on the GPU. The prefill channel (0
 // without prefill_cpu_share): up to offloaded_moe::kMaxCpuJobs experts per call (every miss may go),
-// calls of up to the static prefill chunk (at most kMaxCpuCallColumns; a wider call stays on the
-// GPU), share_num / share_den of the misses. `device` is ProgramDevicePlan::cpu_misses (the
-// service's 4-byte request counter); `pinned` its mapped channel (the request, the x columns and the
-// outputs, the done and heartbeat words) and the Program's error word. Both 0 when neither use is on.
+// calls of up to the wider of the static prefill chunk and a streamed call's 4,096 columns (at most
+// kMaxCpuCallColumns and the context; a wider call stays on the GPU), share_num / share_den of the
+// misses. `device` is ProgramDevicePlan::cpu_misses (the service's 4-byte request counter); `pinned`
+// its mapped channel (the request, the x columns and the outputs, the done and heartbeat words) and
+// the Program's error word; `pageable` the worker team's buffers. All 0 when neither use is on.
 struct CpuMissPlan {
     int workers = 0, max_jobs = 0, max_columns = 0;
     int verify_jobs = 0, verify_columns = 0, pcie_divisor = 0;
     int prefill_jobs = 0, prefill_columns = 0, share_num = 0, share_den = 0;
-    std::uint64_t device = 0;
-    std::uint64_t pinned = 0;
+    std::uint64_t device   = 0;
+    std::uint64_t pinned   = 0;
+    std::uint64_t pageable = 0; // the worker team's buffers and the service's job list
 };
 [[nodiscard]] CpuMissPlan plan_cpu_misses(const ProgramOptions& options);
 

@@ -18,6 +18,9 @@
 //   - prefill_sorted_by_rows_then_id: the fewest rows first, then the lower expert id, whatever the
 //     job order;
 //   - share_zero_takes_none: num 0 takes nothing; bad fractions are refused.
+//   - stream_cold_lowest_counts: a streamed call leaves out round(share * min(n, capacity)) of a
+//     layer's n non-resident experts, those with the lowest prior use counts (ties to the lower id),
+//     never a resident one; the result is ascending.
 
 #include "ops/offloaded_sparse_moe/cpu_selection.h"
 #include "ops/offloaded_sparse_moe/cpu_share.h"
@@ -212,6 +215,31 @@ void share_zero_takes_none() {
           "share_zero_takes_none: a negative cap is refused");
 }
 
+void stream_cold_lowest_counts() {
+    using u32s = std::vector<std::uint32_t>;
+    // Experts 0..7, 2 and 5 resident: n = 6 misses (0, 1, 3, 4, 6, 7) with counts 9, 1, 4, 1, 7, 0.
+    const ints frames  = {-1, -1, 10, -1, -1, 11, -1, -1};
+    const u32s counts  = {9, 1, 100, 4, 1, 0, 7, 0};
+    // 3 / 5 of 6 = 3.6 -> 4: counts 0 (7), 1 (1), 1 (4), 4 (3); ascending ids.
+    check(om::select_stream_cold(frames, counts, 64, 3, 5) == ints{1, 3, 4, 7},
+          "stream_cold_lowest_counts: the four lowest counts, ties to the lower id, a resident 0 skipped");
+    // A ring of 2: the stream would copy 2 of the 6, so 3 / 5 of 2 = 1 is left out.
+    check(om::select_stream_cold(frames, counts, 2, 3, 5) == ints{7}, "stream_cold_lowest_counts: the capacity sizes it");
+    check(om::select_stream_cold(frames, counts, 64, 0, 5).empty(), "stream_cold_lowest_counts: share 0 leaves none");
+    check(om::select_stream_cold(frames, counts, 64, 1, 1) == ints{0, 1, 3, 4, 6, 7},
+          "stream_cold_lowest_counts: share 1 leaves every miss");
+    // Equal counts (a fresh cache): the lowest ids.
+    const u32s zeros(8, 0);
+    check(om::select_stream_cold(frames, zeros, 64, 1, 2) == ints{0, 1, 3}, "stream_cold_lowest_counts: ties to the lower id");
+    const ints resident = {0, 1, 2, 3};
+    check(om::select_stream_cold(resident, u32s(4, 0), 64, 3, 5).empty(), "stream_cold_lowest_counts: no misses");
+    bool refused = false;
+    try {
+        (void)om::select_stream_cold(frames, u32s(3, 0), 64, 3, 5);
+    } catch (const std::invalid_argument&) { refused = true; }
+    check(refused, "stream_cold_lowest_counts: mismatched spans are refused");
+}
+
 } // namespace
 
 int main() {
@@ -225,6 +253,7 @@ int main() {
     prefill_rows_cap();
     prefill_sorted_by_rows_then_id();
     share_zero_takes_none();
+    stream_cold_lowest_counts();
     if (failures != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;

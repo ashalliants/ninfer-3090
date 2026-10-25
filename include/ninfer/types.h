@@ -436,13 +436,14 @@ struct FlashNextOptions {
     // of prefill_cpu_share (one CPU miss service serves both).
     bool cpu_verify_misses           = false;
     std::uint32_t cpu_verify_workers = 6;
-    // In prefill calls that do not stream their experts (--prefill-cpu-share F): prompts and tails
-    // shorter than 512 tokens, forced tokens, and every call when the expert cache cannot lend the
-    // stream's ring. Of each layer's n non-resident routed experts, round(F * n) (halves up), the ones
-    // with the fewest columns first and none of more than 8, are computed by the CPU miss service's
-    // cpu_verify_workers threads while the GPU stages and runs the others, instead of reading them over
-    // PCIe. F = num / den in [0, 1]; num 0 (the default) is off; Basalt's default 0.6 is 3 / 5. The
-    // CPU's arithmetic equals the GPU's bit for bit, so the same output. den is at most 32767.
+    // In prefill and forced-token calls (--prefill-cpu-share F), of each layer's n non-resident
+    // routed experts, round(F * n) (halves up), the ones with the fewest columns first and none of
+    // more than 8, are computed by the CPU miss service's cpu_verify_workers threads while the GPU
+    // stages and runs the others, instead of reading them over PCIe. A call that streams its experts
+    // ahead of time (512 tokens or more) first leaves the share F of each layer's experts with the
+    // lowest expert-cache use counts out of the stream, so they are misses. F = num / den in [0, 1];
+    // num 0 (the default) is off; Basalt's default 0.6 is 3 / 5. The CPU's arithmetic equals the
+    // GPU's bit for bit, so the same output. den is at most 32767.
     struct Fraction {
         std::uint32_t num = 0;
         std::uint32_t den = 1;

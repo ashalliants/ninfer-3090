@@ -299,6 +299,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     demand.reserve      = next.ram_headroom_bytes;
     models::qwen4_exp::plan_pinned_weights(demand, plan.pinned_bytes(), hot_embedding);
     demand.later_pinned = kProgramPinnedAllowance;
+    std::uint64_t cpu_misses_pageable = 0;
     {
         // --cpu-verify-misses or --prefill-cpu-share: the CPU miss service's mapped channel and the
         // calls' error word.
@@ -310,7 +311,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         cpu.prefill_cpu_share_den = next.prefill_cpu_share.den;
         cpu.prefill_chunk         = options.prefill_chunk;
         cpu.max_context           = options.max_context;
-        demand.later_pinned += models::qwen4_exp::plan_cpu_misses(cpu).pinned;
+        const auto service  = models::qwen4_exp::plan_cpu_misses(cpu);
+        cpu_misses_pageable = service.pageable; // the worker team's buffers
+        demand.later_pinned += service.pinned;
     }
     {
         // --ngram-flag-wait: the round graphs' mapped flag and error word.
@@ -318,7 +321,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         flag.ngram_flag_wait = next.ngram_flag_wait;
         demand.later_pinned += models::qwen4_exp::plan_ngram_flag_wait(flag).pinned;
     }
-    demand.pageable     = models::qwen4_exp::NgramVolume::cache_bytes(config.ple.table);
+    demand.pageable     = models::qwen4_exp::NgramVolume::cache_bytes(config.ple.table) + cpu_misses_pageable;
     // Decoded media: the frontend's cache up to its budget, and in flight at most one prompt's patches
     // (one prompt per lane; a prompt's vision tokens are bounded by the context).
     if (vision) {

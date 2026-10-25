@@ -51,6 +51,9 @@ public:
 
     using SavedState = expert_cache::SavedState;
     [[nodiscard]] SavedState saved_state() const;
+    // Every key's LFRU use count (U32 [layers][experts]; zeros without a policy): the prior the
+    // expert stream's CPU share ranks a layer's misses by before the layer routes.
+    void use_counts(std::vector<std::uint32_t>& out) const;
     // Before the first round: seeds the counts (each capped at `count_cap`, so a stale expert
     // yields to new uses) and loads at most `max_keys` of the ranked keys, best first, into free
     // frames, waiting for the copies. Returns the number loaded.

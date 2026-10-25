@@ -1017,12 +1017,13 @@ public:
         for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) { experts.frames.push_back(residency_->table(l)); }
         if (cpu_misses_) {
             // --cpu-verify-misses: verification calls hand misses to the service; --prefill-cpu-share:
-            // prefill calls that do not stream hand it their share. A timed-out wait reports to the
+            // prefill and forced-token calls hand it their share. A timed-out wait reports to the
             // error word, which every verification round and prefill call checks. Both channels use
             // the service's one buffer (layer calls run in stream order, each wait before the next
             // call's plan), each narrowed to its own jobs, columns and rule.
-            const CpuMissPlan p = plan_cpu_misses(options_);
-            experts.error       = cpu_error_device_;
+            const CpuMissPlan p  = plan_cpu_misses(options_);
+            experts.error        = cpu_error_device_;
+            prefill_cpu_columns_ = p.prefill_columns;
             for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) {
                 ops::MoeCpuChannel channel = cpu_misses_->channel(static_cast<int>(l));
                 if (p.verify_jobs > 0) {
@@ -1313,7 +1314,13 @@ public:
                                  (why.empty() ? std::string() : "; " + why) + ")");
     }
     void check_cpu_verify() { check_cpu_misses("--cpu-verify-misses", "a verification"); }
-    void check_cpu_prefill() { check_cpu_misses("--prefill-cpu-share", "a prefill call"); }
+    // After a prefill or forced-token call: only a call that handed the service its share can have
+    // set the word (a verification checks its own round).
+    void check_cpu_prefill() {
+        if (!prefill_used_cpu_) { return; }
+        prefill_used_cpu_ = false;
+        check_cpu_misses("--prefill-cpu-share", "a prefill call");
+    }
 
     const ProgramDevicePlan& device_plan() const noexcept { return plan_.bytes; }
     const VramSizing& vram_sizing() const noexcept { return sizing_; }
@@ -3638,8 +3645,11 @@ private:
         stage(begin, width);
         residency_->before_round(device_.stream);
         auto b = batch(width);
-        // --prefill-cpu-share: a call that does not stream its experts hands the CPU its share.
-        b.cpu_share = !wide && prefill_cpu_share_live();
+        // --prefill-cpu-share: the call hands the CPU its share of each layer's misses (a call wider
+        // than the prefill channel's columns stays on the GPU). A streamed call first leaves each
+        // layer's predicted-cold experts out of the stream (ExpertStream::Share), so they are misses.
+        b.cpu_share        = width <= prefill_cpu_columns_ && prefill_cpu_share_live();
+        prefill_used_cpu_  = b.cpu_share;
         if (mtp_chunk_) { b.mtp_chunk = &*mtp_chunk_; }
         b.vision = call_vision_;
         if (!wide) {
@@ -3647,7 +3657,14 @@ private:
         } else {
             forward_->use_workspace(*wide_work_);
             try {
-                stream_->begin(residency_->host_table(), stream_tables_, ring_first_, ring_frames_, device_.stream);
+                execution::ExpertStream::Share share;
+                if (b.cpu_share) {
+                    residency_->use_counts(stream_counts_);
+                    share = {static_cast<int>(options_.prefill_cpu_share_num),
+                             static_cast<int>(options_.prefill_cpu_share_den), stream_counts_.data()};
+                }
+                stream_->begin(residency_->host_table(), stream_tables_, ring_first_, ring_frames_, device_.stream,
+                               share);
                 forward_->run(b, logits32_);
             } catch (...) {
                 stream_->end();
@@ -5086,6 +5103,12 @@ private:
     std::uint32_t* cpu_error_device_ = nullptr;
     bool cpu_verify_off_reported_    = false;
     bool prefill_share_off_reported_ = false;
+    // --prefill-cpu-share: the widest call the prefill channel serves (0: off), whether the last
+    // prefill or forced-token call handed the service its share (check_cpu_prefill), and the LFRU
+    // use counts a streamed call's cold sets are ranked by.
+    std::int32_t prefill_cpu_columns_ = 0;
+    bool prefill_used_cpu_            = false;
+    std::vector<std::uint32_t> stream_counts_;
     // --ngram-flag-wait: the mapped flag and error word (64 bytes apart), their device addresses, the
     // round graphs' wait counter, and the flag's last raised value (the count of round launches).
     // Declared before the forward and the graphs, like the CPU miss service's words. Unset when off.
@@ -5326,11 +5349,13 @@ CpuMissPlan plan_cpu_misses(const ProgramOptions& options) {
         p.pcie_divisor   = defaults.pcie_divisor;
     }
     if (prefill) {
-        // Every miss may go (Basalt's share has no count cap), in calls of up to the static chunk
-        // (prefill and forced-token calls that do not stream; a wider one stays on the GPU).
+        // Every miss may go (Basalt's share has no count cap), in calls of up to the wider of the
+        // static chunk and the streamed call (kWideChunk), at most kMaxCpuCallColumns (a wider call
+        // stays on the GPU).
         p.prefill_jobs    = om::kMaxCpuJobs;
         p.prefill_columns = static_cast<int>(std::min<std::uint32_t>(
-            {options.prefill_chunk, options.max_context, static_cast<std::uint32_t>(om::kMaxCpuCallColumns)}));
+            {std::max(options.prefill_chunk, static_cast<std::uint32_t>(detail::kWideChunk)), options.max_context,
+             static_cast<std::uint32_t>(om::kMaxCpuCallColumns)}));
         p.share_num = static_cast<int>(options.prefill_cpu_share_num);
         p.share_den = static_cast<int>(options.prefill_cpu_share_den);
     }
@@ -5341,6 +5366,11 @@ CpuMissPlan plan_cpu_misses(const ProgramOptions& options) {
     // line (CpuMissService's constructor), then the Program's 64-byte error word.
     p.pinned = sizeof(om::MissRequest) + 2ULL * om::kHidden * static_cast<std::uint64_t>(p.max_columns) +
                2ULL * om::kHidden * static_cast<std::uint64_t>(p.max_jobs) * om::kMaxColumns + 64 + 64;
+    // The worker team's buffers (CpuExpertTeam: per job column the A8 codes and scales of x and of
+    // h; per job its record geometry) and the service's job list.
+    constexpr std::uint64_t kColumnBytes = om::kHidden + 4 * (om::kHidden / 32) + om::kIntermediate + 4 * (om::kIntermediate / 32);
+    p.pageable = static_cast<std::uint64_t>(p.max_jobs) *
+                 (om::kMaxColumns * kColumnBytes + sizeof(om::RecordGeometry) + sizeof(om::CpuExpertJob));
     return p;
 }
 
