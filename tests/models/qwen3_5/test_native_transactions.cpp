@@ -3788,6 +3788,64 @@ void lossy_scout_window(DeviceContext& device, const qwen::execution::Parameters
     require(program.physical_usage().occupied == empty, "the aborted scout leaked resources");
 }
 
+// Program::abort_lossy_scout, the Engine's way to pause a scouting lane under memory pressure:
+// after one scout step it ends the scout with the lane back at M exactly as the scout found it (GDN
+// state and prefix KV bit-identical, no page past M kept), the request continues as an ordinary
+// prefill, and the lane can then be paused.
+void lossy_scout_abort_then_pause(DeviceContext& device, const qwen::execution::Parameters& parameters,
+                                  qwen::Frontend& frontend, EngineOptions options) {
+    auto fixture  = make_lossy_program(device, parameters, options, kScoutCapacity, 0.2F);
+    auto& program = *fixture.program;
+    ScoutLane lanes(program, device);
+    const auto empty = program.physical_usage().occupied;
+    auto base           = lossy_request(program, frontend, long_prompt_ids(kScoutPrefix + kScoutSpan));
+    const auto root     = program.inspect_source(base, std::nullopt);
+    const auto sequence = lanes.bind(base, 0, *root);
+    require(program.enable_lossy(sequence), "the lossy request was refused");
+    require(!program.abort_lossy_scout(sequence), "abort_lossy_scout ended a scout that never began");
+    std::vector<qwen::CheckpointHandle> shared;
+    std::optional<ScoutTrace> at_m;
+    for (unsigned call = 0; call < 64 && !program.scout_active(sequence); ++call) {
+        lanes.reserve(sequence);
+        auto step = program.advance_prefill(sequence, nullptr, nullptr);
+        require(!step.pending, "the lossy request finished before scouting");
+        if (step.capture_ready) {
+            require(program.start_capture(sequence), "the shared prefix at M was not captured");
+            const auto captured = settle_positions(program, device);
+            shared.insert(shared.end(), captured.captured_checkpoints.begin(),
+                          captured.captured_checkpoints.end());
+        }
+        // The lane at M, settled, just before the step that opens the scout.
+        if (program.sequences[0].text_kv_valid == kLossyMarker && !program.scout_active(sequence) &&
+            !program.requests[0].capture_pending) {
+            at_m = scout_trace(program, device, 0, kLossyMarker);
+        }
+    }
+    require(program.scout_active(sequence) && at_m, "the lossy request did not reach its scout");
+    require(!program.start_pause(sequence, false, nullptr, false), "a scouting lane paused");
+
+    require(program.abort_lossy_scout(sequence), "abort_lossy_scout refused a scouting lane");
+    require(!program.scout_active(sequence) && !program.scout_session.has_value(),
+            "abort_lossy_scout left the scout open");
+    require_no_trace(scout_trace(program, device, 0, kLossyMarker), *at_m, "aborted scout at M");
+    require(program.sequences[0].text_kv_valid == kLossyMarker &&
+                program.requests[0].prefill->cursor == kLossyMarker,
+            "the aborted scout moved the lane away from M");
+    require(!program.abort_lossy_scout(sequence), "a second abort_lossy_scout ended a scout");
+
+    // Pausable again; the pause saves the lane at M.
+    require(program.start_pause(sequence, true, nullptr, false),
+            "the lane did not pause after its scout ended");
+    auto paused = settle_positions(program, device);
+    require(paused.published && paused.paused && paused.paused->frontier() == kLossyMarker,
+            "the pause after an aborted scout did not save the lane at M");
+    paused.paused.reset();
+    for (const auto point : shared) {
+        require(program.release_checkpoint(point), "the shared prefix kept a reader");
+    }
+    require(program.physical_usage().occupied == empty, "the aborted scout and pause leaked resources");
+}
+
 SpeculativeBackend selected_backend(std::string_view name) {
     if (name == "none") { return SpeculativeBackend::None; }
     if (name == "mtp") { return SpeculativeBackend::Mtp; }
@@ -3914,6 +3972,7 @@ int main(int argc, char** argv) {
         scout_finds_needle(device, parameters, scout_frontend, options);
         lossy_keep_all_matches_ordinary_prefill(device, parameters, scout_frontend, options);
         lossy_scout_window(device, parameters, scout_frontend, options);
+        lossy_scout_abort_then_pause(device, parameters, scout_frontend, options);
         // The 40K lossy prompts need a Frontend with a longer context.
         auto lossy_frontend = qwen::make_frontend(
             model->resources(), {.vision_enabled = false, .max_context = kLossyCapacity});

@@ -1105,6 +1105,9 @@ private:
     }
 
     void complete_error(const std::shared_ptr<Request>& request, std::exception_ptr error) {
+        // A request on the lossy path that fails before its outcome counts as aborted, so the
+        // outcome counters add up to the requests that took the path.
+        lossy_aborted(*request);
         if (request->preemption_count) {
             observe_scheduling(request, GenerationSchedulingTransition::Terminal);
         }
@@ -1985,7 +1988,7 @@ private:
         request->lossy.reset();
     }
 
-    [[nodiscard]] LossyPrefillReport lossy_report(const Request& request) const {
+    [[nodiscard]] LossyPrefillReport lossy_report(const Request& request) const noexcept {
         const auto& state = *request.lossy;
         const std::uint32_t prompt = request.base_plan->summary().prompt_tokens;
         return LossyPrefillReport{
@@ -2082,9 +2085,9 @@ private:
     }
 
     // A request on the lossy path that ends, or leaves the path, before its outcome counts as
-    // aborted: cancelled, or its scout ended for memory pressure. One already counted as skipped,
-    // or not yet bound, is left alone.
-    void lossy_aborted(Request& request) {
+    // aborted: cancelled, failed, or its scout ended for memory pressure. One already counted, or
+    // not yet bound, is left alone. noexcept: it only updates counters and the report.
+    void lossy_aborted(Request& request) noexcept {
         if (!request.lossy) { return; }
         auto& state = *request.lossy;
         using Phase = LossyPrefillState::Phase;
@@ -2092,7 +2095,8 @@ private:
                           (state.phase == Phase::Main && state.report &&
                            state.report->outcome == LossyPrefillOutcome::Completed);
         if (!open) { return; }
-        if (!state.report) { state.report = lossy_report(request); }
+        if (!state.report && request.base_plan) { state.report = lossy_report(request); }
+        if (!state.report) { state.report = LossyPrefillReport{.filter_layer = lossy_options_.filter_layer}; }
         state.report->outcome = LossyPrefillOutcome::Aborted;
         state.report->main_ms = static_cast<double>(state.main_ns) * 1e-6;
         state.phase           = Phase::Ended;

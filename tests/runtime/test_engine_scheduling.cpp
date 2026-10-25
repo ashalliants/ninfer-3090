@@ -1278,6 +1278,34 @@ void test_lossy_counters_and_request_log() {
             "a declined request was not counted skipped, or its tokens were counted as scouted");
 }
 
+// A request on the lossy path that fails before its outcome is counted aborted, so the outcomes
+// add up to the requests that took the path.
+void test_lossy_failure_counts_aborted() {
+    Rig rig({.chunk = kLossyChunk, .lanes = 1, .lossy_min_tokens = 30000});
+    rig.hold_at([](const Event& e) {
+        return e.kind == Event::Kind::Scout && e.request == 1 && e.position == kMarker + kLossyChunk;
+    });
+    auto result = rig.run_prompt(lossy_prompt(1), 1);
+    require(rig.wait_held(), "the scout never reached its second step\n" + rig.dump());
+    arm_worker_failures(1); // the held scout step throws once it has run
+    rig.release();
+    bool failed = false;
+    try {
+        (void)finished(result);
+    } catch (const std::exception&) { failed = true; }
+    arm_worker_failures(0);
+    require(failed, "the injected failure did not fail the request\n" + rig.dump());
+    const auto stats = rig.core().runtime_stats();
+    require(stats.lossy_prefills_aborted == 1 && stats.lossy_prefills_completed == 0 &&
+                stats.lossy_prefills_skipped == 0,
+            "a lossy request that failed was not counted aborted");
+    // The Engine recovered: the next lossy request runs to its outcome.
+    auto next = rig.run_prompt(lossy_prompt(2), 1);
+    require(finished(next), "the Engine did not serve after the failure\n" + rig.dump());
+    require(rig.core().runtime_stats().lossy_prefills_completed == 1,
+            "the request after the failure was not counted");
+}
+
 // The backlog prices a lossy prefill as its scout and the main pass over the kept share.
 void test_lossy_backlog_predicts_scout_and_main() {
     Rig rig({.chunk = kLossyChunk, .lanes = 1, .lossy_min_tokens = 30000});
@@ -1364,5 +1392,6 @@ int main() {
     run("LossyUsageReportsOriginal", test_lossy_usage_reports_original);
     run("LossyCountersAndRequestLog", test_lossy_counters_and_request_log);
     run("LossyBacklogPredictsScoutAndMain", test_lossy_backlog_predicts_scout_and_main);
+    run("LossyFailureCountsAborted", test_lossy_failure_counts_aborted);
     return failures == 0 ? 0 : 1;
 }

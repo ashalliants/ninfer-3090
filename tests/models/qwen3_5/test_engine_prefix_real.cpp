@@ -1375,21 +1375,41 @@ int exercise_lossy_prefill(const char* artifact) {
         return message;
     };
     // A product prompt (system message and a tool: the shared marker ends it), then about 40K
-    // tokens of records the selection can thin out.
-    ninfer::PromptInput input;
-    input.context_cache.session_key = "lossy-follow-up";
-    input.options.tool_jsons.push_back(
-        R"({"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}}})");
-    input.messages.push_back(text_message(ninfer::ChatRole::System,
-                                          "You answer questions about the inventory records."));
-    std::string records;
-    for (int i = 0; i < 3300; ++i) {
-        records += "Record " + std::to_string(i) + ": shelf " + std::to_string((i * 37) % 101) +
-                   " holds " + std::to_string((i * 53) % 997) + " units of part " +
-                   std::to_string(1000 + i) + ".\n";
+    // tokens of records the selection can thin out. The record count is sized from the prepared
+    // length: numbers tokenize digit by digit, so a fixed count would miss the target.
+    const auto record = [](int i) {
+        return "Record " + std::to_string(i) + ": shelf " + std::to_string((i * 37) % 101) +
+               " holds " + std::to_string((i * 53) % 997) + " units of part " +
+               std::to_string(1000 + i) + ".\n";
+    };
+    const auto make_input = [&](int records) {
+        ninfer::PromptInput built;
+        built.context_cache.session_key = "lossy-follow-up";
+        built.options.tool_jsons.push_back(
+            R"({"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}}})");
+        built.messages.push_back(text_message(ninfer::ChatRole::System,
+                                              "You answer questions about the inventory records."));
+        std::string text;
+        for (int i = 0; i < records; ++i) { text += record(i); }
+        built.messages.push_back(text_message(
+            ninfer::ChatRole::User, text + "\nWhich shelf holds part 1007? Answer briefly."));
+        return built;
+    };
+    const auto measured = [&](int records) {
+        return engine.prepare(make_input(records)).summary().prompt_tokens;
+    };
+    constexpr std::uint32_t kTarget = 40000;
+    const std::uint32_t base_tokens  = measured(0);
+    const std::uint32_t probe_tokens = measured(500);
+    const double per_record = static_cast<double>(probe_tokens - base_tokens) / 500.0;
+    int records = static_cast<int>(static_cast<double>(kTarget - base_tokens) / per_record);
+    // The estimate is linear in the record digits; correct it on the measured length.
+    for (int round = 0; round < 4; ++round) {
+        const std::uint32_t tokens = measured(records);
+        if (tokens + 500 >= kTarget && tokens <= kTarget + 500) { break; }
+        records += static_cast<int>((static_cast<double>(kTarget) - tokens) / per_record);
     }
-    input.messages.push_back(text_message(
-        ninfer::ChatRole::User, records + "\nWhich shelf holds part 1007? Answer briefly."));
+    ninfer::PromptInput input = make_input(records);
     ninfer::RequestOptions request;
     request.execution.requested_output_tokens = 8;
     request.execution.sampling.temperature    = 0.0F;
@@ -1424,6 +1444,15 @@ int exercise_lossy_prefill(const char* artifact) {
     }
     const std::uint32_t exact_end = first_tokens - first.lossy_prefill->uncached_tokens;
     const std::uint32_t kept_length = exact_end + first.lossy_prefill->kept_tokens;
+    // The follow-up reuses through its rewritten prompt; usage counts that reuse in the client's
+    // tokens (RequestBasePlan::reported_frontier), so it must reach at least the first prompt's
+    // input-recovery position (the prompt without its assistant opener and the user turn's
+    // closing), far past the kept length a compacted count would give.
+    const auto opener_tokens =
+        static_cast<std::uint32_t>(engine.tokenize_text("<|im_start|>assistant\n").size());
+    const auto closing_tokens =
+        static_cast<std::uint32_t>(engine.tokenize_text("<|im_end|>\n").size());
+    const std::uint32_t reported_floor = first_tokens - opener_tokens - closing_tokens;
 
     // lossy_follow_up_turn_reuses
     input.messages.push_back(text_message(ninfer::ChatRole::Assistant, first.content));
@@ -1434,7 +1463,7 @@ int exercise_lossy_prefill(const char* artifact) {
     auto second                       = engine.generate(std::move(second_prompt), request);
     const auto after_second           = engine.runtime_stats();
     if (second.prompt.prompt_tokens != second_tokens || second.lossy_prefill ||
-        second.reused_prompt_tokens < kept_length ||
+        second.reused_prompt_tokens < reported_floor || reported_floor <= kept_length ||
         second.reused_prompt_tokens >= second.prompt.prompt_tokens ||
         second.prefix_reuse_path != ninfer::PrefixReusePath::Checkpoint ||
         second.computed_prefill_tokens >= 4096 ||
@@ -1442,7 +1471,7 @@ int exercise_lossy_prefill(const char* artifact) {
         after_second.lossy_prefill_alias_hits != before_second.lossy_prefill_alias_hits + 1) {
         std::cerr << "lossy follow-up: prompt=" << second.prompt.prompt_tokens
                   << " expected=" << second_tokens << " reused=" << second.reused_prompt_tokens
-                  << " kept_length=" << kept_length
+                  << " kept_length=" << kept_length << " floor=" << reported_floor
                   << " computed=" << second.computed_prefill_tokens << " scouted="
                   << after_second.lossy_prefill_scouted_tokens -
                          before_second.lossy_prefill_scouted_tokens
