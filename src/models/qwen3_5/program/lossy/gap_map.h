@@ -56,6 +56,14 @@ using GapMapSet = std::vector<std::shared_ptr<const GapMap>>; // lineage order
 [[nodiscard]] GapMap make_gap_map(const PreparedPromptData& original, std::uint32_t begin,
                                   std::span<const std::uint32_t> kept_offsets);
 
+// The same map with U ending at its last dropped token: a trailing kept run leaves U (and the
+// stored original), since compaction copies it unchanged either way, so compact_prompt gives the
+// same prompt and frontier translation the same frontiers. A lossy prefill's U runs to the end of
+// the prompt, generation opener included, which a follow-up turn serializes differently (the
+// assistant turn replaces it); without this no follow-up would ever match the map. `original` is
+// the prompt the map was made from.
+[[nodiscard]] GapMap end_at_last_gap(GapMap map, const PreparedPromptData& original);
+
 // Kept prompt: [0, begin) unchanged, then the kept tokens of U, then [original_end, size)
 // unchanged. token_ids, token_types and all three position axes are subset and keep their original
 // values; rope_delta grows by the dropped count. Rewrite checkpoints, rewrite execution frontiers and

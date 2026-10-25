@@ -222,6 +222,21 @@ GapMap make_gap_map(const PreparedPromptData& original, std::uint32_t begin,
     return map;
 }
 
+GapMap end_at_last_gap(GapMap map, const PreparedPromptData& original) {
+    check_map(map);
+    if (map.kept_runs.empty() ||
+        map.kept_runs.back().first + map.kept_runs.back().second != map.original_end - map.begin) {
+        return map;
+    }
+    map.original_end = map.begin + map.kept_runs.back().first;
+    map.kept_runs.pop_back();
+    map.digest = gap_map_digest(original, map.original_end);
+    map.original_ids.resize(map.original_end);
+    map.original_types.resize(map.original_end);
+    map.original_positions = position_runs(original, map.original_end);
+    return map;
+}
+
 PreparedPromptData compact_prompt(const PreparedPromptData& original, const GapMap& map) {
     check_shape(original);
     check_map(map);

@@ -2,6 +2,7 @@
 #include "models/qwen3_5/program/lossy/gap_map.h"
 #include "models/qwen3_5/program/prefix_identity.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
 #include <limits>
@@ -20,6 +21,7 @@ using ninfer::models::qwen3_5::RewriteCheckpointKind;
 using ninfer::models::qwen3_5::RewriteCheckpointSpec;
 using ninfer::models::qwen3_5::detail::apply_gap_map;
 using ninfer::models::qwen3_5::detail::compact_prompt;
+using ninfer::models::qwen3_5::detail::end_at_last_gap;
 using ninfer::models::qwen3_5::detail::gap_map_digest;
 using ninfer::models::qwen3_5::detail::GapMap;
 using ninfer::models::qwen3_5::detail::make_gap_map;
@@ -429,6 +431,37 @@ void test_original_frontier_maps_through_the_lineage() {
 
 } // namespace
 
+// A selection keeps the recent tail, so U's last run reaches the prompt end, generation opener
+// included. Ending U at the last dropped token compacts the same, and a follow-up that keeps the
+// prompt only through the end of the user turn (its assistant turn replaces the opener) matches.
+void test_end_at_last_gap_matches_a_follow_up() {
+    const PreparedPromptData original = text_prompt(20);
+    const std::vector<std::uint32_t> kept{0, 1, 5, 6, 7, 12, 13, 14, 15}; // tail [16, 20) kept
+    const GapMap full = make_gap_map(original, 4, kept);
+    const GapMap map  = end_at_last_gap(full, original);
+    require(map.begin == 4 && map.original_end == 16, "U ends at the last dropped token");
+    require((map.kept_runs == std::vector<std::pair<std::uint32_t, std::uint32_t>>{{0, 2}, {5, 3}}),
+            "the trailing run left U");
+    require(map.dropped_tokens() == full.dropped_tokens(), "same dropped count");
+    require(map.digest == gap_map_digest(original, 16) && map.original_ids.size() == 16 &&
+                map.original_types.size() == 16,
+            "stored original covers the shorter U");
+    const PreparedPromptData a = compact_prompt(original, full);
+    const PreparedPromptData b = compact_prompt(original, map);
+    require(a.token_ids == b.token_ids && a.token_types == b.token_types &&
+                a.positions == b.positions && a.rope_delta == b.rope_delta,
+            "same compacted prompt");
+    require(end_at_last_gap(map, original).original_end == 16, "idempotent");
+
+    // The follow-up shares the original through 18 only, then diverges.
+    PreparedPromptData follow_up = extend(text_prompt(18), 6, 900);
+    require(!apply_gap_map(follow_up, full).has_value(), "the full-span map misses the follow-up");
+    const auto rewritten = apply_gap_map(follow_up, map);
+    require(rewritten.has_value(), "the trimmed map rewrites the follow-up");
+    require(std::equal(b.token_ids.begin(), b.token_ids.begin() + 11, rewritten->token_ids.begin()),
+            "the follow-up shares the compacted prefix through the kept tail");
+}
+
 int main() {
     try {
         test_subsets_tokens_and_keeps_positions();
@@ -447,6 +480,7 @@ int main() {
         test_rewrite_prefers_the_deepest_map();
         test_rewrite_applies_each_map_once();
         test_original_frontier_maps_through_the_lineage();
+        test_end_at_last_gap_matches_a_follow_up();
         std::cout << "lossy gap map tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

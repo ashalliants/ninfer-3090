@@ -175,7 +175,8 @@ void ProgramImpl::finish_lossy_scout(std::uint32_t lane, PrefillProgress& progre
         outcome.kept_runs   = {{0U, span}};
     } else {
         outcome.kept_runs = kept_runs(selection.kept);
-        auto map = std::make_shared<const GapMap>(make_gap_map(staged.prompt, begin, selection.kept));
+        auto map = std::make_shared<const GapMap>(
+            end_at_last_gap(make_gap_map(staged.prompt, begin, selection.kept), staged.prompt));
         // Compact before the call: argument evaluation order is unspecified, and moving `map`
         // into the parameter first would leave `*map` null.
         PreparedPromptData compacted = compact_prompt(staged.prompt, *map);
