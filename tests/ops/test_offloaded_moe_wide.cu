@@ -18,8 +18,9 @@
 //     offloaded_moe::select_prefill_cpu_jobs (fewest rows, then lowest id, at most 8 rows) with
 //     compacted columns.
 //   - prefill_cpu_share_streamed: a streamed call's frame table (cache and ring frames, the
-//     predicted-cold set of select_stream_cold left -1) with the 3/5 share at T in {1024, 2048}, 512
-//     experts, the cold half routed few rows: the same checks.
+//     predicted-cold set of select_stream_cold at 3/5 left -1) with the plan share 1/1 (every miss of
+//     at most 8 rows to the CPU) at T in {1024, 2048}, 512 experts, the cold half routed few rows: the
+//     same checks.
 //
 // --small: one format at T in {9, 65} with two placements, the share at T in {16, 65} (for
 // compute-sanitizer).
@@ -615,10 +616,11 @@ void test_prefill_cpu_share() {
 }
 
 // A streamed call (ExpertStream with a Share): 512 experts, every fourth in the cache, the rest in
-// the stream's ring except the predicted-cold set, select_stream_cold over a prior that marks the
-// upper half rarely used, which the routing also routes rarely (its logits lowered). Those stay -1 in
-// the frame table, so the call stages them through 64 slots and hands its 3/5 share of the few-row
-// ones to the CPU, at T in {1024, 2048} (every GPU job on the wide route).
+// the stream's ring except the predicted-cold set, select_stream_cold at 3/5 over a prior that marks
+// the upper half rarely used, which the routing also routes rarely (its logits lowered). Those stay
+// -1 in the frame table; the call's channel has the share 1/1 (the Forward's setting for a streamed
+// call), so every miss of at most 8 rows goes to the CPU and the rest are staged through 64 slots,
+// at T in {1024, 2048} (every GPU job on the wide route).
 void test_prefill_cpu_share_streamed() {
     std::mt19937 rng(1313);
     constexpr int kExperts = 512, kTopK = 10;
@@ -659,8 +661,10 @@ void test_prefill_cpu_share_streamed() {
                 logits[static_cast<std::size_t>(t) * (kExperts + 1) + e] = n(rng) - (e >= kExperts / 2 && e < kExperts ? lower : 0.0F);
             }
         }
-        const ShareCase c = run_share_case(bank, service, table, 64, 3, 5, logits, columns, kTopK, stream, rng,
-                                           "streamed 3/5 staged-64 T=" + std::to_string(columns));
+        // The cold set encodes the 3/5 share; the call's channel takes every few-row miss (1/1, as the
+        // Forward sets it for a streamed call).
+        const ShareCase c = run_share_case(bank, service, table, 64, 1, 1, logits, columns, kTopK, stream, rng,
+                                           "streamed cold 3/5, plan 1/1, staged-64 T=" + std::to_string(columns));
         published += c.chosen > 0 ? 1 : 0;
     }
     check(published > 0, "streamed share: no call handed the CPU a cold expert");

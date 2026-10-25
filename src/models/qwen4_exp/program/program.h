@@ -465,9 +465,10 @@ struct ProgramOptions {
     // FlashNextOptions::prefill_cpu_share (num / den, num 0: off): the same service (started for
     // either option) takes that share of each layer's misses in prefill and forced-token calls
     // (execution::ForwardExperts::prefill_cpu, ForwardBatch::cpu_share), the fewest-column ones of
-    // at most 8 columns first, while the GPU stages and runs the rest. A streamed call first leaves
+    // at most 8 columns first, while the GPU stages and runs the rest. A streamed call instead leaves
     // that share of each layer's experts, the lowest LFRU use counts, out of the expert stream
-    // (ExpertStream::Share), so they are misses. The same outputs, bit for bit. A call whose CPU leg times out throws (its request ends with an error);
+    // (ExpertStream::Share), and the CPU takes every one of those misses of at most 8 columns. The
+    // same outputs, bit for bit. A call whose CPU leg times out throws (its request ends with an error);
     // once the service thread has failed, prefill stays on the GPU. 0 <= num <= den, 1 <= den <= 32767.
     std::uint32_t prefill_cpu_share_num = 0;
     std::uint32_t prefill_cpu_share_den = 1;

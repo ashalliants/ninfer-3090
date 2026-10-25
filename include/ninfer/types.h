@@ -440,8 +440,9 @@ struct FlashNextOptions {
     // routed experts, round(F * n) (halves up), the ones with the fewest columns first and none of
     // more than 8, are computed by the CPU miss service's cpu_verify_workers threads while the GPU
     // stages and runs the others, instead of reading them over PCIe. A call that streams its experts
-    // ahead of time (512 tokens or more) first leaves the share F of each layer's experts with the
-    // lowest expert-cache use counts out of the stream, so they are misses. F = num / den in [0, 1];
+    // ahead of time (512 tokens or more) instead leaves the share F of each layer's experts with the
+    // lowest expert-cache use counts out of the stream, and the CPU computes every one of those misses
+    // with at most 8 columns. F = num / den in [0, 1];
     // num 0 (the default) is off; Basalt's default 0.6 is 3 / 5. The CPU's arithmetic equals the
     // GPU's bit for bit, so the same output. den is at most 32767.
     struct Fraction {
