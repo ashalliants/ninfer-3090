@@ -1,6 +1,8 @@
 # Lossy long-prompt prefill: design
 
-Status: design, nothing built. A temporary plan in the sense of `AGENTS.md`: fold its stable facts into
+Status: built, GPU verification pending (everything compiles; the CPU and fake-engine tests pass;
+no GPU test, quality or speed number has been run yet). What the build changed from this design is in
+["As built / deviations"](#as-built--deviations). A temporary plan in the sense of `AGENTS.md`: fold its stable facts into
 `docs/serving.md`, `docs/maintainer/engine-architecture.md` and
 `docs/maintainer/resource-scheduling-and-context-cache.md` when the work lands, then delete it.
 Numbers marked **(predicted)** come from the fitted prefill cost model (`tools/bench/prefill_time_model.py`,
@@ -132,9 +134,13 @@ Otherwise the prompt prefills exactly as today.
 
 **The product prompt is never selected (my call).** On a cold box the shared product prompt (system
 messages, tool definitions; 1.6-9K tokens per `cache-provider-baseline.md`) lies inside `U`. Before the
-scout, the engine prefills exactly up to the last shared marker (automatic or explicit,
-`resource-scheduling-and-context-cache.md` §4.3) as an ordinary prefill, publishing its shared checkpoint
-as today; that span becomes part of `C`, and only the rest is `U` (the threshold is checked on that rest).
+scout, the engine prefills exactly up to the end of the product prompt as an ordinary prefill, publishing
+its shared checkpoint as today; that span becomes part of `C`, and only the rest is `U` (the threshold is
+checked on that rest). As built, M (the product-prompt end) is the end of the graft, the leading
+System/Developer messages and the tool declarations, or a shared marker inside them, never a message-level
+boundary past them, whatever its evidence: OpenAI chat's default policy places an automatic boundary at
+the end of the last message and Anthropic `cache_control` on a recent message becomes an explicit one, and
+taking the deepest marker would leave `U` a few tokens long (see "As built / deviations").
 This keeps tool schemas intact and keeps the box's shared-prefix reuse working for other conversations.
 
 **Capacity and reporting (my call).** Limits tied to positions (`max_context`, the 262,144 RoPE capacity)
@@ -172,14 +178,17 @@ buffer, 2 KB/token, ~200 MB at 100K. My call, made while planning.) Layers above
 
 From the per-token scores over `U`:
 
-1. Smooth with a 1-D pooling window, then score fixed blocks of `B` consecutive tokens (keeping whole spans
+1. Smooth with a 1-D pooling window (as built: a centred per-token max over `pool_window` tokens, odd,
+   clamped at the ends), then score fixed blocks of `B` consecutive tokens (keeping whole spans
    matters more for code than keeping isolated tokens; SpecPrefill also keeps chunks,
    [arXiv 2502.02789](https://arxiv.org/pdf/2502.02789)).
 2. Always keep: the last `R` tokens of the prompt (the question and recent turns), the first `S` tokens of
    `U`, and every special/template token (role markers, tool-call delimiters), so the chat structure the
-   model was trained on survives.
+   model was trained on survives. As built this is every added token of the tokenizer, plus the two
+   tokens after each `<|im_start|>` (the role name and its newline).
 3. Fill up to `keep_ratio * |U|` with the highest-scoring blocks; output kept tokens in original order.
-4. **Skip rule:** if the kept count is above `skip_ratio * |U|` (e.g. the forced keeps already cover most
+4. **Skip rule:** if the kept count (as built: the larger of the forced keeps and the budget, against
+   `ceil(skip_ratio * |U|)`; `keep_ratio > skip_ratio` is refused at startup) is above `skip_ratio * |U|` (e.g. the forced keeps already cover most
    of a prompt barely over the threshold), keep everything: the main pass is then an ordinary full prefill
    and the request pays only the scout.
 
@@ -373,7 +382,10 @@ Scout at `L` = 16 costs ≈ a quarter of a full prefill; main pass on 20% costs 
 
 Workloads, each run with the flag off (baseline) and over the sweep grid:
 
-1. **Needle in a haystack** (`eval/configs/*needle_haystack*`, evalscope) at 32K, 64K, 100K and 5 depths.
+1. **Needle in a haystack** (`eval/configs/*needle_haystack*`, evalscope) at 32K, 64K, 100K. As built,
+   11 depths x English/Chinese = 22 samples per length (5 depths gave 5 samples, where one miss was
+   already 0.80x and the 0.95x gate had no resolution); a check with fewer than 20 samples on either side
+   is reported as not measured.
 2. **Agent replay** (`tools/bench/agent_replay`, 30K-120K contexts): tool-call validity, and for `Edit`
    calls whether `old_string` occurs in the file (exact-copy fidelity), plus output divergence from
    baseline.
@@ -420,6 +432,51 @@ and looks again on the step that ends the scout. A pause for memory ends the sco
 (`Program::abort_lossy_scout`: the lane goes back to M exactly as the scout found it, and the
 request continues as an ordinary full prefill of U), then pauses as usual; it counts as `aborted`.
 Cancelling during the scout aborts the lane, which drops the scout and its pages.
+
+## As built / deviations
+
+What the build does differently from the design above, or adds to it. Each item is deliberate; the
+quality and speed consequences are unmeasured until the GPU sweep runs.
+
+- **M is the end of the product prompt, not the deepest shared marker.** The Frontend records
+  `PreparedContextCache::product_prompt_end` (the graft, the leading System/Developer messages, the tool
+  declarations, and any marker inside them), resolved whatever the protocol's cache policy says;
+  `lossy_planned_exact_end` takes it, plus any engine-structural opportunity, for both strategies. Taking
+  the deepest SharedStablePrefix opportunity, as first built, meant the trigger could never fire for
+  ordinary OpenAI chat (default automatic boundary at the end of the last message) or Anthropic traffic
+  (`cache_control` on a recent message). A prompt with neither system message nor tools has M = 0.
+  Tested on real OpenAI and Anthropic translation (`ninfer_qwen3_5_lossy_exact_end_test`); the sweep
+  aborts a point whose preflight request does not log `outcome: "completed"`.
+- **The scout uses full KV pages** (the v1 fallback in "Scout pass"): peak KV during the scout is a full
+  prefill's for the scouted span.
+- **Scout steps are not layer-sliced** and cannot be paused (`start_pause` refuses while a scout runs).
+  Exact and Main steps keep layer slices, the stall budget and yield. A request yielded during Exact
+  keeps its lossy path: the Program's saved control carries the phase and M, and the restore goes on to
+  M and scouts (fake-engine test `LossyResumesAfterExactPause`).
+- **Teacher-forced KL is replaced by greedy agreement** (first divergence from the baseline's greedy
+  output) in the sweep. It is reported, not gated.
+- **Follow-ups planned before the lossy run finishes run cold**: the gap map exists only once the
+  selection is done, so a request admitted earlier with the same prefix is not rewritten.
+- **Once a gap map is live, any request whose prompt starts with that original prompt (through the end of
+  its `U`) is rewritten onto the lossy lineage**, also one that would not itself have triggered (another
+  client re-sending the same long prompt with a different question after it, say). It then sees the
+  kept tokens only, as the follow-up turns do.
+- **Key mass is not causal over the last query rows**: each of the `q` trailing query rows attends to
+  every key of `U`, including the few after it. Harmless: those rows and keys are inside the always-kept
+  recent window.
+- **Scout scratch is permanent VRAM when enabled**: the filter-layer keys (BF16, about 2 KB/token on the
+  27B) and scores (4 B/token) are sized for `max_context` at startup, about 256 MiB at 128K, plus the GDN
+  state copy of the layers below `L`. Nothing is reserved with lossy prefill off.
+- **The text-prefill RoPE axis** (one extra I32 row per chunk token) is planned only where the scout is.
+  Before this feature, text-only prompts always had `rope_delta` 0 without Vision, so no earlier path
+  needed it; this is not a latent fix.
+- **The summary registry is memory-only**: recorded summaries are lost on restart. A later turn of a
+  conversation summarised before the restart is then not rewritten with that summary, so it cannot match
+  checkpoints the context store kept for the summarised prompt; it is probed again and, if cold,
+  summarised again.
+- **The trigger is exclusive**: `|U| > min_tokens`.
+- **Request log**: `request_done.lossy_prefill` is omitted (not `null`) for a request that did not take or
+  consider the path, so the default schema is unchanged.
 
 ## Options (names are proposals; builder may adjust)
 

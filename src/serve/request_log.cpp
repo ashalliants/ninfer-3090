@@ -385,32 +385,32 @@ const char* lossy_prefill_outcome_name(ninfer::LossyPrefillOutcome outcome) {
     return "unknown";
 }
 
-// docs/maintainer/lossy-long-prefill.md, "Observability": null unless the request took the path.
+// docs/maintainer/lossy-long-prefill.md, "Observability": the record carries the object only when
+// the request took or considered the path; otherwise the key is absent (the default schema).
 // `detail` (--request-log-lossy-detail) adds kept_runs: the kept offsets of the filtered part as
 // [begin, end) pairs, which the sweep's kept-block overlap (Jaccard) reads. `strategy` is "select"
 // or "summary"; a summary adds summarized_messages, summary_reused and summary_probe.
-Json lossy_prefill_json(const std::optional<ninfer::LossyPrefillReport>& report, bool detail) {
-    if (!report) { return nullptr; }
-    const bool summary = report->strategy == ninfer::LossyStrategy::Summary;
-    Json out{{"outcome", lossy_prefill_outcome_name(report->outcome)},
+Json lossy_prefill_json(const ninfer::LossyPrefillReport& report, bool detail) {
+    const bool summary = report.strategy == ninfer::LossyStrategy::Summary;
+    Json out{{"outcome", lossy_prefill_outcome_name(report.outcome)},
              {"strategy", summary ? "summary" : "select"},
-             {"uncached_tokens", report->uncached_tokens},
-             {"kept_tokens", report->kept_tokens},
-             {"filter_layer", report->filter_layer},
-             {"scout_ms", report->scout_ms},
-             {"main_ms", report->main_ms}};
+             {"uncached_tokens", report.uncached_tokens},
+             {"kept_tokens", report.kept_tokens},
+             {"filter_layer", report.filter_layer},
+             {"scout_ms", report.scout_ms},
+             {"main_ms", report.main_ms}};
     if (summary) {
         // The newest summarised messages, [first, last) in the client's indices, and whether a
         // summary recorded for an earlier turn was substituted rather than written now.
         out["summarized_messages"] =
-            report->summarized_messages
-                ? Json::array({(*report->summarized_messages)[0], (*report->summarized_messages)[1]})
+            report.summarized_messages
+                ? Json::array({(*report.summarized_messages)[0], (*report.summarized_messages)[1]})
                 : Json(nullptr);
-        out["summary_reused"] = report->summary_reused;
+        out["summary_reused"] = report.summary_reused;
         // The coldness probe's answer; null when the prompt was too short to be probed.
         const char* probe = nullptr;
-        if (report->summary_probe) {
-            switch (*report->summary_probe) {
+        if (report.summary_probe) {
+            switch (*report.summary_probe) {
             case ninfer::LossySummaryProbe::Cold:
                 probe = "cold";
                 break;
@@ -426,7 +426,7 @@ Json lossy_prefill_json(const std::optional<ninfer::LossyPrefillReport>& report,
     }
     if (detail) {
         Json runs = Json::array();
-        for (const auto& run : report->kept_runs) { runs.push_back(Json::array({run[0], run[1]})); }
+        for (const auto& run : report.kept_runs) { runs.push_back(Json::array({run[0], run[1]})); }
         out["kept_runs"] = std::move(runs);
     }
     return out;
@@ -1024,7 +1024,9 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
             ? first_output_timing_json(*outcome.metrics.first_output_timing)
             : Json(nullptr);
     record["speculative"]   = speculative_json(outcome.metrics);
-    record["lossy_prefill"] = lossy_prefill_json(outcome.metrics.lossy_prefill, lossy_detail);
+    if (outcome.metrics.lossy_prefill) {
+        record["lossy_prefill"] = lossy_prefill_json(*outcome.metrics.lossy_prefill, lossy_detail);
+    }
     record["generation"]  = Json{{"engine_request_id", outcome.metrics.engine_request_id},
                                  {"scheduling", scheduling_json(outcome.metrics.scheduling)},
                                  {"admission", admission_json(outcome.metrics.admission)}};

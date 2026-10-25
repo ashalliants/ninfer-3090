@@ -628,8 +628,8 @@ int main() {
                        {"revoked_checkpoints", 1},
                        {"fallback_reason", "source_revoked"}},
               "admission observation lost selected source, queue subset or revocation reason");
-    failures += check(admission_done.at("lossy_prefill").is_null(),
-                      "a request that took no lossy prefill logged one");
+    failures += check(!admission_done.contains("lossy_prefill"),
+                      "a request that took no lossy prefill logged the key");
     observed.metrics.lossy_prefill = ninfer::LossyPrefillReport{
         .outcome         = ninfer::LossyPrefillOutcome::Completed,
         .uncached_tokens = 37952,

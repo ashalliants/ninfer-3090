@@ -854,6 +854,10 @@ server restarts.
 | `ninfer_prefill_yields_total` | prefills paused so a short request at the head of the queue could be admitted (`--yield-long-prefill-ms`) |
 | `ninfer_deferred_prefill_turns_total` | worker cycles that held the prefill step back for `--prefill-decode-share` |
 | `ninfer_sliced_prefill_steps_total`, `ninfer_prefill_slice_boundaries_total` | prefill steps run in layer slices (`--prefill-layer-slices`), and the boundaries between their slices where a neighbour's decode round ran |
+| `ninfer_lossy_prefill_total{outcome="completed\|skipped\|aborted"}` | experimental: requests that took the [lossy prefill](#lossy-long-prompt-prefill-experimental) path, by outcome. `skipped` also counts one that declined because another lane held the scout; the request log tells them apart |
+| `ninfer_lossy_prefill_scouted_tokens_total`, `ninfer_lossy_prefill_kept_tokens_total` | prompt tokens the scouts scored, and the scored tokens the selections kept (the rest never entered the KV cache) |
+| `ninfer_lossy_prefill_alias_hits_total` | prompts rewritten onto a lossy-prefilled lineage, so a follow-up turn reuses its kept checkpoints |
+| `ninfer_lossy_prefill_summaries_total{kind="new\|reused"}`, `ninfer_lossy_prefill_summary_probe_timeouts_total` | summary strategy: prompts it rewrote with a summary made now or recorded for an earlier turn, and coldness probes not answered in time (the prompt was treated as warm and left whole) |
 | `ninfer_engine_recoveries_total` | host-side worker failures the server survived by failing the in-flight requests and clearing the context cache |
 | `ninfer_device_kv_{used,capacity}_pages`, `ninfer_device_backend_kv_used_pages`, `ninfer_device_state_{used,capacity}_slots` | physical Main KV, speculative backend KV and StateImage occupancy; retained history also occupies these pools |
 | `ninfer_host_context_{used,reserved,capacity,peak}_bytes`, `ninfer_host_state_images`, `ninfer_host_kv_used_bytes` | unified Host backing; reserved bytes, StateImages and KV bytes are breakdowns already included in used bytes |
@@ -1972,6 +1976,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--media-live-mib N` | all live prepared BF16 media payloads | `2048` |
 | `--media-preprocess-threads N` | bounded media preprocessing workers; `0` selects at most 16 from host concurrency | `0` |
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
+| `--request-log-lossy-detail` | add `kept_runs` (the kept offsets) to `request_done.lossy_prefill`; experimental, for the lossy sweep | off |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8\|fp8\|rk8v4\|rk4v4\|nvfp4\|k8v4` | KV-cache storage. `rk8v4` is opt-in RotorQuant and `rk4v4` opt-in Lloyd-Max 4-bit keys; all seven are accepted on this fork's sm_86/sm_89 targets | `bf16` |
@@ -2000,6 +2005,17 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--yield-long-prefill-ms N` | let the request at the head of the queue pause a prefill with at least N ms of work left, when its own prefill costs at most a quarter of that; see [execution behavior](#execution-behavior) | off |
 | `--prefill-decode-share P` | after each prefill step, while another lane decodes, run decode rounds for P percent (0-90) of the step's time before the next step; see [execution behavior](#execution-behavior) | off |
 | `--prefill-layer-slices N` | while another lane decodes, run each text prefill chunk as N slices of layers with that lane's decode round between slices (2-16); see [execution behavior](#execution-behavior) | off |
+| `--lossy-prefill-min-tokens N` | **experimental, opt-in, lossy.** Filter a cold prompt whose part after the product prompt (leading system/developer messages and tools) has more than N tokens: a scout scores it and only the kept blocks are prefilled, so the model never sees the dropped text. Text-only Qwen3.5 dense on one device; never when the conversation itself is cached. See [lossy long-prompt prefill](#lossy-long-prompt-prefill-experimental) | `0` (off) |
+| `--lossy-prefill-keep F` | share of the filtered part kept, (0, 1], at most `--lossy-prefill-skip` | `0.2` |
+| `--lossy-prefill-filter-layer N` | full-attention layer whose attention mass scores the tokens | `15` |
+| `--lossy-prefill-block N` | selection block, tokens (multiple of 16) | `64` |
+| `--lossy-prefill-recent N`, `--lossy-prefill-head N` | tokens at the end and at the start of the filtered part that are always kept | `4096`, `256` |
+| `--lossy-prefill-query-rows N` | trailing query rows that score the keys (1-256) | `64` |
+| `--lossy-prefill-pool-window N` | per-token max-pooling width before blocks are summed (odd; 1 is none) | `33` |
+| `--lossy-prefill-skip F` | keep everything (an ordinary prefill after the scout) when the forced tokens or the keep budget would exceed this share, (0, 1] | `0.8` |
+| `--lossy-prefill-scout-a4` | run the scout's Q4 GEMMs with int4 activations; needs `--prefill-a8` on an sm86 build | off |
+| `--lossy-prefill-strategy select\|summary` | `select`: the scout and block selection above. `summary`: replace the middle of a cold long conversation with one deterministic summary message (no model call) and prefill that exactly; ignores the selection knobs | `select` |
+| `--lossy-prefill-summary-max-tokens N` | summary strategy: the summary's budget, `min(0.06 x max_context, N)` tokens, at least 1,500 | `8000` |
 | `--sleep-idle-seconds N` | suspend the model after N seconds with no request; needs `--model-suspend` (with a router, sleeps idle models that were started with it) | off |
 | `--models-dir DIR` | [router mode](#several-models-router): serve every `.ninfer` in DIR; give no artifact path | off |
 | `--models-preset FILE` | router mode: INI presets, `[id]` sections with `model = PATH` and options without dashes; `[*]` applies to all | off |
@@ -2083,7 +2099,7 @@ they do not infer request behavior from process-global counter deltas.
 | `server_start` | build version, artifact path, architecture, public name, actual formats and prefill signature; resolved Engine and context-cache capacities, thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, unified Host context capacity and occupancy, KV sizing ledger, CUDA Graph allowance, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, requested reasoning effort, actual initial thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, requested reasoning effort, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
-| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, preemption/recovery counters, thinking-budget application counters, model thinking tokens, reasoning-loop guard firing, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, preemption/recovery counters, thinking-budget application counters, model thinking tokens, reasoning-loop guard firing, unrounded request-stage seconds, per-request Engine Host exposure, complete speculative-decoding counters, and `lossy_prefill` when the request took or considered the lossy path (the key is absent otherwise) |
 | `request_scheduling` | request identity, pause/restore/recovery transitions, Snapshot revocation, Engine observation time and cumulative global/request work counters |
 | `request_error` | the resolved request configuration and the generation, cancellation, or pre-outcome transport terminal message |
 | `throughput` | interval token/decode/context-cache pressure counter deltas, authoritative worker Host-work deltas, current scheduler/resource gauges, and decode-round batch statistics |
@@ -2104,6 +2120,16 @@ the strict parser returns as text to produce the structured calls (see
 [Tolerant tool calls](#tolerant-tool-calls)); the fallback reason is then `none`. These counters
 contain no tool arguments or generated text. `server_start.server.tolerant_tool_calls` records the
 flag.
+
+`request_done.lossy_prefill` (experimental) is present only for a request that took or considered
+[lossy prefill](#lossy-long-prompt-prefill-experimental): `outcome` (`completed`, `skipped` when
+nothing was dropped, `declined` when another lane held the scout, `aborted` when cancelled or its
+scout ended for memory first), `strategy` (`select` or `summary`), `uncached_tokens` (the filtered
+part, in the client's tokens), `kept_tokens`, `filter_layer`, `scout_ms` and `main_ms`. The summary
+strategy adds `summarized_messages` (`[first, last)` client message indices, or `null`),
+`summary_reused` and `summary_probe` (`cold`, `warm`, `timeout`, or `null` when not probed).
+`--request-log-lossy-detail` adds `kept_runs`, the kept offsets of the filtered part as
+`[begin, end)` pairs. Usage (`prompt_tokens`, `cached_tokens`) keeps counting the client's prompt.
 
 `request_done.constraint` carries the same constraint observation as the HTTP terminal result,
 or `null` for unconstrained requests. Preparation failures and execution errors use the existing
@@ -2379,6 +2405,25 @@ responses. NInfer does not execute tools or enforce tool-argument schemas throug
 
 Prompt-token usage includes chat-template and expanded media tokens. Generated-token usage comes
 from accepted output token IDs, including a stop token whose decoded text may be withheld.
+
+### Lossy long-prompt prefill (experimental)
+
+Off by default and **lossy**: when it runs, the model does not see part of the prompt.
+`--lossy-prefill-min-tokens N` turns it on for a cold prompt (no cached conversation; at most a
+shared product-prompt checkpoint) whose part after the product prompt -- the leading
+system/developer messages and the tool declarations -- has more than N tokens. The product prompt is
+prefilled exactly; a scout pass then runs the layers below `--lossy-prefill-filter-layer` over the
+rest and scores every token by the attention mass of the last query rows at that layer, whole blocks
+are kept by score (plus the head, the recent tail, every added token such as role markers and
+tool-call delimiters, and the role name after each turn start), and only the kept tokens are
+prefilled, at their original RoPE positions. A follow-up turn that starts with the same original
+prompt is rewritten onto the kept lineage, so it reuses that prefill. Text-only Qwen3.5 dense on one
+device; startup refuses MoE and pipeline-split models. When enabled, the scout's scratch is a
+permanent VRAM reservation of about 2 KB per token of `--max-context` on the 27B. `--lossy-prefill-strategy
+summary` is the alternative: a deterministic summary replaces the middle of a long conversation.
+Design, acceptance numbers and the deviations of the build are in
+[docs/maintainer/lossy-long-prefill.md](maintainer/lossy-long-prefill.md); quality and speed are
+not yet measured on a GPU.
 
 ### Automatic host cache
 
