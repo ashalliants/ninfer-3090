@@ -1412,8 +1412,9 @@ int exercise_lossy_prefill(const char* artifact) {
     // tokens (RequestBasePlan::reported_frontier), so it must reach at least the first prompt's
     // input-recovery position (the prompt without its assistant opener and the user turn's
     // closing), far past the kept length a compacted count would give.
+    // The generation prompt opens the reasoning block too (thinking is on by default).
     const auto opener_tokens =
-        static_cast<std::uint32_t>(engine.tokenize_text("<|im_start|>assistant\n").size());
+        static_cast<std::uint32_t>(engine.tokenize_text("<|im_start|>assistant\n<think>\n").size());
     const auto closing_tokens =
         static_cast<std::uint32_t>(engine.tokenize_text("<|im_end|>\n").size());
     const std::uint32_t reported_floor = first_tokens - opener_tokens - closing_tokens;
@@ -1568,8 +1569,9 @@ int exercise_lossy_summary(const char* artifact) {
         return 1;
     }
     const std::uint32_t summarised = first_report->kept_tokens;
+    // The generation prompt opens the reasoning block too (thinking is on by default).
     const auto opener_tokens =
-        static_cast<std::uint32_t>(engine.tokenize_text("<|im_start|>assistant\n").size());
+        static_cast<std::uint32_t>(engine.tokenize_text("<|im_start|>assistant\n<think>\n").size());
     const auto closing_tokens =
         static_cast<std::uint32_t>(engine.tokenize_text("<|im_end|>\n").size());
 
