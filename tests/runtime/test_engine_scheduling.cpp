@@ -1150,6 +1150,51 @@ void test_lossy_yield_refused_during_scout() {
             "the restored main pass did not continue on the compacted prompt\n" + rig.dump());
 }
 
+// LossyResumesAfterExactPause: a short request at the head yields the long one while it is still
+// prefilling the product prompt (Exact, before M). Restored, it finishes Exact at M, scouts U and
+// prefills the kept tokens: the pause does not drop the lossy path. The Program carries the path
+// in its saved control, so the Engine enables it once, at the first binding.
+void test_lossy_resumes_after_exact_pause() {
+    constexpr std::uint32_t kDeepMarker = 3 * kLossyChunk; // Exact takes three chunks
+    constexpr std::uint32_t kPrompt     = kDeepMarker + 31000;
+    constexpr std::uint32_t kKept       = 6200;            // ceil(0.2 * 31,000)
+    Rig rig({.chunk = kLossyChunk, .lanes = 1, .yield_ms = 100, .lossy_min_tokens = 30000});
+    rig.hold_at([](const Event& e) {
+        return e.kind == Event::Kind::Prefill && e.request == 1 && e.position == kLossyChunk;
+    });
+    fake::PreparedPrompt prompt = lossy_prompt(1, kPrompt);
+    prompt.lossy_exact_end      = kDeepMarker;
+    auto long_result = rig.run_prompt(std::move(prompt), 1);
+    require(rig.wait_held(), "the exact phase never reached its second chunk\n" + rig.dump());
+    auto short_result = rig.run(2, 100, 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    rig.release();
+    require(finished(short_result) && finished(long_result), "a request did not finish\n" + rig.dump());
+    const auto events      = rig.events();
+    const auto pause_start = first_index(events, Event::Kind::PauseStart, 1);
+    const auto restore     = first_index(events, Event::Kind::Restore, 1);
+    const auto first_scout = first_index(events, Event::Kind::Scout, 1);
+    require(pause_start && restore && first_scout && *pause_start < *restore &&
+                *restore < *first_scout,
+            "the long request was not paused in Exact and restored before its scout\n" + rig.dump());
+    require(events[*pause_start].position < kDeepMarker, "the pause was not before M\n" + rig.dump());
+    require(rig.events_of(1, Event::Kind::EnableLossy).size() == 1,
+            "the path was not enabled exactly once\n" + rig.dump());
+    const auto scout = rig.events_of(1, Event::Kind::Scout);
+    require(total_tokens(scout) == kPrompt - kDeepMarker && scout.front().position == kDeepMarker,
+            "the restored request did not scout U from M\n" + rig.dump());
+    require(total_tokens(rig.events_of(1, Event::Kind::Prefill)) == kDeepMarker + kKept,
+            "the restored request did not prefill M plus the kept tokens\n" + rig.dump());
+    const auto& report = long_result.get().lossy_prefill;
+    require(report && report->outcome == LossyPrefillOutcome::Completed &&
+                report->uncached_tokens == kPrompt - kDeepMarker && report->kept_tokens == kKept,
+            "the resumed lossy prefill was not reported completed");
+    const auto stats = rig.core().runtime_stats();
+    require(stats.lossy_prefills_completed == 1 && stats.lossy_prefills_aborted == 0 &&
+                stats.prefill_yields == 1,
+            "the resumed lossy prefill was not counted completed");
+}
+
 // LossyPreemptionDuringScout: memory pressure needs the scouting lane's pages. The pause is never
 // refused into a deadlock: the scout ends at M, the request is paused, restored, and prefills U in
 // full.
@@ -1585,6 +1630,7 @@ int main() {
     run("LossyPromptLengthChangeAccepted", test_lossy_prompt_length_change_accepted);
     run("LossyCancelDuringScout", test_lossy_cancel_during_scout);
     run("LossyYieldRefusedDuringScout", test_lossy_yield_refused_during_scout);
+    run("LossyResumesAfterExactPause", test_lossy_resumes_after_exact_pause);
     run("LossyPreemptionDuringScout", test_lossy_preemption_during_scout);
     run("LossyUsageReportsOriginal", test_lossy_usage_reports_original);
     run("LossyCountersAndRequestLog", test_lossy_counters_and_request_log);

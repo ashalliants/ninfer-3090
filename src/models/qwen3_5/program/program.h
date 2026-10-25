@@ -593,7 +593,9 @@ public:
     // never layer-sliced. While the scout runs the lane cannot be paused (start_pause returns
     // false) or captured; abort is always allowed. Returns false, with nothing changed, for a
     // request it cannot take: no scout scratch (lossy prefill off, MoE or split model), a plan
-    // without lossy(), a multimodal or resumed request, one already advanced, or M at the prompt end.
+    // without lossy(), a multimodal request, one already advanced or already on the path, or M at
+    // the prompt end. A request paused in Exact keeps the path: its saved control carries the phase
+    // and M, so its restore goes on to M and scouts without another call.
     // The Program runs one scout at a time: a request that reaches M while another lane scouts
     // declines (LossyOutcome::declined) and prefills normally. The trigger's other conditions --
     // the threshold, and a reuse source that is none or a SharedPrefix checkpoint, never a private

@@ -19,7 +19,8 @@
 // way the Engine sees it: a plan with lossy() prefills exactly to M, then scout steps report
 // scouted_tokens with nothing processed, and the step that ends the scout reports the compacted
 // length (M + keep share of U) and a compacted plan. While a lane scouts, start_pause refuses;
-// abort_lossy_scout ends the scout at M, and so does abort.
+// abort_lossy_scout ends the scout at M, and so does abort. A pause in Exact carries the lossy
+// state to the restore (CarriedLossy), as the real Program's saved control does.
 
 #include "core/device_snapshot.h"
 #include "ninfer/types.h"
@@ -222,12 +223,20 @@ struct BindingReservation {
 };
 
 // What a paused request keeps. The fake always saves the cursor, so a restore never recomputes.
+// A paused lane's lossy state, carried to its restore like the real Program's saved RequestControl
+// (pause.cpp keeps the whole control, install_binding moves it back): a request paused in Exact
+// goes on to M and scouts after its restore. A scout cannot pause; Main needs nothing carried (the
+// Engine rebinds the compacted plan).
+struct CarriedLossy {
+    std::uint32_t exact_end = 0;
+};
+
 class ResumeState {
 public:
     ResumeState() = default;
     ResumeState(std::uint32_t frontier, std::uint32_t generated, std::optional<CheckpointHandle> snapshot,
-                std::uint32_t base = 0)
-        : frontier_(frontier), generated_(generated), base_(base), snapshot_(snapshot) {}
+                std::uint32_t base = 0, std::optional<CarriedLossy> lossy = std::nullopt)
+        : frontier_(frontier), generated_(generated), base_(base), snapshot_(snapshot), lossy_(lossy) {}
     ResumeState(ResumeState&&) noexcept            = default;
     ResumeState& operator=(ResumeState&&) noexcept = default;
 
@@ -236,12 +245,14 @@ public:
     [[nodiscard]] std::uint32_t frontier() const noexcept { return frontier_; }
     [[nodiscard]] std::uint32_t generated() const noexcept { return generated_; }
     [[nodiscard]] std::uint32_t base() const noexcept { return base_; }
+    [[nodiscard]] std::optional<CarriedLossy> lossy() const noexcept { return lossy_; }
 
 private:
     std::uint32_t frontier_  = 0;
     std::uint32_t generated_ = 0;
     std::uint32_t base_      = 0; // the admitted reuse frontier, which the Begin summary keeps
     std::optional<CheckpointHandle> snapshot_;
+    std::optional<CarriedLossy> lossy_;
 };
 
 enum class ExecutionUnitKind : std::uint8_t { Prefill, Replay, Decode, Control, Normalize };
@@ -739,6 +750,7 @@ public:
             tx.generated = resume->generated();
             tx.base      = resume->base();
             tx.resumed   = true;
+            tx.lossy     = resume->lossy();
             if (auto handle = resume->snapshot_handle()) { snapshots_.erase(handle->index); }
         }
         transaction_ = tx;
@@ -798,6 +810,9 @@ public:
             lane.cursor     = tx.cursor;
             lane.generated  = tx.generated;
             lane.decoding   = tx.cursor >= tx.prompt_tokens && tx.generated != 0;
+            if (tx.lossy) {
+                lane.lossy = Lossy{.phase = LossyPhase::Exact, .exact_end = tx.lossy->exact_end};
+            }
             progress.sequence = SequenceHandle{tx.lane, lane.epoch};
             record({tx.resumed ? Event::Kind::Restore : Event::Kind::Bind, tx.lane, tx.plan, 0, 0,
                     tx.cursor, false});
@@ -808,7 +823,11 @@ public:
                 snapshot = CheckpointHandle{next_snapshot_, 1};
                 snapshots_.insert(next_snapshot_++);
             }
-            progress.paused.emplace(lane.cursor, lane.generated, snapshot, lane.base);
+            std::optional<CarriedLossy> carried;
+            if (lane.lossy && lane.lossy->phase == LossyPhase::Exact) {
+                carried = CarriedLossy{.exact_end = lane.lossy->exact_end};
+            }
+            progress.paused.emplace(lane.cursor, lane.generated, snapshot, lane.base, carried);
             record({Event::Kind::PauseDone, tx.lane, lane.plan, 0, 0, lane.cursor, tx.snapshot});
             lane = Lane{};
         }
@@ -1056,6 +1075,7 @@ private:
         bool snapshot             = false;
         RequestBasePlan base_plan;
         std::uint32_t base        = 0;
+        std::optional<CarriedLossy> lossy;
     };
 
     [[nodiscard]] const SharedPrefix* shared_prefix(CheckpointHandle handle) const noexcept {

@@ -2154,7 +2154,7 @@ private:
             }
             state.phase = Phase::Ended;
         } else if (state.before_outcome() && state.phase != Phase::Planned) {
-            // The path did not run to its outcome (a replay restore rebuilt the lane ordinarily).
+            // The path did not run to its outcome (the lane was rebuilt without it).
             lossy_aborted(request);
         }
     }
@@ -2319,6 +2319,11 @@ private:
                     request->paused_ns += elapsed_ns(*request->paused_at, Clock::now());
                 }
                 request->paused_at.reset();
+                // A request paused in Exact (before M) keeps its lossy path: the Program's saved
+                // control carries its phase and M to the restored lane (pause.cpp, install_binding),
+                // which goes on to M and scouts. Nothing is enabled again here; enable_lossy refuses
+                // a lane already on the path. A scout cannot pause, and Main runs on the compacted
+                // plan this rebinding used.
                 observe_scheduling(request, GenerationSchedulingTransition::Restored);
             } else {
                 request->initial_binding_ns = elapsed_ns(*request->admitted_at, Clock::now());
