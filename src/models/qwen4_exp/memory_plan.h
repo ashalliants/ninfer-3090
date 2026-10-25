@@ -74,6 +74,26 @@ struct HostMemoryLedger {
 
 [[nodiscard]] HostMemoryLedger plan_host_memory(const HostMemorySnapshot& snapshot, const HostMemoryDemand& demand);
 
+// --hot-embedding-rows N (FlashNextOptions::hot_embedding_rows): the token embedding, GGML IQ4_XS rows
+// of hidden / 256 blocks of 136 bytes, is loaded whole into the pinned block (mapped, so the GPU reads
+// its rows over PCIe) instead of device memory, and the Program copies its first N rows (the lowest
+// ids, the most frequent tokens) to a device buffer. All zero when N is 0.
+struct HotEmbeddingPlan {
+    std::uint64_t row_bytes = 0; // one row
+    // The whole table: it leaves the dense device weights (LoadPlan::device_bytes) and joins the
+    // pinned block, planned as HostMemoryDemand::other_pinned.
+    std::uint64_t table = 0;
+    // The first N rows' device copy (ProgramDevicePlan::hot_embedding).
+    std::uint64_t hot = 0;
+};
+// Refuses (std::invalid_argument naming --hot-embedding-rows) N above the vocabulary, and a hidden
+// size that is not a multiple of 256 when N is nonzero.
+[[nodiscard]] HotEmbeddingPlan plan_hot_embedding(std::uint64_t vocab, std::uint64_t hidden, std::uint32_t hot_rows);
+// The RAM ledger's terms for the load plan's pinned block of `pinned_block` bytes (LoadPlan::pinned_bytes):
+// the hot-embedding table is other_pinned, the rest (the expert banks and, with --vision, the tower)
+// expert_banks.
+void plan_pinned_weights(HostMemoryDemand& demand, std::uint64_t pinned_block, const HotEmbeddingPlan& hot);
+
 // The context cache's Host tier beside everything else the ledger plans: `requested` bytes when they
 // fit with the experts (their full need and margin) above the reserve, else the most that fits in
 // whole `granule`s; zero below `minimum` (too small to hold one long checkpoint) or when the experts

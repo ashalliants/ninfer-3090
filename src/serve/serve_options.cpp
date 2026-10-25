@@ -176,6 +176,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--no-cuda-graph] [--no-prefix-reuse] [--devices N,M,...] [--stage-layers A,B,...] "
            "[--ngram-volume FILE] [--ngram-keepalive-ms N] [--expert-state FILE|--no-expert-state] [--default-expert-state FILE] "
            "[--vram-headroom-mib N] [--shared-expert-stream] [--mtp-constrained] [--mtp-joint-acceptance] [--ngram-prefetch] "
+           "[--hot-embedding-rows N] "
            "[--ram-headroom-mib N] [--expert-cache-mib N] [--context-nvme-mib N [--context-nvme-dir DIR]] "
            "[--chat-template FILE] "
            "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
@@ -269,7 +270,10 @@ std::string serve_usage_text(const char* argv0) {
            "of acceptance, estimated from each draft's probability, stays above an adaptive threshold "
            "(off by default: an acceptance estimate picks the count before drafting); --ngram-prefetch "
            "(--spec mtp) reads the anchor column's n-gram rows while the drafter runs, so verification "
-           "finds them cached (off by default); --vision takes "
+           "finds them cached (off by default); --hot-embedding-rows N keeps only the token embedding's "
+           "first N rows in VRAM and reads the rest from pinned RAM, freeing VRAM for the expert cache "
+           "(the same output; 0, the default, keeps the whole table in VRAM; at most the vocabulary); "
+           "--vision takes "
            "images when "
            "the model was converted with "
            "--mmproj (its vision tower stays in host memory and borrows expert-cache memory per image)\n"
@@ -675,6 +679,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.flash_next.mtp_joint_acceptance = true;
         } else if (arg == "--ngram-prefetch") {
             options.flash_next.ngram_prefetch = true;
+        } else if (arg == "--hot-embedding-rows") {
+            options.flash_next.hot_embedding_rows = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--hot-embedding-rows"), "hot-embedding-rows"));
         } else if (arg == "--expert-state") {
             options.flash_next.expert_state_path = require_value("--expert-state");
             if (options.flash_next.expert_state_path.empty()) {

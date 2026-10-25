@@ -506,6 +506,7 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
         throw std::invalid_argument("Qwen3.8-Flash-Next: --mtp-joint-acceptance chooses how many drafts each round "
                                     "verifies and --mtp-fixed always verifies --draft-tokens: use one of them");
     }
+    (void)plan_hot_embedding(c.vocab_size, c.hidden_size, o.hot_embedding_rows); // refuses N above the vocabulary
     Layout d;
     d.drafts       = static_cast<std::int32_t>(o.mtp_draft_tokens);
     d.max_width    = 1 + d.drafts;
@@ -597,6 +598,7 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     b.shared_expert_workspace = plan_shared_expert_workspace(o, c);
     b.mtp_constrained_masks   = plan_mtp_constrained_masks(o, public_tokens);
     b.mtp_draft_probs         = plan_mtp_draft_probs(o);
+    b.hot_embedding           = plan_hot_embedding(c.vocab_size, c.hidden_size, o.hot_embedding_rows).hot;
     b.staging   = d.staging;
     b.state     = d.state_total;
     // Logits of the widest round (FP32 and BF16; at least one column per lane), then the sampling
@@ -776,6 +778,22 @@ public:
             allocated += plan_.bytes.mtp_draft_probs;
             draft_probs_host_ = PinnedHostBuffer(plan_.bytes.mtp_draft_probs);
         }
+        if (plan_.bytes.hot_embedding != 0) {
+            // --hot-embedding-rows: the token embedding is in the mapped pinned block (the forward reads
+            // its rows through the device pointer); its first rows get a device copy.
+            const Weight& table = parameters_.token_embedding;
+            void* mapped        = nullptr;
+            if (cudaHostGetDevicePointer(&mapped, const_cast<void*>(table.qdata), 0) != cudaSuccess ||
+                mapped == nullptr) {
+                (void)cudaGetLastError();
+                throw std::runtime_error("--hot-embedding-rows: the token embedding is not in mapped pinned memory "
+                                         "(load the model with its embedding in the pinned block)");
+            }
+            cold_embedding_ = mapped;
+            hot_embedding_  = DeviceBuffer(plan_.bytes.hot_embedding);
+            allocated += plan_.bytes.hot_embedding;
+            CUDA_CHECK(cudaMemcpy(hot_embedding_.p, table.qdata, plan_.bytes.hot_embedding, cudaMemcpyHostToDevice));
+        }
 
         // The shared expert's side-stream carve (when on) comes out of the same arena.
         work_ = std::make_unique<WorkspaceArena>(plan_.work + plan_.bytes.shared_expert_workspace);
@@ -952,7 +970,7 @@ public:
         ngram_next_ = PinnedHostBuffer(plan_.io.bytes - plan_.io.ngram);
         forward_ = std::make_unique<execution::Forward>(
             parameters_, device_, *work_, std::move(state), std::move(kv), std::move(experts), std::move(drafter),
-            execution::ForwardOptions{.shared_expert_stream = options_.shared_expert_stream});
+            forward_options());
         if (options_.shared_expert_stream) {
             // The plan was made before the weights were read: refuse weights whose shared expert
             // Linears need more scratch than the static workspace or a wide call's lent arena hold.
@@ -984,6 +1002,29 @@ public:
 
     ProgramImpl(const ProgramImpl&)            = delete;
     ProgramImpl& operator=(const ProgramImpl&) = delete;
+
+    // The forward's options; with --hot-embedding-rows its two embedding planes: the device copy of
+    // the first rows and the whole table through its device pointer in the mapped pinned block.
+    execution::ForwardOptions forward_options() const {
+        execution::ForwardOptions out{.shared_expert_stream = options_.shared_expert_stream};
+        if (plan_.bytes.hot_embedding == 0) { return out; }
+        const Weight& table        = parameters_.token_embedding;
+        const auto rows            = static_cast<std::int32_t>(options_.hot_embedding_rows);
+        out.hot_embedding_rows     = rows;
+        out.cold_embedding         = table;
+        // The payload keeps its offset before the codes (zero for ggml_blocks_v1).
+        const auto codes_at = static_cast<const std::byte*>(table.qdata) - static_cast<const std::byte*>(table.payload);
+        out.cold_embedding.payload = static_cast<const std::byte*>(cold_embedding_) - codes_at;
+        out.cold_embedding.qdata   = cold_embedding_;
+        out.hot_embedding          = table;
+        out.hot_embedding.payload  = hot_embedding_.p;
+        out.hot_embedding.qdata    = hot_embedding_.p;
+        out.hot_embedding.payload_bytes   = plan_.bytes.hot_embedding;
+        out.hot_embedding.shape[0]        = rows;
+        out.hot_embedding.padded_shape[0] = rows;
+        out.hot_embedding.n               = rows;
+        return out;
+    }
 
     const ProgramDevicePlan& device_plan() const noexcept { return plan_.bytes; }
     const VramSizing& vram_sizing() const noexcept { return sizing_; }
@@ -4647,6 +4688,9 @@ private:
     // --mtp-joint-acceptance: the drafts' probabilities on the device and their pinned staging.
     DeviceBuffer draft_probs_;
     PinnedHostBuffer draft_probs_host_{1};
+    // --hot-embedding-rows: the token embedding's first rows (ProgramDevicePlan::hot_embedding).
+    DeviceBuffer hot_embedding_;
+    const void* cold_embedding_ = nullptr; // the whole table's device pointer in the mapped pinned block
     PinnedHostBuffer config_host_{1};
     Tensor logits32_, logits16_, sampled_, sample_position_, token_counts_;
     Tensor lane_logits_; // BF16 [V, lanes]: each lane's last prefill call's logits (checkpoints, exact hits)

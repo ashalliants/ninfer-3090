@@ -264,15 +264,19 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         throw std::invalid_argument("Qwen3.8-Flash-Next: this artifact has no vision tower: convert it with --mmproj "
                                     "to use --vision, or remove --vision");
     }
-    auto plan      = models::qwen4_exp::plan_load(reader, mtp, vision);
+    // --hot-embedding-rows: the token embedding is pinned whole (beside the banks) and only its first
+    // rows get a device copy.
+    auto plan      = models::qwen4_exp::plan_load(reader, mtp, vision, next.hot_embedding_rows != 0);
     binding.complete();
     const auto& config = plan.config();
+    const auto hot_embedding =
+        models::qwen4_exp::plan_hot_embedding(config.vocab_size, config.hidden_size, next.hot_embedding_rows);
 
     // The RAM ledger: every expert (and the vision tower) is pinned, beside a reserve for Windows and
     // every other planned allocation, before anything is pinned or read.
     models::qwen4_exp::HostMemoryDemand demand;
     demand.reserve      = next.ram_headroom_bytes;
-    demand.expert_banks = plan.pinned_bytes();
+    models::qwen4_exp::plan_pinned_weights(demand, plan.pinned_bytes(), hot_embedding);
     demand.later_pinned = kProgramPinnedAllowance;
     demand.pageable     = models::qwen4_exp::NgramVolume::cache_bytes(config.ple.table);
     // Decoded media: the frontend's cache up to its budget, and in flight at most one prompt's patches
@@ -347,6 +351,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.context_bounce_bytes = kNvmeBounceBytes;
     program_options.ngram_keepalive_ms = next.ngram_keepalive_ms;
     program_options.shared_expert_stream = next.shared_expert_stream;
+    program_options.hot_embedding_rows   = next.hot_embedding_rows;
     program_options.ngram_volume    = next.ngram_volume_path.empty()
                                           ? models::qwen4_exp::default_ngram_volume(options.artifact_path)
                                           : next.ngram_volume_path;
@@ -369,6 +374,13 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                                                                      plan.resources().public_token_count,
                                                                      plan.expert_record_strides());
     const std::uint64_t dense = plan.device_bytes();
+    if (hot_embedding.table != 0) {
+        report("token embedding: " + std::to_string(next.hot_embedding_rows) + " of " +
+               std::to_string(config.vocab_size) + " rows in VRAM (" + std::to_string(mib(hot_embedding.hot)) +
+               " MiB), the rest read from pinned RAM (" + std::to_string(mib(hot_embedding.table)) +
+               " MiB pinned): " + std::to_string(mib(hot_embedding.table - hot_embedding.hot)) +
+               " MiB more VRAM for the expert cache");
+    }
     auto vram                 = open_vram_budget_source(device.device);
     const VramSnapshot before = vram->query();
     {

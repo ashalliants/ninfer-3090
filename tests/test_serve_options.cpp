@@ -182,6 +182,19 @@ int main() {
         }
         failures += check(refused, "--ngram-prefetch without --spec mtp was not refused naming both flags");
     }
+    failures += check(defaults.flash_next.hot_embedding_rows == 0, "hot embedding rows are on by default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--hot-embedding-rows", "8192"}))
+                              .flash_next.hot_embedding_rows == 8192,
+                      "--hot-embedding-rows does not reach the Engine");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--hot-embedding-rows", "0"})
+                              .flash_next.hot_embedding_rows == 0,
+                      "--hot-embedding-rows 0 did not keep the whole table in VRAM");
+    {
+        bool negative_rejected = false;
+        try { (void)parse({"ninfer-serve", "model.ninfer", "--hot-embedding-rows", "-1"}); }
+        catch (const std::invalid_argument&) { negative_rejected = true; }
+        failures += check(negative_rejected, "--hot-embedding-rows accepted a negative count");
+    }
     failures += check(parse({"ninfer-serve", "model.ninfer", "--ngram-keepalive-ms", "25"})
                               .flash_next.ngram_keepalive_ms == 25,
                       "--ngram-keepalive-ms was not parsed");

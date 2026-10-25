@@ -335,13 +335,16 @@ struct ProgramDevicePlan {
     // --mtp-joint-acceptance: the drafts' probabilities, one FP32 word per draft
     // (plan_mtp_draft_probs; 0 when off or without MTP).
     std::uint64_t mtp_draft_probs = 0;
+    // --hot-embedding-rows: the device copy of the token embedding's first rows
+    // (plan_hot_embedding(...).hot; 0 when off). The whole table is in the pinned block then.
+    std::uint64_t hot_embedding = 0;
     std::uint64_t expert_record_stride = 0; // one expert frame
     std::uint32_t max_frames           = 0; // the most frames the expert cache uses
     std::uint32_t graph_bound          = 0; // CUDA graph executables the Program may instantiate (counts both halves of the split decode)
 
     [[nodiscard]] std::uint64_t fixed_bytes() const noexcept {
         return kv + workspace + staging + state + io + residency + speculation + shared_expert_workspace +
-               mtp_constrained_masks + mtp_draft_probs;
+               mtp_constrained_masks + mtp_draft_probs + hot_embedding;
     }
 };
 
@@ -417,6 +420,11 @@ struct ProgramOptions {
     // Each MoE block's shared expert on a high-priority side stream beside the routed experts
     // (execution::ForwardOptions::shared_expert_stream); the same outputs, bit for bit.
     bool shared_expert_stream = false;
+    // FlashNextOptions::hot_embedding_rows: the model loaded its token embedding into the pinned
+    // block (plan_load with hot_embedding), and the Program copies its first rows to the device; the
+    // forward reads the rest from the pinned block (execution::ForwardOptions::hot_embedding_rows).
+    // 0: the embedding is in device memory.
+    std::uint32_t hot_embedding_rows = 0;
 };
 
 // ProgramDevicePlan::shared_expert_workspace of these options: the side-stream carve

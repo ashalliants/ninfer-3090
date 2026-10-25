@@ -672,6 +672,26 @@ None has been measured on the RTX 3090 yet.
     (the same ids, in the same order).
   - Checked on the CPU only (`ninfer_qwen4_exp_ngram_volume_test`: the ids against hand-derived
     windows, the prefetched rows cached). Not measured.
+- **Hot embedding rows in VRAM** (`--hot-embedding-rows N`; Basalt keeps 8192). The token embedding
+  (248,320 IQ4_XS rows of 1,360 bytes, 322 MiB) is bound in the pinned block, before the expert
+  banks, instead of device memory, and the Program copies rows [0, N) to a device buffer. The text
+  model and the MTP drafter gather through `ops::embedding_split`: ids below N from the device copy,
+  the rest through the block's device pointer (it is `cudaHostAllocMapped`, as the expert banks'
+  zero-copy reads already use; no new registration). The byte-level BPE gives the most frequent
+  tokens the lowest ids, so Basalt expects most gathers to stay in VRAM. Designed to work with two
+  lanes, MTP and vision (the vision tower is pinned after the banks, so its groups stay contiguous).
+  - Ledgers: `LoadPlan::device_bytes` loses the whole table, `ProgramDevicePlan::hot_embedding` gains
+    N rows (11 MiB at 8192), and the RAM ledger plans the table as `HostMemoryDemand::other_pinned`
+    (`plan_hot_embedding` and `plan_pinned_weights` in `memory_plan.h`). At 8192 the frames get
+    311 MiB more, about 220 experts of 1.5 MB. Off, every term is zero and the embedding is in device
+    memory as on master.
+  - The same values: the split route decodes each row exactly as `ops::embedding`.
+    `ninfer_embedding_test` (`embedding_split_matches_embedding`) checks it bitwise across the
+    boundary, with the cold plane in mapped pinned memory; not run yet.
+  - Cost: a cold id's row (1,360 bytes) crosses PCIe inside the embedding kernel; a decode step
+    gathers one row per column. The 322 MiB join the pinned block (one `cudaHostAlloc` at load,
+    so no extra `cudaHostRegister` under WDDM); the RAM ledger counts them, so a host that only
+    just fits the banks does not start with the option. Not measured.
 
 ## Artifact decisions
 
