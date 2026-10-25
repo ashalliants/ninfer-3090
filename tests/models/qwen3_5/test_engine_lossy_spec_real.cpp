@@ -46,6 +46,9 @@ ninfer::EngineOptions lossy_options(const char* artifact, const Spec* spec) {
     options.context_cache.host_capacity_bytes = 0;
     options.lossy_prefill.min_tokens          = 30000;
     options.speculative.backend               = ninfer::SpeculativeBackend::None;
+    // DFlash2 needs FP16 Gated DeltaNet state; the plain reference uses it too, so the two
+    // engines differ only in speculation (FP32 state alone moves greedy output at token 17).
+    options.gdn_state_fp16 = selected_spec() == Spec::DFlash2;
     if (spec && *spec == Spec::Mtp) {
         options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
         options.speculative.draft_tokens  = 3;
@@ -54,7 +57,6 @@ ninfer::EngineOptions lossy_options(const char* artifact, const Spec* spec) {
         options.speculative.backend      = ninfer::SpeculativeBackend::DFlash2;
         options.speculative.draft_tokens  = 7;
         options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
-        options.gdn_state_fp16            = true;
     }
     return options;
 }
