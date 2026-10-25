@@ -79,6 +79,9 @@ T2Launch select_t2_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
     case LinearPolicy::AllowPrefillCublas:
         return select_t2_a16_launch(n, k, t);
     case LinearPolicy::AllowA4:
+    // Only the four policy-bearing Ops take the scout's int4 route (linear.h); plain Linear
+    // refuses it before dispatch, so it never reaches a T2 weight.
+    case LinearPolicy::ScoutA4Int:
         break;
     }
     throw std::invalid_argument("t2 linear: unsupported policy");

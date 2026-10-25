@@ -4,8 +4,10 @@
 //      (a4_g64_reference.h) byte for byte.
 //   2. q4_a4_linear against an exact oracle over the same int4 inputs: both operands decoded to
 //      their represented values on the host and summed in FP64, independently of any tiling.
-//      Criterion kExactPath: relative L2 <= 1e-2 and no element off by more than 1e-2 of the
-//      largest reference (FP32 group accumulation plus the output's own rounding is ~1e-3).
+//      Criterion kExactPath: relative L2 <= 3e-3 and no element off by more than two BF16 steps
+//      (2^-7) of the largest reference (FP32 group accumulation plus the output's own rounding is
+//      ~1.1e-3). Token magnitudes are hashed powers of two in [2^-3, 2^3], so a wrong token's (or a
+//      shared) activation scale is off by up to 64x and fails clearly.
 //   3. Agreement with the existing integer-A8 routes on the same weight and BF16 activation
 //      (gate_up: q4a8 LinearSwiGLU, compared after applying SwiGLU to this Op's rows; down: the
 //      A8 LinearAdd into a zero residual): cosine >= 0.995 on the outlier-free fixture. The
@@ -55,7 +57,12 @@ using ninfer::test::ReductionCriterion;
 namespace qw = ninfer::test::quantized_weight;
 namespace a4 = ninfer::test::a4_g64;
 
-constexpr ReductionCriterion kExactPath{1.0e-2, 0.0, 1.0e-2};
+// Same int4 inputs on both sides, so only FP32 accumulation order (~1e-6 relative at K = 17408)
+// and the output's own rounding remain: for a BF16 output at most 2^-9 per element, about 1.1e-3
+// relative L2. 3e-3 leaves ~2.7x for that; the gross term is the house two-BF16-step floor.
+// Tightened from 1e-2/1e-2 together with the non-uniform token magnitudes; compiled, not yet run on
+// a GPU at this limit.
+constexpr ReductionCriterion kExactPath{3.0e-3, 0.0, ninfer::test::kBf16GrossRelativeFloor};
 constexpr double kA8CosineTarget = 0.995;
 constexpr double kSpeedupTarget  = 1.4;
 constexpr double kRouteCosine    = 0.9999;
@@ -85,12 +92,20 @@ HostActivation make_activation(std::int32_t k, std::int32_t t, std::uint32_t see
     a.bits.resize(static_cast<std::size_t>(k) * t);
     a.values.resize(a.bits.size());
     for (std::int32_t token = 0; token < t; ++token) {
+        // Each token's magnitude is a hashed power of two in [2^-3, 2^3], so its per-group A4 scales
+        // differ from its neighbours' by up to 64x: a kernel that applied another token's scale (or
+        // a tile-shared one) would be off by that factor, far outside the exact-path bound, instead
+        // of hiding in the rounding noise of uniformly scaled tokens.
+        const int exponent = static_cast<int>(
+            qw::detail::mix64(static_cast<std::uint64_t>(token) * 0x9e3779b97f4a7c15ULL ^ seed) % 7U) - 3;
+        const float magnitude = std::ldexp(1.0F, exponent);
         for (std::int32_t r = 0; r < k; ++r) {
             const std::size_t i = static_cast<std::size_t>(token) * k + r;
             const std::uint64_t h =
                 qw::detail::mix64((static_cast<std::uint64_t>(token) << 32) ^
                                   static_cast<std::uint64_t>(r) ^ seed);
-            float v = static_cast<float>(static_cast<std::int32_t>(h & 0xffffU) - 32768) / 32768.0F;
+            float v = magnitude *
+                      static_cast<float>(static_cast<std::int32_t>(h & 0xffffU) - 32768) / 32768.0F;
             if (fixture == Fixture::Outlier && (r % 431) == 7) { v *= 24.0F; }
             if (dtype == DType::BF16) {
                 a.bits[i]   = f32_to_bf16(v);
