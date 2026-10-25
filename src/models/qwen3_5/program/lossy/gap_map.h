@@ -56,13 +56,27 @@ using GapMapSet = std::vector<std::shared_ptr<const GapMap>>; // lineage order
 [[nodiscard]] GapMap make_gap_map(const PreparedPromptData& original, std::uint32_t begin,
                                   std::span<const std::uint32_t> kept_offsets);
 
-// The same map with U ending at its last dropped token: a trailing kept run leaves U (and the
-// stored original), since compaction copies it unchanged either way, so compact_prompt gives the
-// same prompt and frontier translation the same frontiers. A lossy prefill's U runs to the end of
-// the prompt, generation opener included, which a follow-up turn serializes differently (the
-// assistant turn replaces it); without this no follow-up would ever match the map. `original` is
-// the prompt the map was made from.
-[[nodiscard]] GapMap end_at_last_gap(GapMap map, const PreparedPromptData& original);
+// Where the prompt's generation opener (`<|im_start|>assistant\n<think>\n`) begins: the last
+// `turn_start` with no `turn_end` after it, the open turn the model is asked to write. nullopt when
+// either token is unknown, when the prompt has no open turn, or when it continues the final
+// assistant message (continuation_content set): then the prompt has no generation opener.
+[[nodiscard]] std::optional<std::uint32_t> generation_opener(const PreparedPromptData& prompt,
+                                                             std::optional<TokenId> turn_start,
+                                                             std::optional<TokenId> turn_end);
+
+// The same map with U ending at max(last dropped token + 1, opener): through the end of the last
+// message, which a follow-up turn reproduces verbatim, and not through the generation opener, which
+// a follow-up serializes differently (its assistant turn replaces it). Without this no follow-up
+// would ever match the map. It does not end at the last dropped token: the recent window is always
+// kept, so that would make every prompt sharing the original through the last gap (the same
+// document with another question, a regenerated last message, a parallel fork) inherit a selection
+// scored with another prompt's query rows. Only part of the trailing kept run leaves U (and the
+// stored original), and compaction copies it unchanged either way, so compact_prompt gives the
+// same prompt and frontier translation the same frontiers. nullopt (or an opener at or past
+// original_end) keeps the full span. `original` is the prompt the map was made from. A keep-all map
+// (nothing dropped) is a logic error: a skipped selection makes no gap map.
+[[nodiscard]] GapMap end_at_last_message(GapMap map, const PreparedPromptData& original,
+                                         std::optional<std::uint32_t> opener);
 
 // Kept prompt: [0, begin) unchanged, then the kept tokens of U, then [original_end, size)
 // unchanged. token_ids, token_types and all three position axes are subset and keep their original

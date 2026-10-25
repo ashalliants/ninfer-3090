@@ -469,6 +469,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                 lossy_special_tokens.push_back(static_cast<TokenId>(token.id));
                 if (token.content == "<|im_start|>") {
                     lossy_turn_start = static_cast<TokenId>(token.id);
+                } else if (token.content == "<|im_end|>") {
+                    lossy_turn_end = static_cast<TokenId>(token.id);
                 }
             }
             std::sort(lossy_special_tokens.begin(), lossy_special_tokens.end());

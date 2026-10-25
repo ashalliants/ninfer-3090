@@ -222,6 +222,16 @@ lineage, not of one checkpoint.
 - A lossy prefill produces a **gap map**: the original-prompt span `U` it covered (start, length, digest of
   the original tokens up to the end of `U`) and the kept token positions inside it. It is small (a few
   hundred KB at 100K tokens at most; run-length encoded over kept blocks it is far smaller).
+- `U` ends at the end of the last message, not at the prompt end: at max(last dropped token + 1, start
+  of the generation opener `<|im_start|>assistant\n<think>\n`), the last `<|im_start|>` with no
+  `<|im_end|>` after it. A follow-up reproduces every earlier message verbatim but replaces the opener
+  with its assistant turn, so a span through the opener would never match. It does not end at the
+  last dropped token either: the recent window is always kept, so a prompt that shares the original
+  only through the last gap (the same document with another question, a regenerated last message, a
+  parallel fork) would inherit a selection scored with another prompt's query rows and never be scouted
+  itself. The trimmed tail is kept, so the compacted prompt is the same. A prompt with no generation
+  opener (continuation of the final assistant message) keeps the span to the prompt end
+  (`end_at_last_message`, `lossy/gap_map.h`).
 - Every checkpoint descended from the selected sequence (captures at typed rewrite points, recovery
   frontiers, anchors, generation endpoints, snapshots) carries a reference to its lineage's gap maps.
   The gap map lives as long as any checkpoint referencing it.

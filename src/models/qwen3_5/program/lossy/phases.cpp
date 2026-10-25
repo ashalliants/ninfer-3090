@@ -59,8 +59,15 @@ bool ProgramImpl::abort_lossy_scout(SequenceHandle handle) {
     // end_scout puts back the growth reservation of the unit that opened the scout. Between units
     // (no permit) that unit is long settled, so settle the lane as any unit end would: otherwise
     // it keeps a chunk of pages reserved with no unit to use them, which the Engine's abort for a
-    // pause is meant to free.
-    if (!request.permit) { settle_unit(lane); }
+    // pause is meant to free. Inside a unit the lane holds that unit's permit: reserve what the
+    // permit covers, as reserve_units did for it, not what the opening unit covered.
+    if (!request.permit) {
+        settle_unit(lane);
+    } else {
+        const KVAddressSpaceHandle text = active_sequence(lane).kv->text;
+        text_kv_addresses->reserve_growth(
+            text, text_kv_addresses->growth_pages_for_tokens(text, request.permit->main_frontier));
+    }
     // Cannot happen: a scout begins only with the cursor at M (advance_lossy_scout checks it) and
     // its steps never move the cursor. A lane found elsewhere is corrupt, and the throw sends the
     // Engine to its worker recovery (clear every lane, verify the baseline), which is the right
@@ -181,7 +188,8 @@ void ProgramImpl::finish_lossy_scout(std::uint32_t lane, PrefillProgress& progre
     } else {
         outcome.kept_runs = kept_runs(selection.kept);
         auto map = std::make_shared<const GapMap>(
-            end_at_last_gap(make_gap_map(staged.prompt, begin, selection.kept), staged.prompt));
+            end_at_last_message(make_gap_map(staged.prompt, begin, selection.kept), staged.prompt,
+                                generation_opener(staged.prompt, lossy_turn_start, lossy_turn_end)));
         // Compact before the call: argument evaluation order is unspecified, and moving `map`
         // into the parameter first would leave `*map` null.
         PreparedPromptData compacted = compact_prompt(staged.prompt, *map);

@@ -21,7 +21,8 @@ using ninfer::models::qwen3_5::RewriteCheckpointKind;
 using ninfer::models::qwen3_5::RewriteCheckpointSpec;
 using ninfer::models::qwen3_5::detail::apply_gap_map;
 using ninfer::models::qwen3_5::detail::compact_prompt;
-using ninfer::models::qwen3_5::detail::end_at_last_gap;
+using ninfer::models::qwen3_5::detail::end_at_last_message;
+using ninfer::models::qwen3_5::detail::generation_opener;
 using ninfer::models::qwen3_5::detail::gap_map_digest;
 using ninfer::models::qwen3_5::detail::GapMap;
 using ninfer::models::qwen3_5::detail::make_gap_map;
@@ -431,35 +432,159 @@ void test_original_frontier_maps_through_the_lineage() {
 
 } // namespace
 
+// Chat structure for the end_at_last_message tests: <|im_start|>, <|im_end|>, role names, newline.
+constexpr TokenId kTurnStart = 1;
+constexpr TokenId kTurnEnd   = 2;
+constexpr TokenId kUser      = 10;
+constexpr TokenId kNewline   = 11;
+constexpr TokenId kAssistant = 12;
+constexpr TokenId kThink     = 13;
+
+void append_turn(std::vector<TokenId>& ids, TokenId role, const std::vector<TokenId>& content) {
+    ids.insert(ids.end(), {kTurnStart, role, kNewline});
+    ids.insert(ids.end(), content.begin(), content.end());
+    ids.push_back(kTurnEnd);
+}
+
+void append_opener(std::vector<TokenId>& ids) {
+    ids.insert(ids.end(), {kTurnStart, kAssistant, kNewline, kThink, kNewline});
+}
+
+std::vector<TokenId> id_range(TokenId first, std::size_t n) {
+    std::vector<TokenId> out(n);
+    for (std::size_t i = 0; i < n; ++i) { out[i] = first + static_cast<TokenId>(i); }
+    return out;
+}
+
+// Ids at positions 0..n-1.
+PreparedPromptData chat_prompt(const std::vector<TokenId>& ids) {
+    std::vector<std::int32_t> positions(ids.size());
+    for (std::size_t i = 0; i < ids.size(); ++i) { positions[i] = static_cast<std::int32_t>(i); }
+    return make_prompt(ids, positions, 0);
+}
+
+// A product prompt [0, 4), one user message holding a document and a question, and the generation
+// opener. The prompt can be built with another question or another ending.
+std::vector<TokenId> chat_ids(const std::vector<TokenId>& question) {
+    std::vector<TokenId> ids = id_range(100, 4); // M = 4
+    std::vector<TokenId> content = id_range(200, 20); // the document
+    content.insert(content.end(), question.begin(), question.end());
+    append_turn(ids, kUser, content);
+    return ids;
+}
+
+const std::vector<TokenId> kQuestion = id_range(220, 10);
+
+// The compacted prompt and the rewritten one agree on ids, types and positions over [0, n).
+bool same_prefix(const PreparedPromptData& a, const PreparedPromptData& b, std::size_t n) {
+    if (a.token_ids.size() < n || b.token_ids.size() < n) { return false; }
+    for (std::size_t i = 0; i < n; ++i) {
+        if (a.token_ids[i] != b.token_ids[i] || a.token_types[i] != b.token_types[i]) { return false; }
+        for (int axis = 0; axis < 3; ++axis) {
+            if (a.position_axis(axis)[i] != b.position_axis(axis)[i]) { return false; }
+        }
+    }
+    return true;
+}
+
 // A selection keeps the recent tail, so U's last run reaches the prompt end, generation opener
-// included. Ending U at the last dropped token compacts the same, and a follow-up that keeps the
-// prompt only through the end of the user turn (its assistant turn replaces the opener) matches.
-void test_end_at_last_gap_matches_a_follow_up() {
-    const PreparedPromptData original = text_prompt(20);
-    const std::vector<std::uint32_t> kept{0, 1, 5, 6, 7, 12, 13, 14, 15}; // tail [16, 20) kept
+// included. U ends at the start of the opener instead (the end of the last message): the same
+// compacted prompt, and a follow-up, which reproduces every message verbatim but not the opener,
+// matches. A prompt that diverges inside the last message (another question, an edited ending)
+// does not, although it shares the original through the last gap.
+void test_end_at_last_message() {
+    std::vector<TokenId> ids = chat_ids(kQuestion); // [4, 38): the user turn
+    append_opener(ids);                             // [38, 43)
+    const PreparedPromptData original = chat_prompt(ids);
+    const auto opener = generation_opener(original, kTurnStart, kTurnEnd);
+    require(opener == std::optional<std::uint32_t>(38), "the opener is the last open turn start");
+
+    // U = [4, 43): keep the header, drop document tokens [7, 17), keep the rest.
+    std::vector<std::uint32_t> kept{0, 1, 2};
+    for (std::uint32_t offset = 13; offset < 39; ++offset) { kept.push_back(offset); }
     const GapMap full = make_gap_map(original, 4, kept);
-    const GapMap map  = end_at_last_gap(full, original);
-    require(map.begin == 4 && map.original_end == 16, "U ends at the last dropped token");
-    require((map.kept_runs == std::vector<std::pair<std::uint32_t, std::uint32_t>>{{0, 2}, {5, 3}}),
-            "the trailing run left U");
-    require(map.dropped_tokens() == full.dropped_tokens(), "same dropped count");
-    require(map.digest == gap_map_digest(original, 16) && map.original_ids.size() == 16 &&
-                map.original_types.size() == 16,
+    const GapMap map  = end_at_last_message(full, original, opener);
+    require(map.begin == 4 && map.original_end == 38, "U ends at the generation opener");
+    require((map.kept_runs == std::vector<std::pair<std::uint32_t, std::uint32_t>>{{0, 3}, {13, 21}}),
+            "the opener left the trailing run");
+    require(map.dropped_tokens() == full.dropped_tokens() && map.dropped_tokens() == 10,
+            "same dropped count");
+    require(map.digest == gap_map_digest(original, 38) && map.original_ids.size() == 38 &&
+                map.original_types.size() == 38,
             "stored original covers the shorter U");
     const PreparedPromptData a = compact_prompt(original, full);
     const PreparedPromptData b = compact_prompt(original, map);
     require(a.token_ids == b.token_ids && a.token_types == b.token_types &&
                 a.positions == b.positions && a.rope_delta == b.rope_delta,
             "same compacted prompt");
-    require(end_at_last_gap(map, original).original_end == 16, "idempotent");
+    require(end_at_last_message(map, original, opener).original_end == 38, "idempotent");
+    require(end_at_last_message(full, original, std::nullopt).original_end == 43,
+            "no opener keeps the full span");
+    require(end_at_last_message(full, original, 10).original_end == 17,
+            "U never ends before its last dropped token");
+    const std::size_t compacted_through_message = 38 - 10;
 
-    // The follow-up shares the original through 18 only, then diverges.
-    PreparedPromptData follow_up = extend(text_prompt(18), 6, 900);
+    // (a) A follow-up: the original messages, the reply, a new user message, a new opener.
+    std::vector<TokenId> follow_ids(ids.begin(), ids.begin() + 38);
+    append_turn(follow_ids, kAssistant, id_range(300, 5));
+    append_turn(follow_ids, kUser, id_range(400, 3));
+    append_opener(follow_ids);
+    const PreparedPromptData follow_up = chat_prompt(follow_ids);
     require(!apply_gap_map(follow_up, full).has_value(), "the full-span map misses the follow-up");
     const auto rewritten = apply_gap_map(follow_up, map);
     require(rewritten.has_value(), "the trimmed map rewrites the follow-up");
-    require(std::equal(b.token_ids.begin(), b.token_ids.begin() + 11, rewritten->token_ids.begin()),
-            "the follow-up shares the compacted prefix through the kept tail");
+    require(same_prefix(b, *rewritten, compacted_through_message),
+            "the follow-up shares the compacted prefix (ids, types, positions) through the message");
+    require(rewritten->token_ids.size() == follow_ids.size() - 10, "the follow-up loses the gap");
+    for (std::size_t i = compacted_through_message; i < rewritten->token_ids.size(); ++i) {
+        require(rewritten->token_ids[i] == follow_ids[i + 10] &&
+                    rewritten->position_axis(0)[i] == static_cast<std::int32_t>(i + 10),
+                "the follow-up's new turns keep their original positions");
+    }
+
+    // (b) The same document with another question: identical through the last gap (17).
+    std::vector<TokenId> other_ids = chat_ids(id_range(600, 10));
+    append_opener(other_ids);
+    const PreparedPromptData other_question = chat_prompt(other_ids);
+    require(std::equal(ids.begin(), ids.begin() + 24, other_ids.begin()),
+            "the other question shares the original past the last gap");
+    require(!apply_gap_map(other_question, map).has_value(),
+            "another final question inherits no selection");
+
+    // (c) A regenerated last message: only its final token differs.
+    std::vector<TokenId> regenerated = kQuestion;
+    regenerated.back() = 700;
+    std::vector<TokenId> regen_ids = chat_ids(regenerated);
+    append_opener(regen_ids);
+    require(!apply_gap_map(chat_prompt(regen_ids), map).has_value(),
+            "a regenerated last message inherits no selection");
+}
+
+void test_generation_opener_needs_an_open_turn() {
+    std::vector<TokenId> ids = chat_ids(kQuestion);
+    require(!generation_opener(chat_prompt(ids), kTurnStart, kTurnEnd).has_value(),
+            "a closed last turn is no opener");
+    append_opener(ids);
+    PreparedPromptData continued = chat_prompt(ids);
+    require(!generation_opener(continued, std::nullopt, kTurnEnd).has_value() &&
+                !generation_opener(continued, kTurnStart, std::nullopt).has_value(),
+            "unknown chat tokens find no opener");
+    continued.continuation_content = "partial";
+    require(!generation_opener(continued, kTurnStart, kTurnEnd).has_value(),
+            "continuation mode has no generation opener");
+}
+
+void test_end_at_last_message_rejects_keep_all() {
+    std::vector<TokenId> ids = chat_ids(kQuestion);
+    append_opener(ids);
+    const PreparedPromptData original = chat_prompt(ids);
+    std::vector<std::uint32_t> all(39);
+    for (std::uint32_t i = 0; i < all.size(); ++i) { all[i] = i; }
+    bool threw = false;
+    try {
+        (void)end_at_last_message(make_gap_map(original, 4, all), original, 38);
+    } catch (const std::logic_error&) { threw = true; }
+    require(threw, "a keep-all map is never trimmed");
 }
 
 int main() {
@@ -480,7 +605,9 @@ int main() {
         test_rewrite_prefers_the_deepest_map();
         test_rewrite_applies_each_map_once();
         test_original_frontier_maps_through_the_lineage();
-        test_end_at_last_gap_matches_a_follow_up();
+        test_end_at_last_message();
+        test_generation_opener_needs_an_open_turn();
+        test_end_at_last_message_rejects_keep_all();
         std::cout << "lossy gap map tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

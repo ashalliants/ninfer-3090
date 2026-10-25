@@ -222,14 +222,38 @@ GapMap make_gap_map(const PreparedPromptData& original, std::uint32_t begin,
     return map;
 }
 
-GapMap end_at_last_gap(GapMap map, const PreparedPromptData& original) {
+std::optional<std::uint32_t> generation_opener(const PreparedPromptData& prompt,
+                                               std::optional<TokenId> turn_start,
+                                               std::optional<TokenId> turn_end) {
+    check_shape(prompt);
+    if (!turn_start || !turn_end || !prompt.continuation_content.empty()) { return std::nullopt; }
+    for (std::size_t i = prompt.token_ids.size(); i-- > 0;) {
+        const TokenId id = prompt.token_ids[i];
+        if (id == *turn_end) { return std::nullopt; } // the last turn is closed
+        if (id == *turn_start) { return static_cast<std::uint32_t>(i); }
+    }
+    return std::nullopt;
+}
+
+GapMap end_at_last_message(GapMap map, const PreparedPromptData& original,
+                           std::optional<std::uint32_t> opener) {
     check_map(map);
+    if (map.dropped_tokens() == 0) {
+        throw std::logic_error("a keep-all selection has no gap map to trim");
+    }
     if (map.kept_runs.empty() ||
         map.kept_runs.back().first + map.kept_runs.back().second != map.original_end - map.begin) {
-        return map;
+        return map; // U ends with a dropped token
     }
-    map.original_end = map.begin + map.kept_runs.back().first;
-    map.kept_runs.pop_back();
+    const std::uint32_t last_gap_end = map.begin + map.kept_runs.back().first;
+    const std::uint32_t end          = std::max(last_gap_end, opener.value_or(map.original_end));
+    if (end >= map.original_end) { return map; }
+    map.original_end = end;
+    if (end == last_gap_end) {
+        map.kept_runs.pop_back();
+    } else {
+        map.kept_runs.back().second = end - map.begin - map.kept_runs.back().first;
+    }
     map.digest = gap_map_digest(original, map.original_end);
     map.original_ids.resize(map.original_end);
     map.original_types.resize(map.original_end);

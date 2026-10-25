@@ -605,6 +605,8 @@ public:
     std::vector<TokenId> lossy_special_tokens;
     // <|im_start|>: the role name after it is forced too (lossy_forced_tokens).
     std::optional<TokenId> lossy_turn_start;
+    // <|im_end|>: with lossy_turn_start, finds the generation opener a gap map ends before.
+    std::optional<TokenId> lossy_turn_end;
     std::vector<std::weak_ptr<const GapMap>> gap_map_registry;
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
