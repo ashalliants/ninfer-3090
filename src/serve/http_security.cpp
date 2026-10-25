@@ -232,8 +232,11 @@ bool exposed_without_key(std::string_view bind_host, bool has_key) {
 }
 
 bool dropped_when_relaying(std::string_view header_name) {
+    constexpr std::string_view fetch_metadata = "sec-fetch-";
     return iequal(header_name, "authorization") || iequal(header_name, "x-api-key") ||
-           iequal(header_name, "origin");
+           iequal(header_name, "origin") ||
+           (header_name.size() >= fetch_metadata.size() &&
+            iequal(header_name.substr(0, fetch_metadata.size()), fetch_metadata));
 }
 
 std::string local_machine_name() {

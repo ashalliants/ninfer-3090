@@ -13,7 +13,9 @@
 #include <httplib.h>
 #include <spdlog/logger.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -505,24 +507,63 @@ void routed_models_leave_access_to_the_router() {
            "a routed model keeps its own options but none of the router's access settings");
 }
 
+// A stand-in for a routed model's server: the same pre-routing check a real one runs, with the
+// options routed_model_options() gives it, then 200 with the request headers it received.
+struct FakeModelServer {
+    httplib::Server server;
+    std::thread listener;
+    int port = 0;
+
+    FakeModelServer() {
+        port = server.bind_to_any_port("127.0.0.1");
+        const ServeOptions inner = routed_model_options(ServeOptions{}, "a");
+        const HostPolicy policy  = make_host_policy(inner.host, port, inner.allowed_hosts, "");
+        server.set_pre_routing_handler([inner, policy](const httplib::Request& req,
+                                                       httplib::Response& res) {
+            return reject_untrusted_request(policy, inner, req, res)
+                       ? httplib::Server::HandlerResponse::Handled
+                       : httplib::Server::HandlerResponse::Unhandled;
+        });
+        server.Get(R"(.*)", [](const httplib::Request& req, httplib::Response& res) {
+            std::string names;
+            for (const auto& [name, value] : req.headers) {
+                std::string lower = name;
+                std::transform(lower.begin(), lower.end(), lower.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                names += lower + "\n";
+            }
+            res.set_content(names, "text/plain");
+        });
+        listener = std::thread([this] { (void)server.listen_after_bind(); });
+    }
+
+    ~FakeModelServer() {
+        server.stop();
+        if (listener.joinable()) { listener.join(); }
+    }
+};
+
 // The router's pre-routing handler runs the Host, Origin and Sec-Fetch-Site checks on its public
-// address, ahead of the key, over real HTTP. No model is loaded (autoload is off).
+// address, ahead of the key, over real HTTP; what a key or --cors lets in also gets through the
+// keyless, CORS-less model behind it (the relay drops Origin and Sec-Fetch-*).
 void router_checks_host_and_origin() {
-    for (const bool keyed : {false, true}) {
+    enum class Access { Open, Keyed, Cors };
+    for (const Access access : {Access::Open, Access::Keyed, Access::Cors}) {
         Journal journal;
-        RegistryPolicy policy;
-        policy.autoload = false;
-        ModelRegistry registry({model("a")}, policy, factory(journal), true);
+        ModelRegistry registry({model("a")}, RegistryPolicy{}, factory(journal), true);
+        FakeModelServer model_server;
+        expect(model_server.port > 0, "the fake model could not bind a loopback port");
+        auto ports = std::make_shared<RoutedPorts>();
+        ports->set("a", model_server.port);
         ServeOptions options;
-        options.host = "127.0.0.1";
-        if (keyed) { options.api_key = "secret"; }
+        options.host        = "127.0.0.1";
+        options.enable_cors = access == Access::Cors;
+        if (access == Access::Keyed) { options.api_key = "secret"; }
         auto logger = std::make_shared<spdlog::logger>("router-test");
         std::unique_ptr<RouterServer> router;
         for (int port = 18480; port < 18580 && !router; ++port) {
-            options.port = port;
-            auto candidate =
-                std::make_unique<RouterServer>(options, registry, std::make_shared<RoutedPorts>(),
-                                               logger);
+            options.port   = port;
+            auto candidate = std::make_unique<RouterServer>(options, registry, ports, logger);
             if (candidate->bind()) { router = std::move(candidate); }
         }
         if (!router) {
@@ -534,12 +575,14 @@ void router_checks_host_and_origin() {
         client.set_connection_timeout(5, 0);
         client.set_read_timeout(5, 0);
         const auto get = [&](const std::string& path, httplib::Headers headers) {
-            if (keyed) { headers.emplace("Authorization", "Bearer secret"); }
+            if (access == Access::Keyed) { headers.emplace("Authorization", "Bearer secret"); }
             const auto result = client.Get(path, headers);
             if (!result) { return std::pair<int, std::string>{-1, ""}; }
             return std::pair<int, std::string>{result->status, result->body};
         };
-        const std::string with = keyed ? " (with a key)" : " (without a key)";
+        const std::string with = access == Access::Open    ? " (no key, no --cors)"
+                                 : access == Access::Keyed ? " (with a key)"
+                                                           : " (with --cors)";
         expect(get("/health", {}).first == 200, "a plain request reaches the router" + with);
         const auto rebound = get("/health", {{"Host", "evil.example:8080"}});
         expect(rebound.first == 403 &&
@@ -549,20 +592,30 @@ void router_checks_host_and_origin() {
                "an address Host passes the router" + with);
         const auto foreign = get("/v1/models", {{"Origin", "http://evil.example"}});
         const auto cross   = get("/v1/models", {{"Sec-Fetch-Site", "cross-site"}});
-        if (keyed) {
-            expect(foreign.first == 200 && cross.first == 200,
-                   "a key decides browser access on its own");
-        } else {
+        // A browser request from another site, relayed to the model.
+        const auto relayed = get("/v1/echo?model=a", {{"Origin", "http://evil.example"},
+                                                      {"Sec-Fetch-Site", "cross-site"},
+                                                      {"Sec-Fetch-Mode", "cors"}});
+        if (access == Access::Open) {
             expect(foreign.first == 403 &&
                        foreign.second.find("origin_not_allowed") != std::string::npos,
                    "a foreign Origin gets 403 from a keyless router");
             expect(cross.first == 403 &&
                        cross.second.find("cross_site_request") != std::string::npos,
                    "a cross-site request gets 403 from a keyless router");
+            expect(relayed.first == 403, "a keyless router relays no cross-site request");
             expect(get("/v1/models", {{"Origin", "http://localhost:" +
                                                      std::to_string(options.port)}})
                            .first == 200,
                    "the router's own origin passes");
+        } else {
+            expect(foreign.first == 200 && cross.first == 200,
+                   "a key or --cors decides browser access on its own" + with);
+            expect(relayed.first == 200, "the model refused a request the router let in" + with);
+            expect(relayed.second.find("origin\n") == std::string::npos &&
+                       relayed.second.find("sec-fetch-") == std::string::npos &&
+                       relayed.second.find("authorization\n") == std::string::npos,
+                   "the relay passed Origin, Sec-Fetch-* or credentials to the model" + with);
         }
         router->stop();
         listener.join();
