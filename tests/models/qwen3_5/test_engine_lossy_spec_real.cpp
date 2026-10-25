@@ -74,6 +74,7 @@ Run run_lossy(const char* artifact, const Spec* spec, const char* label) {
     request.execution.sampling.seed           = 0;
     request.execution.allow_prefix_reuse      = true;
     request.stop.include_model_defaults       = false;
+    request.tool_choice.constraints           = ninfer::ToolConstraintMode::Automatic;
 
     auto prompt                     = engine.prepare(input);
     const std::uint32_t tokens      = prompt.summary().prompt_tokens;

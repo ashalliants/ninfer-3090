@@ -1382,6 +1382,7 @@ int exercise_lossy_prefill(const char* artifact) {
     request.execution.sampling.temperature    = 0.0F;
     request.execution.allow_prefix_reuse      = true;
     request.stop.include_model_defaults       = false;
+    request.tool_choice.constraints           = ninfer::ToolConstraintMode::Automatic;
 
     auto first_prompt                 = engine.prepare(input);
     const std::uint32_t first_tokens  = first_prompt.summary().prompt_tokens;
@@ -1543,6 +1544,7 @@ int exercise_lossy_summary(const char* artifact) {
     request.execution.sampling.temperature    = 0.0F;
     request.execution.allow_prefix_reuse      = true;
     request.stop.include_model_defaults       = false;
+    request.tool_choice.constraints           = ninfer::ToolConstraintMode::Automatic;
 
     auto first_prompt                = engine.prepare(input);
     const std::uint32_t first_tokens = first_prompt.summary().prompt_tokens;
