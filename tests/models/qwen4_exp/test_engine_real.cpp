@@ -44,6 +44,14 @@
 //   ninfer_qwen4_exp_engine_real_test --hot-embedding-exact N [--mtp K] [--max-context N] [--generate N]
 //       [TOKENS...]
 //
+// GDN head map (gdn_head_map_matches_copies below, --gdn-head-map): greedy ids with the GDN reading
+// its key heads through the tiled head map equal those of an Engine with the q/k copies. --mtp K runs
+// both Engines with MTP, so the verification's replay records (16 key heads) and their fold run too.
+// Without TOKENS the chat fixture's first 300 tokens are the prompt (a chunked-route prefill).
+//
+//   ninfer_qwen4_exp_engine_real_test --gdn-head-map-exact [--mtp K] [--max-context N] [--generate N]
+//       [TOKENS...]
+//
 // MTP for constrained requests (mtp_constrained_matches_plain below): a greedy JSON-schema request
 // with --mtp-constrained (K drafts, default 3) gives the ids of plain constrained decoding.
 //
@@ -635,6 +643,71 @@ int hot_embedding_matches_plain(const std::string& artifact, const std::vector<s
     return ok ? 0 : 1;
 }
 
+// gdn_head_map_matches_copies (--gdn-head-map-exact, FlashNextOptions::gdn_head_map): the whole route
+// through the Program (the forward's option, and with MTP the records planned with 16 key heads and
+// their fold) gives the greedy ids of the q/k copies.
+int gdn_head_map_matches_copies(const std::string& artifact, const std::vector<std::string>& args) {
+    std::uint32_t max_context = 8192, tokens = 128, mtp = 0;
+    std::vector<std::string> jobs;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (a == "--max-context" && i + 1 < args.size()) {
+            max_context = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        } else if (a == "--generate" && i + 1 < args.size()) {
+            tokens = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        } else if (a == "--mtp" && i + 1 < args.size()) {
+            mtp = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        } else {
+            jobs.push_back(a);
+        }
+    }
+    std::vector<std::vector<TokenId>> prompts;
+    for (const std::string& job : jobs) { prompts.push_back(parse_tokens(job)); }
+    if (prompts.empty()) {
+        auto ids = parse_tokens("@" + std::string(NINFER_SOURCE_DIR) + "/tests/fixtures/qwen4_exp/ppl_tokens-chat.ids");
+        ids.resize(std::min<std::size_t>(ids.size(), 300));
+        prompts.push_back(std::move(ids));
+        jobs.push_back("ppl_tokens-chat[0:300]");
+    }
+    const auto engine_options = [&](bool head_map) {
+        EngineOptions options                = base_options(artifact, max_context);
+        options.flash_next.save_expert_state = false;
+        options.flash_next.gdn_head_map      = head_map;
+        if (mtp != 0) {
+            options.speculative.backend      = SpeculativeBackend::Mtp;
+            options.speculative.draft_tokens = mtp;
+        }
+        return options;
+    };
+    const double ram_before = available_ram_gib();
+    std::vector<std::vector<TokenId>> copies;
+    {
+        Engine engine(engine_options(false));
+        for (std::size_t j = 0; j < prompts.size(); ++j) {
+            const Run run = generate(engine, prompts[j], tokens);
+            print_run(("q/k copies " + jobs[j]).c_str(), run, prompts[j].size());
+            copies.push_back(run.ids);
+        }
+    }
+    wait_for_ram(ram_before);
+    bool ok = true;
+    Engine engine(engine_options(true));
+    for (std::size_t j = 0; j < prompts.size(); ++j) {
+        const Run run           = generate(engine, prompts[j], tokens);
+        const std::string label = "gdn head map " + jobs[j];
+        print_run(label.c_str(), run, prompts[j].size());
+        if (mtp != 0) { print_speculation(label.c_str(), run.speculative); }
+        ok = same(label.c_str(), copies[j], run.ids) && ok;
+        if (mtp != 0 && run.speculative.rounds == 0) {
+            std::printf("FAIL: %s ran no MTP round, so the replay records and their fold were not exercised\n",
+                        label.c_str());
+            ok = false;
+        }
+    }
+    std::printf(ok ? "qwen4_exp gdn head map exactness passed\n" : "FAIL: qwen4_exp gdn head map exactness\n");
+    return ok ? 0 : 1;
+}
+
 // mtp_constrained_matches_plain (--mtp-constrained, FlashNextOptions::mtp_constrained): a greedy
 // JSON-schema request on an MTP Engine with the option gives the ids of plain constrained decoding.
 // The reference is an MTP Engine without the option, where the constrained row runs plain rounds
@@ -1079,6 +1152,9 @@ int main(int argc, char** argv) {
         }
         if (!args.empty() && args.front() == "--hot-embedding-exact") {
             return hot_embedding_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
+        }
+        if (!args.empty() && args.front() == "--gdn-head-map-exact") {
+            return gdn_head_map_matches_copies(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
         }
         if (!args.empty() && args.front() == "--mtp-constrained") {
             return mtp_constrained_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));

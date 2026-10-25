@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/gdn_head_map.h"
+
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
@@ -12,6 +14,8 @@ struct Inputs {
     std::int64_t qk_heads    = 0;
     std::int64_t value_heads = 0;
     std::int64_t tokens      = 0;
+    // Which Q/K head value head h reads (core/gdn_head_map.h).
+    GdnHeadMap head_map = GdnHeadMap::Blocked;
 
     // q/k/v contain the exact FP32 values represented by their public BF16 tensors.
     // g/beta/state contain the exact public FP32 values.
@@ -31,8 +35,8 @@ struct Result {
 };
 
 inline std::int64_t qk_head(std::int64_t value_head, std::int64_t qk_heads,
-                            std::int64_t value_heads) {
-    return value_head / (value_heads / qk_heads);
+                            std::int64_t value_heads, GdnHeadMap map = GdnHeadMap::Blocked) {
+    return gdn_qk_head(value_head, value_heads, qk_heads, map);
 }
 
 inline Result evaluate(const Inputs& in, double scale, bool normalize_qk,
@@ -96,7 +100,7 @@ inline Result evaluate(const Inputs& in, double scale, bool normalize_qk,
                 static_cast<double>(in.state[state_base + static_cast<std::size_t>(i)]);
         }
 
-        const std::int64_t qh = qk_head(h, H_qk, H_v);
+        const std::int64_t qh = qk_head(h, H_qk, H_v, in.head_map);
         for (std::int64_t t = 0; t < T; ++t) {
             const std::size_t qk_base = static_cast<std::size_t>((t * H_qk + qh) * S);
             const std::size_t v_base  = static_cast<std::size_t>((t * H_v + h) * S);

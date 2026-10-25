@@ -408,6 +408,11 @@ struct FlashNextOptions {
     // 8192) goes to the expert cache. The same embedding values, bit for bit. 0: the table stays in
     // VRAM. At most the vocabulary.
     std::uint32_t hot_embedding_rows = 0;
+    // Read the GatedDeltaNet's 16 key heads for its 48 value heads in place, through the GGUF's tiled
+    // head map (value head h reads key head h % 16), instead of copying them to one key head per value
+    // head first (--gdn-head-map): 216 copies a decode token fewer, and MTP's GDN replay records hold
+    // a third of the key heads. The same output, bit for bit.
+    bool gdn_head_map = false;
     // The context cache's NVMe tier: a scratch file of up to this many bytes holds the checkpoints,
     // with the Host context budget as its RAM cache (a zero Host budget then reuses prefixes from
     // disk alone); 0: none. The file is created in `context_nvme_dir` (empty: beside the artifact),

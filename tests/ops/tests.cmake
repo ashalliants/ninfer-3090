@@ -41,6 +41,13 @@ ninfer_add_op_test(ninfer_ggml_blocks_decode_test NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_blocks_decode.cpp"
   LIBRARIES ninfer_core)
 
+# Host-only: the GatedDeltaNet head map in the FP64 oracle. The tiled map (value head h reads key
+# head h % Hqk, Qwen3.8-Flash-Next) on 16 q/k heads equals, bit for bit, the blocked map on q/k
+# tiled to one head per value head.
+ninfer_add_op_test(ninfer_gdn_head_map_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_head_map.cpp"
+  LIBRARIES ninfer_core)
+
 # offloaded_sparse_moe over GGML expert records. The CPU test needs no GPU: the canonical A8 cast,
 # the exact sub-block decode, the FP64 expert oracle, AVX2 = scalar and the worker team. The layer
 # test runs routing, dispatch, every record placement, the CPU miss channel and the combine on the

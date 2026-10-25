@@ -64,6 +64,7 @@ struct FoldProfile {
     std::int32_t value_heads;
     std::int32_t conv_channels;
     std::int32_t qk_heads = kQkHeads; // 48: Qwen3.8-Flash-Next's tiled heads (one per value head)
+    GdnHeadMap map        = GdnHeadMap::Blocked; // Tiled: Flash-Next's 16 key heads read in place
 };
 
 std::vector<float> initial_recurrent_values(std::size_t elements, std::uint32_t seed, int layer,
@@ -103,6 +104,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
         .value_heads     = profile.value_heads,
         .key_dim         = kStateDim,
         .value_dim       = kStateDim,
+        .head_map        = profile.map,
     };
     LayoutBuilder record_builder;
     const GdnReplayRecordLayout record_layout =
@@ -334,7 +336,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                     output.slice(2, token, 1).view({kStateDim, profile.value_heads, 1});
                 ops::detail::gated_delta_net::launch_recurrent(
                     query, key, value, g_tensor, beta_tensor, kScale, true, local_state_tensor,
-                    output_token, nullptr);
+                    output_token, nullptr, profile.map);
                 if (token + 1 == commit)
                     cuda_check(cudaMemcpyAsync(expected, local_state.p, recurrent_slot_bytes,
                                                cudaMemcpyDeviceToDevice, nullptr),
@@ -377,7 +379,8 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     }
 
     int failures             = 0;
-    const std::string suffix = " L=" + std::to_string(profile.layers) +
+    const std::string suffix = std::string(profile.map == GdnHeadMap::Tiled ? " tiled" : "") +
+                               " L=" + std::to_string(profile.layers) +
                                " Hv=" + std::to_string(profile.value_heads) +
                                " T=" + std::to_string(width) + " B=" + std::to_string(rows);
     std::vector<float> actual_recurrent(recurrent_slot_elements);
@@ -507,6 +510,102 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
         ++failures;
     }
     return failures;
+}
+
+// The fold of records holding Flash-Next's 16 key heads under the tiled map against the fold of the
+// same records with the keys expanded to one per value head (value head h's copy of key head h % 16)
+// under the blocked map: every state slot must end bitwise equal.
+int tiled_fold_matches_expanded(std::int32_t layers, std::int32_t width, std::int32_t rows,
+                                const std::vector<std::int32_t>& commits, std::uint32_t seed) {
+    constexpr std::int32_t kQk = 16, kValue = 48, kConv = 10240;
+    const std::int32_t slot_count = 2 * rows + 1;
+    const auto plan_records = [&](std::int32_t qk_heads, GdnHeadMap map) {
+        LayoutBuilder builder;
+        const GdnReplayRecordLayout layout = plan_gdn_replay_records(
+            builder, {.layers          = layers,
+                      .record_capacity = kRecordCapacity,
+                      .width           = width,
+                      .conv_channels   = kConv,
+                      .qk_heads        = qk_heads,
+                      .value_heads     = kValue,
+                      .key_dim         = kStateDim,
+                      .value_dim       = kStateDim,
+                      .head_map        = map});
+        return std::make_pair(layout, builder.finish(256));
+    };
+    const auto [tiled_layout, tiled_bytes] = plan_records(kQk, GdnHeadMap::Tiled);
+    const auto [copy_layout, copy_bytes]   = plan_records(kValue, GdnHeadMap::Blocked);
+    DeviceBuffer tiled_storage(tiled_bytes), copy_storage(copy_bytes);
+    const GdnReplayRecords tiled({tiled_storage.p, tiled_bytes}, tiled_layout);
+    const GdnReplayRecords copy({copy_storage.p, copy_bytes}, copy_layout);
+
+    const std::int64_t cells = static_cast<std::int64_t>(layers) * kRecordCapacity * width;
+    std::vector<std::uint16_t> conv(tiled.conv.numel()), key(tiled.key.numel()), value(tiled.value.numel());
+    std::vector<std::uint32_t> gate(tiled.gate.numel());
+    for (std::size_t i = 0; i < conv.size(); ++i) { conv[i] = bf16_pattern(seed + static_cast<std::uint32_t>(i)); }
+    for (std::size_t i = 0; i < key.size(); ++i) {
+        key[i] = bf16_pattern(seed + 100003U + static_cast<std::uint32_t>(i), 0.08F);
+    }
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        value[i] = bf16_pattern(seed + 200003U + static_cast<std::uint32_t>(i), 0.08F);
+    }
+    for (std::size_t i = 0; i < gate.size(); i += 2) {
+        const auto cell = static_cast<std::uint32_t>(i / 2);
+        gate[i]     = std::bit_cast<std::uint32_t>(-0.03F - static_cast<float>(mix(seed + cell) % 900U) / 1000.0F);
+        gate[i + 1] = std::bit_cast<std::uint32_t>(0.05F + static_cast<float>(mix(seed + 300007U + cell) % 900U) / 1000.0F);
+    }
+    std::vector<std::uint16_t> expanded(copy.key.numel());
+    for (std::int64_t c = 0; c < cells; ++c) {
+        for (std::int32_t h = 0; h < kValue; ++h) {
+            std::copy_n(key.begin() + (c * kQk + h % kQk) * kStateDim, kStateDim,
+                        expanded.begin() + (c * kValue + h) * kStateDim);
+        }
+    }
+    for (const GdnReplayRecords* records : {&tiled, &copy}) {
+        cuda_check(cudaMemcpy(records->conv.data, conv.data(), records->conv.bytes(), cudaMemcpyHostToDevice),
+                   "upload conv records");
+        cuda_check(cudaMemcpy(records->value.data, value.data(), records->value.bytes(), cudaMemcpyHostToDevice),
+                   "upload value records");
+        cuda_check(cudaMemcpy(records->gate.data, gate.data(), records->gate.bytes(), cudaMemcpyHostToDevice),
+                   "upload gate records");
+    }
+    cuda_check(cudaMemcpy(tiled.key.data, key.data(), tiled.key.bytes(), cudaMemcpyHostToDevice),
+               "upload tiled key records");
+    cuda_check(cudaMemcpy(copy.key.data, expanded.data(), copy.key.bytes(), cudaMemcpyHostToDevice),
+               "upload expanded key records");
+
+    LayoutBuilder state_builder;
+    const LinearAttentionStatePoolLayout state_layout = plan_linear_attention_state_pool(
+        state_builder, {.layers         = static_cast<std::uint32_t>(layers),
+                        .conv_channels  = kConv,
+                        .conv_width     = 3,
+                        .value_heads    = kValue,
+                        .value_head_dim = kStateDim,
+                        .key_head_dim   = kStateDim,
+                        .slot_count     = slot_count,
+                        .conv_dtype     = DType::BF16});
+    const std::size_t state_bytes = state_builder.finish(256);
+    std::vector<std::uint16_t> initial(state_bytes / 2);
+    for (std::size_t i = 0; i < initial.size(); ++i) {
+        initial[i] = bf16_pattern(seed + 400009U + static_cast<std::uint32_t>(i), 0.02F);
+    }
+    DeviceBuffer tiled_state = to_device(initial), copy_state = to_device(initial);
+    const LinearAttentionStatePool tiled_pool({tiled_state.p, state_bytes}, state_layout);
+    const LinearAttentionStatePool copy_pool({copy_state.p, state_bytes}, state_layout);
+    // Row r folds from slot r into slot rows + r (a distinct destination) or in place for odd rows.
+    std::vector<ops::GdnReplayFoldRow> fold_rows;
+    for (std::int32_t row = 0; row < rows; ++row) {
+        fold_rows.push_back({row, row % 2 == 0 ? rows + row : row, commits[static_cast<std::size_t>(row)]});
+    }
+    ops::GdnReplayFoldPlan(tiled, tiled_pool.all_layers_view()).execute(fold_rows, nullptr);
+    ops::GdnReplayFoldPlan(copy, copy_pool.all_layers_view()).execute(fold_rows, nullptr);
+    cuda_synchronize();
+    if (from_device<std::uint8_t>(tiled_state, state_bytes) != from_device<std::uint8_t>(copy_state, state_bytes)) {
+        std::cerr << "tiled fold differs from the expanded fold L=" << layers << " T=" << width << " B=" << rows
+                  << "\n";
+        return 1;
+    }
+    return 0;
 }
 
 int run_record_fold_rounds() {
@@ -782,6 +881,15 @@ int main() {
     failures += run_case({36, 48, 10240, 48}, 5, 1, {3}, 1873U);
     failures += run_case({36, 48, 10240, 48}, 8, 1, {8}, 1875U);
     failures += run_case({36, 48, 10240, 48}, 4, 1, {0}, 1877U);
+    // The same heads as 16 key heads read in place through the tiled map.
+    failures += run_case({36, 48, 10240, 16, GdnHeadMap::Tiled}, 2, 1, {1}, 1881U);
+    failures += run_case({36, 48, 10240, 16, GdnHeadMap::Tiled}, 5, 1, {3}, 1883U, true);
+    failures += run_case({36, 48, 10240, 16, GdnHeadMap::Tiled}, 8, 1, {8}, 1885U);
+    failures += run_case({36, 48, 10240, 16, GdnHeadMap::Tiled}, 4, 1, {0}, 1887U);
+    failures += run_case({3, 48, 10240, 16, GdnHeadMap::Tiled}, 16, 8, {0, 1, 2, 3, 7, 13, 15, 16}, 1889U, true);
+    failures += tiled_fold_matches_expanded(36, 8, 1, {8}, 1891U);
+    failures += tiled_fold_matches_expanded(36, 3, 1, {2}, 1893U);
+    failures += tiled_fold_matches_expanded(4, 16, 4, {16, 0, 5, 1}, 1895U);
     failures += run_record_fold_rounds();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_replay_fold\n";
     return failures == 0 ? 0 : 1;

@@ -397,14 +397,14 @@ struct SpecLayout {
                 w_lengths = 0, w_anchors = 0, w_commit = 0, w_mtp_ids = 0, w_count = 0;
 
     static SpecLayout plan(const TextConfig& c, std::int32_t drafts, std::size_t tail_bytes, std::size_t conv_bytes,
-                           std::size_t lanes) {
+                           std::size_t lanes, bool gdn_head_map) {
         SpecLayout out;
         out.drafts = drafts;
         out.width  = drafts + 1;
         const std::size_t W = static_cast<std::size_t>(out.width), w = c.residual_width();
         const std::size_t di = c.qsa.index_head_dim;
         LayoutBuilder builder;
-        out.gdn = plan_gdn_replay_records(builder, records_spec(c, out.width));
+        out.gdn = plan_gdn_replay_records(builder, gdn_records_spec(c, out.width, gdn_head_map));
         out.gdn_bytes = align(out.gdn.payload_bytes());
         std::size_t at = out.gdn_bytes;
         const auto take = [&](std::size_t bytes) {
@@ -440,17 +440,6 @@ struct SpecLayout {
         out.words      = take(4 * out.w_count);
         out.bytes      = at;
         return out;
-    }
-
-    static GdnReplayRecordSpec records_spec(const TextConfig& c, std::int32_t width) {
-        return {.layers          = static_cast<std::int32_t>(c.gdn_layers),
-                .record_capacity = 1,
-                .width           = width,
-                .conv_channels   = static_cast<std::int32_t>(c.gdn.conv_channels()),
-                .qk_heads        = static_cast<std::int32_t>(c.gdn.value_heads), // tiled: one per value head
-                .value_heads     = static_cast<std::int32_t>(c.gdn.value_heads),
-                .key_dim         = static_cast<std::int32_t>(c.gdn.key_head_dim),
-                .value_dim       = static_cast<std::int32_t>(c.gdn.value_head_dim)};
     }
 };
 
@@ -560,7 +549,7 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
         d.slots_at    = align(at);
         d.state_total = d.slots_at + align(4ULL * d.lanes);
     }
-    if (d.drafts > 0) { d.spec = SpecLayout::plan(c, d.drafts, d.tail, d.gdn_conv, d.lanes); }
+    if (d.drafts > 0) { d.spec = SpecLayout::plan(c, d.drafts, d.tail, d.gdn_conv, d.lanes, o.gdn_head_map); }
     for (const std::uint64_t stride : strides) { d.frame_stride = std::max(d.frame_stride, stride); }
     if (d.frame_stride == 0) { throw std::invalid_argument("Qwen3.8-Flash-Next: no expert banks"); }
     d.staging    = static_cast<std::size_t>(kStagingSlots) * d.frame_stride;
@@ -1006,7 +995,8 @@ public:
     // The forward's options; with --hot-embedding-rows its two embedding planes: the device copy of
     // the first rows and the whole table through its device pointer in the mapped pinned block.
     execution::ForwardOptions forward_options() const {
-        execution::ForwardOptions out{.shared_expert_stream = options_.shared_expert_stream};
+        execution::ForwardOptions out{.shared_expert_stream = options_.shared_expert_stream,
+                                      .gdn_head_map         = options_.gdn_head_map};
         if (plan_.bytes.hot_embedding == 0) { return out; }
         const Weight& table        = parameters_.token_embedding;
         const auto rows            = static_cast<std::int32_t>(options_.hot_embedding_rows);
@@ -3766,7 +3756,7 @@ private:
         auto& records = records_.at(static_cast<std::size_t>(W));
         if (!records) {
             LayoutBuilder builder;
-            const auto layout = plan_gdn_replay_records(builder, SpecLayout::records_spec(c_, W));
+            const auto layout = plan_gdn_replay_records(builder, gdn_records_spec(c_, W, options_.gdn_head_map));
             records.emplace(DeviceSpan{spec_base(), plan_.spec.gdn_bytes}, layout);
         }
         const auto& s = plan_.spec;
@@ -4890,6 +4880,27 @@ std::uint64_t plan_mtp_constrained_masks(const ProgramOptions& options, std::uin
 std::uint64_t plan_mtp_draft_probs(const ProgramOptions& options) {
     if (!options.mtp_joint_acceptance || options.mtp_draft_tokens == 0) { return 0; }
     return 4ULL * options.mtp_draft_tokens;
+}
+
+GdnReplayRecordSpec gdn_records_spec(const TextConfig& c, std::int32_t width, bool gdn_head_map) {
+    // The copy route tiles q/k to one key head per value head; the map reads the key heads in place.
+    const std::uint32_t qk_heads = gdn_head_map ? c.gdn.key_heads : c.gdn.value_heads;
+    return {.layers          = static_cast<std::int32_t>(c.gdn_layers),
+            .record_capacity = 1,
+            .width           = width,
+            .conv_channels   = static_cast<std::int32_t>(c.gdn.conv_channels()),
+            .qk_heads        = static_cast<std::int32_t>(qk_heads),
+            .value_heads     = static_cast<std::int32_t>(c.gdn.value_heads),
+            .key_dim         = static_cast<std::int32_t>(c.gdn.key_head_dim),
+            .value_dim       = static_cast<std::int32_t>(c.gdn.value_head_dim),
+            .head_map        = gdn_head_map ? GdnHeadMap::Tiled : GdnHeadMap::Blocked};
+}
+
+std::uint64_t plan_gdn_record_bytes(const ProgramOptions& options, const TextConfig& config) {
+    if (options.mtp_draft_tokens == 0) { return 0; }
+    LayoutBuilder builder;
+    const auto width = static_cast<std::int32_t>(1 + options.mtp_draft_tokens);
+    return detail::align(plan_gdn_replay_records(builder, gdn_records_spec(config, width, options.gdn_head_map)).payload_bytes());
 }
 
 void require_shared_expert_workspace(std::uint64_t need, std::uint64_t planned, std::uint32_t columns) {

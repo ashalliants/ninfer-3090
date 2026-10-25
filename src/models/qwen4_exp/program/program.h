@@ -15,6 +15,7 @@
 // unit, the VRAM expert cache (LFRU frames, warm-start state) and the decode CUDA graph. Prompts and
 // outputs use the Qwen3.5 frontend (the same tokenizer and chat template).
 
+#include "core/gdn_replay_records.h"
 #include "models/qwen3_5/frontend/frontend.h"
 #include "models/qwen3_5/frontend/output_session.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
@@ -425,6 +426,10 @@ struct ProgramOptions {
     // forward reads the rest from the pinned block (execution::ForwardOptions::hot_embedding_rows).
     // 0: the embedding is in device memory.
     std::uint32_t hot_embedding_rows = 0;
+    // FlashNextOptions::gdn_head_map: the GDN recurrence reads the key heads in place through the
+    // tiled head map (execution::ForwardOptions::gdn_head_map) instead of tiled copies; the GDN
+    // replay records then hold the key heads only (gdn_records_spec). The same outputs, bit for bit.
+    bool gdn_head_map = false;
 };
 
 // ProgramDevicePlan::shared_expert_workspace of these options: the side-stream carve
@@ -444,6 +449,13 @@ void require_shared_expert_workspace(std::uint64_t need, std::uint64_t planned, 
 // ProgramDevicePlan::mtp_draft_probs of these options: one FP32 word per draft (mtp_draft_tokens);
 // 0 without mtp_joint_acceptance or MTP.
 [[nodiscard]] std::uint64_t plan_mtp_draft_probs(const ProgramOptions& options);
+// The GDN replay records of one W-column verification: every GDN layer, one record row. Their key
+// records hold one key head per value head (the copy route), or with gdn_head_map the model's key
+// heads read through the tiled map (spec.head_map Tiled).
+[[nodiscard]] GdnReplayRecordSpec gdn_records_spec(const TextConfig& config, std::int32_t width, bool gdn_head_map);
+// The GDN replay records' share of ProgramDevicePlan::speculation: the records of the widest
+// verification (1 + mtp_draft_tokens columns, gdn_records_spec), 256-byte aligned; 0 without MTP.
+[[nodiscard]] std::uint64_t plan_gdn_record_bytes(const ProgramOptions& options, const TextConfig& config);
 
 class Program {
 public:

@@ -8,6 +8,7 @@
 // --mtp-constrained: a verification's per-position grammar masks (one per draft and the bonus) are
 // a named term too, zero when the option or MTP is off. So are --mtp-joint-acceptance's draft
 // probabilities, and --hot-embedding-rows's device copy of the embedding's first rows.
+// --gdn-head-map: MTP's GDN replay records (part of the speculation term) hold the 16 key heads.
 
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/program/program.h"
@@ -228,6 +229,44 @@ int main() {
         } catch (const std::exception&) {
         }
         check(refused, "--hot-embedding-rows above the vocabulary is refused naming the flag");
+
+        // --gdn-head-map: MTP's GDN replay records hold the 16 key heads (the tiled map) instead of one
+        // key head per value head (the copy route), so their key plane shrinks by two thirds. The
+        // records are the GDN share of ProgramDevicePlan::speculation (SpecLayout::plan takes the same
+        // gdn_records_spec), zero without MTP.
+        q4::TextConfig flash          = config();
+        flash.gdn_layers              = 36;
+        flash.gdn.key_heads           = 16;
+        flash.gdn.key_head_dim        = 128;
+        flash.gdn.value_heads         = 48;
+        flash.gdn.value_head_dim      = 128;
+        q4::ProgramOptions copies;
+        copies.max_context = 32768;
+        check(!copies.gdn_head_map, "the GDN head map is on by default");
+        const auto copy_spec = q4::gdn_records_spec(flash, 8, false);
+        const auto map_spec  = q4::gdn_records_spec(flash, 8, true);
+        check(copy_spec.qk_heads == 48 && copy_spec.head_map == ninfer::GdnHeadMap::Blocked,
+              "the copy route records one key head per value head under the blocked map");
+        check(map_spec.qk_heads == 16 && map_spec.head_map == ninfer::GdnHeadMap::Tiled,
+              "the head map records the 16 key heads under the tiled map");
+        check(map_spec.value_heads == 48 && map_spec.conv_channels == 10240 && map_spec.layers == 36 &&
+                  map_spec.width == 8 && map_spec.record_capacity == 1,
+              "the head map leaves the other record extents");
+        check(q4::plan_gdn_record_bytes(copies, flash) == 0, "no MTP plans no GDN records");
+        copies.mtp_draft_tokens = 7;
+        q4::ProgramOptions mapped = copies;
+        mapped.gdn_head_map       = true;
+        // Planes of 36 layers x 8 columns: conv 10240 BF16, key H x 128 BF16, value 48 x 128 BF16, gate
+        // 2 x 48 FP32 (each a multiple of 256 bytes).
+        const std::uint64_t cells = 36ULL * 8, conv = cells * 10240 * 2, value = cells * 48 * 128 * 2,
+                            gate = cells * 2 * 48 * 4;
+        check(q4::plan_gdn_record_bytes(copies, flash) == conv + cells * 48 * 128 * 2 + value + gate,
+              "the copy route's records hold 48 key heads");
+        check(q4::plan_gdn_record_bytes(mapped, flash) == conv + cells * 16 * 128 * 2 + value + gate,
+              "the head map's records hold 16 key heads");
+        check(q4::plan_gdn_record_bytes(copies, flash) - q4::plan_gdn_record_bytes(mapped, flash) ==
+                  cells * 32 * 128 * 2,
+              "the head map saves 32 key heads of records (2.25 MiB at 7 drafts)");
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

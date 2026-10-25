@@ -259,6 +259,12 @@ struct ForwardOptions {
     std::int32_t hot_embedding_rows = 0;
     Weight hot_embedding;
     Weight cold_embedding;
+    // Each GDN layer's recurrence reads its config_.gdn.key_heads q/k heads in place through the
+    // tiled head map (value head h reads key head h % key_heads, ops::GdnHeadMap::Tiled) instead of
+    // copying them to one head per value head first. The same values reach the same arithmetic:
+    // bitwise the outputs and state of the copy route. A verification call's GDN records then hold
+    // key_heads key heads (spec.qk_heads, spec.head_map Tiled: gdn_records_spec in program.h).
+    bool gdn_head_map = false;
 };
 
 class Forward {
@@ -398,6 +404,7 @@ private:
     // ForwardOptions::hot_embedding_rows and its planes (0: parameters_.token_embedding).
     std::int32_t hot_embedding_rows_ = 0;
     Weight hot_embedding_, cold_embedding_;
+    bool gdn_head_map_ = false; // ForwardOptions::gdn_head_map
     Tensor mtp_frames_; // I32 [E]: every drafter expert resident at its own index
     DeviceBuffer mtp_frames_backing_;
     Tensor residual_; // the call's residual stream, in the workspace from run_front to run_back

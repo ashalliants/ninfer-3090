@@ -131,6 +131,9 @@ int main() {
     failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--shared-expert-stream"}))
                           .flash_next.shared_expert_stream,
                       "--shared-expert-stream does not reach the Engine");
+    failures += check(!defaults.flash_next.gdn_head_map, "the GDN head map is on by default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--gdn-head-map"})).flash_next.gdn_head_map,
+                      "--gdn-head-map does not reach the Engine");
     failures += check(!defaults.flash_next.mtp_constrained, "MTP for constrained requests is on by default");
     failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
                                                  "--mtp-constrained"}))

@@ -72,6 +72,16 @@
 // graph and replayed. The
 // prompt call's last logits and every decode call's must be bitwise equal between the serial and the
 // side-stream run of the same decode mode.
+//
+// GDN head-map mode (ForwardOptions::gdn_head_map is bit-exact):
+//
+//   ninfer_qwen4_exp_forward_real_test --gdn-head-map TOKENS [--window W] [--decode N] [--staging SLOTS]
+//
+// From a fresh state, twice (q/k tiled by copies, then read in place through the tiled head map):
+// all but the last W + N tokens are prefilled as one call (at least 16 tokens, the GDN's chunked
+// route), the next W (default 3, 2..8) are one verification call (the recorded recurrence, every
+// column's logits) committed in full by the GDN fold, then each of the last N (default 2) is decoded
+// by one call (the recurrent kernel). Every logits column must be bitwise equal between the runs.
 
 #include "artifact/reader.h"
 #include "core/arena.h"
@@ -86,6 +96,7 @@
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 #include "models/qwen4_exp/model.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
+#include "models/qwen4_exp/program/program.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/ple.h"
@@ -965,7 +976,8 @@ struct Verifier {
     static std::int32_t dim(std::uint64_t v) { return static_cast<std::int32_t>(v); }
     static std::size_t align256(std::size_t v) { return (v + 255) / 256 * 256; }
 
-    Verifier(const Harness& h, std::int32_t max_width) : h(h), c(h.config) {
+    Verifier(const Harness& h, std::int32_t max_width, bool gdn_head_map = false)
+        : h(h), c(h.config), gdn_head_map(gdn_head_map) {
         di = dim(c.qsa.index_head_dim);
         r  = dim(c.qsa.compress_ratio);
         LayoutBuilder builder;
@@ -992,17 +1004,8 @@ struct Verifier {
         folds.resize(W + 1);
     }
 
-    // SpecLayout::records_spec.
-    GdnReplayRecordSpec records_spec(std::int32_t width) const {
-        return {.layers          = dim(c.gdn_layers),
-                .record_capacity = 1,
-                .width           = width,
-                .conv_channels   = dim(c.gdn.conv_channels()),
-                .qk_heads        = dim(c.gdn.value_heads), // tiled: one per value head
-                .value_heads     = dim(c.gdn.value_heads),
-                .key_dim         = dim(c.gdn.key_head_dim),
-                .value_dim       = dim(c.gdn.value_head_dim)};
-    }
+    // The Program's records (one key head per value head, or the key heads under the tiled map).
+    GdnReplayRecordSpec records_spec(std::int32_t width) const { return q4::gdn_records_spec(c, width, gdn_head_map); }
 
     ex::ForwardVerify view(std::int32_t W) const {
         LayoutBuilder builder;
@@ -1062,6 +1065,7 @@ struct Verifier {
 
     const Harness& h;
     const q4::TextConfig& c;
+    bool gdn_head_map = false;
     std::int32_t di = 0, r = 0;
     std::size_t records_bytes = 0, tail_stride = 0;
     DeviceBuffer backing;
@@ -1304,6 +1308,111 @@ int shared_expert_mode(int argc, char** argv, const char* artifact_env) {
     return ok ? 0 : 1;
 }
 
+// The identity check of ForwardOptions::gdn_head_map (see the header): the same calls from a fresh
+// state with the q/k copies and with the head map; every logits column must be bitwise equal.
+int gdn_head_map_mode(int argc, char** argv, const char* artifact_env) {
+    std::vector<std::int32_t> tokens;
+    std::int32_t window = 3, decode = 2, staging_slots = 64;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--gdn-head-map") { continue; }
+        if (arg.rfind("--", 0) != 0) {
+            if (!tokens.empty()) { throw std::invalid_argument("--gdn-head-map takes one token list"); }
+            tokens = parse_tokens(arg);
+            continue;
+        }
+        if (i + 1 >= argc) { throw std::invalid_argument(arg + " needs a value"); }
+        const std::string value = argv[++i];
+        if (arg == "--window") {
+            window = std::stoi(value);
+        } else if (arg == "--decode") {
+            decode = std::stoi(value);
+        } else if (arg == "--staging") {
+            staging_slots = std::stoi(value);
+        } else {
+            throw std::invalid_argument("unknown option " + arg + " in --gdn-head-map mode");
+        }
+    }
+    if (window < 2 || window > kMaxVerifyColumns) {
+        throw std::invalid_argument("--window must be 2 to " + std::to_string(kMaxVerifyColumns));
+    }
+    if (decode < 1) { throw std::invalid_argument("--decode must be at least 1"); }
+    const auto n            = static_cast<std::int32_t>(tokens.size());
+    const std::int32_t head = n - window - decode;
+    if (head < 16) {
+        throw std::invalid_argument("--gdn-head-map needs at least 16 prompt tokens before the window and the "
+                                    "decode tokens (the GDN's chunked route)");
+    }
+
+    DeviceContext device(0);
+    artifact::Reader reader(artifact_env);
+    if (!q4::is_qwen4_exp(reader)) {
+        std::printf("SKIP: %s is not a Qwen4Exp artifact\n", artifact_env);
+        return 77;
+    }
+    const auto model = q4::load_model(reader, device);
+    device.synchronize();
+    const ex::Parameters parameters(*model);
+    const auto& c         = model->config();
+    const char* ngram_env = std::getenv("NINFER_TEST_QWEN4EXP_NGRAM");
+    q4::NgramVolume volume(ngram_env != nullptr ? std::filesystem::path(ngram_env)
+                                                : q4::default_ngram_volume(artifact_env),
+                           c.ple.table);
+    const std::size_t vocab    = c.vocab_size;
+    const std::int32_t context = std::max<std::int32_t>(256, (n + 63) / 64 * 64);
+    // Every run reads the same device inputs: the prompt, the verification window (every column's
+    // logits), then one call per decode token.
+    const Call prompt = make_call(c, volume, tokens, 0, head, false);
+    Call verify       = make_call(c, volume, tokens, head, window, true);
+    std::vector<Call> steps;
+    for (std::int32_t p = head + window; p < n; ++p) { steps.push_back(make_call(c, volume, tokens, p, 1, false)); }
+    DeviceBuffer logits(vocab * static_cast<std::size_t>(window) * sizeof(float));
+    std::printf("prompt %d tokens as one call, a %d-column verification committed by the fold, %d decode calls; "
+                "staging slots %d\n",
+                head, window, decode, staging_slots);
+
+    // Every logits column of the prompt, the verification and the decode calls, in order.
+    const auto run = [&](bool head_map) {
+        Harness harness(parameters, device, context, head, staging_slots, ex::ForwardOptions{.gdn_head_map = head_map});
+        Verifier verifier(harness, window, head_map);
+        std::vector<std::vector<float>> rows;
+        Tensor one(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), 1});
+        harness.forward->run(prompt.batch, one);
+        device.synchronize();
+        rows.push_back(to_float(logits, vocab));
+        const ex::ForwardVerify view = verifier.view(window);
+        verify.batch.verify          = &view;
+        Tensor all(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), window});
+        verifier.copy_tails(device.stream);
+        harness.forward->run(verify.batch, all);
+        verifier.commit(view, window, verify.batch.positions, device.stream);
+        device.synchronize();
+        verify.batch.verify = nullptr;
+        const std::vector<float> columns = to_float(logits, vocab * static_cast<std::size_t>(window));
+        for (std::int32_t j = 0; j < window; ++j) {
+            rows.emplace_back(columns.begin() + static_cast<std::ptrdiff_t>(vocab) * j,
+                              columns.begin() + static_cast<std::ptrdiff_t>(vocab) * (j + 1));
+        }
+        for (const Call& step : steps) {
+            harness.forward->run(step.batch, one);
+            device.synchronize();
+            rows.push_back(to_float(logits, vocab));
+        }
+        return rows;
+    };
+    const auto copies = run(false);
+    const auto mapped = run(true);
+    std::size_t equal = 0;
+    for (std::size_t r = 0; r < copies.size(); ++r) {
+        equal += std::memcmp(copies[r].data(), mapped[r].data(), vocab * sizeof(float)) == 0 ? 1 : 0;
+    }
+    std::printf("%zu of %zu logits columns bitwise equal with --gdn-head-map (prompt, %d verified, %d decoded)\n",
+                equal, copies.size(), window, decode);
+    const bool ok = equal == copies.size();
+    std::printf(ok ? "gdn head map checks passed\n" : "FAIL: the GDN head map changed the logits\n");
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
     const char* artifact_env = std::getenv("NINFER_TEST_QWEN4EXP_ARTIFACT");
     if (artifact_env == nullptr || argc < 2) {
@@ -1324,6 +1433,9 @@ int main(int argc, char** argv) {
         }
         if (std::any_of(argv + 1, argv + argc, [](const char* a) { return std::string(a) == "--shared-expert-stream"; })) {
             return shared_expert_mode(argc, argv, artifact_env);
+        }
+        if (std::any_of(argv + 1, argv + argc, [](const char* a) { return std::string(a) == "--gdn-head-map"; })) {
+            return gdn_head_map_mode(argc, argv, artifact_env);
         }
         std::vector<Job> jobs;
         std::int32_t staging_slots = 64;
