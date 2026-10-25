@@ -35,10 +35,6 @@ inline void require_expert_job(const char* who, const std::uint8_t* record, int 
     }
 }
 
-// Pins the calling thread to `cpu` (Linux, Windows); a negative cpu or another platform is a no-op.
-// Worker 0 of a team is the caller, so whoever owns that thread (CpuMissService) pins it.
-void pin_current_thread(int cpu);
-
 // One A8-cast activation column: k codes and k / 32 scales.
 struct A8Act {
     const std::int8_t* q = nullptr;

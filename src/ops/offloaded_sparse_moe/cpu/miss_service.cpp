@@ -81,12 +81,10 @@ struct CpuMissService::Impl {
 
     void serve() {
         try {
-            detail::pin_current_thread(options.cpus.empty() ? -1 : options.cpus[0]);
             beat();
             CpuExpertTeam team({.workers  = options.workers,
                                 .isa      = options.isa,
                                 .max_jobs = options.max_jobs,
-                                .cpus     = options.cpus,
                                 .progress = heartbeat});
             std::vector<CpuExpertJob> jobs(static_cast<std::size_t>(options.max_jobs));
             auto* volatile_sequence = reinterpret_cast<volatile std::uint32_t*>(&request->sequence);

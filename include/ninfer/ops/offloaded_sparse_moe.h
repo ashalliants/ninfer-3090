@@ -171,7 +171,6 @@ public:
         CpuIsa isa          = best_cpu_isa();
         int max_jobs        = 16; // per round
         int spin_iterations = 1 << 16;
-        std::vector<int> cpus; // optional CPU of worker i (worker 0 is the caller, not pinned)
         // Optional liveness word: every worker atomically increments it as it takes each work item,
         // so it keeps changing for as long as a round makes progress (CpuMissService's heartbeat).
         std::uint32_t* progress = nullptr;
@@ -332,7 +331,6 @@ public:
         int pcie_divisor    = 3;  // misses / pcie_divisor stay on the GPU (0: none)
         int max_job_columns = kMaxColumns;
         CpuIsa isa          = best_cpu_isa();
-        std::vector<int> cpus; // optional CPU of worker i (worker 0 is the service thread)
     };
 
     CpuMissService(std::vector<Layer> layers, Options options);
