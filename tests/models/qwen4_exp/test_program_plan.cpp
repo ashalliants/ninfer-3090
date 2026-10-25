@@ -9,10 +9,13 @@
 // a named term too, zero when the option or MTP is off. So are --mtp-joint-acceptance's draft
 // probabilities, and --hot-embedding-rows's device copy of the embedding's first rows.
 // --gdn-head-map: MTP's GDN replay records (part of the speculation term) hold the 16 key heads.
+// --moe-precast-input: each routed-expert call's workspace, part of the forward's workspace term,
+// holds the call's A8-cast input (codes and scales, T * (2560 + 320) bytes).
 
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/program/program.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/offloaded_sparse_moe.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -267,6 +270,27 @@ int main() {
         check(q4::plan_gdn_record_bytes(copies, flash) - q4::plan_gdn_record_bytes(mapped, flash) ==
                   cells * 32 * 128 * 2,
               "the head map saves 32 key heads of records (2.25 MiB at 7 drafts)");
+
+        // --moe-precast-input: the routed experts' workspace grows by the A8 planes of the call's
+        // columns (each 256-byte aligned), at every width the forward plans (decode, a verification,
+        // a wide call past the narrow route, a prefill chunk), and the forward's MoE term with it.
+        check(!q4::ProgramOptions{}.moe_precast_input, "the MoE precast input is off by default");
+        q4::TextConfig experts = flash;
+        experts.moe.experts    = 512;
+        experts.moe.top_k      = 10;
+        for (const std::int32_t t : {1, 8, 9, 1024}) {
+            const auto plane          = [](std::uint64_t n) { return (n + 255) / 256 * 256; };
+            const std::uint64_t cast  = plane(2560ULL * t) + plane(320ULL * t);
+            const std::int32_t routed = 10 * t, jobs = std::min(512, routed);
+            check(ops::moe_experts_workspace_bytes(jobs, routed, t, true) -
+                          ops::moe_experts_workspace_bytes(jobs, routed, t, false) ==
+                      cast,
+                  "the precast input adds its two planes to the experts' workspace at T = " + std::to_string(t));
+            check(ex::Forward::moe_workspace_bytes(experts, t, true) -
+                          ex::Forward::moe_workspace_bytes(experts, t, false) ==
+                      cast,
+                  "the forward's MoE term plans the precast planes at T = " + std::to_string(t));
+        }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

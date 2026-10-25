@@ -136,3 +136,10 @@ set_tests_properties(ninfer_qwen4_exp_hot_embedding_test PROPERTIES SKIP_RETURN_
 add_test(NAME ninfer_qwen4_exp_gdn_head_map_test
   COMMAND ninfer_tests ninfer_qwen4_exp_engine_real_test --gdn-head-map-exact --mtp 3)
 set_tests_properties(ninfer_qwen4_exp_gdn_head_map_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# GPU, real artifact with the MTP drafter (skips otherwise): moe_precast_matches_plain, the engine
+# test's --moe-precast-exact mode. Greedy ids with --moe-precast-input (each routed-expert call casts
+# its input to A8 once) equal those of the per-block casts, prefill, decode and MTP rounds included.
+add_test(NAME ninfer_qwen4_exp_moe_precast_test
+  COMMAND ninfer_tests ninfer_qwen4_exp_engine_real_test --moe-precast-exact --mtp 3)
+set_tests_properties(ninfer_qwen4_exp_moe_precast_test PROPERTIES SKIP_RETURN_CODE 77)

@@ -8,6 +8,7 @@
 //         (a 256 MiB read before every rep), CUDA events around the call replayed from a CUDA graph
 //         (as decode issues it) and launched eagerly, median of --reps. Rate = record bytes read /
 //         graph time.
+//         --precast 1 sets MoeExpertSource::precast_input (x cast to A8 once per call).
 //   cpu   one cold expert at T = 1 on the CPU worker team, over a sweep of worker counts; records
 //         rotate through a bank larger than the last-level cache. Median of --reps.
 //
@@ -15,6 +16,7 @@
 // rate does not depend on their values).
 //
 //   ninfer_benches ninfer_offloaded_moe_bench [--mode gpu|cpu|all] [--experts 10] [--reps 30] [--misses 1]
+//       [--precast 0|1]
 
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -108,7 +110,7 @@ double median(std::vector<double> v) {
     return v[v.size() / 2];
 }
 
-void bench_gpu(int experts, int reps, int misses) {
+void bench_gpu(int experts, int reps, int misses, bool precast) {
     std::mt19937 rng(5);
     cudaStream_t stream = nullptr;
     cuda_ok(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
@@ -124,8 +126,8 @@ void bench_gpu(int experts, int reps, int misses) {
     cudaEvent_t a, b;
     cuda_ok(cudaEventCreate(&a), "event");
     cuda_ok(cudaEventCreate(&b), "event");
-    std::printf("GPU narrow route, %d experts each routed every column (top_k = %d), cold L2, median of %d\n", experts,
-                experts, reps);
+    std::printf("GPU narrow route, %d experts each routed every column (top_k = %d), cold L2, median of %d%s\n",
+                experts, experts, reps, precast ? ", input cast once per call" : "");
     std::printf("%-8s %-10s %3s %8s %9s %8s %9s %6s\n", "format", "placement", "T", "MB", "graph us", "eager us",
                 "GB/s", "of 936");
     for (QType format : kFormats) {
@@ -161,7 +163,7 @@ void bench_gpu(int experts, int reps, int misses) {
                 v = static_cast<std::uint16_t>(u >> 16);
             }
             DeviceBuffer x(xh.size() * 2), out(static_cast<std::size_t>(experts) * t * om::kHidden * 2),
-                workspace(ops::moe_experts_workspace_bytes(experts, experts * t, t));
+                workspace(ops::moe_experts_workspace_bytes(experts, experts * t, t, precast));
             x.copy_from_host(xh.data(), xh.size() * 2);
             for (int placement = 0; placement < 6; ++placement) {
                 if (placement > 0 && t > 1) { continue; } // misses at T = 1 only
@@ -182,6 +184,7 @@ void bench_gpu(int experts, int reps, int misses) {
                 source.staging_base  = static_cast<std::uint8_t*>(staging.p);
                 source.staging_slots    = placement == 1 || placement == 3 || placement == 4 ? experts : 0;
                 source.zero_copy_misses = placement == 4 ? misses : 0;
+                source.precast_input    = precast;
                 const Tensor xt(x.p, DType::BF16, {om::kHidden, t});
                 Tensor ot(out.p, DType::BF16, {om::kHidden, experts * t});
                 // The call as decode issues it, replayed from a CUDA graph, and launched eagerly.
@@ -264,23 +267,25 @@ void bench_cpu(int reps) {
 
 int main(int argc, char** argv) {
     std::string mode = "all";
-    int experts = 10, reps = 30, misses = 1;
+    int experts = 10, reps = 30, misses = 1, precast = 0;
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string k = argv[i];
         if (k == "--mode") { mode = argv[i + 1]; }
         else if (k == "--experts") { experts = std::atoi(argv[i + 1]); }
         else if (k == "--reps") { reps = std::atoi(argv[i + 1]); }
         else if (k == "--misses") { misses = std::atoi(argv[i + 1]); }
+        else if (k == "--precast") { precast = std::atoi(argv[i + 1]); }
         else {
-            std::fprintf(stderr, "usage: %s [--mode gpu|cpu|all] [--experts 10] [--reps 30] [--misses 1]\n", argv[0]);
+            std::fprintf(stderr, "usage: %s [--mode gpu|cpu|all] [--experts 10] [--reps 30] [--misses 1] [--precast 0|1]\n",
+                         argv[0]);
             return 2;
         }
     }
-    if (experts < 1 || experts > 16 || reps < 1 || misses < 1 || misses > experts) {
-        std::fprintf(stderr, "--experts must be in [1, 16], --reps positive and --misses in [1, experts]\n");
+    if (experts < 1 || experts > 16 || reps < 1 || misses < 1 || misses > experts || (precast != 0 && precast != 1)) {
+        std::fprintf(stderr, "--experts must be in [1, 16], --reps positive, --misses in [1, experts] and --precast 0 or 1\n");
         return 2;
     }
-    if (mode == "gpu" || mode == "all") { bench_gpu(experts, reps, misses); }
+    if (mode == "gpu" || mode == "all") { bench_gpu(experts, reps, misses, precast != 0); }
     if (mode == "cpu" || mode == "all") { bench_cpu(reps); }
     return 0;
 }

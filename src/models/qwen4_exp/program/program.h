@@ -430,6 +430,9 @@ struct ProgramOptions {
     // tiled head map (execution::ForwardOptions::gdn_head_map) instead of tiled copies; the GDN
     // replay records then hold the key heads only (gdn_records_spec). The same outputs, bit for bit.
     bool gdn_head_map = false;
+    // FlashNextOptions::moe_precast_input: each routed-expert call casts its input to A8 once
+    // (execution::ForwardOptions::moe_precast_input); the workspace terms include its planes.
+    bool moe_precast_input = false;
 };
 
 // ProgramDevicePlan::shared_expert_workspace of these options: the side-stream carve

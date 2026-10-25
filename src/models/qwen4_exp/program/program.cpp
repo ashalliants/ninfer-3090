@@ -565,19 +565,20 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     // A rows round decodes and samples one row per lane, so neither a --prefill-chunk below the lane
     // count nor a one-row sampling profile may size the workspace below that round.
     d.work = execution::Forward::workspace_bytes(c, std::max(d.chunk, static_cast<std::int32_t>(d.lanes)), d.pages * kPagedKVPageSize,
-                                                 DeviceExecutionView{nullptr, sms}) +
+                                                 DeviceExecutionView{nullptr, sms}, o.moe_precast_input) +
              ops::sampling_workspace_capacity_bytes(d.token_domain, 1, static_cast<std::int32_t>(d.lanes));
     if (d.drafts > 0) {
         // A drafter step (one column and the head's logits), and a prefill call's drafter cells: a
         // sub-chunk's residual rows beside the call's residual. Acceptance's workspace.
         const std::size_t step = execution::Forward::mtp_workspace_bytes(c, 1, d.pages * kPagedKVPageSize,
-                                                                         DeviceExecutionView{nullptr, sms});
+                                                                         DeviceExecutionView{nullptr, sms},
+                                                                         o.moe_precast_input);
         d.work = std::max(d.work, step) + std::size_t(c.residual_width()) * execution::kMtpChunkColumns * 2 * 3 +
                  ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(d.token_domain, 1, d.drafts, 1, 1);
     }
     d.sms       = sms;
     d.wide_work = execution::Forward::workspace_bytes(c, d.wide_chunk, d.pages * kPagedKVPageSize,
-                                                      DeviceExecutionView{nullptr, sms}) +
+                                                      DeviceExecutionView{nullptr, sms}, o.moe_precast_input) +
                   (o.shared_expert_stream ? execution::Forward::shared_expert_workspace_bytes(c, d.wide_chunk) : 0);
     d.vmm = VmmArena::supported(o.device);
 
@@ -998,7 +999,8 @@ public:
     // the first rows and the whole table through its device pointer in the mapped pinned block.
     execution::ForwardOptions forward_options() const {
         execution::ForwardOptions out{.shared_expert_stream = options_.shared_expert_stream,
-                                      .gdn_head_map         = options_.gdn_head_map};
+                                      .gdn_head_map         = options_.gdn_head_map,
+                                      .moe_precast_input    = options_.moe_precast_input};
         if (plan_.bytes.hot_embedding == 0) { return out; }
         const Weight& table        = parameters_.token_embedding;
         const auto rows            = static_cast<std::int32_t>(options_.hot_embedding_rows);
@@ -2950,7 +2952,8 @@ private:
         const std::uint32_t keys    = plan_.pages * kPagedKVPageSize;
         const std::size_t work      = std::min<std::size_t>(
             plan_.wide_work,
-            execution::Forward::workspace_bytes(c_, widest, keys, DeviceExecutionView{nullptr, plan_.sms}) +
+            execution::Forward::workspace_bytes(c_, widest, keys, DeviceExecutionView{nullptr, plan_.sms},
+                                                options_.moe_precast_input) +
                 (options_.shared_expert_stream ? forward_->max_shared_expert_scratch_bytes(widest) : 0));
         const std::uint64_t stride  = residency_->frame_stride();
         const std::size_t tables    = align(stream_->table_bytes());

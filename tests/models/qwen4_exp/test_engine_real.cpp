@@ -52,6 +52,14 @@
 //   ninfer_qwen4_exp_engine_real_test --gdn-head-map-exact [--mtp K] [--max-context N] [--generate N]
 //       [TOKENS...]
 //
+// MoE precast input (moe_precast_matches_plain below, --moe-precast-input): greedy ids with every
+// routed-expert call casting its input to A8 once equal those of an Engine casting it per block.
+// --mtp K runs both Engines with MTP, so the drafter's and the verification's calls take it too.
+// Without TOKENS the chat fixture's first 300 tokens are the prompt (a prefill wider than 8 columns).
+//
+//   ninfer_qwen4_exp_engine_real_test --moe-precast-exact [--mtp K] [--max-context N] [--generate N]
+//       [TOKENS...]
+//
 // MTP for constrained requests (mtp_constrained_matches_plain below): a greedy JSON-schema request
 // with --mtp-constrained (K drafts, default 3) gives the ids of plain constrained decoding.
 //
@@ -643,10 +651,18 @@ int hot_embedding_matches_plain(const std::string& artifact, const std::vector<s
     return ok ? 0 : 1;
 }
 
-// gdn_head_map_matches_copies (--gdn-head-map-exact, FlashNextOptions::gdn_head_map): the whole route
-// through the Program (the forward's option, and with MTP the records planned with 16 key heads and
-// their fold) gives the greedy ids of the q/k copies.
-int gdn_head_map_matches_copies(const std::string& artifact, const std::vector<std::string>& args) {
+// The greedy ids of an Engine with a Flash-Next option that is designed to change no bit (`set`
+// turns it on) against an Engine without it, through the whole route of the Program. `on` and `off`
+// label the runs; with --mtp K the option's Engine must run MTP rounds.
+struct BitwiseOption {
+    const char* off;
+    const char* on;
+    const char* name; // in the verdict
+    void (*set)(EngineOptions&);
+};
+
+int option_matches_off(const std::string& artifact, const std::vector<std::string>& args,
+                       const BitwiseOption& option) {
     std::uint32_t max_context = 8192, tokens = 128, mtp = 0;
     std::vector<std::string> jobs;
     for (std::size_t i = 0; i < args.size(); ++i) {
@@ -669,10 +685,10 @@ int gdn_head_map_matches_copies(const std::string& artifact, const std::vector<s
         prompts.push_back(std::move(ids));
         jobs.push_back("ppl_tokens-chat[0:300]");
     }
-    const auto engine_options = [&](bool head_map) {
+    const auto engine_options = [&](bool on) {
         EngineOptions options                = base_options(artifact, max_context);
         options.flash_next.save_expert_state = false;
-        options.flash_next.gdn_head_map      = head_map;
+        if (on) { option.set(options); }
         if (mtp != 0) {
             options.speculative.backend      = SpeculativeBackend::Mtp;
             options.speculative.draft_tokens = mtp;
@@ -680,13 +696,13 @@ int gdn_head_map_matches_copies(const std::string& artifact, const std::vector<s
         return options;
     };
     const double ram_before = available_ram_gib();
-    std::vector<std::vector<TokenId>> copies;
+    std::vector<std::vector<TokenId>> reference;
     try {
         Engine engine(engine_options(false));
         for (std::size_t j = 0; j < prompts.size(); ++j) {
             const Run run = generate(engine, prompts[j], tokens);
-            print_run(("q/k copies " + jobs[j]).c_str(), run, prompts[j].size());
-            copies.push_back(run.ids);
+            print_run((std::string(option.off) + " " + jobs[j]).c_str(), run, prompts[j].size());
+            reference.push_back(run.ids);
         }
     } catch (const std::exception& error) {
         if (mtp == 0 || std::string(error.what()).find("no MTP drafter") == std::string::npos) { throw; }
@@ -698,19 +714,43 @@ int gdn_head_map_matches_copies(const std::string& artifact, const std::vector<s
     Engine engine(engine_options(true));
     for (std::size_t j = 0; j < prompts.size(); ++j) {
         const Run run           = generate(engine, prompts[j], tokens);
-        const std::string label = "gdn head map " + jobs[j];
+        const std::string label = std::string(option.on) + " " + jobs[j];
         print_run(label.c_str(), run, prompts[j].size());
         if (mtp != 0) { print_speculation(label.c_str(), run.speculative); }
-        ok = same(label.c_str(), copies[j], run.ids) && ok;
+        ok = same(label.c_str(), reference[j], run.ids) && ok;
         if (mtp != 0 && run.speculative.rounds == 0) {
-            std::printf("FAIL: %s ran no MTP round, so the replay records and their fold were not exercised\n",
-                        label.c_str());
+            std::printf("FAIL: %s ran no MTP round, so the option's MTP route was not exercised\n", label.c_str());
             ok = false;
         }
     }
-    std::printf(ok ? "qwen4_exp gdn head map exactness passed\n" : "FAIL: qwen4_exp gdn head map exactness\n");
+    if (ok) {
+        std::printf("qwen4_exp %s exactness passed\n", option.name);
+    } else {
+        std::printf("FAIL: qwen4_exp %s exactness\n", option.name);
+    }
     return ok ? 0 : 1;
 }
+
+// gdn_head_map_matches_copies (--gdn-head-map-exact, FlashNextOptions::gdn_head_map): the whole route
+// through the Program (the forward's option, and with MTP the records planned with 16 key heads and
+// their fold) gives the greedy ids of the q/k copies.
+int gdn_head_map_matches_copies(const std::string& artifact, const std::vector<std::string>& args) {
+    return option_matches_off(artifact, args,
+                              {"q/k copies", "gdn head map", "gdn head map",
+                               [](EngineOptions& o) { o.flash_next.gdn_head_map = true; }});
+}
+
+// moe_precast_matches_plain (--moe-precast-exact, FlashNextOptions::moe_precast_input): every
+// routed-expert call casting its input to A8 once (the text model's prefill and decode calls, with
+// MTP the drafter's and the verification's, in the workspace the Program plans for it) gives the
+// greedy ids of the per-block casts.
+int moe_precast_matches_plain(const std::string& artifact, const std::vector<std::string>& args) {
+    return option_matches_off(artifact, args,
+                              {"per-block casts", "moe precast input", "moe precast input",
+                               [](EngineOptions& o) { o.flash_next.moe_precast_input = true; }});
+}
+
+
 
 // mtp_constrained_matches_plain (--mtp-constrained, FlashNextOptions::mtp_constrained): a greedy
 // JSON-schema request on an MTP Engine with the option gives the ids of plain constrained decoding.
@@ -1159,6 +1199,9 @@ int main(int argc, char** argv) {
         }
         if (!args.empty() && args.front() == "--gdn-head-map-exact") {
             return gdn_head_map_matches_copies(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
+        }
+        if (!args.empty() && args.front() == "--moe-precast-exact") {
+            return moe_precast_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
         }
         if (!args.empty() && args.front() == "--mtp-constrained") {
             return mtp_constrained_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));

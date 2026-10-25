@@ -82,6 +82,14 @@
 // route), the next W (default 3, 2..8) are one verification call (the recorded recurrence, every
 // column's logits) committed in full by the GDN fold, then each of the last N (default 2) is decoded
 // by one call (the recurrent kernel). Every logits column must be bitwise equal between the runs.
+//
+// MoE precast mode (ForwardOptions::moe_precast_input is bit-exact):
+//
+//   ninfer_qwen4_exp_forward_real_test --moe-precast-input TOKENS [--window W] [--decode N] [--staging SLOTS]
+//
+// The same calls as the head-map mode (a prompt call wider than 8 columns, whose experts take the
+// narrow and the wide route; a verification window; decode calls), each routed-expert call casting
+// its input to A8 per block, then once per call. Every logits column must be bitwise equal.
 
 #include "artifact/reader.h"
 #include "core/arena.h"
@@ -271,7 +279,8 @@ struct Harness {
             experts.staging_slots = staging_slots;
         }
         work = std::make_unique<WorkspaceArena>(
-            ex::Forward::workspace_bytes(c, columns, static_cast<std::uint32_t>(context), device.execution_view()) +
+            ex::Forward::workspace_bytes(c, columns, static_cast<std::uint32_t>(context), device.execution_view(),
+                                         options.moe_precast_input) +
             (options.shared_expert_stream ? ex::Forward::shared_expert_workspace_bytes(c, columns) : 0));
         views   = state;
         forward = std::make_unique<ex::Forward>(parameters, device, *work, std::move(state), std::move(kv),
@@ -486,7 +495,8 @@ struct RowsHarness {
         experts.route_log     = static_cast<std::int32_t*>(route_log.p);
         experts.route_stride  = route_stride;
         work = std::make_unique<WorkspaceArena>(
-            ex::Forward::workspace_bytes(c, kPrefillChunk, static_cast<std::uint32_t>(context), device.execution_view()));
+            ex::Forward::workspace_bytes(c, kPrefillChunk, static_cast<std::uint32_t>(context), device.execution_view(),
+                                         false));
         forward = std::make_unique<ex::Forward>(parameters, device, *work, std::move(state), std::move(kv),
                                                 std::move(experts));
     }
@@ -1308,16 +1318,17 @@ int shared_expert_mode(int argc, char** argv, const char* artifact_env) {
     return ok ? 0 : 1;
 }
 
-// The identity check of ForwardOptions::gdn_head_map (see the header): the same calls from a fresh
-// state with the q/k copies and with the head map; every logits column must be bitwise equal.
-int gdn_head_map_mode(int argc, char** argv, const char* artifact_env) {
+// The identity checks of ForwardOptions::gdn_head_map and ForwardOptions::moe_precast_input (see
+// the header; `flag` names the one checked): the same calls from a fresh state without and with the
+// option; every logits column must be bitwise equal.
+int identity_mode(int argc, char** argv, const char* artifact_env, const std::string& flag) {
     std::vector<std::int32_t> tokens;
     std::int32_t window = 3, decode = 2, staging_slots = 64;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        if (arg == "--gdn-head-map") { continue; }
+        if (arg == flag) { continue; }
         if (arg.rfind("--", 0) != 0) {
-            if (!tokens.empty()) { throw std::invalid_argument("--gdn-head-map takes one token list"); }
+            if (!tokens.empty()) { throw std::invalid_argument(flag + " takes one token list"); }
             tokens = parse_tokens(arg);
             continue;
         }
@@ -1330,7 +1341,7 @@ int gdn_head_map_mode(int argc, char** argv, const char* artifact_env) {
         } else if (arg == "--staging") {
             staging_slots = std::stoi(value);
         } else {
-            throw std::invalid_argument("unknown option " + arg + " in --gdn-head-map mode");
+            throw std::invalid_argument("unknown option " + arg + " in " + flag + " mode");
         }
     }
     if (window < 2 || window > kMaxVerifyColumns) {
@@ -1340,8 +1351,8 @@ int gdn_head_map_mode(int argc, char** argv, const char* artifact_env) {
     const auto n            = static_cast<std::int32_t>(tokens.size());
     const std::int32_t head = n - window - decode;
     if (head < 16) {
-        throw std::invalid_argument("--gdn-head-map needs at least 16 prompt tokens before the window and the "
-                                    "decode tokens (the GDN's chunked route)");
+        throw std::invalid_argument(flag + " needs at least 16 prompt tokens before the window and the decode "
+                                    "tokens (the GDN's chunked route, routed-expert calls wider than 8 columns)");
     }
 
     DeviceContext device(0);
@@ -1372,9 +1383,12 @@ int gdn_head_map_mode(int argc, char** argv, const char* artifact_env) {
                 head, window, decode, staging_slots);
 
     // Every logits column of the prompt, the verification and the decode calls, in order.
-    const auto run = [&](bool head_map) {
-        Harness harness(parameters, device, context, head, staging_slots, ex::ForwardOptions{.gdn_head_map = head_map});
-        Verifier verifier(harness, window, head_map);
+    const bool head_map_mode = flag == "--gdn-head-map";
+    const auto run = [&](bool on) {
+        const ex::ForwardOptions options{.gdn_head_map      = on && head_map_mode,
+                                         .moe_precast_input = on && !head_map_mode};
+        Harness harness(parameters, device, context, head, staging_slots, options);
+        Verifier verifier(harness, window, options.gdn_head_map);
         std::vector<std::vector<float>> rows;
         Tensor one(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), 1});
         harness.forward->run(prompt.batch, one);
@@ -1400,16 +1414,20 @@ int gdn_head_map_mode(int argc, char** argv, const char* artifact_env) {
         }
         return rows;
     };
-    const auto copies = run(false);
-    const auto mapped = run(true);
+    const auto off = run(false);
+    const auto on  = run(true);
     std::size_t equal = 0;
-    for (std::size_t r = 0; r < copies.size(); ++r) {
-        equal += std::memcmp(copies[r].data(), mapped[r].data(), vocab * sizeof(float)) == 0 ? 1 : 0;
+    for (std::size_t r = 0; r < off.size(); ++r) {
+        equal += std::memcmp(off[r].data(), on[r].data(), vocab * sizeof(float)) == 0 ? 1 : 0;
     }
-    std::printf("%zu of %zu logits columns bitwise equal with --gdn-head-map (prompt, %d verified, %d decoded)\n",
-                equal, copies.size(), window, decode);
-    const bool ok = equal == copies.size();
-    std::printf(ok ? "gdn head map checks passed\n" : "FAIL: the GDN head map changed the logits\n");
+    std::printf("%zu of %zu logits columns bitwise equal with %s (prompt, %d verified, %d decoded)\n", equal,
+                off.size(), flag.c_str(), window, decode);
+    const bool ok = equal == off.size();
+    if (ok) {
+        std::printf("%s checks passed\n", flag.c_str());
+    } else {
+        std::printf("FAIL: %s changed the logits\n", flag.c_str());
+    }
     return ok ? 0 : 1;
 }
 
@@ -1434,8 +1452,10 @@ int main(int argc, char** argv) {
         if (std::any_of(argv + 1, argv + argc, [](const char* a) { return std::string(a) == "--shared-expert-stream"; })) {
             return shared_expert_mode(argc, argv, artifact_env);
         }
-        if (std::any_of(argv + 1, argv + argc, [](const char* a) { return std::string(a) == "--gdn-head-map"; })) {
-            return gdn_head_map_mode(argc, argv, artifact_env);
+        for (const char* flag : {"--gdn-head-map", "--moe-precast-input"}) {
+            if (std::any_of(argv + 1, argv + argc, [&](const char* a) { return std::string(a) == flag; })) {
+                return identity_mode(argc, argv, artifact_env, flag);
+            }
         }
         std::vector<Job> jobs;
         std::int32_t staging_slots = 64;

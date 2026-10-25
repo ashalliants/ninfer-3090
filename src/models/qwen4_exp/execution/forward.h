@@ -265,6 +265,11 @@ struct ForwardOptions {
     // bitwise the outputs and state of the copy route. A verification call's GDN records then hold
     // key_heads key heads (spec.qk_heads, spec.head_map Tiled: gdn_records_spec in program.h).
     bool gdn_head_map = false;
+    // Every routed-expert call (the text model's and the drafter's) casts its input to A8 once
+    // (ops::MoeExpertSource::precast_input) instead of in each gate/up thread block: the same codes,
+    // bitwise the outputs. The planes are in the call's workspace: workspace_bytes and
+    // mtp_workspace_bytes take the same choice.
+    bool moe_precast_input = false;
 };
 
 class Forward {
@@ -292,9 +297,11 @@ public:
     // Runs one call of the MTP drafter (requires its parameters and ForwardMtp). Uses the
     // workspace like a forward call (not between run_front and run_back).
     void run_mtp(const MtpCall& call);
-    // Workspace of a drafter call of up to `columns` cells (full steps run one).
+    // Workspace of a drafter call of up to `columns` cells (full steps run one), with
+    // ForwardOptions::moe_precast_input as `moe_precast_input`.
     [[nodiscard]] static std::size_t mtp_workspace_bytes(const TextConfig& config, std::int32_t columns,
-                                                         std::uint32_t max_visible_keys, DeviceExecutionView execution);
+                                                         std::uint32_t max_visible_keys, DeviceExecutionView execution,
+                                                         bool moe_precast_input);
 
     // FP32 logits [V, n] of batch.logit_columns.
     void run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap = nullptr);
@@ -312,9 +319,16 @@ public:
     // The first layer that reads the n-gram rows (the PLE layer); the layer count when none does.
     [[nodiscard]] std::uint32_t rows_layer() const noexcept;
 
-    // Workspace one call of up to `columns` columns needs, at the given context.
+    // Workspace one call of up to `columns` columns needs, at the given context, with
+    // ForwardOptions::moe_precast_input as `moe_precast_input`.
     [[nodiscard]] static std::size_t workspace_bytes(const TextConfig& config, std::int32_t columns,
-                                                     std::uint32_t max_visible_keys, DeviceExecutionView execution);
+                                                     std::uint32_t max_visible_keys, DeviceExecutionView execution,
+                                                     bool moe_precast_input);
+    // The MoE block's share of workspace_bytes: routing, dispatch, the routed experts' outputs and
+    // workspace (with the precast input's planes under moe_precast_input), the shared expert and
+    // the combine.
+    [[nodiscard]] static std::size_t moe_workspace_bytes(const TextConfig& config, std::int32_t columns,
+                                                         bool moe_precast_input);
     // With ForwardOptions::shared_expert_stream, the workspace a call of up to `columns` columns
     // is planned to need beyond workspace_bytes, from the configuration alone (before the weights
     // are read): the Q8_1 rows of the shared expert's widest input, the scratch a GGML Linear above
@@ -405,6 +419,7 @@ private:
     std::int32_t hot_embedding_rows_ = 0;
     Weight hot_embedding_, cold_embedding_;
     bool gdn_head_map_ = false; // ForwardOptions::gdn_head_map
+    bool moe_precast_input_ = false; // ForwardOptions::moe_precast_input
     Tensor mtp_frames_; // I32 [E]: every drafter expert resident at its own index
     DeviceBuffer mtp_frames_backing_;
     Tensor residual_; // the call's residual stream, in the workspace from run_front to run_back

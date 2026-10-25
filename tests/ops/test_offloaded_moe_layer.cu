@@ -12,6 +12,8 @@
 //     1, 3 or 64 slots, mixed, and served by the CPU
 //     miss service at 1 and 6 workers; and staged calls whose passes with few misses read them
 //     zero-copy (MoeExpertSource::zero_copy_misses), alone, mixed and beside the CPU service.
+//     precast_bitwise: every one of these placements again with MoeExpertSource::precast_input (x
+//     cast to A8 once per call, the gate/up CTAs reading its codes), bit for bit the same outputs.
 //   - The whole layer against FP64: route weights, the routed experts (FP64 over the decoded
 //     records and A8-cast activations), a shared expert composed of GGML linears and silu_mul (its
 //     Op outputs rounded to BF16, their observable boundaries), and moe_combine.
@@ -304,6 +306,7 @@ struct Config {
     // record formats differ in size): MoeExpertSource::frame_stride.
     bool wide_frames = false;
     int zero_copy_misses = 0; // MoeExpertSource::zero_copy_misses
+    bool precast_input   = false; // MoeExpertSource::precast_input
 };
 
 std::vector<Config> configs() {
@@ -373,7 +376,9 @@ std::vector<std::uint16_t> run_config(const Bank& bank, const Config& cfg, const
     }
     std::unique_ptr<DeviceBuffer> staging;
     if (cfg.staging_slots > 0) { staging = std::make_unique<DeviceBuffer>(bank.stride * cfg.staging_slots); }
-    DeviceBuffer workspace(ops::moe_experts_workspace_bytes(max_jobs, k * columns, columns));
+    DeviceBuffer workspace(ops::moe_experts_workspace_bytes(max_jobs, k * columns, columns, cfg.precast_input));
+    // The precast codes must be written before the gate/up CTAs read them: start from garbage.
+    if (cfg.precast_input) { cuda_ok(cudaMemset(workspace.p, 0xA5, workspace.bytes), "poison the workspace"); }
     DeviceBuffer outputs(static_cast<std::size_t>(k) * columns * om::kHidden * 2);
     cuda_ok(cudaMemset(outputs.p, 0xFF, outputs.bytes), "poison");
     Pinned error(64);
@@ -390,6 +395,7 @@ std::vector<std::uint16_t> run_config(const Bank& bank, const Config& cfg, const
     source.staging_base  = staging ? static_cast<std::uint8_t*>(staging->p) : nullptr;
     source.staging_slots = cfg.staging_slots;
     source.zero_copy_misses = cfg.zero_copy_misses;
+    source.precast_input    = cfg.precast_input;
     std::unique_ptr<om::CpuMissService> owned;
     om::CpuMissService* service = external;
     if (service == nullptr && cfg.cpu_workers > 0) {
@@ -449,13 +455,19 @@ void check_bank(const Bank& bank, int k, const std::vector<int>& column_counts, 
         DeviceBuffer x_dev(x.size() * 2);
         x_dev.copy_from_host(x.data(), x.size() * 2);
         const auto want = expected_outputs(bank, x, ids, k, columns);
-        for (const auto& cfg : configs()) {
-            std::printf("  %s T=%d %s\n", format_name(bank.format), columns, cfg.name.c_str());
-            const auto got = run_config(bank, cfg, r, x_dev, columns);
-            std::size_t mismatches = 0;
-            for (std::size_t i = 0; i < got.size(); ++i) { mismatches += got[i] != want[i] ? 1 : 0; }
-            check(mismatches == 0, std::string(format_name(bank.format)) + " T=" + std::to_string(columns) + " " +
-                                       cfg.name + ": " + std::to_string(mismatches) + " BF16 outputs differ from the CPU engine");
+        // Every placement as it is, then with the input cast once per call (precast_bitwise).
+        for (const bool precast : {false, true}) {
+            for (Config cfg : configs()) {
+                cfg.precast_input = precast;
+                if (precast) { cfg.name += "+precast"; }
+                std::printf("  %s T=%d %s\n", format_name(bank.format), columns, cfg.name.c_str());
+                const auto got = run_config(bank, cfg, r, x_dev, columns);
+                std::size_t mismatches = 0;
+                for (std::size_t i = 0; i < got.size(); ++i) { mismatches += got[i] != want[i] ? 1 : 0; }
+                check(mismatches == 0, std::string(format_name(bank.format)) + " T=" + std::to_string(columns) + " " +
+                                           cfg.name + ": " + std::to_string(mismatches) +
+                                           " BF16 outputs differ from the CPU engine");
+            }
         }
         if (oracle && columns <= 8) {
             double worst_norm = 0.0, worst_point = 0.0;
@@ -468,10 +480,12 @@ void check_bank(const Bank& bank, int k, const std::vector<int>& column_counts, 
                 worst_point = std::max(worst_point, crit.worst);
                 check(accept(crit), "expert output outside the A8 criterion against FP64");
             }
-            std::printf("%-13s T=%-2d %zu placements bit-identical to the CPU engine; FP64 normwise %.3e, worst %.3e\n",
+            std::printf("%-13s T=%-2d %zu placements, with and without precast_input, bit-identical to the CPU engine; "
+                        "FP64 normwise %.3e, worst %.3e\n",
                         format_name(bank.format), columns, configs().size(), worst_norm, worst_point);
         } else {
-            std::printf("%-13s T=%-2d %zu placements bit-identical to the CPU engine\n", format_name(bank.format), columns,
+            std::printf("%-13s T=%-2d %zu placements, with and without precast_input, bit-identical to the CPU engine\n",
+                        format_name(bank.format), columns,
                         configs().size());
         }
     }

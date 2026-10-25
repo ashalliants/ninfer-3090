@@ -87,9 +87,10 @@ namespace ninfer::ops {
  *
  * Workspace:
  *   moe_dispatch: caller-owned device arrays of moe_dispatch_bytes(). moe_experts: caller-owned
- *   device scratch of moe_experts_workspace_bytes(max_jobs, entries, columns), reserved from the
- *   call until its outputs are placed (moe_experts_cpu_wait for wait_for_cpu == false). Staging
- *   slots are caller-owned device scratch of the call, shared by every layer.
+ *   device scratch of moe_experts_workspace_bytes(max_jobs, entries, columns, precast_input),
+ *   reserved from the call until its outputs are placed (moe_experts_cpu_wait for wait_for_cpu ==
+ *   false); with source.precast_input it also holds the call's A8-cast x. Staging slots are
+ *   caller-owned device scratch of the call, shared by every layer.
  *
  * Execution:
  *   Every call is enqueued on `stream` without host synchronization; none allocates device memory.
@@ -248,6 +249,12 @@ struct MoeCpuChannel {
 
 struct MoeExpertSource {
     QType format                     = QType::BF16; // the layer's record format
+    // Cast x to A8 once per call into the workspace (codes [T][2560], then FP32 scales [T][80]: the
+    // canonical cast), which the narrow route's gate/up CTAs read instead of each casting their
+    // columns again. The same codes, so the same outputs bit for bit. The call's workspace grows by
+    // the two planes (moe_experts_workspace_bytes with precast_input). Declared beside `format` so
+    // it lies in that field's padding and the struct's layout is unchanged.
+    bool precast_input               = false;
     const std::uint8_t* frame_base   = nullptr;
     const std::int32_t* frames       = nullptr; // device [E]: frame of a resident expert, else -1
     const std::uint8_t* host_records = nullptr; // pinned host bank, device-readable (mapped)
@@ -270,8 +277,10 @@ struct MoeExpertSource {
 };
 
 /// Workspace of one moe_experts call of `columns` (T) columns and `entries` (k*T) routed entries.
+/// With `precast_input` (MoeExpertSource::precast_input) it holds the call's A8 input too: T * 2560
+/// code bytes and T * 320 scale bytes more, each rounded up to 256 bytes.
 [[nodiscard]] std::size_t moe_experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries,
-                                                      std::int32_t columns);
+                                                      std::int32_t columns, bool precast_input = false);
 
 /// x: BF16 [H, T]. outputs: BF16 [H, k*T], column t*k + slot receives expert ids[slot, t]'s
 /// output for column t. max_jobs bounds the job count the grid covers (min(E, k*T)).
@@ -288,6 +297,10 @@ struct MoeExpertSource {
 /// 512 columns or more every expert takes the wide route. Both produce the canonical bits, so the
 /// route is invisible in the outputs. A call of more than kMaxColumns
 /// columns needs the larger workspace moe_experts_workspace_bytes returns for it.
+///
+/// With source.precast_input one kernel casts every column of x to A8 before the passes (skipped
+/// in a call where every expert takes the wide route, which casts x itself) and the narrow gate/up
+/// kernels copy a column's codes and scales instead of casting it in every CTA.
 ///
 /// With wait_for_cpu == false the call returns before placing CPU-served outputs; the caller may
 /// enqueue unrelated work (the shared expert) and must call moe_experts_cpu_wait with the same

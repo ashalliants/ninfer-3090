@@ -413,6 +413,10 @@ struct FlashNextOptions {
     // head first (--gdn-head-map): 216 copies a decode token fewer, and MTP's GDN replay records hold
     // a third of the key heads. The same output, bit for bit.
     bool gdn_head_map = false;
+    // Cast each routed-expert call's input to A8 once (--moe-precast-input) instead of in every one
+    // of its gate/up thread blocks (40 per expert): the same codes, so the same output bit for bit;
+    // the call's workspace grows by about 2.8 KiB a column.
+    bool moe_precast_input = false;
     // The context cache's NVMe tier: a scratch file of up to this many bytes holds the checkpoints,
     // with the Host context budget as its RAM cache (a zero Host budget then reuses prefixes from
     // disk alone); 0: none. The file is created in `context_nvme_dir` (empty: beside the artifact),

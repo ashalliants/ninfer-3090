@@ -176,7 +176,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--no-cuda-graph] [--no-prefix-reuse] [--devices N,M,...] [--stage-layers A,B,...] "
            "[--ngram-volume FILE] [--ngram-keepalive-ms N] [--expert-state FILE|--no-expert-state] [--default-expert-state FILE] "
            "[--vram-headroom-mib N] [--shared-expert-stream] [--mtp-constrained] [--mtp-joint-acceptance] [--ngram-prefetch] "
-           "[--hot-embedding-rows N] [--gdn-head-map] "
+           "[--hot-embedding-rows N] [--gdn-head-map] [--moe-precast-input] "
            "[--ram-headroom-mib N] [--expert-cache-mib N] [--context-nvme-mib N [--context-nvme-dir DIR]] "
            "[--chat-template FILE] "
            "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
@@ -274,7 +274,9 @@ std::string serve_usage_text(const char* argv0) {
            "first N rows in VRAM and reads the rest from pinned RAM, freeing VRAM for the expert cache "
            "(the same output; 0, the default, keeps the whole table in VRAM; at most the vocabulary); "
            "--gdn-head-map reads the GDN's key heads through the tiled head map instead of copying "
-           "them per value head (the same output, bit for bit; off by default); "
+           "them per value head (the same output, bit for bit; off by default); --moe-precast-input "
+           "casts each routed-expert call's input to A8 once instead of in every gate/up block (the same "
+           "output, bit for bit; off by default); "
            "--vision takes "
            "images when "
            "the model was converted with "
@@ -683,6 +685,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.flash_next.ngram_prefetch = true;
         } else if (arg == "--gdn-head-map") {
             options.flash_next.gdn_head_map = true;
+        } else if (arg == "--moe-precast-input") {
+            options.flash_next.moe_precast_input = true;
         } else if (arg == "--hot-embedding-rows") {
             options.flash_next.hot_embedding_rows = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--hot-embedding-rows"), "hot-embedding-rows"));
