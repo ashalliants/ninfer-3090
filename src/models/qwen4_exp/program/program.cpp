@@ -1012,10 +1012,13 @@ public:
         const auto rows            = static_cast<std::int32_t>(options_.hot_embedding_rows);
         out.hot_embedding_rows     = rows;
         out.cold_embedding         = table;
-        // The payload keeps its offset before the codes (zero for ggml_blocks_v1).
-        const auto codes_at = static_cast<const std::byte*>(table.qdata) - static_cast<const std::byte*>(table.payload);
-        out.cold_embedding.payload = static_cast<const std::byte*>(cold_embedding_) - codes_at;
-        out.cold_embedding.qdata   = cold_embedding_;
+        // Each plane's payload starts at its codes (ggml_blocks_v1 has no other plane), and its
+        // payload_bytes count from there.
+        const auto codes_at = static_cast<std::uint64_t>(static_cast<const std::byte*>(table.qdata) -
+                                                         static_cast<const std::byte*>(table.payload));
+        out.cold_embedding.payload       = cold_embedding_;
+        out.cold_embedding.qdata         = cold_embedding_;
+        out.cold_embedding.payload_bytes = table.payload_bytes - codes_at;
         out.hot_embedding          = table;
         out.hot_embedding.payload  = hot_embedding_.p;
         out.hot_embedding.qdata    = hot_embedding_.p;

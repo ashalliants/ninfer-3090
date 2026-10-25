@@ -461,6 +461,10 @@ void test_hot_embedding_ledgers() {
     require(b.planned - a.planned >= on.table + overhead && b.planned - a.planned <= on.table + overhead + 1,
             "the ledger plans the table with its lock overhead");
     require(b.full_need == a.full_need, "the experts' need is unchanged");
+    char pinned[64];
+    std::snprintf(pinned, sizeof(pinned), "(%.1f GiB pinned)",
+                  static_cast<double>(hot.expert_banks + on.table) / static_cast<double>(kGiB));
+    require(b.fits && b.summary().find(pinned) != std::string::npos, "the summary counts the pinned table");
 }
 
 } // namespace

@@ -687,7 +687,10 @@ None has been measured on the RTX 3090 yet.
     memory as on master.
   - The same values: the split route decodes each row exactly as `ops::embedding`.
     `ninfer_embedding_test` (`embedding_split_matches_embedding`) checks it bitwise across the
-    boundary, with the cold plane in mapped pinned memory; not run yet.
+    boundary, with the cold plane in mapped pinned memory. End to end,
+    `ninfer_qwen4_exp_hot_embedding_test` (`ninfer_qwen4_exp_engine_real_test --hot-embedding-exact
+    8192 [--mtp K]`) checks that greedy ids through the Program equal those with the table in VRAM.
+    Neither has run yet.
   - Cost: a cold id's row (1,360 bytes) crosses PCIe inside the embedding kernel; a decode step
     gathers one row per column. The 322 MiB join the pinned block (one `cudaHostAlloc` at load,
     so no extra `cudaHostRegister` under WDDM); the RAM ledger counts them, so a host that only
