@@ -60,6 +60,8 @@ public:
     void listen_failure(std::string_view host, int port) const;
     void server_ready(std::string_view host, int port, std::string_view model_id,
                       bool auth_enabled) const;
+    // The server listens beyond loopback without --api-key.
+    void exposure_warning(std::string_view host, int port) const;
     void server_stopped() const;
     void server_failure(bool serving, std::string_view detail) const;
     void engine_fault(const ninfer::EngineFaultEvent& event) const;

@@ -798,7 +798,7 @@ without its leading dashes). A section named after a model found in `--models-di
 The command line wins over a preset where they repeat an option. Comments sit on lines of their own
 (`;` or `#` first). The router's own options (`models-max`, `models-autoload`, `sleep-idle-seconds`,
 `unload-idle-seconds`) are command-line only, as are the options the router overrides for every
-model (`api-key`, `host`, `port`, `model-id`): a preset that sets one is rejected at startup. A model
+model (`api-key`, `allowed-host`, `host`, `port`, `model-id`): a preset that sets one is rejected at startup. A model
 id may not contain `/`, `?`, `#`, `%` or `\`. With
 `--context-store DIR` each model keeps its store in `DIR/<model id>` (and under `<prefix><model id>/`
 in S3; characters other than letters, digits, `-` and `_` are written as `%XX`). `--request-log-jsonl`
@@ -833,7 +833,7 @@ The router answers llama.cpp's model API itself:
 model that last served, without waking or loading it (a 503 while it is unloaded). Everything
 else (chat completions, Responses, Messages and the rest) is forwarded to the model it names: each model runs the ordinary
 single-model server on a loopback port of its own, so every endpoint, request log and metric works
-per model unchanged. The router checks `--api-key` and applies `--cors`; models need neither.
+per model unchanged. The router checks `--api-key`, runs the [Host and Origin checks](#host-and-origin-checks) and applies `--cors`; models need none of them.
 Streamed responses stream, and a client that disconnects cancels the generation, also while the
 model is still loading or working on the prompt. The router rewrites only the `"model"` member of a
 body it forwards (to the model's id), so every other value reaches the model as you wrote it.
@@ -1997,6 +1997,58 @@ curl http://127.0.0.1:8080/v1/models \
 
 `--cors` adds permissive browser CORS headers. It is disabled by default.
 
+The key is compared in constant time, so response times say nothing about how much of a guess was
+right.
+
+### Host and Origin checks
+
+Two checks run before every route, `GET /health` and the loading `503` included. They stop a web
+page in a browser on this machine (or on the LAN) from using the server behind your back.
+
+- **Host**, always. A request whose `Host` header names something the server does not answer to is
+  refused. This is what defeats DNS rebinding, where an attacker's domain is made to resolve to
+  `127.0.0.1`. Accepted:
+  - `localhost`, `127.0.0.1` and `[::1]`;
+  - the `--host` address or name, unless it is a wildcard (`0.0.0.0`, `::`);
+  - the machine's host name, when it is a wildcard;
+  - each `--allowed-host NAME` (repeatable);
+  - any IPv4 or bracketed IPv6 address, such as `192.168.1.5:8080` from another machine on the
+    LAN, because a rebinding attack needs a name.
+
+  Names are matched in any case and with or without a trailing dot. The port is not compared, so
+  SSH tunnels and port forwards keep working. A request with no `Host` header at all (HTTP/1.0
+  tools) is accepted.
+- **Origin**, only when the server has no `--api-key` and no `--cors`. A browser request from
+  another site carries that site's `Origin`, and is refused unless the origin is the server's own
+  (`scheme://name:port`, a name from the list above on the server's port). Clients that are not
+  browser pages (`curl`, the OpenAI and Anthropic SDKs, a chat UI's server-side backend) send no
+  `Origin` and are not affected. `Origin: null`, sent by `file://` pages and sandboxed frames, is
+  refused, as are browser-extension origins. Give such a client a key, or start the server with
+  `--cors`.
+
+A refused request gets `403` in the error shape of the endpoint it called: the OpenAI shape (code
+`host_not_allowed` or `origin_not_allowed`) everywhere else, and the Anthropic shape (type
+`permission_error`) under `/v1/messages`.
+
+```json
+{"error": {"message": "Host 'evil.example:8080' is not a name this server answers to; start it with --allowed-host NAME to accept another name",
+           "type": "invalid_request_error", "param": null, "code": "host_not_allowed"}}
+```
+
+The router runs both checks on its public address and drops `Origin` (with the credentials) from
+the requests it relays to its models, which listen on loopback.
+
+**Serving on a LAN.** Bind a wildcard or the LAN address, and give it a key:
+
+```bash
+ninfer-serve model.ninfer --host 0.0.0.0 --api-key "$(openssl rand -hex 24)"
+```
+
+Clients reach it at `http://<lan-ip>:8080` or `http://<machine-name>:8080` with no extra setup. For
+any other name (a DNS alias, `gpubox.local`, a Docker Compose service name), add
+`--allowed-host gpubox.local`. Without `--api-key`, a server listening beyond loopback logs a
+warning at startup: anyone who can reach the address can use the model.
+
 ## Server options
 
 The table lists executable defaults. The startup example selects a long-context FP8/MTP3 profile.
@@ -2006,6 +2058,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--host H` | listen address | `127.0.0.1` |
 | `--port N` | listen port | `8080` |
 | `--api-key KEY` | required bearer or `x-api-key` value | unset |
+| `--allowed-host NAME` | one more name the [Host check](#host-and-origin-checks) accepts; a name without a scheme or port; repeatable | none |
 | `--model-id ID` | override the public OpenAI model alias | artifact `metadata.name`, or architecture name |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |

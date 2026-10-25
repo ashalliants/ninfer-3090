@@ -1002,6 +1002,22 @@ int main() {
                           std::string::npos,
                       "serve help omits --context-store");
 
+    // --allowed-host: repeatable, appended in order; a name, never a URL or name:port.
+    failures += check(defaults.allowed_hosts.empty(), "--allowed-host names are set by default");
+    const ServeOptions hosts = parse({"ninfer-serve", "model.ninfer", "--allowed-host",
+                                      "gpubox.lan", "--allowed-host", "[fe80::5]"});
+    failures += check(hosts.allowed_hosts == std::vector<std::string>{"gpubox.lan", "[fe80::5]"},
+                      "--allowed-host did not append each name");
+    for (const char* bad : {"", "http://gpubox", "gpubox:8080", "gpubox/v1", "fe80::5", "a b"}) {
+        failures += check(rejected({"ninfer-serve", "model.ninfer", "--allowed-host", bad}),
+                          "--allowed-host accepted something that is not a host name");
+    }
+    failures += check(rejected({"ninfer-serve", "model.ninfer", "--allowed-host"}),
+                      "--allowed-host without a value was accepted");
+    failures += check(serve_usage_text("ninfer-serve").find("--allowed-host NAME") !=
+                          std::string::npos,
+                      "serve help omits --allowed-host");
+
     // Model suspend.
     failures += check(!defaults.suspend.enabled && defaults.sleep_idle_seconds == 0 &&
                           defaults.suspend.auto_resume,

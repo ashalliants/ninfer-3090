@@ -289,8 +289,10 @@ bool is_json_content_type(std::string_view content_type) {
 RouterServer::RouterServer(ServeOptions options, ModelRegistry& registry,
                            std::shared_ptr<RoutedPorts> ports,
                            std::shared_ptr<spdlog::logger> logger)
-    : options_(std::move(options)), registry_(registry), ports_(std::move(ports)),
-      logger_(std::move(logger)) {
+    : options_(std::move(options)),
+      host_policy_(make_host_policy(options_.host, options_.port, options_.allowed_hosts,
+                                    local_machine_name())),
+      registry_(registry), ports_(std::move(ports)), logger_(std::move(logger)) {
     // cpp-httplib is thread-per-connection, and a relayed request holds a router worker for as long
     // as its model holds the matching worker of its own server.
     constexpr std::size_t kBaseWorkers = 32;
@@ -345,12 +347,16 @@ void RouterServer::register_routes() {
     server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
         // On every response, errors included, as on a single-model server.
         res.set_header("X-NInfer-Version", std::string(ninfer::product::build_version()));
+        if (reject_untrusted_request(host_policy_, options_, req, res)) {
+            return httplib::Server::HandlerResponse::Handled;
+        }
         if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
             return httplib::Server::HandlerResponse::Unhandled;
         }
         const bool bearer_ok =
             matches_bearer_credential(req.get_header_value("Authorization"), options_.api_key);
-        const bool x_api_key_ok = req.get_header_value("x-api-key") == options_.api_key;
+        const bool x_api_key_ok =
+            constant_time_equal(req.get_header_value("x-api-key"), options_.api_key);
         if (!bearer_ok && !x_api_key_ok) {
             write_error(req, res, 401, "invalid_api_key", "missing or invalid API key");
             return httplib::Server::HandlerResponse::Handled;
@@ -702,10 +708,10 @@ void RouterServer::relay(const httplib::Request& req, httplib::Response& res,
     upstream.body   = std::move(body);
     for (const auto& [name, value] : req.headers) {
         const std::string lower = lower_ascii(name);
-        // The model needs no credentials (it listens on loopback for the router alone), and
+        // The model needs no credentials (it listens on loopback for the router alone) and no
+        // Origin (the router has checked it, and the keyless model would refuse a foreign one), and
         // compression is the router's business with its client, not the model's.
-        if (hop_by_hop(name) || lower == "authorization" || lower == "x-api-key" ||
-            lower == "accept-encoding") {
+        if (hop_by_hop(name) || dropped_when_relaying(name) || lower == "accept-encoding") {
             continue;
         }
         upstream.headers.emplace(name, value);

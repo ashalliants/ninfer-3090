@@ -600,6 +600,12 @@ void OperationalLog::server_ready(std::string_view host, int port, std::string_v
                   auth_enabled ? "bearer" : "disabled");
 }
 
+void OperationalLog::exposure_warning(std::string_view host, int port) const {
+    logger_->warn("listening on {}:{} without --api-key | anyone who can reach this address can "
+                  "use the model | set --api-key, or --host 127.0.0.1 to stay local",
+                  product::format_pretty_text(host), port);
+}
+
 void OperationalLog::server_stopped() const { logger_->info("server stopped"); }
 
 OperationalRecord render_engine_fault(const ninfer::EngineFaultEvent& event) {

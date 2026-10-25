@@ -2,6 +2,7 @@
 #include "product/logging/startup_log.h"
 #include "product/version/version.h"
 #include "serve/generation_service.h"
+#include "serve/http_security.h"
 #include "serve/http_server.h"
 #include "serve/model_catalog.h"
 #include "serve/model_registry.h"
@@ -248,6 +249,9 @@ int run_router(const char* argv0, const ninfer::serve::ServeOptions& options,
         }
         operational_log.server_ready(options.host, options.port, "router",
                                      !options.api_key.empty());
+        if (ninfer::serve::exposed_without_key(options.host, !options.api_key.empty())) {
+            operational_log.exposure_warning(options.host, options.port);
+        }
         listener.join();
         join_watcher();
         g_router.store(nullptr);
@@ -352,6 +356,9 @@ int main(int argc, char** argv) {
         serving = true;
         operational_log.server_ready(options.host, options.port, server.public_model_id(),
                                      !options.api_key.empty());
+        if (ninfer::serve::exposed_without_key(options.host, !options.api_key.empty())) {
+            operational_log.exposure_warning(options.host, options.port);
+        }
 
         const bool ok = server.listen();
         g_server.store(nullptr);

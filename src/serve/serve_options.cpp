@@ -188,7 +188,7 @@ std::string serve_usage_text(const char* argv0) {
            "[options passed to every model]    (router mode: several models, no artifact path)\n"
            "   or: " +
            argv0 +
-           " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
+           " <model.ninfer> [--host H] [--port N] [--api-key KEY] [--allowed-host NAME]... "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--fit-context MIN] "
            "[--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
@@ -251,6 +251,9 @@ std::string serve_usage_text(const char* argv0) {
            "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
            "       --model-id overrides the artifact metadata.name reported by the server\n"
+           "       --allowed-host NAME is one more name the Host check accepts, besides localhost, "
+           "IP addresses and the --host name (the machine name with --host 0.0.0.0). Repeatable\n"
+           "       without --api-key or --cors, a browser request from another origin is refused\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
@@ -553,6 +556,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.port = parse_nonnegative_int(require_value("--port"), "port");
         } else if (arg == "--api-key") {
             options.api_key = require_value("--api-key");
+        } else if (arg == "--allowed-host") {
+            const std::string_view name = require_value("--allowed-host");
+            // A name alone: the Host check ignores the port, and a scheme or path is no name.
+            const bool bracketed = name.starts_with('[') && name.ends_with(']');
+            if (name.empty() || name.find_first_of("/ \t@") != std::string_view::npos ||
+                (!bracketed && name.find(':') != std::string_view::npos)) {
+                throw std::invalid_argument(
+                    "--allowed-host takes a host name without a scheme or port, e.g. "
+                    "--allowed-host gpubox.lan");
+            }
+            options.allowed_hosts.emplace_back(name);
         } else if (arg == "--model-id") {
             options.model_id_override = require_value("--model-id");
             if (options.model_id_override->empty()) {

@@ -1,3 +1,7 @@
+# The Host/Origin checks and key comparison: string logic alone, so its test builds host-only.
+add_library(ninfer_serve_security STATIC http_security.cpp)
+ninfer_internal_includes(ninfer_serve_security)
+
 add_library(ninfer_serve STATIC
   http_transport.cpp
   console_log.cpp
@@ -31,6 +35,6 @@ add_library(ninfer_serve STATIC
 )
 ninfer_internal_includes(ninfer_serve)
 target_link_libraries(ninfer_serve
-  PUBLIC ninfer_engine Threads::Threads ninfer::json ninfer::httplib
+  PUBLIC ninfer_engine ninfer_serve_security Threads::Threads ninfer::json ninfer::httplib
   PRIVATE ninfer_media_acquire ninfer_s3_object_store ninfer_product_logging ninfer_product_version ninfer_grammar
           ${NINFER_CUDART_TARGET})
