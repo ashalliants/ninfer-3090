@@ -218,6 +218,34 @@ int main() {
             check(volume.counters().keepalive_reads == settled, "no keep-alive reads after the window");
             check(rows_match(rows, read(volume, rows)), "rows equal the oracle with the keep-alive on");
             volume.set_keepalive(std::chrono::milliseconds(0), std::chrono::milliseconds(0));
+
+            // The default period, 40 ms (Basalt's, against an SSD that sleeps after about 100 ms
+            // idle). A loaded host delays the keep-alive thread by tens of milliseconds, so the
+            // upper bound is the best of five idle spells: at least one read within three periods;
+            // and in every spell none before half the period has passed.
+            volume.set_keepalive(std::chrono::milliseconds(40), std::chrono::milliseconds(2000));
+            using Clock = std::chrono::steady_clock;
+            auto best = Clock::duration::max();
+            bool early = false;
+            for (int attempt = 0; attempt < 5; ++attempt) {
+                (void)read(volume, rows);
+                const auto idle_from  = Clock::now();
+                const auto idle_start = volume.counters().keepalive_reads;
+                std::this_thread::sleep_for(std::chrono::milliseconds(15));
+                early = early || volume.counters().keepalive_reads != idle_start;
+                while (Clock::now() - idle_from < std::chrono::milliseconds(500)) {
+                    if (volume.counters().keepalive_reads > idle_start) {
+                        best = std::min(best, Clock::now() - idle_from);
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+            check(!early, "no 40 ms keep-alive read before half the period");
+            check(best <= std::chrono::milliseconds(120),
+                  "a 40 ms keep-alive reads within three periods of idleness (best " +
+                      std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(best).count()) + " ms)");
+            volume.set_keepalive(std::chrono::milliseconds(0), std::chrono::milliseconds(0));
         }
 
         q4::NgramTableConfig wrong = table;

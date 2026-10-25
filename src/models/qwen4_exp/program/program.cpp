@@ -683,8 +683,9 @@ public:
           volume_(options_.ngram_volume, c_.ple.table), hash_(c_.ple.ngram, 0),
           plan_(plan_layout(options_, c_, parameters.model.resources().public_token_count, strides(parameters))) {
         exempt_process_from_power_throttling();
-        // A read after 100 ms idle within a minute of a request keeps the volume's drive awake.
-        volume_.set_keepalive(std::chrono::milliseconds(100), std::chrono::milliseconds(60000));
+        // A read after ngram_keepalive_ms of idleness within a minute of a request keeps the volume's
+        // drive awake (a zero period leaves the keep-alive off).
+        volume_.set_keepalive(std::chrono::milliseconds(options_.ngram_keepalive_ms), std::chrono::milliseconds(60000));
         vocab_ = dim(c_.vocab_size);
 
         // Every fixed allocation is checked against the plan and against device free memory (an
