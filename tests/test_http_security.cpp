@@ -3,7 +3,7 @@
 //   - host_loopback_ok: localhost, 127.0.0.1 and [::1], with and without a port, in any case and
 //     with a trailing dot, and a missing Host header;
 //   - host_rebind_rejected: a name the server does not answer to (evil.example:8080) is refused,
-//     also when it merely ends in or contains an allowed name;
+//     also when it merely ends in or contains an allowed name, carries userinfo or a space;
 //   - host_lan_ip_ok_when_bound: bound to 192.168.1.5, Host 192.168.1.5:8080 passes;
 //   - host_wildcard_machine_name: bound to 0.0.0.0 or ::, the machine name passes, and so does a
 //     LAN address the server cannot know in advance; bound to one address, the machine name does
@@ -12,6 +12,10 @@
 //   - origin_cases: a key or --cors allows any origin; without either, a missing origin and the
 //     server's own origins pass, and a foreign origin, another port, "null" and other schemes
 //     are refused;
+//   - fetch_site_cases: Sec-Fetch-Site: cross-site is refused without a key or --cors; the other
+//     values and its absence pass;
+//   - allowed_host_values: --allowed-host takes names and addresses the Host check can match, and
+//     refuses wildcards, ports, schemes, paths, userinfo and characters no name holds;
 //   - exposure_warning_cases: 0.0.0.0, :: and a LAN address without a key warn; loopback, or a
 //     key, does not;
 //   - relay_drops_origin_and_credentials: the router drops Origin, Authorization and x-api-key
@@ -28,10 +32,12 @@ namespace {
 using ninfer::serve::constant_time_equal;
 using ninfer::serve::dropped_when_relaying;
 using ninfer::serve::exposed_without_key;
+using ninfer::serve::fetch_site_allowed;
 using ninfer::serve::host_allowed;
 using ninfer::serve::HostPolicy;
 using ninfer::serve::make_host_policy;
 using ninfer::serve::origin_allowed;
+using ninfer::serve::valid_allowed_host;
 
 int failures = 0;
 
@@ -77,7 +83,9 @@ void host_rebind_rejected() {
          {"evil.example:8080", "evil.example", "EVIL.example", "localhost.evil.example:8080",
           "evillocalhost:8080", "127.0.0.1.evil.example", "localhost:8080.evil.example",
           "localhost:abc", "localhost:8080:8080", "localhost..", "gpubox:8080", "::1",
-          "[::1", "[evil.example]:8080", "1.2.3:8080", "256.1.1.1:8080", "1.2.3.4.5"}) {
+          "[::1", "[evil.example]:8080", "1.2.3:8080", "256.1.1.1:8080", "1.2.3.4.5",
+          "user@localhost", "user@localhost:8080", "local host:8080", "localhost :8080",
+          "local\thost"}) {
         check(!host_allowed(policy, host), std::string("rebinding host accepted: ") + host);
     }
 }
@@ -171,6 +179,28 @@ void origin_cases() {
           "--allowed-host origin on another port");
 }
 
+void fetch_site_cases() {
+    check(!fetch_site_allowed("cross-site", false, false), "cross-site without a key or --cors");
+    check(!fetch_site_allowed(" Cross-Site ", false, false), "cross-site in another case");
+    check(fetch_site_allowed("cross-site", true, false), "cross-site with a key");
+    check(fetch_site_allowed("cross-site", false, true), "cross-site with --cors");
+    for (const char* site : {"", "same-origin", "same-site", "none"}) {
+        check(fetch_site_allowed(site, false, false), std::string("refused: ") + site);
+    }
+}
+
+void allowed_host_values() {
+    for (const char* good : {"gpubox", "gpubox.lan", "GpuBox.Local", "my_box", "192.168.1.5",
+                             "[fe80::5]", "gpubox.lan."}) {
+        check(valid_allowed_host(good), std::string("valid --allowed-host refused: ") + good);
+    }
+    for (const char* bad : {"", "*", "*.lan", "gpu%box", "gpubox?", "gpu box", "user@gpubox",
+                            "http://gpubox", "gpubox:8080", "gpubox:", "gpubox/v1", "fe80::5",
+                            "[fe80::5]:8080", "[gpubox]", ".", "gpu\tbox"}) {
+        check(!valid_allowed_host(bad), std::string("invalid --allowed-host accepted: ") + bad);
+    }
+}
+
 void exposure_warning_cases() {
     check(exposed_without_key("0.0.0.0", false), "0.0.0.0 without a key warns");
     check(exposed_without_key("::", false), ":: without a key warns");
@@ -206,6 +236,8 @@ int main() {
     host_wildcard_machine_name();
     host_allowed_flag();
     origin_cases();
+    fetch_site_cases();
+    allowed_host_values();
     exposure_warning_cases();
     relay_drops_origin_and_credentials();
     if (failures != 0) {

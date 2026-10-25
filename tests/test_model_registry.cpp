@@ -2,11 +2,16 @@
 // registry asks of it. Covered: resolving ids and aliases, autoload, making room under models_max
 // by putting the least recently used idle model to sleep (or unloading it when it cannot sleep),
 // waking a sleeping model, leases holding a model in place, idle sleep, explicit load/unload/sleep,
-// the event stream, and the preset/models-directory catalog with its option precedence.
+// the event stream, the preset/models-directory catalog with its option precedence, the options a
+// routed model runs with, and the router's Host, Origin and Sec-Fetch-Site checks over HTTP.
 
 #include "serve/model_catalog.h"
 #include "serve/model_registry.h"
+#include "serve/routed_model.h"
 #include "serve/router_server.h"
+
+#include <httplib.h>
+#include <spdlog/logger.h>
 
 #include <atomic>
 #include <chrono>
@@ -482,6 +487,88 @@ void single_model_mode() {
     expect(lease.model() == "only", "a request naming no model gets the one model");
 }
 
+// A routed model runs keyless on loopback; the public address's access settings stay with the
+// router, so --cors passed on to every model must not reach the model's own server.
+void routed_models_leave_access_to_the_router() {
+    ServeOptions started;
+    started.host        = "0.0.0.0";
+    started.port        = 9000;
+    started.api_key     = "secret";
+    started.enable_cors = true;
+    started.allowed_hosts.push_back("gpubox.lan");
+    started.max_context      = 4096;
+    const ServeOptions inner = routed_model_options(started, "small");
+    expect(inner.host == "127.0.0.1" && inner.port == 0 && inner.api_key.empty() &&
+               !inner.enable_cors && inner.allowed_hosts.empty() &&
+               inner.model_id_override == std::optional<std::string>("small") &&
+               inner.max_context == 4096,
+           "a routed model keeps its own options but none of the router's access settings");
+}
+
+// The router's pre-routing handler runs the Host, Origin and Sec-Fetch-Site checks on its public
+// address, ahead of the key, over real HTTP. No model is loaded (autoload is off).
+void router_checks_host_and_origin() {
+    for (const bool keyed : {false, true}) {
+        Journal journal;
+        RegistryPolicy policy;
+        policy.autoload = false;
+        ModelRegistry registry({model("a")}, policy, factory(journal), true);
+        ServeOptions options;
+        options.host = "127.0.0.1";
+        if (keyed) { options.api_key = "secret"; }
+        auto logger = std::make_shared<spdlog::logger>("router-test");
+        std::unique_ptr<RouterServer> router;
+        for (int port = 18480; port < 18580 && !router; ++port) {
+            options.port = port;
+            auto candidate =
+                std::make_unique<RouterServer>(options, registry, std::make_shared<RoutedPorts>(),
+                                               logger);
+            if (candidate->bind()) { router = std::move(candidate); }
+        }
+        if (!router) {
+            expect(false, "the router test could not bind a loopback port");
+            return;
+        }
+        std::thread listener([&] { (void)router->listen(); });
+        httplib::Client client("127.0.0.1", options.port);
+        client.set_connection_timeout(5, 0);
+        client.set_read_timeout(5, 0);
+        const auto get = [&](const std::string& path, httplib::Headers headers) {
+            if (keyed) { headers.emplace("Authorization", "Bearer secret"); }
+            const auto result = client.Get(path, headers);
+            if (!result) { return std::pair<int, std::string>{-1, ""}; }
+            return std::pair<int, std::string>{result->status, result->body};
+        };
+        const std::string with = keyed ? " (with a key)" : " (without a key)";
+        expect(get("/health", {}).first == 200, "a plain request reaches the router" + with);
+        const auto rebound = get("/health", {{"Host", "evil.example:8080"}});
+        expect(rebound.first == 403 &&
+                   rebound.second.find("host_not_allowed") != std::string::npos,
+               "a rebinding Host gets 403 from the router" + with);
+        expect(get("/health", {{"Host", "192.168.1.5:8080"}}).first == 200,
+               "an address Host passes the router" + with);
+        const auto foreign = get("/v1/models", {{"Origin", "http://evil.example"}});
+        const auto cross   = get("/v1/models", {{"Sec-Fetch-Site", "cross-site"}});
+        if (keyed) {
+            expect(foreign.first == 200 && cross.first == 200,
+                   "a key decides browser access on its own");
+        } else {
+            expect(foreign.first == 403 &&
+                       foreign.second.find("origin_not_allowed") != std::string::npos,
+                   "a foreign Origin gets 403 from a keyless router");
+            expect(cross.first == 403 &&
+                       cross.second.find("cross_site_request") != std::string::npos,
+                   "a cross-site request gets 403 from a keyless router");
+            expect(get("/v1/models", {{"Origin", "http://localhost:" +
+                                                     std::to_string(options.port)}})
+                           .first == 200,
+                   "the router's own origin passes");
+        }
+        router->stop();
+        listener.join();
+    }
+}
+
 void catalog() {
     const auto preset = parse_preset_file(R"(
 version = 1
@@ -578,6 +665,8 @@ int main() {
         a_resumed_failed_service_is_rebuilt();
         selector_rewrite_changes_only_the_selector();
         single_model_mode();
+        routed_models_leave_access_to_the_router();
+        router_checks_host_and_origin();
         catalog();
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';

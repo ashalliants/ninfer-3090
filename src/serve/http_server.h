@@ -51,8 +51,8 @@ parse_context_store_flush_body(std::string_view body);
 // Its answer: {"written", "unsaved", "uploaded", "seconds"}.
 [[nodiscard]] std::string context_store_flush_json(const ninfer::ContextStoreFlushReport& report);
 
-// The Host check (always) and the Origin check (without a key and without --cors). A refused
-// request gets a 403 in its endpoint's error shape and the result is true.
+// The Host check (always), and without a key and without --cors the Origin and Sec-Fetch-Site
+// checks. A refused request gets a 403 in its endpoint's error shape and the result is true.
 [[nodiscard]] bool reject_untrusted_request(const HostPolicy& policy, const ServeOptions& options,
                                             const httplib::Request& request,
                                             httplib::Response& response);
