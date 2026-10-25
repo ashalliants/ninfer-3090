@@ -60,6 +60,13 @@
 //   ninfer_qwen4_exp_engine_real_test --moe-precast-exact [--mtp K] [--max-context N] [--generate N]
 //       [TOKENS...]
 //
+// MoE register gate/up (moe_gate_up_registers_matches_plain below, --moe-gate-up-registers with the
+// --moe-precast-input it needs): greedy ids equal those of an Engine with the default gate/up kernel
+// and per-block casts. The same arguments as --moe-precast-exact.
+//
+//   ninfer_qwen4_exp_engine_real_test --moe-gate-up-registers-exact [--mtp K] [--max-context N]
+//       [--generate N] [TOKENS...]
+//
 // MTP for constrained requests (mtp_constrained_matches_plain below): a greedy JSON-schema request
 // with --mtp-constrained (K drafts, default 3) gives the ids of plain constrained decoding.
 //
@@ -750,7 +757,17 @@ int moe_precast_matches_plain(const std::string& artifact, const std::vector<std
                                [](EngineOptions& o) { o.flash_next.moe_precast_input = true; }});
 }
 
-
+// moe_gate_up_registers_matches_plain (--moe-gate-up-registers-exact,
+// FlashNextOptions::moe_gate_up_registers with moe_precast_input): every routed-expert call's narrow
+// gate/up rows computed from registers by the co-resident grid (prefill, decode, with MTP the
+// drafter's and the verification's calls) give the greedy ids of the staged kernel.
+int moe_gate_up_registers_matches_plain(const std::string& artifact, const std::vector<std::string>& args) {
+    return option_matches_off(artifact, args,
+                              {"staged gate/up", "register gate/up", "moe register gate/up", [](EngineOptions& o) {
+                                   o.flash_next.moe_precast_input     = true;
+                                   o.flash_next.moe_gate_up_registers = true;
+                               }});
+}
 
 // mtp_constrained_matches_plain (--mtp-constrained, FlashNextOptions::mtp_constrained): a greedy
 // JSON-schema request on an MTP Engine with the option gives the ids of plain constrained decoding.
@@ -1202,6 +1219,9 @@ int main(int argc, char** argv) {
         }
         if (!args.empty() && args.front() == "--moe-precast-exact") {
             return moe_precast_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
+        }
+        if (!args.empty() && args.front() == "--moe-gate-up-registers-exact") {
+            return moe_gate_up_registers_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
         }
         if (!args.empty() && args.front() == "--mtp-constrained") {
             return mtp_constrained_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));

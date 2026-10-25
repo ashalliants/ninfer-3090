@@ -1,4 +1,6 @@
 // Adapted from Infernix a3edb450 src/ops/offloaded_sparse_moe/cuda/moe_layer.cu (Apache-2.0).
+// Adapted from Basalt 8d73a39 src/kernels/cuda/gu2.cuh and src/kernels/cuda/dec_moe.cuh (MIT,
+// third_party/basalt/LICENSE): the register gate/up kernel (gate_up_registers_kernel) only.
 // Modified for NInfer-3090: GGML expert records with the canonical A8 arithmetic (narrow route
 // here; the wide route is wide_expert.cu); routing, dispatch, staging, the CPU channel and the
 // combine are Infernix's, without the SSD tier, fetch channel, landing, streamed records,
@@ -18,6 +20,7 @@
 #include "core/device.h"
 
 #include "ops/common/canonical_ggml.h"
+#include "ops/offloaded_sparse_moe/coresident.h"
 #include "ops/offloaded_sparse_moe/cuda/expert_decode.cuh"
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
 
@@ -27,8 +30,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 namespace ninfer::ops {
 namespace {
@@ -52,8 +57,8 @@ constexpr int kXGroups    = moe::kHidden / canon::kA8Values;       // 80
 constexpr int kHGroups    = moe::kIntermediate / canon::kA8Values; // 20
 constexpr int kMaxDynamicSmem = 99 * 1024;
 
-// MoeExpertSource::precast_input lies in the padding after `format`: the kernels taking the source
-// by value keep their parameter layout.
+// MoeExpertSource::precast_input and gate_up_variant lie in the padding after `format`: the kernels
+// taking the source by value keep their parameter layout.
 static_assert(offsetof(MoeExpertSource, frame_base) == sizeof(void*), "MoeExpertSource's layout changed");
 
 void require(bool condition, const char* message) {
@@ -601,6 +606,190 @@ __global__ void __launch_bounds__(kThreads)
     }
 }
 
+// ------------------------------------------------------------- gate/up from registers (Registers)
+//
+// GateUpVariant::Registers. Adapted from Basalt 8d73a39 src/kernels/cuda/gu2.cuh (rows2) and
+// src/kernels/cuda/dec_moe.cuh (dm_glue_gu_kernel's item loop and dm_glue_blocks) (MIT,
+// third_party/basalt/LICENSE). Modified for NInfer-3090: the canonical A8 arithmetic over our
+// record decoders (expert_decode.cuh), a warp's two rows are one intermediate's gate and up rows
+// (so it applies SwiGLU itself and the kernel needs no shared memory), and the activations are the
+// call's precast planes read in place.
+//
+// Why the outputs are the staged kernel's bits (canonical_ggml.h steps 4-5): a gate/up row has 80
+// sub-blocks, so canonical lane partial l (l < 32) receives, in this order, the fma of sub-blocks l,
+// l + 32 and, for l < 16 only, l + 64; then the butterfly adds the partials at 16, 8, 4, 2, 1. Here
+// lane l holds partial l of both rows, gate g[l] and up u[l]:
+//   - passes 1 and 2: every lane decodes sub-block s = l + 32 * pass of both rows and applies
+//     canon::accumulate to g[l] and u[l], exactly as row_dots does;
+//   - pass 3: lane l < 16 decodes the gate row's sub-block 64 + l, lane l >= 16 the up row's
+//     sub-block 64 + (l - 16). Every lane forms the two operands of that sub-block's fma for each
+//     column, the scale product c * d (canon::mul_rn) and float(P); a __shfl_down_sync by 16 moves
+//     lane l + 16's pair (the up row's sub-block 64 + l) to lane l, and only lanes l < 16 apply
+//     fma(c * d, float(P), partial) to g[l] with their own pair and to u[l] with the received one.
+//     This is canon::accumulate split at its product: the same rounded operands, computed on
+//     another lane (IEEE operations give the same bits on every lane), reach the fma of partial l
+//     as its third and last step, so neither row's per-partial sequence nor its order changes.
+//     Lanes 16-31 apply nothing in pass 3, as canonically (sub-blocks 80-95 do not exist);
+//   - the butterfly is row_dots' (__shfl_xor_sync, __fadd_rn, offsets 16 down to 1) on each value.
+// The sub-block integers come from the same decoders and the codes and scales from the precast
+// planes, which hold the bits the staged kernel copies to shared memory (copy_precast_columns).
+
+constexpr int kRegistersRows      = kWarps;                            // intermediates per item: one a warp
+constexpr int kRegistersRowBlocks = moe::kIntermediate / kRegistersRows; // 80 items per job
+constexpr int kRegistersBlocksPerSm = 2; // the launch bound; the grid follows the measured occupancy
+
+// The exact int32 P of one sub-block against one column's codes (canonical_ggml.h step 3), in
+// row_dots' dp4a order.
+__device__ __forceinline__ int sub_product(const moe::device::Sub& w, const int4& a0, const int4& a1) {
+    int lo = __dp4a(w.v[0], a0.x, 0);
+    lo     = __dp4a(w.v[1], a0.y, lo);
+    lo     = __dp4a(w.v[2], a0.z, lo);
+    lo     = __dp4a(w.v[3], a0.w, lo);
+    int hi = __dp4a(w.v[4], a1.x, 0);
+    hi     = __dp4a(w.v[5], a1.y, hi);
+    hi     = __dp4a(w.v[6], a1.z, hi);
+    hi     = __dp4a(w.v[7], a1.w, hi);
+    return w.m0 * lo + w.m1 * hi;
+}
+
+// The canonical rowdots of one gate row and one up row (global memory, wherever the record lives)
+// against n <= NC precast columns (codes cq[c], scales cd[c]: the column's planes), the whole warp;
+// every lane returns gate row value g[c] and up row value u[c]. See above for the order.
+template <QType F, int NC>
+__device__ __forceinline__ void gate_up_pair(const std::uint8_t* gate, const std::uint8_t* up,
+                                             const std::int8_t* const (&cq)[NC], const float* const (&cd)[NC], int n,
+                                             float (&g)[NC], float (&u)[NC], const uint2* grid) {
+    using Format = moe::device::ExpertFormat<F>;
+    static_assert(moe::kHidden / canon::kA8Values == 2 * 32 + 16, "the passes assume 80 sub-blocks a row");
+    const int lane = threadIdx.x % 32;
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        g[c] = 0.0F;
+        u[c] = 0.0F;
+    }
+#pragma unroll
+    for (int pass = 0; pass < 2; ++pass) {
+        const int s               = lane + 32 * pass;
+        const moe::device::Sub wg = Format::decode(gate, s, grid);
+        const moe::device::Sub wu = Format::decode(up, s, grid);
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            if (c < n) {
+                const int4* a  = reinterpret_cast<const int4*>(cq[c] + s * canon::kA8Values);
+                const int4 a0  = a[0], a1 = a[1];
+                const float da = cd[c][s];
+                g[c]           = canon::accumulate(g[c], wg.c, da, sub_product(wg, a0, a1));
+                u[c]           = canon::accumulate(u[c], wu.c, da, sub_product(wu, a0, a1));
+            }
+        }
+    }
+    // Pass 3, balanced: the gate row's sub-blocks 64-79 on lanes 0-15, the up row's on lanes 16-31.
+    const int s              = 64 + (lane & 15);
+    const moe::device::Sub w = Format::decode(lane < 16 ? gate : up, s, grid);
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        if (c < n) { // n is the same on every lane: the shuffles see the whole warp
+            const int4* a      = reinterpret_cast<const int4*>(cq[c] + s * canon::kA8Values);
+            const int4 a0      = a[0], a1 = a[1];
+            const float scale  = canon::mul_rn(w.c, cd[c][s]);
+            const float value  = static_cast<float>(sub_product(w, a0, a1));
+            const float scale1 = __shfl_down_sync(0xFFFFFFFFU, scale, 16); // lane + 16's: the up row's
+            const float value1 = __shfl_down_sync(0xFFFFFFFFU, value, 16);
+            if (lane < 16) {
+                g[c] = canon::fma_rn(scale, value, g[c]);
+                u[c] = canon::fma_rn(scale1, value1, u[c]);
+            }
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            g[c] = __fadd_rn(g[c], __shfl_xor_sync(0xFFFFFFFFU, g[c], o));
+            u[c] = __fadd_rn(u[c], __shfl_xor_sync(0xFFFFFFFFU, u[c], o));
+        }
+    }
+}
+
+// A co-resident grid (coresident_grid) loops over the pass's (row block, job) items, job-major: item
+// i is row block i % 80 of job i / 80, and its warp w computes intermediate 8 (i % 80) + w, gate and
+// up rows, then SwiGLU, and h in FP32 to the entry's row of h_rows ([entries][kIntermediate]), as
+// gate_up_kernel does. The columns' codes and scales are the call's precast planes (xq, xd), read
+// where they are. No shared memory and no barrier: the warps of a block are independent.
+template <QType F, int NC>
+__global__ void __launch_bounds__(kThreads, kRegistersBlocksPerSm)
+    gate_up_registers_kernel(MoeDispatch dispatch, MoeExpertSource source, Geometry g, int top_k,
+                             const std::uint8_t* const* __restrict__ job_records,
+                             const std::int32_t* __restrict__ cpu_flags, int job_base, int pass_jobs,
+                             float* __restrict__ h_rows, const std::int8_t* __restrict__ xq,
+                             const float* __restrict__ xd) {
+    const int jobs = min(*dispatch.job_count - job_base, pass_jobs);
+    if (jobs <= 0) { return; }
+    const int items   = jobs * kRegistersRowBlocks;
+    const uint2* grid = moe::device::ExpertFormat<F>::global_grid();
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    for (int item = static_cast<int>(blockIdx.x); item < items; item += static_cast<int>(gridDim.x)) {
+        const int job = job_base + item / kRegistersRowBlocks;
+        if (cpu_flags != nullptr && cpu_flags[job] != 0) { continue; }
+        const int expert           = dispatch.jobs[job];
+        const int i                = (item % kRegistersRowBlocks) * kRegistersRows + warp;
+        const std::uint8_t* record = job_record(source, job_records, expert, job);
+        const std::uint8_t* gate   = record + static_cast<std::size_t>(i) * g.gate_up_row_bytes;
+        const std::uint8_t* up     = gate + g.up_offset;
+        const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
+        for (int pass = 0; pass < count; pass += NC) {
+            const int n = min(NC, count - pass);
+            const std::int8_t* cq[NC];
+            const float* cd[NC];
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                const auto t = static_cast<std::size_t>(dispatch.entries[first + pass + min(c, n - 1)] / top_k);
+                cq[c]        = xq + t * moe::kHidden;
+                cd[c]        = xd + t * kXGroups;
+            }
+            float gv[NC], uv[NC];
+            gate_up_pair<F, NC>(gate, up, cq, cd, n, gv, uv, grid);
+            if (lane < n) { // lane c writes column c (every lane holds every value)
+                float gl = gv[0], ul = uv[0];
+#pragma unroll
+                for (int c = 1; c < NC; ++c) {
+                    if (c == lane) {
+                        gl = gv[c];
+                        ul = uv[c];
+                    }
+                }
+                h_rows[static_cast<std::size_t>(first + pass + lane) * moe::kIntermediate + i] =
+                    canon::swiglu_f32(gl, ul);
+            }
+        }
+    }
+}
+
+// The co-resident grid of gate_up_registers_kernel<F, NC> on the current device
+// (offloaded_moe::coresident_blocks of its measured occupancy), computed once per device.
+template <QType F, int NC>
+int coresident_grid() {
+    static std::mutex mutex;
+    static std::unordered_map<int, int> blocks;
+    const auto ok = [](cudaError_t e) {
+        if (e != cudaSuccess) {
+            throw std::runtime_error(std::string("offloaded_sparse_moe register gate/up grid: ") +
+                                     cudaGetErrorString(e));
+        }
+    };
+    int device = -1;
+    ok(cudaGetDevice(&device));
+    const std::scoped_lock lock(mutex);
+    const auto found = blocks.find(device);
+    if (found != blocks.end()) { return found->second; }
+    int sms = 0, per_sm = 0;
+    ok(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
+    ok(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gate_up_registers_kernel<F, NC>, kThreads, 0));
+    const int out = std::max(1, moe::coresident_blocks(sms, std::max(1, per_sm)));
+    blocks.emplace(device, out);
+    return out;
+}
+
 template <int NC>
 struct DownShared {
     alignas(16) std::int8_t hq[NC * moe::kIntermediate];
@@ -672,10 +861,25 @@ struct PrecastInput {
     float* d       = nullptr; // [T][kXGroups]
 };
 
+// The gate/up half of a pass with GateUpVariant::Registers: the co-resident grid, never more blocks
+// than the pass has items.
+template <QType F, int NC>
+void launch_gate_up_registers(const MoeDispatch& dispatch, const MoeExpertSource& source, const Geometry& g, int top_k,
+                              const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
+                              float* h_rows, const PrecastInput& precast, cudaStream_t stream) {
+    const int blocks = static_cast<int>(
+        std::min<std::int64_t>(coresident_grid<F, NC>(), static_cast<std::int64_t>(jobs) * kRegistersRowBlocks));
+    gate_up_registers_kernel<F, NC><<<blocks, kThreads, 0, stream>>>(dispatch, source, g, top_k, job_records, flags,
+                                                                     base, jobs, h_rows, precast.q, precast.d);
+    check_launch("gate/up registers");
+}
+
+// `registers`: GateUpVariant::Registers, which needs the precast planes (P); the down kernel is the
+// same either way.
 template <QType F, int NC, bool P>
 void launch_pass_nc(const bf16* x, const MoeDispatch& dispatch, const MoeExpertSource& source, const Geometry& g,
                     int top_k, const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
-                    float* h_rows, bf16* outputs, const PrecastInput& precast, cudaStream_t stream) {
+                    float* h_rows, bf16* outputs, const PrecastInput& precast, bool registers, cudaStream_t stream) {
     const int gate_up_smem = 2 * kUnitRows * static_cast<int>(g.gate_up_row_bytes) + static_cast<int>(sizeof(GateUpShared<NC>));
     const int down_smem    = kDownRows * static_cast<int>(g.down_row_bytes) + static_cast<int>(sizeof(DownShared<NC>));
     configure_cuda_device_once([] {
@@ -691,9 +895,19 @@ void launch_pass_nc(const bf16* x, const MoeDispatch& dispatch, const MoeExpertS
         }
         return cudaSuccess;
     });
-    gate_up_kernel<F, NC, P><<<dim3(kGateUpCtas, jobs), kThreads, gate_up_smem, stream>>>(
-        x, dispatch, source, g, top_k, job_records, flags, base, h_rows, precast.q, precast.d);
-    check_launch("gate/up");
+    bool staged = true;
+    if constexpr (P) {
+        if (registers) {
+            launch_gate_up_registers<F, NC>(dispatch, source, g, top_k, job_records, flags, base, jobs, h_rows, precast,
+                                            stream);
+            staged = false;
+        }
+    }
+    if (staged) {
+        gate_up_kernel<F, NC, P><<<dim3(kGateUpCtas, jobs), kThreads, gate_up_smem, stream>>>(
+            x, dispatch, source, g, top_k, job_records, flags, base, h_rows, precast.q, precast.d);
+        check_launch("gate/up");
+    }
     down_kernel<NC><<<dim3(kDownCtas, jobs), kThreads, down_smem, stream>>>(dispatch, source, g, job_records, flags,
                                                                                base, h_rows, outputs);
     check_launch("down");
@@ -703,16 +917,16 @@ template <QType F, bool P>
 void launch_pass_columns(int columns, const bf16* x, const MoeDispatch& dispatch, const MoeExpertSource& source,
                          const Geometry& g, int top_k, const std::uint8_t* const* job_records,
                          const std::int32_t* flags, int base, int jobs, float* h_rows, bf16* outputs,
-                         const PrecastInput& precast, cudaStream_t stream) {
+                         const PrecastInput& precast, bool registers, cudaStream_t stream) {
     if (columns <= 1) {
         launch_pass_nc<F, 1, P>(x, dispatch, source, g, top_k, job_records, flags, base, jobs, h_rows, outputs, precast,
-                                stream);
+                                registers, stream);
     } else if (columns <= 4) {
         launch_pass_nc<F, 4, P>(x, dispatch, source, g, top_k, job_records, flags, base, jobs, h_rows, outputs, precast,
-                                stream);
+                                registers, stream);
     } else {
         launch_pass_nc<F, 8, P>(x, dispatch, source, g, top_k, job_records, flags, base, jobs, h_rows, outputs, precast,
-                                stream);
+                                registers, stream);
     }
 }
 
@@ -720,12 +934,13 @@ template <QType F>
 void launch_pass_format(int columns, const bf16* x, const MoeDispatch& dispatch, const MoeExpertSource& source,
                         const Geometry& g, int top_k, const std::uint8_t* const* job_records, const std::int32_t* flags,
                         int base, int jobs, float* h_rows, bf16* outputs, const PrecastInput& precast, cudaStream_t stream) {
+    const bool registers = source.gate_up_variant == GateUpVariant::Registers;
     if (precast.q != nullptr) {
         launch_pass_columns<F, true>(columns, x, dispatch, source, g, top_k, job_records, flags, base, jobs, h_rows,
-                                     outputs, precast, stream);
+                                     outputs, precast, registers, stream);
     } else {
         launch_pass_columns<F, false>(columns, x, dispatch, source, g, top_k, job_records, flags, base, jobs, h_rows,
-                                      outputs, precast, stream);
+                                      outputs, precast, registers, stream);
     }
 }
 
@@ -1142,6 +1357,9 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
                 source.staging_slots >= 0 && (source.staging_slots == 0 || source.staging_base != nullptr) &&
                 workspace != nullptr,
             "experts source is incomplete");
+    require(source.gate_up_variant == GateUpVariant::Staged ||
+                (source.gate_up_variant == GateUpVariant::Registers && source.precast_input),
+            "the register gate/up kernel (GateUpVariant::Registers) reads the precast input: set precast_input");
     const auto layout = carve_workspace(workspace, max_jobs, outputs.ne[1], source.precast_input ? x.ne[1] : 0);
     const bool cpu    = cpu_served(x, source);
     if (cpu) {

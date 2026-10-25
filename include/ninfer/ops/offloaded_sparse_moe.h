@@ -247,6 +247,16 @@ struct MoeCpuChannel {
     std::int32_t max_job_columns        = offloaded_moe::kMaxColumns; // 1..kMaxColumns
 };
 
+/// The narrow route's gate/up kernel (MoeExpertSource::gate_up_variant). Both compute the canonical
+/// rowdot of every gate and up row, so the outputs are the same bits.
+///   Staged:    a CTA per (16 intermediates, job) copies its weight slice to shared memory with
+///              cp.async and computes it there (the default).
+///   Registers: a co-resident grid loops over (8 intermediates, job) items; a warp loads one gate
+///              and one up row straight into registers, and the third pass of their 80 sub-blocks
+///              runs the gate row on lanes 0-15 and the up row on lanes 16-31. Reads the precast
+///              input, so it requires MoeExpertSource::precast_input.
+enum class GateUpVariant : std::uint8_t { Staged, Registers };
+
 struct MoeExpertSource {
     QType format                     = QType::BF16; // the layer's record format
     // Cast x to A8 once per call into the workspace (codes [T][2560], then FP32 scales [T][80]: the
@@ -255,6 +265,9 @@ struct MoeExpertSource {
     // the two planes (moe_experts_workspace_bytes with precast_input). Declared beside `format` so
     // it lies in that field's padding and the struct's layout is unchanged.
     bool precast_input               = false;
+    // The narrow route's gate/up kernel (GateUpVariant); Registers requires precast_input. Also in
+    // `format`'s padding.
+    GateUpVariant gate_up_variant    = GateUpVariant::Staged;
     const std::uint8_t* frame_base   = nullptr;
     const std::int32_t* frames       = nullptr; // device [E]: frame of a resident expert, else -1
     const std::uint8_t* host_records = nullptr; // pinned host bank, device-readable (mapped)
@@ -300,7 +313,10 @@ struct MoeExpertSource {
 ///
 /// With source.precast_input one kernel casts every column of x to A8 before the passes (skipped
 /// in a call where every expert takes the wide route, which casts x itself) and the narrow gate/up
-/// kernels copy a column's codes and scales instead of casting it in every CTA.
+/// kernels copy a column's codes and scales instead of casting it in every CTA. With
+/// source.gate_up_variant == GateUpVariant::Registers (which requires precast_input; refused
+/// otherwise) the narrow gate/up rows are computed from registers by a co-resident grid instead,
+/// reading the precast codes in place; the down kernel is the same.
 ///
 /// With wait_for_cpu == false the call returns before placing CPU-served outputs; the caller may
 /// enqueue unrelated work (the shared expert) and must call moe_experts_cpu_wait with the same

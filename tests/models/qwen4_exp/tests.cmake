@@ -143,3 +143,10 @@ set_tests_properties(ninfer_qwen4_exp_gdn_head_map_test PROPERTIES SKIP_RETURN_C
 add_test(NAME ninfer_qwen4_exp_moe_precast_test
   COMMAND ninfer_tests ninfer_qwen4_exp_engine_real_test --moe-precast-exact --mtp 3)
 set_tests_properties(ninfer_qwen4_exp_moe_precast_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# GPU, real artifact with the MTP drafter (skips otherwise): moe_gate_up_registers_matches_plain, the
+# engine test's --moe-gate-up-registers-exact mode. Greedy ids with --moe-gate-up-registers (and the
+# --moe-precast-input it needs) equal those of the staged gate/up kernel, MTP rounds included.
+add_test(NAME ninfer_qwen4_exp_moe_gate_up_registers_test
+  COMMAND ninfer_tests ninfer_qwen4_exp_engine_real_test --moe-gate-up-registers-exact --mtp 3)
+set_tests_properties(ninfer_qwen4_exp_moe_gate_up_registers_test PROPERTIES SKIP_RETURN_CODE 77)
