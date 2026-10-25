@@ -23,6 +23,7 @@ using ninfer::models::qwen3_5::detail::compact_prompt;
 using ninfer::models::qwen3_5::detail::gap_map_digest;
 using ninfer::models::qwen3_5::detail::GapMap;
 using ninfer::models::qwen3_5::detail::make_gap_map;
+using ninfer::models::qwen3_5::detail::original_frontier;
 using ninfer::models::qwen3_5::detail::GapMapSet;
 using ninfer::models::qwen3_5::detail::PositionRun;
 using ninfer::models::qwen3_5::detail::rewrite_with_gap_maps;
@@ -403,6 +404,29 @@ void test_rewrite_applies_each_map_once() {
     require(rewritten.prompt.token_ids.size() == 11, "identity map keeps every token");
 }
 
+// Usage reports frontiers of a rewritten prompt in the client's tokens.
+void test_original_frontier_maps_through_the_lineage() {
+    const PreparedPromptData original = text_prompt(20);
+    const auto first = shared_map(make_gap_map(original, 4, kKept)); // 16 of U, 5 kept, 11 dropped
+    const GapMapSet one{first};
+    require(original_frontier({}, 7) == 7, "no lineage leaves a frontier alone");
+    require(original_frontier(one, 3) == 3 && original_frontier(one, 4) == 4, "below begin");
+    require(original_frontier(one, 5) == 5 && original_frontier(one, 6) == 6, "first kept run");
+    require(original_frontier(one, 7) == 10, "inside the second kept run");
+    require(original_frontier(one, 9) == 20, "past the kept tokens: + dropped");
+    require(original_frontier(one, 12) == 23, "the tail after U");
+
+    const PreparedPromptData turn2 = extend(original, 10, 500);
+    const auto turn2_rewritten     = apply_gap_map(turn2, *first);
+    require(turn2_rewritten.has_value(), "turn 2 rewrites");
+    const auto second =
+        shared_map(make_gap_map(*turn2_rewritten, 9, std::vector<std::uint32_t>{0, 8, 9}));
+    const GapMapSet both{first, second};
+    require(original_frontier(both, 15) == 33, "the end of turn 3 maps to its original length");
+    require(original_frontier(both, 10) == 21, "the first kept token of the second map");
+    require(original_frontier(both, 9) == 20, "the second map's begin through the first map");
+}
+
 } // namespace
 
 int main() {
@@ -422,6 +446,7 @@ int main() {
         test_rewrite_applies_lineage_in_any_order();
         test_rewrite_prefers_the_deepest_map();
         test_rewrite_applies_each_map_once();
+        test_original_frontier_maps_through_the_lineage();
         std::cout << "lossy gap map tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

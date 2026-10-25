@@ -1317,6 +1317,25 @@ struct GenerationAdmissionStats {
     AdmissionFallbackReason fallback_reason = AdmissionFallbackReason::None;
 };
 
+enum class LossyPrefillOutcome : std::uint8_t {
+    Completed, // the selection dropped tokens and the kept ones were prefilled
+    Skipped,   // the selection kept everything: the whole uncached part was prefilled
+    Declined,  // another request held the one scout: prefilled in full, no scout ran
+    Aborted,   // cancelled, or the scout ended for memory pressure, before the outcome
+};
+
+// A request that took the lossy prefill path (docs/maintainer/lossy-long-prefill.md,
+// "Observability"). Token counts are of the uncached part U after the exact prefix.
+struct LossyPrefillReport {
+    LossyPrefillOutcome outcome   = LossyPrefillOutcome::Completed;
+    std::uint32_t uncached_tokens = 0;
+    std::uint32_t kept_tokens     = 0;
+    std::uint32_t filter_layer    = 0;
+    double scout_ms               = 0.0;
+    // Prefill after the selection: the kept tokens (or all of U when nothing was dropped).
+    double main_ms                = 0.0;
+};
+
 struct GenerationResult {
     // Unique within this Engine instance; diagnostic correlation only.
     std::uint64_t engine_request_id = 0;
@@ -1341,6 +1360,9 @@ struct GenerationResult {
     SpeculativeStats speculative;
     ThinkingBudgetStats thinking;
     std::optional<ConstraintObservation> constraint;
+    // Set when the request took the lossy prefill path. prompt_tokens and reused_prompt_tokens
+    // keep counting the client's prompt; the kept count is only here.
+    std::optional<LossyPrefillReport> lossy_prefill;
 };
 
 enum class ModelResidency : std::uint8_t {
@@ -1546,6 +1568,18 @@ struct RuntimeStats {
     // (PrefillScheduleOptions::layer_slices): each boundary is a point where a neighbour decoded.
     std::uint64_t sliced_prefill_steps              = 0;
     std::uint64_t prefill_slice_boundaries          = 0;
+    // Lossy long-prompt prefill (LossyPrefillOptions), one outcome per request that took the path:
+    // its selection dropped tokens and the kept ones were prefilled (completed); the selection
+    // kept everything, or the request found the one scout taken and prefilled in full (skipped);
+    // it was cancelled, or its scout was ended for memory pressure, before that (aborted). Also
+    // the prompt tokens the scouts scored, the tokens their selections kept, and follow-up prompts
+    // rewritten onto a selected lineage (alias hits).
+    std::uint64_t lossy_prefills_completed          = 0;
+    std::uint64_t lossy_prefills_skipped            = 0;
+    std::uint64_t lossy_prefills_aborted            = 0;
+    std::uint64_t lossy_prefill_scouted_tokens      = 0;
+    std::uint64_t lossy_prefill_kept_tokens         = 0;
+    std::uint64_t lossy_prefill_alias_hits          = 0;
 
     std::uint64_t root_selections               = 0;
     std::uint64_t checkpoint_selections         = 0;

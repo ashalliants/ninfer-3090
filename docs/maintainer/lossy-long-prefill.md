@@ -328,6 +328,24 @@ pass times separately, neighbour worst gap with layer slices on, peak KV pages d
   scout_ms, main_ms}` when used.
 - `ninfer_prefill_backlog_seconds` / `/v1/load` predict the lossy cost for requests that will take the path.
 
+As built (engine): `ninfer_lossy_prefill_total{outcome="completed|skipped|aborted"}`, where
+`skipped` also counts a request that declined because another lane held the one scout (the
+request log tells them apart: `lossy_prefill.outcome` is `completed`, `skipped`, `declined` or
+`aborted`); `ninfer_lossy_prefill_scouted_tokens_total`, `ninfer_lossy_prefill_kept_tokens_total`
+(not for declined requests, which scout nothing) and `ninfer_lossy_prefill_alias_hits_total`
+(admitted prompts the Program rewrote onto a lossy lineage). Prompt progress and the cached-token
+count are reported in the client's tokens (`RequestBasePlan::reported_frontier`). The backlog
+prices a lossy request as the exact part to M, the scout over U at `Program::lossy_scout_share()`
+of a full prefill, and the main pass over `keep_fraction` of U; a queued request is priced that way
+when it is long enough and has no media.
+
+Pausing during the scout (as built): `start_pause` refuses while the scout runs, so the Engine
+never asks. A pause that only serves the queue (`--yield-long-prefill-ms`) skips a scouting lane
+and looks again on the step that ends the scout. A pause for memory ends the scout first
+(`Program::abort_lossy_scout`: the lane goes back to M exactly as the scout found it, and the
+request continues as an ordinary full prefill of U), then pauses as usual; it counts as `aborted`.
+Cancelling during the scout aborts the lane, which drops the scout and its pages.
+
 ## Options (names are proposals; builder may adjust)
 
 | option | default | meaning |

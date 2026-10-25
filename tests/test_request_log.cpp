@@ -628,6 +628,25 @@ int main() {
                        {"revoked_checkpoints", 1},
                        {"fallback_reason", "source_revoked"}},
               "admission observation lost selected source, queue subset or revocation reason");
+    failures += check(admission_done.at("lossy_prefill").is_null(),
+                      "a request that took no lossy prefill logged one");
+    observed.metrics.lossy_prefill = ninfer::LossyPrefillReport{
+        .outcome         = ninfer::LossyPrefillOutcome::Completed,
+        .uncached_tokens = 37952,
+        .kept_tokens     = 7591,
+        .filter_layer    = 15,
+        .scout_ms        = 12.5,
+        .main_ms         = 40.25};
+    const auto lossy_done =
+        Json::parse(format_request_done_json("serve-test", 3003, context, observed));
+    failures += check(lossy_done.at("lossy_prefill") == Json{{"outcome", "completed"},
+                                                             {"uncached_tokens", 37952},
+                                                             {"kept_tokens", 7591},
+                                                             {"filter_layer", 15},
+                                                             {"scout_ms", 12.5},
+                                                             {"main_ms", 40.25}},
+                      "the lossy prefill fields are missing from the request log");
+    observed.metrics.lossy_prefill.reset();
 
     const ninfer::GenerationSchedulingObservation scheduling{
         .transition              = ninfer::GenerationSchedulingTransition::ReplayComplete,

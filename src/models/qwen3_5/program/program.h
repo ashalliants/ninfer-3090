@@ -128,6 +128,10 @@ public:
     prefix_shortlist_key(std::uint32_t frontier) const noexcept;
     // Set when the request may take the lossy prefill path; see LossyPlan.
     [[nodiscard]] std::optional<LossyPlan> lossy() const noexcept;
+    // `frontier` of this plan's prompt in the client's prompt tokens: unchanged unless the prompt
+    // was rewritten onto, or compacted into, a lossy lineage (gap maps), where dropped tokens count
+    // again. Usage and prompt progress report in these terms.
+    [[nodiscard]] std::uint32_t reported_frontier(std::uint32_t frontier) const noexcept;
 
 private:
     explicit RequestBasePlan(std::shared_ptr<detail::RequestBasePlanImpl> impl) noexcept;
@@ -592,6 +596,16 @@ public:
     // the threshold, and a reuse source that is none or a SharedPrefix checkpoint, never a private
     // conversation record -- are the Engine's to check before calling this.
     [[nodiscard]] bool enable_lossy(SequenceHandle sequence);
+    // Ends a running lossy scout part-way: the lane is restored to M exactly as the scout found
+    // it (end_scout) and the request goes on as an ordinary prefill of all of U, with no
+    // selection. It can then be paused. The Engine calls this where it must pause a scouting lane
+    // under memory pressure (start_pause refuses while the scout runs). False, with nothing
+    // changed, when the lane is not scouting.
+    [[nodiscard]] bool abort_lossy_scout(SequenceHandle sequence);
+    // What a scout costs as a share of an ordinary prefill of the same tokens: the layers below
+    // the filter layer and the filter layer itself out of all of them. 0 without lossy prefill.
+    // The Engine's backlog prediction uses it.
+    [[nodiscard]] double lossy_scout_share() const noexcept;
     // A resumed binding retains its complete recovery capacity until committed new progress.
     [[nodiscard]] bool recovery_pending(SequenceHandle sequence) const noexcept;
     // Overlay Vision residency; every call is a no-op for a resident or text-only Program.

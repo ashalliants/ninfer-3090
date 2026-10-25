@@ -434,6 +434,8 @@ public:
     [[nodiscard]] bool scout_active(SequenceHandle) const noexcept;
     // ---- Lossy prefill phases (lossy_flow.h; see Program::enable_lossy) ----
     [[nodiscard]] bool enable_lossy(SequenceHandle);
+    [[nodiscard]] bool abort_lossy_scout(SequenceHandle);
+    [[nodiscard]] double lossy_scout_share() const noexcept;
     // Whether the lane is a lossy request that may not pause or capture now (lossy_flow.h).
     [[nodiscard]] bool lane_refuses_pause(std::uint32_t lane) const noexcept;
     [[nodiscard]] bool lane_holds_captures(std::uint32_t lane) const noexcept;

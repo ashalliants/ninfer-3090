@@ -371,6 +371,31 @@ Json scheduling_json(const ninfer::GenerationSchedulingStats& stats) {
                 {"host_to_device_bytes", stats.host_to_device_bytes}};
 }
 
+const char* lossy_prefill_outcome_name(ninfer::LossyPrefillOutcome outcome) {
+    switch (outcome) {
+    case ninfer::LossyPrefillOutcome::Completed:
+        return "completed";
+    case ninfer::LossyPrefillOutcome::Skipped:
+        return "skipped";
+    case ninfer::LossyPrefillOutcome::Declined:
+        return "declined";
+    case ninfer::LossyPrefillOutcome::Aborted:
+        return "aborted";
+    }
+    return "unknown";
+}
+
+// docs/maintainer/lossy-long-prefill.md, "Observability": null unless the request took the path.
+Json lossy_prefill_json(const std::optional<ninfer::LossyPrefillReport>& report) {
+    if (!report) { return nullptr; }
+    return Json{{"outcome", lossy_prefill_outcome_name(report->outcome)},
+                {"uncached_tokens", report->uncached_tokens},
+                {"kept_tokens", report->kept_tokens},
+                {"filter_layer", report->filter_layer},
+                {"scout_ms", report->scout_ms},
+                {"main_ms", report->main_ms}};
+}
+
 Json admission_json(const ninfer::GenerationAdmissionStats& stats) {
     const char* reason = nullptr;
     switch (stats.fallback_reason) {
@@ -962,7 +987,8 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
         outcome.metrics.first_output_timing
             ? first_output_timing_json(*outcome.metrics.first_output_timing)
             : Json(nullptr);
-    record["speculative"] = speculative_json(outcome.metrics);
+    record["speculative"]   = speculative_json(outcome.metrics);
+    record["lossy_prefill"] = lossy_prefill_json(outcome.metrics.lossy_prefill);
     record["generation"]  = Json{{"engine_request_id", outcome.metrics.engine_request_id},
                                  {"scheduling", scheduling_json(outcome.metrics.scheduling)},
                                  {"admission", admission_json(outcome.metrics.admission)}};

@@ -127,6 +127,10 @@ std::optional<LossyPlan> RequestBasePlan::lossy() const noexcept {
     return impl_ != nullptr ? impl_->lossy : std::nullopt;
 }
 
+std::uint32_t RequestBasePlan::reported_frontier(std::uint32_t frontier) const noexcept {
+    return impl_ != nullptr ? detail::original_frontier(impl_->gap_maps, frontier) : frontier;
+}
+
 ResumeState::ResumeState(std::unique_ptr<detail::ResumeStateImpl> impl) noexcept
     : impl_(std::move(impl)) {}
 
@@ -299,6 +303,12 @@ bool Program::context_blocks(SequenceHandle sequence) const noexcept {
 }
 
 bool Program::enable_lossy(SequenceHandle sequence) { return impl_->enable_lossy(sequence); }
+
+bool Program::abort_lossy_scout(SequenceHandle sequence) {
+    return impl_->abort_lossy_scout(sequence);
+}
+
+double Program::lossy_scout_share() const noexcept { return impl_->lossy_scout_share(); }
 
 bool Program::recovery_pending(SequenceHandle sequence) const noexcept {
     return impl_->recovery_pending(sequence);

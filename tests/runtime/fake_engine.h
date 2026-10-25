@@ -10,10 +10,16 @@
 // the cursor and a restore resumes from it. Every call is appended to an event log, and a hook runs
 // on the worker thread before each execution unit so a test can hold the Engine at a known point.
 //
-// What it is not: the real Program. It has no memory, no checkpoints (the context cache is left
-// empty), no speculation and no media; its pause always saves a snapshot, restores always
-// succeed and a context transaction takes exactly one poll. It checks the Engine's logic and the
-// order of its calls, not GPU behaviour.
+// What it is not: the real Program. It has no memory, no speculation and no media, and its only
+// checkpoints are shared prefixes a test installs (add_shared_prefix); its pause always saves a
+// snapshot, restores always succeed and a context transaction takes exactly one poll. It checks
+// the Engine's logic and the order of its calls, not GPU behaviour.
+//
+// Lossy prefill (Program::enable_lossy, docs/maintainer/lossy-long-prefill.md) is modelled the
+// way the Engine sees it: a plan with lossy() prefills exactly to M, then scout steps report
+// scouted_tokens with nothing processed, and the step that ends the scout reports the compacted
+// length (M + keep share of U) and a compacted plan. While a lane scouts, start_pause refuses;
+// abort_lossy_scout ends the scout at M, and so does abort.
 
 #include "core/device_snapshot.h"
 #include "ninfer/types.h"
@@ -28,6 +34,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -63,6 +70,25 @@ struct Key {
 struct PreparedPrompt {
     std::uint32_t tokens = 0;
     std::uint64_t id     = 0;
+    // The plan's lossy().exact_end: set for a prompt the lossy path may take.
+    std::optional<std::uint32_t> lossy_exact_end;
+    // The first `shared_tokens` tokens are the shared prefix `shared_group` (0: none), which an
+    // installed add_shared_prefix checkpoint of that group serves.
+    std::uint64_t shared_group  = 0;
+    std::uint32_t shared_tokens = 0;
+};
+
+struct LossyPlan {
+    std::uint32_t exact_end = 0;
+};
+
+struct LossyOutcome {
+    std::uint32_t exact_end       = 0;
+    std::uint32_t uncached_tokens = 0;
+    std::uint32_t kept_tokens     = 0;
+    bool skipped                  = false;
+    double scout_seconds          = 0.0;
+    bool declined                 = false;
 };
 
 struct SequenceHandle {
@@ -103,6 +129,12 @@ struct CacheAdvice {
 class RequestBasePlan {
 public:
     RequestBasePlan() = default;
+    RequestBasePlan(const PreparedPrompt& prompt, std::uint32_t output_tokens)
+        : RequestBasePlan(prompt.id, prompt.tokens, output_tokens) {
+        if (prompt.lossy_exact_end) { lossy_ = LossyPlan{*prompt.lossy_exact_end}; }
+        shared_group_  = prompt.shared_group;
+        shared_tokens_ = prompt.shared_tokens;
+    }
     RequestBasePlan(std::uint64_t id, std::uint32_t prompt_tokens, std::uint32_t output_tokens) {
         id_                         = id;
         summary_.prompt_tokens      = prompt_tokens;
@@ -119,14 +151,46 @@ public:
     [[nodiscard]] std::vector<std::uint32_t> shared_prefix_frontiers() const { return {}; }
     [[nodiscard]] std::optional<Key> prefix_shortlist_key(std::uint32_t frontier) const noexcept {
         if (frontier > summary_.prompt_tokens) { return std::nullopt; }
+        if (shared_group_ != 0 && frontier <= shared_tokens_) {
+            return Key{{shared_group_, 1}, frontier, 0};
+        }
         return Key{{id_, 0}, frontier, 0};
     }
     [[nodiscard]] std::uint64_t id() const noexcept { return id_; }
+    [[nodiscard]] std::optional<LossyPlan> lossy() const noexcept { return lossy_; }
+    [[nodiscard]] std::uint64_t shared_group() const noexcept { return shared_group_; }
+    [[nodiscard]] std::uint32_t shared_tokens() const noexcept { return shared_tokens_; }
+    // One gap, as the real gap map counts it: past `gap_begin_` and all `gap_kept_` kept tokens a
+    // frontier stands for `gap_dropped_` more of the client's tokens (the fake keeps the first
+    // tokens of U, so a frontier among them is unchanged).
+    [[nodiscard]] std::uint32_t reported_frontier(std::uint32_t frontier) const noexcept {
+        return gap_dropped_ != 0 && frontier > gap_begin_ && frontier >= gap_begin_ + gap_kept_
+                   ? frontier + gap_dropped_
+                   : frontier;
+    }
+
+    // The plan the fake reports after a selection kept `kept` of the tokens after `begin`.
+    [[nodiscard]] RequestBasePlan compacted(std::uint32_t begin, std::uint32_t kept) const {
+        RequestBasePlan out             = *this;
+        const std::uint32_t dropped     = summary_.prompt_tokens - begin - kept;
+        out.summary_.prompt_tokens      = begin + kept;
+        out.lossy_.reset();
+        out.gap_begin_   = begin;
+        out.gap_kept_    = kept;
+        out.gap_dropped_ = dropped;
+        return out;
+    }
 
 private:
     std::uint64_t id_ = 0;
     RequestPlanSummary summary_;
     CacheAdvice advice_;
+    std::optional<LossyPlan> lossy_;
+    std::uint64_t shared_group_  = 0;
+    std::uint32_t shared_tokens_ = 0;
+    std::uint32_t gap_begin_     = 0;
+    std::uint32_t gap_kept_      = 0;
+    std::uint32_t gap_dropped_   = 0;
 };
 
 struct SourceCandidate {
@@ -159,8 +223,9 @@ struct BindingReservation {
 class ResumeState {
 public:
     ResumeState() = default;
-    ResumeState(std::uint32_t frontier, std::uint32_t generated, std::optional<CheckpointHandle> snapshot)
-        : frontier_(frontier), generated_(generated), snapshot_(snapshot) {}
+    ResumeState(std::uint32_t frontier, std::uint32_t generated, std::optional<CheckpointHandle> snapshot,
+                std::uint32_t base = 0)
+        : frontier_(frontier), generated_(generated), base_(base), snapshot_(snapshot) {}
     ResumeState(ResumeState&&) noexcept            = default;
     ResumeState& operator=(ResumeState&&) noexcept = default;
 
@@ -168,10 +233,12 @@ public:
     [[nodiscard]] std::optional<CheckpointHandle> snapshot_handle() const noexcept { return snapshot_; }
     [[nodiscard]] std::uint32_t frontier() const noexcept { return frontier_; }
     [[nodiscard]] std::uint32_t generated() const noexcept { return generated_; }
+    [[nodiscard]] std::uint32_t base() const noexcept { return base_; }
 
 private:
     std::uint32_t frontier_  = 0;
     std::uint32_t generated_ = 0;
+    std::uint32_t base_      = 0; // the admitted reuse frontier, which the Begin summary keeps
     std::optional<CheckpointHandle> snapshot_;
 };
 
@@ -206,6 +273,10 @@ public:
 struct PrefillProgress {
     BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
+    std::uint32_t scouted_tokens          = 0;
+    std::optional<std::uint32_t> compacted_prompt_tokens;
+    std::optional<RequestBasePlan> compacted_plan;
+    std::optional<LossyOutcome> lossy;
     bool complete                         = false;
     bool partial                          = false;
     bool cap_applied                      = false;
@@ -426,6 +497,9 @@ struct Event {
         PauseDone,
         Finish,
         Abort,
+        EnableLossy, // enable_lossy took the request; position: M
+        Scout,       // a scout step: tokens scouted, position: M + already scouted
+        ScoutEnd,    // a scout ended early and its lane was restored to M (abort, abort_lossy_scout)
     } kind;
     std::uint32_t lane       = 0;
     std::uint64_t request    = 0; // the plan's id
@@ -459,6 +533,25 @@ public:
         return log_;
     }
 
+    // Installs a SharedPrefix checkpoint over the first `frontier` tokens of group `group`, for
+    // Instance::external_checkpoints (the Engine pins those as shared prefixes at construction).
+    [[nodiscard]] CheckpointHandle add_shared_prefix(std::uint64_t group, std::uint32_t frontier) {
+        const CheckpointHandle handle{kSharedBase + static_cast<std::uint32_t>(shared_.size()), 1};
+        shared_.push_back({group, frontier});
+        return handle;
+    }
+    // Lossy prefill: the kept share of U a selection reports (1: keeps everything, so skipped),
+    // whether enable_lossy takes anything at all, and the scout's cost share.
+    void set_lossy_keep(double keep) noexcept { lossy_keep_ = keep; }
+    void set_lossy_supported(bool supported) noexcept { lossy_supported_ = supported; }
+    // While a lane scouts and another is bound, a Decode unit finds no KV pages: the memory
+    // pressure under which the Engine has to pause a scouting lane.
+    void set_decode_shortage_while_scouting(bool on) noexcept { decode_shortage_while_scouting_ = on; }
+    [[nodiscard]] std::uint32_t scout_pause_refusals() const noexcept {
+        return scout_pause_refusals_.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] bool scouting() const noexcept { return scout_lane_.has_value(); }
+
     // ---- planning ----
     // The admission fit check (--admission-fit-check) asks the Program. The fake pool never fills, so
     // the answer is whatever a test sets (default: it fits).
@@ -470,7 +563,7 @@ public:
     [[nodiscard]] RequestBasePlan plan_request(PreparedPrompt&& prompt,
                                                const ResolvedExecutionOptions& options) {
         if (prompt.tokens == 0) { throw std::invalid_argument("prompt must contain tokens"); }
-        return RequestBasePlan(prompt.id, prompt.tokens, options.requested_output_tokens);
+        return RequestBasePlan(prompt, options.requested_output_tokens);
     }
 
     [[nodiscard]] PrefillWork prefill_work(const RequestBasePlan&, std::uint32_t begin,
@@ -482,21 +575,45 @@ public:
     inspect_source(const RequestBasePlan& base, std::optional<CheckpointHandle> checkpoint,
                    bool = false, std::span<const CheckpointHandle> = {},
                    std::span<const CheckpointHandle> = {}) const {
-        if (checkpoint) { return std::nullopt; }
         SourceCandidate source;
-        source.remaining_work = prefill_work(base, 0, base.summary().prompt_tokens);
+        if (checkpoint) {
+            const auto* shared = shared_prefix(*checkpoint);
+            if (shared == nullptr || !serves(*shared, base)) { return std::nullopt; }
+            source.checkpoint    = checkpoint;
+            source.reused_tokens = shared->frontier;
+        }
+        source.remaining_work =
+            prefill_work(base, source.reused_tokens, base.summary().prompt_tokens);
         return source;
     }
 
-    // ---- checkpoints: the fake keeps none ----
-    [[nodiscard]] Key checkpoint_key(CheckpointHandle, std::uint32_t) const { return {}; }
+    // ---- checkpoints: only installed shared prefixes (add_shared_prefix) ----
+    [[nodiscard]] Key checkpoint_key(CheckpointHandle handle, std::uint32_t frontier) const {
+        if (const auto* shared = shared_prefix(handle)) {
+            return Key{{shared->group, 1}, frontier, 0};
+        }
+        return {};
+    }
     [[nodiscard]] ContextResourceUsage checkpoint_footprint(std::span<const CheckpointHandle>) const {
         return {};
     }
-    [[nodiscard]] CheckpointSummary checkpoint_summary(CheckpointHandle) const { return {}; }
-    [[nodiscard]] CheckpointMetadata checkpoint_metadata(CheckpointHandle) const { return {}; }
-    [[nodiscard]] bool checkpoint_matches(CheckpointHandle, const RequestBasePlan&) const {
-        return false;
+    [[nodiscard]] CheckpointSummary checkpoint_summary(CheckpointHandle handle) const {
+        if (const auto* shared = shared_prefix(handle)) {
+            return {.key      = checkpoint_key(handle, shared->frontier),
+                    .frontier = shared->frontier,
+                    .role     = CheckpointRole::SharedPrefix};
+        }
+        return {};
+    }
+    [[nodiscard]] CheckpointMetadata checkpoint_metadata(CheckpointHandle handle) const {
+        if (const auto* shared = shared_prefix(handle)) {
+            return {.frontier = shared->frontier, .role = CheckpointRole::SharedPrefix};
+        }
+        return {};
+    }
+    [[nodiscard]] bool checkpoint_matches(CheckpointHandle handle, const RequestBasePlan& base) const {
+        const auto* shared = shared_prefix(handle);
+        return shared != nullptr && serves(*shared, base);
     }
     [[nodiscard]] std::uint32_t checkpoint_recovery_frontier(CheckpointHandle,
                                                              const RequestBasePlan&,
@@ -508,7 +625,8 @@ public:
         return 0;
     }
     [[nodiscard]] bool valid_checkpoint(CheckpointHandle handle) const noexcept {
-        return handle.generation != 0 && snapshots_.count(handle.index) != 0;
+        return handle.generation != 0 &&
+               (snapshots_.count(handle.index) != 0 || shared_prefix(handle) != nullptr);
     }
     [[nodiscard]] bool release_checkpoint(CheckpointHandle) noexcept { return false; }
     [[nodiscard]] bool revoke_snapshot(ResumeState&) noexcept { return false; }
@@ -562,7 +680,14 @@ public:
     [[nodiscard]] bool start_demote(const Demotion&) { return false; }
 
     // ---- resources ----
-    [[nodiscard]] ResourceReservation reserve_units(std::span<const ExecutionUnit>) {
+    [[nodiscard]] ResourceReservation reserve_units(std::span<const ExecutionUnit> units) {
+        if (decode_shortage_while_scouting_ && scout_lane_ &&
+            std::count_if(lanes_.begin(), lanes_.end(), [](const Lane& l) { return l.bound; }) > 1 &&
+            std::any_of(units.begin(), units.end(), [](const ExecutionUnit& unit) {
+                return unit.kind == ExecutionUnitKind::Decode;
+            })) {
+            return {.reserved = false, .shortage = {.main_kv_pages = 1}};
+        }
         return {.reserved = true};
     }
     void release_units(std::span<const SequenceHandle>) noexcept {}
@@ -581,6 +706,8 @@ public:
                           .host_bytes       = std::size_t{1} << 40};
         for (const auto& lane : lanes_) {
             if (lane.bound) { ++usage.occupied.state_slots; }
+            // A scout's KV pages are the lane's own until the scout ends (one per token here).
+            usage.occupied.main_kv_pages += lane.scouted;
         }
         return usage;
     }
@@ -590,7 +717,7 @@ public:
 
     // ---- context transactions: one poll each ----
     [[nodiscard]] BindingReservation start_binding(const RequestBasePlan& base, LaneId lane,
-                                                   const SourceCandidate&,
+                                                   const SourceCandidate& source,
                                                    ResumeState* resume = nullptr,
                                                    ExecutionUnitKind = ExecutionUnitKind::Decode,
                                                    std::uint32_t = 1) {
@@ -602,9 +729,13 @@ public:
         tx.lane = lane.value;
         tx.plan = base.id();
         tx.prompt_tokens = base.summary().prompt_tokens;
+        tx.base_plan     = base;
+        tx.cursor        = source.reused_tokens;
+        tx.base          = source.reused_tokens;
         if (resume != nullptr) {
             tx.cursor    = resume->frontier();
             tx.generated = resume->generated();
+            tx.base      = resume->base();
             tx.resumed   = true;
             if (auto handle = resume->snapshot_handle()) { snapshots_.erase(handle->index); }
         }
@@ -615,6 +746,11 @@ public:
                                    bool require_snapshot = false) {
         (void)require_snapshot; // the fake always has room for the snapshot
         if (transaction_ || !valid(sequence)) { return false; }
+        // Like the real Program: a scout keeps uncommitted pages, so there is no frontier to save.
+        if (scout_lane_ == sequence.lane) {
+            scout_pause_refusals_.fetch_add(1, std::memory_order_acq_rel);
+            return false;
+        }
         // Like the real Program: a chunk part-way through its layers has no frontier to save.
         if (lanes_[sequence.lane].slice_count != 0) { return false; }
         Transaction tx;
@@ -653,7 +789,10 @@ public:
             lane.bound      = true;
             lane.epoch      = ++epoch_;
             lane.plan       = tx.plan;
+            lane.base_plan  = tx.base_plan;
             lane.prompt     = tx.prompt_tokens;
+            lane.base       = tx.base;
+            lane.resumed    = tx.resumed;
             lane.cursor     = tx.cursor;
             lane.generated  = tx.generated;
             lane.decoding   = tx.cursor >= tx.prompt_tokens && tx.generated != 0;
@@ -667,7 +806,7 @@ public:
                 snapshot = CheckpointHandle{next_snapshot_, 1};
                 snapshots_.insert(next_snapshot_++);
             }
-            progress.paused.emplace(lane.cursor, lane.generated, snapshot);
+            progress.paused.emplace(lane.cursor, lane.generated, snapshot, lane.base);
             record({Event::Kind::PauseDone, tx.lane, lane.plan, 0, 0, lane.cursor, tx.snapshot});
             lane = Lane{};
         }
@@ -685,8 +824,28 @@ public:
         const bool resuming = lane.slice_count != 0;
         std::uint32_t step  = lane.slice_tokens;
         bool cap_narrowed   = false;
+        std::optional<LossyOutcome> declined;
+        std::uint32_t exact_limit = UINT32_MAX;
+        if (!resuming && lane.lossy && lane.lossy->phase != LossyPhase::Main) {
+            auto& lossy = *lane.lossy;
+            if (lane.cursor < lossy.exact_end) {
+                exact_limit = lossy.exact_end - lane.cursor; // Exact stops at M
+            } else if (lossy.phase == LossyPhase::Exact && scout_lane_ &&
+                       *scout_lane_ != sequence.lane) {
+                // The one scout is taken: prefill all of U as an ordinary request.
+                lossy.phase = LossyPhase::Main;
+                const std::uint32_t span = lane.prompt - lossy.exact_end;
+                declined = LossyOutcome{.exact_end       = lossy.exact_end,
+                                        .uncached_tokens = span,
+                                        .kept_tokens     = span,
+                                        .skipped         = true,
+                                        .declined        = true};
+            } else {
+                return scout_step(sequence, lane, max_tokens);
+            }
+        }
         if (!resuming) {
-            const std::uint32_t remaining = lane.prompt - lane.cursor;
+            const std::uint32_t remaining = std::min(lane.prompt - lane.cursor, exact_limit);
             step                          = std::min(chunk_, remaining);
             const std::uint32_t uncapped = step;
             if (max_tokens != 0) { step = std::min(step, max_tokens); }
@@ -705,7 +864,11 @@ public:
         hook(event);
         if (cost_.prefill_sleep.count() != 0) { std::this_thread::sleep_for(cost_.prefill_sleep); }
         PrefillProgress progress;
-        progress.summary = {.prompt_tokens = lane.prompt};
+        progress.summary = summary(lane);
+        if (declined) {
+            progress.compacted_prompt_tokens = lane.prompt;
+            progress.lossy                   = declined;
+        }
         const std::uint64_t step_ns = cost_.prefill_fixed_ns + cost_.prefill_per_token_ns * step;
         progress.timing.device_wait_ns = sliced ? step_ns / lane.slice_count : step_ns;
         if (!last) {
@@ -797,6 +960,8 @@ public:
     }
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept {
         if (!valid(sequence)) { return {}; }
+        // A cleared lane drops its scout and the scout's pages with it.
+        if (scout_lane_ == sequence.lane) { end_scout(sequence.lane); }
         record({Event::Kind::Abort, sequence.lane, lanes_[sequence.lane].plan, 0, 0,
                 lanes_[sequence.lane].cursor, false});
         lanes_[sequence.lane] = Lane{};
@@ -807,7 +972,30 @@ public:
     void fail_all_cleanup() noexcept {
         for (auto& lane : lanes_) { lane = Lane{}; }
         transaction_.reset();
+        scout_lane_.reset();
     }
+
+    // ---- lossy prefill ----
+    [[nodiscard]] bool enable_lossy(SequenceHandle sequence) {
+        if (!valid(sequence)) { return false; }
+        Lane& lane       = lanes_[sequence.lane];
+        const auto plan  = lane.base_plan.lossy();
+        if (!lossy_supported_ || !plan || lane.lossy || lane.resumed || lane.cursor != lane.base) {
+            return false;
+        }
+        const std::uint32_t exact_end = std::max(plan->exact_end, lane.base);
+        if (exact_end >= lane.prompt) { return false; }
+        lane.lossy = Lossy{.phase = LossyPhase::Exact, .exact_end = exact_end};
+        record({Event::Kind::EnableLossy, sequence.lane, lane.plan, 0, 0, exact_end, false});
+        return true;
+    }
+    [[nodiscard]] bool abort_lossy_scout(SequenceHandle sequence) {
+        if (!valid(sequence) || scout_lane_ != sequence.lane) { return false; }
+        end_scout(sequence.lane);
+        lanes_[sequence.lane].lossy->phase = LossyPhase::Main;
+        return true;
+    }
+    [[nodiscard]] double lossy_scout_share() const noexcept { return lossy_supported_ ? 0.25 : 0.0; }
 
     // ---- checkpoint images (the store is off in these tests) ----
     [[nodiscard]] CheckpointImage export_checkpoints(std::span<const CheckpointHandle>,
@@ -825,6 +1013,17 @@ public:
     }
 
 private:
+    static constexpr std::uint32_t kSharedBase = 1'000'000;
+    enum class LossyPhase : std::uint8_t { Exact, Scout, Main };
+    struct Lossy {
+        LossyPhase phase        = LossyPhase::Exact;
+        std::uint32_t exact_end = 0;
+        double scout_seconds    = 0.0;
+    };
+    struct SharedPrefix {
+        std::uint64_t group    = 0;
+        std::uint32_t frontier = 0;
+    };
     struct Lane {
         bool bound              = false;
         std::uint64_t epoch     = 0;
@@ -838,6 +1037,11 @@ private:
         std::uint32_t slice_index  = 0;
         std::uint32_t slice_tokens = 0;
         bool slice_cap_applied = false;
+        RequestBasePlan base_plan;
+        std::uint32_t base   = 0; // the reuse frontier the binding started from
+        bool resumed         = false;
+        std::optional<Lossy> lossy;
+        std::uint32_t scouted = 0; // tokens of U the running scout has covered
     };
     struct Transaction {
         ContextOperationKind kind = ContextOperationKind::Bind;
@@ -848,7 +1052,81 @@ private:
         std::uint32_t generated   = 0;
         bool resumed              = false;
         bool snapshot             = false;
+        RequestBasePlan base_plan;
+        std::uint32_t base        = 0;
     };
+
+    [[nodiscard]] const SharedPrefix* shared_prefix(CheckpointHandle handle) const noexcept {
+        if (handle.generation != 1 || handle.index < kSharedBase ||
+            handle.index - kSharedBase >= shared_.size()) {
+            return nullptr;
+        }
+        return &shared_[handle.index - kSharedBase];
+    }
+    [[nodiscard]] static bool serves(const SharedPrefix& shared, const RequestBasePlan& base) noexcept {
+        return base.shared_group() == shared.group && shared.frontier <= base.shared_tokens() &&
+               shared.frontier < base.summary().prompt_tokens;
+    }
+    [[nodiscard]] static BeginSummary summary(const Lane& lane) noexcept {
+        return {.prompt_tokens        = lane.prompt,
+                .reused_prompt_tokens = lane.base,
+                .prefix_reuse_path = lane.base ? PrefixReusePath::Checkpoint : PrefixReusePath::Root};
+    }
+    void end_scout(std::uint32_t lane) noexcept {
+        record({Event::Kind::ScoutEnd, lane, lanes_[lane].plan, lanes_[lane].scouted, 0,
+                lanes_[lane].cursor, false});
+        lanes_[lane].scouted = 0;
+        scout_lane_.reset();
+    }
+
+    // One scout step at M: scores up to a chunk of U and processes nothing. The step that covers
+    // the rest of U selects: the prompt becomes M + the kept share of U (unchanged when it keeps
+    // everything), and the plan follows.
+    PrefillProgress scout_step(SequenceHandle sequence, Lane& lane, std::uint32_t max_tokens) {
+        auto& lossy = *lane.lossy;
+        if (lossy.phase == LossyPhase::Exact) {
+            lossy.phase = LossyPhase::Scout;
+            scout_lane_ = sequence.lane;
+        }
+        const std::uint32_t span      = lane.prompt - lossy.exact_end;
+        const std::uint32_t uncapped  = std::min(chunk_, span - lane.scouted);
+        const std::uint32_t step      = max_tokens != 0 ? std::min(uncapped, max_tokens) : uncapped;
+        Event event{Event::Kind::Scout, sequence.lane, lane.plan, step, max_tokens,
+                    lossy.exact_end + lane.scouted, false};
+        hook(event);
+        if (cost_.prefill_sleep.count() != 0) { std::this_thread::sleep_for(cost_.prefill_sleep); }
+        PrefillProgress progress;
+        progress.scouted_tokens = step;
+        progress.cap_applied    = step < uncapped;
+        const auto step_ns      = static_cast<std::uint64_t>(
+            static_cast<double>(cost_.prefill_fixed_ns + cost_.prefill_per_token_ns * step) *
+            lossy_scout_share());
+        progress.timing.device_wait_ns = step_ns;
+        lossy.scout_seconds += static_cast<double>(step_ns) * 1e-9;
+        lane.scouted += step;
+        record(event);
+        if (lane.scouted == span) {
+            const auto kept = static_cast<std::uint32_t>(std::clamp<double>(
+                std::ceil(lossy_keep_ * static_cast<double>(span)), 1.0, static_cast<double>(span)));
+            LossyOutcome outcome{.exact_end       = lossy.exact_end,
+                                 .uncached_tokens = span,
+                                 .kept_tokens     = kept,
+                                 .skipped         = kept == span,
+                                 .scout_seconds   = lossy.scout_seconds};
+            if (kept != span) {
+                lane.base_plan          = lane.base_plan.compacted(lossy.exact_end, kept);
+                lane.prompt             = lossy.exact_end + kept;
+                progress.compacted_plan = lane.base_plan;
+            }
+            lossy.phase  = LossyPhase::Main;
+            lane.scouted = 0;
+            scout_lane_.reset();
+            progress.compacted_prompt_tokens = lane.prompt;
+            progress.lossy                   = outcome;
+        }
+        progress.summary = summary(lane);
+        return progress;
+    }
 
     [[nodiscard]] bool valid(SequenceHandle sequence) const noexcept {
         return sequence.lane < lanes_.size() && lanes_[sequence.lane].bound &&
@@ -874,6 +1152,12 @@ private:
     std::uint64_t epoch_ = 0;
     std::uint32_t next_snapshot_ = 1;
     std::set<std::uint32_t> snapshots_;
+    std::vector<SharedPrefix> shared_;
+    std::optional<std::uint32_t> scout_lane_;
+    double lossy_keep_                   = 0.2;
+    bool lossy_supported_                = true;
+    bool decode_shortage_while_scouting_ = false;
+    std::atomic<std::uint32_t> scout_pause_refusals_{0};
     mutable std::mutex log_mutex_;
     std::vector<Event> log_;
 };

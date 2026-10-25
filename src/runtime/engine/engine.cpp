@@ -222,6 +222,12 @@ public:
     using ScoringCore    = runtime::CausalScoreCore<runtime::ModelInstance>;
     // Qwen3.8-Flash-Next: the common core over its own Program.
     using Qwen4ExpCore = runtime::EngineCore<runtime::Qwen4ExpInstance>;
+    // Lossy long-prompt prefill: the Qwen3.5 Program runs it; qwen4_exp refuses the option at
+    // startup. Usage counts prompt_tokens from the client's prepared prompt (PromptSummary) and
+    // cached tokens in its terms (RequestBasePlan::reported_frontier), whatever the Program kept.
+    static_assert(GenerationCore::kLossyCapable,
+                  "the Qwen3.5 Program must provide the lossy prefill contract the Engine uses");
+    static_assert(!Qwen4ExpCore::kLossyCapable);
     using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>,
                               std::unique_ptr<ScoringCore>, std::unique_ptr<Qwen4ExpCore>>;
 

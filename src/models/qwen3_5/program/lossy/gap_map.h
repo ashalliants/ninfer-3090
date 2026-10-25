@@ -86,6 +86,13 @@ using GapMapSet = std::vector<std::shared_ptr<const GapMap>>; // lineage order
     return out;
 }
 
+// The frontier in the original prompt that `frontier` of a prompt rewritten through `lineage`
+// (in the order the maps were applied) stands for: a frontier at or below a map's begin is
+// unchanged, one past its kept tokens moves up by the dropped count, and one inside them ends just
+// after the original position of the last kept token it covers. Usage counts prompt tokens in
+// the client's terms with it (docs/maintainer/lossy-long-prefill.md, "Capacity and reporting").
+[[nodiscard]] std::uint32_t original_frontier(const GapMapSet& lineage, std::uint32_t frontier) noexcept;
+
 struct GapMapRewrite {
     PreparedPromptData prompt;
     GapMapSet applied; // in the order they were applied: the prompt's lineage

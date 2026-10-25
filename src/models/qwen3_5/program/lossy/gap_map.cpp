@@ -169,6 +169,28 @@ std::uint32_t GapMap::kept_tokens() const noexcept {
     return kept;
 }
 
+std::uint32_t original_frontier(const GapMapSet& lineage, std::uint32_t frontier) noexcept {
+    for (auto it = lineage.rbegin(); it != lineage.rend(); ++it) {
+        if (!*it || frontier <= (*it)->begin) { continue; }
+        const GapMap& map        = **it;
+        const std::uint32_t kept = map.kept_tokens();
+        const std::uint32_t k    = frontier - map.begin;
+        if (k >= kept) {
+            frontier += map.dropped_tokens();
+            continue;
+        }
+        std::uint32_t covered = 0;
+        for (const auto& [offset, length] : map.kept_runs) {
+            if (k <= covered + length) {
+                frontier = map.begin + offset + (k - covered);
+                break;
+            }
+            covered += length;
+        }
+    }
+    return frontier;
+}
+
 GapMap make_gap_map(const PreparedPromptData& original, std::uint32_t begin,
                     std::span<const std::uint32_t> kept_offsets) {
     check_shape(original);

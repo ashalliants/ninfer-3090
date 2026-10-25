@@ -5,6 +5,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
+#include <tuple>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -379,6 +381,27 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
             "Prefill steps run in layer slices because another lane was decoding.");
     COUNTER(prefill_slice_boundaries, "prefill_slice_boundaries_total",
             "Boundaries between the layer slices of those steps, where the other lane's decode ran.");
+    header("lossy_prefill_total", "counter",
+           "Requests that took the lossy long-prompt prefill path, by outcome: the selection "
+           "dropped tokens and the kept ones were prefilled (completed), nothing was dropped or "
+           "another request held the scout (skipped), or the request was cancelled or its scout "
+           "ended for memory pressure first (aborted).");
+    for (const auto& [outcome, current, baseline] :
+         std::array{std::tuple{"completed", stats.lossy_prefills_completed,
+                               baseline_.lossy_prefills_completed},
+                    std::tuple{"skipped", stats.lossy_prefills_skipped,
+                               baseline_.lossy_prefills_skipped},
+                    std::tuple{"aborted", stats.lossy_prefills_aborted,
+                               baseline_.lossy_prefills_aborted}}) {
+        out << "ninfer_lossy_prefill_total{outcome=\"" << outcome << "\"} " << current - baseline
+            << '\n';
+    }
+    COUNTER(lossy_prefill_scouted_tokens, "lossy_prefill_scouted_tokens_total",
+            "Prompt tokens the lossy prefill scouts scored.");
+    COUNTER(lossy_prefill_kept_tokens, "lossy_prefill_kept_tokens_total",
+            "Scored tokens the selections kept; the rest never entered the KV cache.");
+    COUNTER(lossy_prefill_alias_hits, "lossy_prefill_alias_hits_total",
+            "Prompts rewritten onto a lossy-prefilled lineage, so a follow-up turn reuses it.");
     COUNTER(engine_recoveries, "engine_recoveries_total",
             "Host-side worker failures survived by failing in-flight requests and clearing the "
             "context cache.");

@@ -1348,6 +1348,118 @@ int exercise_agent_continuation(const char* artifact) {
     return 0;
 }
 
+// Lossy long-prompt prefill at the Engine (docs/maintainer/lossy-long-prefill.md), rk4v4 as in
+// production: a cold 40K prompt with the option on takes the path, and usage still counts the
+// client's prompt (lossy_reports_original_prompt_tokens); the next turn (prompt + reply + a new
+// user message) is rewritten onto the kept lineage, reuses at least the first prompt's kept length
+// and runs no scout (lossy_follow_up_turn_reuses).
+int exercise_lossy_prefill(const char* artifact) {
+    ninfer::EngineOptions options;
+    options.artifact_path                     = artifact;
+    options.max_context                       = 45056;
+    options.kv_capacity                       = ninfer::KvCapacityPolicy::explicit_capacity(45056);
+    options.prefill_chunk                     = 4096;
+    options.kv_cache                          = ninfer::KvCacheStorage::RotatedLloyd4KeyInt4Value;
+    options.speculative.backend               = ninfer::SpeculativeBackend::None;
+    options.max_concurrency                   = 1;
+    options.max_pending_requests              = 1;
+    options.context_cache.device_state_slots  = 4;
+    options.context_cache.host_capacity_bytes = 0;
+    options.lossy_prefill.min_tokens          = 30000;
+    ninfer::Engine engine(std::move(options));
+    const auto text_message = [](ninfer::ChatRole role, std::string text) {
+        ninfer::ChatMessage message;
+        message.role = role;
+        message.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        return message;
+    };
+    // A product prompt (system message and a tool: the shared marker ends it), then about 40K
+    // tokens of records the selection can thin out.
+    ninfer::PromptInput input;
+    input.context_cache.session_key = "lossy-follow-up";
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}}})");
+    input.messages.push_back(text_message(ninfer::ChatRole::System,
+                                          "You answer questions about the inventory records."));
+    std::string records;
+    for (int i = 0; i < 3300; ++i) {
+        records += "Record " + std::to_string(i) + ": shelf " + std::to_string((i * 37) % 101) +
+                   " holds " + std::to_string((i * 53) % 997) + " units of part " +
+                   std::to_string(1000 + i) + ".\n";
+    }
+    input.messages.push_back(text_message(
+        ninfer::ChatRole::User, records + "\nWhich shelf holds part 1007? Answer briefly."));
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 8;
+    request.execution.sampling.temperature    = 0.0F;
+    request.execution.allow_prefix_reuse      = true;
+    request.stop.include_model_defaults       = false;
+
+    auto first_prompt                 = engine.prepare(input);
+    const std::uint32_t first_tokens  = first_prompt.summary().prompt_tokens;
+    if (first_tokens < 36000 || first_tokens > 44000) {
+        std::cerr << "lossy fixture prompt has " << first_tokens << " tokens, not about 40K\n";
+        return 1;
+    }
+    const auto before = engine.runtime_stats();
+    auto first        = engine.generate(std::move(first_prompt), request);
+    const auto after  = engine.runtime_stats();
+    // lossy_reports_original_prompt_tokens
+    if (!first.lossy_prefill || first.lossy_prefill->outcome != ninfer::LossyPrefillOutcome::Completed ||
+        first.prompt.prompt_tokens != first_tokens ||
+        first.reused_prompt_tokens > first.prompt.prompt_tokens ||
+        first.lossy_prefill->kept_tokens >= first.lossy_prefill->uncached_tokens ||
+        first.lossy_prefill->uncached_tokens > first_tokens ||
+        first.computed_prefill_tokens + first.reused_prompt_tokens >= first_tokens ||
+        after.lossy_prefills_completed != before.lossy_prefills_completed + 1 ||
+        after.lossy_prefill_scouted_tokens - before.lossy_prefill_scouted_tokens !=
+            first.lossy_prefill->uncached_tokens) {
+        std::cerr << "lossy first turn: prompt=" << first.prompt.prompt_tokens
+                  << " expected=" << first_tokens << " reused=" << first.reused_prompt_tokens
+                  << " computed=" << first.computed_prefill_tokens << " lossy="
+                  << (first.lossy_prefill ? static_cast<int>(first.lossy_prefill->outcome) : -1)
+                  << '\n';
+        return 1;
+    }
+    const std::uint32_t exact_end = first_tokens - first.lossy_prefill->uncached_tokens;
+    const std::uint32_t kept_length = exact_end + first.lossy_prefill->kept_tokens;
+
+    // lossy_follow_up_turn_reuses
+    input.messages.push_back(text_message(ninfer::ChatRole::Assistant, first.content));
+    input.messages.push_back(text_message(ninfer::ChatRole::User, "And part 1011?"));
+    auto second_prompt                = engine.prepare(input);
+    const std::uint32_t second_tokens = second_prompt.summary().prompt_tokens;
+    const auto before_second          = engine.runtime_stats();
+    auto second                       = engine.generate(std::move(second_prompt), request);
+    const auto after_second           = engine.runtime_stats();
+    if (second.prompt.prompt_tokens != second_tokens || second.lossy_prefill ||
+        second.reused_prompt_tokens < kept_length ||
+        second.reused_prompt_tokens >= second.prompt.prompt_tokens ||
+        second.prefix_reuse_path != ninfer::PrefixReusePath::Checkpoint ||
+        second.computed_prefill_tokens >= 4096 ||
+        after_second.lossy_prefill_scouted_tokens != before_second.lossy_prefill_scouted_tokens ||
+        after_second.lossy_prefill_alias_hits != before_second.lossy_prefill_alias_hits + 1) {
+        std::cerr << "lossy follow-up: prompt=" << second.prompt.prompt_tokens
+                  << " expected=" << second_tokens << " reused=" << second.reused_prompt_tokens
+                  << " kept_length=" << kept_length
+                  << " computed=" << second.computed_prefill_tokens << " scouted="
+                  << after_second.lossy_prefill_scouted_tokens -
+                         before_second.lossy_prefill_scouted_tokens
+                  << " alias_hits="
+                  << after_second.lossy_prefill_alias_hits - before_second.lossy_prefill_alias_hits
+                  << '\n';
+        return 1;
+    }
+    std::cout << "lossy prefill: first=" << first_tokens << " exact_end=" << exact_end
+              << " kept=" << first.lossy_prefill->kept_tokens
+              << " scout_ms=" << first.lossy_prefill->scout_ms
+              << " main_ms=" << first.lossy_prefill->main_ms << " follow_up=" << second_tokens
+              << " reused=" << second.reused_prompt_tokens
+              << " computed=" << second.computed_prefill_tokens << '\n';
+    return 0;
+}
+
 int exercise_rewrite_branch(const char* artifact) {
     auto text_message = [](ninfer::ChatRole role, std::string text) {
         ninfer::ChatMessage message;
@@ -2062,6 +2174,8 @@ int main() {
         result = exercise_late_instructions(artifact);
     } else if (scenario == "agent-continuation") {
         result = exercise_agent_continuation(artifact);
+    } else if (scenario == "lossy") {
+        result = exercise_lossy_prefill(artifact);
     } else if (scenario == "explicit-prefix") {
         result = exercise_explicit_prefix(artifact);
     } else if (scenario == "explicit-anchor") {

@@ -44,6 +44,34 @@ bool ProgramImpl::enable_lossy(SequenceHandle handle) {
     return true;
 }
 
+bool ProgramImpl::abort_lossy_scout(SequenceHandle handle) {
+    if (!valid_sequence(handle)) { return false; }
+    const auto lane = ContractAccess::lane(handle).value;
+    auto& request   = requests[lane];
+    if (!request.lossy || request.lossy->phase != LossyPhase::Scout || !scout_session ||
+        scout_session->lane != lane || !request.prefill) {
+        return false;
+    }
+    // Every scout step synchronized and settled its unit, so nothing still writes the scout's
+    // pages. end_scout puts back the GDN states and the growth reservation and releases every page
+    // past M; the lane is then the Prefilling lane at M the scout started from.
+    end_scout(handle);
+    if (request.prefill->cursor != request.lossy->exact_end) {
+        throw std::logic_error("an aborted lossy scout left its lane away from M");
+    }
+    // Main without a selection: the ordinary prefill of all of U. Captures past M apply again.
+    request.lossy->phase = LossyPhase::Main;
+    return true;
+}
+
+double ProgramImpl::lossy_scout_share() const noexcept {
+    if (!scout_buffers) { return 0.0; }
+    const auto layers = parameters.model.config().text.layer_types.size();
+    if (layers == 0) { return 0.0; }
+    return std::min(1.0, static_cast<double>(scout_buffers->filter_layer + 1U) /
+                             static_cast<double>(layers));
+}
+
 bool ProgramImpl::lane_refuses_pause(std::uint32_t lane) const noexcept {
     const auto& lossy = requests[lane].lossy;
     return lossy && lossy_refuses_pause(lossy->phase);

@@ -110,6 +110,28 @@ enum class EngineRequestState : std::uint8_t {
     ModelFinished,
 };
 
+// A request on the lossy prefill path, as the Engine follows it (EngineCore, lossy_prefill.h).
+struct LossyPrefillState {
+    enum class Phase : std::uint8_t {
+        Planned, // admission chose it; enable_lossy runs once the binding publishes
+        Exact,   // prefilling exactly up to M
+        Scout,   // the scout runs: the lane cannot pause
+        Main,    // the outcome is known; prefilling the kept tokens (or all of U)
+        Ended,   // counted: completed, or aborted before its outcome
+    };
+    Phase phase             = Phase::Planned;
+    std::uint32_t exact_end = 0; // M
+    std::uint32_t scouted   = 0; // tokens of U the scout has covered
+    std::optional<LossyPrefillReport> report;
+    std::uint64_t main_ns = 0;
+
+    [[nodiscard]] bool scouting() const noexcept { return phase == Phase::Scout; }
+    // Still ahead of its outcome: what the backlog predicts as a lossy prefill.
+    [[nodiscard]] bool before_outcome() const noexcept {
+        return phase == Phase::Planned || phase == Phase::Exact || phase == Phase::Scout;
+    }
+};
+
 template <class ModelContract>
 struct RequestRecord {
     using Clock          = std::chrono::steady_clock;
@@ -193,6 +215,7 @@ struct RequestRecord {
     std::optional<FinishReason> terminal_reason;
 
     std::optional<BasePlan> base_plan;
+    std::optional<LossyPrefillState> lossy;
     std::optional<ResumeState> suspended;
     ContinuationOwnerToken continuation_owner = 0;
     // Shared checkpoints this request published at its progress anchors, oldest first. Only the

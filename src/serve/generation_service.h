@@ -65,6 +65,8 @@ struct GenerationMetrics {
     std::uint64_t speculative_ngram_accepted_tokens = 0;
     std::uint32_t prefix_cache_hit_tokens     = 0;
     ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::Root;
+    // Set when the request took the lossy prefill path (the request log's lossy_prefill).
+    std::optional<ninfer::LossyPrefillReport> lossy_prefill;
 };
 
 struct GenerationOutcome {
