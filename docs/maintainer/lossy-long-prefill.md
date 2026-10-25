@@ -271,8 +271,15 @@ and a session log with `[#N]` references to message indices). The output is dete
   (`--lossy-prefill-summary-max-tokens`), as in the original.
 - **Usage and log:** `prompt_tokens` is the original rendered length; the request log records
   `lossy_prefill.strategy = "summary"` and the summarized message range.
-- **Correctness reference:** the C++ projector must reproduce the Python projector's output byte for byte on
-  recorded transcripts (golden files generated from the pinned commit).
+- **Correctness reference:** the C++ projector (`src/runtime/engine/compaction/vcc_projector.cpp`) must
+  reproduce the Python projector's output byte for byte on recorded transcripts: `tools/bench/vcc_golden.py`
+  writes the golden files in `tests/fixtures/vcc` from the pinned commit, `ninfer_vcc_projector_test`
+  checks them, and `vcc_golden.py --fuzz N --out DIR` with `NINFER_VCC_FIXTURE_DIR=DIR` runs a random
+  differential set.
+- **Tool names:** the projector knows Hermes-style tool names only (`terminal`/`shell`/`bash`/`run_command`
+  for commands; `read_file`, `patch`, `write_file`, `edit_file`, ... for file verbs), case-sensitively.
+  Claude-Code-style `Bash`/`Read`/`Edit` calls still appear in the log and file list (by their `file_path`),
+  but not under "Commands Run", and their files read with the tool's own name as the verb.
 - **Known weakness:** it drops file contents from the middle; Hermes relies on a `session_search` tool to recover
   them, which our clients do not have. The agent-replay `Edit` metric is where the two strategies are compared.
 

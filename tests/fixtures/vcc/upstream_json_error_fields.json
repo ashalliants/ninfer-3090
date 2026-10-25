@@ -1,0 +1,54 @@
+{
+ "messages": [
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "a",
+     "name": "web_extract",
+     "arguments_json": "{\"urls\": [\"https://x\"]}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "a",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"error\": \"timeout after 30s\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "b",
+     "name": "patch",
+     "arguments_json": "{\"path\": \"/f.py\", \"old_string\": \"x\", \"new_string\": \"y\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "b",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"success\": false, \"error\": \"old_string not found\"}"
+    }
+   ]
+  }
+ ],
+ "cases": [
+  {
+   "id": "b4000",
+   "first": 0,
+   "last": 4,
+   "budget_chars": 4000
+  }
+ ]
+}

@@ -1,0 +1,11 @@
+## Historical Task Snapshot
+Looks good so far, continue with batch 20.
+
+## Goal
+Audit the repo and clean up the logging module.
+
+## Blocked
+Failed calls with no later successful retry of the same call:
+- [#242] terminal `python -m pytest tests/test_7.py -q` — ERROR exit 1: Traceback (most recent call last): xxxxxxxxxxxxxxxxxxxxxxxx … omitted; use session_search to read them.
+… 437 older log line(s) omitted; use session_search to read them.
+[#420] user: Looks good so far, continue with batch 20.

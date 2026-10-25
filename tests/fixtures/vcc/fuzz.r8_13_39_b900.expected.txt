@@ -1,0 +1,15 @@
+## Historical Task Snapshot
+The build in ~/proj is red, please fix it and keep the public API unchanged.
+
+## Goal
+Looks good so far, continue with batch 1.
+
+## Blocked
+Failed calls with no later successful retry of the same call:
+- [#15] tool — ERROR exit 1: Traceback (most recent call last): xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+- [#31] tool — ERROR exit 1: E ImportError: cannot import name 'parse' from 'proj.core' 1 failed
+
+## Erro … l: x' is a call the agent made; '← tool ok/exit N: ...' is what that tool returned.)
+… 3 more line(s) omitted; use session_search to read them.
+… 21 older log line(s) omitted; use session_search to read them.
+[#34] user: The build in ~/proj is red, please fix it and keep the public API unchanged.

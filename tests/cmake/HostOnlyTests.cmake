@@ -51,6 +51,7 @@ set(NINFER_HOST_ONLY_TESTS
   ninfer_s3_object_store_test
   ninfer_scheduler_test
   ninfer_tensor_test
+  ninfer_vcc_projector_test
   ninfer_wide_math_test
   ninfer_worker_recovery_test
 )
