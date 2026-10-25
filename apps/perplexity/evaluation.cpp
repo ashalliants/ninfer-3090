@@ -3,12 +3,14 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
 #include <cstring>
 #include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 
 namespace ninfer::perplexity {
 
@@ -264,6 +266,74 @@ std::vector<std::pair<int, int>> decode_windows(int first, int end, int width) {
         begin = stop;
     }
     return windows;
+}
+
+namespace {
+
+int parse_positive(std::string_view text, const char* flag, int maximum) {
+    int value                = 0;
+    const char* const end    = text.data() + text.size();
+    const auto [stop, error] = std::from_chars(text.data(), end, value);
+    if (text.empty() || error != std::errc{} || stop != end || value < 1 || value > maximum) {
+        throw std::invalid_argument(std::string(flag) + " must be an integer in [1," +
+                                    std::to_string(maximum) + "]: " + std::string(text));
+    }
+    return value;
+}
+
+} // namespace
+
+int parse_decode_window(std::string_view text) {
+    return parse_positive(text, "--decode-window", 16);
+}
+
+int parse_kld_chunks(std::string_view text) {
+    return parse_positive(text, "--chunks", std::numeric_limits<int>::max());
+}
+
+void check_source_flags(const ScoringSourceFlags& flags) {
+    if (static_cast<int>(flags.corpus) + static_cast<int>(flags.text) +
+            static_cast<int>(flags.kld_base) != 1) {
+        throw std::invalid_argument("exactly one of --corpus, --text and --kld-base is required");
+    }
+    if (flags.quick && !flags.corpus) { throw std::invalid_argument("--quick requires --corpus"); }
+    if ((flags.chunks || flags.decode_window) && !flags.kld_base) {
+        throw std::invalid_argument("--chunks and --decode-window require --kld-base");
+    }
+    if (flags.kld_base && (flags.context || flags.stride)) {
+        throw std::invalid_argument(
+            "--kld-base takes the context from the base file; drop --context and --stride");
+    }
+}
+
+int kld_chunk_count(const KldBase& base, std::optional<int> requested) {
+    if (!requested) { return base.n_chunk; }
+    if (*requested < 1 || *requested > base.n_chunk) {
+        throw std::invalid_argument("--chunks " + std::to_string(*requested) + " exceeds the " +
+                                    std::to_string(base.n_chunk) + " chunks of " +
+                                    base.path.string());
+    }
+    return *requested;
+}
+
+KldChunk kld_chunk(const KldBase& base, int chunk) {
+    if (chunk < 0 || chunk >= base.n_chunk) {
+        throw std::out_of_range("KL-divergence chunk out of range");
+    }
+    const auto begin = static_cast<std::size_t>(chunk) * base.n_ctx;
+    KldChunk out;
+    out.tokens.assign(base.tokens.begin() + static_cast<std::ptrdiff_t>(begin),
+                      base.tokens.begin() + static_cast<std::ptrdiff_t>(begin + base.n_ctx));
+    out.first_target = base.n_ctx / 2U + 1U;
+    return out;
+}
+
+int kld_row(const KldBase& base, std::int64_t position) {
+    const std::int64_t first = static_cast<std::int64_t>(base.n_ctx / 2U) + 1;
+    if (position < first || position >= static_cast<std::int64_t>(base.n_ctx)) {
+        throw std::out_of_range("target position outside the decoded half of a chunk");
+    }
+    return static_cast<int>(position - first);
 }
 
 } // namespace ninfer::perplexity

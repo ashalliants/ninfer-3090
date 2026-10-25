@@ -27,6 +27,11 @@ void validate_spec(const RoundStateSpec& spec) {
                                 spec.draft_window != 0 || spec.batch_capacity != 1)) {
         throw std::invalid_argument("scoring controls require one non-speculative sequence");
     }
+    if (spec.score_decode_width != 0 &&
+        (!spec.causal_scoring || spec.score_decode_width > kScoreDecodeMaximumWidth)) {
+        throw std::invalid_argument(
+            "a decode scoring frame requires causal scoring and a width in [1,16]");
+    }
     if (spec.hidden <= 0) { throw std::invalid_argument("RoundState hidden must be positive"); }
     if (spec.output_rows <= 0) {
         throw std::invalid_argument("RoundState output_rows must be positive");
@@ -79,6 +84,19 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
         layout.logits = add_tensor(builder, DType::BF16, {spec.output_rows, 1}, "step logits");
     }
     layout.text_kv_table_row = add_tensor(builder, DType::I32, {1}, "step Text KV table row");
+    if (spec.score_decode_width != 0) {
+        const auto width = static_cast<std::int32_t>(spec.score_decode_width);
+        ScoreDecodeStateLayout& decode = layout.score_decode.emplace();
+        decode.ingress =
+            builder.add(sizeof(ScoreDecodeIngress), kArenaAlign, "score decode ingress");
+        decode.logits = add_tensor(builder, DType::BF16, {spec.output_rows, width},
+                                   "score decode logits");
+        decode.hidden =
+            add_tensor(builder, DType::BF16, {spec.hidden, width}, "score decode hidden");
+        decode.target_tokens =
+            add_tensor(builder, DType::I32, {width}, "score decode target argmax");
+        decode.logprobs = add_tensor(builder, DType::FP32, {width}, "score decode logprobs");
+    }
     if (!spec.causal_scoring) {
         layout.backend_kv_table_row =
             add_tensor(builder, DType::I32, {1}, "step backend KV table row");
@@ -118,6 +136,31 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
                             DType::I32, {count});
     logits         = layout.logits.bind(backing);
     hidden         = layout.hidden.bind(backing);
+}
+
+ScoreDecodeState::ScoreDecodeState(DeviceSpan backing, const ScoreDecodeStateLayout& layout,
+                                   std::uint32_t width) {
+    if (width == 0 || width > kScoreDecodeMaximumWidth) {
+        throw std::invalid_argument("score decode width must be in [1,16]");
+    }
+    static_assert(std::is_standard_layout_v<ScoreDecodeIngress>);
+    ingress          = layout.ingress.bind(backing);
+    const auto count = static_cast<std::int32_t>(width);
+    const auto field = [&](std::size_t offset, std::int32_t elements) {
+        return Tensor(static_cast<unsigned char*>(ingress.data) + offset, DType::I32, {elements});
+    };
+    tokens                 = field(offsetof(ScoreDecodeIngress, tokens), count);
+    cache_positions        = field(offsetof(ScoreDecodeIngress, cache_positions), count);
+    rope_positions         = field(offsetof(ScoreDecodeIngress, rope_positions), count);
+    targets                = field(offsetof(ScoreDecodeIngress, targets), count);
+    valid_columns          = field(offsetof(ScoreDecodeIngress, valid_columns), 1);
+    text_kv_table_row      = field(offsetof(ScoreDecodeIngress, text_kv_table_row), 1);
+    state_source_slot      = field(offsetof(ScoreDecodeIngress, state_source_slot), 1);
+    state_destination_slot = field(offsetof(ScoreDecodeIngress, state_destination_slot), 1);
+    logits                 = layout.logits.bind(backing);
+    hidden                 = layout.hidden.bind(backing);
+    target_tokens          = layout.target_tokens.bind(backing);
+    logprobs               = layout.logprobs.bind(backing);
 }
 
 void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layout) {
@@ -421,6 +464,9 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     if (!layout.complete) { throw std::invalid_argument("RoundState layout is incomplete"); }
     if (layout.ordinary) {
         ordinary.emplace(backing, *layout.ordinary, layout.spec.batch_capacity);
+    }
+    if (layout.score_decode) {
+        score_decode.emplace(backing, *layout.score_decode, layout.spec.score_decode_width);
     }
     rope_delta        = layout.rope_delta.bind(backing);
     text_kv_table_row = layout.text_kv_table_row.bind(backing);

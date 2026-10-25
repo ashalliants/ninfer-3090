@@ -13,6 +13,7 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/graphs.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/prefill.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/decode.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/score_decode.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/grammar_masks.cpp"
 
   "${CMAKE_CURRENT_LIST_DIR}/program/planning/startup.cpp"

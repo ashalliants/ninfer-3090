@@ -26,6 +26,24 @@ struct RoundStateSpec {
     std::uint32_t draft_window   = 0;
     SpeculativeBackend backend   = SpeculativeBackend::None;
     bool causal_scoring          = false;
+    // Causal scoring only: the widest teacher-forced decode window (EngineOptions::
+    // scoring_decode_window), or zero for prefill-only scoring, which plans no decode frame.
+    std::uint32_t score_decode_width = 0;
+};
+
+inline constexpr std::uint32_t kScoreDecodeMaximumWidth = 16;
+
+// Stable pinned/device transfer format of one teacher-forced scoring window, copied once per
+// forward. Columns past the window's live count repeat its last live token and position.
+struct ScoreDecodeIngress {
+    std::array<TokenId, kScoreDecodeMaximumWidth> tokens{};
+    std::array<std::int32_t, kScoreDecodeMaximumWidth> cache_positions{};
+    std::array<std::int32_t, kScoreDecodeMaximumWidth> rope_positions{};
+    std::array<TokenId, kScoreDecodeMaximumWidth> targets{};
+    std::int32_t valid_columns          = 0;
+    std::int32_t text_kv_table_row      = 0;
+    std::int32_t state_source_slot      = 0;
+    std::int32_t state_destination_slot = 0;
 };
 
 struct PrefillRoundHost {
@@ -126,6 +144,14 @@ struct OrdinaryDecodeStateLayout {
     TensorRegion hidden;
 };
 
+struct ScoreDecodeStateLayout {
+    LayoutRegion ingress;
+    TensorRegion logits;
+    TensorRegion hidden;
+    TensorRegion target_tokens;
+    TensorRegion logprobs;
+};
+
 struct MtpPrefillStateLayout {
     TensorRegion position;
     TensorRegion ar_hidden;
@@ -179,6 +205,7 @@ struct DFlashDecodeStateLayout {
 struct RoundStateLayout {
     RoundStateSpec spec;
     std::optional<OrdinaryDecodeStateLayout> ordinary;
+    std::optional<ScoreDecodeStateLayout> score_decode;
     TensorRegion token;
     TensorRegion pos;
     TensorRegion rope_pos;
@@ -210,6 +237,28 @@ struct OrdinaryDecodeState {
     OrdinaryDecodeState() = default;
     OrdinaryDecodeState(DeviceSpan backing, const OrdinaryDecodeStateLayout& layout,
                         std::uint32_t batch_capacity);
+};
+
+// One teacher-forced scoring frame at the planned width W. Every tensor is [W] (or [rows, W]); a
+// window views its leading columns.
+struct ScoreDecodeState {
+    DeviceSpan ingress;
+    Tensor tokens;
+    Tensor cache_positions;
+    Tensor rope_positions;
+    Tensor targets;
+    Tensor valid_columns;
+    Tensor text_kv_table_row;
+    Tensor state_source_slot;
+    Tensor state_destination_slot;
+    Tensor logits;
+    Tensor hidden;
+    Tensor target_tokens;
+    Tensor logprobs;
+
+    ScoreDecodeState() = default;
+    ScoreDecodeState(DeviceSpan backing, const ScoreDecodeStateLayout& layout,
+                     std::uint32_t width);
 };
 
 // The two planning calls expose one deliberate exact-target extension seam after scalar logits.
@@ -331,6 +380,7 @@ struct DFlashDecodeState {
 
 struct RoundState {
     std::optional<OrdinaryDecodeState> ordinary;
+    std::optional<ScoreDecodeState> score_decode;
     Tensor token;
     Tensor pos;
     Tensor rope_pos;
