@@ -255,6 +255,40 @@ void test_round_layout() {
         } catch (const std::invalid_argument&) { return true; }
         return false;
     };
+    expect(!round.draft_context_rows && !dflash.draft_context_rows,
+           "without --draft-context-rows no context-row ids are planned");
+
+    // --draft-context-rows plans one I32 id per slot after the rest of the round state, and
+    // leaves every other region where the layout without it puts it.
+    for (const auto backend : {ninfer::SpeculativeBackend::Mtp, ninfer::SpeculativeBackend::DFlash2}) {
+        const q36::RoundStateSpec off{.hidden = 32, .output_rows = 128, .draft_window = 7,
+                                      .backend = backend};
+        q36::RoundStateSpec on = off;
+        on.draft_context_rows  = 512;
+        ninfer::LayoutBuilder off_builder;
+        ninfer::LayoutBuilder on_builder;
+        auto without = q36::begin_round_state_layout(off_builder, off);
+        auto with    = q36::begin_round_state_layout(on_builder, on);
+        q36::complete_round_state_layout(off_builder, without);
+        q36::complete_round_state_layout(on_builder, with);
+        const std::size_t off_bytes = off_builder.finish(256);
+        const std::size_t on_bytes  = on_builder.finish(256);
+        expect(with.draft_context_rows.has_value() &&
+                   with.draft_context_rows->dtype == ninfer::DType::I32 &&
+                   with.draft_context_rows->shape[0] == 512 &&
+                   with.draft_context_rows->region.bytes == 512 * sizeof(std::int32_t),
+               "context-row ids are I32 [C]");
+        expect(with.draft_context_rows && with.draft_context_rows->region.offset >= off_bytes &&
+                   on_bytes == off_bytes + 512 * sizeof(std::int32_t),
+               "context-row ids are the one term the option adds, after the round state");
+        expect(with.logits.region.offset == without.logits.region.offset,
+               "context rows move no other round-state region");
+    }
+    expect(refused({.hidden = 32, .output_rows = 128, .draft_context_rows = 512}),
+           "context rows without a speculative backend are refused");
+    expect(refused({.hidden = 32, .output_rows = 128, .draft_window = 3,
+                    .backend = ninfer::SpeculativeBackend::Mtp, .draft_context_rows = 2049}),
+           "more than 2048 context rows are refused");
     expect(refused({.hidden = 32, .output_rows = 128, .score_decode_width = 4}),
            "a decode scoring frame without causal scoring is refused");
     expect(refused({.hidden = 32, .output_rows = 128, .causal_scoring = true,

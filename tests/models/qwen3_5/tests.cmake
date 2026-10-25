@@ -116,6 +116,13 @@ ninfer_add_test(ninfer_qwen3_5_dflash_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_dflash_real.cpp"
   LIBRARIES ninfer_engine)
 
+# Draft-head context rows (--draft-context-rows) on a real artifact: greedy ids unchanged with the
+# option on, one and two requests at a time, with both acceptance rates reported.
+# NINFER_CONTEXT_ROWS_SPEC selects mtp (default), dflash or dflash2.
+ninfer_add_test(ninfer_qwen3_5_context_rows_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_context_rows_real.cpp"
+  LIBRARIES ninfer_engine)
+
 # Captures the 27B's own KV/state after a real prompt prefix into graft containers, then checks that
 # the installed direct graft reproduces the replayed prefix's greedy output across backends,
 # concurrency and cache pressure. NINFER_TEST_GRAFT_REFERENCE=<phantom-kv prefill_kv container> also
@@ -312,6 +319,12 @@ ninfer_add_test(ninfer_qwen3_5_ngram_proposer_test
 ninfer_add_test(ninfer_qwen3_5_draft_window_policy_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_draft_window_policy.cpp"
   LIBRARIES ninfer_core)
+
+# The draft head's context rows (--draft-context-rows): the per-round id set and the head formats
+# the option runs with (CPU only).
+ninfer_add_test(ninfer_qwen3_5_context_rows_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_context_rows.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_core)
 # STANDALONE: the Python schema oracle drives this probe by executable path.
 ninfer_add_test(ninfer_qwen3_5_tool_constraints_test
   STANDALONE
