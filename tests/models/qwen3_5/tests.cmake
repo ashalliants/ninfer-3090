@@ -198,6 +198,13 @@ ninfer_add_test(ninfer_qwen3_5_mlp_a8_decode_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mlp_a8_decode_wiring.cpp"
   LIBRARIES ninfer_model_runtime ninfer_ops)
 
+# Token selection for lossy long-prefill. selection.cpp is compiled into the test directly, so it
+# links no kernel library and runs in a host-only tree.
+ninfer_add_test(ninfer_qwen3_5_lossy_selection_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lossy_selection.cpp"
+          "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/program/lossy/selection.cpp"
+  LIBRARIES ninfer_core)
+
 ninfer_add_test(ninfer_qwen3_5_ngram_proposer_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_proposer.cpp"
   LIBRARIES ninfer_core)

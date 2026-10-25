@@ -35,6 +35,8 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/transactions/reclaim.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/transactions/replay.cpp"
 
+  "${CMAKE_CURRENT_LIST_DIR}/program/lossy/selection.cpp"
+
   "${CMAKE_CURRENT_LIST_DIR}/program/speculative/mtp.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/speculative/target_verification.cpp"
 )
