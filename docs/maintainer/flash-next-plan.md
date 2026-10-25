@@ -657,6 +657,21 @@ None has been measured on the RTX 3090 yet.
     the threshold (Basalt's conditional draft graph, `verify_kernels.cu:824-827`,
     `src/core/mtp.cpp:1390-1453`). Phase A pays for every draft step even when the window keeps one,
     so it can lose to the acceptance estimate when the rule keeps short windows.
+- **N-gram prefetch for the anchor column** (`--ngram-prefetch`, needs `--spec mtp`). Verification's
+  `upload_rows` reads W columns of rows (`program/ngram_rows.h`, `ngram_window_rows`) after the front
+  half of the verify forward is enqueued; the volume reads are the host's critical path when the rows
+  miss the 2^20-row cache. The anchor column's rows depend only on history known before drafting, so
+  `mtp_draft` reads them between enqueueing the draft graph and its sync, into a scratch buffer, only
+  to fill the volume's cache; verification then finds them cached.
+  - Runs on the Program thread, since `NgramVolume::read_rows` is not reentrant. It can lengthen a
+    round only when the volume read outlasts the draft graph, and then by what verification would
+    have waited for the same rows.
+  - The drafts' rows (columns 1..K) are unknown until the sync and are read as before.
+  - No device memory; the rows, the drafts and the output are unchanged. Off: verification reads
+    every row, as on master. `ngram_window_rows` is also what the prefill and decode row reads use
+    (the same ids, in the same order).
+  - Checked on the CPU only (`ninfer_qwen4_exp_ngram_volume_test`: the ids against hand-derived
+    windows, the prefetched rows cached). Not measured.
 
 ## Artifact decisions
 
@@ -733,11 +748,12 @@ Infernix is Apache-2.0; each adapted file carries the notice the spec's licensin
 | `tests/ops/test_hyper_connection.cpp`, `test_projection_fp32.cpp`, `test_rows.cpp` | `tests/ops/test_hyper_connection.cpp`, `tests/ops/linear/test_projection_fp32.cpp`, `tests/ops/test_rows.cpp` | Ported with their Ops |
 | `src/core/read_only_file{.h,_win32.cpp,_posix.cpp}` | `src/core/read_only_file*` | Unbuffered reads only (no mapping); each `read_direct` waits on its own event |
 | `src/models/qwen4_exp/config.{h,cpp}` | `src/models/qwen4_exp/config.{h,cpp}` | IQ4_NL volume rows; no load options, MTP or YaRN; the vision config is Qwen3.5's (PR 14) |
-| `src/models/qwen4_exp/frontend/ngram_hash.{h,cpp}` | same path | Verbatim |
+| `src/models/qwen4_exp/frontend/ngram_hash.{h,cpp}` | same path | Verbatim, plus `ngram_size()` and `eos_token_id()` accessors |
 | `src/models/qwen4_exp/weights.h`, `model.h`, `load.cpp` | `weights.h`, `model.h`, `load.{h,cpp}` | GGUF-mirroring parameters; record banks with no scales |
 | `src/models/qwen4_exp/execution/parameters.{h,cpp}` | same path | One Linear per GGUF tensor |
 | `src/models/qwen4_exp/execution/forward.{h,cpp}` | same path | One sequence; NInfer's single-sequence QSA Ops; interleaved query/gate rows; tiled GDN heads |
 | `src/models/qwen4_exp/program/ngram_volume.{h,cpp}` | same path | Version 2 volume; keep-alive after Strata's PLE reader |
+| `src/models/qwen4_exp/program/ngram_rows.h` | Program's inline row-id code | NInfer's; one pure function for the row read and the prefetch |
 | `tests/models/qwen4_exp/test_{ngram_hash,ngram_volume,forward_real}.cpp`, `tests/fixtures/qwen4_exp/ngram_rows.txt` | same paths (`forward_real` with `45f20fb9`'s taps) | One sequence; INT8 KV built directly; timed decode |
 | `tools/flash_next/{ngram,reference,block_check,strata_compare}.py` | same paths | The reference reads the `.ninfer` through the exact GGML decoders, with the canonical A8 cast |
 | `src/core/{vmm_arena.{h,cu},cuda_vmm.h,vram_budget.{h,cpp},copy_batch.{h,cpp},link_probe.{h,cpp},power_throttling.{h,cpp}}` | same paths | Namespace; `CopyBatch` takes CUDA 12.8's `cudaMemcpyBatchAsync` form and falls back to single copies; a `cuMemSetAccess` that WDDM cannot make resident (`CUDA_ERROR_NOT_READY`) is a refusal, like an out-of-memory `cuMemCreate` (PR 12) |
