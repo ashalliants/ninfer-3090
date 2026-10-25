@@ -2002,7 +2002,7 @@ right.
 
 ### Host and Origin checks
 
-Two checks run before every route, `GET /health` and the loading `503` included. They stop a web
+These checks run before every route, `GET /health` and the loading `503` included. They stop a web
 page in a browser on this machine (or on the LAN) from using the server behind your back.
 
 - **Host**, always. A request whose `Host` header names something the server does not answer to is
@@ -2025,9 +2025,13 @@ page in a browser on this machine (or on the LAN) from using the server behind y
   `Origin` and are not affected. `Origin: null`, sent by `file://` pages and sandboxed frames, is
   refused, as are browser-extension origins. Give such a client a key, or start the server with
   `--cors`.
+- **Sec-Fetch-Site**, under the same condition. A request a browser marks `cross-site` (a link,
+  an image or a `no-cors` fetch from another site, some of which carry no `Origin`) is refused,
+  so a page elsewhere cannot make the router load, wake or evict a model. `same-origin`,
+  `same-site`, `none` (an address typed by the user) and no header at all pass.
 
 A refused request gets `403` in the error shape of the endpoint it called: the OpenAI shape (code
-`host_not_allowed` or `origin_not_allowed`) everywhere else, and the Anthropic shape (type
+`host_not_allowed`, `origin_not_allowed` or `cross_site_request`) everywhere else, and the Anthropic shape (type
 `permission_error`) under `/v1/messages`.
 
 ```json
@@ -2035,8 +2039,10 @@ A refused request gets `403` in the error shape of the endpoint it called: the O
            "type": "invalid_request_error", "param": null, "code": "host_not_allowed"}}
 ```
 
-The router runs both checks on its public address and drops `Origin` (with the credentials) from
-the requests it relays to its models, which listen on loopback.
+The router runs these checks on its public address and drops `Origin` (with the credentials) from
+the requests it relays to its models. Each model's own server listens on loopback with no key, no
+`--cors` and no `--allowed-host`, whatever the command line gives the router, so a browser page
+cannot reach it directly around the router's key.
 
 **Serving on a LAN.** Bind a wildcard or the LAN address, and give it a key:
 
@@ -2046,8 +2052,16 @@ ninfer-serve model.ninfer --host 0.0.0.0 --api-key "$(openssl rand -hex 24)"
 
 Clients reach it at `http://<lan-ip>:8080` or `http://<machine-name>:8080` with no extra setup. For
 any other name (a DNS alias, `gpubox.local`, a Docker Compose service name), add
-`--allowed-host gpubox.local`. Without `--api-key`, a server listening beyond loopback logs a
-warning at startup: anyone who can reach the address can use the model.
+`--allowed-host gpubox.local`. The value is a host name or an address, with no scheme, port, path
+or wildcard; anything else is refused at startup. Without `--api-key`, a server listening beyond
+loopback logs a warning at startup: anyone who can reach the address can use the model.
+
+**Behind a reverse proxy.** Caddy and nginx (with `proxy_set_header Host $host`, which most
+configurations use) pass on the Host the client used, so add each public name with
+`--allowed-host`. A web UI served from the proxy's own origin sends `Origin: https://name` (port
+443), which can never be the server's own origin, so a proxied server that browsers reach needs
+`--api-key` (the UI sends the key) or `--cors`; a keyless server without `--cors` refuses those
+requests.
 
 ## Server options
 
@@ -2058,7 +2072,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--host H` | listen address | `127.0.0.1` |
 | `--port N` | listen port | `8080` |
 | `--api-key KEY` | required bearer or `x-api-key` value | unset |
-| `--allowed-host NAME` | one more name the [Host check](#host-and-origin-checks) accepts; a name without a scheme or port; repeatable | none |
+| `--allowed-host NAME` | one more name the [Host check](#host-and-origin-checks) accepts; a host name or address without a scheme, port or wildcard; repeatable | none |
 | `--model-id ID` | override the public OpenAI model alias | artifact `metadata.name`, or architecture name |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |

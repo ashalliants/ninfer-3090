@@ -1,5 +1,7 @@
 #include "serve/serve_options.h"
 
+#include "serve/http_security.h"
+
 #include <algorithm>
 #include "product/reasoning_loop_options.h"
 #include "product/speculative_options.h"
@@ -558,12 +560,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.api_key = require_value("--api-key");
         } else if (arg == "--allowed-host") {
             const std::string_view name = require_value("--allowed-host");
-            // A name alone: the Host check ignores the port, and a scheme or path is no name.
-            const bool bracketed = name.starts_with('[') && name.ends_with(']');
-            if (name.empty() || name.find_first_of("/ \t@") != std::string_view::npos ||
-                (!bracketed && name.find(':') != std::string_view::npos)) {
+            // Only what the Host check can match: the port is not compared, and a scheme, path,
+            // wildcard or userinfo would never match anything.
+            if (!valid_allowed_host(name)) {
                 throw std::invalid_argument(
-                    "--allowed-host takes a host name without a scheme or port, e.g. "
+                    "--allowed-host '" + std::string(name) +
+                    "' is not a host name or address (no scheme, port, path or wildcard), e.g. "
                     "--allowed-host gpubox.lan");
             }
             options.allowed_hosts.emplace_back(name);

@@ -40,12 +40,24 @@ struct HostPolicy {
 [[nodiscard]] bool origin_allowed(const HostPolicy& policy, std::string_view origin, bool has_key,
                                   bool cors);
 
+// The Fetch Metadata check, beside the Origin check and under the same condition (no key, no
+// --cors): a browser marks a request another site started (a link, an image, a no-cors fetch,
+// some of which carry no Origin) with Sec-Fetch-Site: cross-site, and that is refused. Absent
+// (non-browser clients, older browsers), "same-origin", "same-site" and "none" (typed by the user)
+// pass.
+[[nodiscard]] bool fetch_site_allowed(std::string_view sec_fetch_site, bool has_key, bool cors);
+
+// Whether an --allowed-host value is a name the Host check can ever match: a host name or an
+// IPv4 / bracketed IPv6 address, with no port, scheme, path, userinfo or wildcard.
+[[nodiscard]] bool valid_allowed_host(std::string_view name);
+
 // True when the server listens beyond loopback with no key: anyone who can reach the address can
 // use it.
 [[nodiscard]] bool exposed_without_key(std::string_view bind_host, bool has_key);
 
 // The relay from the router to a model drops these request headers: credentials (the model needs
-// none) and Origin (the router has checked it; the model, keyless on loopback, would refuse it).
+// none) and Origin (the router has checked it, and the model, keyless on loopback and never with
+// --cors, would refuse a foreign one).
 [[nodiscard]] bool dropped_when_relaying(std::string_view header_name);
 
 // This machine's host name, empty when the system will not say.

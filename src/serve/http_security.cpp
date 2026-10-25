@@ -215,6 +215,18 @@ bool origin_allowed(const HostPolicy& policy, std::string_view origin, bool has_
                     authority->host + ":" + std::to_string(authority->port.value_or(default_port)));
 }
 
+bool fetch_site_allowed(std::string_view sec_fetch_site, bool has_key, bool cors) {
+    return has_key || cors || !iequal(trim(sec_fetch_site), "cross-site");
+}
+
+bool valid_allowed_host(std::string_view name) {
+    const std::optional<Authority> authority = parse_authority(name);
+    // parse_authority accepts "name:" (an empty port); a value for the flag has no colon at all
+    // outside an IPv6 address's brackets.
+    const bool colon_outside = !name.starts_with('[') && name.find(':') != std::string_view::npos;
+    return authority && !authority->port && !colon_outside;
+}
+
 bool exposed_without_key(std::string_view bind_host, bool has_key) {
     return !has_key && !is_loopback(bind_host);
 }

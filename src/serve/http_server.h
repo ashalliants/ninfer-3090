@@ -41,8 +41,8 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 [[nodiscard]] bool matches_bearer_credential(std::string_view authorization,
                                              std::string_view api_key) noexcept;
 
-// The Host check (always) and the Origin check (without a key and without --cors). A refused
-// request gets a 403 in its endpoint's error shape and the result is true.
+// The Host check (always), and without a key and without --cors the Origin and Sec-Fetch-Site
+// checks. A refused request gets a 403 in its endpoint's error shape and the result is true.
 [[nodiscard]] bool reject_untrusted_request(const HostPolicy& policy, const ServeOptions& options,
                                             const httplib::Request& request,
                                             httplib::Response& response);

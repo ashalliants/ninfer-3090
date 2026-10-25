@@ -244,6 +244,12 @@ bool reject_untrusted_request(const HostPolicy& policy, const ServeOptions& opti
         error.message = "Origin " + quoted(origin) +
                         " is another site; a server without --api-key accepts browser requests "
                         "only from its own origin (set --api-key or --cors to allow others)";
+    } else if (!fetch_site_allowed(request.get_header_value("Sec-Fetch-Site"),
+                                   !options.api_key.empty(), options.enable_cors)) {
+        // A link, image or no-cors fetch from another site, which may carry no Origin.
+        error.code    = "cross_site_request";
+        error.message = "a request another site started is refused by a server without --api-key "
+                        "(set --api-key or --cors to allow it)";
     } else {
         return false;
     }

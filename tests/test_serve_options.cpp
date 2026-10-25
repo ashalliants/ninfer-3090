@@ -1008,7 +1008,8 @@ int main() {
                                       "gpubox.lan", "--allowed-host", "[fe80::5]"});
     failures += check(hosts.allowed_hosts == std::vector<std::string>{"gpubox.lan", "[fe80::5]"},
                       "--allowed-host did not append each name");
-    for (const char* bad : {"", "http://gpubox", "gpubox:8080", "gpubox/v1", "fe80::5", "a b"}) {
+    for (const char* bad : {"", "http://gpubox", "gpubox:8080", "gpubox/v1", "fe80::5", "a b",
+                            "*", "*.lan", "gpu%box", "gpubox?", "user@gpubox"}) {
         failures += check(rejected({"ninfer-serve", "model.ninfer", "--allowed-host", bad}),
                           "--allowed-host accepted something that is not a host name");
     }
