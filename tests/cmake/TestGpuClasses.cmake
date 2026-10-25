@@ -70,6 +70,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_qwen3_5_runtime_mechanisms_test
   ninfer_qwen3_5_speculative_round_shapes_test
   ninfer_qwen3_5_state_image_layout_test
+  ninfer_qwen3_5_text_positions_test
   ninfer_qwen3_5_tool_constraints_test
   ninfer_qwen3_5_tool_schema_oracle_test
   ninfer_qwen4_exp_context_cache_test

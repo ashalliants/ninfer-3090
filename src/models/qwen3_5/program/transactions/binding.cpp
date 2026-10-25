@@ -1,10 +1,13 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
+#include "models/qwen3_5/program/text_positions.h"
 #include "core/device.h"
 #include "runtime/contract/admission_fit.h"
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
+#include <span>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -36,6 +39,10 @@ void ProgramImpl::initialize_prefill(std::uint32_t lane, std::uint32_t base) {
     staged.mtp_bridge           = !staged.prepare_mtp || !base   ? MtpBridgeMode::None
                                   : base == staged.prompt_tokens ? MtpBridgeMode::AfterExactHit
                                                                  : MtpBridgeMode::BeforeSuffix;
+    // Axis 0 decides: text positions are equal on all three axes.
+    const std::span<const std::int32_t> axis0(staged.prompt.positions.data(),
+                                              staged.prompt.token_ids.size());
+    staged.regular_text_positions = regular_text_positions(axis0, base, staged.prompt.rope_delta);
     initialize_captures(lane, base, plan.summary.prompt_tokens);
     if (plan.vision_control_plan) {
         auto& vision        = staged.vision_plan.emplace();

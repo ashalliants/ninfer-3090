@@ -1430,10 +1430,16 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     const int chunk          = static_cast<int>(prefill_chunk_);
     const std::uint32_t base = text_kv_base_;
 
+    const bool explicit_text_positions =
+        text_prefill != nullptr && !text_prefill->rope_positions.empty();
     if (text_prefill != nullptr) {
         if (multimodal != nullptr || base != text_prefill->begin ||
             text_prefill->token_ids.size() < static_cast<std::size_t>(base) + ids.size()) {
             throw std::invalid_argument("text prefill chunk does not match its full prompt");
+        }
+        if (explicit_text_positions &&
+            text_prefill->rope_positions.size() < static_cast<std::size_t>(base) + ids.size()) {
+            throw std::invalid_argument("text prefill RoPE positions do not cover the chunk");
         }
     }
     if (multimodal != nullptr) {
@@ -1448,9 +1454,12 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             throw std::invalid_argument("multimodal prefill requires a Vision session");
         }
         rope_delta_ = multimodal->rope_delta;
-    } else if (text_kv_base_ == 0) {
+    } else if (text_kv_base_ == 0 && text_prefill == nullptr) {
         rope_delta_ = 0;
     }
+    // A text prompt keeps the rope_delta its card was given (set_rope_delta, the sequence's) from
+    // the first chunk on: a compacted lossy prompt's delta is its dropped count, and the token
+    // after the prompt sits at prompt length + delta.
     ops::set_i32_scalar(io_.rope_delta, rope_delta_, s);
 
     // Prefix-append prefill continues an existing cache: positions are absolute (start at the
@@ -1518,7 +1527,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 }
             }
 
-            const std::int32_t rope_axes = multimodal != nullptr ? 3 : (rope_delta_ != 0 ? 1 : 0);
+            const std::int32_t rope_axes =
+                multimodal != nullptr ? 3 : (explicit_text_positions || rope_delta_ != 0 ? 1 : 0);
             const bool overlay_staging   = !vision_chunk.host_embeddings.empty();
             const auto roots             = workspace::text_prefill_roots(
                 work_, config_, len, rope_axes,
@@ -1542,6 +1552,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                                 rope_positions_host.data() + static_cast<std::size_t>(axis) * len);
                 }
                 copy_i32(rope_positions_host.data(), rope_positions, s);
+            } else if (explicit_text_positions) {
+                // One axis: text positions are equal on all three. The span outlives the copy.
+                rope_positions = roots.rope_positions;
+                copy_i32(text_prefill->rope_positions.data() + prompt_t0, rope_positions, s);
             } else if (rope_delta_ != 0) {
                 rope_positions = roots.rope_positions;
                 ops::offset_i32_positions(positions, io_.rope_delta, rope_positions, s);
@@ -1786,12 +1800,13 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 }
 
 PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std::uint32_t begin,
-                                              std::uint32_t nominal_length, bool finalize_at_end) {
+                                              std::uint32_t nominal_length, bool finalize_at_end,
+                                              std::span<const std::int32_t> rope_positions) {
     if (begin >= full_ids.size() || nominal_length == 0 ||
         nominal_length > full_ids.size() - begin) {
         throw std::invalid_argument("text prefill chunk is outside the prompt");
     }
-    const TextPrefill text_prefill{full_ids, begin};
+    const TextPrefill text_prefill{full_ids, begin, rope_positions};
     NullTap tap;
     return prefill_impl(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr, tap,
                         finalize_at_end);
@@ -1799,12 +1814,13 @@ PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std
 
 PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std::uint32_t begin,
                                               std::uint32_t nominal_length, bool finalize_at_end,
-                                              DFlashFeatureSink& sink) {
+                                              DFlashFeatureSink& sink,
+                                              std::span<const std::int32_t> rope_positions) {
     if (begin >= full_ids.size() || nominal_length == 0 ||
         nominal_length > full_ids.size() - begin) {
         throw std::invalid_argument("text prefill chunk is outside the prompt");
     }
-    const TextPrefill text_prefill{full_ids, begin};
+    const TextPrefill text_prefill{full_ids, begin, rope_positions};
     return prefill_impl(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr, sink,
                         finalize_at_end);
 }

@@ -360,7 +360,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto finish = [](const WorkspaceLayoutBuilder& layout) { return layout.peak_bytes(1); };
 
     const auto text_common_root = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens) {
-        (void)workspace::text_prefill_roots(layout, config, tokens, plan.features.vision ? 3 : 0,
+        // Text prefill takes one RoPE axis when its positions are explicit (a lossy prompt's gapped
+        // positions) or offset by rope_delta; Vision takes three.
+        (void)workspace::text_prefill_roots(layout, config, tokens, plan.features.vision ? 3 : 1,
                                             plan.features.vision ? tokens : 0,
                                             plan.features.overlay_vision());
     };

@@ -141,14 +141,16 @@ public:
 
     [[nodiscard]] int proposal_head_n() const noexcept { return proposal_head_n_; }
 
-    [[nodiscard]] PrefillChunkResult prefill_chunk(std::span<const int> full_ids,
-                                                   std::uint32_t begin,
-                                                   std::uint32_t nominal_length,
-                                                   bool finalize_at_end);
-    [[nodiscard]] PrefillChunkResult prefill_chunk(std::span<const int> full_ids,
-                                                   std::uint32_t begin,
-                                                   std::uint32_t nominal_length,
-                                                   bool finalize_at_end, DFlashFeatureSink& sink);
+    // `rope_positions` is the whole prompt's axis-0 RoPE positions (text positions are equal on
+    // every axis). Empty means slot + rope_delta. A lossy prompt keeps its tokens at their
+    // original, gapped positions while its KV slots stay contiguous, so it passes them here.
+    [[nodiscard]] PrefillChunkResult
+    prefill_chunk(std::span<const int> full_ids, std::uint32_t begin, std::uint32_t nominal_length,
+                  bool finalize_at_end, std::span<const std::int32_t> rope_positions = {});
+    [[nodiscard]] PrefillChunkResult
+    prefill_chunk(std::span<const int> full_ids, std::uint32_t begin, std::uint32_t nominal_length,
+                  bool finalize_at_end, DFlashFeatureSink& sink,
+                  std::span<const std::int32_t> rope_positions = {});
     [[nodiscard]] PrefillChunkResult
     prefill_chunk(const qwen3_5::PreparedPromptData& input, std::uint32_t begin,
                   std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);
@@ -257,6 +259,9 @@ private:
     struct TextPrefill {
         std::span<const int> token_ids;
         std::uint32_t begin = 0;
+        // Axis-0 RoPE positions over the whole prompt (at least begin + the chunk's tokens). Empty
+        // means slot + rope_delta. Text only, so layer slices stay allowed.
+        std::span<const std::int32_t> rope_positions;
     };
 
     template <class Tap>

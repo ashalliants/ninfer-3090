@@ -4,13 +4,17 @@
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/program/program.h"
+#include "models/qwen3_5/program/lossy/gap_map.h"
 #include "models/qwen3_5/program/program_impl.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstddef>
 #include <cstdlib>
+#include <functional>
+#include <memory>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
@@ -2664,6 +2668,382 @@ void replay_sampling_counts(DeviceContext& device, const qwen::execution::Parame
             "sampling-count fixture leaked typed resources");
 }
 
+// ---- Explicit RoPE positions in text prefill (lossy long-prefill, Task 4) ----
+
+constexpr std::uint32_t kLongCapacity = 4096;
+constexpr std::uint32_t kLongChunk    = 512;
+constexpr std::uint32_t kLongPrompt   = 3000;
+constexpr std::int32_t kRopeOffset    = 17;
+// rk4v4 is the production KV storage; int8 is the extra one.
+constexpr std::array<KvCacheStorage, 2> kPositionStorages{
+    KvCacheStorage::RotatedLloyd4KeyInt4Value, KvCacheStorage::Int8Group64};
+
+std::vector<TokenId> long_prompt_ids(std::uint32_t count) {
+    std::vector<TokenId> ids(count);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        ids[i] = 100 + static_cast<TokenId>((i * 37 + i / 64) % 900);
+    }
+    return ids;
+}
+
+// Every position axis set to positions[i], the shape a text prompt carries.
+void set_text_positions(qwen::PreparedPromptData& prompt, const std::vector<std::int32_t>& axis,
+                        std::int32_t rope_delta) {
+    const std::size_t tokens = prompt.token_ids.size();
+    require(axis.size() == tokens, "position fixture does not cover its prompt");
+    prompt.positions.resize(3 * tokens);
+    for (std::size_t a = 0; a < 3; ++a) {
+        std::copy(axis.begin(), axis.end(), prompt.positions.begin() + a * tokens);
+    }
+    prompt.rope_delta = rope_delta;
+}
+
+void append_device_bytes(std::vector<std::byte>& bytes, const Tensor& tensor) {
+    require(tensor.is_contiguous(), "a compared device region is not contiguous");
+    const auto offset = bytes.size();
+    bytes.resize(offset + tensor.bytes());
+    CUDA_CHECK(
+        cudaMemcpy(bytes.data() + offset, tensor.data, tensor.bytes(), cudaMemcpyDeviceToHost));
+}
+
+// The page slices of one KV plane: one per page (page-major) or one per page and head.
+template <class Visit>
+void visit_page_slices(const Tensor& plane, PagedKVPlaneOrder order, std::int32_t page,
+                       Visit&& visit) {
+    if (order == PagedKVPlaneOrder::PageMajor) {
+        visit(plane.slice(3, page, 1));
+        return;
+    }
+    for (std::int32_t head = 0; head < plane.ne[3]; ++head) {
+        visit(plane.slice(3, head, 1).slice(2, page, 1));
+    }
+}
+
+// A page's unused tail columns keep whatever an earlier run left there, so every run starts from
+// zeroed planes and the comparison can take whole pages.
+void zero_text_kv(qwen::detail::ProgramImpl& program, DeviceContext& device) {
+    const auto& pool  = program.decoder->text_kv.page_pool();
+    const auto order  = pool.geometry().device_plane_order;
+    for (std::size_t index = 0; index < pool.plane_count(); ++index) {
+        const Tensor& plane = pool.plane(index);
+        const std::int32_t pages =
+            order == PagedKVPlaneOrder::PageMajor ? plane.ne[3] : plane.ne[2];
+        for (std::int32_t page = 0; page < pages; ++page) {
+            visit_page_slices(plane, order, page, [&](const Tensor& slice) {
+                require(slice.is_contiguous(), "a KV page slice is not contiguous");
+                CUDA_CHECK(cudaMemsetAsync(slice.data, 0, slice.bytes(), device.stream));
+            });
+        }
+    }
+    device.synchronize();
+}
+
+// Text KV of a lane's first `tokens` positions, gathered page by page through its block table.
+std::vector<std::byte> text_kv_bytes(qwen::detail::ProgramImpl& program, std::uint32_t lane,
+                                     std::uint32_t tokens) {
+    auto& cache          = program.decoder->text_kv;
+    const auto& pool     = cache.page_pool();
+    const auto order     = pool.geometry().device_plane_order;
+    const auto page_size = pool.geometry().page_tokens;
+    const auto row       = program.text_kv_addresses->bound_row(program.sequences[lane].kv->text);
+    const auto table     = cache.execution_tables().matrix().slice(1, row, 1);
+    std::vector<std::int32_t> physical((tokens + page_size - 1) / page_size);
+    CUDA_CHECK(cudaMemcpy(physical.data(), table.data, physical.size() * sizeof(std::int32_t),
+                          cudaMemcpyDeviceToHost));
+    std::vector<std::byte> bytes;
+    for (std::size_t index = 0; index < pool.plane_count(); ++index) {
+        for (const std::int32_t page : physical) {
+            require(page >= 0, "a prompt KV page is not mapped");
+            visit_page_slices(pool.plane(index), order, page,
+                              [&](const Tensor& slice) { append_device_bytes(bytes, slice); });
+        }
+    }
+    return bytes;
+}
+
+struct PrefillImage {
+    TokenId first = -1;
+    std::vector<std::byte> logits;
+    std::vector<std::byte> kv;
+    std::vector<std::byte> state;
+};
+
+struct PositionsProgram {
+    std::unique_ptr<qwen::detail::SequencePlanImpl> plan;
+    std::unique_ptr<qwen::detail::ProgramImpl> program;
+};
+
+PositionsProgram make_positions_program(DeviceContext& device,
+                                        const qwen::execution::Parameters& parameters,
+                                        EngineOptions options, KvCacheStorage storage,
+                                        std::uint32_t lanes) {
+    options.max_context                       = kLongCapacity;
+    options.kv_capacity                       = KvCapacityPolicy::explicit_capacity(kLongCapacity);
+    options.prefill_chunk                     = kLongChunk;
+    options.max_concurrency                   = lanes;
+    options.kv_cache                          = storage;
+    options.context_cache.enabled             = false;
+    options.context_cache.device_state_slots  = 0;
+    options.context_cache.host_capacity_bytes = 0;
+    auto planner = qwen::detail::make_sequence_planner_impl(parameters, device, options);
+    const std::uint32_t pages = lanes * planner->curve.minimum_main_page_groups;
+    PositionsProgram out;
+    out.plan    = qwen::detail::finalize_sequence_plan_impl(std::move(planner), pages);
+    out.program = std::make_unique<qwen::detail::ProgramImpl>(parameters, *out.plan, device,
+                                                              StartupObserver{});
+    return out;
+}
+
+qwen::ContextProgress settle_positions(qwen::detail::ProgramImpl& program, DeviceContext& device) {
+    std::atomic<bool> flag{false};
+    for (unsigned step = 0; step < 8; ++step) {
+        device.synchronize();
+        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+        auto progress = program.poll_context({&flag});
+        if (progress.complete) { return progress; }
+    }
+    throw std::runtime_error("explicit-position transaction did not settle");
+}
+
+// Binds `prompt` to lane 0 of an idle Program, prefills it (whole, or in `slices` layer slices) and
+// returns the last-token logits, the prompt's text KV and the lane's GDN state image as they stand
+// when the prefill finishes, then releases the lane.
+PrefillImage prefill_image(qwen::detail::ProgramImpl& program, DeviceContext& device,
+                           qwen::PreparedPromptData prompt, std::uint32_t slices) {
+    const auto empty           = program.physical_usage().occupied;
+    const auto prompt_tokens   = static_cast<std::uint32_t>(prompt.token_ids.size());
+    zero_text_kv(program, device);
+    runtime::ResolvedExecutionOptions request;
+    request.requested_output_tokens = 8;
+    request.allow_prefix_reuse      = false;
+    auto base       = program.plan_request(std::move(prompt), request);
+    const auto root = program.inspect_source(base, std::nullopt);
+    require(root.has_value(), "explicit-position request has no root source");
+    require(static_cast<bool>(program.start_binding(base, {0}, *root, nullptr,
+                                                    qwen::ExecutionUnitKind::Prefill, 0)),
+            "explicit-position request could not bind");
+    const auto bound = settle_positions(program, device);
+    require(bound.sequence.has_value(), "explicit-position binding did not publish");
+    const auto sequence = *bound.sequence;
+
+    PrefillImage image;
+    std::uint32_t processed = 0;
+    for (unsigned call = 0; call < 256 && processed < prompt_tokens; ++call) {
+        const std::array<qwen::ExecutionUnit, 1> units{
+            {{sequence, qwen::ExecutionUnitKind::Prefill}}};
+        require(static_cast<bool>(program.reserve_units(units)),
+                "explicit-position prefill could not reserve its unit");
+        auto step = program.advance_prefill(sequence, nullptr, nullptr, 0, slices);
+        if (step.partial) { continue; }
+        processed += step.processed_prompt_tokens;
+        if (!step.pending) { continue; }
+        device.synchronize();
+        image.first = step.pending->tokens().front();
+        append_device_bytes(image.logits, program.io.logits.slice(1, 0, 1));
+        image.kv = text_kv_bytes(program, 0, prompt_tokens);
+        const auto& layout = program.state_images->host_layout();
+        image.state.resize(layout.image_bytes);
+        const auto selectors = program.state_selectors(program.sequences[0]);
+        program.state_images->copy_to_host(selectors.destination,
+                                           qwen::HostStateImageView{image.state.data(), &layout},
+                                           RankStreams(device.stream));
+        device.synchronize();
+        const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
+        (void)program.commit(std::move(*step.pending), accepted, {}, nullptr);
+    }
+    require(processed == prompt_tokens && image.first >= 0,
+            "explicit-position prefill did not finish its prompt");
+    require(program.abort(sequence).status == runtime::ConsumeStatus::Consumed,
+            "explicit-position prefill retained its execution resources");
+    require(program.physical_usage().occupied == empty,
+            "explicit-position prefill leaked physical resources");
+    return image;
+}
+
+void require_same_image(const PrefillImage& actual, const PrefillImage& expected,
+                        std::string_view what) {
+    require(actual.first == expected.first, std::string(what) + ": first token differs");
+    require(actual.logits == expected.logits, std::string(what) + ": last-token logits differ");
+    require(actual.kv == expected.kv, std::string(what) + ": text KV differs");
+    require(actual.state == expected.state, std::string(what) + ": GDN state differs");
+}
+
+// Positions i + 17 given explicitly (the prompt's rope_delta stays 0, so prefill cannot derive them
+// from the KV slot) must equal the slot + rope_delta path with rope_delta 17, bit for bit, whole
+// and in four layer slices.
+void explicit_positions_match_rope_delta(DeviceContext& device,
+                                         const qwen::execution::Parameters& parameters,
+                                         qwen::Frontend& frontend, EngineOptions options,
+                                         bool with_slices) {
+    const auto ids = long_prompt_ids(kLongPrompt);
+    std::vector<std::int32_t> offset(kLongPrompt);
+    for (std::uint32_t i = 0; i < kLongPrompt; ++i) {
+        offset[i] = static_cast<std::int32_t>(i) + kRopeOffset;
+    }
+    for (const KvCacheStorage storage : kPositionStorages) {
+        auto fixture = make_positions_program(device, parameters, options, storage, 1);
+        auto delta_prompt = qwen::PreparedPromptAccess::take(frontend.prepare_tokens(ids));
+        set_text_positions(delta_prompt, offset, kRopeOffset);
+        auto explicit_prompt = qwen::PreparedPromptAccess::take(frontend.prepare_tokens(ids));
+        set_text_positions(explicit_prompt, offset, 0);
+
+        const PrefillImage reference = prefill_image(*fixture.program, device, delta_prompt, 0);
+        const PrefillImage explicit_run =
+            prefill_image(*fixture.program, device, explicit_prompt, with_slices ? 4U : 0U);
+        require_same_image(explicit_run, reference,
+                           with_slices ? "explicit positions in four layer slices"
+                                       : "explicit positions");
+        if (!with_slices) {
+            // A guard against a vacuous pass: the slot positions (delta 0) are a different input.
+            auto slot_prompt = qwen::PreparedPromptAccess::take(frontend.prepare_tokens(ids));
+            const PrefillImage slot =
+                prefill_image(*fixture.program, device, std::move(slot_prompt), 0);
+            require(slot.logits != reference.logits,
+                    "positions i + 17 produced the logits of positions i");
+        }
+    }
+}
+
+void explicit_positions_equal_rope_delta_path(DeviceContext& device,
+                                              const qwen::execution::Parameters& parameters,
+                                              qwen::Frontend& frontend, EngineOptions options) {
+    explicit_positions_match_rope_delta(device, parameters, frontend, options, false);
+}
+
+void explicit_positions_with_layer_slices(DeviceContext& device,
+                                          const qwen::execution::Parameters& parameters,
+                                          qwen::Frontend& frontend, EngineOptions options) {
+    explicit_positions_match_rope_delta(device, parameters, frontend, options, true);
+}
+
+// A gapped prompt (kept tokens at their original positions, rope_delta raised by the dropped count)
+// paused with no snapshot is rebuilt by replay from its ledger. The replay must prefill with the
+// stored positions: the greedy continuation after the resume equals the run that never paused. The
+// first prefill runs in capped 200-token steps and replay in 512-token chunks, so a path that took
+// RoPE from the chunk layout (slot + a delta reset on the first chunk) would not agree with itself.
+void replay_preserves_gapped_positions(DeviceContext& device,
+                                       const qwen::execution::Parameters& parameters,
+                                       qwen::Frontend& frontend, EngineOptions options) {
+    constexpr std::uint32_t kGeneratedTokens = 32;
+    constexpr std::uint32_t kPauseAfter      = 8;
+    constexpr std::uint32_t kGapBegin        = 256;
+    constexpr std::uint32_t kPrefillStepCap  = 200;
+    const auto original = qwen::PreparedPromptAccess::take(
+        frontend.prepare_tokens(long_prompt_ids(kLongPrompt)));
+    // Keep every other 64-token block of U = [256, 3000) and its last 512 tokens.
+    std::vector<std::uint32_t> kept;
+    const std::uint32_t span = kLongPrompt - kGapBegin;
+    for (std::uint32_t offset = 0; offset < span; ++offset) {
+        if ((offset / 64) % 2 == 0 || offset + 512 >= span) { kept.push_back(offset); }
+    }
+    const auto map = qwen::detail::make_gap_map(original, kGapBegin, kept);
+    const auto gapped = qwen::detail::compact_prompt(original, map);
+    require(gapped.token_ids.size() == kGapBegin + kept.size() &&
+                gapped.rope_delta == static_cast<std::int32_t>(span - kept.size()) &&
+                gapped.positions[gapped.token_ids.size() - 1] ==
+                    static_cast<std::int32_t>(kLongPrompt - 1),
+            "the gapped prompt fixture is not the compacted original");
+    const auto gapped_tokens = static_cast<std::uint32_t>(gapped.token_ids.size());
+
+    for (const KvCacheStorage storage : kPositionStorages) {
+        auto fixture   = make_positions_program(device, parameters, options, storage, 2);
+        auto& program  = *fixture.program;
+        const auto empty = program.physical_usage().occupied;
+        runtime::ResolvedExecutionOptions request;
+        request.requested_output_tokens = 64;
+        request.allow_prefix_reuse      = false;
+
+        const auto reserve = [&](qwen::SequenceHandle sequence, qwen::ExecutionUnitKind kind,
+                                 std::uint32_t tokens = 0) {
+            const std::array<qwen::ExecutionUnit, 1> units{{{sequence, kind, tokens}}};
+            require(static_cast<bool>(program.reserve_units(units)),
+                    "gapped replay could not reserve a unit");
+        };
+        const auto bind = [&](qwen::RequestBasePlan& base, std::uint32_t lane,
+                              qwen::ResumeState* resume) {
+            auto source = program.inspect_source(base, std::nullopt);
+            require(source && static_cast<bool>(
+                                  program.start_binding(base, {lane}, *source, resume,
+                                                        qwen::ExecutionUnitKind::Decode, 1)),
+                    "gapped replay could not bind its lane");
+            auto progress = settle_positions(program, device);
+            require(progress.published && progress.sequence, "gapped replay did not publish");
+            require(!resume || progress.replaying, "gapped resume did not enter replay");
+            return *progress.sequence;
+        };
+        const auto prefill = [&](qwen::SequenceHandle sequence) {
+            std::uint32_t processed = 0;
+            for (unsigned call = 0; call < 64 && processed < gapped_tokens; ++call) {
+                // A capped step that ends mid-chunk returns without a token; keep going.
+                reserve(sequence, qwen::ExecutionUnitKind::Prefill);
+                auto step = program.advance_prefill(sequence, nullptr, nullptr, kPrefillStepCap);
+                processed += step.processed_prompt_tokens;
+                if (step.pending) {
+                    const TokenId first = step.pending->tokens().front();
+                    const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
+                    (void)program.commit(std::move(*step.pending), accepted, {}, nullptr);
+                    require(processed == gapped_tokens, "gapped prefill sampled early");
+                    return first;
+                }
+            }
+            throw std::runtime_error("gapped prefill did not finish its prompt");
+        };
+        const auto decode_round = [&](qwen::SequenceHandle sequence) {
+            reserve(sequence, qwen::ExecutionUnitKind::Decode, 64);
+            const std::array<qwen::SequenceHandle, 1> rows{sequence};
+            const std::array<runtime::RoundBudget, 1> budgets{{{.generated_tokens_remaining = 64}}};
+            auto pending        = program.decode(rows, budgets, nullptr, nullptr);
+            const TokenId token = pending.tokens().front();
+            const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
+            (void)program.commit(std::move(pending), accepted, {}, nullptr);
+            return token;
+        };
+
+        // The unpaused reference.
+        std::vector<TokenId> unpaused;
+        {
+            auto base = program.plan_request(qwen::PreparedPromptData(gapped), request);
+            const auto sequence = bind(base, 0, nullptr);
+            unpaused.push_back(prefill(sequence));
+            while (unpaused.size() < kGeneratedTokens) {
+                unpaused.push_back(decode_round(sequence));
+            }
+            require(program.abort(sequence).status == runtime::ConsumeStatus::Consumed,
+                    "the unpaused gapped run retained its resources");
+        }
+
+        std::vector<TokenId> resumed_tokens;
+        {
+            auto base = program.plan_request(qwen::PreparedPromptData(gapped), request);
+            const auto initial = bind(base, 0, nullptr);
+            resumed_tokens.push_back(prefill(initial));
+            while (resumed_tokens.size() < kPauseAfter) {
+                resumed_tokens.push_back(decode_round(initial));
+            }
+            require(program.start_pause(initial, false, nullptr), "gapped run could not pause");
+            auto paused = settle_positions(program, device);
+            require(paused.paused && !paused.paused->has_snapshot(),
+                    "gapped pause kept a snapshot, so nothing replays");
+            const auto resumed = bind(base, 1, &*paused.paused);
+            paused.paused.reset();
+            bool recovered = false;
+            for (unsigned step = 0; step < 64 && !recovered; ++step) {
+                reserve(resumed, qwen::ExecutionUnitKind::Replay);
+                recovered = program.advance_replay(resumed, nullptr).complete;
+            }
+            require(recovered, "gapped replay did not finish");
+            while (resumed_tokens.size() < kGeneratedTokens) {
+                resumed_tokens.push_back(decode_round(resumed));
+            }
+            require(program.abort(resumed).status == runtime::ConsumeStatus::Consumed,
+                    "the resumed gapped run retained its resources");
+        }
+        require(program.physical_usage().occupied == empty, "gapped replay leaked resources");
+        require(resumed_tokens == unpaused,
+                "a gapped prompt replayed after a pause decoded different greedy tokens");
+    }
+}
+
 SpeculativeBackend selected_backend(std::string_view name) {
     if (name == "none") { return SpeculativeBackend::None; }
     if (name == "mtp") { return SpeculativeBackend::Mtp; }
@@ -2775,6 +3155,12 @@ int main(int argc, char** argv) {
         sliced_prefill_matches_whole(device, parameters, frontend, options);
         sliced_prefill_beside_a_decoding_lane(device, parameters, frontend, options);
         replay_sampling_counts(device, parameters, frontend, options);
+        // A 3,000-token prompt needs a Frontend with a longer context than the fixtures above.
+        auto long_frontend = qwen::make_frontend(
+            model->resources(), {.vision_enabled = false, .max_context = kLongCapacity});
+        explicit_positions_equal_rope_delta_path(device, parameters, long_frontend, options);
+        explicit_positions_with_layer_slices(device, parameters, long_frontend, options);
+        replay_preserves_gapped_positions(device, parameters, long_frontend, options);
         std::cout << "OK native transaction cancellation, paused ownership and replay recovery\n";
         return 0;
     } catch (const std::exception& error) {

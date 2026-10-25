@@ -70,7 +70,8 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
 PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const TokenId> ids,
                                       std::uint32_t nominal_length,
                                       std::optional<std::uint32_t> split_frontier,
-                                      bool finalize_at_end, PrefillSliceState* slice) {
+                                      bool finalize_at_end, PrefillSliceState* slice,
+                                      std::span<const std::int32_t> rope_positions) {
     TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
@@ -88,9 +89,10 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
-                                  sink);
+                                  sink, rope_positions);
     }
-    return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end);
+    return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
+                              rope_positions);
 }
 
 PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
@@ -667,10 +669,16 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                                                                  *staged.vision, remaining,
                                                                  split_frontier, final_candidate);
                 } else {
+                    // Axis 0 of the prompt's positions; empty when slot + rope_delta gives them.
+                    const auto rope_positions =
+                        staged.regular_text_positions
+                            ? std::span<const std::int32_t>{}
+                            : std::span<const std::int32_t>(staged.prompt.positions.data(),
+                                                            staged.prompt.token_ids.size());
                     result = execution::prefill_text_chunk(
                         schedule_state, std::span<const TokenId>(staged.prompt.token_ids),
                         remaining, split_frontier, final_candidate,
-                        sliced_call ? &staged.slice : nullptr);
+                        sliced_call ? &staged.slice : nullptr, rope_positions);
                 }
                 timing.include(result.timing);
                 timing.resume_post();

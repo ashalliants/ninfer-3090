@@ -247,6 +247,10 @@ struct RequestControl {
         double elapsed_seconds           = 0.0;
         double retired_vision_seconds    = 0.0;
         bool prepare_mtp                 = false;
+        // Whether every prompt position from base on is index + rope_delta, so text prefill derives
+        // RoPE from the KV slot. False for a compacted lossy prompt (gapped original positions),
+        // whose chunks pass the stored positions instead.
+        bool regular_text_positions      = true;
         PrefixReusePath reuse            = PrefixReusePath::Root;
         MtpBridgeMode mtp_bridge         = MtpBridgeMode::None;
         // A chunk run in slices (execution::PrefillSliceState): where it stands, and how many
