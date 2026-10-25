@@ -501,6 +501,8 @@ void ProgramImpl::install_binding(ContextTransaction& tx) {
         state.prefix_identity.assign(*tx.base->prompt);
         state.prefix_digests          = tx.base->prefix_digests;
         state.rope_delta              = tx.base->prompt->rope_delta;
+        // The lineage is the plan's: a rewritten prompt is the kept identity whatever source binds.
+        state.gap_maps                = tx.base->gap_maps;
         state.text_kv_valid           = tx.reuse_frontier;
         state.mtp_kv_valid            = tx.backend_frontier;
         state.dflash_context_frontier = tx.reuse_frontier;

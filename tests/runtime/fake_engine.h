@@ -106,6 +106,7 @@ public:
     RequestBasePlan(std::uint64_t id, std::uint32_t prompt_tokens, std::uint32_t output_tokens) {
         id_                         = id;
         summary_.prompt_tokens      = prompt_tokens;
+        summary_.reported_prompt_tokens = prompt_tokens;
         summary_.requested_output_tokens = output_tokens;
         summary_.effective_output_tokens = output_tokens;
         summary_.effective_limit_reason  = FinishReason::OutputLimit;

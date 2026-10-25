@@ -207,6 +207,15 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
     if (!valid_sequence(handle)) { throw std::logic_error("prefill has a stale lane"); }
     const auto lane = ContractAccess::lane(handle).value;
     require_unit(lane, ExecutionUnitKind::Prefill);
+    if (const auto& lossy = requests[lane].lossy; lossy && requests[lane].prefill &&
+        lossy_step(lossy->phase, requests[lane].prefill->cursor, lossy->exact_end) !=
+            LossyStep::Ordinary) {
+        // A scout step maps its own pages past the committed frontier and keeps them between
+        // steps; settle_unit leaves them mapped while the scout runs.
+        auto progress = advance_lossy_scout(lane, timing, max_tokens);
+        settle_unit(lane);
+        return progress;
+    }
     auto& state = sequences[lane];
     prepare_capture_boundary(lane);
     const auto permit = *requests[lane].permit;
@@ -602,6 +611,12 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
 
         if (staged.cursor < staged.prompt_tokens) {
             std::uint32_t nominal = std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+            // A lossy request's Exact phase stops at M, where its scout begins.
+            if (request.lossy) {
+                nominal = std::min(nominal, lossy_step_limit(request.lossy->phase, staged.cursor,
+                                                             request.lossy->exact_end));
+                if (nominal == 0) { throw std::logic_error("lossy prefill step at M is a scout step"); }
+            }
             // A cap shortens the step only; the planned chunk and its reservation stay as they
             // were. A media item's span decides its own step, so a prompt with media keeps the plan.
             const std::uint32_t uncapped_nominal = nominal;

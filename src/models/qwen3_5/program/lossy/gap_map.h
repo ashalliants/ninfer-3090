@@ -69,9 +69,32 @@ using GapMapSet = std::vector<std::shared_ptr<const GapMap>>; // lineage order
 // nullopt unless the prompt has at least original_end tokens, no Vision tokens before
 // original_end, and token ids, types and all three position axes over [0, original_end) equal the
 // map's stored original exactly (the digest is only a quick reject); otherwise
-// compact_prompt(prompt, map). Rewrite frontiers do not take part in the match. Several maps of one
-// lineage apply in order, each to the previous result.
+// compact_prompt(prompt, map). Also nullopt, rather than a throw, where compaction could not
+// represent the result: an installed external prefix reaching past the map's begin, or a
+// rope_delta that would leave int32. Rewrite frontiers do not take part in the match. Several maps
+// of one lineage apply in order, each to the previous result.
 [[nodiscard]] std::optional<PreparedPromptData> apply_gap_map(const PreparedPromptData& prompt,
                                                               const GapMap& map);
+
+// The maps of a lineage a checkpoint at `frontier` holds kept tokens of (begin < frontier). A
+// shallower checkpoint does not depend on them and does not keep them alive.
+[[nodiscard]] inline GapMapSet gap_maps_through(const GapMapSet& lineage, std::uint32_t frontier) {
+    GapMapSet out;
+    for (const auto& map : lineage) {
+        if (map && map->begin < frontier) { out.push_back(map); }
+    }
+    return out;
+}
+
+struct GapMapRewrite {
+    PreparedPromptData prompt;
+    GapMapSet applied; // in the order they were applied: the prompt's lineage
+};
+
+// Rewrites a prompt with every map in `maps` that matches it, the one with the deepest
+// original_end first, each later one tried on the previous result, until none matches. Each map
+// applies at most once. Null entries are ignored. A prompt no map matches comes back unchanged.
+[[nodiscard]] GapMapRewrite rewrite_with_gap_maps(PreparedPromptData prompt,
+                                                  std::span<const std::shared_ptr<const GapMap>> maps);
 
 } // namespace ninfer::models::qwen3_5::detail

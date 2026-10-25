@@ -4,6 +4,8 @@
 
 #include <cstdint>
 #include <iostream>
+#include <limits>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -21,7 +23,9 @@ using ninfer::models::qwen3_5::detail::compact_prompt;
 using ninfer::models::qwen3_5::detail::gap_map_digest;
 using ninfer::models::qwen3_5::detail::GapMap;
 using ninfer::models::qwen3_5::detail::make_gap_map;
+using ninfer::models::qwen3_5::detail::GapMapSet;
 using ninfer::models::qwen3_5::detail::PositionRun;
+using ninfer::models::qwen3_5::detail::rewrite_with_gap_maps;
 using ninfer::models::qwen3_5::detail::ResidentPrefixIdentity;
 
 void require(bool ok, const std::string& what) {
@@ -324,6 +328,81 @@ void test_rejects_invalid_input() {
     require(compact_prompt(external, map).external_prefix_tokens == 4, "external prefix up to M");
 }
 
+
+// Where compaction would throw (an installed graft reaching into U, a rope_delta past int32), the
+// map does not apply: planning must treat it as no rewrite, never fail the request.
+void test_apply_returns_nullopt_where_compaction_would_throw() {
+    const PreparedPromptData original = text_prompt(20);
+    const GapMap map                  = make_gap_map(original, 4, kKept);
+    PreparedPromptData external       = extend(original, 7, 500);
+    external.external_prefix_tokens   = 5;
+    require(!apply_gap_map(external, map).has_value(), "external prefix inside U: no rewrite");
+    external.external_prefix_tokens = 4;
+    require(apply_gap_map(external, map).has_value(), "external prefix up to M is rewritten");
+    PreparedPromptData far = extend(original, 7, 500);
+    far.rope_delta         = std::numeric_limits<std::int32_t>::max() - 3; // + 11 dropped overflows
+    require(!apply_gap_map(far, map).has_value(), "rope_delta overflow: no rewrite");
+}
+
+std::shared_ptr<const GapMap> shared_map(GapMap map) {
+    return std::make_shared<const GapMap>(std::move(map));
+}
+
+// Planning applies every live map that matches, deepest original_end first, each to the previous
+// result, so a lineage's maps compose in any registry order and an unrelated map is ignored.
+void test_rewrite_applies_lineage_in_any_order() {
+    const PreparedPromptData original = text_prompt(20);
+    const auto first                  = shared_map(make_gap_map(original, 4, kKept));
+    const PreparedPromptData turn2    = extend(original, 10, 500);
+    const auto turn2_rewritten        = apply_gap_map(turn2, *first);
+    require(turn2_rewritten.has_value(), "turn 2 rewritten");
+    const auto second =
+        shared_map(make_gap_map(*turn2_rewritten, 9, std::vector<std::uint32_t>{0, 8, 9}));
+    const auto unrelated = shared_map(make_gap_map(extend(text_prompt(4), 16, 900), 4, kKept));
+    const PreparedPromptData turn3 = extend(turn2, 3, 700);
+
+    const GapMapSet registry{unrelated, second, first};
+    const auto rewritten = rewrite_with_gap_maps(turn3, registry);
+    require(rewritten.applied.size() == 2 && rewritten.applied[0] == first &&
+                rewritten.applied[1] == second,
+            "both lineage maps applied in lineage order");
+    const auto expected = apply_gap_map(*apply_gap_map(turn3, *first), *second);
+    require(rewritten.prompt.token_ids == expected->token_ids &&
+                rewritten.prompt.positions == expected->positions &&
+                rewritten.prompt.rope_delta == expected->rope_delta,
+            "rewrite equals the maps applied in order");
+
+    PreparedPromptData other = text_prompt(25);
+    other.token_ids[2]       = 9999; // before every map's begin
+    const auto none          = rewrite_with_gap_maps(other, registry);
+    require(none.applied.empty() && none.prompt.token_ids == other.token_ids,
+            "a prompt no map matches is unchanged");
+}
+
+// Two maps that both match the raw prompt: the one covering more of it wins, and the other, which
+// no longer matches the rewritten prompt, is not applied.
+void test_rewrite_prefers_the_deepest_map() {
+    const PreparedPromptData original = text_prompt(20);
+    const auto shallow                = shared_map(make_gap_map(original, 4, kKept));
+    const PreparedPromptData longer   = extend(original, 10, 500);
+    const auto deep = shared_map(make_gap_map(longer, 4, std::vector<std::uint32_t>{0, 1, 25}));
+    const PreparedPromptData prompt = extend(longer, 2, 800);
+    const auto rewritten            = rewrite_with_gap_maps(prompt, GapMapSet{shallow, deep});
+    require(rewritten.applied.size() == 1 && rewritten.applied[0] == deep, "deepest map applied");
+    require(rewritten.prompt.token_ids == compact_prompt(prompt, *deep).token_ids,
+            "deep compaction");
+}
+
+// A map that drops nothing rewrites a prompt to itself; it is applied once, not forever.
+void test_rewrite_applies_each_map_once() {
+    const PreparedPromptData original = text_prompt(8);
+    std::vector<std::uint32_t> all{0, 1, 2, 3, 4, 5};
+    const auto identity = shared_map(make_gap_map(original, 2, all));
+    const auto rewritten = rewrite_with_gap_maps(extend(original, 3, 500), GapMapSet{identity});
+    require(rewritten.applied.size() == 1, "identity map applied once");
+    require(rewritten.prompt.token_ids.size() == 11, "identity map keeps every token");
+}
+
 } // namespace
 
 int main() {
@@ -339,6 +418,10 @@ int main() {
         test_digest_collision_is_not_enough();
         test_two_maps_apply_in_order();
         test_rejects_invalid_input();
+        test_apply_returns_nullopt_where_compaction_would_throw();
+        test_rewrite_applies_lineage_in_any_order();
+        test_rewrite_prefers_the_deepest_map();
+        test_rewrite_applies_each_map_once();
         std::cout << "lossy gap map tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

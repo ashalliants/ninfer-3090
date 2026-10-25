@@ -12,6 +12,8 @@
 #include "core/decode_graph.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 
+#include "models/qwen3_5/program/lossy/gap_map.h"
+#include "models/qwen3_5/program/lossy/lossy_flow.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
 #include "models/qwen3_5/program/storage/host_kv_store.h"
@@ -69,6 +71,10 @@ struct RequestBasePlanImpl {
     PrefixShortlistDigests prefix_digests;
     std::uint32_t prefix_identity_tag = 0;
     bool allow_prefix_reuse           = false;
+    // The lossy lineage planning rewrote the prompt with (empty: the prompt is the client's), and
+    // whether the request may take the lossy path (see LossyPlan).
+    GapMapSet gap_maps;
+    std::optional<LossyPlan> lossy;
     // The prepared n-gram copy index, moved out of the prompt at planning and into the request's
     // control by its one fresh binding; a resumed binding carries the control's own. Only the
     // Engine worker touches it after planning.
@@ -198,6 +204,9 @@ struct SequenceState {
     std::uint32_t mtp_draft_count = 0;
     bool tail_hidden_valid        = false;
     bool endpoint_valid           = false;
+    // The lossy lineage of the ledger (lineage order): the maps from the original prompts to it.
+    // Every checkpoint taken from the sequence past a map's begin carries that map.
+    GapMapSet gap_maps;
 };
 
 struct CaptureReservation {
@@ -263,6 +272,14 @@ struct RequestControl {
 
     std::optional<Prefill> prefill;
     std::optional<Prefill> replay;
+
+    // A request on the lossy prefill path (enable_lossy): its phase (lossy_flow.h) and M.
+    struct Lossy {
+        LossyPhase phase                     = LossyPhase::Exact;
+        std::uint32_t exact_end              = 0;
+        double scout_seconds                 = 0.0;
+    };
+    std::optional<Lossy> lossy;
 };
 
 struct CheckpointState {
@@ -275,6 +292,8 @@ struct CheckpointState {
     std::uint32_t backend_frontier = 0;
     std::int32_t rope_delta        = 0;
     bool tail_hidden_valid         = false;
+    // The lossy lineage of the identity: the maps whose kept tokens it holds (begin < frontier).
+    GapMapSet gap_maps;
 };
 
 struct CheckpointSlot {
@@ -413,6 +432,23 @@ public:
     [[nodiscard]] std::vector<float> scout_scores() const;
     void end_scout(SequenceHandle);
     [[nodiscard]] bool scout_active(SequenceHandle) const noexcept;
+    // ---- Lossy prefill phases (lossy_flow.h; see Program::enable_lossy) ----
+    [[nodiscard]] bool enable_lossy(SequenceHandle);
+    // Whether the lane is a lossy request that may not pause or capture now (lossy_flow.h).
+    [[nodiscard]] bool lane_refuses_pause(std::uint32_t lane) const noexcept;
+    [[nodiscard]] bool lane_holds_captures(std::uint32_t lane) const noexcept;
+    // One Scout step (EnterScout or Scout in lossy_step); the step that scores U also selects,
+    // compacts and moves the request to Main.
+    [[nodiscard]] PrefillProgress advance_lossy_scout(std::uint32_t lane, runtime::ExecutionTiming*,
+                                                      std::uint32_t max_tokens);
+    void finish_lossy_scout(std::uint32_t lane, PrefillProgress& progress);
+    void install_compacted_prompt(std::uint32_t lane, PreparedPromptData&& compacted,
+                                  std::shared_ptr<const GapMap> map);
+    // The live maps of the registry, pruning expired ones.
+    [[nodiscard]] GapMapSet live_gap_maps();
+    // The tail of plan_request shared with a lossy compaction: the prompt's digests, identity and
+    // capture groups.
+    void finish_request_plan(RequestBasePlanImpl& base, PreparedPromptData&& prompt) const;
 
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle, runtime::ExecutionTiming*,
                                                   runtime::TokenMaskProvider*,
@@ -558,6 +594,11 @@ public:
     };
     std::optional<ScoutSession> scout_session;
     [[nodiscard]] std::uint32_t scout_lane(SequenceHandle) const;
+    // Lossy prefill: the options, the tokenizer's special and added token ids (sorted; always kept
+    // by selection) and every gap map some sequence or checkpoint still holds.
+    LossyPrefillOptions lossy_options;
+    std::vector<TokenId> lossy_special_tokens;
+    std::vector<std::weak_ptr<const GapMap>> gap_map_registry;
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
     Tensor grammar_masks_device;

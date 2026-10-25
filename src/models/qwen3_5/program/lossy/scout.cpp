@@ -183,9 +183,12 @@ std::vector<float> ProgramImpl::scout_scores() const {
 }
 
 void ProgramImpl::end_scout(SequenceHandle handle) {
-    const auto lane              = scout_lane(handle);
-    const ScoutSession& session  = *scout_session;
-    auto& sequence               = active_sequence(lane);
+    const auto lane             = scout_lane(handle);
+    // The session ends here whatever follows: a check that throws below leaves no scout behind to
+    // wedge the lane (its caller clears the lane on failure).
+    const ScoutSession session  = *scout_session;
+    scout_session.reset();
+    auto& sequence              = active_sequence(lane);
     if (session.restore_state && scout_buffers->gdn_saved) {
         copy_gdn_layers(*scout_buffers->gdn_saved, 0, state_images->linear(0),
                         session.state_source, scout_buffers->gdn_saved->layer_count(),
@@ -198,7 +201,6 @@ void ProgramImpl::end_scout(SequenceHandle handle) {
     if (text_kv_addresses->mapped_pages(text) != session.mapped_pages) {
         throw std::logic_error("scout end did not return the lane's KV mapping");
     }
-    scout_session.reset();
 }
 
 } // namespace ninfer::models::qwen3_5::detail

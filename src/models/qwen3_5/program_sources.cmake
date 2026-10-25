@@ -36,6 +36,7 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/transactions/replay.cpp"
 
   "${CMAKE_CURRENT_LIST_DIR}/program/lossy/gap_map.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/lossy/phases.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/lossy/scout.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/lossy/selection.cpp"
 

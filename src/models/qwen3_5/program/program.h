@@ -100,6 +100,15 @@ private:
                                                  const EngineOptions&);
 };
 
+// A request the lossy long-prompt prefill can take (docs/maintainer/lossy-long-prefill.md): the
+// Program has the scout scratch, and the prompt is text only, has no installed graft and was not
+// rewritten onto a lossy lineage. `exact_end` is the planned end of the product prompt, the deepest
+// SharedStablePrefix opportunity (0 without one); the request's M is
+// max(exact_end, reuse frontier), and the trigger compares prompt_tokens - M with the threshold.
+struct LossyPlan {
+    std::uint32_t exact_end = 0;
+};
+
 class RequestBasePlan {
 public:
     RequestBasePlan(RequestBasePlan&&) noexcept;
@@ -117,6 +126,8 @@ public:
     [[nodiscard]] std::vector<std::uint32_t> shared_prefix_frontiers() const;
     [[nodiscard]] std::optional<PrefixShortlistKey>
     prefix_shortlist_key(std::uint32_t frontier) const noexcept;
+    // Set when the request may take the lossy prefill path; see LossyPlan.
+    [[nodiscard]] std::optional<LossyPlan> lossy() const noexcept;
 
 private:
     explicit RequestBasePlan(std::shared_ptr<detail::RequestBasePlanImpl> impl) noexcept;
@@ -314,9 +325,29 @@ private:
     friend struct detail::ContractAccess;
 };
 
+// How a lossy prefill's selection came out, reported once, by the step that ends the scout.
+struct LossyOutcome {
+    std::uint32_t exact_end       = 0; // M
+    std::uint32_t uncached_tokens = 0; // |U| = original prompt tokens - M
+    std::uint32_t kept_tokens     = 0; // of U; equals uncached_tokens when skipped
+    bool skipped                  = false; // nothing dropped: Main prefills all of U, no gap map
+    double scout_seconds          = 0.0;
+};
+
 struct PrefillProgress {
     runtime::BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
+    // Lossy prefill only: prompt tokens this step scouted (its processed_prompt_tokens is then 0;
+    // the cursor stays at M during the scout).
+    std::uint32_t scouted_tokens = 0;
+    // Lossy prefill only, on the step that ends the scout: the request's prompt_tokens from now on
+    // (the compacted length; unchanged when skipped), the selection's outcome and, when the prompt
+    // was compacted, the plan that now describes the request (summary, capture frontiers and
+    // identity). The caller replaces its own plan with it: binding a resumed request to one of its
+    // later checkpoints, for one, matches against the compacted identity.
+    std::optional<std::uint32_t> compacted_prompt_tokens;
+    std::optional<RequestBasePlan> compacted_plan;
+    std::optional<LossyOutcome> lossy;
     bool complete                         = false;
     // Some layers of the step's chunk ran and the rest wait for the next call (layer_slices).
     bool partial = false;
@@ -544,6 +575,16 @@ public:
     DeviceSnapshot::Stats suspend_device_state(DeviceSnapshot& snapshot);
     DeviceSnapshot::Stats resume_device_state(DeviceSnapshot& snapshot);
     [[nodiscard]] bool context_blocks(SequenceHandle sequence) const noexcept;
+    // Turns on the lossy prefill path for a freshly bound request whose plan has lossy() set, before
+    // its first prefill step (docs/maintainer/lossy-long-prefill.md). Its next steps then prefill
+    // exactly up to M = max(lossy()->exact_end, reuse frontier), scout [M, end), select and
+    // compact, and prefill the kept tokens; PrefillProgress reports scouted_tokens and, once,
+    // compacted_prompt_tokens. Scout steps are reserved as Prefill units, honour max_tokens and are
+    // never layer-sliced. While the scout runs the lane cannot be paused (start_pause returns
+    // false) or captured; abort is always allowed. Returns false, with nothing changed, for a
+    // request it cannot take: no scout scratch (lossy prefill off, MoE or split model), a plan
+    // without lossy(), a multimodal or resumed request, one already advanced, or M at the prompt end.
+    [[nodiscard]] bool enable_lossy(SequenceHandle sequence);
     // A resumed binding retains its complete recovery capacity until committed new progress.
     [[nodiscard]] bool recovery_pending(SequenceHandle sequence) const noexcept;
     // Overlay Vision residency; every call is a no-op for a resident or text-only Program.

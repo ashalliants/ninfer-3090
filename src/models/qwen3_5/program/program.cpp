@@ -123,6 +123,10 @@ RequestBasePlan::prefix_shortlist_key(std::uint32_t frontier) const noexcept {
     };
 }
 
+std::optional<LossyPlan> RequestBasePlan::lossy() const noexcept {
+    return impl_ != nullptr ? impl_->lossy : std::nullopt;
+}
+
 ResumeState::ResumeState(std::unique_ptr<detail::ResumeStateImpl> impl) noexcept
     : impl_(std::move(impl)) {}
 
@@ -293,6 +297,8 @@ ContextProgress Program::poll_context(runtime::CancellationFlagView c) {
 bool Program::context_blocks(SequenceHandle sequence) const noexcept {
     return impl_->context_blocks(sequence);
 }
+
+bool Program::enable_lossy(SequenceHandle sequence) { return impl_->enable_lossy(sequence); }
 
 bool Program::recovery_pending(SequenceHandle sequence) const noexcept {
     return impl_->recovery_pending(sequence);

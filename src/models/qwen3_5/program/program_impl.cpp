@@ -2,6 +2,7 @@
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/execution_context.h"
 #include "models/qwen3_5/execution/linear.h"
+#include "models/qwen3_5/frontend/tokenizer.h"
 #include "core/startup.h"
 #include "core/device.h"
 #include <cuda_runtime.h>
@@ -456,6 +457,18 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             buffers.gdn_saved = std::make_unique<LinearAttentionStatePool>(backing, *layout.gdn_state);
         }
         buffers.filter_layer = layout.filter_layer;
+        lossy_options        = plan.lossy_prefill;
+        // Selection always keeps the chat structure: role markers, tool-call delimiters and every
+        // other added token of the tokenizer, special or not.
+        if (const auto& tokenizer = parameters.model.resources().tokenizer) {
+            for (const auto& token : tokenizer->added_tokens()) {
+                lossy_special_tokens.push_back(static_cast<TokenId>(token.id));
+            }
+            std::sort(lossy_special_tokens.begin(), lossy_special_tokens.end());
+            lossy_special_tokens.erase(
+                std::unique(lossy_special_tokens.begin(), lossy_special_tokens.end()),
+                lossy_special_tokens.end());
+        }
     }
     if (plan.persistent.score_hidden) {
         score_hidden = plan.persistent.score_hidden->bind(backing);

@@ -31,6 +31,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace ninfer::models::qwen3_5::detail {
@@ -926,6 +927,14 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
             "loaded components do not match the requested execution options");
     }
     if (options.lossy_prefill.enabled()) {
+        // Dense, single-device Qwen3.5 only (docs/maintainer/lossy-long-prefill.md, "Non-goals"):
+        // refused here, before any scout scratch is planned.
+        if (std::holds_alternative<MoeConfig>(parameters.model.config().text.ffn)) {
+            throw std::invalid_argument("lossy prefill supports only the dense Qwen3.5 models");
+        }
+        if (parameters.text.split_execution()) {
+            throw std::invalid_argument("lossy prefill does not support a pipeline-split model");
+        }
         // Throws unless the filter layer is one of the model's full-attention layers.
         (void)scout_gdn_layers(parameters.model.config().text.layer_types,
                                options.lossy_prefill.filter_layer);

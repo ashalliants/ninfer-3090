@@ -287,7 +287,41 @@ std::optional<PreparedPromptData> apply_gap_map(const PreparedPromptData& prompt
     }
     if (gap_map_digest(prompt, map.original_end) != map.digest) { return std::nullopt; }
     if (!matches_original(prompt, map)) { return std::nullopt; }
+    // What compact_prompt would reject for this prompt (not for the map) is no rewrite.
+    if (prompt.external_prefix_tokens > map.begin ||
+        static_cast<std::int64_t>(prompt.rope_delta) + map.dropped_tokens() >
+            std::numeric_limits<std::int32_t>::max()) {
+        return std::nullopt;
+    }
     return compact_prompt(prompt, map);
+}
+
+GapMapRewrite rewrite_with_gap_maps(PreparedPromptData prompt,
+                                    std::span<const std::shared_ptr<const GapMap>> maps) {
+    std::vector<const std::shared_ptr<const GapMap>*> order;
+    order.reserve(maps.size());
+    for (const auto& map : maps) {
+        if (map) { order.push_back(&map); }
+    }
+    std::stable_sort(order.begin(), order.end(), [](const auto* a, const auto* b) {
+        return (*a)->original_end > (*b)->original_end;
+    });
+    GapMapRewrite out{.prompt = std::move(prompt), .applied = {}};
+    std::vector<bool> used(order.size(), false);
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (std::size_t i = 0; i < order.size(); ++i) {
+            if (used[i]) { continue; }
+            auto rewritten = apply_gap_map(out.prompt, **order[i]);
+            if (!rewritten) { continue; }
+            used[i]    = true;
+            out.prompt = std::move(*rewritten);
+            out.applied.push_back(*order[i]);
+            changed = true;
+            break; // the deepest remaining map is tried first on the new prompt
+        }
+    }
+    return out;
 }
 
 } // namespace ninfer::models::qwen3_5::detail
