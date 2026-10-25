@@ -257,17 +257,6 @@ KldSummary summarize(std::span<const ScoredRow> rows) {
     return s;
 }
 
-std::vector<std::pair<int, int>> decode_windows(int first, int end, int width) {
-    if (width <= 0) { throw std::invalid_argument("decode_windows: width must be positive"); }
-    std::vector<std::pair<int, int>> windows;
-    for (int begin = first; begin < end;) {
-        const int stop = end - begin > width ? begin + width : end;
-        windows.emplace_back(begin, stop);
-        begin = stop;
-    }
-    return windows;
-}
-
 namespace {
 
 int parse_positive(std::string_view text, const char* flag, int maximum) {
@@ -284,7 +273,8 @@ int parse_positive(std::string_view text, const char* flag, int maximum) {
 } // namespace
 
 int parse_decode_window(std::string_view text) {
-    return parse_positive(text, "--decode-window", 16);
+    return parse_positive(text, "--decode-window",
+                          static_cast<int>(kMaximumScoringDecodeWindow));
 }
 
 int parse_kld_chunks(std::string_view text) {

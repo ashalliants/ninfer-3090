@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <iostream>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -198,6 +199,82 @@ void check_dflash(std::uint32_t capacity, std::uint32_t draft_window, std::uint3
     }
 }
 
+
+// Decode scoring runs eagerly with served_decode_envelope. At every frontier its envelope must be
+// the one the served graph captured for the profile holding that frontier -- the ordinary graph's
+// {min+1, max+1}, or the MTP round's target verify {1, min(capacity, max+K+1)}, rebuilt here from
+// the round's own formula -- because the kernels read more of the envelope than the route (the
+// INT8 chunk tier, the small-T plan, the BF16 plan's minimum). It must also cover the live keys,
+// and so resolve the route and launch shape the served graph replays.
+void check_served_decode(std::uint32_t capacity, std::uint32_t width,
+                         const MtpGraphAttention& attention, bool every_frontier) {
+    namespace detail   = ninfer::models::qwen3_5::detail;
+    const auto profiles = detail::served_decode_profiles(capacity, width, attention);
+    const auto label    = [&](std::uint32_t frontier) {
+        return "served decode capacity=" + std::to_string(capacity) +
+               " T=" + std::to_string(width) + " f=" + std::to_string(frontier) +
+               " heads=" + std::to_string(attention.geometry.query_heads) +
+               " kv=" + std::to_string(static_cast<int>(attention.storage));
+    };
+    const auto served = width == 1
+                            ? ninfer::models::qwen3_5::detail::ordinary_graph_profiles(capacity)
+                            : detail::mtp_graph_profiles(capacity, width - 1U, attention);
+    for (const auto& profile : served) {
+        std::vector<std::uint32_t> frontiers{profile.min, profile.max};
+        for (std::uint32_t f = profile.min + 1; every_frontier && f < profile.max; ++f) {
+            frontiers.push_back(f);
+        }
+        const CausalAttentionExecutionEnvelope captured =
+            width == 1 ? CausalAttentionExecutionEnvelope{profile.min + 1, profile.max + 1}
+                       : CausalAttentionExecutionEnvelope{
+                             1U, static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                                     capacity, static_cast<std::uint64_t>(profile.max) + width))};
+        const CausalAttentionRoute replayed = causal_attention_resolve_route(
+            attention.geometry.query_heads, static_cast<std::int32_t>(width), 1, attention.storage,
+            captured);
+        const auto replayed_shape = ninfer::ops::causal_softmax_attention_launch_shape(
+            attention.geometry, attention.storage, captured, 1, static_cast<std::int32_t>(width),
+            {nullptr, attention.multiprocessor_count});
+        for (const std::uint32_t frontier : frontiers) {
+            const CausalAttentionExecutionEnvelope envelope =
+                detail::served_decode_envelope(profiles, capacity, width, frontier);
+            if (envelope.min_visible_keys != captured.min_visible_keys ||
+                envelope.max_visible_keys != captured.max_visible_keys) {
+                std::cerr << label(frontier) << ": envelope {" << envelope.min_visible_keys << ","
+                          << envelope.max_visible_keys << "} is not the captured {"
+                          << captured.min_visible_keys << "," << captured.max_visible_keys
+                          << "}\n";
+                ++failures;
+            }
+            const std::uint64_t live_end =
+                std::min<std::uint64_t>(capacity, static_cast<std::uint64_t>(frontier) + width);
+            if (envelope.min_visible_keys > frontier + 1U || envelope.max_visible_keys < live_end) {
+                std::cerr << label(frontier) << ": envelope does not cover the live keys\n";
+                ++failures;
+            }
+            const CausalAttentionRoute route = causal_attention_resolve_route(
+                attention.geometry.query_heads, static_cast<std::int32_t>(width), 1,
+                attention.storage, envelope);
+            const auto shape = ninfer::ops::causal_softmax_attention_launch_shape(
+                attention.geometry, attention.storage, envelope, 1,
+                static_cast<std::int32_t>(width), {nullptr, attention.multiprocessor_count});
+            if (route != replayed || !(shape == replayed_shape)) {
+                std::cerr << label(frontier) << ": scoring resolves "
+                          << causal_attention_route_name(route) << ", served graph replays "
+                          << causal_attention_route_name(replayed) << "\n";
+                ++failures;
+            }
+        }
+    }
+    bool refused = false;
+    try {
+        (void)detail::served_decode_envelope(profiles, capacity, width, capacity);
+    } catch (const std::logic_error&) { refused = true; }
+    if (!refused) {
+        std::cerr << label(capacity) << ": a frontier past the capacity was accepted\n";
+        ++failures;
+    }
+}
 } // namespace
 
 int main() {
@@ -220,6 +297,19 @@ int main() {
                         }
                     }
                 }
+            }
+        }
+    }
+    // Decode scoring's served envelopes: every frontier at short contexts, profile ends at long.
+    for (const AttentionHeadGeometry geometry : kGeometries) {
+        for (const KvCacheStorage storage : kStorages) {
+            const MtpGraphAttention attention{
+                .geometry = geometry, .storage = storage, .multiprocessor_count = 82};
+            for (std::uint32_t width = 1; width <= ninfer::kMaximumScoringDecodeWindow; ++width) {
+                for (const std::uint32_t capacity : {512U, 2048U}) {
+                    check_served_decode(capacity, width, attention, true);
+                }
+                check_served_decode(65536U, width, attention, false);
             }
         }
     }

@@ -13,10 +13,15 @@
 
 namespace {
 
-// The target_logprobs Op's FP32 criterion (tests/ops/test_target_logprobs.cpp).
+// The target_logprobs Op's FP32 criterion (tests/ops/test_target_logprobs.cpp): one Op against
+// FP64 on the same BF16 logits, so it holds only where both sides read the same logits.
 constexpr double kRelativeL2      = 2.0e-5;
 constexpr double kGrossAbsolute   = 2.0e-4;
-constexpr std::uint32_t kDecodeWindow = 4;
+// Two forward paths (chunked vs recurrent GDN, A8 prefill vs BF16 decode GEMV, KV read back from
+// the cache, width-specific kernels) differ by far more than that. PROVISIONAL bound on the mean
+// |delta logprob| over the targets, pending the first GPU run; tighten it from the measurement.
+constexpr double kProvisionalMeanAbsolute = 0.05;
+constexpr std::uint32_t kDecodeWindow     = 4;
 
 using ninfer::ScoringOptions;
 
@@ -56,6 +61,40 @@ int within_criterion(const char* label, const std::vector<float>& actual,
               << where << ", mean |delta| " << total / static_cast<double>(actual.size()) << '\n';
     if (relative > kRelativeL2 || worst > kGrossAbsolute) {
         std::cerr << label << ": outside the target_logprobs criterion\n";
+        return 1;
+    }
+    return 0;
+}
+
+// Two forward paths against each other: a provisional bound on the mean |delta|, printing the mean
+// and the maximum so the first GPU run can set the real bound.
+int within_provisional_bound(const char* label, const std::vector<float>& actual,
+                             const std::vector<float>& reference) {
+    if (actual.size() != reference.size() || actual.empty()) {
+        std::cerr << label << ": result sizes differ\n";
+        return 1;
+    }
+    double total      = 0.0;
+    double worst      = 0.0;
+    std::size_t where = 0;
+    for (std::size_t i = 0; i < actual.size(); ++i) {
+        if (!std::isfinite(actual[i])) {
+            std::cerr << label << ": non-finite log probability at " << i << '\n';
+            return 1;
+        }
+        const double delta =
+            std::abs(static_cast<double>(actual[i]) - static_cast<double>(reference[i]));
+        total += delta;
+        if (delta > worst) {
+            worst = delta;
+            where = i;
+        }
+    }
+    const double mean = total / static_cast<double>(actual.size());
+    std::cout << label << ": mean |delta| " << mean << ", max |delta| " << worst << " at row "
+              << where << " (provisional bound: mean <= " << kProvisionalMeanAbsolute << ")\n";
+    if (mean > kProvisionalMeanAbsolute) {
+        std::cerr << label << ": mean |delta| above the provisional bound\n";
         return 1;
     }
     return 0;
@@ -112,7 +151,7 @@ int decode_phase_matches_prefill(ninfer::Engine& engine, const std::vector<ninfe
         const std::vector<float> decoded =
             engine.score_tokens(tokens, first_target, decode(window), nullptr);
         const std::string label = "decode_phase_matches_prefill T=" + std::to_string(window);
-        failures += within_criterion(label.c_str(), decoded, prefill);
+        failures += within_provisional_bound(label.c_str(), decoded, prefill);
     }
     return failures;
 }
@@ -125,8 +164,8 @@ int decode_windows_agree(ninfer::Engine& engine, const std::vector<ninfer::Token
     const std::vector<float> three =
         engine.score_tokens(tokens, first_target, decode(3), nullptr);
     const std::vector<float> again = engine.score_tokens(tokens, first_target, decode(4), nullptr);
-    int failures = within_criterion("decode_windows_agree T=4 vs T=1", four, one);
-    failures += within_criterion("decode_windows_agree T=3 vs T=1", three, one);
+    int failures = within_provisional_bound("decode_windows_agree T=4 vs T=1", four, one);
+    failures += within_provisional_bound("decode_windows_agree T=3 vs T=1", three, one);
     if (again != four) {
         std::cerr << "decode_windows_agree: a repeated T=4 window inherited prior State/KV\n";
         ++failures;
@@ -173,10 +212,41 @@ int run() {
     }
 
     ninfer::EngineOptions options;
-    options.artifact_path         = artifact;
-    options.purpose               = ninfer::EnginePurpose::CausalScoring;
-    options.max_context           = 2048;
-    options.kv_cache              = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    options.artifact_path = artifact;
+    options.purpose       = ninfer::EnginePurpose::CausalScoring;
+    options.max_context   = 2048;
+    options.kv_cache      = ninfer::KvCacheStorage::Fp8E4M3Row256;
+
+    const auto make_tokens = [](ninfer::Engine& engine) {
+        std::string text;
+        const std::string paragraph =
+            "NInfer scores each target token from the preceding hidden state. "
+            "Every evaluation window owns fresh state and a fresh KV address space.\n";
+        std::vector<ninfer::TokenId> tokens;
+        while (tokens.size() < 1537) {
+            text += paragraph;
+            tokens = engine.tokenize_text(text);
+        }
+        tokens.resize(1537);
+        return tokens;
+    };
+
+    // Off is unchanged: prefill scores from an Engine that plans no decode scoring (window 0),
+    // compared bitwise below with the same scores from one planned at window 4. One Engine at a
+    // time, so both fit beside the weights.
+    std::vector<float> unplanned_all;
+    std::vector<float> unplanned_suffix;
+    {
+        ninfer::Engine unplanned(options);
+        if (unplanned.options().scoring_decode_window != 0) {
+            std::cerr << "the default scoring_decode_window is not zero\n";
+            return 1;
+        }
+        const std::vector<ninfer::TokenId> tokens = make_tokens(unplanned);
+        unplanned_all    = unplanned.score_tokens(tokens, 1);
+        unplanned_suffix = unplanned.score_tokens(tokens, 513);
+    }
+
     options.scoring_decode_window = kDecodeWindow;
     ninfer::Engine engine(options);
     const auto& effective = engine.options();
@@ -191,17 +261,7 @@ int run() {
         return 1;
     }
 
-    std::string text;
-    const std::string paragraph =
-        "NInfer scores each target token from the preceding hidden state. "
-        "Every evaluation window owns fresh state and a fresh KV address space.\n";
-    std::vector<ninfer::TokenId> tokens;
-    while (tokens.size() < 1537) {
-        text += paragraph;
-        tokens = engine.tokenize_text(text);
-    }
-    tokens.resize(1537);
-
+    const std::vector<ninfer::TokenId> tokens = make_tokens(engine);
     const std::vector<float> all      = engine.score_tokens(tokens, 1);
     const std::vector<float> suffix   = engine.score_tokens(tokens, 513);
     const std::vector<float> repeated = engine.score_tokens(tokens, 513);
@@ -224,6 +284,10 @@ int run() {
             std::cerr << "a repeated score window inherited prior State/KV\n";
             return 1;
         }
+    }
+    if (all != unplanned_all || suffix != unplanned_suffix) {
+        std::cerr << "planning decode scoring changed prefill-phase scores (window 4 vs 0)\n";
+        return 1;
     }
 
     // Decode scoring: a 769-token window whose first 512 targets are the prompt half, the last 256

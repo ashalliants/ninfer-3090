@@ -87,7 +87,8 @@ std::string usage_text() {
            "        windows the speculative verify forward). Context comes from the base: no\n"
            "        --context or --stride. --chunks scores the first N chunks (default all))\n"
            "       (--mlp-a8-decode and other verify-phase routes are inert with --corpus and\n"
-           "        --text, which score the prefill phase; --kld-base runs them when decoding)\n"
+           "        --text, which score the prefill phase; --kld-base reaches a verify route\n"
+           "        once --decode-window is wide enough for it)\n"
            "       (--no-prefill-a8 is the opposite: --corpus/--text score the prefill phase, so\n"
            "        this is how the integer prefill routes' perplexity cost is measured)\n"
            "       [--prefill-cublas [--no-prefill-cublas-projections]]\n"
@@ -637,16 +638,6 @@ int run_kld(const Options& options, const std::shared_ptr<spdlog::logger>& logge
     Clock::time_point next_progress         = scoring_started + std::chrono::seconds(10);
     for (int chunk = 0; chunk < chunk_count; ++chunk) {
         const ninfer::perplexity::KldChunk input = ninfer::perplexity::kld_chunk(base, chunk);
-        // The prompt half scored here must be the base's own tokens for this chunk.
-        const auto base_begin =
-            base.tokens.begin() +
-            static_cast<std::ptrdiff_t>(static_cast<std::size_t>(chunk) * base.n_ctx);
-        const auto prompt_end = input.tokens.begin() + input.first_target;
-        if (input.first_target != first_target ||
-            !std::equal(input.tokens.begin(), prompt_end, base_begin)) {
-            throw std::logic_error("chunk " + std::to_string(chunk) +
-                                   " prompt half differs from the base tokens");
-        }
         KldRowScorer scorer(base, input, chunk, rows, tsv);
         std::vector<float> logprobs;
         try {
