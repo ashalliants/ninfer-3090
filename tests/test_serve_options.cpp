@@ -468,7 +468,7 @@ int main() {
     {
         const auto& l = defaults.lossy_prefill;
         failures += check(!l.enabled() && l.min_tokens == 0, "lossy prefill is not off by default");
-        failures += check(l.keep_fraction == 0.2F && l.filter_layer == 15 && l.block_tokens == 64 &&
+        failures += check(l.keep_fraction == 0.3F && l.filter_layer == 7 && l.block_tokens == 64 &&
                               l.recent_tokens == 4096 && l.head_tokens == 256 && l.query_rows == 64 &&
                               l.pool_window == 33 && l.skip_fraction == 0.8F && !l.scout_a4 &&
                               l.strategy == ninfer::LossyStrategy::Select && l.summary_max_tokens == 8000,

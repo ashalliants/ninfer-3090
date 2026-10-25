@@ -76,6 +76,9 @@ public:
         options.admission_fit_check   = settings.admission_fit_check;
         options.lossy_prefill.min_tokens = settings.lossy_min_tokens;
         options.lossy_prefill.strategy   = settings.lossy_strategy;
+        // The fake Program keeps 0.2 of U (fake::Program::set_lossy_keep); the Engine prices the
+        // main pass with the same share, so the backlog checks stay independent of the default.
+        options.lossy_prefill.keep_fraction = 0.2F;
         for (const auto& [group, frontier] : settings.shared_prefixes) {
             instance_.external_checkpoints.push_back(
                 instance_.program->add_shared_prefix(group, frontier));
@@ -1521,7 +1524,7 @@ void test_lossy_counters_and_request_log() {
     const auto report = completed.get().lossy_prefill;
     require(report && report->outcome == LossyPrefillOutcome::Completed &&
                 report->uncached_tokens == kLossyPrompt - kMarker &&
-                report->kept_tokens == kLossyKept && report->filter_layer == 15 &&
+                report->kept_tokens == kLossyKept && report->filter_layer == 7 &&
                 report->scout_ms > 0.0 && report->main_ms > 0.0,
             "the completed request's lossy report is wrong");
     rig.program().set_lossy_keep(1.0);

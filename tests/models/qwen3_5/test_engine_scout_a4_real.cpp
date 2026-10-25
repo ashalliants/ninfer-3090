@@ -50,6 +50,9 @@ ninfer::EngineOptions scout_options(const char* artifact, bool a4) {
     options.prefill_a8                        = true; // the int8 scout is the A8 routes
     options.lossy_prefill.min_tokens          = 16384;
     options.lossy_prefill.scout_a4            = a4;
+    // The shape the int4 go/no-go measured (2026-10-25): filter layer 15, keep 0.2.
+    options.lossy_prefill.filter_layer        = 15;
+    options.lossy_prefill.keep_fraction       = 0.2F;
     options.speculative.backend               = ninfer::SpeculativeBackend::None;
     return options;
 }

@@ -290,15 +290,17 @@ enum class LossyStrategy : std::uint8_t {
 enum class LossySummaryProbe : std::uint8_t { Cold, Warm, Timeout };
 
 // Lossy long-prompt prefill: past a threshold, a cheap scout pass scores blocks of the prompt and
-// only the kept blocks are prefilled (the rest never enter the KV cache). Off by default.
+// only the kept blocks are prefilled (the rest never enter the KV cache). Off by default. The
+// selection defaults (filter layer 7, keep 0.3, block 64) are the fastest point that passed every
+// gate of the 2026-10-25 sweep (docs/maintainer/lossy-long-prefill.md, "Results").
 struct LossyPrefillOptions {
     // Prompts whose part after the product prompt (the leading System/Developer messages and tools)
     // has more than this many tokens are filtered. 0 (the default) is off.
     std::uint32_t min_tokens = 0;
     // Share of the filtered part's blocks to keep, in (0, 1].
-    float keep_fraction = 0.2F;
+    float keep_fraction = 0.3F;
     // Full-attention layer whose scores pick the blocks (checked against the model at startup).
-    std::uint32_t filter_layer = 15;
+    std::uint32_t filter_layer = 7;
     // Block size in tokens: a multiple of 16, at least 16.
     std::uint32_t block_tokens = 64;
     // Tokens at the end and at the start of the filtered part that are always kept.

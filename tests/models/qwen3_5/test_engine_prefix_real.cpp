@@ -1367,6 +1367,10 @@ int exercise_lossy_prefill(const char* artifact) {
     options.context_cache.device_state_slots  = 4;
     options.context_cache.host_capacity_bytes = 0;
     options.lossy_prefill.min_tokens          = 30000;
+    // The selection measured on the GPU before the 2026-10-25 defaults changed (filter layer 15,
+    // keep 0.2): the test checks reuse and alias bookkeeping, not the shipped selection.
+    options.lossy_prefill.filter_layer        = 15;
+    options.lossy_prefill.keep_fraction       = 0.2F;
     ninfer::Engine engine(std::move(options));
     const auto text_message = ninfer::test::lossy_text_message;
     // A product prompt, then about 40K tokens of records (tests/models/qwen3_5/lossy_fixture.h).

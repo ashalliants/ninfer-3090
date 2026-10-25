@@ -45,6 +45,10 @@ ninfer::EngineOptions lossy_options(const char* artifact, const Spec* spec) {
     options.context_cache.device_state_slots  = 4;
     options.context_cache.host_capacity_bytes = 0;
     options.lossy_prefill.min_tokens          = 30000;
+    // The selection measured on the GPU before the 2026-10-25 defaults changed (filter layer 15,
+    // keep 0.2): the test checks reuse and alias bookkeeping, not the shipped selection.
+    options.lossy_prefill.filter_layer        = 15;
+    options.lossy_prefill.keep_fraction       = 0.2F;
     options.speculative.backend               = ninfer::SpeculativeBackend::None;
     // DFlash2 needs FP16 Gated DeltaNet state; the plain reference uses it too, so the two
     // engines differ only in speculation (FP32 state alone moves greedy output at token 17).
