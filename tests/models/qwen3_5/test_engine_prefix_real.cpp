@@ -1,5 +1,6 @@
 #include "ninfer/engine.h"
 #include "kv_cache_storage.h"
+#include "lossy_fixture.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -1367,49 +1368,15 @@ int exercise_lossy_prefill(const char* artifact) {
     options.context_cache.host_capacity_bytes = 0;
     options.lossy_prefill.min_tokens          = 30000;
     ninfer::Engine engine(std::move(options));
-    const auto text_message = [](ninfer::ChatRole role, std::string text) {
-        ninfer::ChatMessage message;
-        message.role = role;
-        message.parts.push_back(ninfer::MessagePart{
-            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
-        return message;
-    };
-    // A product prompt (system message and a tool: the shared marker ends it), then about 40K
-    // tokens of records the selection can thin out. The record count is sized from the prepared
-    // length: numbers tokenize digit by digit, so a fixed count would miss the target.
-    const auto record = [](int i) {
-        return "Record " + std::to_string(i) + ": shelf " + std::to_string((i * 37) % 101) +
-               " holds " + std::to_string((i * 53) % 997) + " units of part " +
-               std::to_string(1000 + i) + ".\n";
-    };
-    const auto make_input = [&](int records) {
-        ninfer::PromptInput built;
-        built.context_cache.session_key = "lossy-follow-up";
-        built.options.tool_jsons.push_back(
-            R"({"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}}})");
-        built.messages.push_back(text_message(ninfer::ChatRole::System,
-                                              "You answer questions about the inventory records."));
-        std::string text;
-        for (int i = 0; i < records; ++i) { text += record(i); }
-        built.messages.push_back(text_message(
-            ninfer::ChatRole::User, text + "\nWhich shelf holds part 1007? Answer briefly."));
-        return built;
-    };
-    const auto measured = [&](int records) {
-        return engine.prepare(make_input(records)).summary().prompt_tokens;
-    };
-    constexpr std::uint32_t kTarget = 40000;
-    const std::uint32_t base_tokens  = measured(0);
-    const std::uint32_t probe_tokens = measured(500);
-    const double per_record = static_cast<double>(probe_tokens - base_tokens) / 500.0;
-    int records = static_cast<int>(static_cast<double>(kTarget - base_tokens) / per_record);
-    // The estimate is linear in the record digits; correct it on the measured length.
-    for (int round = 0; round < 4; ++round) {
-        const std::uint32_t tokens = measured(records);
-        if (tokens + 500 >= kTarget && tokens <= kTarget + 500) { break; }
-        records += static_cast<int>((static_cast<double>(kTarget) - tokens) / per_record);
+    const auto text_message = ninfer::test::lossy_text_message;
+    // A product prompt, then about 40K tokens of records (tests/models/qwen3_5/lossy_fixture.h).
+    ninfer::PromptInput input;
+    try {
+        input = ninfer::test::lossy_fixture_40k(engine, "lossy-follow-up");
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
     }
-    ninfer::PromptInput input = make_input(records);
     ninfer::RequestOptions request;
     request.execution.requested_output_tokens = 8;
     request.execution.sampling.temperature    = 0.0F;
@@ -1418,10 +1385,6 @@ int exercise_lossy_prefill(const char* artifact) {
 
     auto first_prompt                 = engine.prepare(input);
     const std::uint32_t first_tokens  = first_prompt.summary().prompt_tokens;
-    if (first_tokens < 36000 || first_tokens > 44000) {
-        std::cerr << "lossy fixture prompt has " << first_tokens << " tokens, not about 40K\n";
-        return 1;
-    }
     const auto before = engine.runtime_stats();
     auto first        = engine.generate(std::move(first_prompt), request);
     const auto after  = engine.runtime_stats();

@@ -155,6 +155,22 @@ add_test(NAME ninfer_qwen3_5_lossy_prefill_real_test
 set_tests_properties(ninfer_qwen3_5_lossy_prefill_real_test PROPERTIES
   ENVIRONMENT "NINFER_PREFIX_REAL_SCENARIO=lossy")
 
+# Speculative decoding after a lossy long-prompt prefill (40K prompt, rk4v4, keep 0.2): 128 greedy
+# tokens with MTP or DFlash2 must equal the same lossy prefill decoded without speculation.
+ninfer_add_test(ninfer_qwen3_5_lossy_spec_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_lossy_spec_real.cpp"
+  LIBRARIES ninfer_engine)
+ninfer_bundle_command(ninfer_qwen3_5_lossy_spec_real_command ninfer_tests
+  ninfer_qwen3_5_lossy_spec_real_test)
+add_test(NAME ninfer_qwen3_5_dflash2_after_lossy_real_test
+  COMMAND ${ninfer_qwen3_5_lossy_spec_real_command})
+set_tests_properties(ninfer_qwen3_5_dflash2_after_lossy_real_test PROPERTIES
+  ENVIRONMENT "NINFER_LOSSY_SPEC_REAL=dflash2")
+add_test(NAME ninfer_qwen3_5_mtp_after_lossy_real_test
+  COMMAND ${ninfer_qwen3_5_lossy_spec_real_command})
+set_tests_properties(ninfer_qwen3_5_mtp_after_lossy_real_test PROPERTIES
+  ENVIRONMENT "NINFER_LOSSY_SPEC_REAL=mtp")
+
 # A real-model test owns the single GPU while its artifact is resident.
 set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_loading_real_test
@@ -162,6 +178,9 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_prefix_real_test
   ninfer_qwen3_5_agent_continuation_real_test
   ninfer_qwen3_5_lossy_prefill_real_test
+  ninfer_qwen3_5_lossy_spec_real_test
+  ninfer_qwen3_5_dflash2_after_lossy_real_test
+  ninfer_qwen3_5_mtp_after_lossy_real_test
   ninfer_qwen3_5_context_store_real_test
   ninfer_qwen3_5_context_store_dflash2_real_test
   ninfer_qwen3_5_context_store_ngram_real_test
