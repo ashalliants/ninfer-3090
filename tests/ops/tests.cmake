@@ -81,6 +81,11 @@ ninfer_add_op_test(ninfer_qsa_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qsa.cpp"
   LIBRARIES ninfer_ops)
 
+# Per-key softmax mass summed over query rows and heads (lossy-prefill scout) against FP64.
+ninfer_add_op_test(ninfer_attention_key_mass_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_attention_key_mass.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_candidate_selector_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_candidate_selector.cpp"
   LIBRARIES ninfer_ops)
