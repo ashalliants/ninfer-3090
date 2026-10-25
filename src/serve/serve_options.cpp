@@ -174,7 +174,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--reasoning-loop off|stop|conclude] "
            "[--vision] [--vision-residency resident|overlay] [--vision-max-merged N] "
            "[--no-cuda-graph] [--no-prefix-reuse] [--devices N,M,...] [--stage-layers A,B,...] "
-           "[--ngram-volume FILE] [--expert-state FILE|--no-expert-state] [--vram-headroom-mib N] "
+           "[--ngram-volume FILE] [--ngram-keepalive-ms N] [--expert-state FILE|--no-expert-state] "
+           "[--vram-headroom-mib N] "
            "[--ram-headroom-mib N] [--expert-cache-mib N] [--context-nvme-mib N [--context-nvme-dir DIR]] "
            "[--chat-template FILE] "
            "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
@@ -249,7 +250,9 @@ std::string serve_usage_text(const char* argv0) {
            "--context-nvme-mib N, in a scratch file of up to N MiB on local disk (removed at exit; "
            "--context-nvme-dir DIR, default beside the model) with --host-context-mib as its RAM "
            "cache (0: disk only); --context-store DIR keeps it across restarts; "
-           "--ngram-volume FILE is its n-gram table (default <model>.ngram); --expert-state FILE "
+           "--ngram-volume FILE is its n-gram table (default <model>.ngram); --ngram-keepalive-ms N "
+           "reads a block from it after N ms of idleness so the drive stays awake (default 40, "
+           "0 turns it off); --expert-state FILE "
            "keeps the VRAM expert cache's state across restarts (default <model>.expert-state; "
            "--no-expert-state starts it empty and saves nothing); --vram-headroom-mib N is the VRAM "
            "the expert cache leaves free for the desktop (default 512 with a display, 256 without); "
@@ -647,6 +650,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.use_cuda_graph = false;
         } else if (arg == "--ngram-volume") {
             options.flash_next.ngram_volume_path = require_value("--ngram-volume");
+        } else if (arg == "--ngram-keepalive-ms") {
+            const int ms = parse_nonnegative_int(require_value("--ngram-keepalive-ms"), "ngram-keepalive-ms");
+            if (ms > 60000) { throw std::invalid_argument("--ngram-keepalive-ms must be in [0, 60000]"); }
+            options.flash_next.ngram_keepalive_ms = static_cast<std::uint32_t>(ms);
         } else if (arg == "--expert-state") {
             options.flash_next.expert_state_path = require_value("--expert-state");
             if (options.flash_next.expert_state_path.empty()) {

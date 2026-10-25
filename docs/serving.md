@@ -165,6 +165,7 @@ the Qwen3.5 models:
 | Flash-Next option | Meaning | Default |
 |---|---|---|
 | `--ngram-volume FILE` | the per-layer n-gram embedding volume | `<model>.ngram` |
+| `--ngram-keepalive-ms N` | read one block of the n-gram volume after N ms idle so the drive does not sleep (SSDs sleep after about 100 ms); `0` turns it off; changes timing only | `40` (was a fixed 100) |
 | `--expert-state FILE` | where the expert cache's state is saved and read | `<model>.expert-state` |
 | `--no-expert-state` | start the expert cache empty and save nothing | off |
 | `--vram-headroom-mib N` | VRAM the expert cache leaves free for the desktop and other programs | 512 with a display, 256 without |

@@ -325,6 +325,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.context_nvme_bytes   = nvme_bytes;
     program_options.context_nvme_path    = nvme_path;
     program_options.context_bounce_bytes = kNvmeBounceBytes;
+    program_options.ngram_keepalive_ms = next.ngram_keepalive_ms;
     program_options.ngram_volume    = next.ngram_volume_path.empty()
                                           ? models::qwen4_exp::default_ngram_volume(options.artifact_path)
                                           : next.ngram_volume_path;

@@ -102,7 +102,8 @@ int main() {
                           defaults.flash_next.expert_state_path.empty() &&
                           defaults.flash_next.save_expert_state && !defaults.flash_next.vram_headroom_bytes &&
                           !defaults.flash_next.expert_cache_bytes &&
-                          defaults.flash_next.ram_headroom_bytes == (2ULL << 30),
+                          defaults.flash_next.ram_headroom_bytes == (2ULL << 30) &&
+                          defaults.flash_next.ngram_keepalive_ms == 40,
                       "Flash-Next defaults mismatch");
     const ServeOptions flash = parse({"ninfer-serve", "model.ninfer", "--ngram-volume", "K:/v.ngram",
                                       "--expert-state", "K:/s.state", "--vram-headroom-mib", "300",
@@ -117,6 +118,23 @@ int main() {
                       "Flash-Next options do not reach the Engine");
     failures += check(!parse({"ninfer-serve", "model.ninfer", "--no-expert-state"}).flash_next.save_expert_state,
                       "--no-expert-state did not turn the saved state off");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--ngram-keepalive-ms", "25"})
+                              .flash_next.ngram_keepalive_ms == 25,
+                      "--ngram-keepalive-ms was not parsed");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--ngram-keepalive-ms", "0"})
+                              .flash_next.ngram_keepalive_ms == 0,
+                      "--ngram-keepalive-ms 0 did not turn the keep-alive off");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--ngram-keepalive-ms", "25"}))
+                              .flash_next.ngram_keepalive_ms == 25,
+                      "--ngram-keepalive-ms does not reach the Engine");
+    {
+        bool negative_rejected = false, huge_rejected = false;
+        try { (void)parse({"ninfer-serve", "model.ninfer", "--ngram-keepalive-ms", "-1"}); }
+        catch (const std::invalid_argument&) { negative_rejected = true; }
+        try { (void)parse({"ninfer-serve", "model.ninfer", "--ngram-keepalive-ms", "60001"}); }
+        catch (const std::invalid_argument&) { huge_rejected = true; }
+        failures += check(negative_rejected && huge_rejected, "--ngram-keepalive-ms accepted a value outside [0, 60000]");
+    }
 
     // Without --default-max-tokens an omitted request limit is derived per request as the prompt's
     // remaining context, bounded above by --max-context; the flag replaces it with a fixed cap.

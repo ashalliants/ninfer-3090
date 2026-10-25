@@ -342,6 +342,8 @@ struct ProgramOptions {
     std::uint32_t prefill_chunk   = 1024;
     bool use_cuda_graph           = true;
     std::filesystem::path ngram_volume;
+    // The n-gram volume's keep-alive period in milliseconds (0: off); see FlashNextOptions.
+    std::uint32_t ngram_keepalive_ms = 40;
     // The expert cache's saved state: read at startup to fill the frames (warm start), written at
     // shutdown and, between requests, every 10 minutes. Empty: no warm start. The identity names
     // the artifact the state belongs to.
