@@ -3484,6 +3484,9 @@ qwen::RequestBasePlan lossy_request(qwen::detail::ProgramImpl& program, qwen::Fr
         {.kind     = PromptCacheMarkerKind::SharedStablePrefix,
          .evidence = SharedCandidateEvidence::ExplicitBoundary,
          .frontier = kLossyMarker});
+    // M is the product prompt's end (lossy_planned_exact_end); an explicit marker alone no
+    // longer sets it, so the raw-token prompt declares its product prompt ending at the marker.
+    prepared.context_cache.product_prompt_end = kLossyMarker;
     runtime::ResolvedExecutionOptions request;
     request.requested_output_tokens = output_tokens;
     request.allow_prefix_reuse      = true;
