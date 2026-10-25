@@ -6,12 +6,14 @@
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/execution/workspace.h"
+#include "models/qwen3_5/program/lossy/scout_plan.h"
 
 #include "core/nvtx.h"
 #include "models/qwen3_5/execution/visual_scatter.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_control.h"
 #include "ninfer/ops/argmax.h"
+#include "ninfer/ops/attention_key_mass.h"
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "ninfer/ops/embedding.h"
@@ -837,13 +839,10 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
     proposal_argmax(hidden, logits, draft_tokens);
 }
 
-void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph) {
+TextContext::AttentionInputs TextContext::attention_inputs(const BlockParameters& w, Tensor& x) {
     const auto& p  = std::get<AttentionParameters>(w.mixer);
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
-    if (active_causal_attention_envelope_ == nullptr) {
-        throw std::logic_error("Text GQA execution envelope is not set");
-    }
 
     const auto projection        = workspace::text_attention_projection(work_, config_, T);
     Tensor h                     = projection.hidden;
@@ -877,15 +876,30 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
                                              dimension(config_.attention->num_key_value_heads), T});
     ops::rmsnorm(q, p.query_norm, config_.rms_norm_eps, true, qn, s);
     ops::rmsnorm(k, p.key_norm, config_.rms_norm_eps, true, kn, s);
-    const Tensor& cache_positions =
-        active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
     text_rope(rope_for_op, *config_.rope_parameters, qn, kn, ctx_.execution_view());
+    return {.gate = gate, .value = v, .query = qn, .key = kn, .attention = results.attention};
+}
 
-    Tensor a = results.attention.view({dimension(config_.attention->head_dim),
-                                       dimension(config_.attention->num_attention_heads), T});
+void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph) {
+    const auto& p  = std::get<AttentionParameters>(w.mixer);
+    cudaStream_t s = ctx_.stream;
+    const int T    = x.ne[1];
+    if (active_causal_attention_envelope_ == nullptr) {
+        throw std::logic_error("Text GQA execution envelope is not set");
+    }
+    const AttentionInputs inputs = attention_inputs(w, x);
+    Tensor gate                  = inputs.gate;
+    Tensor v                     = inputs.value;
+    Tensor qn                    = inputs.query;
+    Tensor kn                    = inputs.key;
+    const Tensor& cache_positions =
+        active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
+
+    Tensor a = inputs.attention.view({dimension(config_.attention->head_dim),
+                                      dimension(config_.attention->num_attention_heads), T});
     const Tensor& kv_table_rows =
         active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
     if (active_sequence_batch_ != 0) {
@@ -1851,6 +1865,151 @@ PrefillChunkResult TextContext::prefill_chunk(const qwen3_5::PreparedPromptData&
     const MultimodalPrefill multimodal{tokens, input.positions, &vision, begin, input.rope_delta};
     return prefill_impl(tokens.subspan(begin, nominal_length), nullptr, &multimodal, sink,
                         finalize_at_end);
+}
+
+PrefillChunkResult TextContext::scout_chunk(const TextPrefill& prompt, std::uint32_t u_begin,
+                                            std::uint32_t begin, std::uint32_t len,
+                                            std::uint32_t filter_layer, ScoutScratch& scratch) {
+    runtime::ExecutionTimingRecorder timing;
+    if (prompt.token_ids.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::overflow_error("scout prompt token count exceeds int32");
+    }
+    const auto prompt_tokens = static_cast<std::uint32_t>(prompt.token_ids.size());
+    if (len == 0 || begin < u_begin || begin >= prompt_tokens || len > prompt_tokens - begin) {
+        throw std::invalid_argument("scout chunk is outside the uncached span");
+    }
+    if (begin != text_kv_base_) {
+        throw std::invalid_argument("scout chunk does not start at its KV base");
+    }
+    const bool explicit_positions = !prompt.rope_positions.empty();
+    if (explicit_positions && prompt.rope_positions.size() < prompt.token_ids.size()) {
+        throw std::invalid_argument("scout RoPE positions do not cover the prompt");
+    }
+    if (parameters_.text.split_execution()) {
+        throw std::logic_error("the scout runs on a single device only");
+    }
+    if (filter_layer >= parameters_.text.layers.size() ||
+        config_.layer_types[filter_layer] != MixerKind::FullAttention) {
+        throw std::invalid_argument("scout filter layer is not a full-attention layer");
+    }
+    const std::uint32_t span     = prompt_tokens - u_begin;
+    const std::int32_t head_dim  = dimension(config_.attention->head_dim);
+    const std::int32_t q_heads   = dimension(config_.attention->num_attention_heads);
+    const std::int32_t kv_heads  = dimension(config_.attention->num_key_value_heads);
+    const Tensor& keys_root      = scratch.filter_keys;
+    const Tensor& queries_root   = scratch.last_queries;
+    const Tensor& scores_root    = scratch.scores;
+    if (keys_root.dtype != DType::BF16 || keys_root.ne[0] != head_dim ||
+        keys_root.ne[1] != kv_heads || keys_root.ne[2] < 0 ||
+        static_cast<std::uint32_t>(keys_root.ne[2]) < span || keys_root.ne[3] != 1 ||
+        !keys_root.is_contiguous() || keys_root.data == nullptr) {
+        throw std::invalid_argument("scout filter keys do not hold the uncached span");
+    }
+    if (scores_root.dtype != DType::FP32 || scores_root.ne[0] < 0 ||
+        static_cast<std::uint32_t>(scores_root.ne[0]) < span || scores_root.ne[1] != 1 ||
+        !scores_root.is_contiguous() || scores_root.data == nullptr) {
+        throw std::invalid_argument("scout scores do not hold the uncached span");
+    }
+    if (queries_root.dtype != DType::BF16 || queries_root.ne[0] != head_dim ||
+        queries_root.ne[1] != q_heads || queries_root.ne[2] <= 0 || queries_root.ne[3] != 1 ||
+        !queries_root.is_contiguous() || queries_root.data == nullptr) {
+        throw std::invalid_argument("scout query rows are invalid");
+    }
+    const auto query_rows = static_cast<std::uint32_t>(queries_root.ne[2]);
+
+    cudaStream_t s           = ctx_.stream;
+    const int T              = static_cast<int>(std::min(len, prefill_chunk_));
+    const auto begin_i       = static_cast<std::int32_t>(begin);
+    const bool ends_prompt   = begin + static_cast<std::uint32_t>(T) == prompt_tokens;
+    work_.reset();
+    if (prefill_gpu_timer_) { prefill_gpu_timer_->start(); }
+    {
+        nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
+                                      static_cast<std::uint64_t>(T));
+        ops::set_i32_scalar(io_.rope_delta, rope_delta_, s);
+        const std::int32_t rope_axes = explicit_positions || rope_delta_ != 0 ? 1 : 0;
+        const auto roots = workspace::text_prefill_roots(work_, config_, T, rope_axes, 0, false);
+        Tensor ids_device = roots.ids;
+        copy_i32(prompt.token_ids.data() + begin, ids_device, s);
+        Tensor positions = roots.positions;
+        ops::fill_i32_positions(positions, begin_i, s);
+        Tensor rope_positions = positions;
+        if (explicit_positions) {
+            rope_positions = roots.rope_positions;
+            copy_i32(prompt.rope_positions.data() + begin, rope_positions, s);
+        } else if (rope_delta_ != 0) {
+            rope_positions = roots.rope_positions;
+            ops::offset_i32_positions(positions, io_.rope_delta, rope_positions, s);
+        }
+        ScopedPositions scoped_cache(active_cache_positions_, positions);
+        ScopedPositions scoped_rope(active_rope_positions_, rope_positions);
+        const auto visible = static_cast<std::uint32_t>(begin_i + T);
+        const ops::CausalAttentionExecutionEnvelope chunk_envelope{visible, visible};
+        ScopedEnvelope scoped_envelope(active_causal_attention_envelope_, chunk_envelope);
+
+        Tensor x = roots.residual;
+        embed_tokens(ids_device, *embed_, parameters_.text.token_embedding_signs, x, s);
+        for (const cudaEvent_t event : layer_ready_) { CUDA_CHECK(cudaStreamWaitEvent(s, event, 0)); }
+        layer_ready_ = {};
+        NullTap tap;
+        run_stage_layers(0, x, Phase::Prefill, tap, 0, filter_layer);
+
+        nvtx::ScopedRange filter_range(nvtx::Name::PrefillAttention, nvtx::Category::Attention,
+                                       filter_layer);
+        try {
+            auto scope                   = work_.scope();
+            const AttentionInputs inputs = attention_inputs(parameters_.text.layers[filter_layer], x);
+            Tensor keys = keys_root.slice(2, static_cast<std::int32_t>(begin - u_begin), T);
+            if (!inputs.key.is_contiguous() || inputs.key.bytes() != keys.bytes()) {
+                throw std::logic_error("scout keys do not match their scratch rows");
+            }
+            CUDA_CHECK(cudaMemcpyAsync(keys.data, inputs.key.data, keys.bytes(),
+                                       cudaMemcpyDeviceToDevice, s));
+            const qwen3_5::detail::ScoutQueryRows rows = qwen3_5::detail::scout_query_rows(
+                u_begin, prompt_tokens, query_rows, begin, static_cast<std::uint32_t>(T));
+            if (rows.count != 0) {
+                Tensor target = queries_root.slice(2, static_cast<std::int32_t>(rows.row),
+                                                   static_cast<std::int32_t>(rows.count));
+                const Tensor source =
+                    inputs.query.slice(2, static_cast<std::int32_t>(rows.chunk_offset),
+                                       static_cast<std::int32_t>(rows.count));
+                if (!source.is_contiguous() || source.bytes() != target.bytes()) {
+                    throw std::logic_error("scout queries do not match their scratch rows");
+                }
+                CUDA_CHECK(cudaMemcpyAsync(target.data, source.data, target.bytes(),
+                                           cudaMemcpyDeviceToDevice, s));
+            }
+            if (ends_prompt) {
+                const auto count =
+                    qwen3_5::detail::scout_query_row_count(u_begin, prompt_tokens, query_rows);
+                const Tensor q = queries_root.slice(2, 0, static_cast<std::int32_t>(count));
+                const Tensor k = keys_root.slice(2, 0, static_cast<std::int32_t>(span));
+                Tensor out     = scores_root.slice(0, 0, static_cast<std::int32_t>(span));
+                // The model's attention scale, as attn_mix applies it.
+                ops::attention_key_mass(
+                    q, k,
+                    static_cast<float>(1.0 /
+                                       std::sqrt(static_cast<double>(config_.attention->head_dim))),
+                    out, work_, s);
+            }
+        } catch (const std::exception& error) {
+            throw std::runtime_error("text/layers/" + std::to_string(filter_layer) +
+                                     " scout filter columns=" + std::to_string(T) + ": " +
+                                     error.what());
+        }
+    }
+    if (prefill_gpu_timer_) { prefill_gpu_timer_->record_stop(); }
+    timing.begin_wait();
+    ctx_.synchronize();
+    timing.end_wait();
+    if (prefill_gpu_timer_) {
+        timing.include({.gpu_elapsed_ns = static_cast<std::uint64_t>(
+                            static_cast<double>(prefill_gpu_timer_->elapsed_ms()) * 1.0e6 + 0.5)});
+    }
+    work_.reset();
+    return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(T),
+                              .finalized        = ends_prompt,
+                              .timing           = timing.finish()};
 }
 
 } // namespace ninfer::models::qwen3_5::execution

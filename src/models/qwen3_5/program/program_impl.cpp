@@ -446,6 +446,17 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         throw std::logic_error("DFlash decode frame does not match the sequence plan");
     }
     prefill_hidden = plan.persistent.prefill_hidden.bind(backing);
+    if (plan.persistent.scout) {
+        const ScoutLayout& layout = *plan.persistent.scout;
+        ScoutBuffers& buffers     = scout_buffers.emplace();
+        buffers.scratch           = {.filter_keys  = layout.filter_keys.bind(backing),
+                                     .last_queries = layout.last_queries.bind(backing),
+                                     .scores       = layout.scores.bind(backing)};
+        if (layout.gdn_state) {
+            buffers.gdn_saved = std::make_unique<LinearAttentionStatePool>(backing, *layout.gdn_state);
+        }
+        buffers.filter_layer = layout.filter_layer;
+    }
     if (plan.persistent.score_hidden) {
         score_hidden = plan.persistent.score_hidden->bind(backing);
     }

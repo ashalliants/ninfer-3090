@@ -385,6 +385,35 @@ public:
     [[nodiscard]] std::unique_ptr<execution::VisionPrefillSession>
     make_vision_session(const PreparedPromptData& prompt, const VisionPrefillPlan& plan);
 
+    // ---- Lossy-prefill scout (docs/maintainer/lossy-long-prefill.md, "Scout pass") ----
+    // Present only when the plan has the scout scratch (lossy prefill on, one device).
+    //
+    // begin_scout opens a scout over U = [cursor, prompt end) of a Prefilling text lane whose
+    // cursor sits at the end of its cached prefix C. When the lane writes the state its main pass
+    // reads (no fork pending), the GDN conv and recurrent states of the layers below the filter
+    // layer are copied to the scout's saved slot. advance_scout runs the next scout chunk
+    // (TextContext::scout_chunk) at most `max_tokens` (0: the prefill chunk) wide: its KV goes to
+    // the lane's own pages past the committed frontier (mapped from the free pool; `reserved` is
+    // false and nothing runs when the pool is short), its GDN states advance in place, and the
+    // lane's cursor, ledger, frontier and fork are left alone. The chunk that ends the prompt
+    // scores U (scout_scores). end_scout, after the last chunk or to abort part-way, copies the
+    // saved states back, releases the scout's pages and restores the lane's growth reservation,
+    // so the lane is exactly as begin_scout found it. A lane cleared while scouting drops the
+    // scout. One scout at a time. The lane must not be settled (settle_unit truncates mapped
+    // pages) between begin_scout and end_scout.
+    struct ScoutStep {
+        std::uint32_t processed_tokens = 0;
+        bool complete                  = false; // U is scored
+        bool reserved                  = true;  // false: too few free KV pages, nothing ran
+        runtime::ExecutionTiming timing;
+    };
+    void begin_scout(SequenceHandle);
+    [[nodiscard]] ScoutStep advance_scout(SequenceHandle, std::uint32_t max_tokens = 0);
+    // Per-token key mass of U, in prompt order. Only after the scout's last chunk.
+    [[nodiscard]] std::vector<float> scout_scores() const;
+    void end_scout(SequenceHandle);
+    [[nodiscard]] bool scout_active(SequenceHandle) const noexcept;
+
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle, runtime::ExecutionTiming*,
                                                   runtime::TokenMaskProvider*,
                                                   std::uint32_t max_tokens   = 0,
@@ -504,6 +533,31 @@ public:
     std::optional<DFlashPersistentState> dflash;
     qwen3_5::RoundState io;
     Tensor prefill_hidden;
+    // The scout's scratch (see begin_scout), bound from the persistent layout's ScoutLayout.
+    struct ScoutBuffers {
+        execution::ScoutScratch scratch;
+        // The saved GDN states of the layers below the filter layer, one slot. Null when no GDN
+        // layer lies below it.
+        std::unique_ptr<LinearAttentionStatePool> gdn_saved;
+        std::uint32_t filter_layer = 0;
+    };
+    std::optional<ScoutBuffers> scout_buffers;
+    struct ScoutSession {
+        std::uint32_t lane          = 0;
+        std::uint32_t u_begin       = 0;
+        std::uint32_t prompt_tokens = 0;
+        std::uint32_t cursor        = 0;
+        // The lane's GDN slots when the scout began; see scout_chunk_slots.
+        std::int32_t state_source      = 0;
+        std::int32_t state_destination = 0;
+        bool restore_state             = false;
+        // The lane's KV growth reservation when the scout began, put back by end_scout.
+        std::uint32_t growth_pages = 0;
+        std::uint32_t mapped_pages = 0;
+        bool scored                = false;
+    };
+    std::optional<ScoutSession> scout_session;
+    [[nodiscard]] std::uint32_t scout_lane(SequenceHandle) const;
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
     Tensor grammar_masks_device;

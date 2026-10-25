@@ -7,6 +7,8 @@
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/planning/startup.h"
+#include "models/qwen3_5/program/lossy/scout_plan.h"
+#include "ninfer/ops/attention_key_mass.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/execution/workspace.h"
 #include "core/device.h"
@@ -98,6 +100,13 @@ std::size_t graph_topology_allowance(const std::vector<GraphExecutionProfile>& p
 TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
                         std::initializer_list<std::int32_t> shape, const char* label) {
     return builder.add_tensor(dtype, shape, kArenaAlign, label);
+}
+
+// The scout scratch exists only where the scout can run: lossy prefill on, one device, a
+// generating (not scoring) Program.
+bool scout_planned(const SequencePlanImpl& plan) {
+    return plan.lossy_prefill.enabled() && !plan.parameters->text.split_execution() &&
+           !plan.causal_scoring;
 }
 
 PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
@@ -314,6 +323,31 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         out.sampling_config = add_tensor(
             builder, DType::I32, {config_words, static_cast<std::int32_t>(plan.max_concurrency)},
             "sampling config");
+    }
+    if (scout_planned(plan)) {
+        // Keys and scores for every token the Program can hold: an uncached span is at most the
+        // whole context (2 KB/token of keys at 27B, so 256 MiB at 128K).
+        ScoutLayout& scout = out.scout.emplace();
+        scout.filter_layer = plan.lossy_prefill.filter_layer;
+        scout.gdn_layers   = scout_gdn_layers(config.layer_types, scout.filter_layer);
+        const auto capacity = checked_i32(plan.capacity, "scout key capacity exceeds int32");
+        scout.filter_keys   = add_tensor(builder, DType::BF16,
+                                         {dimension(config.attention->head_dim),
+                                          dimension(config.attention->num_key_value_heads), capacity},
+                                         "lossy scout filter-layer keys");
+        scout.last_queries  = add_tensor(
+            builder, DType::BF16,
+            {dimension(config.attention->head_dim),
+             dimension(config.attention->num_attention_heads),
+             checked_i32(plan.lossy_prefill.query_rows, "scout query rows exceed int32")},
+            "lossy scout query rows");
+        scout.scores = add_tensor(builder, DType::FP32, {capacity}, "lossy scout key scores");
+        if (scout.gdn_layers != 0) {
+            LinearAttentionStatePoolSpec saved = state_image_spec.linear;
+            saved.layers                       = scout.gdn_layers;
+            saved.slot_count                   = 1;
+            scout.gdn_state = plan_linear_attention_state_pool(builder, saved);
+        }
     }
     out.bytes = builder.finish(kArenaAlign, "persistent layout");
     for (std::size_t rank = 1; rank < ranks; ++rank) {
@@ -806,9 +840,33 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         }
     }
 
+    if (scout_planned(plan)) {
+        // A scout chunk: the prefill roots, the layers below the filter layer, then the filter
+        // layer's attention input and the key-mass reduction over every key the Program can hold.
+        const auto& filter_block = parameters.text.layers.at(plan.lossy_prefill.filter_layer);
+        const auto& filter_attention =
+            std::get<execution::AttentionParameters>(filter_block.mixer);
+        WorkspaceLayoutBuilder scout;
+        text_common_root(scout, chunk);
+        target_body(scout, 1, chunk, qwen3_5::TextPhase::Prefill, GdnWorkspacePath::Prefill, 1, 1,
+                    chunk, text_envelope);
+        {
+            auto filter = scout.scope();
+            (void)workspace::text_attention_projection(scout, config, chunk);
+            scratch(scout,
+                    execution::attention_projection_workspace_bytes(filter_attention, 1, chunk));
+            (void)workspace::text_attention_results(scout, config, chunk);
+            scratch(scout, ops::attention_key_mass_workspace_capacity_bytes(
+                               dimension(config.attention->num_attention_heads),
+                               static_cast<std::int32_t>(plan.lossy_prefill.query_rows),
+                               static_cast<std::int32_t>(plan.capacity)));
+        }
+        out.scout_prefill = finish(scout);
+    }
+
     out.general_capacity =
         std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round,
-                  out.dflash_context, out.dflash_round, out.causal_score});
+                  out.dflash_context, out.dflash_round, out.causal_score, out.scout_prefill});
     if (parameters.text.split_execution()) {
         // Around its layers a stage holds the residual it received and its copy of the control
         // block (rank 0 holds the packed block instead, which is smaller), alive for the whole pass
@@ -866,6 +924,14 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     if (parameters.model.options() != models::load_options(options)) {
         throw std::invalid_argument(
             "loaded components do not match the requested execution options");
+    }
+    if (options.lossy_prefill.enabled()) {
+        // Throws unless the filter layer is one of the model's full-attention layers.
+        (void)scout_gdn_layers(parameters.model.config().text.layer_types,
+                               options.lossy_prefill.filter_layer);
+        if (options.lossy_prefill.query_rows == 0 || options.lossy_prefill.query_rows > 256) {
+            throw std::invalid_argument("lossy prefill query rows must be in [1,256]");
+        }
     }
     if (parameters.draft &&
         options.max_context > parameters.model.config().draft->max_position_embeddings) {
@@ -1010,6 +1076,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->multiprocessor_count = inputs.multiprocessor_count;
     impl->context_cache        = inputs.context_cache;
     impl->kv_storage           = inputs.kv_storage;
+    impl->lossy_prefill        = inputs.lossy_prefill;
     impl->round_shapes = speculative_round_shapes(inputs.speculative_backend, inputs.draft_window,
                                                   inputs.ngram_draft_tokens);
     impl->persistent   = persistent_layout(*impl);
@@ -1178,6 +1245,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .device               = options.device,
         .multiprocessor_count = device.multiprocessor_count(),
         .context_cache        = options.context_cache,
+        .lossy_prefill        = options.lossy_prefill,
     };
     // Installed direct grafts keep their Main KV pages for the Engine's life. They are added on
     // top of the request range, so every request can still use the capacity it was planned for.

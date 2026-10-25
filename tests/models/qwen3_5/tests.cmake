@@ -212,6 +212,12 @@ ninfer_add_test(ninfer_qwen3_5_lossy_gap_map_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lossy_gap_map.cpp"
   LIBRARIES ninfer_model_runtime)
 
+# Lossy-prefill scout arithmetic: GDN layers below the filter layer, scratch sizes, query rows per
+# chunk and state slots (header only, links no kernel).
+ninfer_add_test(ninfer_qwen3_5_lossy_scout_plan_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lossy_scout_plan.cpp"
+  LIBRARIES ninfer_core)
+
 # Whether a text prompt's RoPE positions are slot + rope_delta (header only, links no kernel).
 ninfer_add_test(ninfer_qwen3_5_text_positions_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_text_positions.cpp"

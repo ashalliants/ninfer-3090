@@ -83,10 +83,26 @@ struct DFlashFeatureSink {
     void consume_prefill_chunk(std::int32_t tokens, bool rewrite_checkpoint);
 };
 
+// The lossy-prefill scout's device scratch (docs/maintainer/lossy-long-prefill.md, "Scout pass").
+// The Program owns it; TextContext::scout_chunk fills it.
+struct ScoutScratch {
+    Tensor filter_keys;  // BF16 [head_dim, kv_heads, capacity], rows [0, |U|)
+    Tensor last_queries; // BF16 [head_dim, q_heads, query_rows]
+    Tensor scores;       // F32 [capacity]
+};
+
 class VisionPrefillSession;
 
 class TextContext {
 public:
+    struct TextPrefill {
+        std::span<const int> token_ids;
+        std::uint32_t begin = 0;
+        // Axis-0 RoPE positions over the whole prompt (at least begin + the chunk's tokens). Empty
+        // means slot + rope_delta. Text only, so layer slices stay allowed.
+        std::span<const std::int32_t> rope_positions;
+    };
+
     TextContext(DeviceContext& ctx, const execution::Parameters& weights, WorkspaceArena& work,
                 qwen3_5::PagedKVCacheView kv, LinearAttentionStatePool& state,
                 qwen3_5::RoundState& io, Tensor& prefill_hidden, std::uint32_t prefill_chunk,
@@ -159,6 +175,20 @@ public:
                                                    std::uint32_t nominal_length,
                                                    VisionPrefillSession& vision,
                                                    bool finalize_at_end, DFlashFeatureSink& sink);
+    // One lossy-prefill scout chunk over prompt.token_ids[begin, begin + len) (at most the prefill
+    // chunk; the result says how many ran). Runs layers [0, filter_layer) as an ordinary text
+    // prefill does: their KV is written to the sequence's own pages at slots begin.., their GDN
+    // states advance from the slots set_linear_state_slots names. At the filter layer it runs only
+    // the input norm, the attention input projection, the q/k norms and RoPE, and writes the K rows
+    // to scratch.filter_keys at [begin - u_begin, +len) and the rows that fall in the prompt's last
+    // min(query_rows, |U|) tokens to scratch.last_queries. A chunk that ends the prompt then runs
+    // attention_key_mass into scratch.scores[0, |U|) and reports `finalized`. No DFlash tap, no MTP
+    // alignment, no final norm or LM head, no layer slices; prefill_hidden and the round's logits
+    // and token are not touched. The context's text_kv_base must be `begin`.
+    [[nodiscard]] PrefillChunkResult scout_chunk(const TextPrefill& prompt, std::uint32_t u_begin,
+                                                 std::uint32_t begin, std::uint32_t len,
+                                                 std::uint32_t filter_layer,
+                                                 ScoutScratch& scratch);
     void ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
                                const Tensor& rope_positions, const Tensor& kv_table_rows,
                                const Tensor& linear_state_source_slots,
@@ -194,6 +224,17 @@ private:
         return mtp_kv_.valid() || batch_mtp_kv_ != nullptr;
     }
 
+    // The attention input of one full-attention layer for the residual `x`: input norm, the
+    // fused Q/gate/K/V projection, the q/k norms and RoPE at the active positions. The tensors are
+    // workspace views allocated in the caller's scope.
+    struct AttentionInputs {
+        Tensor gate; // [query_width, T]
+        Tensor value;
+        Tensor query; // normalized, rotated [head_dim, q_heads, T]
+        Tensor key;   // normalized, rotated [head_dim, kv_heads, T]
+        Tensor attention; // the attention output's workspace root [query_width, T]
+    };
+    [[nodiscard]] AttentionInputs attention_inputs(const BlockParameters& weights, Tensor& x);
     void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
     void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
     void mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
@@ -254,14 +295,6 @@ private:
         VisionPrefillSession* vision = nullptr;
         std::uint32_t begin          = 0;
         std::int32_t rope_delta      = 0;
-    };
-
-    struct TextPrefill {
-        std::span<const int> token_ids;
-        std::uint32_t begin = 0;
-        // Axis-0 RoPE positions over the whole prompt (at least begin + the chunk's tokens). Empty
-        // means slot + rope_delta. Text only, so layer slices stay allowed.
-        std::span<const std::int32_t> rope_positions;
     };
 
     template <class Tap>

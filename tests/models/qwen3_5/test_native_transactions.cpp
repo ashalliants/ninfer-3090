@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstddef>
 #include <cstdlib>
@@ -3044,6 +3045,366 @@ void replay_preserves_gapped_positions(DeviceContext& device,
     }
 }
 
+// ---- Lossy-prefill scout chunks (Task 6) ----
+
+constexpr std::uint32_t kScoutCapacity = 36864;
+constexpr std::uint32_t kScoutChunk    = 4096;
+constexpr std::uint32_t kScoutPrefix   = 2048;
+constexpr std::uint32_t kScoutSpan     = 12288;
+constexpr std::uint32_t kScoutLayer    = 15;
+constexpr std::uint32_t kScoutRows     = 64;
+
+struct ScoutFixture {
+    std::unique_ptr<qwen::detail::SequencePlanImpl> plan;
+    std::unique_ptr<qwen::detail::ProgramImpl> program;
+};
+
+// One rk4v4 Program with the scout's scratch (lossy prefill on), two lanes and a context cache for
+// the shared-prefix binding.
+ScoutFixture make_scout_program(DeviceContext& device, const qwen::execution::Parameters& parameters,
+                                EngineOptions options) {
+    options.max_context                       = kScoutCapacity;
+    options.kv_capacity                       = KvCapacityPolicy::explicit_capacity(kScoutCapacity);
+    options.prefill_chunk                     = kScoutChunk;
+    options.max_concurrency                   = 2;
+    options.kv_cache                          = KvCacheStorage::RotatedLloyd4KeyInt4Value;
+    options.context_cache.enabled             = true;
+    options.context_cache.device_state_slots  = 2;
+    options.context_cache.host_capacity_bytes = 0;
+    options.lossy_prefill.min_tokens          = 1;
+    options.lossy_prefill.filter_layer        = kScoutLayer;
+    options.lossy_prefill.query_rows          = kScoutRows;
+    auto planner = qwen::detail::make_sequence_planner_impl(parameters, device, options);
+    const std::uint32_t pages = planner->curve.minimum_main_page_groups;
+    ScoutFixture out;
+    out.plan    = qwen::detail::finalize_sequence_plan_impl(std::move(planner), pages);
+    out.program = std::make_unique<qwen::detail::ProgramImpl>(parameters, *out.plan, device,
+                                                              StartupObserver{});
+    require(out.program->scout_buffers.has_value(), "lossy prefill planned no scout scratch");
+    return out;
+}
+
+// What the main pass starts from: the GDN state image in the slot the lane reads, the text KV of
+// the cached prefix and the free page count.
+struct ScoutTrace {
+    std::vector<std::byte> state;
+    std::vector<std::byte> kv;
+    std::uint32_t free_pages   = 0;
+    std::uint32_t mapped_pages = 0;
+};
+
+ScoutTrace scout_trace(qwen::detail::ProgramImpl& program, DeviceContext& device,
+                       std::uint32_t lane, std::uint32_t prefix) {
+    device.synchronize();
+    ScoutTrace trace;
+    const auto& layout = program.state_images->host_layout();
+    trace.state.resize(layout.image_bytes);
+    const auto selectors = program.state_selectors(program.sequences[lane]);
+    program.state_images->copy_to_host(selectors.source,
+                                       qwen::HostStateImageView{trace.state.data(), &layout},
+                                       RankStreams(device.stream));
+    device.synchronize();
+    trace.kv           = text_kv_bytes(program, lane, prefix);
+    trace.free_pages   = program.text_kv_pages->physical_pool().available_pages();
+    trace.mapped_pages = program.text_kv_addresses->mapped_pages(program.sequences[lane].kv->text);
+    return trace;
+}
+
+void require_no_trace(const ScoutTrace& after, const ScoutTrace& before, std::string_view what) {
+    require(after.state == before.state, std::string(what) + ": GDN state changed");
+    require(after.kv == before.kv, std::string(what) + ": cached-prefix KV changed");
+    require(after.free_pages == before.free_pages, std::string(what) + ": KV pages leaked");
+    require(after.mapped_pages == before.mapped_pages, std::string(what) + ": KV mapping changed");
+}
+
+class ScoutLane {
+public:
+    ScoutLane(qwen::detail::ProgramImpl& program, DeviceContext& device)
+        : program_(program), device_(device) {}
+
+    // A fresh request for `ids`, bound on `lane` with no reuse and prefilled to `prefix` tokens.
+    qwen::SequenceHandle private_prefix(const std::vector<TokenId>& ids, std::uint32_t lane,
+                                        std::uint32_t prefix, qwen::Frontend& frontend) {
+        runtime::ResolvedExecutionOptions request;
+        request.requested_output_tokens = 8;
+        request.allow_prefix_reuse      = false;
+        auto base       = program_.plan_request(
+            qwen::PreparedPromptAccess::take(frontend.prepare_tokens(ids)), request);
+        const auto root = program_.inspect_source(base, std::nullopt);
+        const auto sequence = bind(base, lane, *root);
+        if (prefix != 0) {
+            reserve(sequence);
+            const auto step = program_.advance_prefill(sequence, nullptr, nullptr, prefix);
+            require(step.processed_prompt_tokens == prefix && !step.pending,
+                    "the cached prefix did not stop at its frontier");
+        }
+        return sequence;
+    }
+
+    qwen::SequenceHandle bind(qwen::RequestBasePlan& base, std::uint32_t lane,
+                              const qwen::SourceCandidate& source) {
+        require(static_cast<bool>(program_.start_binding(base, {lane}, source, nullptr,
+                                                         qwen::ExecutionUnitKind::Prefill, 0)),
+                "scout request could not bind");
+        const auto bound = settle_positions(program_, device_);
+        require(bound.sequence.has_value(), "scout binding did not publish");
+        return *bound.sequence;
+    }
+
+    void reserve(qwen::SequenceHandle sequence) {
+        const std::array<qwen::ExecutionUnit, 1> units{
+            {{sequence, qwen::ExecutionUnitKind::Prefill}}};
+        require(static_cast<bool>(program_.reserve_units(units)),
+                "scout test could not reserve a prefill unit");
+    }
+
+    // Scouts the lane's uncached span in steps of at most `step` tokens (stopping after `stop`
+    // chunks when nonzero) and returns the scores (empty when stopped early). Ends the scout.
+    std::vector<float> scout(qwen::SequenceHandle sequence, std::uint32_t step,
+                             std::uint32_t stop = 0) {
+        program_.begin_scout(sequence);
+        require(program_.scout_active(sequence), "begin_scout did not open a scout");
+        std::vector<float> scores;
+        for (std::uint32_t chunk = 0; chunk < 1024; ++chunk) {
+            if (stop != 0 && chunk == stop) { break; }
+            const auto result = program_.advance_scout(sequence, step);
+            require(result.reserved && result.processed_tokens != 0,
+                    "a scout chunk found too few KV pages");
+            if (result.complete) {
+                scores = program_.scout_scores();
+                break;
+            }
+        }
+        program_.end_scout(sequence);
+        require(!program_.scout_active(sequence), "end_scout left the scout open");
+        return scores;
+    }
+
+    // Prefills the rest of the prompt and returns the first token and the last-token logits.
+    std::pair<TokenId, std::vector<std::byte>> finish(qwen::SequenceHandle sequence) {
+        for (unsigned call = 0; call < 64; ++call) {
+            reserve(sequence);
+            auto step = program_.advance_prefill(sequence, nullptr, nullptr);
+            if (step.capture_ready) { program_.skip_capture(sequence); }
+            if (!step.pending) { continue; }
+            device_.synchronize();
+            std::vector<std::byte> logits;
+            append_device_bytes(logits, program_.io.logits.slice(1, 0, 1));
+            const TokenId first = step.pending->tokens().front();
+            const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
+            const auto committed = program_.commit(std::move(*step.pending), accepted, {}, nullptr);
+            if (committed.capture_ready[0]) { program_.skip_capture(sequence); }
+            return {first, std::move(logits)};
+        }
+        throw std::runtime_error("scout test prefill did not finish its prompt");
+    }
+
+    void abort(qwen::SequenceHandle sequence) {
+        require(program_.abort(sequence).status == runtime::ConsumeStatus::Consumed,
+                "scout lane retained its execution resources");
+    }
+
+private:
+    qwen::detail::ProgramImpl& program_;
+    DeviceContext& device_;
+};
+
+void require_scores_sane(const qwen::detail::ProgramImpl& program,
+                         const std::vector<float>& scores, std::uint32_t span) {
+    require(scores.size() == span, "scout scored the wrong number of keys");
+    double sum = 0.0;
+    for (const float score : scores) {
+        require(std::isfinite(score) && score >= 0.0F, "scout score is not a finite mass");
+        sum += score;
+    }
+    // Each query row and head distributes a unit of mass over the keys.
+    const double expected =
+        static_cast<double>(kScoutRows) *
+        static_cast<double>(program.parameters.model.config().text.attention->num_attention_heads);
+    require(std::abs(sum - expected) <= 1e-2 * expected, "scout scores do not sum to rows x heads");
+}
+
+// Scouting 12,288 tokens after a 2,048-token cached prefix leaves the prefix's KV, the GDN state
+// the main pass reads and the free page count exactly as they were, and the ordinary prefill that
+// follows equals one that never scouted, bit for bit. Run for a private prefix (the lane writes
+// its state in place, so the scout saves and restores it) and a shared prefix (a fork is pending:
+// the scout writes the destination and the main pass reads the untouched checkpoint).
+void scout_leaves_no_trace(DeviceContext& device, const qwen::execution::Parameters& parameters,
+                           qwen::Frontend& frontend, EngineOptions options) {
+    auto fixture  = make_scout_program(device, parameters, options);
+    auto& program = *fixture.program;
+    ScoutLane lanes(program, device);
+    const auto empty = program.physical_usage().occupied;
+    const auto ids   = long_prompt_ids(kScoutPrefix + kScoutSpan);
+
+    // Private prefix.
+    {
+        const auto reference_sequence = lanes.private_prefix(ids, 0, kScoutPrefix, frontend);
+        const auto reference          = lanes.finish(reference_sequence);
+        lanes.abort(reference_sequence);
+
+        const auto sequence = lanes.private_prefix(ids, 0, kScoutPrefix, frontend);
+        const ScoutTrace before = scout_trace(program, device, 0, kScoutPrefix);
+        require_scores_sane(program, lanes.scout(sequence, 0), kScoutSpan);
+        require_no_trace(scout_trace(program, device, 0, kScoutPrefix), before, "private scout");
+        const auto after = lanes.finish(sequence);
+        require(after.first == reference.first && after.second == reference.second,
+                "a prefill after a private scout differs from one without it");
+        lanes.abort(sequence);
+    }
+    require(program.physical_usage().occupied == empty, "private scout leaked resources");
+
+    // Shared prefix.
+    {
+        auto prepared = qwen::PreparedPromptAccess::take(frontend.prepare_tokens(ids));
+        prepared.context_cache.opportunities.push_back(
+            {.kind     = PromptCacheMarkerKind::SharedStablePrefix,
+             .evidence = SharedCandidateEvidence::ExplicitBoundary,
+             .frontier = kScoutPrefix});
+        runtime::ResolvedExecutionOptions request;
+        request.requested_output_tokens = 8;
+        request.allow_prefix_reuse      = true;
+        auto base         = program.plan_request(std::move(prepared), request);
+        const auto root   = program.inspect_source(base, std::nullopt);
+        const auto writer = lanes.bind(base, 0, *root);
+        lanes.reserve(writer);
+        const auto step = program.advance_prefill(writer, nullptr, nullptr);
+        require(step.processed_prompt_tokens == kScoutPrefix && step.capture_ready,
+                "the shared prefix writer did not stop at its capture");
+        require(program.start_capture(writer), "the shared prefix could not be captured");
+        const auto captured = settle_positions(program, device);
+        std::optional<qwen::CheckpointHandle> shared;
+        for (const auto point : captured.captured_checkpoints) {
+            if (program.checkpoint_summary(point).role == runtime::CheckpointRole::SharedPrefix) {
+                shared = point;
+            }
+        }
+        require(shared.has_value(), "the shared prefix was not captured");
+        lanes.abort(writer);
+
+        const auto source = program.inspect_source(base, *shared);
+        require(source && source->reused_tokens == kScoutPrefix,
+                "the shared prefix does not cover its frontier");
+        const auto reference_sequence = lanes.bind(base, 1, *source);
+        const auto reference          = lanes.finish(reference_sequence);
+        lanes.abort(reference_sequence);
+
+        const auto sequence = lanes.bind(base, 1, *source);
+        const auto selectors = program.state_selectors(program.sequences[1]);
+        require(selectors.source != selectors.destination,
+                "a shared-prefix binding has no pending fork");
+        const ScoutTrace before = scout_trace(program, device, 1, kScoutPrefix);
+        require_scores_sane(program, lanes.scout(sequence, 0), kScoutSpan);
+        require_no_trace(scout_trace(program, device, 1, kScoutPrefix), before, "shared scout");
+        const auto after = lanes.finish(sequence);
+        require(after.first == reference.first && after.second == reference.second,
+                "a prefill after a shared-prefix scout differs from one without it");
+        lanes.abort(sequence);
+        for (const auto point : captured.captured_checkpoints) {
+            require(program.release_checkpoint(point), "the shared prefix kept a reader");
+        }
+    }
+    require(program.physical_usage().occupied == empty, "shared scout leaked resources");
+}
+
+// A scout ended after its second chunk (an abort) leaves the same no trace, gives back every page
+// it took, and a lane aborted part-way through a scout takes the scout with it.
+void scout_abort_leaves_no_trace(DeviceContext& device,
+                                 const qwen::execution::Parameters& parameters,
+                                 qwen::Frontend& frontend, EngineOptions options) {
+    auto fixture  = make_scout_program(device, parameters, options);
+    auto& program = *fixture.program;
+    ScoutLane lanes(program, device);
+    const auto empty = program.physical_usage().occupied;
+    const auto ids   = long_prompt_ids(kScoutPrefix + kScoutSpan);
+
+    const auto sequence     = lanes.private_prefix(ids, 0, kScoutPrefix, frontend);
+    const ScoutTrace before = scout_trace(program, device, 0, kScoutPrefix);
+    const auto scores       = lanes.scout(sequence, 0, 2);
+    require(scores.empty(), "a scout ended after two chunks reported scores");
+    require_no_trace(scout_trace(program, device, 0, kScoutPrefix), before, "aborted scout");
+
+    // Abort the lane itself in the middle of a second scout.
+    program.begin_scout(sequence);
+    const auto step = program.advance_scout(sequence, 0);
+    require(step.reserved && !step.complete, "the second scout's first chunk did not run");
+    lanes.abort(sequence);
+    require(!program.scout_session.has_value(), "an aborted lane kept its scout");
+    require(program.physical_usage().occupied == empty, "an aborted scout leaked resources");
+}
+
+// The scores do not depend on how the span is cut into chunks: 1,024- and 4,096-token scout
+// chunks agree within 1e-3 relative per token.
+void scout_scores_chunk_invariant(DeviceContext& device,
+                                  const qwen::execution::Parameters& parameters,
+                                  qwen::Frontend& frontend, EngineOptions options) {
+    auto fixture  = make_scout_program(device, parameters, options);
+    auto& program = *fixture.program;
+    ScoutLane lanes(program, device);
+    const auto ids   = long_prompt_ids(kScoutPrefix + kScoutSpan);
+    const auto run   = [&](std::uint32_t step) {
+        const auto sequence = lanes.private_prefix(ids, 0, kScoutPrefix, frontend);
+        auto scores         = lanes.scout(sequence, step);
+        lanes.abort(sequence);
+        require_scores_sane(program, scores, kScoutSpan);
+        return scores;
+    };
+    const auto narrow = run(1024);
+    const auto wide   = run(4096);
+    for (std::size_t i = 0; i < narrow.size(); ++i) {
+        const float scale = std::max(std::abs(narrow[i]), std::abs(wide[i]));
+        // An absolute floor far below any score that matters keeps exact zeros comparable.
+        require(std::abs(narrow[i] - wide[i]) <= 1e-3F * scale + 1e-9F,
+                "scout score " + std::to_string(i) + " depends on the chunk size: " +
+                    std::to_string(narrow[i]) + " vs " + std::to_string(wide[i]));
+    }
+}
+
+// In a 32K-token haystack with a pass key sentence at 50% depth and the question at the end, the
+// pass key's tokens score in the top 5% of the prompt.
+void scout_finds_needle(DeviceContext& device, const qwen::execution::Parameters& parameters,
+                        qwen::Frontend& frontend, EngineOptions options) {
+    constexpr std::uint32_t kHaystack = 32768;
+    const auto filler = frontend.tokenize_text(
+        " The grass is green. The sky is blue. The sun is yellow. Here we go. There and back "
+        "again.");
+    const auto lead     = frontend.tokenize_text(" The pass key is ");
+    const auto key      = frontend.tokenize_text("71432");
+    const auto trail    = frontend.tokenize_text(". Remember it. 71432 is the pass key.");
+    const auto question = frontend.tokenize_text(
+        " What is the pass key? Answer with the number only. The pass key is");
+    require(!filler.empty() && !key.empty(), "the haystack fixture did not tokenize");
+    std::vector<TokenId> ids;
+    const auto fill_to = [&](std::size_t target) {
+        while (ids.size() + filler.size() <= target) {
+            ids.insert(ids.end(), filler.begin(), filler.end());
+        }
+    };
+    fill_to(kHaystack / 2);
+    ids.insert(ids.end(), lead.begin(), lead.end());
+    const std::size_t key_begin = ids.size();
+    ids.insert(ids.end(), key.begin(), key.end());
+    ids.insert(ids.end(), trail.begin(), trail.end());
+    fill_to(kHaystack - question.size());
+    ids.insert(ids.end(), question.begin(), question.end());
+
+    auto fixture  = make_scout_program(device, parameters, options);
+    auto& program = *fixture.program;
+    ScoutLane lanes(program, device);
+    const auto sequence = lanes.private_prefix(ids, 0, 0, frontend);
+    const auto scores   = lanes.scout(sequence, 0);
+    lanes.abort(sequence);
+    require(scores.size() == ids.size(), "the needle scout did not score its whole prompt");
+
+    std::vector<float> sorted = scores;
+    std::sort(sorted.begin(), sorted.end(), std::greater<>());
+    const float cutoff = sorted[sorted.size() / 20];
+    for (std::size_t i = key_begin; i < key_begin + key.size(); ++i) {
+        require(scores[i] > cutoff, "pass key token " + std::to_string(i - key_begin) +
+                                        " is outside the top 5% of scout scores");
+    }
+}
+
 SpeculativeBackend selected_backend(std::string_view name) {
     if (name == "none") { return SpeculativeBackend::None; }
     if (name == "mtp") { return SpeculativeBackend::Mtp; }
@@ -3161,6 +3522,13 @@ int main(int argc, char** argv) {
         explicit_positions_equal_rope_delta_path(device, parameters, long_frontend, options);
         explicit_positions_with_layer_slices(device, parameters, long_frontend, options);
         replay_preserves_gapped_positions(device, parameters, long_frontend, options);
+        // The scout tests need a 32K-token Frontend.
+        auto scout_frontend = qwen::make_frontend(
+            model->resources(), {.vision_enabled = false, .max_context = kScoutCapacity});
+        scout_leaves_no_trace(device, parameters, scout_frontend, options);
+        scout_abort_leaves_no_trace(device, parameters, scout_frontend, options);
+        scout_scores_chunk_invariant(device, parameters, scout_frontend, options);
+        scout_finds_needle(device, parameters, scout_frontend, options);
         std::cout << "OK native transaction cancellation, paused ownership and replay recovery\n";
         return 0;
     } catch (const std::exception& error) {
