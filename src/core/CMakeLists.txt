@@ -21,6 +21,7 @@ add_library(ninfer_core STATIC
   vmm_region.cu
   device_snapshot.cu
   pinned_upload.cu
+  host_flag_wait.cu
   copy_batch.cpp
   cgroup_memory.cpp
   host_memory.cpp
@@ -40,10 +41,10 @@ else()
 endif()
 if(NINFER_HOST_ONLY)
   # No CUDA compiler (see NINFER_HOST_ONLY): these .cu files hold host code only and compile as
-  # C++ against the CUDA headers. The two with kernels are left out; nothing the host-only tests
+  # C++ against the CUDA headers. The three with kernels are left out; nothing the host-only tests
   # link calls them.
   ninfer_host_only_sources(ninfer_core
-    KERNELS host_gather.cu pinned_upload.cu)
+    KERNELS host_gather.cu pinned_upload.cu host_flag_wait.cu)
 endif()
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)

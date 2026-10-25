@@ -35,14 +35,6 @@ foreach(op IN LISTS ninfer_op_tests)
     LIBRARIES ninfer_ops)
 endforeach()
 
-# GPU: wait_flag_ge / wait_flag_sequence, the stream-ordered wait for a mapped host flag
-# (--ngram-flag-wait): a flag raised late by a host thread holds the work behind it back, a flag
-# never raised times out into the error word, a stale flag never releases the next call, and one
-# captured wait waits for a new value at each replay.
-ninfer_add_op_test(ninfer_wait_flag_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_wait_flag.cpp"
-  LIBRARIES ninfer_ops)
-
 # Host-only: the exact GGML block decoder against ggml's own golden outputs. It is the oracle GGML
 # Ops are qualified against, so it is checked here independently of any kernel.
 ninfer_add_op_test(ninfer_ggml_blocks_decode_test NEEDS_SOURCE_DIR

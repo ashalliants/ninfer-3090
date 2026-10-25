@@ -32,6 +32,7 @@
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include "core/gdn_replay_records.h"
+#include "core/host_flag_wait.h"
 #include "core/host_gather.h"
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
@@ -64,11 +65,11 @@
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/cast.h"
 #include "ninfer/ops/gdn_replay.h"
+#include "ninfer/ops/offloaded_sparse_moe.h"
 #include "ninfer/ops/ple.h"
 #include "ninfer/ops/qsa.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
-#include "ninfer/ops/wait_flag.h"
 
 #include <cuda_runtime.h>
 
@@ -77,12 +78,14 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <exception>
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <string_view>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -208,8 +211,20 @@ double seconds(std::uint64_t ns) { return static_cast<double>(ns) * 1e-9; }
 
 // --gdn-async-commit: folds run on fold streams in this process (Program::process_async_gdn_folds).
 std::atomic<std::uint64_t> g_async_gdn_folds{0};
-// --ngram-flag-wait: rounds run as one graph waiting for their rows (Program::process_ngram_flag_rounds).
+// --ngram-flag-wait: plain rounds and verifications run as one graph waiting for their rows
+// (Program::process_ngram_flag_rounds / process_ngram_flag_verifications).
 std::atomic<std::uint64_t> g_ngram_flag_rounds{0};
+std::atomic<std::uint64_t> g_ngram_flag_verifications{0};
+static_assert(kWaitFlagTimeoutNs == ops::offloaded_moe::kHeartbeatTimeoutNs,
+              "the n-gram flag wait times out like the CPU-miss wait");
+
+// CUDA_LAUNCH_BLOCKING=1 (which compute-sanitizer's serialization resembles): a launch returns only
+// once its work is done, so a round graph whose flag the host raises after the launch would always
+// time out.
+bool launch_blocking() noexcept {
+    const char* value = std::getenv("CUDA_LAUNCH_BLOCKING");
+    return value != nullptr && std::string_view(value) == "1";
+}
 
 // The KV pool's chunk: the VMM allocation granularity of the RTX 3090 (2 MiB).
 constexpr std::size_t kKvChunkBytes = 2ULL << 20;
@@ -1109,10 +1124,10 @@ public:
         o.max_jobs     = p.max_jobs;
         o.max_columns  = p.max_columns;
         o.pcie_divisor = p.pcie_divisor;
-        cpu_error_     = PinnedHostBuffer(64);
-        std::memset(cpu_error_.data(), 0, 64);
+        cpu_error_.emplace(64);
+        std::memset(cpu_error_->data(), 0, 64);
         void* mapped = nullptr;
-        if (cudaHostGetDevicePointer(&mapped, cpu_error_.data(), 0) != cudaSuccess || mapped == nullptr) {
+        if (cudaHostGetDevicePointer(&mapped, cpu_error_->data(), 0) != cudaSuccess || mapped == nullptr) {
             (void)cudaGetLastError();
             throw std::runtime_error("--cpu-verify-misses: the error word has no device address");
         }
@@ -1125,10 +1140,10 @@ public:
     // raise).
     void start_ngram_flag() {
         const NgramFlagPlan p = plan_ngram_flag_wait(options_);
-        ngram_flag_           = PinnedHostBuffer(p.pinned);
-        std::memset(ngram_flag_.data(), 0, p.pinned);
+        ngram_flag_.emplace(p.pinned);
+        std::memset(ngram_flag_->data(), 0, p.pinned);
         void* mapped = nullptr;
-        if (cudaHostGetDevicePointer(&mapped, ngram_flag_.data(), 0) != cudaSuccess || mapped == nullptr) {
+        if (cudaHostGetDevicePointer(&mapped, ngram_flag_->data(), 0) != cudaSuccess || mapped == nullptr) {
             (void)cudaGetLastError();
             throw std::runtime_error("--ngram-flag-wait: the round flag has no device address");
         }
@@ -1137,27 +1152,40 @@ public:
         ngram_sequence_     = DeviceBuffer(p.device);
         ngram_sequence_.fill(0);
         ngram_raised_ = 0;
+        ngram_launch_blocking_ = launch_blocking();
+        if (ngram_launch_blocking_) {
+            diagnostic("ngram flag wait: CUDA_LAUNCH_BLOCKING=1 serializes launches, so a round graph waiting "
+                       "for the host's n-gram rows would always time out; rounds keep their two parts");
+        }
+    }
+
+    // --ngram-flag-wait: whether this round runs as one graph (the rule, with the launch mode).
+    bool rows_in_graph(bool eager_done) const noexcept {
+        return ngram_rows_in_graph(options_, eager_done, ngram_launch_blocking_);
     }
 
     // --ngram-flag-wait: one launch of a round graph that waits for its n-gram rows (the caller ran
     // its parts eagerly first, so the capture runs no kernel's one-time setup): captured on its first
-    // use, then replayed.
-    void launch_round(DecodeGraphDefinition& graph, DecodeGraphExecutable& exec, const std::function<void()>& body) {
+    // use, then replayed, counted in `launched`. The error word is cleared first: a word an earlier
+    // round left set must not fail this round.
+    void launch_round(DecodeGraphDefinition& graph, DecodeGraphExecutable& exec, const std::function<void()>& body,
+                      std::atomic<std::uint64_t>& launched) {
         if (!exec.ready()) {
             graph.capture(device_.stream, body);
             exec.instantiate(graph);
             exec.upload(device_.stream);
         }
+        (void)take_ngram_flag_error();
         exec.launch(device_.stream);
-        g_ngram_flag_rounds.fetch_add(1, std::memory_order_relaxed);
+        launched.fetch_add(1, std::memory_order_relaxed);
     }
 
     // The part of a round graph between the front and the back: the wait for this replay's flag
     // value, then the rows of `width` columns from the pinned block (where gather_rows reads them).
     void wait_for_rows(std::int32_t width) {
         const cudaStream_t s = device_.stream;
-        ops::wait_flag_sequence(ngram_flag_device_, static_cast<std::uint32_t*>(ngram_sequence_.p),
-                                ngram_error_device_, s);
+        wait_flag_sequence(ngram_flag_device_, static_cast<std::uint32_t*>(ngram_sequence_.p), ngram_error_device_,
+                           s);
         const std::size_t rows = static_cast<std::size_t>(width) * hash_.heads() * c_.ple.table.row_bytes;
         upload_pinned(static_cast<std::byte*>(io_device_.p) + plan_.io.ngram,
                       static_cast<std::byte*>(io_host_.data()) + plan_.io.ngram, rows, s);
@@ -1171,23 +1199,27 @@ public:
         struct Raise {
             ProgramImpl* self;
             ~Raise() {
-                std::atomic_ref<std::uint32_t>(*static_cast<std::uint32_t*>(self->ngram_flag_.data()))
+                std::atomic_ref<std::uint32_t>(*static_cast<std::uint32_t*>(self->ngram_flag_->data()))
                     .store(++self->ngram_raised_, std::memory_order_release);
             }
         } raise{this};
         (void)read_rows(begin, width);
     }
 
-    // --ngram-flag-wait, after a round synchronized: a wait that timed out wrote
-    // ops::kWaitFlagErrorTimeout to the error word, and its round read rows the host had not
-    // finished, so the round throws (the caller releases the lane; nothing is committed). The word is
-    // cleared for the next round.
-    void check_ngram_flag() {
-        if (ngram_flag_device_ == nullptr) { return; }
-        auto* word = static_cast<volatile std::uint32_t*>(ngram_flag_.data()) + 16;
+    // --ngram-flag-wait, after a round synchronized: a wait that timed out wrote kWaitFlagErrorTimeout
+    // to the error word, and its round read rows the host had not finished, so the round throws (the
+    // caller releases the lane; nothing is committed). take_ngram_flag_error reads and clears the
+    // word (0 when off); throw_ngram_flag throws for a nonzero one.
+    std::uint32_t take_ngram_flag_error() noexcept {
+        if (!ngram_flag_) { return 0; }
+        auto* word                 = static_cast<volatile std::uint32_t*>(ngram_flag_->data()) + 16;
         const std::uint32_t failed = *word;
+        if (failed != 0) { *word = 0; }
+        return failed;
+    }
+    void check_ngram_flag() { throw_ngram_flag(take_ngram_flag_error()); }
+    static void throw_ngram_flag(std::uint32_t failed) {
         if (failed == 0) { return; }
-        *word = 0;
         char code[16];
         std::snprintf(code, sizeof(code), "0x%04X", failed);
         throw std::runtime_error(std::string("Qwen3.8-Flash-Next: --ngram-flag-wait: the round's n-gram rows were not "
@@ -1221,7 +1253,7 @@ public:
     // the request ends with an error. The word is cleared for the next round.
     void check_cpu_verify() {
         if (!cpu_misses_) { return; }
-        auto* word                 = static_cast<volatile std::uint32_t*>(cpu_error_.data());
+        auto* word                 = static_cast<volatile std::uint32_t*>(cpu_error_->data());
         const std::uint32_t failed = *word;
         if (failed == 0) { return; }
         *word = 0;
@@ -1714,7 +1746,7 @@ public:
             upload_inputs(position, 1);
             residency_->before_round(device_.stream);
             join_gdn_fold(); // the front reads and writes the recurrent state
-            if (ngram_rows_in_graph(options_, G().front_runs > 0 && G().back_runs > 0)) {
+            if (rows_in_graph(G().front_runs > 0 && G().back_runs > 0)) {
                 run_decode_round();
                 const nvtx::ScopedRange rows(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode);
                 gather_rows(position, 1);
@@ -3606,12 +3638,15 @@ private:
     // the round's rows (wait_for_rows); the host reads them after the launch (gather_rows).
     void run_decode_round() {
         const std::uint32_t split = forward_->rows_layer();
-        launch_round(G().round_graph, G().round_exec, [this, split] {
-            forward_->run_front(batch(1, true), split);
-            wait_for_rows(1);
-            forward_->run_back(batch(1, true), split, logits32_);
-            ops::cast_fp32_to_bf16(logits32_, logits16_, device_.stream);
-        });
+        launch_round(
+            G().round_graph, G().round_exec,
+            [this, split] {
+                forward_->run_front(batch(1, true), split);
+                wait_for_rows(1);
+                forward_->run_back(batch(1, true), split, logits32_);
+                ops::cast_fp32_to_bf16(logits32_, logits16_, device_.stream);
+            },
+            g_ngram_flag_rounds);
     }
 
     // Samples the next token from the last call's logits (`logits`, or the shared logits16_) at
@@ -4314,13 +4349,16 @@ private:
             forward_->run_back(batch(W, true, &view), split, logits);
             ops::cast_fp32_to_bf16(wide32, wide16, s);
         };
-        if (ngram_rows_in_graph(options_, G().verify_runs.at(w) > 0 && G().verify_back_runs.at(w) > 0)) {
+        if (rows_in_graph(G().verify_runs.at(w) > 0 && G().verify_back_runs.at(w) > 0)) {
             // --ngram-flag-wait: one graph, the rows behind the flag (raised once they are read).
-            launch_round(G().verify_round.at(w), G().verify_round_exec.at(w), [&] {
-                front();
-                wait_for_rows(W);
-                back();
-            });
+            launch_round(
+                G().verify_round.at(w), G().verify_round_exec.at(w),
+                [&] {
+                    front();
+                    wait_for_rows(W);
+                    back();
+                },
+                g_ngram_flag_verifications);
             const nvtx::ScopedRange rows(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode);
             gather_rows(S, W);
         } else {
@@ -4363,8 +4401,11 @@ private:
         }
         runtime::ExecutionTiming timing;
         timing.device_wait_ns = elapsed_ns(wait);
-        check_cpu_verify(); // before anything reads the round's outputs
-        check_ngram_flag(); // decode()'s catch releases the lane
+        // Before anything reads the round's outputs. Both words are read before either check throws,
+        // so neither is left set for a later round; decode()'s catch releases the lane.
+        const std::uint32_t flag_error = take_ngram_flag_error();
+        check_cpu_verify();
+        throw_ngram_flag(flag_error);
         const std::int32_t LC = words[sp.w_counts], A = words[sp.w_accepted];
         if (LC < 1 || LC > W || A != LC - 1) {
             release_lane();
@@ -4987,13 +5028,15 @@ private:
     // before the forward and the graphs so it is destroyed after them, once the destructor has
     // synchronized) and the mapped error word its verification calls' waits report to.
     std::unique_ptr<ops::offloaded_moe::CpuMissService> cpu_misses_;
-    PinnedHostBuffer cpu_error_{1};
+    std::optional<PinnedHostBuffer> cpu_error_; // set only with the option
     std::uint32_t* cpu_error_device_ = nullptr;
     bool cpu_verify_off_reported_    = false;
     // --ngram-flag-wait: the mapped flag and error word (64 bytes apart), their device addresses, the
     // round graphs' wait counter, and the flag's last raised value (the count of round launches).
-    // Declared before the forward and the graphs, like the CPU miss service's words.
-    PinnedHostBuffer ngram_flag_{1};
+    // Declared before the forward and the graphs, like the CPU miss service's words. Unset when off.
+    // ngram_launch_blocking_: CUDA_LAUNCH_BLOCKING=1 at startup, so rounds keep their two parts.
+    std::optional<PinnedHostBuffer> ngram_flag_;
+    bool ngram_launch_blocking_ = false;
     std::uint32_t* ngram_flag_device_  = nullptr;
     std::uint32_t* ngram_error_device_ = nullptr;
     DeviceBuffer ngram_sequence_;
@@ -5235,8 +5278,8 @@ bool gdn_fold_on_side_stream(const ProgramOptions& options, bool terminal) noexc
     return options.gdn_async_commit && options.mtp_draft_tokens > 0 && !terminal;
 }
 
-bool ngram_rows_in_graph(const ProgramOptions& options, bool eager_done) noexcept {
-    return options.ngram_flag_wait && options.use_cuda_graph && eager_done;
+bool ngram_rows_in_graph(const ProgramOptions& options, bool eager_done, bool launch_blocking) noexcept {
+    return options.ngram_flag_wait && options.use_cuda_graph && eager_done && !launch_blocking;
 }
 
 NgramFlagPlan plan_ngram_flag_wait(const ProgramOptions& options) noexcept {
@@ -5289,6 +5332,9 @@ std::uint64_t Program::process_async_gdn_folds() noexcept {
 }
 std::uint64_t Program::process_ngram_flag_rounds() noexcept {
     return detail::g_ngram_flag_rounds.load(std::memory_order_relaxed);
+}
+std::uint64_t Program::process_ngram_flag_verifications() noexcept {
+    return detail::g_ngram_flag_verifications.load(std::memory_order_relaxed);
 }
 
 RequestBasePlan Program::plan_request(PreparedPrompt&& prompt, const runtime::ResolvedExecutionOptions& options) {

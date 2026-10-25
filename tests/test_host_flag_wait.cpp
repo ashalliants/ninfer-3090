@@ -1,6 +1,6 @@
-// Public-contract qualification of wait_flag_ge / wait_flag_sequence (ninfer/ops/wait_flag.h):
-// the stream-ordered wait for a flag in mapped host memory that the Flash-Next round graph's
-// n-gram rows arrive behind (--ngram-flag-wait).
+// The contract of wait_flag_ge / wait_flag_sequence (core/host_flag_wait.h): the stream-ordered
+// wait for a flag in mapped host memory that the Flash-Next round graph's n-gram rows arrive
+// behind (--ngram-flag-wait).
 //
 //   raised_later:     a host thread raises the flag after a delay; the wait holds back the stream
 //                     work behind it until then (a D2H marker stays unwritten), then completes with
@@ -15,20 +15,40 @@
 //
 // The expected values follow from the contract alone: the flag's value, the counter, the timeout.
 
-#include "ninfer/ops/wait_flag.h"
-#include "ops/op_tester.h"
+#include "core/arena.h"
+#include "core/host_flag_wait.h"
+
+#include <cuda_runtime.h>
 
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 
 using namespace ninfer;
-using namespace ninfer::test;
 
 namespace {
+
+void cuda_check(cudaError_t status, const char* operation) {
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
+    }
+}
+
+void cuda_synchronize(cudaStream_t stream) {
+    cuda_check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+}
+
+bool cuda_unavailable() {
+    int n               = 0;
+    const cudaError_t e = cudaGetDeviceCount(&n);
+    if (e == cudaSuccess) { return n == 0; }
+    if (e == cudaErrorNoDevice || e == cudaErrorInsufficientDriver) { return true; }
+    throw std::runtime_error(std::string("cudaGetDeviceCount: ") + cudaGetErrorString(e));
+}
 
 using Clock = std::chrono::steady_clock;
 
@@ -54,8 +74,8 @@ struct Words {
     std::uint32_t* marker = nullptr;
     std::uint32_t* flag_dev  = nullptr;
     std::uint32_t* error_dev = nullptr;
-    GuardedDeviceBuffer source{sizeof(std::uint32_t)};
-    GuardedDeviceBuffer sequence{sizeof(std::uint32_t)};
+    DeviceBuffer source{sizeof(std::uint32_t)};
+    DeviceBuffer sequence{sizeof(std::uint32_t)};
 
     Words() {
         auto* words = static_cast<std::uint32_t*>(host.data());
@@ -92,7 +112,7 @@ struct Words {
     }
     // The stream work behind a wait: the marker copied to mapped host memory.
     void enqueue_marker(cudaStream_t stream) {
-        cuda_check(cudaMemcpyAsync(marker, source.data(), sizeof(std::uint32_t),
+        cuda_check(cudaMemcpyAsync(marker, source.p, sizeof(std::uint32_t),
                                    cudaMemcpyDeviceToHost, stream),
                    "marker copy");
     }
@@ -120,7 +140,7 @@ void check_held(Words& w, cudaStream_t stream, const std::string& name) {
 void raised_later(cudaStream_t stream) {
     Words w;
     const auto start = Clock::now();
-    ops::wait_flag_ge(w.flag_dev, 1, w.error_dev, stream);
+    wait_flag_ge(w.flag_dev, 1, w.error_dev, stream);
     w.enqueue_marker(stream);
     std::thread host = raise_later(w.flag, 1, std::chrono::milliseconds(200));
     check_held(w, stream, "raised_later");
@@ -142,7 +162,7 @@ void already_reached(cudaStream_t stream) {
     for (const Case c : {Case{1, 1}, Case{7, 3}, Case{2, 0xFFFFFFF0U}, Case{0x7FFFFFFFU, 0}}) {
         w.reset(c.flag);
         const auto start = Clock::now();
-        ops::wait_flag_ge(w.flag_dev, c.value, w.error_dev, stream);
+        wait_flag_ge(w.flag_dev, c.value, w.error_dev, stream);
         w.enqueue_marker(stream);
         cuda_synchronize(stream);
         const std::string name =
@@ -153,7 +173,7 @@ void already_reached(cudaStream_t stream) {
     // Below the value, wrap-aware: 0xFFFFFFFF is one short of 0.
     for (const Case c : {Case{0xFFFFFFFFU, 0}, Case{4, 5}}) {
         w.reset(c.flag);
-        ops::wait_flag_ge(w.flag_dev, c.value, w.error_dev, stream);
+        wait_flag_ge(w.flag_dev, c.value, w.error_dev, stream);
         w.enqueue_marker(stream);
         const std::string name =
             "below flag " + std::to_string(c.flag) + " value " + std::to_string(c.value);
@@ -169,12 +189,12 @@ void already_reached(cudaStream_t stream) {
 void never_raised(cudaStream_t stream) {
     Words w;
     const auto start = Clock::now();
-    ops::wait_flag_ge(w.flag_dev, 5, w.error_dev, stream);
+    wait_flag_ge(w.flag_dev, 5, w.error_dev, stream);
     w.enqueue_marker(stream);
     cuda_synchronize(stream);
     const double took   = seconds_since(start);
-    const double target = static_cast<double>(ops::kWaitFlagTimeoutNs) * 1e-9;
-    check(Words::load(w.error) == ops::kWaitFlagErrorTimeout,
+    const double target = static_cast<double>(kWaitFlagTimeoutNs) * 1e-9;
+    check(Words::load(w.error) == kWaitFlagErrorTimeout,
           "never_raised: the error word does not hold the timeout");
     check(w.marked(), "never_raised: the stream did not continue after the timeout");
     check(took >= 0.9 * target && took < target + 1.0,
@@ -184,9 +204,9 @@ void never_raised(cudaStream_t stream) {
 
 void stale_sequence(cudaStream_t stream) {
     Words w;
-    auto* sequence = static_cast<std::uint32_t*>(w.sequence.data());
+    auto* sequence = static_cast<std::uint32_t*>(w.sequence.p);
     // Round 1 wants 1.
-    ops::wait_flag_sequence(w.flag_dev, sequence, w.error_dev, stream);
+    wait_flag_sequence(w.flag_dev, sequence, w.error_dev, stream);
     w.enqueue_marker(stream);
     std::thread first = raise_later(w.flag, 1, std::chrono::milliseconds(100));
     check_held(w, stream, "stale_sequence round 1");
@@ -196,7 +216,7 @@ void stale_sequence(cudaStream_t stream) {
     check(w.read_sequence() == 1, "stale_sequence: the counter is not 1 after one call");
     // Round 2 with the flag still at round 1's value: it must wait for 2.
     w.clear_marker();
-    ops::wait_flag_sequence(w.flag_dev, sequence, w.error_dev, stream);
+    wait_flag_sequence(w.flag_dev, sequence, w.error_dev, stream);
     w.enqueue_marker(stream);
     std::thread second = raise_later(w.flag, 2, std::chrono::milliseconds(100));
     check_held(w, stream, "stale_sequence round 2 (flag left at 1)");
@@ -207,7 +227,7 @@ void stale_sequence(cudaStream_t stream) {
     // Across the wrap: the counter at 0xFFFFFFFF wants 0, and the flag at 0xFFFFFFFF holds it back.
     w.set_sequence(0xFFFFFFFFU);
     w.reset(0xFFFFFFFFU);
-    ops::wait_flag_sequence(w.flag_dev, sequence, w.error_dev, stream);
+    wait_flag_sequence(w.flag_dev, sequence, w.error_dev, stream);
     w.enqueue_marker(stream);
     std::thread wrap = raise_later(w.flag, 0, std::chrono::milliseconds(100));
     check_held(w, stream, "stale_sequence across the wrap");
@@ -220,10 +240,10 @@ void stale_sequence(cudaStream_t stream) {
 
 void replayed_graph(cudaStream_t stream) {
     Words w;
-    auto* sequence = static_cast<std::uint32_t*>(w.sequence.data());
+    auto* sequence = static_cast<std::uint32_t*>(w.sequence.p);
     cudaGraph_t graph = nullptr;
     cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "begin capture");
-    ops::wait_flag_sequence(w.flag_dev, sequence, w.error_dev, stream);
+    wait_flag_sequence(w.flag_dev, sequence, w.error_dev, stream);
     w.enqueue_marker(stream);
     cuda_check(cudaStreamEndCapture(stream, &graph), "end capture");
     cudaGraphExec_t exec = nullptr;
@@ -241,8 +261,6 @@ void replayed_graph(cudaStream_t stream) {
     check(w.read_sequence() == 3, "replayed_graph: the counter is not 3 after three replays");
     cuda_check(cudaGraphExecDestroy(exec), "exec destroy");
     cuda_check(cudaGraphDestroy(graph), "graph destroy");
-    check(w.sequence.verify_guards("wait_flag_sequence counter") == 0,
-          "replayed_graph: the counter's guards changed");
     std::cout << "replayed_graph: three replays of one captured wait, each held until its value\n";
 }
 
@@ -266,6 +284,6 @@ int main() {
         ++failures;
     }
     cuda_check(cudaStreamDestroy(stream), "cudaStreamDestroy");
-    std::cout << (failures == 0 ? "OK" : "FAIL") << " wait_flag public contract\n";
+    std::cout << (failures == 0 ? "OK" : "FAIL") << " host flag wait contract\n";
     return failures == 0 ? 0 : 1;
 }

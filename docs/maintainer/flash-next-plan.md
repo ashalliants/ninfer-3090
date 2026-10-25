@@ -1003,7 +1003,8 @@ None has been measured on the RTX 3090 yet.
   PR 11's split (11c above) runs a round's layers before the PLE layer as one graph, reads the rows
   on the host, uploads them and launches the rest as a second graph: two launches, and the back's
   launch waits for the host's read. With the option a single-request plain round and each MTP
-  verification width run as one graph: the front, `ops::wait_flag_sequence` (one thread spinning
+  verification width run as one graph: the front, `wait_flag_sequence` (`src/core/host_flag_wait.h`,
+  core infrastructure beside `upload_pinned`, not an Op: it has no tensor effect; one thread spinning
   with `__nanosleep(200)` on an `ld.acquire.sys` of a flag in mapped host memory), the rows' copy
   from the pinned io block (`upload_pinned`, captured), the back and the logits cast. After the
   launch the host reads the rows into the pinned block (`read_rows`, including a prefill-prefetched
@@ -1021,26 +1022,33 @@ None has been measured on the RTX 3090 yet.
     verification width's) stays eager in two parts (`ngram_rows_in_graph`): the kernels' one-time
     setup runs outside a capture, and an eager wait could deadlock if any of that setup blocked the
     host on the stream before it raised the flag. The two-part graphs are then never captured, so
-    `graph_bound` still bounds the executables. `ninfer_wait_flag_test` (a flag raised late by a host
+    `graph_bound` still bounds the executables. `ninfer_host_flag_wait_test` (a flag raised late by a host
     thread holds back the stream work behind the wait; a flag never raised times out into the error
     word and the stream continues; a stale flag holds the next call back; one captured wait waits
     for a new value at each replay; the 2^32 wrap) and the engine gates
     `ninfer_qwen4_exp_ngram_flag_wait_test` (plain rounds) and `ninfer_qwen4_exp_ngram_flag_wait_mtp_test`
     (verifications; greedy ids, rounds, drafts and acceptances on vs off, and
-    `Program::process_ngram_flag_rounds` must count a one-graph round) have not run yet.
+    `Program::process_ngram_flag_rounds`, with MTP `process_ngram_flag_verifications`, must count a
+    one-graph round) have not run yet.
   - Not applied: a two-lane round (`decode_rows`) keeps its two parts (one graph pair shared by the
     lanes; a later change could give it the same form), and so does every round with
-    `--no-cuda-graph`, prefill and forced tokens.
-  - Failure: a wait that sees no flag for 1 s (`ops::kWaitFlagTimeoutNs`, the CPU-miss wait's
+    `--no-cuda-graph`, prefill and forced tokens. With `CUDA_LAUNCH_BLOCKING=1` at startup the Program
+    says so once and keeps the two parts: a serialized launch returns only after the wait, so every
+    one-graph round would time out. compute-sanitizer serializes launches the same way and is not
+    detected, so do not run the option under it.
+  - Failure: a wait that sees no flag for 1 s (`kWaitFlagTimeoutNs`, the CPU-miss wait's
     `kHeartbeatTimeoutNs`) writes `kWaitFlagErrorTimeout` to the Program's mapped error word and the
     round runs on with rows the host may not have finished. Each round reads the word after its
     synchronization and before anything reads its outputs; a set word is cleared and the round
     throws, so the request ends with an error and nothing of the round is committed (decode's catch
-    releases the lane). The host raises the flag even when its read throws, so the device does not
-    wait out the timeout and the counter and the flag stay in step.
+    releases the lane). The word is cleared before each one-graph launch, and a verification reads it
+    before the CPU-miss check can throw, so a set word never fails a later round. The host raises the
+    flag even when its read throws, so the device does not wait out the timeout and the counter
+    and the flag stay in step.
   - Memory: the 4-byte device counter is `ProgramDevicePlan::ngram_flag_wait`; the flag and the
     error word (a 64-byte line each, 128 bytes) are pinned and charged to the RAM ledger
-    (`plan_ngram_flag_wait`). The rows use the existing pinned io block.
+    (`plan_ngram_flag_wait`). The rows use the existing pinned io block. Off allocates nothing (nor,
+    now, does `--cpu-verify-misses` off: its error word was a 1-byte pinned placeholder).
   - GPU-session checks: with a display attached (WDDM) a kernel spinning past TdrDelay (2 s) resets
     the driver. A healthy wait is at most the row read (median 0.6 ms, p90 1.2 ms in PR 11) and the
     timeout is 1 s, so check that a stalled host (a cold SSD read, a paging stall) does not trip it,

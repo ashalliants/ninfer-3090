@@ -2,22 +2,24 @@
 
 // Adapted from Basalt 8d73a39 src/kernels/cuda/verify_kernels.cu (wait_flag_ge) (MIT, third_party/basalt/LICENSE).
 // Modified for NInfer-3090: a wrap-aware comparison, a device sequence counter (one captured
-// launch waits for each replay's own value), and a timeout that reports to an error word.
+// launch waits for each replay's own value), and a timeout that reports to an error word. Core
+// infrastructure beside upload_pinned (core/pinned_upload.h): it orders stream work after a host
+// write and has no tensor effect, so it is not an Op.
 
 #include <cuda_runtime.h>
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace ninfer {
 
-// A wait gives up when the flag has not reached its value for this long (GPU time): the same 1 s
-// as offloaded_moe::kHeartbeatTimeoutNs, under the 2 s of Windows' display watchdog (TDR).
+// A wait gives up when the flag has not reached its value for this long (GPU time): 1 s, under the
+// 2 s of Windows' display watchdog (TDR), the same as the CPU-miss wait of offloaded_sparse_moe.
 inline constexpr std::uint64_t kWaitFlagTimeoutNs = 1000000000ULL;
 // What a timed-out wait writes to its error word.
 inline constexpr std::uint32_t kWaitFlagErrorTimeout = 0xFF03;
 
 /**
- * Op: wait_flag_ge / wait_flag_sequence (stream-ordered wait for a host flag)
+ * wait_flag_ge / wait_flag_sequence: a stream-ordered wait for a host flag
  *
  * Math / indexing:
  *   reached(f, v) = (int32)(f - v) >= 0, the wrap-aware f >= v of 32-bit counters (f is at or up
@@ -52,11 +54,13 @@ inline constexpr std::uint32_t kWaitFlagErrorTimeout = 0xFF03;
  *   each replay, so the flag's writer raises it once per replay (to the count of replays) and a
  *   value left from an earlier replay never releases a later one. The device spins (sleeping
  *   between reads) until then, so work enqueued after the call starts only after the flag is
- *   raised; the host must raise it without waiting for the stream.
+ *   raised; the host must raise it without waiting for the stream. Under serialized launches
+ *   (CUDA_LAUNCH_BLOCKING=1, compute-sanitizer) a launch returns only once the wait is done, so a
+ *   host that raises the flag after the launch always meets the timeout.
  */
 void wait_flag_ge(const volatile std::uint32_t* mapped, std::uint32_t value, std::uint32_t* error,
                   cudaStream_t stream);
 void wait_flag_sequence(const volatile std::uint32_t* mapped, std::uint32_t* sequence,
                         std::uint32_t* error, cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace ninfer

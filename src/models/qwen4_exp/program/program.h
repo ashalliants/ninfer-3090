@@ -478,19 +478,23 @@ struct ProgramOptions {
     // outputs of hc_int8 alone; the workspace terms add Forward::hc_fused_read_workspace_bytes.
     bool hc_fused_read = false;
     // FlashNextOptions::ngram_flag_wait: a single-row plain round and an MTP verification run as one
-    // graph (ngram_rows_in_graph): the front, ops::wait_flag_sequence on the Program's mapped flag,
-    // the rows' copy from the pinned block, the back. The host reads the rows into the pinned block
-    // after launching the graph and raises the flag. Bitwise the two-part round. A wait that times out
-    // (the host did not raise the flag within ops::kWaitFlagTimeoutNs) fails the round: its request
-    // ends with an error and nothing of it is committed. Memory: plan_ngram_flag_wait.
+    // graph (ngram_rows_in_graph): the front, wait_flag_sequence (core/host_flag_wait.h) on the
+    // Program's mapped flag, the rows' copy from the pinned block, the back. The host reads the rows
+    // into the pinned block after launching the graph and raises the flag. Bitwise the two-part
+    // round. A wait that times out (the host did not raise the flag within kWaitFlagTimeoutNs) fails
+    // the round: its request ends with an error and nothing of it is committed. Memory:
+    // plan_ngram_flag_wait.
     bool ngram_flag_wait = false;
 };
 
 // --ngram-flag-wait: whether a round runs as one graph that waits for its n-gram rows (true) or in
 // two parts around the host's row read, as off. Only with the option and CUDA graphs on, and once
 // the round's two parts have run eagerly (`eager_done`: their kernels' one-time setup is done, and
-// a round never spins on the device while the host could still block on it).
-[[nodiscard]] bool ngram_rows_in_graph(const ProgramOptions& options, bool eager_done) noexcept;
+// a round never spins on the device while the host could still block on it), and not when launches
+// are serialized (`launch_blocking`: CUDA_LAUNCH_BLOCKING=1 at startup, where every one-graph round
+// would time out, since the host raises the flag only after the launch returns).
+[[nodiscard]] bool ngram_rows_in_graph(const ProgramOptions& options, bool eager_done,
+                                       bool launch_blocking = false) noexcept;
 
 // The memory of --ngram-flag-wait: `device` is ProgramDevicePlan::ngram_flag_wait (the waits'
 // 4-byte sequence counter), `pinned` the mapped flag and error word (one 64-byte line each). Both 0
@@ -583,9 +587,10 @@ public:
     // --gdn-async-commit: the GDN replay folds every Program in this process has run on its fold
     // stream (a test's proof that the option's route ran).
     [[nodiscard]] static std::uint64_t process_async_gdn_folds() noexcept;
-    // --ngram-flag-wait: the rounds every Program in this process has run as one graph waiting for
-    // its n-gram rows (a test's proof that the option's route ran).
+    // --ngram-flag-wait: the plain rounds, and the MTP verifications, every Program in this process
+    // has run as one graph waiting for their n-gram rows (a test's proof that the option's route ran).
     [[nodiscard]] static std::uint64_t process_ngram_flag_rounds() noexcept;
+    [[nodiscard]] static std::uint64_t process_ngram_flag_verifications() noexcept;
 
     [[nodiscard]] RequestBasePlan plan_request(PreparedPrompt&& prompt,
                                                const runtime::ResolvedExecutionOptions& options);
