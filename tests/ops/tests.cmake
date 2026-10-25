@@ -189,6 +189,12 @@ ninfer_add_op_test(ninfer_gdn_input_proj_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_proj.cpp"
   LIBRARIES ninfer_ops)
 
+# The lossy scout's int4 routes of the split attention and GDN input projections (ScoutA4Int), bit
+# for bit against AllowA8Int (Q5 parts) and q4_a4_linear (Q4 parts).
+ninfer_add_op_test(ninfer_scout_a4_input_proj_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_scout_a4_input_proj.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_gdn_input_small_t_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_small_t.cpp"
   LIBRARIES ninfer_ops)

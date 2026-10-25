@@ -157,6 +157,10 @@ struct ProposalParameters {
                                                            std::uint32_t filter_layer);
 // Whether any projection of the block carries the scout's int4 policy.
 [[nodiscard]] bool holds_scout_policy(const BlockParameters& block) noexcept;
+// Whether --lossy-prefill-scout-a4 would move anything at all: some layer in [0, filter_layer] has
+// a Q4 matrix on the integer-A8 prefill route. Startup refuses the option otherwise (without
+// --prefill-a8 it would silently be the int8 scout).
+[[nodiscard]] bool scout_a4_promotes(const TextParameters& text, std::uint32_t filter_layer);
 
 // Cold native preparation for the fixed model implementation. This owner is stable before
 // startup sizing, execution, or Graph capture; all weight addresses borrow the source Model.

@@ -305,7 +305,7 @@ def test_kept_blocks_and_jaccard():
     check(sweep.kept_blocks([[10, 70]], 300, 64) == set(), "a run inside two blocks keeps neither")
     # scored_only drops the forced head (first 64) and recent (last 100 -> blocks ending past 200).
     check(sweep.kept_blocks([[0, 300]], 300, 64, True, 64, 100) == {1, 2}, "head and recent left out")
-    check(sweep.jaccard({1, 2, 3}, {2, 3, 4}) == 0.5 and sweep.jaccard(set(), set()) == 1.0, "jaccard")
+    check(sweep.jaccard({1, 2, 3}, {2, 3, 4}) == 0.5 and sweep.jaccard(set(), set()) is None, "jaccard")
 
 
 def jaccard_rows(a4_runs, int8_runs, outcome="completed", uncached=1000, head="0", recent="0"):
@@ -358,8 +358,12 @@ def test_jaccard_gate():
     for r in defaults:
         if r["workload"] == "jaccard":
             r["params"].pop("head"), r["params"].pop("recent")
-    check(sweep.jaccard_metrics(defaults, "b64_a1")["scored_min"] == 1.0,
-          "with recent 4096 > the span, no score-chosen block remains: an empty pair counts 1.0")
+    overlap = sweep.jaccard_metrics(defaults, "b64_a1")
+    check(overlap["scored_min"] is None and overlap["unmeasured"] == [0, 1],
+          ("with recent 4096 > the span no block is score-chosen: nothing measured", overlap))
+    gate = checks(defaults, "b64_a1")["jaccard"]
+    check(gate["pass"] is None and "not measured" in gate["detail"], ("not measured, never a vacuous pass", gate))
+    check(sweep.evaluate_point(defaults, "b64_a1")["verdict"] != "PASS", "an unmeasured gate cannot PASS")
     # A prompt that did not complete lossy prefill on one side fails rather than being skipped.
     broken = jaccard_rows(same, same)
     broken[1]["metrics"]["kept"][1]["outcome"] = "skipped"

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -141,12 +142,16 @@ std::set<std::uint32_t> kept_blocks(const Scouted& s, std::uint32_t block, bool 
     return out;
 }
 
-double jaccard(const std::set<std::uint32_t>& a, const std::set<std::uint32_t>& b) {
+// Nothing on either side measures nothing: nullopt, which the gate treats as a failure.
+std::optional<double> jaccard(const std::set<std::uint32_t>& a, const std::set<std::uint32_t>& b) {
     std::size_t both = 0;
     for (const auto v : a) { both += b.count(v); }
     const std::size_t either = a.size() + b.size() - both;
-    return either == 0 ? 1.0 : static_cast<double>(both) / static_cast<double>(either);
+    if (either == 0) { return std::nullopt; }
+    return static_cast<double>(both) / static_cast<double>(either);
 }
+
+std::string shown(std::optional<double> v) { return v ? std::to_string(*v) : "not measured"; }
 
 bool keeps(const Scouted& s, std::uint32_t begin, std::uint32_t end) {
     for (std::uint32_t t = begin; t < end; ++t) {
@@ -188,23 +193,27 @@ int exercise(const char* artifact) {
         require(a.uncached == b.uncached && a.exact_end == b.exact_end,
                 n + ": the two scouts filtered different spans");
         require(h.key_begin >= a.exact_end, n + ": the pass key is outside the filtered part");
-        const double all = jaccard(
+        const std::optional<double> all = jaccard(
             kept_blocks(a, shape.block_tokens, false, shape.head_tokens, shape.recent_tokens),
             kept_blocks(b, shape.block_tokens, false, shape.head_tokens, shape.recent_tokens));
-        const double scored = jaccard(
+        const std::optional<double> scored = jaccard(
             kept_blocks(a, shape.block_tokens, true, shape.head_tokens, shape.recent_tokens),
             kept_blocks(b, shape.block_tokens, true, shape.head_tokens, shape.recent_tokens));
         const bool key8 = keeps(a, h.key_begin, h.key_end);
         const bool key4 = keeps(b, h.key_begin, h.key_end);
         std::cout << n << ": kept int8=" << a.kept << " int4=" << b.kept << " of " << a.uncached
-                  << "; kept-block Jaccard over score-chosen blocks " << scored << " (gated >= "
-                  << kJaccardGate << "), all kept blocks " << all
+                  << "; kept-block Jaccard over score-chosen blocks " << shown(scored)
+                  << " (gated >= " << kJaccardGate << "), all kept blocks " << shown(all)
                   << " (reference); pass key kept int8="
                   << key8 << " int4=" << key4 << "; scout int8 " << a.scout_ms << " ms, int4 "
                   << b.scout_ms << " ms (" << a.scout_ms / b.scout_ms << "x)\n";
-        if (!(scored >= kJaccardGate)) {
-            std::cerr << n << ": score-chosen kept-block Jaccard " << scored << " < " << kJaccardGate
-                      << '\n';
+        if (!scored) {
+            std::cerr << n << ": neither scout kept a score-chosen block, so the overlap is not "
+                         "measured\n";
+            ++failures;
+        } else if (!(*scored >= kJaccardGate)) {
+            std::cerr << n << ": score-chosen kept-block Jaccard " << *scored << " < "
+                      << kJaccardGate << '\n';
             ++failures;
         }
         if (!key8 || !key4) {

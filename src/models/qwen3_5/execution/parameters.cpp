@@ -460,6 +460,11 @@ bool holds_scout_policy(const BlockParameters& block) noexcept {
            scout_policy(gdn.output.policy);
 }
 
+bool scout_a4_promotes(const TextParameters& text, std::uint32_t filter_layer) {
+    const auto layers = scout_a4_layers(text, filter_layer);
+    return std::any_of(layers.begin(), layers.end(), holds_scout_policy);
+}
+
 std::vector<BlockParameters> scout_a4_layers(const TextParameters& text,
                                              std::uint32_t filter_layer) {
     if (filter_layer >= text.layers.size()) {

@@ -119,6 +119,32 @@ void run_layers() {
     check(gdn_dense.gate_up.weight.n == 34816 && gdn.output.weight.k == 6144,
           "the copies keep the model's weights");
     check_throws([&] { (void)execution::scout_a4_layers(text, 3); }, "a filter layer past the model");
+
+    // Startup's admission of --lossy-prefill-scout-a4 (validate_target_options refuses it when this
+    // is false): with --prefill-a8 the 27B layers have Q4 matrices to promote; without it every
+    // policy is A16Only and the option would silently be the int8 scout.
+    check(execution::scout_a4_promotes(text, 1), "--prefill-a8 layers admit the int4 scout");
+    execution::TextParameters a16 = model();
+    for (auto& block : a16.layers) {
+        auto& dense          = std::get<execution::DenseParameters>(block.ffn);
+        dense.gate_up.policy = LinearPolicy::A16Only;
+        dense.down.policy    = LinearPolicy::A16Only;
+        if (auto* attention = std::get_if<execution::AttentionParameters>(&block.mixer)) {
+            std::get<ninfer::ops::PairedProjectionWeights>(attention->projection).policy =
+                LinearPolicy::A16Only;
+            attention->output.policy = LinearPolicy::A16Only;
+        } else {
+            auto& gdn = std::get<execution::GdnParameters>(block.mixer);
+            std::get<ninfer::ops::PairedProjectionWeights>(gdn.projection).policy =
+                LinearPolicy::A16Only;
+            gdn.output.policy = LinearPolicy::A16Only;
+        }
+    }
+    check(!execution::scout_a4_promotes(a16, 1), "without --prefill-a8 the int4 scout is refused");
+    // Only Q5 matrices on the integer route: still nothing to promote.
+    execution::TextParameters q5_only = a16;
+    std::get<execution::DenseParameters>(q5_only.layers[0].ffn).down.policy = LinearPolicy::AllowA8Int;
+    check(!execution::scout_a4_promotes(q5_only, 1), "a Q5-only integer route admits nothing");
 }
 
 void run_planning() {

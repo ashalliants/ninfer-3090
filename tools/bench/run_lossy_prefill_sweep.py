@@ -197,9 +197,10 @@ def kept_blocks(runs: Sequence[Sequence[int]], uncached: int, block: int, scored
     return out
 
 
-def jaccard(a: set[int], b: set[int]) -> float:
+def jaccard(a: set[int], b: set[int]) -> float | None:
+    """None when both sets are empty: there is nothing to compare, so no overlap was measured."""
     either = len(a | b)
-    return 1.0 if either == 0 else len(a & b) / either
+    return None if either == 0 else len(a & b) / either
 
 
 def point_params(rows: list[dict[str, Any]], point: str) -> dict[str, str] | None:
@@ -251,11 +252,17 @@ def jaccard_metrics(rows: list[dict[str, Any]], point: str) -> dict[str, Any] | 
         scored.append(jaccard(kept_blocks(record["kept_runs"], n, block, True, head, recent),
                               kept_blocks(other["kept_runs"], n, block, True, head, recent)))
     unmatched += [p for p in by_prompt if p not in {r["prompt"] for r in mine.get("kept") or []}]
+    # A prompt whose two runs hold no score-chosen block (a span within head + recent) measures
+    # nothing; it is listed, and the gate is not measured rather than passed.
+    unmeasured = [r["prompt"] for r, v in zip([r for r in mine.get("kept") or []
+                                               if r["prompt"] not in unmatched], scored) if v is None]
+    some, chosen = [v for v in values if v is not None], [v for v in scored if v is not None]
     return {"partner": partner, "prompts": len(values), "jaccard": values,
-            "jaccard_min": min(values) if values else None,
-            "jaccard_mean": statistics.fmean(values) if values else None,
-            "scored": scored, "scored_min": min(scored) if scored else None,
-            "scored_mean": statistics.fmean(scored) if scored else None, "unmatched": unmatched}
+            "jaccard_min": min(some) if some else None,
+            "jaccard_mean": statistics.fmean(some) if some else None,
+            "scored": scored, "scored_min": min(chosen) if chosen else None,
+            "scored_mean": statistics.fmean(chosen) if chosen else None,
+            "unmatched": unmatched, "unmeasured": unmeasured}
 
 
 def server_command(base_cmd: str, port: int, request_log: Path, params: dict[str, str] | None,
@@ -608,12 +615,23 @@ def evaluate_point(rows: list[dict[str, Any]], point: str) -> dict[str, Any]:
         else:
             # Ruling R11: the gate is over the score-chosen blocks only; the forced head and recent
             # blocks are kept identically by both scouts and would inflate the index.
-            ok = overlap["scored_min"] >= JACCARD_MIN - 1e-9 and not overlap["unmatched"]
+            low = overlap["scored_min"] is not None and overlap["scored_min"] < JACCARD_MIN - 1e-9
+            if overlap["unmatched"] or low:
+                ok: bool | None = False
+            elif overlap["unmeasured"]:
+                ok = None  # some prompt had no score-chosen block on either side
+            else:
+                ok = True
+
+            def fmt(v: float | None) -> str:
+                return "-" if v is None else f"{v:.3f}"
             checks.append(check("jaccard", overlap["scored_min"], ok,
-                                f"score-chosen blocks min {overlap['scored_min']:.3f} over {overlap['prompts']} "
+                                f"score-chosen blocks min {fmt(overlap['scored_min'])} over {overlap['prompts']} "
                                 f"prompt(s) vs `{overlap['partner']}` (need >= {JACCARD_MIN:.2f}); all kept "
-                                f"blocks {overlap['jaccard_min']:.3f} (reference)"
-                                + (f"; unmatched prompts {overlap['unmatched']}" if overlap["unmatched"] else "")))
+                                f"blocks {fmt(overlap['jaccard_min'])} (reference)"
+                                + (f"; unmatched prompts {overlap['unmatched']}" if overlap["unmatched"] else "")
+                                + (f"; no score-chosen block, not measured: prompts {overlap['unmeasured']}"
+                                   if overlap["unmeasured"] else "")))
     if point != BASELINE:
         for workload in ALL_WORKLOADS:
             metrics = _metric(rows, point, workload)
@@ -716,8 +734,10 @@ def render_summary(rows: list[dict[str, Any]]) -> str:
             scout = f"{theirs:.0f} / {mine:.0f} ({theirs / mine:.2f}x)" if mine and theirs else "-"
             gate = {c["name"]: c for c in evaluate_point(rows, point)["checks"]}["jaccard"]
             if overlap and overlap["prompts"]:
-                lines.append(f"| {point} | {partner} | {overlap['prompts']} | {overlap['scored_min']:.3f} "
-                             f"| {overlap['scored_mean']:.3f} | {overlap['jaccard_min']:.3f} | {scout} "
+                def cell(v: float | None) -> str:
+                    return "-" if v is None else f"{v:.3f}"
+                lines.append(f"| {point} | {partner} | {overlap['prompts']} | {cell(overlap['scored_min'])} "
+                             f"| {cell(overlap['scored_mean'])} | {cell(overlap['jaccard_min'])} | {scout} "
                              f"| {_mark(gate, '.3f')} |")
             else:
                 lines.append(f"| {point} | {partner or '-'} | - | - | - | - | {scout} | - |")

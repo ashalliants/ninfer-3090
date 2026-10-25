@@ -969,9 +969,7 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         // that route (no --prefill-a8, or a build without the sm86 integer routes) it would
         // silently be the int8 scout.
         if (options.lossy_prefill.scout_a4) {
-            const auto layers =
-                execution::scout_a4_layers(parameters.text, options.lossy_prefill.filter_layer);
-            if (std::none_of(layers.begin(), layers.end(), execution::holds_scout_policy)) {
+            if (!execution::scout_a4_promotes(parameters.text, options.lossy_prefill.filter_layer)) {
                 throw std::invalid_argument(
                     "--lossy-prefill-scout-a4 needs Q4 projections on the integer-A8 prefill "
                     "route (--prefill-a8 on an sm86 build)");
