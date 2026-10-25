@@ -29,6 +29,7 @@ set(NINFER_HOST_ONLY_TESTS
   ninfer_json_schema_test
   ninfer_kv_capacity_test
   ninfer_media_decode_test
+  ninfer_moe_cpu_selection_test
   ninfer_moe_dispatch_plan_test
   ninfer_perplexity_evaluation_test
   ninfer_prefill_depth_sweep_test

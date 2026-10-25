@@ -427,6 +427,14 @@ struct FlashNextOptions {
     // one launch instead of two (--moe-fused-route), with each expert's columns in a fixed order. The
     // same routing and the same output, bit for bit.
     bool moe_fused_route = false;
+    // Compute some of each MTP verification round's non-resident routed experts on the CPU
+    // (--cpu-verify-misses; needs --spec mtp): per layer up to 4 misses, the fewest-column ones,
+    // a third of them left on the GPU, computed by a worker team of cpu_verify_workers threads
+    // (--cpu-verify-workers, 1..64) while the GPU runs the other experts and the shared expert,
+    // instead of reading them over PCIe. The CPU's arithmetic equals the GPU's bit for bit, so the
+    // same output. Plain decode and prefill are unchanged.
+    bool cpu_verify_misses           = false;
+    std::uint32_t cpu_verify_workers = 6;
     // The context cache's NVMe tier: a scratch file of up to this many bytes holds the checkpoints,
     // with the Host context budget as its RAM cache (a zero Host budget then reuses prefixes from
     // disk alone); 0: none. The file is created in `context_nvme_dir` (empty: beside the artifact),

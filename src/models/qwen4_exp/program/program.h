@@ -8,7 +8,8 @@
 // (docs/maintainer/flash-next-context-cache.md), one lane, MTP speculation (Infernix's drafter,
 // verification and commit), image input (Infernix's vision program: the tower encodes in frames
 // lent by the expert cache at the prompt's first prefill unit, the handoff stays lent until the
-// prompt's last call), no n-gram copy drafts, CPU-served misses or SSD expert tier.
+// prompt's last call), CPU-served misses in verification rounds only (opt-in), no n-gram copy
+// drafts or SSD expert tier.
 //
 // The Qwen4Exp Program: the Engine-facing execution of Qwen3.8-Flash-Next. It owns the lane, its
 // paged INT8 KV (an elastic VMM pool), recurrent state, sampling state and the one pending model
@@ -339,13 +340,17 @@ struct ProgramDevicePlan {
     // --hot-embedding-rows: the device copy of the token embedding's first rows
     // (plan_hot_embedding(...).hot; 0 when off). The whole table is in the pinned block then.
     std::uint64_t hot_embedding = 0;
+    // --cpu-verify-misses: the CPU miss service's device counter of published requests
+    // (plan_cpu_verify_misses(...).device; 0 when off). Its channel and the round's error word are
+    // pinned host memory (.pinned), charged to the RAM ledger.
+    std::uint64_t cpu_verify_misses = 0;
     std::uint64_t expert_record_stride = 0; // one expert frame
     std::uint32_t max_frames           = 0; // the most frames the expert cache uses
     std::uint32_t graph_bound          = 0; // CUDA graph executables the Program may instantiate (counts both halves of the split decode)
 
     [[nodiscard]] std::uint64_t fixed_bytes() const noexcept {
         return kv + workspace + staging + state + io + residency + speculation + shared_expert_workspace +
-               mtp_constrained_masks + mtp_draft_probs + hot_embedding;
+               mtp_constrained_masks + mtp_draft_probs + hot_embedding + cpu_verify_misses;
     }
 };
 
@@ -439,7 +444,28 @@ struct ProgramOptions {
     // FlashNextOptions::moe_fused_route: decode-width routed-expert calls route and dispatch in one
     // launch (execution::ForwardOptions::moe_fused_route). No memory.
     bool moe_fused_route = false;
+    // FlashNextOptions::cpu_verify_misses: a CPU miss service (ops::offloaded_moe::CpuMissService)
+    // over the expert banks, running for the Program's life; each MTP verification's routed experts
+    // hand it some of their misses (execution::ForwardExperts::cpu), computed by its worker team
+    // while the GPU runs the other experts and the shared expert. The same outputs, bit for bit. A
+    // round whose CPU leg times out fails; once the service has failed, rounds decode plain.
+    // Requires MTP (mtp_draft_tokens > 0). cpu_verify_workers: the team's threads, the service thread
+    // included (1..64).
+    bool cpu_verify_misses           = false;
+    std::uint32_t cpu_verify_workers = 6;
 };
+
+// The CPU miss service of --cpu-verify-misses: its options (CPU-served experts per layer call, the
+// share left on the GPU, the widest call it serves: a verification of 1 + mtp_draft_tokens columns)
+// and its memory. `device` is ProgramDevicePlan::cpu_verify_misses (the service's 4-byte request
+// counter); `pinned` its mapped channel (the request, the x columns and the outputs, the done and
+// heartbeat words) and the Program's error word. Both 0 without cpu_verify_misses or MTP.
+struct CpuVerifyPlan {
+    int workers = 0, max_jobs = 0, max_columns = 0, pcie_divisor = 0;
+    std::uint64_t device = 0;
+    std::uint64_t pinned = 0;
+};
+[[nodiscard]] CpuVerifyPlan plan_cpu_verify_misses(const ProgramOptions& options);
 
 // ProgramDevicePlan::shared_expert_workspace of these options: the side-stream carve
 // (execution::Forward::shared_expert_workspace_bytes) of the static workspace's widest call, a

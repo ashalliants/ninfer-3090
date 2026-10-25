@@ -182,6 +182,11 @@ void validate(const EngineOptions& options) {
         refuse("--moe-gate-up-registers reads the input that --moe-precast-input casts once per call and needs it: "
                "add --moe-precast-input or remove --moe-gate-up-registers");
     }
+    if (next.cpu_verify_misses && spec.backend != SpeculativeBackend::Mtp) {
+        refuse("--cpu-verify-misses computes MTP verification rounds' misses on the CPU and needs --spec mtp: add "
+               "--spec mtp or remove --cpu-verify-misses");
+    }
+    if (next.cpu_verify_workers < 1 || next.cpu_verify_workers > 64) { refuse("--cpu-verify-workers must be in [1, 64]"); }
     if (next.ngram_prefetch && spec.backend != SpeculativeBackend::Mtp) {
         refuse("--ngram-prefetch reads the anchor column's n-gram rows while the MTP drafter runs and needs "
                "--spec mtp: add --spec mtp or remove --ngram-prefetch");
@@ -282,6 +287,14 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     demand.reserve      = next.ram_headroom_bytes;
     models::qwen4_exp::plan_pinned_weights(demand, plan.pinned_bytes(), hot_embedding);
     demand.later_pinned = kProgramPinnedAllowance;
+    {
+        // --cpu-verify-misses: the CPU miss service's mapped channel and the round's error word.
+        models::qwen4_exp::ProgramOptions cpu;
+        cpu.cpu_verify_misses  = next.cpu_verify_misses;
+        cpu.cpu_verify_workers = next.cpu_verify_workers;
+        cpu.mtp_draft_tokens   = mtp ? options.speculative.draft_tokens : 0;
+        demand.later_pinned += models::qwen4_exp::plan_cpu_verify_misses(cpu).pinned;
+    }
     demand.pageable     = models::qwen4_exp::NgramVolume::cache_bytes(config.ple.table);
     // Decoded media: the frontend's cache up to its budget, and in flight at most one prompt's patches
     // (one prompt per lane; a prompt's vision tokens are bounded by the context).
@@ -360,6 +373,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.moe_precast_input    = next.moe_precast_input;
     program_options.moe_gate_up_registers = next.moe_gate_up_registers;
     program_options.moe_fused_route       = next.moe_fused_route;
+    program_options.cpu_verify_misses     = next.cpu_verify_misses;
+    program_options.cpu_verify_workers    = next.cpu_verify_workers;
     program_options.ngram_volume    = next.ngram_volume_path.empty()
                                           ? models::qwen4_exp::default_ngram_volume(options.artifact_path)
                                           : next.ngram_volume_path;

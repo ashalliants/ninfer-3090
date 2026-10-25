@@ -157,6 +157,39 @@ int main() {
     failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--moe-fused-route"}))
                           .flash_next.moe_fused_route,
                       "--moe-fused-route does not reach the Engine");
+    failures += check(!defaults.flash_next.cpu_verify_misses && defaults.flash_next.cpu_verify_workers == 6,
+                      "the CPU leg for verification misses is on by default, or its team is not 6 threads");
+    {
+        const ninfer::EngineOptions on = make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp",
+                                                                    "--draft-tokens", "3", "--cpu-verify-misses",
+                                                                    "--cpu-verify-workers", "12"}));
+        failures += check(on.flash_next.cpu_verify_misses && on.flash_next.cpu_verify_workers == 12,
+                          "--cpu-verify-misses --cpu-verify-workers 12 does not reach the Engine");
+        const auto refused = [](std::vector<std::string> args, std::vector<std::string> names) {
+            try {
+                (void)parse(std::move(args));
+            } catch (const std::invalid_argument& error) {
+                for (const auto& name : names) {
+                    if (std::string(error.what()).find(name) == std::string::npos) { return false; }
+                }
+                return true;
+            }
+            return false;
+        };
+        failures += check(refused({"ninfer-serve", "model.ninfer", "--cpu-verify-misses"},
+                                  {"--cpu-verify-misses", "--spec mtp"}),
+                          "--cpu-verify-misses without --spec mtp was not refused naming both flags");
+        failures += check(refused({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+                                   "--cpu-verify-workers", "8"},
+                                  {"--cpu-verify-workers", "--cpu-verify-misses"}),
+                          "--cpu-verify-workers without --cpu-verify-misses was not refused naming both flags");
+        for (const char* bad : {"0", "65"}) {
+            failures += check(refused({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+                                       "--cpu-verify-misses", "--cpu-verify-workers", bad},
+                                      {"--cpu-verify-workers"}),
+                              (std::string("--cpu-verify-workers ") + bad + " was not refused").c_str());
+        }
+    }
     failures += check(!defaults.flash_next.mtp_constrained, "MTP for constrained requests is on by default");
     failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
                                                  "--mtp-constrained"}))

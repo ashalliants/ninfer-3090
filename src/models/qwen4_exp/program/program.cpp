@@ -497,6 +497,13 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
         throw std::invalid_argument("Qwen3.8-Flash-Next: --mtp-joint-acceptance chooses how many drafts each round "
                                     "verifies and --mtp-fixed always verifies --draft-tokens: use one of them");
     }
+    if (o.cpu_verify_misses && o.mtp_draft_tokens == 0) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next: --cpu-verify-misses computes MTP verification rounds' misses "
+                                    "on the CPU and needs --spec mtp: add --spec mtp or remove --cpu-verify-misses");
+    }
+    if (o.cpu_verify_workers < 1 || o.cpu_verify_workers > 64) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next: --cpu-verify-workers must be in [1, 64]");
+    }
     (void)plan_hot_embedding(c.vocab_size, c.hidden_size, o.hot_embedding_rows); // refuses N above the vocabulary
     Layout d;
     d.drafts       = static_cast<std::int32_t>(o.mtp_draft_tokens);
@@ -591,6 +598,7 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     b.mtp_constrained_masks   = plan_mtp_constrained_masks(o, public_tokens);
     b.mtp_draft_probs         = plan_mtp_draft_probs(o);
     b.hot_embedding           = plan_hot_embedding(c.vocab_size, c.hidden_size, o.hot_embedding_rows).hot;
+    b.cpu_verify_misses       = plan_cpu_verify_misses(o).device;
     b.staging   = d.staging;
     b.state     = d.state_total;
     // Logits of the widest round (FP32 and BF16; at least one column per lane), then the sampling
@@ -799,6 +807,9 @@ public:
             spec_host_ = PinnedHostBuffer(4 * plan_.spec.w_count + 64);
         }
 
+        if (plan_.bytes.cpu_verify_misses != 0) { start_cpu_verify(); }
+        allocated += plan_.bytes.cpu_verify_misses;
+
         std::vector<const std::uint8_t*> banks;
         std::vector<std::uint64_t> bank_strides;
         for (const auto& bank : parameters_.model.expert_banks()) {
@@ -949,6 +960,14 @@ public:
         experts.staging_slots = kStagingSlots;
         experts.zero_copy_misses = kZeroCopyMisses;
         for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) { experts.frames.push_back(residency_->table(l)); }
+        if (cpu_misses_) {
+            // --cpu-verify-misses: verification calls hand misses to the service; a timed-out wait
+            // reports to the error word, which every verification round checks.
+            experts.error = cpu_error_device_;
+            for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) {
+                experts.cpu.push_back(cpu_misses_->channel(static_cast<int>(l)));
+            }
+        }
         if (residency_->frames() > 0 && plan_.wide_work > 0) {
             std::vector<execution::ExpertStream::Bank> stream_banks;
             for (const auto& bank : parameters_.model.expert_banks()) {
@@ -988,6 +1007,14 @@ public:
         try {
             device_.synchronize();
         } catch (...) {}
+        if (cpu_misses_) {
+            // The service outlives the forward (declared before it) and stops after this
+            // synchronization, when no call can be waiting for it.
+            try {
+                diagnostic("cpu verify misses: " + std::to_string(cpu_misses_->served_requests()) + " requests, " +
+                           std::to_string(cpu_misses_->served_experts()) + " experts served on the CPU");
+            } catch (...) {}
+        }
         save_expert_state();
         monitor_.reset();
     }
@@ -1023,6 +1050,74 @@ public:
         out.hot_embedding.padded_shape[0] = rows;
         out.hot_embedding.n               = rows;
         return out;
+    }
+
+    // --cpu-verify-misses: the CPU miss service over the text model's expert banks (the CPU reads
+    // each bank's host address) and the zeroed error word, through its device address.
+    void start_cpu_verify() {
+        const CpuVerifyPlan p = plan_cpu_verify_misses(options_);
+        std::vector<ops::offloaded_moe::CpuMissService::Layer> layers;
+        for (const auto& bank : parameters_.model.expert_banks()) {
+            if (bank.host_records == nullptr) {
+                throw std::logic_error("Qwen3.8-Flash-Next: --cpu-verify-misses needs every expert bank in host memory");
+            }
+            layers.push_back({bank.host_records, bank.record_stride, bank.format});
+        }
+        if (layers.size() != c_.num_hidden_layers) {
+            throw std::logic_error("Qwen3.8-Flash-Next: --cpu-verify-misses needs one expert bank per layer");
+        }
+        ops::offloaded_moe::CpuMissService::Options o;
+        o.workers      = p.workers;
+        o.max_jobs     = p.max_jobs;
+        o.max_columns  = p.max_columns;
+        o.pcie_divisor = p.pcie_divisor;
+        cpu_error_     = PinnedHostBuffer(64);
+        std::memset(cpu_error_.data(), 0, 64);
+        void* mapped = nullptr;
+        if (cudaHostGetDevicePointer(&mapped, cpu_error_.data(), 0) != cudaSuccess || mapped == nullptr) {
+            (void)cudaGetLastError();
+            throw std::runtime_error("--cpu-verify-misses: the error word has no device address");
+        }
+        cpu_error_device_ = static_cast<std::uint32_t*>(mapped);
+        cpu_misses_       = std::make_unique<ops::offloaded_moe::CpuMissService>(std::move(layers), o);
+    }
+
+    // --cpu-verify-misses, before a verification is drafted: whether its CPU leg can be served. A
+    // service whose thread has failed never answers again (each layer's wait would time out), so
+    // rounds decode plain from then on; the output is the same.
+    bool cpu_verify_failed() noexcept {
+        if (!cpu_misses_) { return false; }
+        std::string why;
+        try {
+            why = cpu_misses_->failure();
+        } catch (...) {
+            why = "unknown";
+        }
+        if (why.empty()) { return false; }
+        if (!cpu_verify_off_reported_) {
+            cpu_verify_off_reported_ = true;
+            diagnostic("cpu verify misses: the CPU miss service stopped (" + why +
+                       "); MTP speculation is off for the rest of this run");
+        }
+        return true;
+    }
+
+    // --cpu-verify-misses, after a verification synchronized: a call whose CPU leg timed out wrote
+    // layer << 16 | code to the error word and left its CPU outputs unwritten, so the round fails
+    // (its lane is released, nothing is committed). The word is cleared for the next round.
+    void check_cpu_verify() {
+        if (!cpu_misses_) { return; }
+        auto* word                 = static_cast<volatile std::uint32_t*>(cpu_error_.data());
+        const std::uint32_t failed = *word;
+        if (failed == 0) { return; }
+        *word = 0;
+        release_lane();
+        const std::string why = cpu_misses_->failure();
+        char code[64];
+        std::snprintf(code, sizeof(code), "layer %u, code 0x%04X", failed >> 16U, failed & 0xFFFFU);
+        throw std::runtime_error(std::string("Qwen3.8-Flash-Next: --cpu-verify-misses: the CPU miss service did not "
+                                             "answer a verification (") +
+                                 code + (why.empty() ? std::string() : "; " + why) + ")");
     }
 
     const ProgramDevicePlan& device_plan() const noexcept { return plan_.bytes; }
@@ -3988,7 +4083,7 @@ private:
     std::optional<PendingBatch> try_speculate(SequenceHandle row, const runtime::RoundBudget& budget,
                                               runtime::TokenMaskProvider* masks, Clock::time_point start) {
         if (plan_.drafts == 0 || !L().mtp_live ||
-            (masks != nullptr && masks->constrained(0) && !options_.mtp_constrained)) {
+            (masks != nullptr && masks->constrained(0) && !options_.mtp_constrained) || cpu_verify_failed()) {
             return std::nullopt;
         }
         // A row drafts at most one token fewer than it may still emit, and every verified position
@@ -4092,6 +4187,7 @@ private:
         }
         runtime::ExecutionTiming timing;
         timing.device_wait_ns = elapsed_ns(wait);
+        check_cpu_verify(); // before anything reads the round's outputs
         const std::int32_t LC = words[sp.w_counts], A = words[sp.w_accepted];
         if (LC < 1 || LC > W || A != LC - 1) {
             release_lane();
@@ -4700,6 +4796,13 @@ private:
     DeviceBuffer verify_masks_;
     std::unique_ptr<WorkspaceArena> work_;
     DeviceBuffer staging_;
+    // --cpu-verify-misses: the CPU miss service (its thread runs for the Program's life; declared
+    // before the forward and the graphs so it is destroyed after them, once the destructor has
+    // synchronized) and the mapped error word its verification calls' waits report to.
+    std::unique_ptr<ops::offloaded_moe::CpuMissService> cpu_misses_;
+    PinnedHostBuffer cpu_error_{1};
+    std::uint32_t* cpu_error_device_ = nullptr;
+    bool cpu_verify_off_reported_    = false;
     std::unique_ptr<ExpertResidency> residency_;
     std::unique_ptr<execution::Forward> forward_;
     // Wide prefill: the frames lent for the prompt (workspace, stream tables, ring), the arena over
@@ -4887,6 +4990,25 @@ std::uint64_t plan_mtp_constrained_masks(const ProgramOptions& options, std::uin
 std::uint64_t plan_mtp_draft_probs(const ProgramOptions& options) {
     if (!options.mtp_joint_acceptance || options.mtp_draft_tokens == 0) { return 0; }
     return 4ULL * options.mtp_draft_tokens;
+}
+
+CpuVerifyPlan plan_cpu_verify_misses(const ProgramOptions& options) {
+    if (!options.cpu_verify_misses || options.mtp_draft_tokens == 0) { return {}; }
+    namespace om = ops::offloaded_moe;
+    // The service's defaults (PR 11: one or two misses hide behind a verification layer's GPU work)
+    // but its column cap: the widest verification.
+    const om::CpuMissService::Options defaults;
+    CpuVerifyPlan p;
+    p.workers      = static_cast<int>(options.cpu_verify_workers);
+    p.max_jobs     = defaults.max_jobs;
+    p.max_columns  = static_cast<int>(1 + options.mtp_draft_tokens);
+    p.pcie_divisor = defaults.pcie_divisor;
+    p.device       = sizeof(std::uint32_t);
+    // The service's mapped request, x [H, max_columns], y [H, max_jobs * 8] and its done/heartbeat
+    // line (CpuMissService's constructor), then the Program's 64-byte error word.
+    p.pinned = sizeof(om::MissRequest) + 2ULL * om::kHidden * static_cast<std::uint64_t>(p.max_columns) +
+               2ULL * om::kHidden * static_cast<std::uint64_t>(p.max_jobs) * om::kMaxColumns + 64 + 64;
+    return p;
 }
 
 GdnReplayRecordSpec gdn_records_spec(const TextConfig& c, std::int32_t width, bool gdn_head_map) {

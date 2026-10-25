@@ -177,7 +177,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--ngram-volume FILE] [--ngram-keepalive-ms N] [--expert-state FILE|--no-expert-state] [--default-expert-state FILE] "
            "[--vram-headroom-mib N] [--shared-expert-stream] [--mtp-constrained] [--mtp-joint-acceptance] [--ngram-prefetch] "
            "[--hot-embedding-rows N] [--gdn-head-map] [--moe-precast-input [--moe-gate-up-registers]] "
-           "[--moe-fused-route] "
+           "[--moe-fused-route] [--cpu-verify-misses [--cpu-verify-workers N]] "
            "[--ram-headroom-mib N] [--expert-cache-mib N] [--context-nvme-mib N [--context-nvme-dir DIR]] "
            "[--chat-template FILE] "
            "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
@@ -281,7 +281,9 @@ std::string serve_usage_text(const char* argv0) {
            "gate/up rows from registers in a grid that stays resident (the same output, bit for bit; off "
            "by default; needs --moe-precast-input); --moe-fused-route routes and dispatches the routed "
            "experts of a decode call in one launch instead of two (the same output, bit for bit; off by "
-           "default); "
+           "default); --cpu-verify-misses (--spec mtp) computes some of each verification round's "
+           "uncached experts on N CPU threads (--cpu-verify-workers, default 6) beside the GPU instead "
+           "of reading them over PCIe (the same output, bit for bit; off by default); "
            "--vision takes "
            "images when "
            "the model was converted with "
@@ -438,6 +440,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     bool host_reserve_explicit = false;
     bool host_max_explicit     = false;
     bool host_percent_explicit = false;
+    bool cpu_verify_workers_set = false;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -696,6 +699,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.flash_next.moe_gate_up_registers = true;
         } else if (arg == "--moe-fused-route") {
             options.flash_next.moe_fused_route = true;
+        } else if (arg == "--cpu-verify-misses") {
+            options.flash_next.cpu_verify_misses = true;
+        } else if (arg == "--cpu-verify-workers") {
+            const int workers = parse_nonnegative_int(require_value("--cpu-verify-workers"), "cpu-verify-workers");
+            if (workers < 1 || workers > 64) { throw std::invalid_argument("--cpu-verify-workers must be in [1, 64]"); }
+            options.flash_next.cpu_verify_workers = static_cast<std::uint32_t>(workers);
+            cpu_verify_workers_set = true;
         } else if (arg == "--hot-embedding-rows") {
             options.flash_next.hot_embedding_rows = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--hot-embedding-rows"), "hot-embedding-rows"));
@@ -963,6 +973,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.flash_next.ngram_prefetch && options.speculative.backend != SpeculativeBackend::Mtp) {
         throw std::invalid_argument("--ngram-prefetch reads the anchor column's n-gram rows while the MTP "
                                     "drafter runs and needs --spec mtp");
+    }
+    if (options.flash_next.cpu_verify_misses && options.speculative.backend != SpeculativeBackend::Mtp) {
+        throw std::invalid_argument("--cpu-verify-misses computes MTP verification rounds' misses on the CPU and "
+                                    "needs --spec mtp");
+    }
+    if (cpu_verify_workers_set && !options.flash_next.cpu_verify_misses) {
+        throw std::invalid_argument("--cpu-verify-workers sizes the CPU team of --cpu-verify-misses: add "
+                                    "--cpu-verify-misses");
     }
     if (options.context_store_path.empty() &&
         (context_store_tuning || options.context_store_max_gib)) {
