@@ -199,6 +199,27 @@ int main() {
                       "--hc-int8 with MTP and two lanes does not reach the Engine");
     failures += check(serve_usage_text("ninfer-serve").find("--hc-int8") != std::string::npos,
                       "the usage text does not name --hc-int8");
+    failures += check(!defaults.flash_next.hc_fused_read, "the fused hyper-connection read is on by default");
+    {
+        const ninfer::EngineOptions both =
+            make_engine_options(parse({"ninfer-serve", "model.ninfer", "--hc-int8", "--hc-fused-read"}));
+        failures += check(both.flash_next.hc_fused_read && both.flash_next.hc_int8,
+                          "--hc-fused-read does not reach the Engine");
+        failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
+                                                     "3", "--max-concurrency", "2", "--hc-int8", "--hc-fused-read"}))
+                              .flash_next.hc_fused_read,
+                          "--hc-fused-read with MTP and two lanes does not reach the Engine");
+        bool refused = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--hc-fused-read"});
+        } catch (const std::invalid_argument& error) {
+            refused = std::string(error.what()).find("--hc-fused-read") != std::string::npos &&
+                      std::string(error.what()).find("--hc-int8") != std::string::npos;
+        }
+        failures += check(refused, "--hc-fused-read without --hc-int8 was not refused naming both flags");
+        failures += check(serve_usage_text("ninfer-serve").find("--hc-fused-read") != std::string::npos,
+                          "the usage text does not name --hc-fused-read");
+    }
     failures += check(!defaults.flash_next.gdn_async_commit, "the GDN commit on a side stream is on by default");
     failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
                                                  "--gdn-async-commit"}))

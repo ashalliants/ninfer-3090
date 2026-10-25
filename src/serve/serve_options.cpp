@@ -177,7 +177,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--ngram-volume FILE] [--ngram-keepalive-ms N] [--expert-state FILE|--no-expert-state] [--default-expert-state FILE] "
            "[--vram-headroom-mib N] [--shared-expert-stream] [--mtp-constrained] [--mtp-joint-acceptance] [--ngram-prefetch] "
            "[--hot-embedding-rows N] [--gdn-head-map] [--moe-precast-input [--moe-gate-up-registers]] "
-           "[--moe-fused-route] [--cpu-verify-misses [--cpu-verify-workers N]] [--gdn-async-commit] [--hc-int8] "
+           "[--moe-fused-route] [--cpu-verify-misses [--cpu-verify-workers N]] [--gdn-async-commit] [--hc-int8 [--hc-fused-read]] "
            "[--ram-headroom-mib N] [--expert-cache-mib N] [--context-nvme-mib N [--context-nvme-dir DIR]] "
            "[--chat-template FILE] "
            "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
@@ -288,6 +288,9 @@ std::string serve_usage_text(const char* argv0) {
            "while the drafter catches up and drafts the next round (the same state, bit for bit; off by "
            "default); --hc-int8 makes int8 copies of the hyper-connection mixers' weights at startup and "
            "reads those (fewer bytes per token; changes the numerics; about 0.68 GB more VRAM; off by "
+           "default); --hc-fused-read (with --hc-int8) reads each decode MoE block's input in one fused "
+           "read: the previous inject, the int8 mixer, the router with its routing and dispatch, and the "
+           "experts' A8 input (fewer launches; the same output as --hc-int8 alone, bit for bit; off by "
            "default); "
            "--vision takes "
            "images when "
@@ -710,6 +713,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.flash_next.gdn_async_commit = true;
         } else if (arg == "--hc-int8") {
             options.flash_next.hc_int8 = true;
+        } else if (arg == "--hc-fused-read") {
+            options.flash_next.hc_fused_read = true;
         } else if (arg == "--cpu-verify-workers") {
             const int workers = parse_nonnegative_int(require_value("--cpu-verify-workers"), "cpu-verify-workers");
             if (workers < 1 || workers > 64) { throw std::invalid_argument("--cpu-verify-workers must be in [1, 64]"); }
@@ -1099,6 +1104,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.flash_next.moe_gate_up_registers && !options.flash_next.moe_precast_input) {
         throw std::invalid_argument("--moe-gate-up-registers reads the input that --moe-precast-input casts once "
                                     "per call: add --moe-precast-input");
+    }
+    if (options.flash_next.hc_fused_read && !options.flash_next.hc_int8) {
+        throw std::invalid_argument("--hc-fused-read reads the int8 mixer copies that --hc-int8 makes: add --hc-int8");
     }
     if (options.vision_residency == VisionResidency::Overlay && !options.enable_vision) {
         throw std::invalid_argument("--vision-residency overlay requires --vision");

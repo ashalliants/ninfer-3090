@@ -513,6 +513,10 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
         throw std::invalid_argument("Qwen3.8-Flash-Next: --gdn-async-commit folds MTP verification commits on a side "
                                     "stream and needs --spec mtp: add --spec mtp or remove --gdn-async-commit");
     }
+    if (o.hc_fused_read && !o.hc_int8) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next: --hc-fused-read reads the int8 mixer copies that --hc-int8 "
+                                    "makes: add --hc-int8 or remove --hc-fused-read");
+    }
     (void)plan_hot_embedding(c.vocab_size, c.hidden_size, o.hot_embedding_rows); // refuses N above the vocabulary
     Layout d;
     d.drafts       = static_cast<std::int32_t>(o.mtp_draft_tokens);
@@ -580,15 +584,18 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     }
     // A rows round decodes and samples one row per lane, so neither a --prefill-chunk below the lane
     // count nor a one-row sampling profile may size the workspace below that round.
-    d.work = execution::Forward::workspace_bytes(c, std::max(d.chunk, static_cast<std::int32_t>(d.lanes)), d.pages * kPagedKVPageSize,
+    const std::int32_t widest = std::max(d.chunk, static_cast<std::int32_t>(d.lanes));
+    d.work = execution::Forward::workspace_bytes(c, widest, d.pages * kPagedKVPageSize,
                                                  DeviceExecutionView{nullptr, sms}, o.moe_precast_input) +
-             ops::sampling_workspace_capacity_bytes(d.token_domain, 1, static_cast<std::int32_t>(d.lanes));
+             ops::sampling_workspace_capacity_bytes(d.token_domain, 1, static_cast<std::int32_t>(d.lanes)) +
+             plan_hc_fused_read_workspace(o, c, widest);
     if (d.drafts > 0) {
         // A drafter step (one column and the head's logits), and a prefill call's drafter cells: a
         // sub-chunk's residual rows beside the call's residual. Acceptance's workspace.
         const std::size_t step = execution::Forward::mtp_workspace_bytes(c, 1, d.pages * kPagedKVPageSize,
                                                                          DeviceExecutionView{nullptr, sms},
-                                                                         o.moe_precast_input);
+                                                                         o.moe_precast_input) +
+                                 plan_hc_fused_read_workspace(o, c, 1);
         d.work = std::max(d.work, step) + std::size_t(c.residual_width()) * execution::kMtpChunkColumns * 2 * 3 +
                  ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(d.token_domain, 1, d.drafts, 1, 1);
     }
@@ -1052,7 +1059,8 @@ public:
                                       .moe_precast_input    = options_.moe_precast_input,
                                       .moe_gate_up_registers = options_.moe_gate_up_registers,
                                       .moe_fused_route       = options_.moe_fused_route,
-                                      .hc_int8               = hc_int8_.get()};
+                                      .hc_int8               = hc_int8_.get(),
+                                      .hc_fused_read         = options_.hc_fused_read};
         if (plan_.bytes.hot_embedding == 0) { return out; }
         const Weight& table        = parameters_.token_embedding;
         const auto rows            = static_cast<std::int32_t>(options_.hot_embedding_rows);
@@ -5052,6 +5060,11 @@ std::uint64_t plan_mtp_constrained_masks(const ProgramOptions& options, std::uin
     if (!options.mtp_constrained || options.mtp_draft_tokens == 0) { return 0; }
     const std::uint64_t words = (static_cast<std::uint64_t>(public_tokens) + 31) / 32;
     return 4ULL * words * (1ULL + options.mtp_draft_tokens);
+}
+
+std::size_t plan_hc_fused_read_workspace(const ProgramOptions& options, const TextConfig& config,
+                                         std::int32_t columns) {
+    return options.hc_fused_read ? execution::Forward::hc_fused_read_workspace_bytes(config, columns) : 0;
 }
 
 std::uint64_t plan_hc_int8(const ProgramOptions& options, const TextConfig& config) {

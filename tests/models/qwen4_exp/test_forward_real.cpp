@@ -118,6 +118,16 @@
 // The same calls, first with moe_route then moe_dispatch, then with moe_route_dispatch (one launch
 // for the verification and decode calls; the prompt call, wider than 8 columns, takes the two Ops
 // either way). Every logits column must be bitwise equal.
+//
+// Fused hyper-connection read mode (ForwardOptions::hc_fused_read is bit-exact against hc_int8 alone):
+//
+//   ninfer_qwen4_exp_forward_real_test --hc-fused-read TOKENS [--window W] [--decode N] [--staging SLOTS]
+//
+// The same calls, both runs with the mixers' int8 copies (made once): first each routed-expert
+// block's input through the inject, the int8 mixer, the router projection, moe_route and
+// moe_dispatch, then through one hc_fused_read (the verification and decode calls, and the prompt
+// call when it has at most 16 columns; a wider one runs as off). Every logits column must be bitwise
+// equal.
 
 #include "artifact/reader.h"
 #include "core/arena.h"
@@ -309,7 +319,8 @@ struct Harness {
         work = std::make_unique<WorkspaceArena>(
             ex::Forward::workspace_bytes(c, columns, static_cast<std::uint32_t>(context), device.execution_view(),
                                          options.moe_precast_input) +
-            (options.shared_expert_stream ? ex::Forward::shared_expert_workspace_bytes(c, columns) : 0));
+            (options.shared_expert_stream ? ex::Forward::shared_expert_workspace_bytes(c, columns) : 0) +
+            (options.hc_fused_read ? ex::Forward::hc_fused_read_workspace_bytes(c, columns) : 0));
         views   = state;
         forward = std::make_unique<ex::Forward>(parameters, device, *work, std::move(state), std::move(kv),
                                                 std::move(experts), std::nullopt, options);
@@ -1441,9 +1452,10 @@ int shared_expert_mode(int argc, char** argv, const char* artifact_env) {
 }
 
 // The identity checks of ForwardOptions::gdn_head_map, ForwardOptions::moe_precast_input,
-// ForwardOptions::moe_gate_up_registers and ForwardOptions::moe_fused_route (see the header; `flag`
-// names the one checked, moe_gate_up_registers with the precast input it needs): the same calls from
-// a fresh state without and with the option; every logits column must be bitwise equal.
+// ForwardOptions::moe_gate_up_registers, ForwardOptions::moe_fused_route and
+// ForwardOptions::hc_fused_read (see the header; `flag` names the one checked, moe_gate_up_registers
+// with the precast input it needs, hc_fused_read with the int8 copies in both runs): the same calls
+// from a fresh state without and with the option; every logits column must be bitwise equal.
 int identity_mode(int argc, char** argv, const char* artifact_env, const std::string& flag) {
     std::vector<std::int32_t> tokens;
     std::int32_t window = 3, decode = 2, staging_slots = 64;
@@ -1505,6 +1517,14 @@ int identity_mode(int argc, char** argv, const char* artifact_env, const std::st
                 "staging slots %d\n",
                 head, window, decode, staging_slots);
 
+    // --hc-fused-read: the int8 copies both runs read.
+    std::unique_ptr<ex::HcInt8Copies> copies;
+    if (flag == "--hc-fused-read") {
+        auto mixers = ex::HcInt8Copies::mixers(parameters.layers, parameters.final_mixer,
+                                               parameters.mtp ? &*parameters.mtp : nullptr);
+        const std::uint64_t bytes = ex::HcInt8Copies::bytes(mixers);
+        copies = std::make_unique<ex::HcInt8Copies>(std::move(mixers), bytes, device.stream);
+    }
     // Every logits column of the prompt, the verification and the decode calls, in order.
     const bool head_map_mode = flag == "--gdn-head-map";
     const auto run = [&](bool on) {
@@ -1513,7 +1533,9 @@ int identity_mode(int argc, char** argv, const char* artifact_env, const std::st
         const ex::ForwardOptions options{.gdn_head_map          = on && head_map_mode,
                                          .moe_precast_input     = precast,
                                          .moe_gate_up_registers = registers,
-                                         .moe_fused_route       = on && flag == "--moe-fused-route"};
+                                         .moe_fused_route       = on && flag == "--moe-fused-route",
+                                         .hc_int8               = copies.get(),
+                                         .hc_fused_read         = on && flag == "--hc-fused-read"};
         Harness harness(parameters, device, context, head, staging_slots, options);
         Verifier verifier(harness, window, options.gdn_head_map);
         std::vector<std::vector<float>> rows;
@@ -1583,7 +1605,8 @@ int main(int argc, char** argv) {
             return shared_expert_mode(argc, argv, artifact_env);
         }
         for (const char* flag :
-             {"--gdn-head-map", "--moe-precast-input", "--moe-gate-up-registers", "--moe-fused-route"}) {
+             {"--gdn-head-map", "--moe-precast-input", "--moe-gate-up-registers", "--moe-fused-route",
+              "--hc-fused-read"}) {
             if (std::any_of(argv + 1, argv + argc, [&](const char* a) { return std::string(a) == flag; })) {
                 return identity_mode(argc, argv, artifact_env, flag);
             }

@@ -446,6 +446,11 @@ struct FlashNextOptions {
     // prefill keeps the BF16 weights. CHANGES THE NUMERICS (the weights are rounded); the BF16
     // weights stay loaded, so it costs about 0.68 GB of VRAM (fewer expert frames). Off: BF16.
     bool hc_int8 = false;
+    // One fused read per decode-width routed-expert block input (--hc-fused-read; requires hc_int8):
+    // the attention block's inject, the int8 mixer, the router with its top-10 and dispatch, and the
+    // A8 cast of the mixer's output in three launches instead of five to seven. Bitwise the outputs
+    // of hc_int8 alone. Off: the separate Ops.
+    bool hc_fused_read = false;
     // The context cache's NVMe tier: a scratch file of up to this many bytes holds the checkpoints,
     // with the Host context budget as its RAM cache (a zero Host budget then reuses prefixes from
     // disk alone); 0: none. The file is created in `context_nvme_dir` (empty: beside the artifact),

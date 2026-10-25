@@ -467,6 +467,11 @@ struct ProgramOptions {
     // forward's decode-width mixer calls read them (execution::ForwardOptions::hc_int8; prefill
     // keeps the BF16 weights). Changes the numerics; no workspace.
     bool hc_int8 = false;
+    // FlashNextOptions::hc_fused_read: every decode-width routed-expert block's input is read by one
+    // ops::hc_fused_read (execution::ForwardOptions::hc_fused_read: the previous inject, the int8
+    // mixer, the router, routing, dispatch and the A8 cast of x). Requires hc_int8. Bitwise the
+    // outputs of hc_int8 alone; the workspace terms add Forward::hc_fused_read_workspace_bytes.
+    bool hc_fused_read = false;
 };
 
 // --gdn-async-commit: whether a verification commit runs its GDN replay fold on the fold stream
@@ -480,6 +485,13 @@ struct ProgramOptions {
 // rows, the final mixer without, and with MTP the drafter's two block mixers and final mixer: 97,
 // or 100 with MTP, on Flash-Next); 0 without hc_int8.
 [[nodiscard]] std::uint64_t plan_hc_int8(const ProgramOptions& options, const TextConfig& config);
+
+// --hc-fused-read's share of the forward workspace for calls of up to `columns` columns
+// (execution::Forward::hc_fused_read_workspace_bytes), part of ProgramDevicePlan::workspace (the
+// static arena and the drafter step's term); 0 without hc_fused_read. The wide prefill arena takes
+// none (its calls are wider than the fused read).
+[[nodiscard]] std::size_t plan_hc_fused_read_workspace(const ProgramOptions& options, const TextConfig& config,
+                                                       std::int32_t columns);
 
 // The CPU miss service of --cpu-verify-misses: its options (CPU-served experts per layer call, the
 // share left on the GPU, the widest call it serves: a verification of 1 + mtp_draft_tokens columns)
