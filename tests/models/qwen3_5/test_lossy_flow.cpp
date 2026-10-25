@@ -38,6 +38,15 @@ void test_phase_steps() {
     require(lossy_step(LossyPhase::Scout, 4096, 4096) == LossyStep::Scout, "scout continues");
     require(lossy_step(LossyPhase::Main, 4096, 4096) == LossyStep::Ordinary, "main is ordinary");
     require(lossy_step(LossyPhase::Main, 9000, 4096) == LossyStep::Ordinary, "main past M");
+    // One scout per Program: a second lossy lane reaching M while another scouts declines.
+    require(lossy_step(LossyPhase::Exact, 4096, 4096, true) == LossyStep::Decline,
+            "M with the scout busy declines");
+    require(lossy_step(LossyPhase::Exact, 100, 4096, true) == LossyStep::Ordinary,
+            "before M a busy scout does not matter");
+    require(lossy_step(LossyPhase::Scout, 4096, 4096, true) == LossyStep::Scout,
+            "the scouting lane itself continues");
+    require(lossy_step(LossyPhase::Main, 4096, 4096, true) == LossyStep::Ordinary,
+            "main ignores the scout");
 }
 
 void test_step_limit() {

@@ -469,6 +469,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                 std::unique(lossy_special_tokens.begin(), lossy_special_tokens.end()),
                 lossy_special_tokens.end());
         }
+        // Without them selection would drop role markers and tool-call delimiters.
+        if (lossy_special_tokens.empty()) {
+            throw std::invalid_argument(
+                "lossy prefill needs the model tokenizer's added tokens (chat structure)");
+        }
     }
     if (plan.persistent.score_hidden) {
         score_hidden = plan.persistent.score_hidden->bind(backing);

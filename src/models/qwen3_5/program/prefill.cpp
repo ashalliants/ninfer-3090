@@ -207,15 +207,29 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
     if (!valid_sequence(handle)) { throw std::logic_error("prefill has a stale lane"); }
     const auto lane = ContractAccess::lane(handle).value;
     require_unit(lane, ExecutionUnitKind::Prefill);
-    if (const auto& lossy = requests[lane].lossy; lossy && requests[lane].prefill &&
-        lossy_step(lossy->phase, requests[lane].prefill->cursor, lossy->exact_end) !=
-            LossyStep::Ordinary) {
-        // A scout step maps its own pages past the committed frontier and keeps them between
-        // steps; settle_unit leaves them mapped while the scout runs.
-        auto progress = advance_lossy_scout(lane, timing, max_tokens);
-        settle_unit(lane);
-        return progress;
+    std::optional<LossyOutcome> declined;
+    if (auto& lossy = requests[lane].lossy; lossy && requests[lane].prefill) {
+        const auto& staged    = *requests[lane].prefill;
+        const bool scout_busy = scout_session && scout_session->lane != lane;
+        const LossyStep step  = lossy_step(lossy->phase, staged.cursor, lossy->exact_end, scout_busy);
+        if (step == LossyStep::Decline) {
+            // The one scout is taken: this request prefills all of U as an ordinary request.
+            lossy->phase = LossyPhase::Main;
+            declined     = LossyOutcome{.exact_end       = lossy->exact_end,
+                                        .uncached_tokens = staged.prompt_tokens - lossy->exact_end,
+                                        .kept_tokens     = staged.prompt_tokens - lossy->exact_end,
+                                        .skipped         = true,
+                                        .declined        = true};
+        } else if (step != LossyStep::Ordinary) {
+            // A scout step maps its own pages past the committed frontier and keeps them between
+            // steps; settle_unit leaves them mapped while the scout runs.
+            auto progress = advance_lossy_scout(lane, timing, max_tokens);
+            settle_unit(lane);
+            return progress;
+        }
     }
+    const std::uint32_t declined_prompt_tokens =
+        declined ? requests[lane].prefill->prompt_tokens : 0U;
     auto& state = sequences[lane];
     prepare_capture_boundary(lane);
     const auto permit = *requests[lane].permit;
@@ -242,6 +256,10 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
     // earlier layers never wrote (or that a sibling took in between). Reserving the same unit again
     // while the permit is held is a no-op, so the lane simply continues.
     if (!progress.complete && !progress.partial) { settle_unit(lane); }
+    if (declined) {
+        progress.compacted_prompt_tokens = declined_prompt_tokens;
+        progress.lossy                   = declined;
+    }
     return progress;
 }
 

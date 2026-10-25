@@ -332,6 +332,9 @@ struct LossyOutcome {
     std::uint32_t kept_tokens     = 0; // of U; equals uncached_tokens when skipped
     bool skipped                  = false; // nothing dropped: Main prefills all of U, no gap map
     double scout_seconds          = 0.0;
+    // The request reached M while another lane held the Program's one scout: it took no lossy path
+    // and prefilled all of U (skipped is set too, kept_tokens == uncached_tokens, no scout ran).
+    bool declined = false;
 };
 
 struct PrefillProgress {
@@ -584,6 +587,10 @@ public:
     // false) or captured; abort is always allowed. Returns false, with nothing changed, for a
     // request it cannot take: no scout scratch (lossy prefill off, MoE or split model), a plan
     // without lossy(), a multimodal or resumed request, one already advanced, or M at the prompt end.
+    // The Program runs one scout at a time: a request that reaches M while another lane scouts
+    // declines (LossyOutcome::declined) and prefills normally. The trigger's other conditions --
+    // the threshold, and a reuse source that is none or a SharedPrefix checkpoint, never a private
+    // conversation record -- are the Engine's to check before calling this.
     [[nodiscard]] bool enable_lossy(SequenceHandle sequence);
     // A resumed binding retains its complete recovery capacity until committed new progress.
     [[nodiscard]] bool recovery_pending(SequenceHandle sequence) const noexcept;

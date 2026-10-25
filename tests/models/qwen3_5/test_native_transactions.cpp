@@ -3697,6 +3697,97 @@ void lossy_selected_lineage(DeviceContext& device, const qwen::execution::Parame
     require(program.physical_usage().occupied == empty, "the lossy lineage leaked resources");
 }
 
+// The scout window (between M and the first Main chunk) on a two-lane Program:
+// - after the first scout step the lane refuses pause and every capture gate;
+// - a second lossy request reaching M while the first scouts declines the lossy path (reported as
+//   skipped and declined), prefills all of its prompt and is not cleared;
+// - aborting the scouting lane through advance_prefill + abort leaves the shared checkpoint at M
+//   (its GDN state and the prefix KV a new reader binds) exactly as before the scout, and every
+//   resource returns once the checkpoints are released.
+void lossy_scout_window(DeviceContext& device, const qwen::execution::Parameters& parameters,
+                        qwen::Frontend& frontend, EngineOptions options) {
+    auto fixture  = make_lossy_program(device, parameters, options, kScoutCapacity, 0.2F);
+    auto& program = *fixture.program;
+    ScoutLane lanes(program, device);
+    const auto empty = program.physical_usage().occupied;
+    const auto ids   = long_prompt_ids(kScoutPrefix + kScoutSpan);
+
+    auto base           = lossy_request(program, frontend, ids);
+    const auto root     = program.inspect_source(base, std::nullopt);
+    const auto sequence = lanes.bind(base, 0, *root);
+    require(program.enable_lossy(sequence), "the first lossy request was refused");
+    std::vector<qwen::CheckpointHandle> shared;
+    std::optional<ScoutTrace> before;
+    for (unsigned call = 0; call < 64 && !program.scout_active(sequence); ++call) {
+        if (program.sequences[0].text_kv_valid == kLossyMarker && !before &&
+            !program.requests[0].capture_pending) {
+            before = scout_trace(program, device, 0, kLossyMarker);
+        }
+        lanes.reserve(sequence);
+        auto step = program.advance_prefill(sequence, nullptr, nullptr);
+        require(!step.pending, "the lossy request finished before scouting");
+        if (step.capture_ready) {
+            require(program.start_capture(sequence), "the shared prefix at M was not captured");
+            const auto captured = settle_positions(program, device);
+            shared.insert(shared.end(), captured.captured_checkpoints.begin(),
+                          captured.captured_checkpoints.end());
+        }
+        if (step.scouted_tokens != 0) {
+            require(step.processed_prompt_tokens == 0, "a scout step committed prompt tokens");
+        }
+    }
+    require(program.scout_active(sequence) && before && shared.size() == 1,
+            "the lossy request did not reach its scout after an exact capture at M");
+
+    // The window refuses pause and capture.
+    require(!program.start_pause(sequence, true, nullptr, false), "a scouting lane paused");
+    require(!program.start_pause(sequence, true, nullptr, true), "a scouting lane paused (yield)");
+    lanes.reserve(sequence);
+    require(!program.prepare_capture(sequence).has_value(), "a scouting lane prepared a capture");
+    require(!program.start_capture(sequence), "a scouting lane started a capture");
+    require(!program.capture_is_input(sequence), "a scouting lane reports an input capture");
+
+    // A second lossy request reaching M declines and prefills normally.
+    {
+        auto other = lossy_request(program, frontend, long_prompt_ids(kScoutPrefix + kScoutSpan + 128));
+        // Bound from the shared checkpoint, it is at M at once: its first step meets the busy scout.
+        const auto at_m = program.inspect_source(other, shared.front());
+        require(at_m && at_m->reused_tokens == kLossyMarker, "the second request does not reuse M");
+        auto run = lossy_prefill(program, device, other, 1, true, false, at_m);
+        require(run.outcome && run.outcome->declined && run.outcome->skipped &&
+                    run.outcome->kept_tokens == run.outcome->uncached_tokens,
+                "the second lossy request did not decline the busy scout");
+        require(run.scouted == 0 && run.first >= 0 &&
+                    run.prompt_tokens == kScoutPrefix + kScoutSpan + 128,
+                "the declined request did not prefill all of its prompt");
+        require(program.scout_active(sequence), "the declined request disturbed the scout");
+        require(program.abort(run.sequence).status == runtime::ConsumeStatus::Consumed,
+                "the declined lane retained its execution resources");
+        for (const auto point : run.shared) {
+            require(program.release_checkpoint(point), "the declined lane's capture kept a reader");
+        }
+    }
+
+    // Abort mid-scout, then look at what a new reader of the checkpoint at M finds.
+    lanes.reserve(sequence);
+    const auto step = program.advance_prefill(sequence, nullptr, nullptr);
+    require(step.scouted_tokens != 0 && !step.compacted_prompt_tokens,
+            "the second scout step did not run mid-scout");
+    lanes.abort(sequence);
+    require(!program.scout_session.has_value(), "an aborted lane kept its scout");
+    const auto source = program.inspect_source(base, shared.front());
+    require(source && source->reused_tokens == kLossyMarker, "the checkpoint at M stopped matching");
+    const auto reader       = lanes.bind(base, 0, *source);
+    const ScoutTrace after  = scout_trace(program, device, 0, kLossyMarker);
+    require(after.state == before->state, "aborted scout: the GDN state at M changed");
+    require(after.kv == before->kv, "aborted scout: the prefix KV at M changed");
+    lanes.abort(reader);
+    for (const auto point : shared) {
+        require(program.release_checkpoint(point), "the shared prefix kept a reader");
+    }
+    require(program.physical_usage().occupied == empty, "the aborted scout leaked resources");
+}
+
 SpeculativeBackend selected_backend(std::string_view name) {
     if (name == "none") { return SpeculativeBackend::None; }
     if (name == "mtp") { return SpeculativeBackend::Mtp; }
@@ -3822,6 +3913,7 @@ int main(int argc, char** argv) {
         scout_scores_chunk_invariant(device, parameters, scout_frontend, options);
         scout_finds_needle(device, parameters, scout_frontend, options);
         lossy_keep_all_matches_ordinary_prefill(device, parameters, scout_frontend, options);
+        lossy_scout_window(device, parameters, scout_frontend, options);
         // The 40K lossy prompts need a Frontend with a longer context.
         auto lossy_frontend = qwen::make_frontend(
             model->resources(), {.vision_enabled = false, .max_context = kLossyCapacity});

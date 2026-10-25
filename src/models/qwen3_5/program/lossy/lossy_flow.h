@@ -28,12 +28,18 @@ enum class LossyStep : std::uint8_t {
     Ordinary,   // an ordinary prefill step (Exact before M, or Main)
     EnterScout, // Exact at M: open the scout and run its first chunk
     Scout,      // the next scout chunk
+    Decline,    // Exact at M while another lane holds the one scout: give up the lossy path and
+                // prefill all of U as an ordinary request (reported as skipped)
 };
 
+// `scout_busy`: another lane holds the Program's single scout session.
 [[nodiscard]] constexpr LossyStep lossy_step(LossyPhase phase, std::uint32_t cursor,
-                                             std::uint32_t exact_end) noexcept {
+                                             std::uint32_t exact_end,
+                                             bool scout_busy = false) noexcept {
     switch (phase) {
-    case LossyPhase::Exact: return cursor >= exact_end ? LossyStep::EnterScout : LossyStep::Ordinary;
+    case LossyPhase::Exact:
+        if (cursor < exact_end) { return LossyStep::Ordinary; }
+        return scout_busy ? LossyStep::Decline : LossyStep::EnterScout;
     case LossyPhase::Scout: return LossyStep::Scout;
     case LossyPhase::Main: return LossyStep::Ordinary;
     }
