@@ -55,6 +55,7 @@
 #include "models/qwen4_exp/program/draft_policy.h"
 #include "models/qwen4_exp/program/expert_cache/expert_state.h"
 #include "models/qwen4_exp/program/expert_residency.h"
+#include "models/qwen4_exp/program/ngram_rows.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "models/qwen4_exp/program/nvme_tier.h"
 #include "models/qwen4_exp/program/rope_positions.h"
@@ -2802,13 +2803,7 @@ private:
         const auto& io = plan_.io;
         auto* host     = static_cast<std::byte*>(io_host_.data());
         // n-gram rows: the window of ngram_size - 1 earlier tokens, EOS-padded at the start.
-        const std::int32_t context = dim(c_.ple.ngram.ngram_size) - 1;
-        ngram_window_.assign(static_cast<std::size_t>(std::max(0, context - begin)), c_.eos_token_id);
-        const std::int32_t from = std::max(0, begin - context);
-        ngram_window_.insert(ngram_window_.end(), L().history.begin() + from, L().history.begin() + begin + width);
-        const std::size_t heads = hash_.heads();
-        row_ids_.resize(static_cast<std::size_t>(width) * heads);
-        hash_.row_ids(ngram_window_, static_cast<std::size_t>(width), row_ids_.data());
+        row_ids_ = ngram_window_rows(hash_, L().history, {}, begin, width);
         const std::size_t row_bytes = c_.ple.table.row_bytes;
         const std::size_t rows      = static_cast<std::size_t>(width) * hash_.heads() * row_bytes;
         if (next_begin_ == begin && next_width_ == width && next_lane_ == cur_) {
@@ -2826,16 +2821,12 @@ private:
     std::size_t read_rows_of(std::span<const std::uint32_t> rows_lanes) {
         const auto& io = plan_.io;
         auto* host     = static_cast<std::byte*>(io_host_.data());
-        const std::int32_t context = dim(c_.ple.ngram.ngram_size) - 1;
-        const std::size_t heads    = hash_.heads();
+        const std::size_t heads = hash_.heads();
         row_ids_.resize(rows_lanes.size() * heads);
         for (std::size_t b = 0; b < rows_lanes.size(); ++b) {
-            const Lane& lane       = lanes_[rows_lanes[b]];
-            const std::int32_t at  = static_cast<std::int32_t>(lane.state_tokens);
-            ngram_window_.assign(static_cast<std::size_t>(std::max(0, context - at)), c_.eos_token_id);
-            const std::int32_t from = std::max(0, at - context);
-            ngram_window_.insert(ngram_window_.end(), lane.history.begin() + from, lane.history.begin() + at + 1);
-            hash_.row_ids(ngram_window_, 1, row_ids_.data() + b * heads);
+            const Lane& lane = lanes_[rows_lanes[b]];
+            const auto ids   = ngram_window_rows(hash_, lane.history, {}, static_cast<std::int64_t>(lane.state_tokens), 1);
+            std::copy(ids.begin(), ids.end(), row_ids_.begin() + static_cast<std::ptrdiff_t>(b * heads));
         }
         const std::size_t row_bytes = c_.ple.table.row_bytes;
         volume_.read_rows(row_ids_, std::span<std::byte>(host + io.ngram, row_ids_.size() * row_bytes));
@@ -2845,17 +2836,23 @@ private:
     // Reads the n-gram rows of positions [begin, begin + width) into ngram_next_ (the next call's
     // stage takes them from there).
     void prefetch_rows(std::int32_t begin, std::int32_t width) {
-        const std::int32_t context = dim(c_.ple.ngram.ngram_size) - 1;
-        ngram_window_.assign(static_cast<std::size_t>(std::max(0, context - begin)), c_.eos_token_id);
-        const std::int32_t from = std::max(0, begin - context);
-        ngram_window_.insert(ngram_window_.end(), L().history.begin() + from, L().history.begin() + begin + width);
-        row_ids_.resize(static_cast<std::size_t>(width) * hash_.heads());
-        hash_.row_ids(ngram_window_, static_cast<std::size_t>(width), row_ids_.data());
+        row_ids_ = ngram_window_rows(hash_, L().history, {}, begin, width);
         volume_.read_rows(row_ids_, std::span<std::byte>(static_cast<std::byte*>(ngram_next_.data()),
                                                          row_ids_.size() * c_.ple.table.row_bytes));
         next_begin_ = begin;
         next_width_ = width;
         next_lane_  = cur_;
+    }
+
+    // --ngram-prefetch: reads the n-gram rows of the lane's anchor column (the token at the state
+    // position, the first column verification reads) into the volume's host cache. They depend only
+    // on the history, so this runs on the Program thread while the draft graph runs on the device;
+    // the volume's read is not reentrant, so no other thread may do it.
+    void prefetch_anchor_rows() {
+        const std::vector<std::uint32_t> rows =
+            ngram_window_rows(hash_, L().history, {}, static_cast<std::int64_t>(L().state_tokens), 1);
+        prefetch_sink_.resize(rows.size() * c_.ple.table.row_bytes);
+        volume_.read_rows(rows, prefetch_sink_);
     }
 
     // The width of a prefill call. A half-width first call (to start the GPU after fewer n-gram
@@ -3924,6 +3921,9 @@ private:
         }
         {
             const nvtx::ScopedRange wait(nvtx::Name::DecodeMtpWait, nvtx::Category::Decode);
+            // The graph runs while the host reads the anchor column's n-gram rows (the drafts' rows
+            // are unknown until the sync), so verification's row read finds them cached.
+            if (options_.ngram_prefetch) { prefetch_anchor_rows(); }
             device_.synchronize();
         }
         drafts_.assign(spec_words_host() + plan_.spec.w_drafts, spec_words_host() + plan_.spec.w_drafts + steps);
@@ -4730,8 +4730,8 @@ private:
     bool deferred_             = false; // a decode round's cache update awaits its commit
     std::uint64_t decode_rounds_ = 0, rows_rounds_ = 0;
     std::uint64_t budget_tokens_ = 0;
-    std::vector<std::int32_t> ngram_window_;
     std::vector<std::uint32_t> row_ids_;
+    std::vector<std::byte> prefetch_sink_; // the anchor prefetch's rows, read only to fill the volume's cache
     Clock::time_point expert_state_saved_{};
     std::uint64_t expert_state_routed_ = 0;
 

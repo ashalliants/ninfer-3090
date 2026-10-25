@@ -175,7 +175,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--vision] [--vision-residency resident|overlay] [--vision-max-merged N] "
            "[--no-cuda-graph] [--no-prefix-reuse] [--devices N,M,...] [--stage-layers A,B,...] "
            "[--ngram-volume FILE] [--ngram-keepalive-ms N] [--expert-state FILE|--no-expert-state] "
-           "[--vram-headroom-mib N] [--shared-expert-stream] [--mtp-constrained] [--mtp-joint-acceptance] "
+           "[--vram-headroom-mib N] [--shared-expert-stream] [--mtp-constrained] [--mtp-joint-acceptance] [--ngram-prefetch] "
            "[--ram-headroom-mib N] [--expert-cache-mib N] [--context-nvme-mib N [--context-nvme-dir DIR]] "
            "[--chat-template FILE] "
            "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
@@ -265,7 +265,9 @@ std::string serve_usage_text(const char* argv0) {
            "own grammar mask (off by default: they decode without MTP); --mtp-joint-acceptance "
            "(--spec mtp) drafts --draft-tokens each round and verifies the drafts whose joint chance "
            "of acceptance, estimated from each draft's probability, stays above an adaptive threshold "
-           "(off by default: an acceptance estimate picks the count before drafting); --vision takes "
+           "(off by default: an acceptance estimate picks the count before drafting); --ngram-prefetch "
+           "(--spec mtp) reads the anchor column's n-gram rows while the drafter runs, so verification "
+           "finds them cached (off by default); --vision takes "
            "images when "
            "the model was converted with "
            "--mmproj (its vision tower stays in host memory and borrows expert-cache memory per image)\n"
@@ -669,6 +671,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.flash_next.mtp_constrained = true;
         } else if (arg == "--mtp-joint-acceptance") {
             options.flash_next.mtp_joint_acceptance = true;
+        } else if (arg == "--ngram-prefetch") {
+            options.flash_next.ngram_prefetch = true;
         } else if (arg == "--expert-state") {
             options.flash_next.expert_state_path = require_value("--expert-state");
             if (options.flash_next.expert_state_path.empty()) {
@@ -924,6 +928,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.flash_next.mtp_joint_acceptance && options.speculative.backend != SpeculativeBackend::Mtp) {
         throw std::invalid_argument("--mtp-joint-acceptance chooses how many MTP drafts a round verifies and "
                                     "needs --spec mtp");
+    }
+    if (options.flash_next.ngram_prefetch && options.speculative.backend != SpeculativeBackend::Mtp) {
+        throw std::invalid_argument("--ngram-prefetch reads the anchor column's n-gram rows while the MTP "
+                                    "drafter runs and needs --spec mtp");
     }
     if (options.context_store_path.empty() &&
         (context_store_tuning || options.context_store_max_gib)) {

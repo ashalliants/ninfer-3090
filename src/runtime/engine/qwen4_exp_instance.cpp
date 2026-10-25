@@ -177,6 +177,10 @@ void validate(const EngineOptions& options) {
         refuse("--mtp-joint-acceptance chooses how many MTP drafts each round verifies and --mtp-fixed "
                "(mtp_fixed_drafts) always verifies --draft-tokens: use one of them");
     }
+    if (next.ngram_prefetch && spec.backend != SpeculativeBackend::Mtp) {
+        refuse("--ngram-prefetch reads the anchor column's n-gram rows while the MTP drafter runs and needs "
+               "--spec mtp: add --spec mtp or remove --ngram-prefetch");
+    }
     if (next.ram_headroom_bytes > kMaxByteOption ||
         (next.vram_headroom_bytes && *next.vram_headroom_bytes > kMaxByteOption) ||
         (next.expert_cache_bytes && *next.expert_cache_bytes > kMaxByteOption)) {
@@ -334,6 +338,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.mtp_fixed_drafts = next.mtp_fixed_drafts;
     program_options.mtp_constrained  = next.mtp_constrained;
     program_options.mtp_joint_acceptance = next.mtp_joint_acceptance;
+    program_options.ngram_prefetch       = next.ngram_prefetch;
     program_options.vision           = vision;
     program_options.context_cache_bytes  = cache_fit.bytes;
     program_options.context_nvme_bytes   = nvme_bytes;

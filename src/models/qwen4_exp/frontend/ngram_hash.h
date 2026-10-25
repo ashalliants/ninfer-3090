@@ -28,6 +28,8 @@ public:
     NgramHash(const NgramConfig& config, std::uint32_t ple_layer_index);
 
     [[nodiscard]] std::uint32_t heads() const { return static_cast<std::uint32_t>(sizes_.size()); }
+    [[nodiscard]] std::uint32_t ngram_size() const { return config_.ngram_size; }
+    [[nodiscard]] std::int32_t eos_token_id() const { return config_.eos_token_id; }
     [[nodiscard]] std::uint64_t table_rows() const { return padded_rows_; }
     [[nodiscard]] std::span<const std::uint64_t> multipliers() const { return multipliers_; }
     [[nodiscard]] std::span<const std::uint64_t> sizes() const { return sizes_; }

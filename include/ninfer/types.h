@@ -387,6 +387,11 @@ struct FlashNextOptions {
     // whole, from each draft's probability, stays above a per-request adaptive threshold. Off: the
     // acceptance-estimate policy picks the count before drafting.
     bool mtp_joint_acceptance = false;
+    // Read the anchor column's n-gram rows into the volume's host cache while the draft graph runs
+    // (--ngram-prefetch; needs --spec mtp), so verification's row read finds them cached. The rows
+    // and the output are unchanged; only when the host reads them moves. Off: verification reads
+    // them all.
+    bool ngram_prefetch = false;
     // Run each MoE block's shared expert on a high-priority CUDA stream beside the routed experts,
     // joined before they are combined (--shared-expert-stream). The same outputs, bit for bit;
     // the workspace grows by the shared expert's Linear scratch at its widest call.
