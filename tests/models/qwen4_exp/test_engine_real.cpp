@@ -89,6 +89,14 @@
 //   ninfer_qwen4_exp_engine_real_test --gdn-async-commit-exact --mtp K [--max-context N]
 //       [--generate N] [TOKENS...]
 //
+// In-graph n-gram flag wait (ngram_flag_wait_matches_split below, --ngram-flag-wait): greedy ids
+// (and with --mtp K the MTP rounds, drafts and acceptances) equal those of the two-part rounds, and at
+// least one round ran as one graph waiting for its rows. The same arguments as --moe-precast-exact;
+// without --mtp every decode round is a plain one, with it the verifications take the flag wait too.
+//
+//   ninfer_qwen4_exp_engine_real_test --ngram-flag-wait-exact [--mtp K] [--max-context N]
+//       [--generate N] [TOKENS...]
+//
 // MTP for constrained requests (mtp_constrained_matches_plain below): a greedy JSON-schema request
 // with --mtp-constrained (K drafts, default 3) gives the ids of plain constrained decoding.
 //
@@ -856,6 +864,19 @@ int gdn_async_commit_matches_serial(const std::string& artifact, const std::vect
                                [] { return ninfer::models::qwen4_exp::Program::process_async_gdn_folds(); }});
 }
 
+// ngram_flag_wait_matches_split (--ngram-flag-wait-exact, FlashNextOptions::ngram_flag_wait): every
+// decode round after a lane's first (a plain round, and with MTP each verification width after its
+// first) runs as one graph whose wait kernel spins until the host has read the round's n-gram rows
+// into the pinned block and raised the flag. The greedy ids, rounds, drafts and acceptances equal
+// those of the two graphs around the host's read (a wait the rows did not stay behind would read the
+// previous round's rows and diverge), and at least one round ran as one graph.
+int ngram_flag_wait_matches_split(const std::string& artifact, const std::vector<std::string>& args) {
+    return option_matches_off(artifact, args,
+                              {"two-part rounds", "one-graph rounds", "ngram flag wait",
+                               [](EngineOptions& o) { o.flash_next.ngram_flag_wait = true; },
+                               [] { return ninfer::models::qwen4_exp::Program::process_ngram_flag_rounds(); }});
+}
+
 // mtp_constrained_matches_plain (--mtp-constrained, FlashNextOptions::mtp_constrained): a greedy
 // JSON-schema request on an MTP Engine with the option gives the ids of plain constrained decoding.
 // The reference is an MTP Engine without the option, where the constrained row runs plain rounds
@@ -1318,6 +1339,9 @@ int main(int argc, char** argv) {
         }
         if (!args.empty() && args.front() == "--gdn-async-commit-exact") {
             return gdn_async_commit_matches_serial(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
+        }
+        if (!args.empty() && args.front() == "--ngram-flag-wait-exact") {
+            return ngram_flag_wait_matches_split(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
         }
         if (!args.empty() && args.front() == "--mtp-constrained") {
             return mtp_constrained_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));

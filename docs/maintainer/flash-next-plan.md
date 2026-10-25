@@ -345,7 +345,8 @@ IQ1_M layers. Strata holds 12,375-12,583.
 
 **Host and n-gram rows (11c).** The decode round now runs the layers before the PLE layer (two of
 48) as one graph while the host reads the round's n-gram rows from the volume (median 0.6 ms, p90
-1.2 ms per token under nsys), then the rest as a second graph.
+1.2 ms per token under nsys), then the rest as a second graph. `--ngram-flag-wait` (Basalt items, below) makes it
+one graph that waits on the device for the rows.
 
 **Not changed, with reasons.** Power throttling: the opt-out exists since PR 9. WDDM event batching:
 a decode round queries at most a few promotion events and records two per promotion batch; nothing
@@ -997,6 +998,56 @@ None has been measured on the RTX 3090 yet.
   - GPU-session checks: the identity mode above; nsys of a decode step on vs off (three kernels per
     MLP side, the routing kernel against `projection_fp32`'s 10.2 us at T = 1); tok/s on vs off.
     Not measured.
+- **The n-gram rows' wait inside the round graph** (`--ngram-flag-wait`; F7c of the Basalt
+  learnings, Basalt's `wait_flag_ge_kernel` in `verify_kernels.cu` and its use in `verify.cpp`).
+  PR 11's split (11c above) runs a round's layers before the PLE layer as one graph, reads the rows
+  on the host, uploads them and launches the rest as a second graph: two launches, and the back's
+  launch waits for the host's read. With the option a single-request plain round and each MTP
+  verification width run as one graph: the front, `ops::wait_flag_sequence` (one thread spinning
+  with `__nanosleep(200)` on an `ld.acquire.sys` of a flag in mapped host memory), the rows' copy
+  from the pinned io block (`upload_pinned`, captured), the back and the logits cast. After the
+  launch the host reads the rows into the pinned block (`read_rows`, including a prefill-prefetched
+  call's rows), then raises the flag with a release store, and the device's acquire load orders the
+  copy after the rows. The verification keeps `--mtp-constrained`'s order (the grammar masks are
+  filled after the round is launched and the flag raised) and `--ngram-prefetch`'s (the anchor
+  column's rows are warmed while the drafter runs, before the round).
+  - Sequence numbers: a captured kernel's arguments are fixed, so the wait takes a device counter
+    and wants its next value at each execution (`wait_flag_sequence`). The host raises the flag to
+    the count of round launches, so a flag left at the previous round's value never releases the
+    next one, and the comparison is wrap-aware (`(int32)(flag - want) >= 0`). Every lane's and width's
+    round graph shares the counter; rounds are serialized by the host's per-round synchronization.
+  - Bit-identical by construction: the same kernels on the same inputs in the same stream order;
+    only the host's read moves behind the launch. A round's first run on a lane (and each
+    verification width's) stays eager in two parts (`ngram_rows_in_graph`): the kernels' one-time
+    setup runs outside a capture, and an eager wait could deadlock if any of that setup blocked the
+    host on the stream before it raised the flag. The two-part graphs are then never captured, so
+    `graph_bound` still bounds the executables. `ninfer_wait_flag_test` (a flag raised late by a host
+    thread holds back the stream work behind the wait; a flag never raised times out into the error
+    word and the stream continues; a stale flag holds the next call back; one captured wait waits
+    for a new value at each replay; the 2^32 wrap) and the engine gates
+    `ninfer_qwen4_exp_ngram_flag_wait_test` (plain rounds) and `ninfer_qwen4_exp_ngram_flag_wait_mtp_test`
+    (verifications; greedy ids, rounds, drafts and acceptances on vs off, and
+    `Program::process_ngram_flag_rounds` must count a one-graph round) have not run yet.
+  - Not applied: a two-lane round (`decode_rows`) keeps its two parts (one graph pair shared by the
+    lanes; a later change could give it the same form), and so does every round with
+    `--no-cuda-graph`, prefill and forced tokens.
+  - Failure: a wait that sees no flag for 1 s (`ops::kWaitFlagTimeoutNs`, the CPU-miss wait's
+    `kHeartbeatTimeoutNs`) writes `kWaitFlagErrorTimeout` to the Program's mapped error word and the
+    round runs on with rows the host may not have finished. Each round reads the word after its
+    synchronization and before anything reads its outputs; a set word is cleared and the round
+    throws, so the request ends with an error and nothing of the round is committed (decode's catch
+    releases the lane). The host raises the flag even when its read throws, so the device does not
+    wait out the timeout and the counter and the flag stay in step.
+  - Memory: the 4-byte device counter is `ProgramDevicePlan::ngram_flag_wait`; the flag and the
+    error word (a 64-byte line each, 128 bytes) are pinned and charged to the RAM ledger
+    (`plan_ngram_flag_wait`). The rows use the existing pinned io block.
+  - GPU-session checks: with a display attached (WDDM) a kernel spinning past TdrDelay (2 s) resets
+    the driver. A healthy wait is at most the row read (median 0.6 ms, p90 1.2 ms in PR 11) and the
+    timeout is 1 s, so check that a stalled host (a cold SSD read, a paging stall) does not trip it,
+    and how often a round waits at all (the front, two layers, takes ~0.5 ms). Under WDDM the
+    driver may also hold the launch in its command buffer until the next synchronization; nsys
+    should show the front running while the host reads. Measure tok/s on vs off, plain and with MTP.
+    Untested under WDDM. Works with MTP and vision. Not measured.
 
 ## Artifact decisions
 
