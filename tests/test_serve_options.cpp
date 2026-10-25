@@ -463,6 +463,48 @@ int main() {
                           "--prefill-stall-budget-ms accepted more than a minute");
     }
 
+    // Lossy long-prompt prefill: off by default, every flag reaches the options, bad values name
+    // their flag.
+    {
+        const auto& l = defaults.lossy_prefill;
+        failures += check(!l.enabled() && l.min_tokens == 0, "lossy prefill is not off by default");
+        failures += check(l.keep_fraction == 0.2F && l.filter_layer == 15 && l.block_tokens == 64 &&
+                              l.recent_tokens == 4096 && l.head_tokens == 256 && l.query_rows == 64 &&
+                              l.pool_window == 33 && l.skip_fraction == 0.8F && !l.scout_a4,
+                          "lossy prefill defaults are not the documented ones");
+        const ServeOptions all = parse(
+            {"ninfer-serve", "model.ninfer", "--lossy-prefill-min-tokens", "30000",
+             "--lossy-prefill-keep", "0.5", "--lossy-prefill-filter-layer", "11",
+             "--lossy-prefill-block", "128", "--lossy-prefill-recent", "2048",
+             "--lossy-prefill-head", "512", "--lossy-prefill-query-rows", "32",
+             "--lossy-prefill-pool-window", "17", "--lossy-prefill-skip", "0.5",
+             "--lossy-prefill-scout-a4"});
+        const auto& a = all.lossy_prefill;
+        failures += check(a.enabled() && a.min_tokens == 30000 && a.keep_fraction == 0.5F &&
+                              a.filter_layer == 11 && a.block_tokens == 128 &&
+                              a.recent_tokens == 2048 && a.head_tokens == 512 &&
+                              a.query_rows == 32 && a.pool_window == 17 && a.skip_fraction == 0.5F &&
+                              a.scout_a4,
+                          "a --lossy-prefill-* flag did not reach serving options");
+        const std::vector<std::vector<std::string>> bad = {
+            {"--lossy-prefill-keep", "0"},        {"--lossy-prefill-keep", "1.5"},
+            {"--lossy-prefill-block", "24"},      {"--lossy-prefill-pool-window", "32"},
+            {"--lossy-prefill-query-rows", "0"},  {"--lossy-prefill-skip", "0"},
+        };
+        for (const auto& extra : bad) {
+            std::vector<std::string> args = {"ninfer-serve", "model.ninfer", "--lossy-prefill-min-tokens",
+                                             "30000"};
+            args.insert(args.end(), extra.begin(), extra.end());
+            bool named = false;
+            try {
+                (void)parse(args);
+            } catch (const std::invalid_argument& e) {
+                named = std::string(e.what()).find(extra[0].substr(2)) != std::string::npos;
+            }
+            failures += check(named, ("bad value not rejected naming " + extra[0]).c_str());
+        }
+    }
+
     const ServeOptions zero_host_context =
         parse({"ninfer-serve", "model.ninfer", "--host-context-mib", "0"});
     failures += check(zero_host_context.context_cache.enabled &&

@@ -61,6 +61,7 @@ struct ServeOptions {
     SpeculativeOptions speculative;
     ContextCacheOptions context_cache;
     PrefillScheduleOptions prefill_schedule;
+    LossyPrefillOptions lossy_prefill;
     bool enable_vision      = false;
     VisionResidency vision_residency       = VisionResidency::Resident;
     std::uint32_t vision_max_merged_tokens = 16384;

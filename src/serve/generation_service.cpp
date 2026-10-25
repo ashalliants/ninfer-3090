@@ -351,6 +351,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.speculative              = options.speculative;
     engine_options.context_cache            = options.context_cache;
     engine_options.prefill_schedule         = options.prefill_schedule;
+    engine_options.lossy_prefill            = options.lossy_prefill;
     engine_options.context_store.directory  = options.context_store_path;
     engine_options.context_store.max_bytes =
         options.context_store_max_gib ? *options.context_store_max_gib << 30U : 0U;

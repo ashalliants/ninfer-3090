@@ -274,6 +274,34 @@ struct ContextCacheOptions {
     std::optional<std::uint32_t> host_cache_percent;
 };
 
+// Lossy long-prompt prefill: past a threshold, a cheap scout pass scores blocks of the prompt and
+// only the kept blocks are prefilled (the rest never enter the KV cache). Off by default.
+struct LossyPrefillOptions {
+    // Prompts whose part after the last shared marker has at least this many tokens are filtered.
+    // 0 (the default) is off.
+    std::uint32_t min_tokens = 0;
+    // Share of the filtered part's blocks to keep, in (0, 1].
+    float keep_fraction = 0.2F;
+    // Full-attention layer whose scores pick the blocks (checked against the model at startup).
+    std::uint32_t filter_layer = 15;
+    // Block size in tokens: a multiple of 16, at least 16.
+    std::uint32_t block_tokens = 64;
+    // Tokens at the end and at the start of the filtered part that are always kept.
+    std::uint32_t recent_tokens = 4096;
+    std::uint32_t head_tokens   = 256;
+    // Trailing query rows that score the blocks, 1..256.
+    std::uint32_t query_rows = 64;
+    // Score pooling window over neighbouring blocks, odd.
+    std::uint32_t pool_window = 33;
+    // Skip rule: when the kept tokens would exceed this share of the filtered part, keep everything
+    // (an ordinary full prefill after the scout). In (0, 1].
+    float skip_fraction = 0.8F;
+    // Run the scout GEMMs with int4 activations.
+    bool scout_a4 = false;
+
+    [[nodiscard]] bool enabled() const noexcept { return min_tokens > 0; }
+};
+
 // How a long prefill shares the GPU with lanes that are already generating. Off by default.
 struct PrefillScheduleOptions {
     // The Engine runs one prefill step per worker cycle, so a stream that decodes next to a prefill
@@ -496,6 +524,7 @@ struct EngineOptions {
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     PrefillScheduleOptions prefill_schedule;
+    LossyPrefillOptions lossy_prefill;
     // Prompt grafts a request may select by name through PromptOptions::graft. Each is loaded and
     // validated against the resident model at construction.
     std::vector<GraftSource> grafts;
