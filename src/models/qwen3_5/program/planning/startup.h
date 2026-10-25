@@ -120,6 +120,8 @@ struct SequencePlanningInputs {
     // The narrow neural window of the adaptive draft window (0 when off).
     std::uint32_t adaptive_draft_tokens     = 0;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
+    // EngineOptions::relaxed_drafting is set: verification runs the relaxed acceptance instances.
+    bool relaxed_drafting                   = false;
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
     ProposalHead proposal_head              = ProposalHead::Full;
     models::LoadOptions features;
@@ -150,6 +152,8 @@ struct SequencePlanImpl {
     // The narrow neural window of the adaptive draft window (0 when off).
     std::uint32_t adaptive_draft_tokens     = 0;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
+    // EngineOptions::relaxed_drafting is set: verification runs the relaxed acceptance instances.
+    bool relaxed_drafting                   = false;
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
     ProposalHead proposal_head              = ProposalHead::Full;
     models::LoadOptions features;

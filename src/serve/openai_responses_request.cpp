@@ -1363,6 +1363,7 @@ void validate_common_top_level(const Json& body, bool create) {
                                                                   "prompt_cache_options",
                                                                   "prompt_cache_retention",
                                                                   "reasoning",
+                                                                  "relaxed_drafting",
                                                                   "safety_identifier",
                                                                   "service_tier",
                                                                   "store",
@@ -1509,6 +1510,7 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
         if (*top_p < 0.0 || *top_p > 1.0) { bad_request("top_p must be in [0,1]", "top_p"); }
         out.prompt.generation.sampling.top_p = *top_p;
     }
+    out.prompt.generation.sampling.relaxed_drafting = parse_relaxed_drafting_field(body);
     if (const std::optional<int> max_output = optional_int(body, "max_output_tokens")) {
         if (*max_output < 0) {
             bad_request("max_output_tokens must be non-negative", "max_output_tokens");

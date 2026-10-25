@@ -1624,6 +1624,31 @@ int test_input_tokens_uses_shared_state_path() {
     return failures;
 }
 
+// relaxed_drafting on Responses: the same extension as Chat Completions.
+int test_relaxed_drafting_extension() {
+    Json body    = {{"model", "m"}, {"input", "hello"}};
+    int failures = check(!parse_openai_responses_create_request(body, limits())
+                              .prompt.generation.sampling.relaxed_drafting,
+                         "absent Responses relaxed_drafting was not left unset");
+    for (const auto& [value, expected] :
+         {std::pair{Json(0.3), 0.3}, std::pair{Json(false), 0.0}, std::pair{Json(true), 0.5}}) {
+        body["relaxed_drafting"] = value;
+        const auto parsed        = parse_openai_responses_create_request(body, limits())
+                                .prompt.generation.sampling.relaxed_drafting;
+        failures += check(parsed && *parsed == expected,
+                          "Responses relaxed_drafting was not parsed: " + value.dump());
+    }
+    for (const Json& invalid : {Json(-1), Json(2)}) {
+        body["relaxed_drafting"] = invalid;
+        const auto error         = api_error(
+            [&] { (void)parse_openai_responses_create_request(body, limits()); });
+        failures += check(error.param == "relaxed_drafting" &&
+                              error.code == "invalid_relaxed_drafting",
+                          "invalid Responses relaxed_drafting was accepted: " + invalid.dump());
+    }
+    return failures;
+}
+
 int test_thinking_budget_extension() {
     Json body    = {{"model", "m"}, {"input", "hello"}};
     int failures = check(!parse_openai_responses_create_request(body, limits())
@@ -1747,6 +1772,7 @@ int main() {
     int failures = 0;
     failures += test_graft_extension();
     failures += test_thinking_budget_extension();
+    failures += test_relaxed_drafting_extension();
     failures += test_constrained_decoding();
     failures += test_basic_request_and_resolution();
     failures += test_budgets_and_nonsemantic_hints();

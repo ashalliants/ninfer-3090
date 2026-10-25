@@ -5,6 +5,7 @@
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 
 namespace {
@@ -104,6 +105,32 @@ int main() {
                               dense, ninfer::SamplingMode::Thinking, overrides);
                       }),
                       "non-finite sampling override was accepted");
+
+    // resolve_override: relaxed drafting. A request value wins over the Engine default, an
+    // explicit zero (the request's `false`) turns it off, an absent value takes the default, and
+    // an Engine without the option (nullopt) resolves to off and refuses a request that asks.
+    const auto relaxed = [&](std::optional<float> request, std::optional<float> engine) {
+        ninfer::SamplingOverrides relax;
+        relax.relaxed_drafting = request;
+        return ninfer::runtime::resolve_sampling(dense, ninfer::SamplingMode::Thinking, relax,
+                                                 engine)
+            .relaxed_drafting;
+    };
+    failures += check(relaxed(0.3F, 0.5F) == 0.3F, "a request relaxed_drafting does not win");
+    failures += check(relaxed(0.0F, 0.5F) == 0.0F, "relaxed_drafting=false does not turn it off");
+    failures += check(relaxed(std::nullopt, 0.5F) == 0.5F,
+                      "an absent relaxed_drafting does not take the Engine default");
+    failures += check(relaxed(std::nullopt, 0.0F) == 0.0F && relaxed(0.2F, 0.0F) == 0.2F,
+                      "an Engine default of 0 is not exact-by-default with per-request opt-in");
+    failures += check(relaxed(std::nullopt, std::nullopt) == 0.0F &&
+                          relaxed(0.0F, std::nullopt) == 0.0F,
+                      "an Engine without relaxed drafting does not resolve to off");
+    failures += check(throws_invalid([&] { (void)relaxed(0.3F, std::nullopt); }),
+                      "relaxed drafting was accepted by an Engine started without it");
+    for (const float bad : {-1.0F, 2.0F, std::numeric_limits<float>::quiet_NaN()}) {
+        failures += check(throws_invalid([&] { (void)relaxed(bad, 0.5F); }),
+                          "an out-of-range relaxed_drafting was accepted");
+    }
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

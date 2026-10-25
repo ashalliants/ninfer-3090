@@ -87,6 +87,19 @@ void speculative_overlay_copy_proposals(const Tensor& copy_rows, const Tensor& c
                                         Tensor& drafts, Tensor& candidates, Tensor& proposal_q,
                                         std::int32_t token_domain, cudaStream_t stream);
 
+/*
+ * Relaxed drafting (both accept Ops; opt-in, CHANGES THE OUTPUT DISTRIBUTION). With a non-null
+ * relaxed_kept the Op runs its relaxed instance: at a live sampled position i of row b, the draft
+ * d is also accepted when relaxed_keep(p_i(d), configs[b].relaxed_threshold, eligible_i)
+ * (src/ops/common/relaxed_accept.h), where eligible_i holds when drafts[0..i,b] are all in
+ * [0, configs[b].added_token_floor). p is the same final target probability the exact rule reads,
+ * and the accept draw u, the correction and the bonus are those of the exact rule, so a row with
+ * threshold 0 gives the exact Op's results bit for bit. Greedy rows never relax. relaxed_kept is
+ * I32 [B]; relaxed_kept[b] receives how many of the A accepted drafts the exact rule rejected and
+ * the threshold kept. With a null relaxed_kept every row takes the exact rule whatever its
+ * threshold (the default instances).
+ */
+
 /**
  * Op: speculative_accept_greedy_drafts
  *
@@ -129,7 +142,8 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
                                       Tensor& licensed_counts, Tensor& accepted,
                                       std::int32_t token_domain, const SamplingConfig* configs,
-                                      WorkspaceArena& workspace, cudaStream_t stream);
+                                      WorkspaceArena& workspace, cudaStream_t stream,
+                                      Tensor* relaxed_kept = nullptr);
 
 // Caller-owned transient capacity over the inclusive draft-count and batch intervals.
 // The raw-greedy execution envelope requires no workspace.
@@ -189,7 +203,8 @@ void speculative_accept_sparse_drafts(
     const Tensor& candidate_ids, const Tensor& proposal_q, const Tensor& current_extents,
     Tensor& round_lengths, Tensor& round_anchors, Tensor& licensed_tokens, Tensor& licensed_counts,
     Tensor& accepted_drafts, std::int32_t token_domain, const SamplingConfig* configs,
-    SpeculativeAcceptExecutionEnvelope envelope, WorkspaceArena& workspace, cudaStream_t stream);
+    SpeculativeAcceptExecutionEnvelope envelope, WorkspaceArena& workspace, cudaStream_t stream,
+    Tensor* relaxed_kept = nullptr);
 
 /**
  * Op: speculative_select_accepted_hidden

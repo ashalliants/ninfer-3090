@@ -30,12 +30,17 @@ void validate(const ResolvedSamplingParameters& sampling) {
     if (sampling.frequency_penalty < -2.0F || sampling.frequency_penalty > 2.0F) {
         throw std::invalid_argument("frequency_penalty must be in [-2,2]");
     }
+    if (!std::isfinite(sampling.relaxed_drafting) || sampling.relaxed_drafting < 0.0F ||
+        sampling.relaxed_drafting > 1.0F) {
+        throw std::invalid_argument("relaxed_drafting must be in [0,1]");
+    }
 }
 
 } // namespace
 
 ResolvedSamplingParameters resolve_sampling(const ModelSamplingDefaults& defaults,
-                                            SamplingMode mode, const SamplingOverrides& overrides) {
+                                            SamplingMode mode, const SamplingOverrides& overrides,
+                                            std::optional<float> relaxed_drafting) {
     const SamplingPreset& preset = defaults.for_mode(mode);
     ResolvedSamplingParameters resolved{
         .temperature       = overrides.temperature.value_or(preset.temperature),
@@ -45,12 +50,18 @@ ResolvedSamplingParameters resolve_sampling(const ModelSamplingDefaults& default
         .presence_penalty  = overrides.presence_penalty.value_or(preset.presence_penalty),
         .frequency_penalty = overrides.frequency_penalty.value_or(preset.frequency_penalty),
         .seed              = overrides.seed.value_or(0),
+        .relaxed_drafting  = overrides.relaxed_drafting.value_or(relaxed_drafting.value_or(0.0F)),
     };
     // The registered sampling pipeline has an exact top-20 candidate domain. Preserve the
     // existing public meaning of zero (use the target cap), then expose only concrete values to
     // runtimes.
     if (resolved.top_k == 0) { resolved.top_k = 20; }
     validate(resolved);
+    // The exact acceptance kernels are the only ones an Engine without the option prepares.
+    if (!relaxed_drafting && resolved.relaxed_drafting > 0.0F) {
+        throw std::invalid_argument("relaxed_drafting needs an Engine started with relaxed "
+                                    "drafting (--relaxed-drafting)");
+    }
     return resolved;
 }
 

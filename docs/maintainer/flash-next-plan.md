@@ -1121,6 +1121,17 @@ None has been measured on the RTX 3090 yet.
     saves (the share of routed cold experts with more than 8 columns), and whether the cold-set size
     F is right for streamed calls (it sets how much the CPU takes there); and the WDDM/TDR check of `--cpu-verify-misses` (a layer's wait
     here is milliseconds). Works with two lanes, MTP and vision. Not measured.
+- **Relaxed drafting** (`--relaxed-drafting [P]` and the request key `relaxed_drafting`, cross-model;
+  X-C of the Basalt learnings, [serving.md](../serving.md#relaxed-drafting)). **A numerics change:
+  it changes the output distribution**, which is why it is opt-in and why the KLD gate cannot see
+  it (the logits do not change, only which token is emitted). A sampled MTP verification also keeps
+  a draft whose final target probability is at least P; the row's threshold is zeroed for a
+  constrained row, a greedy one and one whose history ends inside `<tool_call>`, and the kernel stops
+  relaxing at the first drafted added token. A round with a threshold runs the Op's relaxed
+  instance and reads back one more spec word (`w_relaxed`, the keep count); without one the exact
+  instance runs and the round is as before. Off, the default instances' SASS is the base kernels'
+  with the 64-byte `SamplingConfig`. Basalt's own measurements (RTX 5090, its models) are in
+  serving.md; nothing has been measured here.
 
 ## Artifact decisions
 

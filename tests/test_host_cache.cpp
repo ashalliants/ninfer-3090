@@ -232,11 +232,57 @@ int check_fork_options_accepted() {
     return failures;
 }
 
+// Relaxed drafting changes which drafts speculation keeps, so it is refused without a speculative
+// backend, on a scoring Engine and outside [0,1]; with a backend any threshold in [0,1] is kept.
+int check_relaxed_drafting() {
+    using ninfer::runtime::normalize_engine_options;
+    const auto normalized = [](auto&& edit) -> std::optional<ninfer::EngineOptions> {
+        ninfer::EngineOptions options;
+        options.speculative.backend      = ninfer::SpeculativeBackend::Mtp;
+        options.speculative.draft_tokens = 3;
+        options.relaxed_drafting         = 0.5F;
+        edit(options);
+        try {
+            return normalize_engine_options(options);
+        } catch (const std::invalid_argument& error) {
+            if (std::string(error.what()).find("--relaxed-drafting") == std::string::npos) {
+                std::cerr << "relaxed drafting refusal does not name the flag: " << error.what()
+                          << '\n';
+            }
+            return std::nullopt;
+        }
+    };
+    int failures = 0;
+    for (const float threshold : {0.0F, 0.2F, 1.0F}) {
+        const auto kept =
+            normalized([&](ninfer::EngineOptions& o) { o.relaxed_drafting = threshold; });
+        failures += check(kept && kept->relaxed_drafting == threshold,
+                          "a relaxed drafting threshold in [0,1] was not kept");
+    }
+    failures += check(!normalized([](ninfer::EngineOptions& o) { o.speculative = {}; }),
+                      "relaxed drafting was accepted without a speculative backend");
+    failures += check(!normalized([](ninfer::EngineOptions& o) {
+                          o.purpose = ninfer::EnginePurpose::CausalScoring;
+                      }),
+                      "relaxed drafting was accepted on a scoring Engine");
+    for (const float bad : {-0.1F, 1.5F}) {
+        failures += check(!normalized([&](ninfer::EngineOptions& o) { o.relaxed_drafting = bad; }),
+                          "an out-of-range relaxed drafting threshold was accepted");
+    }
+    failures += check(normalized([](ninfer::EngineOptions& o) {
+                          o.speculative      = {};
+                          o.relaxed_drafting = std::nullopt;
+                      }).has_value(),
+                      "options without relaxed drafting were refused");
+    return failures;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
     failures += check_automatic_normalization();
+    failures += check_relaxed_drafting();
     failures += check_fork_options_accepted();
     failures += check_scoring_decode_window();
 

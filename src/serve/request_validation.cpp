@@ -254,6 +254,22 @@ std::optional<std::uint32_t> parse_thinking_budget_field(const RequestJson& body
     return static_cast<std::uint32_t>(*budget);
 }
 
+std::optional<double> parse_relaxed_drafting_field(const RequestJson& body) {
+    if (!body.contains("relaxed_drafting") || body.at("relaxed_drafting").is_null()) {
+        return std::nullopt;
+    }
+    const RequestJson& value = body.at("relaxed_drafting");
+    if (value.is_boolean()) {
+        return value.get<bool>() ? static_cast<double>(kRelaxedDraftingDefault) : 0.0;
+    }
+    if (value.is_number()) {
+        const double threshold = value.get<double>();
+        if (std::isfinite(threshold) && threshold >= 0.0 && threshold <= 1.0) { return threshold; }
+    }
+    bad_request("relaxed_drafting must be a number in [0,1] or a boolean", "relaxed_drafting",
+                "invalid_relaxed_drafting");
+}
+
 bool valid_tool_name(std::string_view name, std::size_t maximum_length) noexcept {
     if (name.empty() || name.size() > maximum_length) { return false; }
     for (const unsigned char character : name) {

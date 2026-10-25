@@ -1143,6 +1143,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->ngram_draft_tokens   = inputs.ngram_draft_tokens;
     impl->ngram_min_match      = inputs.ngram_min_match;
     impl->speculative_backend  = inputs.speculative_backend;
+    impl->relaxed_drafting     = inputs.relaxed_drafting;
     impl->proposal_head        = inputs.proposal_head;
     impl->features             = inputs.features;
     impl->numeric_tripwire     = inputs.numeric_tripwire;
@@ -1320,6 +1321,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .ngram_min_match      = options.speculative.ngram_min_match,
         .adaptive_draft_tokens = options.speculative.adaptive_draft_tokens,
         .speculative_backend  = options.speculative.backend,
+        .relaxed_drafting     = options.relaxed_drafting.has_value(),
         .kv_storage           = options.kv_cache,
         .proposal_head        = options.speculative.proposal_head,
         .features             = models::load_options(options),
