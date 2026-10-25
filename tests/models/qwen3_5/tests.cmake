@@ -205,6 +205,13 @@ ninfer_add_test(ninfer_qwen3_5_lossy_selection_test
           "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/program/lossy/selection.cpp"
   LIBRARIES ninfer_core)
 
+# Prompt compaction and gap maps for lossy long-prefill. gap_map.cpp and the prefix digests it
+# reuses live in ninfer_model_runtime, so this links that library (and through it the kernels); it is
+# cpu-labelled but not host-only.
+ninfer_add_test(ninfer_qwen3_5_lossy_gap_map_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lossy_gap_map.cpp"
+  LIBRARIES ninfer_model_runtime)
+
 ninfer_add_test(ninfer_qwen3_5_ngram_proposer_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_proposer.cpp"
   LIBRARIES ninfer_core)
