@@ -594,17 +594,27 @@ Speed items taken from Basalt (commit 8d73a39), each behind its own option that 
 None has been measured on the RTX 3090 yet.
 
 - **Shared expert on a side stream** (`--shared-expert-stream`). Each MoE block (and the MTP
-  drafter's) forks a high-priority stream after the block's input and runs the shared expert's
-  gate/up, SiLU-mul and down there while the routing and routed experts run on the device stream;
-  the device stream waits for it before the combine. The fork and join are events, so the decode and
-  verification graphs capture them. The same Ops run on the same inputs, so the output is unchanged,
-  bit for bit: `ninfer_qwen4_exp_forward_real_test --shared-expert-stream TOKENS` checks that, eager
-  and in CUDA graphs (not run yet). The shared expert's Linears take their scratch from a region
-  carved out of the call's workspace, never from scratch the device stream frees and reuses; the
-  static workspace plans it as `ProgramDevicePlan::shared_expert_workspace` (the Q8_1 rows of the
-  shared expert's widest input, 1.125 bytes per value, at the widest static call) and a wide
-  prefill's lent arena grows by the same at its width. Basalt estimates 0.25-0.5 ms
-  per token. Works with two lanes, MTP and vision.
+  drafter's) forks a second stream after the block's input and runs the shared expert's gate/up,
+  SiLU-mul and down there while the routing and routed experts run on the device stream; the device
+  stream waits for it before the combine. The fork and join are events, so the decode and
+  verification graphs capture them; an exception between them rejoins the stream. The stream has
+  the greatest priority, but that holds for eager calls only: `DecodeGraphExecutable` instantiates
+  graphs without `cudaGraphInstantiateFlagUseNodePriority`, so a graph replay runs the branch
+  concurrently at the default priority (instantiation is left unchanged).
+  - Designed to be bit-exact: the same Ops run on the same inputs. Checked by
+    `ninfer_qwen4_exp_forward_real_test --shared-expert-stream TOKENS` (eager and in CUDA graphs)
+    and `ninfer_qwen4_exp_mtp_real_test` (the drafter), neither run yet.
+  - The shared expert's Linears take their scratch from a region carved out of the call's
+    workspace, never from scratch the device stream frees and reuses. The carve is what the Linear
+    Op asks for (`ops::linear_workspace_capacity_bytes` over the block's gate, up and down).
+  - The static workspace plans it before the weights are read as
+    `ProgramDevicePlan::shared_expert_workspace`: the Q8_1 rows of the shared expert's widest
+    input, 1.125 bytes per value, at the widest static call. A wide prefill's lent arena grows by
+    the same at its width.
+  - At startup the Program checks the loaded weights' need against both, and refuses
+    `--shared-expert-stream` if a format needs more (only the GGML formats are planned for).
+  - Designed to work with two lanes, MTP and vision. Basalt estimates 0.25-0.5 ms per token. Not
+    measured.
 
 ## Artifact decisions
 

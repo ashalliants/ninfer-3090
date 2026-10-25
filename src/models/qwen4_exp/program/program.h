@@ -398,6 +398,13 @@ struct ProgramOptions {
 // (execution::Forward::shared_expert_workspace_bytes) of the static workspace's widest call, a
 // prefill chunk, a round over every lane or an MTP verification; 0 without shared_expert_stream.
 [[nodiscard]] std::uint64_t plan_shared_expert_workspace(const ProgramOptions& options, const TextConfig& config);
+// The widest call on the static workspace the term above is planned for.
+[[nodiscard]] std::uint32_t shared_expert_columns(const ProgramOptions& options);
+// The startup check of --shared-expert-stream: the loaded weights' shared expert Linears take `need`
+// bytes of scratch at calls of up to `columns` columns (execution::Forward::
+// max_shared_expert_scratch_bytes), against the `planned` bytes; refuses (std::invalid_argument
+// naming the flag) when they do not fit.
+void require_shared_expert_workspace(std::uint64_t need, std::uint64_t planned, std::uint32_t columns);
 
 class Program {
 public:

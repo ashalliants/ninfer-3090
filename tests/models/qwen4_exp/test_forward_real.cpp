@@ -65,9 +65,11 @@
 //
 //   ninfer_qwen4_exp_forward_real_test --shared-expert-stream TOKENS [--decode N] [--staging SLOTS]
 //
-// All but the last N tokens (default 4) are prefilled as one call, then each of the N is decoded by
-// one call, from a fresh state, four times: the shared expert after the routed experts or beside them
-// on its side stream, with the decode calls eager or each captured in a CUDA graph and replayed. The
+// All but the last N tokens (default 4; more than 8 must remain, so the prompt call is wider than the
+// GGML decode route and its Linears use the side stream's carve) are prefilled as one call, then each
+// of the N is decoded by one call, from a fresh state, four times: the shared expert after the routed
+// experts or beside them on its side stream, with the decode calls eager or each captured in a CUDA
+// graph and replayed. The
 // prompt call's last logits and every decode call's must be bitwise equal between the serial and the
 // side-stream run of the same decode mode.
 
@@ -1233,7 +1235,10 @@ int shared_expert_mode(int argc, char** argv, const char* artifact_env) {
         }
     }
     const auto n = static_cast<std::int32_t>(tokens.size());
-    if (decode < 1 || decode >= n) { throw std::invalid_argument("--decode must be in [1, tokens)"); }
+    if (decode < 1 || n - decode <= 8) {
+        throw std::invalid_argument("--decode must be at least 1 and leave more than 8 prompt tokens (the prompt "
+                                    "call must be wider than 8 columns to use the side stream's carve)");
+    }
 
     DeviceContext device(0);
     artifact::Reader reader(artifact_env);

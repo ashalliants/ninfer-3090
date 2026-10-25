@@ -927,6 +927,18 @@ public:
         forward_ = std::make_unique<execution::Forward>(
             parameters_, device_, *work_, std::move(state), std::move(kv), std::move(experts), std::move(drafter),
             execution::ForwardOptions{.shared_expert_stream = options_.shared_expert_stream});
+        if (options_.shared_expert_stream) {
+            // The plan was made before the weights were read: refuse weights whose shared expert
+            // Linears need more scratch than the static workspace or a wide call's lent arena hold.
+            const std::uint32_t columns = shared_expert_columns(options_);
+            require_shared_expert_workspace(forward_->max_shared_expert_scratch_bytes(static_cast<std::int32_t>(columns)),
+                                            plan_.bytes.shared_expert_workspace, columns);
+            if (plan_.wide_work > 0) {
+                require_shared_expert_workspace(forward_->max_shared_expert_scratch_bytes(plan_.wide_chunk),
+                                                execution::Forward::shared_expert_workspace_bytes(c_, plan_.wide_chunk),
+                                                static_cast<std::uint32_t>(plan_.wide_chunk));
+            }
+        }
         lane_graphs_.resize(plan_.lanes);
         select_lane(0);
         warm_vision();
@@ -2879,7 +2891,7 @@ private:
         const std::size_t work      = std::min<std::size_t>(
             plan_.wide_work,
             execution::Forward::workspace_bytes(c_, widest, keys, DeviceExecutionView{nullptr, plan_.sms}) +
-                (options_.shared_expert_stream ? execution::Forward::shared_expert_workspace_bytes(c_, widest) : 0));
+                (options_.shared_expert_stream ? forward_->max_shared_expert_scratch_bytes(widest) : 0));
         const std::uint64_t stride  = residency_->frame_stride();
         const std::size_t tables    = align(stream_->table_bytes());
         const auto work_frames      = static_cast<std::uint32_t>((tables + work + stride - 1) / stride);
@@ -4716,11 +4728,24 @@ Program::Program(const execution::Parameters& parameters, DeviceContext& device,
 
 Program::~Program() noexcept = default;
 
+std::uint32_t shared_expert_columns(const ProgramOptions& options) {
+    return std::max({std::min(options.prefill_chunk, options.max_context), options.max_concurrency,
+                     1U + options.mtp_draft_tokens});
+}
+
 std::uint64_t plan_shared_expert_workspace(const ProgramOptions& options, const TextConfig& config) {
     if (!options.shared_expert_stream) { return 0; }
-    const std::uint32_t widest = std::max({std::min(options.prefill_chunk, options.max_context), options.max_concurrency,
-                                           1U + options.mtp_draft_tokens});
-    return execution::Forward::shared_expert_workspace_bytes(config, static_cast<std::int32_t>(widest));
+    return execution::Forward::shared_expert_workspace_bytes(config,
+                                                             static_cast<std::int32_t>(shared_expert_columns(options)));
+}
+
+void require_shared_expert_workspace(std::uint64_t need, std::uint64_t planned, std::uint32_t columns) {
+    if (need > planned) {
+        throw std::invalid_argument("--shared-expert-stream: this model's shared expert Linears need " +
+                                    std::to_string(need) + " bytes of scratch at " + std::to_string(columns) +
+                                    " columns, more than the " + std::to_string(planned) +
+                                    " planned for GGML weights; start without --shared-expert-stream");
+    }
 }
 
 ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const TextConfig& config,

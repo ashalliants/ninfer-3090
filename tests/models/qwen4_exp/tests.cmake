@@ -69,10 +69,11 @@ ninfer_add_test(ninfer_qwen4_exp_memory_plan_test
   LIBRARIES ninfer_model_loading ninfer_core)
 
 # Host only: the Program's planned device terms computed from the options and the configuration
-# (the shared expert's side-stream workspace).
+# and their startup checks (the shared expert's side-stream workspace against the Linear Op's own
+# capacity).
 ninfer_add_test(ninfer_qwen4_exp_program_plan_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_program_plan.cpp"
-  LIBRARIES ninfer_model_runtime ninfer_core)
+  LIBRARIES ninfer_model_runtime ninfer_ops ninfer_core)
 
 # Host only: the context cache's Host tier (slabs, checkpoints sharing KV pages, release quotes and
 # sets, lineage recovery loss), the RAM ledger's sizing of it beside the experts, and the context
