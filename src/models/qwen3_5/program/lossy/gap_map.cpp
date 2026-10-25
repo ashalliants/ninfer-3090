@@ -287,6 +287,8 @@ PreparedPromptData compact_prompt(const PreparedPromptData& original, const GapM
             out.identity.rewrite_execution_frontiers.push_back(*mapped);
         }
     }
+    out.context_cache.product_prompt_end =
+        translate(original.context_cache.product_prompt_end).value_or(0U);
     out.context_cache.opportunities.clear();
     for (PreparedCacheOpportunity opportunity : original.context_cache.opportunities) {
         if (const auto mapped = translate(opportunity.frontier)) {

@@ -69,16 +69,30 @@ void test_pause_and_capture_window() {
 
 void test_exact_end() {
     using ninfer::SharedCandidateEvidence;
-    const std::vector<PreparedCacheOpportunity> none;
-    require(lossy_planned_exact_end(none) == 0, "no marker: M is 0");
-    const std::vector<PreparedCacheOpportunity> markers{
+    using ninfer::models::qwen3_5::PreparedContextCache;
+    require(lossy_planned_exact_end(PreparedContextCache{}) == 0, "no product prompt: M is 0");
+    // Message-level markers past the product prompt never count, whatever their evidence: an
+    // explicit boundary (Anthropic cache_control on the latest message) or an OpenAI automatic one.
+    PreparedContextCache cache;
+    cache.product_prompt_end = 1500;
+    cache.opportunities      = {
         {.kind = PromptCacheMarkerKind::SharedStablePrefix,
-         .evidence = SharedCandidateEvidence::ExplicitBoundary, .frontier = 1500},
+              .evidence = SharedCandidateEvidence::ExplicitBoundary, .frontier = 1500},
         {.kind = PromptCacheMarkerKind::SharedStablePrefix,
-         .evidence = SharedCandidateEvidence::RequestedAutomatic, .frontier = 6000},
+              .evidence = SharedCandidateEvidence::RequestedAutomatic, .frontier = 6000},
+        {.kind = PromptCacheMarkerKind::SharedStablePrefix,
+              .evidence = SharedCandidateEvidence::DefaultAutomatic, .frontier = 7000},
+        {.kind = PromptCacheMarkerKind::SharedStablePrefix,
+              .evidence = SharedCandidateEvidence::ExplicitBoundary, .frontier = 9000},
         {.kind = PromptCacheMarkerKind::PrivateLongAnchor, .frontier = 20000},
     };
-    require(lossy_planned_exact_end(markers) == 6000, "last shared marker, anchors ignored");
+    require(lossy_planned_exact_end(cache) == 1500, "message markers past the product prompt ignored");
+    // An engine-structural opportunity (tools, leading instructions, graft) always counts.
+    cache.opportunities.push_back({.kind     = PromptCacheMarkerKind::SharedStablePrefix,
+                                   .evidence = SharedCandidateEvidence::EngineStructural |
+                                               SharedCandidateEvidence::DefaultAutomatic,
+                                   .frontier = 2200});
+    require(lossy_planned_exact_end(cache) == 2200, "engine-structural opportunity counts");
     // The reuse frontier decides when it is deeper than the product prompt.
     require(lossy_exact_end(6000, 0) == 6000, "cold: M is the marker");
     require(lossy_exact_end(6000, 1500) == 6000, "shared reuse below the marker");

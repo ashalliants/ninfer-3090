@@ -3,8 +3,9 @@
 // docs/maintainer/lossy-long-prefill.md, "How it works". A lossy request prefills in three phases:
 //
 //   Exact  an ordinary prefill from the reuse frontier up to M, the end of the product prompt (the
-//          last SharedStablePrefix marker at or after the reuse frontier). Captures and shared
-//          publication happen as for any prefill. Steps never cross M.
+//          leading System/Developer messages, tools and graft; or the reuse frontier when that is
+//          deeper). Captures and shared publication happen as for any prefill. Steps never
+//          cross M.
 //   Scout  layers below the filter layer over U = [M, prompt end), scoring every token of U. The
 //          cursor stays at M; nothing is committed, captured or paused.
 //   Main   after selection and compaction, an ordinary prefill of the kept tokens from M.
@@ -66,12 +67,19 @@ enum class LossyStep : std::uint8_t {
     return phase != LossyPhase::Main && cursor >= exact_end;
 }
 
-// The planned end of the product prompt: the deepest SharedStablePrefix opportunity, 0 without one.
+// The planned end of the product prompt (M before reuse): the Frontend's product-prompt end, or a
+// deeper engine-structural shared opportunity (tools, leading instructions, graft). Message-level
+// boundaries past the leading System/Developer messages never count, whatever their evidence: an
+// OpenAI automatic boundary or an Anthropic cache_control on the latest message marks the end of
+// the request's own prompt, and taking it as M would leave nothing to select. Both strategies
+// (selection and summary) use this one rule.
 [[nodiscard]] inline std::uint32_t
-lossy_planned_exact_end(std::span<const PreparedCacheOpportunity> opportunities) noexcept {
-    std::uint32_t end = 0;
-    for (const auto& opportunity : opportunities) {
-        if (opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix) {
+lossy_planned_exact_end(const PreparedContextCache& context_cache) noexcept {
+    std::uint32_t end = context_cache.product_prompt_end;
+    for (const auto& opportunity : context_cache.opportunities) {
+        if (opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix &&
+            has_shared_candidate_evidence(opportunity.evidence,
+                                          SharedCandidateEvidence::EngineStructural)) {
             end = std::max(end, opportunity.frontier);
         }
     }

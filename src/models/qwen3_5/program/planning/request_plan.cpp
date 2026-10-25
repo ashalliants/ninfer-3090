@@ -141,7 +141,7 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
     base->summary.prompt_tokens = static_cast<std::uint32_t>(prompt.token_ids.size());
     if (scout_buffers && lossy_options.enabled() && base->gap_maps.empty() && !prompt.has_media() &&
         prompt.external_prefix_tokens == 0) {
-        base->lossy = LossyPlan{.exact_end = lossy_planned_exact_end(prompt.context_cache.opportunities)};
+        base->lossy = LossyPlan{.exact_end = lossy_planned_exact_end(prompt.context_cache)};
     }
     if (prompt.has_media()) {
         if (!workspace_plan.vision) {

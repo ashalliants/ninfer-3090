@@ -274,6 +274,12 @@ ninfer_add_test(ninfer_qwen3_5_lossy_flow_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lossy_flow.cpp"
   LIBRARIES ninfer_core)
 
+# Lossy prefill's M for real OpenAI and Anthropic traffic: translator, Frontend, the M rule.
+ninfer_add_test(ninfer_qwen3_5_lossy_exact_end_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lossy_exact_end.cpp"
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_serve ninfer_engine ninfer_core ninfer::json)
+
 # Whether a text prompt's RoPE positions are slot + rope_delta (header only, links no kernel).
 ninfer_add_test(ninfer_qwen3_5_text_positions_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_text_positions.cpp"

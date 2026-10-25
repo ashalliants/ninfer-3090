@@ -63,6 +63,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_qwen3_5_frontend_test
   ninfer_qwen3_5_graft_loader_test
   ninfer_qwen3_5_loading_test
+  ninfer_qwen3_5_lossy_exact_end_test
   ninfer_qwen3_5_lossy_flow_test
   ninfer_qwen3_5_lossy_gap_map_test
   ninfer_qwen3_5_lossy_scout_plan_test

@@ -363,7 +363,7 @@ public:
         static std::uint32_t tokens(const Prepared& prompt) { return prompt.summary().prompt_tokens; }
         static std::uint32_t exact_end(const Prepared& prompt) {
             return models::qwen3_5::detail::lossy_planned_exact_end(
-                models::qwen3_5::PreparedPromptAccess::view(prompt).context_cache.opportunities);
+                models::qwen3_5::PreparedPromptAccess::view(prompt).context_cache);
         }
         static bool eligible(const Prepared& prompt) {
             const auto& data = models::qwen3_5::PreparedPromptAccess::view(prompt);

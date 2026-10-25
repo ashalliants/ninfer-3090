@@ -117,6 +117,13 @@ struct PreparedCacheOpportunity {
 struct PreparedContextCache {
     std::optional<PreparedSessionKey> session_key;
     std::vector<PreparedCacheOpportunity> opportunities;
+    // The end of the product prompt: the deepest exact frontier among the graft, the end of the
+    // leading System/Developer messages, the end of the tool declarations, and markers that lie
+    // inside those (leading-instruction, tool, or message boundaries within the leading messages).
+    // 0 when the prompt has none. Independent of the protocol's cache policy, so a request whose
+    // only shared marker sits at the end of its own last message still reports where the shared
+    // part ends. Lossy prefill uses it as M (docs/maintainer/lossy-long-prefill.md).
+    std::uint32_t product_prompt_end = 0;
     // Controls replacement of a named SessionIndex entry, not anonymous source ownership.
     bool update_session_index = true;
 };
