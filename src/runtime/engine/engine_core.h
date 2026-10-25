@@ -275,7 +275,8 @@ public:
     Submission submit(PreparedPrompt prompt, PromptSummary prompt_summary, double prepare_seconds,
                       ResolvedRequestOptions options, OutputConsumerMode consumer_mode,
                       GenerationObservationOptions observation,
-                      Clock::time_point pending_deadline = {}) {
+                      Clock::time_point pending_deadline = {},
+                      std::optional<compaction::SummaryRewrite> summary_rewrite = std::nullopt) {
         const Clock::time_point submitted = Clock::now();
         if (pending_deadline == Clock::time_point{}) {
             pending_deadline = submitted + pending_timeout_;
@@ -335,7 +336,8 @@ public:
                                                 std::move(output), prompt_summary, prepare_seconds,
                                                 std::move(options), consumer_mode,
                                                 std::move(observation), pending_deadline, ready);
-            effective_budget = request->output.thinking_stats().effective_budget;
+            effective_budget         = request->output.thinking_stats().effective_budget;
+            request->summary_rewrite = summary_rewrite;
         } catch (...) {
             release_reserved_capacity();
             throw;
@@ -378,6 +380,27 @@ public:
     [[nodiscard]] RuntimeStats runtime_stats() const {
         std::lock_guard lock(stats_mutex_);
         return published_stats_;
+    }
+
+    // The summary strategy's reuse probe, from a caller thread (Engine::prepare): whether the cache
+    // holds a private (conversation) record this prompt starts with, so admission would reuse it
+    // and the prompt is warm. `prompt` is a copy the probe plans and drops. It runs under the
+    // worker's execution lock, between worker cycles, the way memory_summary reads the Program; a
+    // lock not obtained within `wait`, a suspended or failed Engine, or any error count as warm,
+    // so nothing is summarised on doubt.
+    [[nodiscard]] bool has_private_reuse(PreparedPrompt prompt, const ResolvedExecutionOptions& execution,
+                                         std::chrono::milliseconds wait) {
+        std::unique_lock lock(execution_mutex_, std::defer_lock);
+        if (!lock.try_lock_for(wait)) { return true; }
+        {
+            std::lock_guard queue_lock(queue_mutex_);
+            if (stopping_ || failed_) { return true; }
+        }
+        if (suspended_.load(std::memory_order_acquire)) { return true; }
+        try {
+            const auto plan = instance_.program->plan_request(std::move(prompt), execution);
+            return resources_.has_private_match(*instance_.program, plan);
+        } catch (...) { return true; }
     }
 
     // An Engine-wide failure: every queued request failed, every new one is refused, and the
@@ -557,7 +580,7 @@ public:
     // and the main pass over the share of it a selection keeps.
     [[nodiscard]] std::uint64_t queued_prefill_ns(const PromptSummary& summary) const noexcept {
         const double share = lossy_scout_share();
-        if (share > 0.0 && lossy_options_.enabled() && !summary.has_media &&
+        if (share > 0.0 && select_lossy() && !summary.has_media &&
             summary.prompt_tokens > lossy_options_.min_tokens) {
             const auto kept = lossy_expected_kept(summary.prompt_tokens, lossy_options_.keep_fraction);
             return saturating_add(
@@ -1003,15 +1026,14 @@ private:
         // In the client's prompt tokens: a lossy prompt's dropped tokens count as processed once the
         // selection has skipped them, and a prompt rewritten onto a lossy lineage counts its
         // original length (docs/maintainer/lossy-long-prefill.md, "Capacity and reporting").
-        const auto& plan           = *request->base_plan;
         const std::uint32_t total  = reported_prompt_tokens(*request);
-        const std::uint32_t reused = reported_frontier(plan, begin.reused_prompt_tokens);
+        const std::uint32_t reused = reported_frontier(*request, begin.reused_prompt_tokens);
         const PromptProgress progress{
             .total_prompt_tokens  = total,
             .reused_prompt_tokens = reused,
             .processed_prompt_tokens =
-                std::min(total, reported_frontier(plan, begin.reused_prompt_tokens +
-                                                            request->computed_prompt_tokens)),
+                std::min(total, reported_frontier(*request, begin.reused_prompt_tokens +
+                                                                request->computed_prompt_tokens)),
             .elapsed_ns = elapsed_ns(*request->admitted_at, Clock::now()),
         };
         {
@@ -1041,10 +1063,7 @@ private:
             }
             request->stream_start = GenerationStart{
                 .prompt               = request->prompt_summary,
-                .reused_prompt_tokens = request->base_plan
-                                            ? reported_frontier(*request->base_plan,
-                                                                begin.reused_prompt_tokens)
-                                            : begin.reused_prompt_tokens,
+                .reused_prompt_tokens = reported_frontier(*request, begin.reused_prompt_tokens),
             };
         }
         request->cv.notify_one();
@@ -1133,8 +1152,7 @@ private:
         // Read before release_planning_state drops the plan.
         const std::optional<std::uint32_t> reported_reused =
             request->begin && request->base_plan
-                ? std::optional(reported_frontier(*request->base_plan,
-                                                  request->begin->reused_prompt_tokens))
+                ? std::optional(reported_frontier(*request, request->begin->reused_prompt_tokens))
                 : std::nullopt;
         if (request->preemption_count) {
             observe_scheduling(request, GenerationSchedulingTransition::Terminal);
@@ -1188,7 +1206,11 @@ private:
                 reported_reused.value_or(request->begin->reused_prompt_tokens);
             result.prefix_reuse_path = request->begin->prefix_reuse_path;
         }
-        if (request->lossy) { result.lossy_prefill = request->lossy->report; }
+        if (request->lossy) {
+            result.lossy_prefill = request->lossy->report;
+        } else if (request->summary_rewrite) {
+            result.lossy_prefill = summary_report(*request->summary_rewrite);
+        }
         result.timings                 = request->generation_timings;
         result.timings.prepare_seconds = request->prepare_seconds;
         result.speculative             = std::move(request->speculative_stats);
@@ -1928,17 +1950,43 @@ private:
 
     [[nodiscard]] double lossy_scout_share() const noexcept {
         if constexpr (kLossyCapable) {
-            return lossy_options_.enabled() ? instance_.program->lossy_scout_share() : 0.0;
+            return select_lossy() ? instance_.program->lossy_scout_share() : 0.0;
         } else {
             return 0.0;
         }
     }
 
+    // The token (select) strategy runs in the core; the summary strategy rewrote the prompt in
+    // Engine::prepare, so the core never scouts for it.
+    [[nodiscard]] bool select_lossy() const noexcept {
+        return lossy_options_.enabled() && lossy_options_.strategy == LossyStrategy::Select;
+    }
+
     // The client's prompt length: what prompt progress counts to.
     [[nodiscard]] static std::uint32_t reported_prompt_tokens(const Request& request) noexcept {
+        if (request.summary_rewrite) { return request.summary_rewrite->original_tokens; }
         const auto& summary = request.base_plan->summary();
         return summary.reported_prompt_tokens != 0 ? summary.reported_prompt_tokens
                                                    : summary.prompt_tokens;
+    }
+
+    // A frontier of the request's prompt in the client's tokens: through the plan's lossy lineage,
+    // then through a summary rewrite.
+    [[nodiscard]] static std::uint32_t reported_frontier(const Request& request,
+                                                         std::uint32_t frontier) noexcept {
+        const std::uint32_t planned =
+            request.base_plan ? reported_frontier(*request.base_plan, frontier) : frontier;
+        return request.summary_rewrite ? request.summary_rewrite->original_frontier(planned) : planned;
+    }
+
+    // The request log's report for a prompt the summary strategy rewrote.
+    [[nodiscard]] static LossyPrefillReport summary_report(const compaction::SummaryRewrite& rewrite) {
+        return LossyPrefillReport{.outcome             = LossyPrefillOutcome::Completed,
+                                  .uncached_tokens     = rewrite.original_tokens,
+                                  .kept_tokens         = rewrite.prompt_tokens,
+                                  .strategy            = LossyStrategy::Summary,
+                                  .summarized_messages = rewrite.messages,
+                                  .summary_reused      = !rewrite.fresh};
     }
 
     // At admission, once the source is chosen: whether this request takes the lossy path
@@ -1953,7 +2001,7 @@ private:
                             const typename ModelContract::SourceCandidate& source) {
         request->lossy.reset();
         if constexpr (kLossyCapable) {
-            if (!lossy_options_.enabled()) { return; }
+            if (!select_lossy()) { return; }
             const auto& plan  = *request->base_plan;
             const auto lossy  = plan.lossy();
             std::optional<CheckpointRole> role;
@@ -2243,8 +2291,12 @@ private:
                 // In the client's tokens, as usage reports them; computed_prefill_tokens counts
                 // what the Program actually prefilled.
                 cumulative_stats_.reused_prompt_tokens +=
-                    reported_frontier(*request->base_plan, control.summary.reused_prompt_tokens);
+                    reported_frontier(*request, control.summary.reused_prompt_tokens);
                 cumulative_stats_.prompt_tokens += reported_prompt_tokens(*request);
+                if (request->summary_rewrite) {
+                    ++(request->summary_rewrite->fresh ? cumulative_stats_.lossy_prefill_summaries_new
+                                                       : cumulative_stats_.lossy_prefill_summaries_reused);
+                }
                 cumulative_stats_.last_selected_frontier_tokens =
                     control.summary.reused_prompt_tokens;
                 // Generation start was published when the first binding obtained its resources.
@@ -4627,7 +4679,8 @@ private:
     const std::function<void(const EngineFaultEvent&)> fault_listener_;
     ResourceManagement resources_;
 
-    mutable std::mutex execution_mutex_;
+    // Timed: the summary strategy's reuse probe (has_private_reuse) waits for it only briefly.
+    mutable std::timed_mutex execution_mutex_;
     mutable std::mutex queue_mutex_;
     mutable std::mutex stats_mutex_;
     std::condition_variable queue_cv_;

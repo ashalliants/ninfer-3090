@@ -307,6 +307,26 @@ and a session log with `[#N]` references to message indices). The output is dete
   but not under "Commands Run", and their files read with the tool's own name as the verb.
 - **Known weakness:** it drops file contents from the middle; Hermes relies on a `session_search` tool to recover
   them, which our clients do not have. The agent-replay `Edit` metric is where the two strategies are compared.
+- **As built (2026-10-25):** `src/runtime/engine/compaction/summary_{split,registry,strategy}.{h,cpp}`, called from
+  `Engine::prepare`; `ninfer_summary_strategy_test` (cpu) and `ninfer_qwen3_5_lossy_summary_real_test` (GPU).
+  - Tool names are normalized on a copy before projecting, the projector itself untouched: `Bash`/`BashOutput`/
+    `exec_command` → `terminal`, `Read`/`read` → `read_file`, `Write`/`write` → `write_file`, `Edit`/`MultiEdit`/
+    `edit`/`NotebookEdit` → `edit_file`, `Grep`/`Glob`/`grep`/`glob` → `search_files`, `apply_patch` → `patch`;
+    `filePath` → `file_path` and `notebook_path` → `path` when the target key is absent.
+  - The projection's `session_search` instructions are replaced by plain statements that the originals were omitted.
+  - The registry (256 entries, 256 MiB, LRU) keys on the conversation as it stood when summarised. Recorded summaries
+    are substituted first (a chain, oldest first), then the split runs; an earlier summary message is part of the head,
+    so it is never summarised again. Reasoning inside the summarised range is not compared (the summary ignores it).
+  - The coldness probe (`EngineCore::has_private_reuse`) plans a copy of the prepared prompt under the worker's
+    execution lock and asks the prefix index for a valid non-SharedPrefix checkpoint. It waits at most 50 ms for the
+    lock; a busy worker, a suspended or failed Engine, or any error counts as warm, so a cold prompt that arrives
+    during another request's prefill step is not summarised. A session only the context store holds counts as cold.
+  - Under `summary` the core never scouts (no scout scratch is allocated) and the selection knobs are ignored; the
+    Program's dense/single-device refusal still applies. Usage `prompt_tokens` and prompt progress count the client's
+    rendered prompt (which must fit `max_context`); cached tokens map through the shared head and tail
+    (`SummaryRewrite::original_frontier`). `lossy_prefill` in the request log has `strategy`, and for a summary
+    `summarized_messages` ([first, last) in the client's indices, the newest) and `summary_reused`; counters
+    `ninfer_lossy_prefill_summaries_total{kind="new|reused"}`.
 
 ## Expected numbers (predicted, 27B, 100K uncached, chunk 4096)
 

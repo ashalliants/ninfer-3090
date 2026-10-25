@@ -199,6 +199,9 @@ class PreparedPromptAccess {
 public:
     [[nodiscard]] static const PreparedPromptData& view(const PreparedPrompt& prompt);
     [[nodiscard]] static PreparedPromptData take(PreparedPrompt&& prompt);
+    // An independent copy (its n-gram index is not copied), for planning without consuming the
+    // prompt: the summary strategy's reuse probe.
+    [[nodiscard]] static PreparedPrompt copy(const PreparedPrompt& prompt);
 };
 
 } // namespace ninfer::models::qwen3_5

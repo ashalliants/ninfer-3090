@@ -402,6 +402,18 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
             "Scored tokens the selections kept; the rest never entered the KV cache.");
     COUNTER(lossy_prefill_alias_hits, "lossy_prefill_alias_hits_total",
             "Prompts rewritten onto a lossy-prefilled lineage, so a follow-up turn reuses it.");
+    header("lossy_prefill_summaries_total", "counter",
+           "Admitted prompts the summary strategy (--lossy-prefill-strategy summary) rewrote: the "
+           "middle of a cold long conversation summarised by this request (new), or a summary "
+           "recorded for an earlier turn substituted (reused).");
+    for (const auto& [kind, current, baseline] :
+         std::array{std::tuple{"new", stats.lossy_prefill_summaries_new,
+                               baseline_.lossy_prefill_summaries_new},
+                    std::tuple{"reused", stats.lossy_prefill_summaries_reused,
+                               baseline_.lossy_prefill_summaries_reused}}) {
+        out << "ninfer_lossy_prefill_summaries_total{kind=\"" << kind << "\"} " << current - baseline
+            << '\n';
+    }
     COUNTER(engine_recoveries, "engine_recoveries_total",
             "Host-side worker failures survived by failing in-flight requests and clearing the "
             "context cache.");

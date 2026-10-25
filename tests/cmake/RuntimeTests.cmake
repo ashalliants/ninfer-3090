@@ -42,6 +42,10 @@ ninfer_add_test(ninfer_vcc_projector_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_vcc_projector.cpp"
   LIBRARIES ninfer_runtime_support ninfer::json)
 
+ninfer_add_test(ninfer_summary_strategy_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_summary_strategy.cpp"
+  LIBRARIES ninfer_runtime_support)
+
 ninfer_add_test(ninfer_host_cache_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_cache.cpp"
   LIBRARIES ninfer_runtime_support ninfer_engine ninfer::json)
 

@@ -640,12 +640,37 @@ int main() {
     const auto lossy_done =
         Json::parse(format_request_done_json("serve-test", 3003, context, observed));
     failures += check(lossy_done.at("lossy_prefill") == Json{{"outcome", "completed"},
+                                                             {"strategy", "select"},
                                                              {"uncached_tokens", 37952},
                                                              {"kept_tokens", 7591},
                                                              {"filter_layer", 15},
                                                              {"scout_ms", 12.5},
                                                              {"main_ms", 40.25}},
                       "the lossy prefill fields are missing from the request log");
+    // The summary strategy: the whole prompt's lengths and the summarised message range.
+    {
+        auto summarized                 = observed;
+        summarized.metrics.lossy_prefill = ninfer::LossyPrefillReport{
+            .outcome             = ninfer::LossyPrefillOutcome::Completed,
+            .uncached_tokens     = 40000,
+            .kept_tokens         = 9000,
+            .strategy            = ninfer::LossyStrategy::Summary,
+            .summarized_messages = std::array<std::uint32_t, 2>{4, 180},
+            .summary_reused      = true};
+        const auto summary_done =
+            Json::parse(format_request_done_json("serve-test", 3003, context, summarized));
+        failures += check(summary_done.at("lossy_prefill") == Json{{"outcome", "completed"},
+                                                                   {"strategy", "summary"},
+                                                                   {"uncached_tokens", 40000},
+                                                                   {"kept_tokens", 9000},
+                                                                   {"filter_layer", 0},
+                                                                   {"scout_ms", 0.0},
+                                                                   {"main_ms", 0.0},
+                                                                   {"summarized_messages",
+                                                                    Json::array({4, 180})},
+                                                                   {"summary_reused", true}},
+                          "the summary strategy's fields are missing from the request log");
+    }
     // kept_runs appear only under --request-log-lossy-detail.
     observed.metrics.lossy_prefill->kept_runs = {{0, 256}, {1024, 1088}, {33856, 37952}};
     failures += check(

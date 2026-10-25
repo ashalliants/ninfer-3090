@@ -470,7 +470,8 @@ int main() {
         failures += check(!l.enabled() && l.min_tokens == 0, "lossy prefill is not off by default");
         failures += check(l.keep_fraction == 0.2F && l.filter_layer == 15 && l.block_tokens == 64 &&
                               l.recent_tokens == 4096 && l.head_tokens == 256 && l.query_rows == 64 &&
-                              l.pool_window == 33 && l.skip_fraction == 0.8F && !l.scout_a4,
+                              l.pool_window == 33 && l.skip_fraction == 0.8F && !l.scout_a4 &&
+                              l.strategy == ninfer::LossyStrategy::Select && l.summary_max_tokens == 8000,
                           "lossy prefill defaults are not the documented ones");
         const ServeOptions all = parse(
             {"ninfer-serve", "model.ninfer", "--lossy-prefill-min-tokens", "30000",
@@ -486,6 +487,19 @@ int main() {
                               a.query_rows == 32 && a.pool_window == 17 && a.skip_fraction == 0.5F &&
                               a.scout_a4,
                           "a --lossy-prefill-* flag did not reach serving options");
+        // The summary strategy: opt-in, spelled exactly as the sweep passes it.
+        const ServeOptions summary =
+            parse({"ninfer-serve", "model.ninfer", "--lossy-prefill-min-tokens", "30000",
+                   "--lossy-prefill-strategy", "summary", "--lossy-prefill-summary-max-tokens",
+                   "4000"});
+        failures += check(summary.lossy_prefill.strategy == ninfer::LossyStrategy::Summary &&
+                              summary.lossy_prefill.summary_max_tokens == 4000 &&
+                              summary.lossy_prefill.enabled(),
+                          "--lossy-prefill-strategy summary or its budget did not parse");
+        failures += check(parse({"ninfer-serve", "model.ninfer", "--lossy-prefill-strategy",
+                                 "select"})
+                                  .lossy_prefill.strategy == ninfer::LossyStrategy::Select,
+                          "--lossy-prefill-strategy select did not parse");
         failures += check(!defaults.request_log_lossy_detail &&
                               parse({"ninfer-serve", "model.ninfer", "--request-log-lossy-detail"})
                                   .request_log_lossy_detail,
@@ -494,6 +508,9 @@ int main() {
             {"--lossy-prefill-keep", "0"},        {"--lossy-prefill-keep", "1.5"},
             {"--lossy-prefill-block", "24"},      {"--lossy-prefill-pool-window", "32"},
             {"--lossy-prefill-query-rows", "0"},  {"--lossy-prefill-skip", "0"},
+            {"--lossy-prefill-strategy", "tokens"},
+            {"--lossy-prefill-strategy", "Summary"},
+            {"--lossy-prefill-summary-max-tokens", "0"},
         };
         for (const auto& extra : bad) {
             std::vector<std::string> args = {"ninfer-serve", "model.ninfer", "--lossy-prefill-min-tokens",

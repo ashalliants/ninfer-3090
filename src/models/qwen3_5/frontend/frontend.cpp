@@ -839,6 +839,10 @@ PreparedPromptData PreparedPromptAccess::take(PreparedPrompt&& prompt) {
     return std::move(*data);
 }
 
+PreparedPrompt PreparedPromptAccess::copy(const PreparedPrompt& prompt) {
+    return PreparedPrompt(std::make_unique<PreparedPromptData>(view(prompt)));
+}
+
 const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prompt) {
     return PreparedPromptAccess::view(prompt);
 }

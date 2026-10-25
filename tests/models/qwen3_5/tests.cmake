@@ -154,6 +154,12 @@ add_test(NAME ninfer_qwen3_5_lossy_prefill_real_test
   COMMAND ${ninfer_qwen3_5_prefix_real_command})
 set_tests_properties(ninfer_qwen3_5_lossy_prefill_real_test PROPERTIES
   ENVIRONMENT "NINFER_PREFIX_REAL_SCENARIO=lossy")
+# The summary strategy (--lossy-prefill-strategy summary): a cold 40K agent session is summarised
+# and its follow-up turn reuses the summarised prompt (lossy_summary_follow_up_turn_reuses).
+add_test(NAME ninfer_qwen3_5_lossy_summary_real_test
+  COMMAND ${ninfer_qwen3_5_prefix_real_command})
+set_tests_properties(ninfer_qwen3_5_lossy_summary_real_test PROPERTIES
+  ENVIRONMENT "NINFER_PREFIX_REAL_SCENARIO=lossy-summary")
 
 # Speculative decoding after a lossy long-prompt prefill (40K prompt, rk4v4, keep 0.2): 128 greedy
 # tokens with MTP or DFlash2 must equal the same lossy prefill decoded without speculation.
@@ -191,6 +197,7 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_prefix_real_test
   ninfer_qwen3_5_agent_continuation_real_test
   ninfer_qwen3_5_lossy_prefill_real_test
+  ninfer_qwen3_5_lossy_summary_real_test
   ninfer_qwen3_5_dflash2_after_lossy_real_test
   ninfer_qwen3_5_mtp_after_lossy_real_test
   ninfer_qwen3_5_scout_a4_kept_overlap_real_test

@@ -150,7 +150,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--prefill-stall-budget-ms N] [--yield-long-prefill-ms N] "
            "[--prefill-decode-share P] [--prefill-layer-slices N] "
-           "[--lossy-prefill-min-tokens N] "
+           "[--lossy-prefill-min-tokens N] [--lossy-prefill-strategy select|summary] "
            "[--log-stats-interval-ms N] "
            "[--device N] "
            "[--context-cost-presets FILE] "
@@ -256,6 +256,12 @@ std::string serve_usage_text(const char* argv0) {
            "--lossy-prefill-pool-window N (odd, default 33), "
            "--lossy-prefill-skip F (keep everything when the kept share would exceed F, (0,1], default 0.8), "
            "--lossy-prefill-scout-a4 (int4 scout GEMMs)\n"
+           "       --lossy-prefill-strategy select|summary picks how such a prompt is shortened: "
+           "select (the default) is the scout and block selection above; summary replaces the "
+           "middle of the conversation with one deterministic summary message (no model call) and "
+           "prefills that as an ordinary prompt, ignoring the selection knobs. Opt-in, for "
+           "comparison. --lossy-prefill-summary-max-tokens N bounds the summary at "
+           "min(0.06 x max_context, N) tokens, at least 1500 (default 8000)\n"
            "       --prefill-cublas hands wide prefill GEMMs to cuBLAS: a large prefill speedup for a "
            "small perplexity cost (docs/performance.md), off by default, and it wants a larger "
            "--prefill-chunk to pay; --no-prefill-cublas-projections keeps the attention and GDN "
@@ -534,6 +540,19 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 require_value("--lossy-prefill-skip"), "lossy-prefill-skip", 0.0F, 1000.0F);
         } else if (arg == "--lossy-prefill-scout-a4") {
             options.lossy_prefill.scout_a4 = true;
+        } else if (arg == "--lossy-prefill-strategy") {
+            const std::string value = require_value("--lossy-prefill-strategy");
+            if (value == "select") {
+                options.lossy_prefill.strategy = LossyStrategy::Select;
+            } else if (value == "summary") {
+                options.lossy_prefill.strategy = LossyStrategy::Summary;
+            } else {
+                throw std::invalid_argument("--lossy-prefill-strategy must be select or summary");
+            }
+        } else if (arg == "--lossy-prefill-summary-max-tokens") {
+            options.lossy_prefill.summary_max_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--lossy-prefill-summary-max-tokens"),
+                                      "lossy-prefill-summary-max-tokens"));
         } else if (arg == "--request-log-lossy-detail") {
             options.request_log_lossy_detail = true;
         } else if (arg == "--yield-long-prefill-ms") {
@@ -1059,6 +1078,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         if (lossy.pool_window % 2 == 0) {
             throw std::invalid_argument("--lossy-prefill-pool-window must be odd");
+        }
+        if (lossy.summary_max_tokens == 0) {
+            throw std::invalid_argument("--lossy-prefill-summary-max-tokens must be positive");
         }
     }
     product::apply_speculative_defaults(options.speculative);

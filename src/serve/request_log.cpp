@@ -387,15 +387,27 @@ const char* lossy_prefill_outcome_name(ninfer::LossyPrefillOutcome outcome) {
 
 // docs/maintainer/lossy-long-prefill.md, "Observability": null unless the request took the path.
 // `detail` (--request-log-lossy-detail) adds kept_runs: the kept offsets of the filtered part as
-// [begin, end) pairs, which the sweep's kept-block overlap (Jaccard) reads.
+// [begin, end) pairs, which the sweep's kept-block overlap (Jaccard) reads. `strategy` is "select"
+// or "summary"; a summary adds summarized_messages and summary_reused.
 Json lossy_prefill_json(const std::optional<ninfer::LossyPrefillReport>& report, bool detail) {
     if (!report) { return nullptr; }
+    const bool summary = report->strategy == ninfer::LossyStrategy::Summary;
     Json out{{"outcome", lossy_prefill_outcome_name(report->outcome)},
+             {"strategy", summary ? "summary" : "select"},
              {"uncached_tokens", report->uncached_tokens},
              {"kept_tokens", report->kept_tokens},
              {"filter_layer", report->filter_layer},
              {"scout_ms", report->scout_ms},
              {"main_ms", report->main_ms}};
+    if (summary) {
+        // The newest summarised messages, [first, last) in the client's indices, and whether a
+        // summary recorded for an earlier turn was substituted rather than written now.
+        out["summarized_messages"] =
+            report->summarized_messages
+                ? Json::array({(*report->summarized_messages)[0], (*report->summarized_messages)[1]})
+                : Json(nullptr);
+        out["summary_reused"] = report->summary_reused;
+    }
     if (detail) {
         Json runs = Json::array();
         for (const auto& run : report->kept_runs) { runs.push_back(Json::array({run[0], run[1]})); }

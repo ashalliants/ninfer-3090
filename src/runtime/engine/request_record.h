@@ -4,6 +4,7 @@
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/engine/generation_budget.h"
+#include "runtime/engine/compaction/summary_rewrite.h"
 #include "runtime/engine/context_cache/types.h"
 
 #include <atomic>
@@ -216,6 +217,8 @@ struct RequestRecord {
 
     std::optional<BasePlan> base_plan;
     std::optional<LossyPrefillState> lossy;
+    // Summary strategy: the prompt as submitted replaced messages of the client's (set by submit).
+    std::optional<compaction::SummaryRewrite> summary_rewrite;
     std::optional<ResumeState> suspended;
     ContinuationOwnerToken continuation_owner = 0;
     // Shared checkpoints this request published at its progress anchors, oldest first. Only the

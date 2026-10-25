@@ -109,6 +109,21 @@ public:
 
     [[nodiscard]] const ContextMachineCostModel& costs() const noexcept { return costs_; }
 
+    // Whether the index holds a valid private (non-SharedPrefix) checkpoint whose prefix this plan
+    // starts with: a conversation record admission could reuse. Read-only (no pruning, no source
+    // preparation); a shortlist match that exact verification would reject only errs towards true.
+    [[nodiscard]] bool has_private_match(Program& program, const Base& base) const {
+        if (!enabled_) { return false; }
+        for (const auto handle : index_.matches(program, base)) {
+            if (!program.valid_checkpoint(handle)) { continue; }
+            const auto metadata = program.checkpoint_metadata(handle);
+            if (metadata.role != CheckpointRole::SharedPrefix && metadata.frontier > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     [[nodiscard]] std::vector<SourceChoice>
     candidates(Program& program, const Base& base, std::uint32_t maximum_frontier = UINT32_MAX,
                std::optional<OwnerToken> own_resume = std::nullopt, std::uint64_t request = 0,

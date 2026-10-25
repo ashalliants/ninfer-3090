@@ -104,11 +104,12 @@ TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
     return builder.add_tensor(dtype, shape, kArenaAlign, label);
 }
 
-// The scout scratch exists only where the scout can run: lossy prefill on, one device, a
+// The scout scratch exists only where the scout can run: lossy prefill on with the select
+// strategy (the summary strategy rewrites the prompt before the Program sees it), one device, a
 // generating (not scoring) Program.
 bool scout_planned(const SequencePlanImpl& plan) {
-    return plan.lossy_prefill.enabled() && !plan.parameters->text.split_execution() &&
-           !plan.causal_scoring;
+    return plan.lossy_prefill.enabled() && plan.lossy_prefill.strategy == LossyStrategy::Select &&
+           !plan.parameters->text.split_execution() && !plan.causal_scoring;
 }
 
 PersistentLayout persistent_layout(const SequencePlanImpl& plan) {

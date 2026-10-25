@@ -48,6 +48,7 @@ struct Settings {
     std::uint32_t pending_timeout_ms = 60'000;
     // Lossy prefill: LossyPrefillOptions::min_tokens (0: off).
     std::uint32_t lossy_min_tokens = 0;
+    LossyStrategy lossy_strategy   = LossyStrategy::Select;
     bool context_cache             = false;
     // Shared prefixes installed before the Engine starts: (group, frontier).
     std::vector<std::pair<std::uint64_t, std::uint32_t>> shared_prefixes;
@@ -74,6 +75,7 @@ public:
         options.context_cache.enabled = settings.context_cache;
         options.admission_fit_check   = settings.admission_fit_check;
         options.lossy_prefill.min_tokens = settings.lossy_min_tokens;
+        options.lossy_prefill.strategy   = settings.lossy_strategy;
         for (const auto& [group, frontier] : settings.shared_prefixes) {
             instance_.external_checkpoints.push_back(
                 instance_.program->add_shared_prefix(group, frontier));
@@ -107,19 +109,22 @@ public:
     }
 
     // `sink`, when given, streams the request (with prompt progress); it must outlive the Rig.
+    // `rewrite`: the prompt as the summary strategy rewrote it (Engine::prepare reports the
+    // client's length in the summary, as here).
     Result run_prompt(fake::PreparedPrompt prompt, std::uint32_t output_tokens,
                       std::shared_ptr<std::atomic<bool>> cancel = nullptr,
-                      OutputSink* sink                         = nullptr) {
+                      OutputSink* sink                         = nullptr,
+                      std::optional<compaction::SummaryRewrite> rewrite = std::nullopt) {
         ResolvedRequestOptions request;
         request.execution.requested_output_tokens = output_tokens;
         PromptSummary summary;
-        summary.prompt_tokens = prompt.tokens;
+        summary.prompt_tokens = rewrite ? rewrite->original_tokens : prompt.tokens;
         GenerationObservationOptions observation;
         observation.prompt_progress = sink != nullptr;
         auto submission = std::make_shared<EngineCore<fake::Instance>::Submission>(core_->submit(
             prompt, summary, 0.0, std::move(request),
             sink != nullptr ? OutputConsumerMode::Streaming : OutputConsumerMode::Aggregate,
-            observation));
+            observation, {}, rewrite));
         // A promise, not std::async: a future from async blocks in its destructor, which would
         // deadlock a failing test that still holds the worker.
         auto promise = std::make_shared<std::promise<GenerationResult>>();
@@ -1220,6 +1225,101 @@ void test_lossy_usage_reports_original() {
                                       std::to_string(last));
 }
 
+// SummaryRewriteReportsOriginal: a prompt the summary strategy rewrote runs as an ordinary prompt
+// (no scout), and usage, prompt progress, the request log and the counters count the client's.
+void test_summary_rewrite_reports_original() {
+    Rig rig({.chunk = kLossyChunk, .lanes = 1, .lossy_min_tokens = 30000,
+             .lossy_strategy = LossyStrategy::Summary});
+    const compaction::SummaryRewrite rewrite{.original_tokens = 40000,
+                                             .prompt_tokens   = 9000,
+                                             .common_prefix   = 2000,
+                                             .common_suffix   = 6000,
+                                             .messages        = {4, 180},
+                                             .fresh           = true};
+    ProgressSink sink;
+    auto result = rig.run_prompt(lossy_prompt(1, 9000), 2, nullptr, &sink, rewrite);
+    require(finished(result), "the summarised request did not finish\n" + rig.dump());
+    const auto& generation = result.get();
+    require(generation.prompt.prompt_tokens == 40000, "usage prompt_tokens is not the client's");
+    require(generation.computed_prefill_tokens == 9000, "the submitted prompt was not prefilled");
+    require(rig.events_of(1, Event::Kind::Scout).empty() &&
+                rig.events_of(1, Event::Kind::EnableLossy).empty(),
+            "a summarised prompt took the token path\n" + rig.dump());
+    const auto& report = generation.lossy_prefill;
+    require(report && report->strategy == LossyStrategy::Summary &&
+                report->outcome == LossyPrefillOutcome::Completed &&
+                report->uncached_tokens == 40000 && report->kept_tokens == 9000 &&
+                report->summarized_messages ==
+                    std::optional(std::array<std::uint32_t, 2>{4, 180}) &&
+                !report->summary_reused,
+            "the summary report is wrong");
+    {
+        std::lock_guard lock(sink.mutex);
+        require(sink.starts.size() == 1 && sink.starts[0].prompt.prompt_tokens == 40000,
+                "the stream start does not count the client's prompt");
+        std::uint32_t last = 0;
+        for (const auto& update : sink.updates) {
+            require(update.total_prompt_tokens == 40000 && update.processed_prompt_tokens >= last &&
+                        update.processed_prompt_tokens <= 40000,
+                    "prompt progress left the client's prompt");
+            last = update.processed_prompt_tokens;
+        }
+        require(last == 40000, "prompt progress did not reach the client's length: " +
+                                   std::to_string(last));
+    }
+    auto reused       = rewrite;
+    reused.fresh      = false;
+    auto second       = rig.run_prompt(lossy_prompt(2, 9000), 1, nullptr, nullptr, reused);
+    require(finished(second), "the reused-summary request did not finish\n" + rig.dump());
+    require(second.get().lossy_prefill && second.get().lossy_prefill->summary_reused,
+            "a substituted summary was not reported as reused");
+    const auto stats = rig.core().runtime_stats();
+    require(stats.lossy_prefill_summaries_new == 1 && stats.lossy_prefill_summaries_reused == 1 &&
+                stats.lossy_prefills_completed == 0 && stats.lossy_prefill_scouted_tokens == 0 &&
+                stats.prompt_tokens == 80000,
+            "the summary counters are wrong");
+}
+
+// SummaryStrategyDisablesTokenPath: under --lossy-prefill-strategy summary the core never scouts,
+// even for a cold long prompt the summary did not rewrite (a busy probe counts as warm).
+void test_summary_strategy_disables_token_path() {
+    Rig rig({.chunk = kLossyChunk, .lanes = 1, .lossy_min_tokens = 30000,
+             .lossy_strategy = LossyStrategy::Summary});
+    auto result = rig.run_prompt(lossy_prompt(1), 1);
+    require(finished(result), "the request did not finish\n" + rig.dump());
+    require(rig.events_of(1, Event::Kind::EnableLossy).empty() &&
+                rig.events_of(1, Event::Kind::Scout).empty() && !result.get().lossy_prefill,
+            "the summary strategy ran the token path\n" + rig.dump());
+    require(total_tokens(rig.events_of(1, Event::Kind::Prefill)) == kLossyPrompt,
+            "the prompt was not prefilled in full");
+}
+
+// PrivateReuseProbe: the summary strategy's probe from a caller thread. An idle Engine with only a
+// shared product prompt cached answers cold; a worker busy past the wait answers warm, in bounded
+// time.
+void test_private_reuse_probe() {
+    Rig rig({.chunk = kLossyChunk, .lanes = 1, .lossy_min_tokens = 30000,
+             .lossy_strategy = LossyStrategy::Summary, .context_cache = true,
+             .shared_prefixes = {{7, kMarker}}});
+    ResolvedExecutionOptions execution;
+    execution.requested_output_tokens = 1;
+    require(!rig.core().has_private_reuse(lossy_prompt(1, kLossyPrompt, 7), execution,
+                                          std::chrono::milliseconds(50)),
+            "a prompt only the shared prefix serves was probed warm");
+    rig.hold_at([](const Event& e) { return e.kind == Event::Kind::Prefill && e.request == 2; });
+    auto busy = rig.run_prompt(lossy_prompt(2, 8192), 1);
+    require(rig.wait_held(), "the worker was not held\n" + rig.dump());
+    const auto started = Clock::now();
+    const bool warm    = rig.core().has_private_reuse(lossy_prompt(3, kLossyPrompt, 7), execution,
+                                                      std::chrono::milliseconds(50));
+    const auto waited  = Clock::now() - started;
+    rig.release();
+    require(warm, "a probe that could not get the worker's lock was not warm");
+    require(waited >= std::chrono::milliseconds(45) && waited < std::chrono::seconds(2),
+            "the probe did not wait its bound");
+    require(finished(busy), "the held request did not finish\n" + rig.dump());
+}
+
 // LossyCountersAndRequestLog: one completed, one skipped (the selection kept everything) and one
 // declined (the scout was taken), with their tokens and the request's report.
 void test_lossy_counters_and_request_log() {
@@ -1393,5 +1493,8 @@ int main() {
     run("LossyCountersAndRequestLog", test_lossy_counters_and_request_log);
     run("LossyBacklogPredictsScoutAndMain", test_lossy_backlog_predicts_scout_and_main);
     run("LossyFailureCountsAborted", test_lossy_failure_counts_aborted);
+    run("SummaryRewriteReportsOriginal", test_summary_rewrite_reports_original);
+    run("SummaryStrategyDisablesTokenPath", test_summary_strategy_disables_token_path);
+    run("PrivateReuseProbe", test_private_reuse_probe);
     return failures == 0 ? 0 : 1;
 }

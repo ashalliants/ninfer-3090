@@ -274,6 +274,16 @@ struct ContextCacheOptions {
     std::optional<std::uint32_t> host_cache_percent;
 };
 
+// How a lossy prefill shortens a long cold prompt (docs/maintainer/lossy-long-prefill.md).
+enum class LossyStrategy : std::uint8_t {
+    // A scout pass scores blocks of the prompt and only the kept blocks are prefilled.
+    Select,
+    // Opt-in alternative: the middle of the conversation is replaced by one deterministic summary
+    // message (the rule-based projector of hermes-vcc-engine) and the result is prefilled as an
+    // ordinary exact prompt. Ignores the selection knobs below.
+    Summary,
+};
+
 // Lossy long-prompt prefill: past a threshold, a cheap scout pass scores blocks of the prompt and
 // only the kept blocks are prefilled (the rest never enter the KV cache). Off by default.
 struct LossyPrefillOptions {
@@ -298,6 +308,10 @@ struct LossyPrefillOptions {
     float skip_fraction = 0.8F;
     // Run the scout GEMMs with int4 activations.
     bool scout_a4 = false;
+    LossyStrategy strategy = LossyStrategy::Select;
+    // Summary strategy: the summary's budget in tokens, min(0.06 x max_context, this), at least
+    // 1,500.
+    std::uint32_t summary_max_tokens = 8000;
 
     [[nodiscard]] bool enabled() const noexcept { return min_tokens > 0; }
 };
@@ -1338,6 +1352,14 @@ struct LossyPrefillReport {
     // skipped, none when declined or aborted. Serve logs them only under
     // --request-log-lossy-detail (the int4 scout's kept-block overlap gate reads them).
     std::vector<std::array<std::uint32_t, 2>> kept_runs;
+    // Summary strategy: the token counts are of the whole prompt (uncached_tokens the client's
+    // rendered prompt, kept_tokens the prompt as prefilled), filter_layer and the times are 0,
+    // `summarized_messages` is the newest summarised range [first, last) in the client's message
+    // indices, and `summary_reused` says a recorded summary was substituted (a later turn of a
+    // summarised conversation) rather than written by this request.
+    LossyStrategy strategy = LossyStrategy::Select;
+    std::optional<std::array<std::uint32_t, 2>> summarized_messages;
+    bool summary_reused = false;
 };
 
 struct GenerationResult {
@@ -1584,6 +1606,10 @@ struct RuntimeStats {
     std::uint64_t lossy_prefill_scouted_tokens      = 0;
     std::uint64_t lossy_prefill_kept_tokens         = 0;
     std::uint64_t lossy_prefill_alias_hits          = 0;
+    // Summary strategy: admitted prompts whose middle this request summarised (new), and ones
+    // that substituted a recorded summary (reused, a later turn of a summarised conversation).
+    std::uint64_t lossy_prefill_summaries_new    = 0;
+    std::uint64_t lossy_prefill_summaries_reused = 0;
 
     std::uint64_t root_selections               = 0;
     std::uint64_t checkpoint_selections         = 0;
