@@ -6,11 +6,20 @@ runs the pinned ``vcc/projector.py`` on each case and writes the expected output
 sidecar that names the upstream commit.
 
 The upstream clone is untrusted third-party data. Run this script with ``python3 -I`` from a
-directory outside the clone; it loads exactly ``<clone>/vcc/projector.py`` by file path (nothing
-from the clone goes on ``sys.path``), refuses a file whose SHA-256 differs from the pinned one, and
-never runs anything else from the clone:
+directory outside the clone. It reads ``<clone>/vcc/projector.py`` once, refuses it unless its
+SHA-256 is the pinned one, and compiles and executes exactly those bytes (no import machinery, so
+no ``__pycache__`` is read or written and nothing from the clone goes on ``sys.path``). Nothing else
+in the clone is read or run:
 
     cd /tmp && python3 -I <repo>/tools/bench/vcc_golden.py --vcc-repo /tmp/ext-vcc/repo
+
+The committed goldens and vcc_unicode_tables.inc were made with CPython 3.12.3 (Unicode 15.0.0).
+Regenerate them with that interpreter: the port's \\w/\\d tables and its JSON nesting limit (9997)
+are that interpreter's, and another version may change outputs at the edges.
+
+The fixtures include conversions of upstream tests/transcripts.py and tests/test_projector.py
+(hermes-vcc-engine, Apache-2.0, Copyright 2026 danbiocchi); see
+src/runtime/engine/compaction/NOTICE.
 
 ``--emit-unicode-tables PATH`` writes the code point tables the C++ port uses for Python's
 ``str.isalnum`` (``\\w``) and ``str.isdecimal`` (``\\d``, ``int()``), from this interpreter's
@@ -32,12 +41,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.util
 import json
 import platform
 import random
 import re
 import sys
+import types
 import unicodedata
 from pathlib import Path
 from typing import Any
@@ -826,15 +835,22 @@ def load_projector(repo: Path):
     digest = hashlib.sha256(data).hexdigest()
     if digest != PROJECTOR_SHA256:
         sys.exit(f"{path}: sha256 {digest} is not the pinned {PROJECTOR_SHA256} (commit {UPSTREAM_COMMIT})")
-    spec = importlib.util.spec_from_file_location("vcc_projector_pinned", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module  # dataclasses resolves annotations through sys.modules
-    spec.loader.exec_module(module)
+    # Execute exactly the bytes that were hashed. An import-system loader would re-read the file
+    # (a race) and prefer vcc/__pycache__/*.pyc, which a hostile clone could plant; it would also
+    # write bytecode into the clone.
+    sys.dont_write_bytecode = True
+    module = types.ModuleType("vcc_projector_pinned")
+    module.__file__ = str(path)
+    sys.modules[module.__name__] = module  # dataclasses resolves annotations through sys.modules
+    exec(compile(data, str(path), "exec"), module.__dict__)
     return module
 
 
 def generate(repo: Path, out: Path, fuzz: int = 0) -> None:
     projector = load_projector(repo)
+    if platform.python_version() != "3.12.3":
+        print(f"warning: Python {platform.python_version()}; the committed goldens and the C++ Unicode tables "
+              "come from CPython 3.12.3", file=sys.stderr)
     out.mkdir(parents=True, exist_ok=True)
     for stale in list(out.glob("*.json")) + list(out.glob("*.expected.txt")) + list(out.glob("*.meta")):
         stale.unlink()

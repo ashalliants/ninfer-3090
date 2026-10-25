@@ -22,6 +22,7 @@
 #include <optional>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1476,9 +1477,10 @@ Str render(const Projection& proj, const ProjectorLimits& limits, const std::vec
         }
         out.emplace_back();
     }
-    std::vector<Str> commands;
+    std::vector<Str> commands;  // dict.fromkeys(proj.commands)
+    std::unordered_set<View> seen;
     for (const Str& c : proj.commands) {
-        if (std::find(commands.begin(), commands.end(), c) == commands.end()) { commands.push_back(c); }
+        if (seen.insert(c).second) { commands.push_back(c); }
     }
     if (!commands.empty()) {
         out.push_back(kCommandsHeading);
