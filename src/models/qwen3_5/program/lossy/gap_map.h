@@ -19,11 +19,24 @@
 
 namespace ninfer::models::qwen3_5::detail {
 
+// A run of tokens whose positions advance by one on every axis: token index + k sits at
+// first[axis] + k. Text is a single run, so the original positions cost a few bytes.
+struct PositionRun {
+    std::uint32_t index = 0;
+    std::array<std::int32_t, 3> first{};
+
+    [[nodiscard]] friend bool operator==(const PositionRun&, const PositionRun&) noexcept = default;
+};
+
 struct GapMap {
-    std::uint32_t begin        = 0;            // M: first original index of U
-    std::uint32_t original_end = 0;            // M + |U|
-    std::array<std::uint64_t, 2> digest{};     // PrefixShortlistDigests::at(original_end) of the original
+    std::uint32_t begin        = 0;        // M: first original index of U
+    std::uint32_t original_end = 0;        // M + |U|
+    std::array<std::uint64_t, 2> digest{}; // gap_map_digest(original, original_end): a pre-check only
     std::vector<std::pair<std::uint32_t, std::uint32_t>> kept_runs; // (offset in U, length), ascending
+    // The original prompt over [0, original_end), compared exactly before any rewrite.
+    std::vector<TokenId> original_ids;
+    std::vector<std::uint8_t> original_types;
+    std::vector<PositionRun> original_positions; // ascending index, first run at 0
 
     [[nodiscard]] std::uint32_t kept_tokens() const noexcept;
     [[nodiscard]] std::uint32_t dropped_tokens() const noexcept {
@@ -33,7 +46,13 @@ struct GapMap {
 
 using GapMapSet = std::vector<std::shared_ptr<const GapMap>>; // lineage order
 
-// U is [begin, original.token_ids.size()). kept_offsets are ascending unique offsets into U.
+// Digest of token ids, types and the three position axes over [0, end). It covers nothing else
+// (no rewrite frontiers), so a follow-up serialization that only adds frontiers still matches.
+[[nodiscard]] std::array<std::uint64_t, 2> gap_map_digest(const PreparedPromptData& prompt,
+                                                          std::uint32_t end);
+
+// U is [begin, original.token_ids.size()). kept_offsets are ascending unique offsets into U. The
+// prompt must have no Vision items (lossy prefill is text only).
 [[nodiscard]] GapMap make_gap_map(const PreparedPromptData& original, std::uint32_t begin,
                                   std::span<const std::uint32_t> kept_offsets);
 
@@ -47,8 +66,10 @@ using GapMapSet = std::vector<std::shared_ptr<const GapMap>>; // lineage order
 // not checked: use apply_gap_map for prompts that are not known to match.
 [[nodiscard]] PreparedPromptData compact_prompt(const PreparedPromptData& original, const GapMap& map);
 
-// nullopt unless the prompt has at least original_end tokens and its digest over
-// [0, original_end) equals map.digest; otherwise compact_prompt(prompt, map). Several maps of one
+// nullopt unless the prompt has at least original_end tokens, no Vision tokens before
+// original_end, and token ids, types and all three position axes over [0, original_end) equal the
+// map's stored original exactly (the digest is only a quick reject); otherwise
+// compact_prompt(prompt, map). Rewrite frontiers do not take part in the match. Several maps of one
 // lineage apply in order, each to the previous result.
 [[nodiscard]] std::optional<PreparedPromptData> apply_gap_map(const PreparedPromptData& prompt,
                                                               const GapMap& map);

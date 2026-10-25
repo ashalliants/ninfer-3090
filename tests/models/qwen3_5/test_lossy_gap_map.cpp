@@ -18,9 +18,10 @@ using ninfer::models::qwen3_5::RewriteCheckpointKind;
 using ninfer::models::qwen3_5::RewriteCheckpointSpec;
 using ninfer::models::qwen3_5::detail::apply_gap_map;
 using ninfer::models::qwen3_5::detail::compact_prompt;
+using ninfer::models::qwen3_5::detail::gap_map_digest;
 using ninfer::models::qwen3_5::detail::GapMap;
 using ninfer::models::qwen3_5::detail::make_gap_map;
-using ninfer::models::qwen3_5::detail::PrefixShortlistDigests;
+using ninfer::models::qwen3_5::detail::PositionRun;
 using ninfer::models::qwen3_5::detail::ResidentPrefixIdentity;
 
 void require(bool ok, const std::string& what) {
@@ -99,9 +100,11 @@ void test_subsets_tokens_and_keeps_positions() {
     require(map.kept_tokens() == 5 && map.dropped_tokens() == 11, "map counts");
     require((map.kept_runs == std::vector<std::pair<std::uint32_t, std::uint32_t>>{{0, 2}, {5, 3}}),
             "map runs");
-    PrefixShortlistDigests digests;
-    digests.assign(original);
-    require(map.digest == digests.at(20), "digest equals the shortlist digest at original_end");
+    require(map.digest == gap_map_digest(original, 20), "digest over [0, original_end)");
+    require(map.original_ids == original.token_ids && map.original_types == original.token_types,
+            "stored original ids and types");
+    require((map.original_positions == std::vector<PositionRun>{PositionRun{0, {0, 0, 0}}}),
+            "text positions stored as one run");
 
     const PreparedPromptData kept = compact_prompt(original, map);
     require(kept.token_ids.size() == 9, "kept length");
@@ -186,9 +189,7 @@ void test_result_identity_differs_from_original() {
     require(!identity.matches(original, original.token_ids.size()), "no match at original length");
     require(!identity.matches(original, kept.token_ids.size()), "no match at kept length");
     require(identity.matches(original, 6), "shared prefix up to the first gap still matches");
-    PrefixShortlistDigests digests;
-    digests.assign(kept);
-    require(digests.at(kept.token_ids.size()) != map.digest, "kept digest differs");
+    require(gap_map_digest(kept, 9) != map.digest, "kept digest differs");
 }
 
 void test_follow_up_prompt_is_rewritten() {
@@ -228,6 +229,37 @@ void test_partial_match_is_not_rewritten() {
     require(!apply_gap_map(moved, map).has_value(), "differs in position");
     require(!apply_gap_map(text_prompt(19), map).has_value(), "shorter than original_end");
     require(apply_gap_map(original, map).has_value(), "exactly the original is rewritten");
+}
+
+void test_follow_up_with_extra_rewrite_frontier_is_rewritten() {
+    const PreparedPromptData original = text_prompt(20);
+    const GapMap map                  = make_gap_map(original, 4, kKept);
+    PreparedPromptData follow         = extend(original, 7, 500);
+    // The follow-up serialization marks frontiers the original prompt did not have.
+    follow.identity.rewrite_execution_frontiers = {3, 12, 20, 24};
+    const auto rewritten = apply_gap_map(follow, map);
+    require(rewritten.has_value(), "rewritten despite extra rewrite frontiers");
+    require(rewritten->token_ids.size() == 16, "rewritten length");
+    // 3 is before U; 12 follows kept 11; 20 follows dropped 19; 24 is after U.
+    require((rewritten->identity.rewrite_execution_frontiers == std::vector<std::uint32_t>{3, 9, 13}),
+            "frontiers translated");
+}
+
+void test_digest_collision_is_not_enough() {
+    const PreparedPromptData original = text_prompt(20);
+    const PreparedPromptData follow   = extend(original, 7, 500);
+    GapMap map                        = make_gap_map(original, 4, kKept);
+    require(map.digest == gap_map_digest(follow, 20), "digest matches the follow-up");
+    GapMap ids = map;
+    ids.original_ids[7] = 9999; // a dropped token: the digest alone would let it through
+    require(!apply_gap_map(follow, ids).has_value(), "stored id differs");
+    GapMap types = map;
+    types.original_types[10] ^= 1U;
+    require(!apply_gap_map(follow, types).has_value(), "stored type differs");
+    GapMap positions = map;
+    positions.original_positions.push_back(PositionRun{6, {7, 6, 6}});
+    require(!apply_gap_map(follow, positions).has_value(), "stored position differs");
+    require(apply_gap_map(follow, map).has_value(), "unaltered map still applies");
 }
 
 void test_two_maps_apply_in_order() {
@@ -278,6 +310,13 @@ void test_rejects_invalid_input() {
             "offset outside U");
     const GapMap map = make_gap_map(original, 4, kKept);
     require(throws([&] { (void)compact_prompt(text_prompt(19), map); }), "prompt shorter than U");
+    PreparedPromptData vision = original;
+    vision.vision_items.emplace_back();
+    vision.vision_items.back().token_spans.push_back({1, 2});
+    require(throws([&] { (void)make_gap_map(vision, 4, kKept); }), "Vision prompt rejected");
+    PreparedPromptData follow_vision = extend(original, 7, 500);
+    follow_vision.vision_items        = vision.vision_items;
+    require(!apply_gap_map(follow_vision, map).has_value(), "Vision before original_end: no rewrite");
     PreparedPromptData external = original;
     external.external_prefix_tokens = 5;
     require(throws([&] { (void)compact_prompt(external, map); }), "external prefix inside U");
@@ -296,6 +335,8 @@ int main() {
         test_result_identity_differs_from_original();
         test_follow_up_prompt_is_rewritten();
         test_partial_match_is_not_rewritten();
+        test_follow_up_with_extra_rewrite_frontier_is_rewritten();
+        test_digest_collision_is_not_enough();
         test_two_maps_apply_in_order();
         test_rejects_invalid_input();
         std::cout << "lossy gap map tests passed\n";

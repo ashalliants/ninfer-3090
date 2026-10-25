@@ -1,8 +1,7 @@
 #include "models/qwen3_5/program/lossy/gap_map.h"
 
-#include "models/qwen3_5/program/prefix_identity.h"
-
 #include <algorithm>
+#include <bit>
 #include <iterator>
 #include <limits>
 #include <optional>
@@ -82,7 +81,87 @@ std::vector<T> gather(std::span<const T> values, std::span<const std::uint32_t> 
     return out;
 }
 
+constexpr std::array<std::uint64_t, 2> kDigestOffset{1469598103934665603ULL, 7809847782465536322ULL};
+constexpr std::array<std::uint64_t, 2> kDigestPrime{1099511628211ULL, 14029467366897019727ULL};
+
+void mix(std::array<std::uint64_t, 2>& digest, std::uint64_t value) noexcept {
+    for (std::size_t lane = 0; lane < digest.size(); ++lane) {
+        const std::uint64_t lane_value =
+            lane == 0 ? value : std::rotl(value ^ 0x9e3779b97f4a7c15ULL, 29);
+        for (std::uint32_t byte = 0; byte < 8; ++byte) {
+            digest[lane] ^= static_cast<std::uint8_t>(lane_value >> (8U * byte));
+            digest[lane] *= kDigestPrime[lane];
+        }
+    }
+}
+
+std::array<std::int32_t, 3> positions_at(const PreparedPromptData& prompt, std::size_t index) {
+    const std::size_t tokens = prompt.token_ids.size();
+    return {prompt.positions[index], prompt.positions[tokens + index],
+            prompt.positions[2U * tokens + index]};
+}
+
+bool continues(const PositionRun& run, std::uint32_t index,
+               const std::array<std::int32_t, 3>& positions) {
+    const std::int64_t step = static_cast<std::int64_t>(index) - run.index;
+    for (std::size_t axis = 0; axis < positions.size(); ++axis) {
+        if (static_cast<std::int64_t>(run.first[axis]) + step != positions[axis]) { return false; }
+    }
+    return true;
+}
+
+std::vector<PositionRun> position_runs(const PreparedPromptData& prompt, std::uint32_t end) {
+    std::vector<PositionRun> runs;
+    for (std::uint32_t i = 0; i < end; ++i) {
+        const auto positions = positions_at(prompt, i);
+        if (runs.empty() || !continues(runs.back(), i, positions)) {
+            runs.push_back(PositionRun{i, positions});
+        }
+    }
+    return runs;
+}
+
+// Exact comparison of the prompt's ids, types and positions over [0, original_end) with the
+// original stored in the map.
+bool matches_original(const PreparedPromptData& prompt, const GapMap& map) {
+    const std::uint32_t end = map.original_end;
+    if (map.original_ids.size() != end || map.original_types.size() != end ||
+        (end > 0 && (map.original_positions.empty() || map.original_positions.front().index != 0))) {
+        throw std::invalid_argument("gap map stored original does not cover its span");
+    }
+    if (!std::equal(map.original_ids.begin(), map.original_ids.end(), prompt.token_ids.begin()) ||
+        !std::equal(map.original_types.begin(), map.original_types.end(),
+                    prompt.token_types.begin())) {
+        return false;
+    }
+    std::size_t run = 0;
+    for (std::uint32_t i = 0; i < end; ++i) {
+        while (run + 1 < map.original_positions.size() && map.original_positions[run + 1].index <= i) {
+            ++run;
+        }
+        if (!continues(map.original_positions[run], i, positions_at(prompt, i))) { return false; }
+    }
+    return true;
+}
+
 } // namespace
+
+std::array<std::uint64_t, 2> gap_map_digest(const PreparedPromptData& prompt, std::uint32_t end) {
+    check_shape(prompt);
+    if (end > prompt.token_ids.size()) {
+        throw std::invalid_argument("gap map digest frontier exceeds the prompt");
+    }
+    std::array<std::uint64_t, 2> digest = kDigestOffset;
+    mix(digest, end);
+    for (std::uint32_t i = 0; i < end; ++i) {
+        mix(digest, static_cast<std::uint32_t>(prompt.token_ids[i]));
+        mix(digest, prompt.token_types[i]);
+        for (const std::int32_t position : positions_at(prompt, i)) {
+            mix(digest, static_cast<std::uint32_t>(position));
+        }
+    }
+    return digest;
+}
 
 std::uint32_t GapMap::kept_tokens() const noexcept {
     std::uint32_t kept = 0;
@@ -95,6 +174,9 @@ GapMap make_gap_map(const PreparedPromptData& original, std::uint32_t begin,
     check_shape(original);
     const auto tokens = static_cast<std::uint32_t>(original.token_ids.size());
     if (begin > tokens) { throw std::invalid_argument("gap map begins past the prompt"); }
+    if (!original.vision_items.empty()) {
+        throw std::invalid_argument("gap maps cover text-only prompts");
+    }
     GapMap map;
     map.begin        = begin;
     map.original_end = tokens;
@@ -111,9 +193,10 @@ GapMap make_gap_map(const PreparedPromptData& original, std::uint32_t begin,
             map.kept_runs.emplace_back(offset, 1U);
         }
     }
-    PrefixShortlistDigests digests;
-    digests.assign(original);
-    map.digest = digests.at(map.original_end);
+    map.digest         = gap_map_digest(original, map.original_end);
+    map.original_ids   = original.token_ids;
+    map.original_types = original.token_types;
+    map.original_positions = position_runs(original, map.original_end);
     return map;
 }
 
@@ -196,9 +279,14 @@ std::optional<PreparedPromptData> apply_gap_map(const PreparedPromptData& prompt
                                                 const GapMap& map) {
     check_shape(prompt);
     if (prompt.token_ids.size() < map.original_end) { return std::nullopt; }
-    PrefixShortlistDigests digests;
-    digests.assign(prompt);
-    if (digests.at(map.original_end) != map.digest) { return std::nullopt; }
+    // The original was text only; Vision content is not part of the stored original.
+    for (const VisionItem& item : prompt.vision_items) {
+        for (const TokenSpan& span : item.token_spans) {
+            if (span.begin < map.original_end) { return std::nullopt; }
+        }
+    }
+    if (gap_map_digest(prompt, map.original_end) != map.digest) { return std::nullopt; }
+    if (!matches_original(prompt, map)) { return std::nullopt; }
     return compact_prompt(prompt, map);
 }
 
