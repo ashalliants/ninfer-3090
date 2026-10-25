@@ -139,6 +139,10 @@ void validate(const EngineOptions& options) {
     if (spec.ngram_draft_tokens != 0) {
         refuse("has no context-lookup drafts: remove --ngram-draft-tokens");
     }
+    if (options.draft_context_rows != 0) {
+        refuse("drafts with its full output head, so every token can already be drafted: remove "
+               "--draft-context-rows");
+    }
     if (spec.backend == SpeculativeBackend::Mtp) {
         if (spec.draft_tokens < 1 || spec.draft_tokens > 7) {
             refuse("verifies at most 7 MTP drafts per round: use --draft-tokens 1..7");

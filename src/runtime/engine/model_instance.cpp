@@ -25,6 +25,27 @@
 
 namespace ninfer::runtime {
 
+namespace {
+
+// --draft-context-rows adds rows to the drafts of the reduced proposal head, so it needs a drafter
+// that reads one.
+void validate_draft_context_rows(const EngineOptions& options) {
+    if (options.draft_context_rows == 0) { return; }
+    if (options.draft_context_rows > kMaximumDraftContextRows) {
+        throw std::invalid_argument("--draft-context-rows N must be in [0," +
+                                    std::to_string(kMaximumDraftContextRows) + "]");
+    }
+    if (options.purpose != EnginePurpose::Generation ||
+        options.speculative.backend == SpeculativeBackend::None ||
+        options.speculative.proposal_head != ProposalHead::Optimized) {
+        throw std::invalid_argument(
+            "--draft-context-rows adds rows to the reduced proposal head's drafts and needs "
+            "--spec mtp, dflash or dflash2 with the optimized proposal head (--lm-head-draft)");
+    }
+}
+
+} // namespace
+
 void validate_engine_options(const EngineOptions& options) {
     if (options.artifact_path.empty()) {
         throw std::invalid_argument("Engine artifact_path must not be empty");
@@ -101,6 +122,7 @@ void validate_engine_options(const EngineOptions& options) {
                 "--spec mtp, dflash or dflash2");
         }
     }
+    validate_draft_context_rows(options);
     if (options.max_pending_requests == 0 || options.pending_timeout_ms == 0) {
         throw std::invalid_argument("Engine pending request capacity and timeout must be nonzero");
     }
@@ -284,6 +306,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
                 "--spec mtp, dflash or dflash2");
         }
     }
+    validate_draft_context_rows(options);
 
     if (options.prefill_schedule.stall_budget_ms > kMaximumPrefillStallBudgetMs) {
         throw std::invalid_argument("prefill_schedule.stall_budget_ms must be at most 60000");

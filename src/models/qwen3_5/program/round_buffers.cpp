@@ -52,6 +52,11 @@ void validate_spec(const RoundStateSpec& spec) {
     }
     (void)checked_i32(static_cast<std::uint64_t>(spec.draft_window) + 1ULL,
                       "RoundState draft window exceeds int32");
+    if (spec.draft_context_rows != 0 && (spec.backend == SpeculativeBackend::None ||
+                                         spec.draft_context_rows > kMaximumDraftContextRows)) {
+        throw std::invalid_argument(
+            "RoundState draft context rows need a speculative backend and at most 2048 slots");
+    }
 }
 
 } // namespace
@@ -264,6 +269,10 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
             builder, DType::BF16, {layout.spec.hidden, columns, batch}, "DFlash target hidden");
         decode.target_continuation_hidden = add_tensor(
             builder, DType::BF16, {layout.spec.hidden, batch}, "DFlash target continuation hidden");
+    }
+    if (layout.spec.draft_context_rows != 0) {
+        layout.draft_context_rows =
+            i32(static_cast<std::int32_t>(layout.spec.draft_context_rows), "draft context row ids");
     }
     layout.complete = true;
 }
@@ -490,6 +499,7 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
         dflash_decode.emplace(backing, *layout.dflash_decode, layout.spec.batch_capacity,
                               layout.spec.draft_window);
     }
+    if (layout.draft_context_rows) { draft_context_rows = layout.draft_context_rows->bind(backing); }
 }
 
 } // namespace ninfer::models::qwen3_5

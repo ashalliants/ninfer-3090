@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -176,6 +177,29 @@ float ProgramImpl::round_relaxed_threshold(const SequenceState& sequence,
         return 0.0F;
     }
     return config.relaxed_threshold;
+}
+
+void ProgramImpl::refresh_draft_context_rows(std::span<const std::uint32_t> lanes) {
+    if (!draft_context_rows) { return; }
+    for (const std::uint32_t lane : lanes) {
+        const std::vector<TokenId>& ledger = active_sequence(lane).ledger;
+        std::size_t& noted                 = draft_context_rows_noted[lane];
+        // A ledger rewound below what was noted notes its new tail; the ids it no longer holds
+        // stay until the lane is released.
+        noted = std::min(noted, ledger.size());
+        draft_context_rows->note(static_cast<int>(lane),
+                                 std::span<const TokenId>(ledger).subspan(noted));
+        noted = ledger.size();
+    }
+    if (draft_context_rows->version() == draft_context_rows_version) { return; }
+    // The previous upload has to have read the pinned copy before it is rewritten.
+    draft_context_rows_uploaded->synchronize();
+    const std::span<const std::int32_t> slots = draft_context_rows->slots();
+    std::memcpy(draft_context_rows_host->data(), slots.data(), slots.size_bytes());
+    CUDA_CHECK(cudaMemcpyAsync(io.draft_context_rows.data, draft_context_rows_host->data(),
+                               slots.size_bytes(), cudaMemcpyHostToDevice, device.stream));
+    draft_context_rows_uploaded->record(device.stream);
+    draft_context_rows_version = draft_context_rows->version();
 }
 
 void ProgramImpl::copy_tail(SequenceState& sequence, const Tensor& source) {
@@ -524,6 +548,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1,
                                       std::min(capacity, frontier + extent + draft_window));
         }
+        refresh_draft_context_rows(lanes);
 
         execution::MtpBatchContext schedule_state{{device, parameters, work, state_images->linear(0),
                                                    replay_records ? &*replay_records : nullptr, io,
@@ -836,6 +861,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1U,
                                       backend_kv_cache() ? frontier : 0U);
         }
+        refresh_draft_context_rows(lanes);
 
         execution::DFlashBatchContext schedule_state{
             {device, parameters, work, state_images->linear(0), round_replay_records(verify_drafts),

@@ -519,6 +519,14 @@ against a 22.3 ms step, 1.15x.
 | drafting with the full output head | +2% acceptance for 4 ms more per round |
 | programmatic dependent launch to hide kernel ramp | needs sm_90; compiled out on `sm_86` |
 
+The 40,960-row row shows how much acceptance the rarer rows carry, and the full-head row bounds what
+the rows past 131,072 can add at this prompt mix (+2%). `--draft-context-rows` (opt-in,
+[serving](serving.md#draft-head-context-rows)) adds only the ones a request actually holds: up to
+2048 rows of the full head chosen by id (about 10 MB of Q8 reads per draft call at the 27B's hidden
+size, against the full head's 1.27 GB), aimed at names and identifiers that a prompt introduces and
+the output repeats. Not measured on the RTX 3090 yet; `ninfer_qwen3_5_context_rows_real_test`
+reports both acceptance rates.
+
 What is left at C1 is mostly ramp-up and drain at the ~500 kernel boundaries of a round (the
 Q5 residual kernels reach 68-82% of their streaming floor, gate_up 89%).
 

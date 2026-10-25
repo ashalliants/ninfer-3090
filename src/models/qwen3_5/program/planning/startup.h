@@ -104,6 +104,8 @@ struct SequencePlanningInputs {
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
     // EngineOptions::relaxed_drafting is set: verification runs the relaxed acceptance instances.
     bool relaxed_drafting                   = false;
+    // EngineOptions::draft_context_rows: the drafters' context-row capacity (0: off).
+    std::uint32_t draft_context_rows        = 0;
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
     ProposalHead proposal_head              = ProposalHead::Full;
     models::LoadOptions features;
@@ -132,6 +134,8 @@ struct SequencePlanImpl {
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
     // EngineOptions::relaxed_drafting is set: verification runs the relaxed acceptance instances.
     bool relaxed_drafting                   = false;
+    // EngineOptions::draft_context_rows: the drafters' context-row capacity (0: off).
+    std::uint32_t draft_context_rows        = 0;
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
     ProposalHead proposal_head              = ProposalHead::Full;
     models::LoadOptions features;

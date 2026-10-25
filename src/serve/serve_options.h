@@ -61,6 +61,8 @@ struct ServeOptions {
     SpeculativeOptions speculative;
     // --relaxed-drafting [P]: EngineOptions::relaxed_drafting (nullopt: off; bare: 0.5).
     std::optional<float> relaxed_drafting;
+    // --draft-context-rows N: EngineOptions::draft_context_rows (0: off).
+    std::uint32_t draft_context_rows = 0;
     ContextCacheOptions context_cache;
     PrefillScheduleOptions prefill_schedule;
     bool enable_vision      = false;

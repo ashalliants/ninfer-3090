@@ -29,6 +29,9 @@ struct RoundStateSpec {
     // Causal scoring only: the widest teacher-forced decode window (EngineOptions::
     // scoring_decode_window), or zero for prefill-only scoring, which plans no decode frame.
     std::uint32_t score_decode_width = 0;
+    // EngineOptions::draft_context_rows: the drafters' context-row ids, one I32 per slot, or zero
+    // for none (the layout is then exactly the one without the option).
+    std::uint32_t draft_context_rows = 0;
 };
 
 inline constexpr std::uint32_t kScoreDecodeMaximumWidth = 16;
@@ -221,6 +224,9 @@ struct RoundStateLayout {
     std::optional<DFlashPrefillStateLayout> dflash_prefill;
     std::optional<MtpDecodeStateLayout> mtp_decode;
     std::optional<DFlashDecodeStateLayout> dflash_decode;
+    // I32 [draft_context_rows], after the round state's other regions; absent without context
+    // rows.
+    std::optional<TensorRegion> draft_context_rows;
     bool complete = false;
 };
 
@@ -400,6 +406,9 @@ struct RoundState {
     std::optional<DFlashPrefillState> dflash_prefill;
     std::optional<MtpDecodeState> mtp_decode;
     std::optional<DFlashDecodeState> dflash_decode;
+    // The drafters' context-row ids (-1: an empty slot), uploaded by the Program before a round
+    // that drafts; empty (no data) without --draft-context-rows.
+    Tensor draft_context_rows;
 
     RoundState() = default;
     RoundState(DeviceSpan backing, const RoundStateLayout& layout);

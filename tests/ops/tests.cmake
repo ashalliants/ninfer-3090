@@ -82,6 +82,11 @@ ninfer_add_op_test(ninfer_offloaded_moe_wide_test
 ninfer_add_op_test(ninfer_linear_topk_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"
   LIBRARIES ninfer_ops)
+# The draft head's context rows (--draft-context-rows): selected head rows by id against the FP64
+# oracle in every head format, and their argmax and top-sixteen merges against dense references.
+ninfer_add_op_test(ninfer_linear_rows_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_rows.cpp"
+  LIBRARIES ninfer_ops)
 
 # Qwen3.8-Flash-Next (qwen4exp) Ops ported from Infernix: hyper-connection mixers, the PLE
 # injection (with its IQ4_NL row decode), FP32 projections (BF16 router, IQ4_XS head) and row

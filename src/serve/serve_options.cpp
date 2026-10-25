@@ -214,6 +214,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4] "
            "[--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--ngram-draft-tokens 0|15] [--ngram-min-match N] [--relaxed-drafting [P]] "
+           "[--draft-context-rows N] "
            "[--default-max-tokens N] [--max-output-tokens N] [--default-thinking-budget N] "
            "[--reasoning-loop off|stop|conclude] "
            "[--vision] [--vision-residency resident|overlay] [--vision-max-merged N] "
@@ -360,6 +361,10 @@ std::string serve_usage_text(const char* argv0) {
            "but no longer the model's exact distribution. Greedy and constrained requests, tool "
            "calls and control tokens stay exact; a request sets its own P with relaxed_drafting "
            "(false: exact). P 0 makes it per-request only. Needs --spec\n"
+           "       --draft-context-rows N (0..2048, off by default) lets the drafter propose up to N "
+           "token ids the requests' own prompts and outputs hold (names, identifiers) that the "
+           "reduced draft head lacks, scored from the full output head; drafts only, so output is "
+           "unchanged. Needs --spec (not Qwen3.8-Flash-Next, which drafts with its full head)\n"
            "       --no-prefix-reuse disables cross-request history; request pause/replay "
            "resources remain available\n"
            "       --context-store DIR keeps retained sessions on disk so a restart or crash does "
@@ -713,6 +718,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 options.relaxed_drafting =
                     parse_float_in(argv[++i], "relaxed-drafting", 0.0f, 1.0f);
             }
+        } else if (arg == "--draft-context-rows") {
+            const int rows =
+                parse_nonnegative_int(require_value("--draft-context-rows"), "draft-context-rows");
+            if (static_cast<std::uint32_t>(rows) > ninfer::kMaximumDraftContextRows) {
+                throw std::invalid_argument("--draft-context-rows N must be in [0," +
+                                            std::to_string(ninfer::kMaximumDraftContextRows) +
+                                            "]");
+            }
+            options.draft_context_rows = static_cast<std::uint32_t>(rows);
         } else if (arg == "--max-output-tokens") {
             options.max_output_tokens =
                 parse_nonnegative_int(require_value("--max-output-tokens"), "max-output-tokens");
@@ -1047,6 +1061,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.relaxed_drafting && options.speculative.backend == SpeculativeBackend::None) {
         throw std::invalid_argument("--relaxed-drafting changes which drafts speculative decoding keeps and "
                                     "needs --spec mtp, dflash or dflash2");
+    }
+    if (options.draft_context_rows != 0 && options.speculative.backend == SpeculativeBackend::None) {
+        throw std::invalid_argument("--draft-context-rows adds rows to the draft head's proposals and needs "
+                                    "--spec mtp, dflash or dflash2");
     }
     if (options.flash_next.mtp_constrained && options.speculative.backend != SpeculativeBackend::Mtp) {
         throw std::invalid_argument("--mtp-constrained keeps MTP speculation on for constrained requests and "

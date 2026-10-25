@@ -43,6 +43,10 @@ bool ProgramImpl::valid_pending(const PendingBatch& pending) const noexcept {
 
 void ProgramImpl::invalidate_lane(std::uint32_t lane) noexcept {
     retire_landing(lane);
+    if (draft_context_rows) {
+        draft_context_rows->release_lane(static_cast<int>(lane));
+        draft_context_rows_noted[lane] = 0;
+    }
     if (++lane_epochs[lane] == 0) { ++lane_epochs[lane]; }
 }
 

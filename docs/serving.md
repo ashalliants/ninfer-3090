@@ -70,7 +70,7 @@ model's positions; KV above 32,768 tokens is borrowed from the expert cache). Wh
 the Qwen3.5 models:
 
 - **One request at a time by default; two lanes opt-in** (`--max-concurrency 2`, `NINFER_CONCURRENCY=2` in the launcher). `--max-concurrency` above 2, `--kv-dtype` other than `int8`,
-  `--spec dflash|dflash2`, `--ngram-draft-tokens`, `--graft`, `--auto-host-cache` and the load-time
+  `--spec dflash|dflash2`, `--ngram-draft-tokens`, `--draft-context-rows`, `--graft`, `--auto-host-cache` and the load-time
   weight flags are refused at startup with the flag to change.
 - **Images** (`--vision`, an artifact converted with `--mmproj`; otherwise startup refuses with that
   instruction): OpenAI `image_url` parts (data URIs, local files) and Anthropic image blocks, through
@@ -2036,6 +2036,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--lm-head-draft` | optimized proposal head; implied by `--spec`, accepted for compatibility | on with `--spec` |
 | `--ngram-draft-tokens 0\|15` | n-gram copy drafting beside `--spec dflash2`: when the text being written already appeared in the request (the prompt, a tool result -- including `cat -n` numbered ones -- or the output so far), a round verifies up to 15 copied tokens instead of the draft model's proposal; verification licenses every token, so a wrong copy costs speed, never output. Copies run when a round holds one or two requests (at two only for copies of 12 or more tokens, and only while the other request, whose row pays the copy width too, has the balance for it: about 3% of its round time if it never copies); see [the CLI guide](cli.md#n-gram-copy-drafting) | `0` (off) |
 | `--relaxed-drafting [P]` | [relaxed drafting](#relaxed-drafting), opt-in and it CHANGES THE OUTPUT DISTRIBUTION: under sampling, keep a draft the model gives probability `P` or more (`0..1`; `0.5` without a value) even where exact speculative sampling would draw another token. The default `P` of requests that do not set `relaxed_drafting`; `0` leaves requests exact unless they ask. Needs `--spec` (refused otherwise) | off (exact; requests asking for it are refused) |
+| `--draft-context-rows N` | [draft-head context rows](#draft-head-context-rows): up to `N` (`0..2048`) ids the requests' prompts and outputs hold that the reduced draft head lacks are scored from the full output head and may be drafted; drafts only, so output is unchanged. Needs `--spec`; refused on Qwen3.8-Flash-Next | `0` (off) |
 | `--ngram-min-match N` | tokens the end of the text must match before a copy is proposed, `4..64` | `12` |
 | `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [performance](performance.md)) | off |
 | `--no-prefill-cublas-projections` | with `--prefill-cublas`, keep the attention and GDN input projections off that route | projections on |
@@ -2476,6 +2477,26 @@ at `P = 0.3` +6 to +12% for 0.04 to 0.07, at `P = 0.2` +7 to +15% for 0.05 to 0.
 per 0.01 of total variation at every threshold; decode speed +3 to +20% at temperature 0.6 and 1.0;
 no measurable loss on gsm8k and MMLU-Pro at 300 and 280 items, and tool calls with declared names
 only. The cost is diversity, which those tasks do not measure.
+
+### Draft-head context rows
+
+The Qwen3.8-27B and Qwen3.6-35B-A3B drafters (MTP, DFlash and DFlash2 with the optimized proposal
+head that `--spec` loads) score only the head's 131,072 most frequent tokens, so a name or
+identifier outside them can never be drafted, however often the request repeats it.
+`--draft-context-rows N` (off by default; `N` up to 2048) keeps up to `N` token ids that the running
+requests' prompts and committed outputs hold and the proposal head lacks, one set shared by every
+lane, and scores them from the full output head beside the proposal head: MTP and DFlash take the
+best of both, DFlash2's sixteen candidates may include them. Ids are noted as they enter a request
+(its prompt at admission, its output as it is committed) and leave with the request; once `N` slots
+are taken, new ids wait for a free slot. **Drafts only**: verification decides every token, so the
+output is unchanged (greedy and exact sampling alike); only acceptance, and the time the extra rows
+take, change.
+
+The rows are read from a Q8, Q6 or Q4 row-split output head (the stored head, `--lm-head-q6` or
+`--lm-head-q4`); startup refuses the option with another head format, without `--spec`, and on
+Qwen3.8-Flash-Next, which drafts with its full output head already. No RTX 3090 measurement has been
+made yet: the gain to expect is bounded by the acceptance a full-vocabulary draft head would add
+(see [performance](performance.md)).
 
 ### Automatic host cache
 

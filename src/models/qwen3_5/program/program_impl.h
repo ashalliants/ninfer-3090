@@ -13,6 +13,7 @@
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 
+#include "models/qwen3_5/program/context_rows.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
 #include "models/qwen3_5/program/storage/host_kv_store.h"
@@ -529,6 +530,19 @@ public:
     ops::SamplingMask fill_grammar_mask(runtime::TokenMaskProvider*, std::size_t row,
                                         std::span<const TokenId> drafts);
     Tensor token_counts;
+    // --draft-context-rows (all empty when off): the ids the lanes' ledgers hold that the proposal
+    // head's subset lacks, how many of each lane's ledger tokens are noted, and the pinned copy
+    // the last upload to io.draft_context_rows read, with its completion and the set version it
+    // holds.
+    std::optional<ContextRowSet> draft_context_rows;
+    std::array<std::size_t, kMaximumConcurrency> draft_context_rows_noted{};
+    std::optional<PinnedHostBuffer> draft_context_rows_host;
+    std::optional<CudaCompletionEvent> draft_context_rows_uploaded;
+    std::uint64_t draft_context_rows_version = 0;
+    // Notes the ledger tokens of `lanes` not noted yet and, when the set changed, uploads it on the
+    // compute stream ahead of the work that drafts with it. Graphs read the device ids at replay,
+    // so nothing is recaptured.
+    void refresh_draft_context_rows(std::span<const std::uint32_t> lanes);
 
     VisionHandoffState vision_handoff;
     std::array<SequenceState, kMaximumConcurrency> sequences;

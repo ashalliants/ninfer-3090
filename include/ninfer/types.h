@@ -566,6 +566,15 @@ struct EngineOptions {
     // greedy rows, constrained rows, tokens inside a tool call or drafted added tokens. Needs a
     // speculative backend.
     std::optional<float> relaxed_drafting;
+    // Draft-head context rows (opt-in; 0 = off). The reduced proposal head scores only its
+    // frequency-sorted token subset, so a name or identifier outside it can never be drafted. With
+    // N > 0 the Qwen3.5 Program keeps up to N ids that the requests' prompts and generated text
+    // hold and the subset lacks, scores them from the full output head and merges them into the
+    // drafter's argmax (MTP, DFlash) or top sixteen (DFlash2). Drafts only: verification decides
+    // every token, so output is unchanged. Needs a speculative backend with
+    // ProposalHead::Optimized (--lm-head-draft, implied by --spec); at most
+    // kMaximumDraftContextRows.
+    std::uint32_t draft_context_rows = 0;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
     // Zero selects a bounded worker count from the detected host concurrency.
@@ -664,6 +673,9 @@ struct ModelSamplingDefaults {
 // Relaxed drafting's threshold for `--relaxed-drafting` without a value and a request's
 // `"relaxed_drafting": true`.
 inline constexpr float kRelaxedDraftingDefault = 0.5F;
+
+// The most draft-head context rows (EngineOptions::draft_context_rows, --draft-context-rows).
+inline constexpr std::uint32_t kMaximumDraftContextRows = 2048;
 
 // Public request-side overrides. std::nullopt means "use the registered model/mode default";
 // explicit zero remains a real override (including temperature=0 for exact argmax).

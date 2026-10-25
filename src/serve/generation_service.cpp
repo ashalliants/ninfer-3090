@@ -350,6 +350,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.prefill_cublas_projections = options.prefill_cublas_projections;
     engine_options.speculative              = options.speculative;
     engine_options.relaxed_drafting         = options.relaxed_drafting;
+    engine_options.draft_context_rows       = options.draft_context_rows;
     engine_options.context_cache            = options.context_cache;
     engine_options.prefill_schedule         = options.prefill_schedule;
     engine_options.context_store.directory  = options.context_store_path;

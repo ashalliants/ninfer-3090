@@ -508,6 +508,28 @@ int main() {
                       "--relaxed-drafting without --spec was not refused naming the flag");
     failures += check(kv_help.find("--relaxed-drafting") != std::string::npos,
                       "serve help omits --relaxed-drafting");
+    // Draft-head context rows: off by default, a count in [0,2048] reaches the Engine, and it needs
+    // a speculative backend.
+    failures += check(default_engine.draft_context_rows == 0, "draft context rows are on by default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp",
+                                                 "--draft-tokens", "3", "--draft-context-rows",
+                                                 "512"}))
+                              .draft_context_rows == 512,
+                      "--draft-context-rows did not reach the Engine");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2",
+                                                 "--draft-tokens", "7", "--draft-context-rows",
+                                                 "2048"}))
+                              .draft_context_rows == 2048,
+                      "--draft-context-rows 2048 was not accepted");
+    failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
+                                     "3", "--draft-context-rows", "2049"},
+                                    "--draft-context-rows N must be in [0,2048]"),
+                      "--draft-context-rows above 2048 was accepted");
+    failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--draft-context-rows", "512"},
+                                    "--draft-context-rows adds rows"),
+                      "--draft-context-rows without --spec was not refused naming the flag");
+    failures += check(kv_help.find("--draft-context-rows") != std::string::npos,
+                      "serve help omits --draft-context-rows");
     // 2^44 MiB shifted by 20 bits wraps a uint64_t to 0; it must be refused, not wrapped.
     for (const char* flag : {"--vram-headroom-mib", "--ram-headroom-mib", "--expert-cache-mib"}) {
         failures += check(serve_rejects({"ninfer-serve", "model.ninfer", flag, "17592186044416"}, "out of range"),

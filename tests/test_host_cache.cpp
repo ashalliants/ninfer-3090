@@ -277,12 +277,62 @@ int check_relaxed_drafting() {
     return failures;
 }
 
+// Draft-head context rows add rows to the reduced proposal head's drafts, so they are refused
+// without a speculative backend reading it, on a scoring Engine and above the slot maximum.
+int check_draft_context_rows() {
+    using ninfer::runtime::normalize_engine_options;
+    const auto normalized = [](auto&& edit) -> std::optional<ninfer::EngineOptions> {
+        ninfer::EngineOptions options;
+        options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
+        options.speculative.draft_tokens  = 3;
+        options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+        options.draft_context_rows        = 512;
+        edit(options);
+        try {
+            return normalize_engine_options(options);
+        } catch (const std::invalid_argument& error) {
+            if (std::string(error.what()).find("--draft-context-rows") == std::string::npos) {
+                std::cerr << "draft context row refusal does not name the flag: " << error.what()
+                          << '\n';
+            }
+            return std::nullopt;
+        }
+    };
+    int failures = 0;
+    for (const std::uint32_t rows : {1U, 512U, ninfer::kMaximumDraftContextRows}) {
+        const auto kept = normalized([&](ninfer::EngineOptions& o) { o.draft_context_rows = rows; });
+        failures += check(kept && kept->draft_context_rows == rows,
+                          "a draft context row count in [1,2048] was not kept");
+    }
+    failures += check(!normalized([](ninfer::EngineOptions& o) {
+                          o.draft_context_rows = ninfer::kMaximumDraftContextRows + 1;
+                      }),
+                      "more than 2048 draft context rows were accepted");
+    failures += check(!normalized([](ninfer::EngineOptions& o) { o.speculative = {}; }),
+                      "draft context rows were accepted without a speculative backend");
+    failures += check(!normalized([](ninfer::EngineOptions& o) {
+                          o.speculative.proposal_head = ninfer::ProposalHead::Full;
+                      }),
+                      "draft context rows were accepted with the full proposal head");
+    failures += check(!normalized([](ninfer::EngineOptions& o) {
+                          o.purpose = ninfer::EnginePurpose::CausalScoring;
+                      }),
+                      "draft context rows were accepted on a scoring Engine");
+    failures += check(normalized([](ninfer::EngineOptions& o) {
+                          o.speculative        = {};
+                          o.draft_context_rows = 0;
+                      }).has_value(),
+                      "options without draft context rows were refused");
+    return failures;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
     failures += check_automatic_normalization();
     failures += check_relaxed_drafting();
+    failures += check_draft_context_rows();
     failures += check_fork_options_accepted();
     failures += check_scoring_decode_window();
 

@@ -521,6 +521,21 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         *dflash_prefill_host_ingress = {};
     }
     CUDA_CHECK(cudaMemsetAsync(io.rope_delta.data, 0, io.rope_delta.bytes(), device.stream));
+    if (io.draft_context_rows.data != nullptr) {
+        const auto& proposal = parameters.model.weights().proposal;
+        if (!proposal || proposal->global_token_ids.empty()) {
+            throw std::logic_error("draft context rows need the proposal head's token subset");
+        }
+        draft_context_rows.emplace(
+            proposal->global_token_ids,
+            execution::dimension(parameters.model.resources().public_token_count),
+            io.draft_context_rows.ne[0]);
+        draft_context_rows_host.emplace(io.draft_context_rows.bytes());
+        draft_context_rows_uploaded.emplace(device);
+        // Every slot starts empty (-1), which is the empty set's version 0.
+        CUDA_CHECK(cudaMemsetAsync(io.draft_context_rows.data, 0xff, io.draft_context_rows.bytes(),
+                                   device.stream));
+    }
     if (io.mtp) {
         CUDA_CHECK(
             cudaMemsetAsync(io.mtp->position.data, 0, io.mtp->position.bytes(), device.stream));
