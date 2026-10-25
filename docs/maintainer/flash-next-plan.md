@@ -840,10 +840,14 @@ None has been measured on the RTX 3090 yet.
     every option). None has run yet.
   - Failure: a wait whose host heartbeat stops for 1 s writes `layer << 16 | kErrorHostSilent` to
     the Program's mapped error word (zero-initialised; the outputs of that call are undefined).
-    Each verification round reads it after its synchronization, before acceptance: a set word fails
-    the round (the lane is released, nothing committed) and is cleared. A service whose thread has
-    failed (`failure()`) never answers again, so the Program then stops speculating (plain rounds,
-    the same output) and says so once.
+    Every later layer of the round sees the word set in `cpu_plan_kernel`, publishes nothing and
+    computes its misses on the GPU, so a host that stopped costs one 1 s wait per round, not one per
+    layer. Each verification round reads the word after its synchronization, before acceptance; a
+    set word clears it and throws. The request then ends with an error, as any failed round
+    does (decode's catch releases the lane and the Engine fails the request): nothing from that
+    round is committed and the lane's state is reset. The round is not retried. Later requests use
+    the CPU leg again unless the service thread itself has died (`failure()` set): it never answers
+    again, so the Program then stops speculating (plain rounds, the same output) and says so once.
   - Memory: the service's 4-byte device counter is `ProgramDevicePlan::cpu_verify_misses`; its
     mapped channel (request, x for 1 + drafts columns, y for 4 jobs of 8 columns, the done line)
     and the error word (220 KiB at 7 drafts) are pinned and charged to the RAM ledger
@@ -853,8 +857,10 @@ None has been measured on the RTX 3090 yet.
     display attached (WDDM) a kernel that spins past TdrDelay (2 s) resets the driver; a healthy
     wait is tens of microseconds, but check that a stalled CPU (heartbeat timeout 1 s) does not
     trip it, and that 6 spinning CPU threads do not slow the rest of the round. The service
-    thread spins while requests arrive and polls every 50 µs after 20 ms without one, which can
-    delay the first layer of a round. Measure tok/s on vs off at 6, 12 and 16 workers, and the
+    thread spins while requests arrive and, after 20 ms without one, sleeps `sleep_for(50 µs)`
+    between polls. On Windows that sleep typically lasts 1-15.6 ms unless the timer resolution is
+    raised, so the first layer of a round after an idle gap (a new request, a slow host step) can
+    wait that long: check on Windows how often a round's first wait is that late. Measure tok/s on vs off at 6, 12 and 16 workers, and the
     share of layers whose wait finds the answer ready. Works with two lanes and vision. Not
     measured.
 

@@ -1041,7 +1041,8 @@ static_assert(moe::kMaxCpuJobColumns == moe::kMaxColumns, "select_cpu_jobs mirro
 // in job order (offloaded_moe::select_cpu_jobs states the same rule on the host). Each thread ranks
 // its jobs among their width with warp ballots. The chosen jobs are marked in cpu_flags and listed
 // in that order in call->job and the request. The x columns they read are published compacted, in
-// column order, then the request's sequence after a system-scope fence.
+// column order, then the request's sequence after a system-scope fence. With the source's error word
+// already set it chooses no job (the GPU computes them all).
 __global__ void __launch_bounds__(kThreads)
     cpu_plan_kernel(MoeDispatch dispatch, MoeExpertSource source, const bf16* __restrict__ x, int columns, int top_k,
                     int max_jobs, std::int32_t* __restrict__ cpu_flags, CpuCall* __restrict__ call) {
@@ -1080,7 +1081,12 @@ __global__ void __launch_bounds__(kThreads)
     if (lane == 0) { atomicAdd(&misses, own); }
     __syncthreads();
     if (threadIdx.x == 0) {
-        const int want = min(cap, channel.pcie_divisor > 0 ? misses - misses / channel.pcie_divisor : misses);
+        // A set error word means an earlier call's host stopped answering: publish nothing, so this
+        // call's misses stay on the GPU and it does not wait out another heartbeat timeout.
+        const bool failed =
+            source.error != nullptr && *reinterpret_cast<const volatile std::uint32_t*>(source.error) != 0;
+        const int want =
+            failed ? 0 : min(cap, channel.pcie_divisor > 0 ? misses - misses / channel.pcie_divisor : misses);
         int m          = 0;
         for (int w = 1; w <= kWidths; ++w) {
             first_slot[w] = m;

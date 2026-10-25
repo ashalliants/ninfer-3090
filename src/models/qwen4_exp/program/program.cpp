@@ -1103,8 +1103,9 @@ public:
     }
 
     // --cpu-verify-misses, after a verification synchronized: a call whose CPU leg timed out wrote
-    // layer << 16 | code to the error word and left its CPU outputs unwritten, so the round fails
-    // (its lane is released, nothing is committed). The word is cleared for the next round.
+    // layer << 16 | code to the error word and left its CPU outputs unwritten (later layers computed
+    // their misses on the GPU), so the round throws: its lane is released, nothing is committed and
+    // the request ends with an error. The word is cleared for the next round.
     void check_cpu_verify() {
         if (!cpu_misses_) { return; }
         auto* word                 = static_cast<volatile std::uint32_t*>(cpu_error_.data());

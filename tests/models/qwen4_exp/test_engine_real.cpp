@@ -76,10 +76,10 @@
 //
 // CPU verification misses (cpu_verify_misses_matches_plain below, --cpu-verify-misses): greedy ids,
 // MTP rounds, drafts and acceptances equal those of the GPU-only verification. The same arguments as
-// --moe-precast-exact; --mtp K is what exercises the option.
+// --moe-precast-exact; --mtp K is what exercises the option, and the CPU must serve an expert.
 //
-//   ninfer_qwen4_exp_engine_real_test --cpu-verify-misses-exact --mtp K [--max-context N]
-//       [--generate N] [TOKENS...]
+//   ninfer_qwen4_exp_engine_real_test --cpu-verify-misses-exact --mtp K [--expert-cache-mib N]
+//       [--max-context N] [--generate N] [TOKENS...]
 //
 // MTP for constrained requests (mtp_constrained_matches_plain below): a greedy JSON-schema request
 // with --mtp-constrained (K drafts, default 3) gives the ids of plain constrained decoding.
@@ -103,6 +103,7 @@
 
 #include "core/vram_budget.h"
 #include "ninfer/engine.h"
+#include "ninfer/ops/offloaded_sparse_moe.h"
 #include "ninfer/types.h"
 
 #include <cuda_runtime.h>
@@ -680,16 +681,22 @@ struct BitwiseOption {
     const char* on;
     const char* name; // in the verdict
     void (*set)(EngineOptions&);
+    // Optional: a process-wide count of the work only the option does; the gate fails when the
+    // option's Engine leaves it unchanged (the option's route never ran).
+    std::uint64_t (*exercised)() = nullptr;
 };
 
 int option_matches_off(const std::string& artifact, const std::vector<std::string>& args,
                        const BitwiseOption& option) {
     std::uint32_t max_context = 8192, tokens = 128, mtp = 0;
+    std::optional<std::uint64_t> cache_bytes;
     std::vector<std::string> jobs;
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& a = args[i];
         if (a == "--max-context" && i + 1 < args.size()) {
             max_context = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        } else if (a == "--expert-cache-mib" && i + 1 < args.size()) {
+            cache_bytes = static_cast<std::uint64_t>(std::stoull(args[++i])) << 20;
         } else if (a == "--generate" && i + 1 < args.size()) {
             tokens = static_cast<std::uint32_t>(std::stoul(args[++i]));
         } else if (a == "--mtp" && i + 1 < args.size()) {
@@ -709,6 +716,7 @@ int option_matches_off(const std::string& artifact, const std::vector<std::strin
     const auto engine_options = [&](bool on) {
         EngineOptions options                = base_options(artifact, max_context);
         options.flash_next.save_expert_state = false;
+        if (cache_bytes) { options.flash_next.expert_cache_bytes = cache_bytes; }
         if (on) { option.set(options); }
         if (mtp != 0) {
             options.speculative.backend      = SpeculativeBackend::Mtp;
@@ -735,6 +743,7 @@ int option_matches_off(const std::string& artifact, const std::vector<std::strin
     }
     wait_for_ram(ram_before);
     bool ok = true;
+    const std::uint64_t exercised_before = option.exercised != nullptr ? option.exercised() : 0;
     Engine engine(engine_options(true));
     for (std::size_t j = 0; j < prompts.size(); ++j) {
         const Run run           = generate(engine, prompts[j], tokens);
@@ -754,6 +763,14 @@ int option_matches_off(const std::string& artifact, const std::vector<std::strin
                          run.speculative.fallback_steps != ref.fallback_steps ||
                          run.speculative.accepted_per_position != ref.accepted_per_position)) {
             std::printf("FAIL: %s: MTP rounds, drafts or acceptances differ from %s\n", label.c_str(), option.off);
+            ok = false;
+        }
+    }
+    if (option.exercised != nullptr) {
+        const std::uint64_t done = option.exercised() - exercised_before;
+        std::printf("%s: %llu units of the option's own work\n", option.on, static_cast<unsigned long long>(done));
+        if (done == 0) {
+            std::printf("FAIL: %s never ran its own route, so the identity says nothing about it\n", option.on);
             ok = false;
         }
     }
@@ -808,11 +825,13 @@ int moe_fused_route_matches_plain(const std::string& artifact, const std::vector
 
 // cpu_verify_misses_matches_plain (--cpu-verify-misses-exact, FlashNextOptions::cpu_verify_misses):
 // each MTP verification round's CPU-served misses (the CPU miss service's worker team beside the
-// GPU) give the greedy ids, rounds, drafts and acceptances of the GPU-only verification. Needs --mtp.
+// GPU) give the greedy ids, rounds, drafts and acceptances of the GPU-only verification, and the
+// CPU serves at least one expert. Needs --mtp; --expert-cache-mib N (both Engines) makes misses common.
 int cpu_verify_misses_matches_plain(const std::string& artifact, const std::vector<std::string>& args) {
     return option_matches_off(artifact, args,
                               {"GPU misses", "CPU verification misses", "cpu verify misses",
-                               [](EngineOptions& o) { o.flash_next.cpu_verify_misses = true; }});
+                               [](EngineOptions& o) { o.flash_next.cpu_verify_misses = true; },
+                               [] { return ops::offloaded_moe::CpuMissService::process_served_experts(); }});
 }
 
 // mtp_constrained_matches_plain (--mtp-constrained, FlashNextOptions::mtp_constrained): a greedy

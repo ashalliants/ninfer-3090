@@ -36,6 +36,8 @@
 //     artifact (layers of IQ2_S, IQ2_XXS and IQ1_M), GPU = CPU bit for bit and FP64 per expert.
 //   - A CPU miss service whose thread has failed: its heartbeat stops, failure() says why, and a call
 //     that hands it misses ends after the heartbeat timeout with kErrorHostSilent in the error word.
+//     A later call with the word still set publishes nothing, does not wait, and computes every
+//     job on the GPU (outputs bitwise the CPU engine's).
 //   - cpu_verify_leg: the CPU leg as an MTP verification runs it (--cpu-verify-misses): moe_experts
 //     without the wait, other work on the stream (the shared expert's place), then
 //     moe_experts_cpu_wait, at T in {2, 3, 8, 16}, eagerly and replayed twice from a captured graph,
@@ -388,11 +390,12 @@ std::vector<std::uint16_t> expected_outputs(const Bank& bank, const std::vector<
     return out;
 }
 
-// `external`, when set, serves the call instead of a service built from cfg; the call must leave
-// `want_error` in the error word.
+// `external`, when set, serves the call instead of a service built from cfg; the error word starts
+// at `initial_error` and the call must leave `want_error` there.
 std::vector<std::uint16_t> run_config(const Bank& bank, const Config& cfg, const DeviceRouting& r,
                                       const DeviceBuffer& x_dev, int columns,
-                                      om::CpuMissService* external = nullptr, std::uint32_t want_error = 0) {
+                                      om::CpuMissService* external = nullptr, std::uint32_t want_error = 0,
+                                      std::uint32_t initial_error = 0) {
     const int k        = r.k;
     const int max_jobs = std::min(bank.experts, k * columns);
     std::vector<std::int32_t> frames(bank.experts, -1);
@@ -419,7 +422,7 @@ std::vector<std::uint16_t> run_config(const Bank& bank, const Config& cfg, const
     DeviceBuffer outputs(static_cast<std::size_t>(k) * columns * om::kHidden * 2);
     cuda_ok(cudaMemset(outputs.p, 0xFF, outputs.bytes), "poison");
     Pinned error(64);
-    *reinterpret_cast<std::uint32_t*>(error.host) = 0;
+    *reinterpret_cast<std::uint32_t*>(error.host) = initial_error;
 
     ops::MoeExpertSource source;
     source.format        = bank.format;
@@ -711,6 +714,23 @@ void test_host_silent() {
     check(seconds >= 0.5, "the silent-host wait ended before the heartbeat timeout");
     std::printf("host-silent: failed service (%s) -> kErrorHostSilent after %.2f s\n", service.failure().c_str(),
                 seconds);
+
+    // The next call of the round, with the error word still set: it hands the host nothing (no new
+    // request) and does not wait, and the GPU computes every job, so its outputs are the CPU
+    // engine's. A dead host costs one timeout per round, not one per layer.
+    const std::uint32_t sequence = *reinterpret_cast<const volatile std::uint32_t*>(&channel.request->sequence);
+    const auto again             = std::chrono::steady_clock::now();
+    const auto got = run_config(bank, cfg, r, x_dev, kColumns, &service, om::kErrorHostSilent, om::kErrorHostSilent);
+    const double after = std::chrono::duration<double>(std::chrono::steady_clock::now() - again).count();
+    check(after < 0.5, "a call with the error word set waited for the silent host");
+    check(*reinterpret_cast<const volatile std::uint32_t*>(&channel.request->sequence) == sequence,
+          "a call with the error word set published a request");
+    const auto ids = download<std::int32_t>(r.ids.p, static_cast<std::size_t>(kTopK) * kColumns);
+    check(got == expected_outputs(bank, x, ids, kTopK, kColumns),
+          "a call with the error word set did not compute its misses on the GPU");
+    std::printf("host-silent: with the error word set the next call publishes nothing, waits %.3f s and its "
+                "outputs equal the CPU engine's\n",
+                after);
 }
 
 // The CPU leg of a verification call (--cpu-verify-misses), in the Forward's order: moe_experts with
