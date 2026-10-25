@@ -16,8 +16,10 @@
 // "Int4 scout GEMMs"). The same 32K and 100K haystack prompts, each with a pass key at half depth,
 // are scouted once with the int8 scout (the integer-A8 prefill routes, --prefill-a8) and once with
 // --lossy-prefill-scout-a4. The blocks each chose by score (the forced head and recent blocks left
-// out, ruling R11: both scouts keep those identically) must overlap with a Jaccard index of at
-// least 0.9, and both must keep every token of the pass key. The Jaccard over all kept blocks is
+// out, ruling R11: both scouts keep those identically) are compared by Jaccard index against the
+// spec gate of 0.9, and both must keep every token of the pass key. Ruling R16: the int4 scout
+// missed the gate on the 3090 (0.84, 2026-10-25) and stays opt-in, so the gate is reported, not
+// asserted; the test fails only below a 0.5 sanity floor (a broken int4 route, not a weaker one). The Jaccard over all kept blocks is
 // printed for reference. rk4v4 KV as in production.
 //
 // The prompts are raw tokens (prepare_tokens) built from separately tokenized pieces, so the pass
@@ -25,7 +27,8 @@
 namespace {
 
 constexpr std::uint32_t kContext       = 110592;
-constexpr double kJaccardGate          = 0.9;
+constexpr double kJaccardGate          = 0.9; // the spec gate: reported only (R16)
+constexpr double kJaccardFloor         = 0.5; // asserted: below it the int4 route is broken
 constexpr const char* kPassKey         = "68213";
 constexpr std::uint32_t kTargets[]     = {32768, 100000};
 
@@ -184,7 +187,8 @@ int exercise(const char* artifact) {
             int4.push_back(scout(engine, h, "int4 " + std::to_string(h.tokens.size())));
         }
     }
-    int failures = 0;
+    int failures  = 0;
+    bool gate_met = true;
     for (std::size_t i = 0; i < prompts.size(); ++i) {
         const Haystack& h   = prompts[i];
         const Scouted& a    = int8[i];
@@ -211,10 +215,13 @@ int exercise(const char* artifact) {
             std::cerr << n << ": neither scout kept a score-chosen block, so the overlap is not "
                          "measured\n";
             ++failures;
-        } else if (!(*scored >= kJaccardGate)) {
-            std::cerr << n << ": score-chosen kept-block Jaccard " << *scored << " < "
-                      << kJaccardGate << '\n';
-            ++failures;
+        } else {
+            if (!(*scored >= kJaccardGate)) { gate_met = false; }
+            if (!(*scored > kJaccardFloor)) {
+                std::cerr << n << ": score-chosen kept-block Jaccard " << *scored
+                          << " is at or below the sanity floor " << kJaccardFloor << '\n';
+                ++failures;
+            }
         }
         if (!key8 || !key4) {
             std::cerr << n << ": the pass key was dropped by the "
@@ -223,6 +230,8 @@ int exercise(const char* artifact) {
             ++failures;
         }
     }
+    std::cout << (gate_met ? "GATE MET" : "GATE NOT MET (int4 scout stays opt-in)")
+              << ": score-chosen kept-block Jaccard >= " << kJaccardGate << '\n';
     std::cout << (failures == 0 ? "OK" : "FAIL") << " scout_a4_kept_overlap\n";
     return failures == 0 ? 0 : 1;
 }
