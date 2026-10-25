@@ -35,6 +35,10 @@
 #include <variant>
 #include <vector>
 
+namespace ninfer {
+class ScoreRowSink;
+} // namespace ninfer
+
 namespace ninfer::models::qwen3_5::detail {
 using execution::dimension;
 using PreparedPromptData = qwen3_5::PreparedPromptData;
@@ -300,7 +304,9 @@ public:
                                                const runtime::ResolvedExecutionOptions&);
     [[nodiscard]] CheckpointHandle install_external_checkpoint(const PromptGraft&);
     [[nodiscard]] std::uint32_t prefix_identity_tag() const noexcept;
-    [[nodiscard]] std::vector<float> causal_score(PreparedPromptData&&, std::uint32_t first_target);
+    [[nodiscard]] std::vector<float> causal_score(PreparedPromptData&&, std::uint32_t first_target,
+                                                  const ScoringOptions& options,
+                                                  ScoreRowSink* sink);
     // Prefill cost features for prompt positions [begin, end) of a planned request.
     [[nodiscard]] runtime::PrefillWork prefill_work(const RequestBasePlan&, std::uint32_t begin,
                                                    std::uint32_t end) const;
@@ -519,6 +525,10 @@ public:
 
     std::optional<PinnedHostBuffer> round_host;
     std::optional<PinnedHostBuffer> score_logprobs_host;
+    // Decode scoring only (EngineOptions::scoring_decode_window): the window's ingress and
+    // log-probabilities, and its BF16 logits for a row sink.
+    std::optional<PinnedHostBuffer> score_decode_host;
+    std::optional<PinnedHostBuffer> score_decode_logits_host;
     TokenId* host_tokens = nullptr;
     std::optional<PinnedHostBuffer> ordinary_host;
     qwen3_5::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
@@ -774,6 +784,11 @@ public:
                                        std::span<const std::uint32_t> counts);
     void validate_licensed_tokens(std::span<const TokenId> tokens) const;
     void mark_workspace_usage(std::size_t phase_bytes) noexcept;
+    // causal_score's Decode phase: prefill [0, first_target - 1), then teacher-force the targets
+    // through the ordinary step (window 1) or the verify forward and ReplaySSM commit (wider).
+    [[nodiscard]] std::vector<float> causal_score_decode(const PreparedPromptData& prompt,
+                                                         std::uint32_t first_target,
+                                                         std::uint32_t window, ScoreRowSink* sink);
     [[nodiscard]] runtime::BatchedGeneratedRound decode_ordinary_batch(
         std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget> budgets,
         runtime::ExecutionTiming* failed_timing, runtime::TokenMaskProvider* masks);

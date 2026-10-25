@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -169,6 +170,41 @@ int check_automatic_normalization() {
     return failures;
 }
 
+// Decode scoring (EngineOptions::scoring_decode_window) is a CausalScoring plan on one device, at
+// most the 16-column verify domain wide; anything else is refused before sizing.
+int check_scoring_decode_window() {
+    using ninfer::runtime::normalize_engine_options;
+    const auto normalized = [](auto&& edit) -> std::optional<ninfer::EngineOptions> {
+        ninfer::EngineOptions options;
+        options.purpose = ninfer::EnginePurpose::CausalScoring;
+        edit(options);
+        try {
+            return normalize_engine_options(options);
+        } catch (const std::invalid_argument&) { return std::nullopt; }
+    };
+    int failures = 0;
+    const auto planned = normalized([](ninfer::EngineOptions& o) { o.scoring_decode_window = 4; });
+    failures += check(planned && planned->scoring_decode_window == 4,
+                      "a CausalScoring decode window of four was not kept");
+    const auto widest = normalized([](ninfer::EngineOptions& o) { o.scoring_decode_window = 16; });
+    failures += check(widest.has_value(), "the 16-column decode window was refused");
+    failures += check(!normalized([](ninfer::EngineOptions& o) { o.scoring_decode_window = 17; }),
+                      "a decode window wider than the verify domain was accepted");
+    failures += check(!normalized([](ninfer::EngineOptions& o) {
+                          o.purpose               = ninfer::EnginePurpose::Generation;
+                          o.scoring_decode_window = 3;
+                      }),
+                      "a decode scoring window on a Generation Engine was accepted");
+    failures += check(!normalized([](ninfer::EngineOptions& o) {
+                          o.devices               = {0, 1};
+                          o.scoring_decode_window = 3;
+                      }),
+                      "decode scoring over pipeline stages was accepted");
+    failures += check(normalized([](ninfer::EngineOptions& o) { o.devices = {0, 1}; }).has_value(),
+                      "prefill-only scoring over pipeline stages was refused");
+    return failures;
+}
+
 // Fork features that were once parked are accepted by option normalization again.
 int check_fork_options_accepted() {
     using ninfer::runtime::normalize_engine_options;
@@ -202,6 +238,7 @@ int main() {
     int failures = 0;
     failures += check_automatic_normalization();
     failures += check_fork_options_accepted();
+    failures += check_scoring_decode_window();
 
     // Everything free but the 3 GiB default reserve is pinned.
     failures += check(resolve_host_capacity_bytes(requested(), 64 * kGiB) == 61 * kGiB,

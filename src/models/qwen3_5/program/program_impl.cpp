@@ -237,6 +237,17 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       score_logprobs_host(plan.causal_scoring ? std::make_optional<PinnedHostBuffer>(
                                                     kCausalScoreTile * sizeof(float))
                                               : std::nullopt),
+      score_decode_host(plan.scoring_decode_window != 0
+                            ? std::make_optional<PinnedHostBuffer>(
+                                  sizeof(qwen3_5::ScoreDecodeIngress) +
+                                  qwen3_5::kScoreDecodeMaximumWidth * sizeof(float))
+                            : std::nullopt),
+      score_decode_logits_host(
+          plan.scoring_decode_window != 0
+              ? std::make_optional<PinnedHostBuffer>(
+                    static_cast<std::size_t>(parameters_in.model.config().text.vocab_size) *
+                    plan.scoring_decode_window * sizeof(std::uint16_t))
+              : std::nullopt),
       ordinary_host(
           !plan.causal_scoring && plan.speculative_backend == SpeculativeBackend::None
               ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_5::OrdinaryDecodeIngress) +
@@ -439,6 +450,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         (!causal_scoring && speculative_backend == SpeculativeBackend::None)) {
         throw std::logic_error("ordinary decode frame does not match the sequence plan");
     }
+    if (io.score_decode.has_value() != (plan.scoring_decode_window != 0) ||
+        (causal_scoring && replay_records.has_value() != (plan.scoring_decode_window >= 2))) {
+        throw std::logic_error("decode scoring storage does not match the sequence plan");
+    }
     if (io.dflash_prefill.has_value() != is_masked_draft_backend(speculative_backend)) {
         throw std::logic_error("DFlash prefill scratch does not match the sequence plan");
     }
@@ -541,7 +556,8 @@ ProgramImpl::~ProgramImpl() noexcept {
 }
 
 std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
-                                             std::uint32_t first_target) {
+                                             std::uint32_t first_target,
+                                             const ScoringOptions& options, ScoreRowSink* sink) {
     if (!causal_scoring || !score_hidden || !score_logprobs_host ||
         workspace_plan.causal_score == 0) {
         throw std::logic_error("Program was not constructed for causal scoring");
@@ -549,6 +565,14 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
     if (speculative_backend != SpeculativeBackend::None || vision_enabled || use_cuda_graph ||
         context_cache.enabled) {
         throw std::logic_error("causal scoring Program has generation-only startup features");
+    }
+    if (options.phase == ScoringOptions::Phase::Decode) {
+        if (options.window < 1) { throw std::invalid_argument("decode scoring window is empty"); }
+        return causal_score_decode(prompt, first_target,
+                                   static_cast<std::uint32_t>(options.window), sink);
+    }
+    if (sink != nullptr) {
+        throw std::invalid_argument("a score row sink requires the Decode scoring phase");
     }
     const std::size_t token_count_size = prompt.token_ids.size();
     if (token_count_size < 2 || token_count_size > capacity) {

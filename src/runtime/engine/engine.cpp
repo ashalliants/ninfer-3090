@@ -747,11 +747,28 @@ std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
 }
 
 std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target) {
+    return score_tokens(std::move(tokens), first_target, ScoringOptions{}, nullptr);
+}
+
+std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target,
+                                        const ScoringOptions& options, ScoreRowSink* sink) {
     nvtx::ScopedRange score_range(nvtx::Name::Score, nvtx::Category::Scoring,
                                   static_cast<std::uint64_t>(tokens.size()));
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     if (impl_->options.purpose != EnginePurpose::CausalScoring) {
         throw std::logic_error("score_tokens requires a CausalScoring Engine");
+    }
+    if (options.window < 1 ||
+        static_cast<std::uint32_t>(options.window) > kMaximumScoringDecodeWindow) {
+        throw std::invalid_argument("score_tokens window must be in [1,16]");
+    }
+    if (options.phase == ScoringOptions::Phase::Decode &&
+        static_cast<std::uint32_t>(options.window) > impl_->options.scoring_decode_window) {
+        throw std::invalid_argument(
+            "score_tokens Decode window exceeds EngineOptions::scoring_decode_window");
+    }
+    if (options.phase == ScoringOptions::Phase::Prefill && sink != nullptr) {
+        throw std::invalid_argument("score_tokens row sink requires the Decode phase");
     }
     if (tokens.size() < 2 || tokens.size() > impl_->options.max_context) {
         throw std::invalid_argument("score_tokens token count must be in [2,max_context]");
@@ -765,7 +782,7 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
         [&](auto& core) -> std::vector<float> {
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
-                return core->score(std::move(prompt.impl_->value), first_target);
+                return core->score(std::move(prompt.impl_->value), first_target, options, sink);
             } else {
                 throw std::logic_error("Engine scoring core is unavailable");
             }

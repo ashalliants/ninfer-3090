@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -58,6 +59,18 @@ private:
     friend class Engine;
 };
 
+// Receives the logits of each scored target from Engine::score_tokens in the Decode phase.
+// `position` is the target's index i in [first_target, tokens.size()); `logits` are the FP32
+// values of the BF16 logits that predict it, over the public token domain [0, public tokens). Rows
+// arrive in position order, each exactly once, on the Engine's scoring thread while score_tokens
+// blocks; the span is valid only during the call. An exception from row() aborts the scoring
+// call and is rethrown by score_tokens.
+class ScoreRowSink {
+public:
+    virtual ~ScoreRowSink()                                                 = default;
+    virtual void row(std::int64_t position, std::span<const float> logits) = 0;
+};
+
 class Engine {
 public:
     explicit Engine(EngineOptions options);
@@ -82,6 +95,14 @@ public:
     // Returns log p(tokens[i] | tokens[0..i)) for i in [first_target,tokens.size()).
     [[nodiscard]] std::vector<float> score_tokens(std::vector<TokenId> tokens,
                                                   std::uint32_t first_target);
+    // The same, through the phase `options` selects (see ScoringOptions). With the Decode phase a
+    // non-null sink receives every target's logits as well. The two-argument form is the Prefill
+    // phase without a sink. Throws std::invalid_argument for a window outside its domain, a Decode
+    // window wider than EngineOptions::scoring_decode_window, or a sink with the Prefill phase.
+    [[nodiscard]] std::vector<float> score_tokens(std::vector<TokenId> tokens,
+                                                  std::uint32_t first_target,
+                                                  const ScoringOptions& options,
+                                                  ScoreRowSink* sink);
 
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;

@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -306,6 +307,120 @@ int check_decode_windows_cover() {
     return failures;
 }
 
+
+template <class Function> bool throws_invalid(Function&& function) {
+    try {
+        (void)function();
+    } catch (const std::invalid_argument&) { return true; }
+    return false;
+}
+
+int check_kld_flag_values() {
+    using ninfer::perplexity::parse_decode_window;
+    using ninfer::perplexity::parse_kld_chunks;
+    int failures = 0;
+    failures += require(ninfer::perplexity::kDefaultDecodeWindow == 3, "the default window is 3");
+    failures += require(parse_decode_window("1") == 1 && parse_decode_window("16") == 16,
+                        "decode windows 1 and 16 parse");
+    failures += require(throws_invalid([] { return parse_decode_window("0"); }) &&
+                            throws_invalid([] { return parse_decode_window("17"); }) &&
+                            throws_invalid([] { return parse_decode_window("3x"); }) &&
+                            throws_invalid([] { return parse_decode_window(""); }),
+                        "decode windows outside [1,16] or not integers are refused");
+    failures += require(parse_kld_chunks("20") == 20, "a chunk count parses");
+    failures += require(throws_invalid([] { return parse_kld_chunks("0"); }) &&
+                            throws_invalid([] { return parse_kld_chunks("-1"); }) &&
+                            throws_invalid([] { return parse_kld_chunks("two"); }),
+                        "a chunk count below one or not an integer is refused");
+    return failures;
+}
+
+int check_scoring_source_flags() {
+    using ninfer::perplexity::ScoringSourceFlags;
+    const auto refused = [](ScoringSourceFlags flags) {
+        return throws_invalid([&] {
+            ninfer::perplexity::check_source_flags(flags);
+            return 0;
+        });
+    };
+    int failures = 0;
+    failures += require(!refused({.corpus = true, .quick = true}) &&
+                            !refused({.text = true, .context = true, .stride = true}) &&
+                            !refused({.kld_base = true}) &&
+                            !refused({.kld_base = true, .chunks = true, .decode_window = true}),
+                        "the supported source combinations are accepted");
+    failures += require(refused({}) && refused({.corpus = true, .text = true}) &&
+                            refused({.text = true, .kld_base = true}) &&
+                            refused({.corpus = true, .kld_base = true}),
+                        "exactly one of --corpus, --text and --kld-base is required");
+    failures += require(refused({.text = true, .quick = true}) &&
+                            refused({.kld_base = true, .quick = true}),
+                        "--quick needs --corpus");
+    failures += require(refused({.corpus = true, .chunks = true}) &&
+                            refused({.text = true, .decode_window = true}),
+                        "--chunks and --decode-window need --kld-base");
+    failures += require(refused({.kld_base = true, .context = true}) &&
+                            refused({.kld_base = true, .stride = true}),
+                        "--kld-base takes its context from the file, not --context/--stride");
+    return failures;
+}
+
+// The chunk/half arithmetic: chunk k is base tokens [k*n_ctx, (k+1)*n_ctx); positions
+// [0, n_ctx/2] are the prompt, targets [n_ctx/2 + 1, n_ctx) are base rows 0.. in order.
+int check_kld_chunks() {
+    constexpr std::uint32_t n_ctx  = 9; // odd: n_ctx/2 rounds down, as llama.cpp does
+    constexpr std::int32_t n_vocab = 3;
+    constexpr std::int32_t n_chunk = 3;
+    constexpr int rows_per_chunk   = n_ctx - 1 - n_ctx / 2; // 4
+    std::vector<std::int32_t> tokens;
+    for (std::int32_t i = 0; i < static_cast<std::int32_t>(n_ctx) * n_chunk; ++i) {
+        tokens.push_back(i % n_vocab);
+    }
+    std::vector<SyntheticRow> rows(static_cast<std::size_t>(n_chunk * rows_per_chunk),
+                                   SyntheticRow{.scale = 0.0F, .min_lp = -1.0F, .q = {0, 0, 0}});
+    TempFile file("chunks");
+    write_file(file.path, synthetic_kld(n_ctx, n_vocab, n_chunk, tokens, rows));
+    const auto base = ninfer::perplexity::read_kld_base(file.path);
+
+    int failures = 0;
+    for (int chunk = 0; chunk < n_chunk; ++chunk) {
+        const auto window = ninfer::perplexity::kld_chunk(base, chunk);
+        failures +=
+            require(window.first_target == n_ctx / 2 + 1, "the first target is n_ctx/2 + 1");
+        failures += require(window.tokens.size() == n_ctx &&
+                                std::equal(window.tokens.begin(), window.tokens.end(),
+                                           tokens.begin() + chunk * static_cast<int>(n_ctx)),
+                            "a chunk is its n_ctx base tokens");
+        failures += require(n_ctx - window.first_target ==
+                                static_cast<std::uint32_t>(rows_per_chunk),
+                            "a chunk decodes one target per base row");
+    }
+    failures += require(ninfer::perplexity::kld_row(base, n_ctx / 2 + 1) == 0 &&
+                            ninfer::perplexity::kld_row(base, n_ctx - 1) == rows_per_chunk - 1,
+                        "targets map to base rows in order");
+    const auto out_of_range = [&](std::int64_t position) {
+        try {
+            (void)ninfer::perplexity::kld_row(base, position);
+        } catch (const std::out_of_range&) { return true; }
+        return false;
+    };
+    failures += require(out_of_range(n_ctx / 2) && out_of_range(n_ctx),
+                        "a position outside the decoded half has no base row");
+    failures += require(ninfer::perplexity::kld_chunk_count(base, std::nullopt) == n_chunk &&
+                            ninfer::perplexity::kld_chunk_count(base, 2) == 2 &&
+                            ninfer::perplexity::kld_chunk_count(base, n_chunk) == n_chunk,
+                        "every chunk by default, or the first N");
+    failures += require(throws_invalid([&] {
+                            return ninfer::perplexity::kld_chunk_count(base, n_chunk + 1);
+                        }),
+                        "more chunks than the base holds are refused");
+    bool chunk_refused = false;
+    try {
+        (void)ninfer::perplexity::kld_chunk(base, n_chunk);
+    } catch (const std::out_of_range&) { chunk_refused = true; }
+    failures += require(chunk_refused, "a chunk outside the base is refused");
+    return failures;
+}
 } // namespace
 
 int main() {
@@ -351,6 +466,9 @@ int main() {
     failures += check_score_row_hand_case();
     failures += check_summarize_percentiles();
     failures += check_decode_windows_cover();
+    failures += check_kld_flag_values();
+    failures += check_scoring_source_flags();
+    failures += check_kld_chunks();
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " perplexity_evaluation\n";
     return failures == 0 ? 0 : 1;

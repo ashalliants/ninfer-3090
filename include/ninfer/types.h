@@ -55,6 +55,19 @@ enum class EnginePurpose : std::uint8_t {
     CausalScoring,
 };
 
+// Widest teacher-forced decode window a CausalScoring Engine can plan (the verify domain).
+inline constexpr std::uint32_t kMaximumScoringDecodeWindow = 16;
+
+// How Engine::score_tokens runs a window. Prefill scores every target from one prefill pass (the
+// original route). Decode prefills positions [0, first_target - 1) and feeds the rest through the
+// decode path, `window` tokens per forward: window 1 is the ordinary decode step, a wider window
+// the speculative verify forward with every live column committed. window is in
+// [1,kMaximumScoringDecodeWindow] and, for Decode, at most EngineOptions::scoring_decode_window.
+struct ScoringOptions {
+    enum class Phase : std::uint8_t { Prefill, Decode } phase = Phase::Prefill;
+    int window = 1;
+};
+
 enum class KvCapacityMode : std::uint8_t {
     Explicit,
     Automatic,
@@ -493,6 +506,11 @@ struct EngineOptions {
     // preprocessing. Also bounds the overlay window.
     std::uint32_t vision_max_merged_tokens = 16384;
     bool use_cuda_graph                    = true;
+    // CausalScoring only: the widest decode window ScoringOptions::Phase::Decode may use, in
+    // [1,kMaximumScoringDecodeWindow]. Plans the decode frame, the decode workspace up to this
+    // width and, from width two, the ReplaySSM records the verify forward writes. Zero plans no
+    // decode scoring and leaves the scoring Program as before. One device only.
+    std::uint32_t scoring_decode_window    = 0;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     PrefillScheduleOptions prefill_schedule;

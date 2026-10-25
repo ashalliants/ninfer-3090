@@ -1,6 +1,7 @@
 #include "core/layout.h"
 #include "models/qwen3_5/state/decoder_state.h"
 #include "models/qwen3_5/program/speculative/mtp_alignment.h"
+#include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/round_buffers.h"
 #include "models/qwen3_5/program/vision_control.h"
 
@@ -11,6 +12,7 @@
 #include <array>
 #include <cstdint>
 #include <iostream>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -221,6 +223,61 @@ void test_round_layout() {
     expect(!scoring.ordinary && !scoring.mtp_decode && !scoring.dflash_decode &&
                scoring.token.region.bytes == 0 && scoring.logits.region.bytes == 0,
            "scoring does not reserve generation frames or sampled output");
+    expect(!scoring.score_decode, "prefill-only scoring plans no decode frame");
+
+    // Decode scoring (EngineOptions::scoring_decode_window) plans one frame at its widest window.
+    ninfer::LayoutBuilder decode_builder;
+    auto decode = q36::begin_round_state_layout(
+        decode_builder,
+        {.hidden = 32, .output_rows = 128, .causal_scoring = true, .score_decode_width = 4});
+    q36::complete_round_state_layout(decode_builder, decode);
+    (void)decode_builder.finish(256);
+    expect(decode.score_decode.has_value(), "decode scoring plans its frame");
+    if (decode.score_decode) {
+        const q36::ScoreDecodeStateLayout& frame = *decode.score_decode;
+        expect(frame.ingress.bytes == sizeof(q36::ScoreDecodeIngress),
+               "the decode frame ingress holds one ScoreDecodeIngress");
+        expect(frame.logits.shape[0] == 128 && frame.logits.shape[1] == 4 &&
+                   frame.logits.dtype == ninfer::DType::BF16,
+               "the decode frame logits are [vocab, width] BF16");
+        expect(frame.hidden.shape[0] == 32 && frame.hidden.shape[1] == 4,
+               "the decode frame hidden is [hidden, width]");
+        expect(frame.target_tokens.shape[0] == 4 && frame.logprobs.shape[0] == 4 &&
+                   frame.logprobs.dtype == ninfer::DType::FP32,
+               "the decode frame argmax and log-probabilities are [width]");
+    }
+    expect(!decode.ordinary && decode.token.region.bytes == 0,
+           "decode scoring still reserves no generation frame");
+    const auto refused = [](q36::RoundStateSpec spec) {
+        ninfer::LayoutBuilder builder;
+        try {
+            (void)q36::begin_round_state_layout(builder, spec);
+        } catch (const std::invalid_argument&) { return true; }
+        return false;
+    };
+    expect(refused({.hidden = 32, .output_rows = 128, .score_decode_width = 4}),
+           "a decode scoring frame without causal scoring is refused");
+    expect(refused({.hidden = 32, .output_rows = 128, .causal_scoring = true,
+                    .score_decode_width = 17}),
+           "a decode scoring frame wider than the verify domain is refused");
+}
+
+void test_scoring_replay_records() {
+    using ninfer::SpeculativeBackend;
+    // Speculative generation records its widest round; decode scoring records its window from two
+    // columns up (one column is the ordinary step, which records nothing); otherwise none.
+    expect(q36::detail::replay_record_width(SpeculativeBackend::Mtp, 3, false, 0) == 4,
+           "MTP records its widest verify round");
+    expect(q36::detail::replay_record_width(SpeculativeBackend::None, 0, false, 0) == 0,
+           "ordinary generation records nothing");
+    expect(q36::detail::replay_record_width(SpeculativeBackend::None, 0, true, 0) == 0,
+           "prefill-only scoring records nothing");
+    expect(q36::detail::replay_record_width(SpeculativeBackend::None, 0, true, 1) == 0,
+           "T=1 decode scoring records nothing");
+    expect(q36::detail::replay_record_width(SpeculativeBackend::None, 0, true, 3) == 3,
+           "T=3 decode scoring records three columns");
+    expect(q36::detail::replay_record_width(SpeculativeBackend::None, 0, true, 16) == 16,
+           "the widest decode scoring window records sixteen columns");
 }
 
 void test_mtp_alignment() {
@@ -517,6 +574,7 @@ int main() {
     test_execution_timing_domains();
     test_decoder_layout();
     test_round_layout();
+    test_scoring_replay_records();
     test_mtp_alignment();
     test_vision_control();
     test_prefix_identity();

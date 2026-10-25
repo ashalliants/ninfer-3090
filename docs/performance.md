@@ -589,9 +589,11 @@ repetitions and tied the fourth, against a spread of about 1.7% within the unfla
 
 **What it costs.** Output changes -- this is a lossy trade, not a free one. Against an FP64 oracle
 the Op measures 0.0080 to 0.0371 relative L2 across 2..32 columns, inside the 0.04 allowance the
-integer-activation path is held to everywhere else in the tree. Perplexity cannot see this trade at
-all: the route is admitted only in the verify phase, and scoring runs the prefill phase, so
-`ninfer-perplexity` reports the same score with and without the flag. Judge it on the oracle bound
+integer-activation path is held to everywhere else in the tree. Corpus perplexity cannot see this
+trade at all: the route is admitted only in the verify phase, and `--corpus`/`--text` scoring runs the
+prefill phase, so `ninfer-perplexity` reports the same score with and without the flag. Its
+`--kld-base` gate decodes through the verify forward and can reach the route at a wide enough
+`--decode-window` ([`docs/perplexity.md`](perplexity.md)). Judge it on the oracle bound
 and on your own outputs. It does nothing for single-stream use, where one request decodes one
 column per step, far below the sixteen the route needs.
 

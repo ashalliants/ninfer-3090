@@ -294,8 +294,10 @@ version:
   the 0.04 allowance, plus the fact that output demonstrably changes at C8.
 
 **Why perplexity is silent on it, and what to use instead.** The route is admitted only in the
-verify phase, and `CausalScoring` runs the prefill phase, so scoring never reaches it -- the flag is
-accepted by `ninfer-perplexity` and changes nothing there.
+verify phase, and `--corpus`/`--text` scoring runs the prefill phase, so it never reaches it -- the
+flag is accepted there and changes nothing. `--kld-base` scores through the decode path and runs
+the verify forward at `--decode-window T`, so it reaches the route once T is wide enough for it
+(see [`docs/perplexity.md`](../perplexity.md)); no such measurement has been made yet.
 
 That phase guard is load-bearing, and the first cut of this did not have it. Width alone is not
 enough: `causal_score` sends its remainder through prefill unchanged, so a 1,041-token input scores

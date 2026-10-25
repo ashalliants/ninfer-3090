@@ -201,7 +201,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     // Every per-round buffer below holds the widest round family; a round views it at its own
     // width.
     const std::uint32_t verify_drafts = max_verify_drafts(plan.round_shapes);
-    if (plan.speculative_backend != SpeculativeBackend::None) {
+    const std::uint32_t record_width  = replay_record_width(
+        plan.speculative_backend, verify_drafts, plan.causal_scoring, plan.scoring_decode_window);
+    if (record_width != 0) {
         // A stage records only the GDN layers it holds, in its own device's memory.
         for (std::size_t shard = 0; shard < state_shards.size(); ++shard) {
             GdnReplayRecordLayout records = plan_gdn_replay_records(
@@ -209,7 +211,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 GdnReplayRecordSpec{
                     .layers          = static_cast<std::int32_t>(state_shards[shard].layers),
                     .record_capacity = static_cast<std::int32_t>(plan.max_concurrency),
-                    .width           = static_cast<std::int32_t>(verify_drafts + 1U),
+                    .width           = static_cast<std::int32_t>(record_width),
                     .conv_channels   = (config.gdn ? dimension(config.gdn->conv_channels()) : 0),
                     .qk_heads = (config.gdn ? dimension(config.gdn->linear_num_key_heads) : 0),
                     .value_heads =
@@ -287,7 +289,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                          .batch_capacity = plan.max_concurrency,
                                          .draft_window   = verify_drafts,
                                          .backend        = plan.speculative_backend,
-                                         .causal_scoring = plan.causal_scoring});
+                                         .causal_scoring = plan.causal_scoring,
+                                         .score_decode_width = plan.scoring_decode_window});
     out.prefill_hidden =
         add_tensor(builder, DType::BF16, {dimension(config.hidden_size), effective_prefill_chunk},
                    "step prefill hidden");
@@ -533,6 +536,19 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         matrix(causal_score, DType::FP32, 1, static_cast<std::int32_t>(kCausalScoreTile));
         linear_scratch(causal_score, parameters.text.output_head, 1, kCausalScoreTile);
         out.causal_score = finish(causal_score);
+
+        // Each decode scoring width a call may use: T=1 runs the ordinary step (GDN snapshot),
+        // wider windows the verify forward (GDN replay records). Both project the head in place.
+        for (std::int32_t width = 1; width <= static_cast<std::int32_t>(plan.scoring_decode_window);
+             ++width) {
+            WorkspaceLayoutBuilder decode;
+            matrix(decode, DType::BF16, dimension(config.hidden_size), width);
+            target_body(decode, width, width, qwen3_5::TextPhase::Verify,
+                        width == 1 ? GdnWorkspacePath::Snapshot : GdnWorkspacePath::ReplayRecord,
+                        1, width, width, text_envelope);
+            linear_scratch(decode, parameters.text.output_head, width, width);
+            out.score_decode = std::max(out.score_decode, finish(decode));
+        }
     }
 
     if (!plan.causal_scoring) {
@@ -806,7 +822,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 
     out.general_capacity =
         std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round,
-                  out.dflash_context, out.dflash_round, out.causal_score});
+                  out.dflash_context, out.dflash_round, out.causal_score, out.score_decode});
     if (parameters.text.split_execution()) {
         // Around its layers a stage holds the residual it received and its copy of the control
         // block (rank 0 holds the packed block instead, which is smaller), alive for the whole pass
@@ -1004,6 +1020,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->features             = inputs.features;
     impl->use_cuda_graph       = inputs.use_cuda_graph;
     impl->causal_scoring       = inputs.causal_scoring;
+    impl->scoring_decode_window = inputs.scoring_decode_window;
     impl->device               = inputs.device;
     impl->multiprocessor_count = inputs.multiprocessor_count;
     impl->context_cache        = inputs.context_cache;
@@ -1173,6 +1190,8 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .features             = models::load_options(options),
         .use_cuda_graph       = options.use_cuda_graph,
         .causal_scoring       = options.purpose == EnginePurpose::CausalScoring,
+        .scoring_decode_window =
+            options.purpose == EnginePurpose::CausalScoring ? options.scoring_decode_window : 0U,
         .device               = options.device,
         .multiprocessor_count = device.multiprocessor_count(),
         .context_cache        = options.context_cache,

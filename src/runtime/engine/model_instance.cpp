@@ -244,6 +244,18 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     default:
         throw std::invalid_argument("Engine purpose is invalid");
     }
+    if (options.scoring_decode_window != 0) {
+        if (options.purpose != EnginePurpose::CausalScoring) {
+            throw std::invalid_argument("scoring_decode_window requires a CausalScoring Engine");
+        }
+        if (options.scoring_decode_window > kMaximumScoringDecodeWindow) {
+            throw std::invalid_argument("scoring_decode_window must be in [1,16]");
+        }
+        if (options.devices.size() > 1) {
+            throw std::invalid_argument(
+                "scoring_decode_window supports one device; drop the pipeline device list");
+        }
+    }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }

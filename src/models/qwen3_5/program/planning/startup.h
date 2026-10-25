@@ -76,6 +76,9 @@ struct WorkspacePlan {
     std::size_t dflash_context   = 0;
     std::size_t dflash_round     = 0;
     std::size_t causal_score     = 0;
+    // Teacher-forced decode scoring: the widest of the T=1 ordinary step and the verify forwards
+    // up to the planned window, each with its output head. Zero without decode scoring.
+    std::size_t score_decode     = 0;
     std::size_t general_capacity = 0;
     // Resident: the encode workspace, folded into capacity after the general region. Overlay: the
     // per-window encode plan, borrowed per item; only the MTP bridge column lives in this workspace.
@@ -104,6 +107,8 @@ struct SequencePlanningInputs {
     models::LoadOptions features;
     bool use_cuda_graph               = true;
     bool causal_scoring               = false;
+    // EngineOptions::scoring_decode_window: zero, or the widest decode scoring window.
+    std::uint32_t scoring_decode_window = 0;
     int device                        = 0;
     std::int32_t multiprocessor_count = 0;
     ContextCacheOptions context_cache;
@@ -128,6 +133,8 @@ struct SequencePlanImpl {
     models::LoadOptions features;
     bool use_cuda_graph               = true;
     bool causal_scoring               = false;
+    // EngineOptions::scoring_decode_window: zero, or the widest decode scoring window.
+    std::uint32_t scoring_decode_window = 0;
     int device                        = 0;
     std::int32_t multiprocessor_count = 0;
     ContextCacheOptions context_cache;
@@ -140,6 +147,16 @@ struct SequencePlanImpl {
     // stage runs in, and its share of the graph allowance. Empty on one device.
     std::vector<std::size_t> extra_rank_reservation_bytes;
 };
+
+// Columns of the ReplaySSM records a Program plans: a speculative backend records its widest
+// verify round (verify_drafts + 1); decode scoring records its window from two columns up (one
+// column is the ordinary step, which records nothing); otherwise zero, no records.
+[[nodiscard]] constexpr std::uint32_t
+replay_record_width(SpeculativeBackend backend, std::uint32_t verify_drafts, bool causal_scoring,
+                    std::uint32_t scoring_decode_window) noexcept {
+    if (backend != SpeculativeBackend::None) { return verify_drafts + 1U; }
+    return causal_scoring && scoring_decode_window >= 2 ? scoring_decode_window : 0U;
+}
 
 // The widest forward pass a pipeline stage boundary carries: prefill columns, or every lane's
 // verification columns. Sizes the boundary links and the scratch each stage needs around its layers.
