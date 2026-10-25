@@ -293,6 +293,13 @@ void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, st
     issue_loads(compute);
 }
 
+void ExpertResidency::use_counts(std::vector<std::uint32_t>& out) const {
+    out.assign(static_cast<std::size_t>(layers_) * experts_, 0);
+    if (!controller_) { return; }
+    const auto& policy = controller_->policy();
+    for (std::uint32_t key = 0; key < policy.num_keys() && key < out.size(); ++key) { out[key] = policy.count(key); }
+}
+
 ExpertResidency::SavedState ExpertResidency::saved_state() const {
     SavedState out;
     if (!controller_) { return out; }

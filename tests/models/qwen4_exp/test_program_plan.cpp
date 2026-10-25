@@ -403,8 +403,9 @@ int main() {
         check(with_leg.fixed_bytes() == 504, "fixed_bytes counts the CPU service's counter");
 
         // --prefill-cpu-share: the same service, started for it alone (no MTP needed), its buffers sized
-        // for every miss of a static prefill call (kMaxCpuJobs jobs, the chunk's columns, at most
-        // kMaxCpuCallColumns); with --cpu-verify-misses too, one service holds both channels.
+        // for every miss of a prefill call (kMaxCpuJobs jobs; the wider of the chunk and a streamed
+        // call's 4,096 columns, at most kMaxCpuCallColumns and the context); with --cpu-verify-misses
+        // too, one service holds both channels. The worker team's buffers are pageable demand.
         q4::ProgramOptions share;
         share.max_context   = 32768;
         share.prefill_chunk = 1024;
@@ -414,15 +415,21 @@ int main() {
         share.prefill_cpu_share_den = 5;
         const q4::CpuMissPlan prefill = q4::plan_cpu_misses(share);
         check(prefill.device == 4 && prefill.workers == 6, "the share alone starts the service: its counter, 6 threads");
-        check(prefill.prefill_jobs == om::kMaxCpuJobs && prefill.prefill_columns == 1024 && prefill.share_num == 3 &&
+        check(prefill.prefill_jobs == om::kMaxCpuJobs && prefill.prefill_columns == 4096 && prefill.share_num == 3 &&
                   prefill.share_den == 5 && prefill.verify_jobs == 0 && prefill.max_jobs == om::kMaxCpuJobs &&
-                  prefill.max_columns == 1024,
-              "the prefill channel takes up to 512 jobs of calls of up to the 1024-column chunk at 3 / 5");
-        check(prefill.pinned == sizeof(om::MissRequest) + 2ULL * 2560 * 1024 + 2ULL * 2560 * 512 * 8 + 64 + 64,
-              "the share pins x for the chunk's 1024 columns and y for 512 jobs of 8 columns");
+                  prefill.max_columns == 4096,
+              "the prefill channel takes up to 512 jobs of calls of up to a streamed call's 4096 columns at 3 / 5");
+        check(prefill.pinned == sizeof(om::MissRequest) + 2ULL * 2560 * 4096 + 2ULL * 2560 * 512 * 8 + 64 + 64,
+              "the share pins x for 4096 columns and y for 512 jobs of 8 columns");
+        const std::uint64_t per_job = 8ULL * (2560 + 4 * 80 + 640 + 4 * 20) + sizeof(om::RecordGeometry) + sizeof(om::CpuExpertJob);
+        check(prefill.pageable == 512 * per_job && served.pageable == 4 * per_job,
+              "the worker team's buffers for 512 (share) or 4 (verification) jobs are pageable demand");
+        check(q4::plan_cpu_misses(q4::ProgramOptions{}).pageable == 0, "off plans no pageable buffers");
         share.prefill_chunk = 8192;
         check(q4::plan_cpu_misses(share).prefill_columns == om::kMaxCpuCallColumns,
               "a chunk above 4096 columns leaves its wider calls on the GPU");
+        share.prefill_chunk = 512;
+        check(q4::plan_cpu_misses(share).prefill_columns == 4096, "a small chunk still serves streamed calls");
         share.prefill_chunk = 1024;
         share.max_context   = 300;
         check(q4::plan_cpu_misses(share).prefill_columns == 300, "the context bounds the chunk");
@@ -431,7 +438,7 @@ int main() {
         share.mtp_draft_tokens  = 7;
         const q4::CpuMissPlan both_uses = q4::plan_cpu_misses(share);
         check(both_uses.verify_jobs == 4 && both_uses.verify_columns == 8 && both_uses.prefill_jobs == om::kMaxCpuJobs &&
-                  both_uses.max_jobs == om::kMaxCpuJobs && both_uses.max_columns == 1024 && both_uses.pinned == prefill.pinned &&
+                  both_uses.max_jobs == om::kMaxCpuJobs && both_uses.max_columns == 4096 && both_uses.pinned == prefill.pinned &&
                   both_uses.device == 4,
               "both options share one service sized for the larger use");
         const auto refuses = [&](const q4::ProgramOptions& o, const char* flag) {

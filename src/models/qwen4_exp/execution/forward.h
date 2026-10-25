@@ -73,8 +73,9 @@ struct ForwardExperts {
     // answering writes it, and the caller must fail the round. Empty: every call stays on the GPU.
     std::vector<ops::MoeCpuChannel> cpu;
     // Optional, per layer: the same service's channels with the share rule (MoeCpuChannel::share_num
-    // / share_den) for a prefill call that asks for it (ForwardBatch::cpu_share) while the expert
-    // stream is not active. Requires `error`, like `cpu`. Empty: prefill stays on the GPU.
+    // / share_den) for a prefill call that asks for it (ForwardBatch::cpu_share), streamed or not
+    // (a streamed call's misses are the experts the stream left out). Requires `error`, like `cpu`.
+    // Empty: prefill stays on the GPU.
     std::vector<ops::MoeCpuChannel> prefill_cpu;
     // Optional prefill expert stream: while it is active the MoE reads its per-layer frame tables
     // (streamed experts resident in the ring) and orders itself with the stream's copies.
@@ -137,8 +138,7 @@ struct ForwardBatch {
     Tensor logit_columns;    // I32 [n]: the columns whose logits are produced
     const ForwardVerify* verify = nullptr; // set for a speculative verification call (T = W >= 2)
     // A prefill or forced-token call whose routed experts hand the CPU share of their misses to
-    // ForwardExperts::prefill_cpu (ignored without those channels or while the expert stream is
-    // active: a streamed chunk's misses are in the ring).
+    // ForwardExperts::prefill_cpu (ignored without those channels).
     bool cpu_share = false;
     Tensor residual_out;     // when set: BF16 [S*H, T] copy of the final residual (the drafter's input)
     const MtpChunk* mtp_chunk = nullptr; // when set: the call's drafter cells (run_back writes them)
@@ -436,7 +436,7 @@ private:
     Tensor gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch);
     Tensor attention(const AttentionParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch);
     // The CPU channels a call of `batch` hands misses to: ForwardExperts::cpu for a verification,
-    // prefill_cpu for a cpu_share call without an active stream, else none (null).
+    // prefill_cpu for a cpu_share call, else none (null).
     [[nodiscard]] const std::vector<ops::MoeCpuChannel>* cpu_channels(const ForwardBatch& batch) const noexcept;
     // `cpu`: the call's CPU channels (cpu_channels; null or empty: every expert on the GPU). `read`:
     // the block's input as the fused read left it (x is read->x), whose routing it uses.

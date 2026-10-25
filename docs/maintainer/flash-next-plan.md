@@ -1056,58 +1056,70 @@ None has been measured on the RTX 3090 yet.
     driver may also hold the launch in its command buffer until the next synchronization; nsys
     should show the front running while the host reads. Measure tok/s on vs off, plain and with MTP.
     Untested under WDDM. Works with MTP and vision. Not measured.
-- **Prefill CPU share for short calls** (`--prefill-cpu-share F`; F9 of the Basalt learnings,
-  Basalt's `--prefill-cpu-share`, default 0.6 there). Short prompts are staging-bound (PR 12's
-  reproduction: 1,260 tok/s at 1K against 2,450 at 8K): a prefill call that does not stream its
-  experts stages each layer's misses over PCIe through the MoE's staging kernel. With the option, the
-  CPU miss service computes a share of them while the GPU stages and runs the rest. Basalt takes
+- **Prefill CPU share** (`--prefill-cpu-share F`; F9 of the Basalt learnings, Basalt's
+  `--prefill-cpu-share`, default 0.6 there). PR 12's reproduction measured 1,260 tok/s at 1K against
+  2,450 at 8K. With default chunking a 1K-2K prompt is one streamed call (4,096-token calls from 512
+  tokens up), so the 1K figure is bound by the expert stream: its copies of every layer's
+  non-resident experts, two layers ahead, have little compute to hide behind in a short call. Only
+  prompts and tails under 512 tokens (and every call when the cache cannot lend the ring) stage their
+  misses through the MoE's staging kernel. With the option the CPU miss service computes a share of a
+  layer's non-resident experts while the GPU streams or stages and runs the rest. Basalt takes
   llround(share × n) of a layer's n streamed experts, the candidates (at most 8 rows, a host copy)
-  ordered by (rows, id); ours takes the same count exactly, (2 × num × n + den) / (2 × den) with F stored as
-  num / den (0.6 is 3 / 5), the fewest-column misses of at most 8 columns first, ties to the lower
-  expert id (job order: jobs are in ascending id).
-  - Which calls: the share applies to calls that do not use the expert stream (`ForwardBatch::cpu_share`,
-    set by `run_call` for every non-wide call: prompts and tails under `kStreamMinColumns` = 512,
-    forced tokens, and every call when the cache cannot lend the ring). The stream decides its copies
-    before routing (two layers ahead, the non-resident experts in id order up to half the ring), so
-    leaving the CPU's experts out of its tables would need the routing first; a streamed chunk also
-    routes nearly every expert with many rows, which the CPU does not take. So `expert_stream.cpp` is
-    unchanged, and `Forward::cpu_channels` ignores `cpu_share` while the stream is active. The static
-    route stages after routing, on the device, per call, so excluding the CPU's jobs there is the
-    existing `cpu_flags` path: the stage kernel and the narrow and wide expert kernels skip them.
+  ordered by (rows, id). Ours takes the same count exactly, (2 × num × n + den) / (2 × den), with F
+  stored as num / den (0.6 is 3 / 5), the fewest-column misses of at most 8 columns first, ties to the
+  lower expert id (job order: jobs are in ascending id).
+  - Static calls (`run_call` with the stream off): the static route stages after routing, on the
+    device, per call; the CPU's jobs are left out of staging by the existing `cpu_flags` path (the
+    stage kernel and the narrow and wide expert kernels skip them).
+  - Streamed calls: the stream decides its copies before the layer routes, so it needs a prior.
+    `ExpertStream::begin` takes a `Share` (num / den and the expert cache's LFRU use counts,
+    `ExpertResidency::use_counts`: every key's global use count, kept by the cache's policy from
+    every routed call, decode and prefill, and seeded by the warm start; the cheapest prior that
+    exists before routing). Per layer `offloaded_moe::select_stream_cold` leaves out round(F × s) of
+    the layer's non-resident experts, s being the number the half-ring would stream, those with the
+    lowest counts (ties to the lower id); they stay -1 in the stream table, so `covers_all()` is
+    false and the call keeps its staging pass. The call's MoE then applies the share rule to its
+    misses (the cold set the call routes plus any beyond the ring), as on a static call, so the CPU
+    takes F of the routed cold experts with at most 8 columns and the GPU stages the rest. A cold
+    guess that routes many rows is staged, not computed on the CPU. `Forward::cpu_channels` no longer
+    drops the share while the stream is active.
   - Design: the same `CpuMissService` as `--cpu-verify-misses`, started for either option, with its
     buffers sized for the larger use (`plan_cpu_misses`). `MoeCpuChannel` gains `share_num` /
-    `share_den` beside `pcie_divisor` (declared last, so the other fields keep their kernel-parameter
-    offsets); `share_den > 0` selects the share rule in `cpu_plan_kernel`, otherwise the divisor
-    rule, so verification keeps Task 17's divisor. `ForwardExperts::prefill_cpu` holds the prefill
-    channels (512 jobs, calls up to the static chunk, at most `kMaxCpuCallColumns`), narrowed from
-    the same service channel as the verification's. Layer calls run in stream order and each wait
-    precedes the next call's plan, so one request buffer serves both. The order is the
+    `share_den` beside `pcie_divisor`, as two 16-bit words in its tail padding, so the struct size and
+    every kernel's parameter offsets are unchanged; `share_den > 0` selects the share rule in
+    `cpu_plan_kernel`, otherwise the divisor rule, so verification keeps Task 17's divisor.
+    `ForwardExperts::prefill_cpu` holds the prefill channels (512 jobs, calls up to the wider of the
+    static chunk and the 4,096-column streamed call, at most `kMaxCpuCallColumns` and the context),
+    narrowed from the same service channel as the verification's. Layer calls run in stream order and
+    each wait precedes the next call's plan, so one request buffer serves both. The order is the
     verification's: experts without the wait, the shared expert, then `moe_experts_cpu_wait`.
-  - Bit-identical by construction (the CPU engine equals every GPU placement). Host mirror:
-    `offloaded_moe::cpu_share_take` and `select_prefill_cpu_jobs`
-    (`src/ops/offloaded_sparse_moe/cpu_share.h`, in `ninfer_moe_cpu_selection_test`: the take equals
-    llround(0.6 n) for n <= 1024, the row cap, (rows, id) order, share 0). GPU
-    (`ninfer_offloaded_moe_wide_test`, prefill_cpu_share): shares 3/5, 1/1 and 1/3, staged through 4
-    or 64 slots and zero-copy, at T in {1, 16, 65, 300, 600} (wide experts beside the CPU's; 600 puts
-    every GPU job on the wide route), eagerly and in two graph replays: outputs against the CPU engine
-    bit for bit, each `MissRequest` against `select_prefill_cpu_jobs` with compacted columns. End to
-    end `ninfer_qwen4_exp_prefill_cpu_share_test` (greedy ids of the 300-token prompt with a 4 GiB
-    cache equal those without the option, and the CPU served at least one expert). None has run yet.
+  - Bit-identical by construction: placement only (the CPU engine equals every GPU placement).
+    Host mirror: `cpu_share_take`, `select_prefill_cpu_jobs` and `select_stream_cold`
+    (`src/ops/offloaded_sparse_moe/cpu_share.h`, in `ninfer_moe_cpu_selection_test`). GPU
+    (`ninfer_offloaded_moe_wide_test`): prefill_cpu_share (shares 3/5, 1/1 and 1/3, staged through 4
+    or 64 slots and zero-copy, T in {1, 16, 65, 300, 600}) and prefill_cpu_share_streamed (a stream
+    table of cache and ring frames with the cold set left -1, 512 experts, T in {1024, 2048}), each
+    eagerly and in two graph replays: outputs against the CPU engine bit for bit, each `MissRequest`
+    against `select_prefill_cpu_jobs` with compacted columns. End to end
+    `ninfer_qwen4_exp_prefill_cpu_share_test` (greedy ids of 300-, 1,024- and 2,048-token prompts with a
+    4 GiB cache equal those without the option, the CPU served at least one expert and a stream left
+    at least one out). None has run yet.
   - Failure: as for verification, a layer whose wait times out writes the error word; each prefill
-    and forced-token call checks it after its synchronization and throws (the request ends, the
-    lane is released). Once the service thread has died the Program stops setting `cpu_share` and
-    says so once.
+    and forced-token call that handed the service its share checks it after its synchronization and
+    throws (the request ends, the lane is released). Once the service thread has died the Program
+    stops setting `cpu_share` (and the stream stops leaving experts out) and says so once.
   - Memory: one 4-byte device counter (`ProgramDevicePlan::cpu_misses`, shared with
-    `--cpu-verify-misses`); pinned for the RAM ledger: the request, x for the chunk's columns (5 MiB
-    at 1,024) and y for 512 jobs of 8 columns (20 MiB), about 26 MiB. The worker team's own buffers
-    for 512 jobs (about 14 MiB pageable) are not in the ledger.
-  - Costs to measure: `cpu_plan_kernel` publishes the chosen jobs' x columns with one CTA, which for a
-    call of hundreds of columns is a few MiB over PCIe from one CTA per layer; the CPU computes up to
-    hundreds of experts per layer (about 100 µs each at 6 workers in PR 11, so raise
-    `--cpu-verify-workers`); the GPU's staging of the rest runs meanwhile. GPU-session checks: tok/s
-    at 1K and on 300-token prompts on vs off at shares 0.4-0.8 and 6, 12 and 16 workers, the plan
-    kernel's time at 1,024 columns, and the WDDM/TDR check of `--cpu-verify-misses` (a layer's wait
-    here is milliseconds, not microseconds). Works with two lanes, MTP and vision. Not measured.
+    `--cpu-verify-misses`); pinned for the RAM ledger: the request, x for 4,096 columns (20 MiB) and y
+    for 512 jobs of 8 columns (20 MiB), about 40 MiB; pageable for the ledger: the worker team's
+    buffers for 512 jobs (about 14 MiB, `CpuMissPlan::pageable`).
+  - GPU-session checks: tok/s at 300 tokens, 1K and 2K on vs off at shares 0.4-0.8 and 6, 12 and 16
+    workers (`--cpu-verify-workers`; about 100 µs per expert at 6 in PR 11, and a layer may hand the
+    CPU over a hundred); the cost of `cpu_plan_kernel`'s one-CTA x publish at 1-2K columns (a few
+    MiB over PCIe per layer from one CTA, and thread 0 compacts the columns serially); whether
+    leaving experts out of the stream costs more staging (on the SMs, inside the layer) than the CPU
+    saves (the share of routed cold experts with more than 8 columns, and whether a share of 1 for
+    the cold set would do better); and the WDDM/TDR check of `--cpu-verify-misses` (a layer's wait
+    here is milliseconds). Works with two lanes, MTP and vision. Not measured.
 
 ## Artifact decisions
 
