@@ -360,13 +360,15 @@ replayed from a CUDA graph (the reported rate) and launched eagerly. The rate co
 over 1-16 workers, rotating through 96 records so none is cache-resident. Records are random blocks
 with finite scales; medians of `--reps` (default 30).
 
-Options: `--mode gpu|cpu|all`, `--experts N` (1-16, default 10), `--reps N` (default 30) and
-`--misses N` (1-`--experts`, default 1).
+Options: `--mode gpu|cpu|all`, `--experts N` (1-16, default 10), `--reps N` (default 30),
+`--misses N` (1-`--experts`, default 1) and `--precast 0|1` (default 0; 1 sets
+`MoeExpertSource::precast_input`, the input cast to A8 once per call, for an A/B of the GPU rows).
 
 ```bash
 ./build/bench/ninfer_benches ninfer_offloaded_moe_bench
 ./build/bench/ninfer_benches ninfer_offloaded_moe_bench --mode cpu --reps 50
 ./build/bench/ninfer_benches ninfer_offloaded_moe_bench --mode gpu --misses 3
+./build/bench/ninfer_benches ninfer_offloaded_moe_bench --mode gpu --precast 1
 ```
 
 ## QSA Op benchmark

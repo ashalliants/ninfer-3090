@@ -719,6 +719,29 @@ None has been measured on the RTX 3090 yet.
     `ProgramDevicePlan::speculation`); the fold registers the [16, 48, 10240, Tiled] geometry. Off,
     the copies, the records and the fold are those of master. Works with two lanes, MTP and vision.
     Not measured.
+- **The routed experts' input cast once per call** (`--moe-precast-input`). Without it every
+  narrow-route gate/up CTA casts its expert's columns of x to A8 (q8_1: int8 codes and an FP32 scale
+  per 32 values) into shared memory: the 40 CTAs of an expert each cast the same columns, and every
+  expert a column is routed to casts it again. With it `moe_experts` runs one kernel that casts every
+  column of x into the call's workspace (codes [T][2560], scales [T][80]) before the passes, and the
+  gate/up CTAs copy their columns' codes and scales into the same shared layout instead
+  (`MoeExpertSource::precast_input`; a compile-time kernel parameter, so the default instances are
+  master's code: cuobjdump SASS of all 24 kernels of `moe_layer.cu` is identical to f6bf9e4d). The
+  wide route keeps its own cast (leaf-major, `wide_expert.cu`), and a call whose experts all take it
+  (512 columns or more) runs no precast kernel. The down kernel still casts h per CTA (a follow-up).
+  - The same cast (`ggml::quantize_q8_1_group`, the canonical A8 cast) on the same values, so the
+    codes and the outputs are designed to equal the per-CTA casts bit for bit:
+    `ninfer_offloaded_moe_layer_test` runs every placement (device frames, zero-copy, staged,
+    mixed, CPU-served, the zero-copy rule) with and without it against the CPU engine at
+    T in {1, 2, 7, 8, 16} (precast_bitwise); end to end `ninfer_qwen4_exp_forward_real_test
+    --moe-precast-input TOKENS` (prompt, verification and decode logits bitwise against off) and
+    `ninfer_qwen4_exp_moe_precast_test` (greedy ids with MTP). None has run yet.
+  - Memory: the call's workspace grows by T * (2560 + 320) bytes (each plane rounded up to 256), in
+    the forward's workspace term (`Forward::moe_workspace_bytes`, so `ProgramDevicePlan::workspace`
+    and a wide prefill's lent arena include it: 2.8 MiB at a 1,024-column chunk; the MoE term is one
+    of the maxima, so the total may not grow). No other device memory.
+  - Works with two lanes, MTP (the drafter's and the verification's calls) and vision. Not
+    measured.
 
 ## Artifact decisions
 

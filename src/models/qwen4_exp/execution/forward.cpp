@@ -151,7 +151,8 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
       state_(std::move(state)), kv_(std::move(kv)), experts_(std::move(experts)), mtp_(std::move(mtp)),
       side_(options.shared_expert_stream ? std::make_unique<SideStream>() : nullptr),
       hot_embedding_rows_(options.hot_embedding_rows), hot_embedding_(options.hot_embedding),
-      cold_embedding_(options.cold_embedding), gdn_head_map_(options.gdn_head_map) {
+      cold_embedding_(options.cold_embedding), gdn_head_map_(options.gdn_head_map),
+      moe_precast_input_(options.moe_precast_input) {
     if (state_.gdn_conv.size() != config_.gdn_layers || state_.gdn_recurrent.size() != config_.gdn_layers ||
         state_.ple_slot.dtype != DType::I32 || state_.ple_slot.numel() != 1 ||
         state_.qsa_tails.size() != config_.attention_layers || kv_.layers.size() != config_.attention_layers ||
@@ -177,7 +178,8 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
     : parameters_(parameters), config_(parameters.model.config()), device_(device), work_(&work),
       experts_(std::move(experts)), side_(options.shared_expert_stream ? std::make_unique<SideStream>() : nullptr),
       hot_embedding_rows_(options.hot_embedding_rows), hot_embedding_(options.hot_embedding),
-      cold_embedding_(options.cold_embedding), gdn_head_map_(options.gdn_head_map) {
+      cold_embedding_(options.cold_embedding), gdn_head_map_(options.gdn_head_map),
+      moe_precast_input_(options.moe_precast_input) {
     if (mtp.has_value() != parameters_.mtp.has_value()) {
         throw std::invalid_argument("Qwen4Exp forward: the MTP drafter's parameters and state go together");
     }
@@ -268,10 +270,20 @@ void Forward::select_row(std::int32_t slot) {
     if (!rows_->slot_mtp.empty()) { mtp_ = rows_->slot_mtp[static_cast<std::size_t>(slot)]; }
 }
 
-std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, std::uint32_t max_visible_keys,
-                                     DeviceExecutionView execution) {
+std::size_t Forward::moe_workspace_bytes(const TextConfig& c, std::int32_t columns, bool moe_precast_input) {
     const std::size_t t = static_cast<std::size_t>(columns), bf = 2, f = 4;
-    const std::size_t h = c.hidden_size, w = c.residual_width(), k = c.moe.top_k;
+    const std::size_t h = c.hidden_size, k = c.moe.top_k;
+    const std::int32_t entries = dim(k * t), max_jobs = std::min(dim(c.moe.experts), entries);
+    return (c.moe.experts + 1) * t * f + k * t * (f * 2) + t * f +
+           ops::moe_dispatch_bytes(dim(c.moe.experts), entries) + h * k * t * bf +
+           ops::moe_experts_workspace_bytes(max_jobs, entries, columns, moe_precast_input) +
+           std::size_t(c.moe.shared_intermediate) * t * bf * 3 + h * t * bf * 2;
+}
+
+std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, std::uint32_t max_visible_keys,
+                                     DeviceExecutionView execution, bool moe_precast_input) {
+    const std::size_t t = static_cast<std::size_t>(columns), bf = 2, f = 4;
+    const std::size_t h = c.hidden_size, w = c.residual_width();
     std::size_t bytes = w * t * bf;                                               // residual
     bytes += h * t * bf * 2 + c.hc.streams * t * f;                               // mixer x, inject
     bytes += (c.hc.rank + c.hc.streams) * t * (bf + f) * 2 + w * t * f * 2;       // mixer scratch bound
@@ -290,11 +302,7 @@ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, 
                                                      dim(c.attention.kv_heads)},
                                                     geometry, KvCacheStorage::Int8Group64, 1, columns, execution);
     const std::size_t ple = std::size_t(c.ple.embed_dim) * t * bf + (w + h) * t * bf * 2 + w * t * bf * 2;
-    const std::int32_t entries = dim(k * t);
-    const std::size_t moe = (c.moe.experts + 1) * t * f + k * t * (f * 2) + t * f +
-                            ops::moe_dispatch_bytes(dim(c.moe.experts), entries) + h * k * t * bf +
-                            ops::moe_experts_workspace_bytes(std::min(dim(c.moe.experts), entries), entries, columns) +
-                            std::size_t(c.moe.shared_intermediate) * t * bf * 3 + h * t * bf * 2;
+    const std::size_t moe = moe_workspace_bytes(c, columns, moe_precast_input);
     bytes += std::max({gdn, attention, ple, moe});
     // Linear's activation casts and the composed mixer route, plus alignment slack per allocation.
     bytes += w * t * (bf + f) * 2 + (256ULL << 20);
@@ -687,6 +695,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
                                 .staging_base  = experts_.staging_base,
                                 .staging_slots = experts_.staging_slots,
                                 .zero_copy_misses = experts_.zero_copy_misses};
+    source.precast_input = moe_precast_input_;
     ExpertStream* stream = experts_.stream != nullptr && experts_.stream->active() ? experts_.stream : nullptr;
     if (stream != nullptr) {
         source.frames = stream->table(layer);
@@ -696,7 +705,8 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     }
     Tensor outputs              = work_->alloc(DType::BF16, {H, K * T});
     const std::int32_t max_jobs = std::min(E, K * T);
-    const DeviceSpan expert_ws  = work_->alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T, T));
+    const DeviceSpan expert_ws  =
+        work_->alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T, T, moe_precast_input_));
     ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s);
     if (stream != nullptr) { stream->after_experts(layer, s); }
 
@@ -1168,6 +1178,7 @@ void Forward::mtp_block(const MtpCall& call) {
         ops::MoeDispatch dispatch       = ops::carve_moe_dispatch(dispatch_bytes.data, E, K * T);
         ops::moe_dispatch(routing, E, dispatch, nullptr, s);
         const ops::MoeExpertSource source{.format        = p.bank->format,
+                                          .precast_input = moe_precast_input_,
                                           .frame_base    = p.bank->device_records,
                                           .frames        = static_cast<const std::int32_t*>(mtp_frames_.data),
                                           .host_records  = p.bank->device_records,
@@ -1175,7 +1186,8 @@ void Forward::mtp_block(const MtpCall& call) {
                                           .frame_stride  = p.bank->record_stride};
         Tensor outputs              = work_->alloc(DType::BF16, {H, K * T});
         const std::int32_t max_jobs = std::min(E, K * T);
-        const DeviceSpan expert_ws  = work_->alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T, T));
+        const DeviceSpan expert_ws  =
+            work_->alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T, T, moe_precast_input_));
         ops::moe_experts(xm, dispatch, source, K, max_jobs, expert_ws.data, outputs, s);
         if (fork) {
             fork->join();
@@ -1217,7 +1229,7 @@ void Forward::mtp_block(const MtpCall& call) {
 }
 
 std::size_t Forward::mtp_workspace_bytes(const TextConfig& c, std::int32_t columns, std::uint32_t max_visible_keys,
-                                         DeviceExecutionView execution) {
+                                         DeviceExecutionView execution, bool moe_precast_input) {
     const std::size_t t = static_cast<std::size_t>(columns), bf = 2, f = 4;
     const std::size_t h = c.hidden_size, w = c.residual_width(), v = c.vocab_size;
     // A block at `columns` columns (as the text forward sizes one), the fusion's tensors, the
@@ -1225,7 +1237,7 @@ std::size_t Forward::mtp_workspace_bytes(const TextConfig& c, std::int32_t colum
     // probability Op's scratch in its place.
     const std::size_t draft = std::max<std::size_t>(
         v * bf, ops::argmax_probability_workspace_capacity_bytes(static_cast<std::int32_t>(v), 1, 1));
-    return workspace_bytes(c, columns, max_visible_keys, execution) + (h * 4 + w * 2) * t * bf +
+    return workspace_bytes(c, columns, max_visible_keys, execution, moe_precast_input) + (h * 4 + w * 2) * t * bf +
            (2 * std::size_t(c.attention.query_width()) + 2 * std::size_t(c.attention.key_width()) + 1024) * t * f +
            v * f + draft + (8ULL << 20);
 }

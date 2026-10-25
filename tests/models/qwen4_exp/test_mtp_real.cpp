@@ -252,9 +252,9 @@ struct Harness {
         experts.staging_slots  = 64;
         const auto keys        = static_cast<std::uint32_t>(context);
         work = std::make_unique<WorkspaceArena>(
-            std::max(ex::Forward::workspace_bytes(c, columns, keys, device.execution_view()),
+            std::max(ex::Forward::workspace_bytes(c, columns, keys, device.execution_view(), options.moe_precast_input),
                      ex::Forward::mtp_workspace_bytes(c, std::min(columns, ex::kMtpChunkColumns), keys,
-                                                      device.execution_view())) +
+                                                      device.execution_view(), options.moe_precast_input)) +
             w * ex::kMtpChunkColumns * 6 +
             (options.shared_expert_stream ? ex::Forward::shared_expert_workspace_bytes(c, columns) : 0));
         forward = std::make_unique<ex::Forward>(parameters, device, *work, std::move(fs), std::move(fkv),
