@@ -281,6 +281,7 @@ Before the first scout chunk the Program copies the sequence's GDN conv and recu
 
 **Interfaces:**
 - Produces: `python tools/bench/run_lossy_prefill_sweep.py --server-cmd "<ninfer-serve ...>" --grid filter_layer=7,11,15,23,31 keep=0.1,0.2,0.3,0.5 block=32,64,128 --workloads needle,agent_replay,greedy_agreement,speed --out <dir>`; for each grid point it starts a fresh server with the flags, runs the workloads, and writes `results.jsonl` plus a `summary.md` table with each acceptance check marked pass/fail against the Global Constraints numbers. `--from-json` re-summarises.
+- Every grid point also takes `strategy=select|summary` (Task 16); the summary strategy ignores the selection knobs, so the harness runs it once per workload.
 - Workloads: needle = `eval` evalscope needle_haystack at 32K/64K/100K × 5 depths (config derived from `eval/configs/qwen3_6_35b_needle_haystack.yaml`); agent_replay = `python -m tools.bench.agent_replay run --min-context 30000 --max-context 120000`, metrics: tool-call validity and `Edit` `old_string`-in-file rate; greedy_agreement = first-divergence token index vs baseline on 20 long prompts; speed = `run_prefill_stall.py` 108K prompt (total, scout, main from the request log; neighbour worst gap with `--prefill-layer-slices 8`).
 - The spec's teacher-forced KL is **not** in v1: `Program::causal_score` does not go through admission, so it would need its own lossy path. Greedy agreement replaces it. (Flag this deviation in the PR.)
 
@@ -332,6 +333,68 @@ void q4_a4_linear(const Tensor& xq, const Tensor& xs, const QuantizedWeight& w, 
 - [ ] **Step 2-3:** implement; GPU run → PASS.
 - [ ] **Step 4:** sweep the chosen default with `--lossy-prefill-scout-a4`; record the gate (Jaccard, quality, speed). Enable by default only if all three pass; else leave opt-in and record why.
 - [ ] **Step 5: Commit** `perf(qwen3_5): int4 scout GEMMs`.
+
+### Task 15: Deterministic conversation projector (CPU)
+
+**Files:**
+- Create: `src/runtime/engine/compaction/vcc_projector.h`, `vcc_projector.cpp`, `src/runtime/engine/compaction/NOTICE` (Apache-2.0 attribution to hermes-vcc-engine `31ee4fe7`)
+- Create: `tools/bench/vcc_golden.py` (runs the pinned Python projector from a clone given by `--vcc-repo` on our transcript fixtures and writes expected outputs; run with `python3 -I` from outside the clone)
+- Create: `tests/fixtures/vcc/*.json` (inputs: their `tests/transcripts.py` cases converted, plus 3 agent-replay sessions exported via `python -m tools.bench.agent_replay export`), `tests/fixtures/vcc/*.expected.txt`
+- Test: `tests/runtime/test_vcc_projector.cpp` → `ninfer_vcc_projector_test` (cpu, host-only)
+
+**Interfaces:**
+- Produces:
+```cpp
+namespace ninfer::runtime::compaction {
+struct ProjectorLimits { /* the Python Limits defaults, same names, same values */ };
+// messages[first, last) is the region to summarise; indices in [#N] tags are absolute message indices.
+[[nodiscard]] std::string project_transcript(std::span<const ChatMessage> messages, std::size_t first,
+                                             std::size_t last, std::size_t budget_chars,
+                                             const ProjectorLimits& limits = {});
+}
+```
+Port `vcc/projector.py` only (not `engine.py` / `anchors.py`, which are Hermes glue). ChatMessage ↔ Hermes dict mapping: role, text parts joined, `tool_calls` (name, arguments JSON), `tool_call_id`.
+
+- [ ] **Step 1:** Write `vcc_golden.py` and generate fixtures from the pinned commit (record the commit hash in each expected file's sidecar `.meta`).
+- [ ] **Step 2:** Write the failing test: every fixture's `project_transcript` output equals its `.expected.txt` byte for byte; plus `Projector.Deterministic` and `Projector.RespectsBudget` (output length ≤ budget_chars).
+- [ ] **Step 3:** Run → FAIL. **Step 4:** Implement the port. **Step 5:** Run → PASS; cpu set.
+- [ ] **Step 6: Commit** `feat(engine): deterministic conversation projector (port of hermes-vcc-engine)`.
+
+### Task 16: Summary strategy in the engine (CPU)
+
+**Files:**
+- Modify: `include/ninfer/types.h` (`LossyPrefillOptions`: `enum class LossyStrategy { Select, Summary } strategy = Select; std::uint32_t summary_max_tokens = 8000;`), `src/serve/serve_options.{h,cpp}` (`--lossy-prefill-strategy select|summary`, `--lossy-prefill-summary-max-tokens`), `tests/test_serve_options.cpp`
+- Create: `src/runtime/engine/compaction/summary_split.{h,cpp}` (head/tail split), `summary_registry.{h,cpp}` (continuity)
+- Modify: `src/runtime/engine/engine.cpp` (`Engine::prepare`: registry substitution, trigger, re-prepare; usage `prompt_tokens` = original), engine-side reuse probe, metrics/request log (`lossy_prefill.strategy`, `summarized_messages: [first, last)`)
+- Test: `tests/runtime/test_summary_strategy.cpp` → `ninfer_summary_strategy_test` (cpu)
+
+**Interfaces:**
+- Consumes: `project_transcript` (Task 15), Task 1 options, Task 8 counters/request-log writer.
+- Produces:
+```cpp
+struct SummarySplit { std::size_t first = 0, last = 0; };   // middle = [first, last); empty if first >= last
+[[nodiscard]] SummarySplit split_for_summary(std::span<const ChatMessage>, std::size_t protect_first = 3,
+                                             std::size_t protect_last = 20, std::size_t min_tail_users = 1);
+class SummaryRegistry {  // thread-safe, bounded (LRU, 256 entries)
+public:
+    void record(std::span<const ChatMessage> original_prefix, std::string summary);
+    // Longest recorded prefix the messages start with (exact comparison), or nullopt.
+    [[nodiscard]] std::optional<std::pair<std::size_t, std::string>> find(std::span<const ChatMessage>) const;
+};
+[[nodiscard]] PromptInput substitute_summary(PromptInput input, std::size_t first, std::size_t last,
+                                             std::string summary);
+// Engine: true when a private (conversation) record would be reused by this prompt; thread-safe.
+[[nodiscard]] bool Engine::Impl::has_private_reuse(const PreparedPrompt&) const;
+```
+- Split rules: head = leading System/Developer messages plus `protect_first` messages; tail starts at the latest index that leaves ≥ `protect_last` messages and ≥ `min_tail_users` real user messages, moved earlier so it never starts at a Tool message or between an Assistant tool call and its results.
+- Summary message: one `ChatRole::User` message, text = `"[Server-side summary of messages " + first + "-" + (last-1) + "; originals omitted]\n" + projection`.
+- `has_private_reuse`: whatever admission's source lookup uses, under its lock; if no thread-safe path exists, post a probe to the worker loop and wait (bounded 50 ms, treat timeout as "warm" so nothing is summarised on doubt).
+
+- [ ] **Step 1: Write failing tests:** `Split.KeepsHeadAndTail`, `Split.NeverOrphansToolResult`, `Split.TooShortGivesEmptyMiddle`; `Registry.FollowUpGetsSameSummary` (record, then a longer conversation starting with the same prefix → same summary and range), `Registry.DivergentPrefixNoHit`, `Registry.EvictsOldest`; `SummaryStrategy.WarmConversationNotSummarised` (probe true → input unchanged), `SummaryStrategy.ColdLongSummarised` (fake frontend counting tokens by characters; probe false, 40K → summarised, `prompt_tokens` reported as the original), `SummaryStrategy.SelectStrategyUnaffected`; option parsing tests for the two flags.
+- [ ] **Step 2:** Run → FAIL. **Step 3:** Implement. **Step 4:** Run → PASS; cpu set.
+- [ ] **Step 5: Commit** `feat(engine): summary strategy for lossy prefill (opt-in)`.
+
+GPU check (batched phase): `lossy_summary_follow_up_turn_reuses` in `test_engine_prefix_real.cpp` (40K cold agent conversation with `--lossy-prefill-strategy summary`, then its follow-up: reused tokens ≥ the summarised prompt minus its last turn).
 
 ### Task 14: Pull request
 

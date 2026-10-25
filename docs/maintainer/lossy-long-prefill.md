@@ -239,6 +239,34 @@ gate below measures. Prior art for the 3090: QuaRot (CUTLASS int4, ~2x over FP16
 3090, [arXiv 2606.08761](https://arxiv.org/pdf/2606.08761)). Against our int8 route the expected gain on
 the scout's GEMMs is about 1.6x **(predicted)**.
 
+### Alternative strategy: deterministic conversation summary (`--lossy-prefill-strategy summary`)
+
+Added 2026-10-25 at the user's request as a flagged option for comparison, not the production choice.
+It ports the rule-based projector of [hermes-vcc-engine](https://github.com/danbiocchi/hermes-vcc-engine)
+(Apache-2.0, commit `31ee4fe7`, after the VCC paper, arXiv 2603.29678) to C++. Instead of thinning tokens,
+it rewrites the *messages*: it keeps the head (system/developer messages, tool definitions and the first
+3 messages) and the tail (the last 20 messages, at least one real user message and everything after it, never
+splitting a tool call from its result), and replaces the middle with one User message holding the
+projector's sections (goal, errors and fixes, error names, relevant files, commands run with exit codes,
+and a session log with `[#N]` references to message indices). The output is deterministic and makes no model call.
+
+- **Trigger:** the same as the token strategy (enabled, cold, and more than `min_tokens` after the product
+  prompt). The rendered original is prepared first to count tokens; a thread-safe reuse probe decides
+  coldness; if it fires, the summarized `PromptInput` is prepared and admitted as an ordinary exact prompt
+  (regular positions, no scout, no gap map).
+- **Continuity:** a bounded in-memory registry maps the exact original message prefix that was summarized
+  (the head plus the middle, compared exactly, with a digest only as a shortlist) to the summary text. A later
+  request whose messages start with that prefix gets the same summary substituted, whatever its length, so
+  it renders the same tokens and hits the cache as an ordinary conversation.
+- **Budget:** the summary is at most `min(0.06 × max_context, 8000)` tokens and at least 1,500
+  (`--lossy-prefill-summary-max-tokens`), as in the original.
+- **Usage and log:** `prompt_tokens` is the original rendered length; the request log records
+  `lossy_prefill.strategy = "summary"` and the summarized message range.
+- **Correctness reference:** the C++ projector must reproduce the Python projector's output byte for byte on
+  recorded transcripts (golden files generated from the pinned commit).
+- **Known weakness:** it drops file contents from the middle; Hermes relies on a `session_search` tool to recover
+  them, which our clients do not have. The agent-replay `Edit` metric is where the two strategies are compared.
+
 ## Expected numbers (predicted, 27B, 100K uncached, chunk 4096)
 
 Baseline split: GEMM ≈ 33 s, attention ≈ 22 s (55 s measured total, 40% attention measured).
