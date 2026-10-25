@@ -363,6 +363,12 @@ struct FlashNextOptions {
     // writes it.
     std::filesystem::path expert_state_path;
     bool save_expert_state = true;
+    // A default expert state shipped beside the model, for a fresh install: read (never written)
+    // only when the saved state above is missing or belongs to another artifact, and accepted for
+    // any copy of the artifact because its identity is the artifact id. Empty uses
+    // `<artifact>.expert-state.default`; no such file ships yet, and a missing one changes nothing.
+    // `save_expert_state = false` reads it no more than the saved state.
+    std::filesystem::path default_expert_state_path;
     // Device memory the expert cache leaves free for the display and other programs once every
     // fixed allocation is made. Empty: 512 MiB with a display attached, 256 MiB headless.
     std::optional<std::uint64_t> vram_headroom_bytes;

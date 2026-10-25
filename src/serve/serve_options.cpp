@@ -174,7 +174,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--reasoning-loop off|stop|conclude] "
            "[--vision] [--vision-residency resident|overlay] [--vision-max-merged N] "
            "[--no-cuda-graph] [--no-prefix-reuse] [--devices N,M,...] [--stage-layers A,B,...] "
-           "[--ngram-volume FILE] [--ngram-keepalive-ms N] [--expert-state FILE|--no-expert-state] "
+           "[--ngram-volume FILE] [--ngram-keepalive-ms N] [--expert-state FILE|--no-expert-state] [--default-expert-state FILE] "
            "[--vram-headroom-mib N] [--shared-expert-stream] [--mtp-constrained] [--mtp-joint-acceptance] [--ngram-prefetch] "
            "[--ram-headroom-mib N] [--expert-cache-mib N] [--context-nvme-mib N [--context-nvme-dir DIR]] "
            "[--chat-template FILE] "
@@ -254,7 +254,9 @@ std::string serve_usage_text(const char* argv0) {
            "reads a block from it after N ms of idleness so the drive stays awake (default 40, "
            "0 turns it off); --expert-state FILE "
            "keeps the VRAM expert cache's state across restarts (default <model>.expert-state; "
-           "--no-expert-state starts it empty and saves nothing); --vram-headroom-mib N is the VRAM "
+           "--no-expert-state starts it empty and saves nothing); --default-expert-state FILE is a state "
+           "shipped for a fresh install, read only when the saved one is missing or belongs to another "
+           "artifact (default <model>.expert-state.default); --vram-headroom-mib N is the VRAM "
            "the expert cache leaves free for the desktop (default 512 with a display, 256 without); "
            "--ram-headroom-mib N is the RAM left free for Windows once every expert is pinned "
            "(default 2048; startup refuses when it cannot be kept); --expert-cache-mib N caps the "
@@ -677,6 +679,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.flash_next.expert_state_path = require_value("--expert-state");
             if (options.flash_next.expert_state_path.empty()) {
                 throw std::invalid_argument("--expert-state must not be empty");
+            }
+        } else if (arg == "--default-expert-state") {
+            options.flash_next.default_expert_state_path = require_value("--default-expert-state");
+            if (options.flash_next.default_expert_state_path.empty()) {
+                throw std::invalid_argument("--default-expert-state must not be empty");
             }
         } else if (arg == "--no-expert-state") {
             options.flash_next.save_expert_state = false;

@@ -17,6 +17,7 @@
 #include "core/vram_budget.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen4_exp/memory_plan.h"
+#include "models/qwen4_exp/program/expert_cache/expert_state.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "models/registry.h"
 #include "runtime/engine/validate_options.h"
@@ -349,20 +350,16 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.ngram_volume    = next.ngram_volume_path.empty()
                                           ? models::qwen4_exp::default_ngram_volume(options.artifact_path)
                                           : next.ngram_volume_path;
-    if (next.save_expert_state) {
-        std::filesystem::path state = next.expert_state_path;
-        if (state.empty()) {
-            state = options.artifact_path;
-            state += ".expert-state";
-        }
-        // The state belongs to the artifact: its experts and their records.
-        std::error_code error;
-        const auto size = std::filesystem::file_size(options.artifact_path, error);
-        const auto time = std::filesystem::last_write_time(options.artifact_path, error);
-        program_options.expert_state          = state;
-        program_options.expert_state_identity = "artifact=" + std::filesystem::absolute(options.artifact_path).string() +
-                                                ";size=" + std::to_string(error ? 0U : size) +
-                                                ";mtime=" + std::to_string(error ? 0 : time.time_since_epoch().count());
+    {
+        // The state belongs to the artifact: its experts and their records. --no-expert-state
+        // leaves every path empty, the shipped default included.
+        const auto files = models::qwen4_exp::expert_cache::resolve_expert_state_files(
+            next.save_expert_state, options.artifact_path, next.expert_state_path, next.default_expert_state_path,
+            artifact::artifact_id_hex(reader.artifact_id()));
+        program_options.expert_state                   = files.primary;
+        program_options.expert_state_identity          = files.primary_identity;
+        program_options.default_expert_state           = files.fallback;
+        program_options.default_expert_state_identity  = files.fallback_identity;
     }
 
     // The VRAM check, before the weights are read: the dense weights, the Program's fixed

@@ -4320,7 +4320,11 @@ private:
     void warm_start_experts() {
         if (options_.expert_state.empty() || !options_.expert_cache || residency_->frames() == 0) { return; }
         const auto keys = c_.num_hidden_layers * c_.moe.experts;
-        const auto load = expert_cache::load_expert_state(options_.expert_state, options_.expert_state_identity, keys);
+        const auto warm = expert_cache::load_warm_start(
+            {options_.expert_state, options_.expert_state_identity, options_.default_expert_state,
+             options_.default_expert_state_identity},
+            keys);
+        const auto& load    = warm.load;
         expert_state_saved_ = Clock::now();
         if (!load.state) {
             diagnostic("expert cache: " + load.message + "; it starts empty and fills as requests arrive");
@@ -4331,8 +4335,8 @@ private:
         const std::uint32_t loaded = residency_->warm_start(*load.state, kSeedCountCap, max_keys, device_.stream);
         device_.synchronize();
         char line[200];
-        std::snprintf(line, sizeof(line), "expert cache: restored the %u most-used experts from the last session (%.1f GiB in %.2f s)",
-                      loaded, static_cast<double>(loaded) * static_cast<double>(residency_->frame_stride()) / (1ULL << 30),
+        std::snprintf(line, sizeof(line), "expert cache: restored the %u most-used experts from %s (%.1f GiB in %.2f s)",
+                      loaded, warm.from_fallback ? "the default state shipped with the model" : "the last session", static_cast<double>(loaded) * static_cast<double>(residency_->frame_stride()) / (1ULL << 30),
                       std::chrono::duration<double>(Clock::now() - start).count());
         diagnostic(line);
         expert_state_routed_ = residency_->stats().routed;

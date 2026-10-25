@@ -34,3 +34,14 @@ target_link_libraries(ninfer-w4-row-scale-error PRIVATE ninfer_artifact)
 ninfer_internal_includes(ninfer-w4-row-scale-error)
 set_target_properties(ninfer-w4-row-scale-error PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
+
+# Rewrites a Flash-Next server's saved expert state as the default state shipped beside the model
+# (identity: the artifact id), for a release. Compiles expert_state.cpp directly, as it needs no
+# CUDA, instead of linking the model runtime.
+add_executable(ninfer-qwen4-exp-expert-state-export
+  qwen4_exp_expert_state_export.cpp
+  ${CMAKE_SOURCE_DIR}/src/models/qwen4_exp/program/expert_cache/expert_state.cpp)
+target_link_libraries(ninfer-qwen4-exp-expert-state-export PRIVATE ninfer_artifact)
+ninfer_internal_includes(ninfer-qwen4-exp-expert-state-export)
+set_target_properties(ninfer-qwen4-exp-expert-state-export PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")

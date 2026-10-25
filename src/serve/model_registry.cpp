@@ -70,6 +70,10 @@ void check_model_state_paths(const std::vector<ModelDefinition>& models) {
                                next.expert_state_path.empty()
                                    ? std::filesystem::path(artifact.string() + ".expert-state")
                                    : normal(next.expert_state_path)});
+            entries.push_back({"its default expert state", model.id,
+                               next.default_expert_state_path.empty()
+                                   ? std::filesystem::path(artifact.string() + ".expert-state.default")
+                                   : normal(next.default_expert_state_path)});
         }
         if (model.options.context_cache.enabled && next.context_nvme_bytes != 0) {
             // The runtime names the NVMe scratch file for the artifact's basename (and the

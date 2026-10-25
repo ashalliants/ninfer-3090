@@ -545,6 +545,133 @@ void test_state_file() {
     check(!std::filesystem::exists(path.string() + ".tmp"), "no temporary file is left behind");
 }
 
+// The default state shipped beside the model (design: a fresh install starts warm). Its identity is
+// the artifact id, not a path, size and time; the session file wins; a default is read only when
+// the session file is missing or belongs to another artifact, and is never written; the state off
+// (--no-expert-state) reads neither; an exporter rewrites a session file as a default.
+void test_default_state() {
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / "ninfer_warm_start_state_test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const fs::path artifact = dir / "model.ninfer";
+    {
+        std::ofstream out(artifact, std::ios::binary);
+        out << "artifact bytes";
+    }
+    const std::string id = "00112233445566778899aabbccddeeff";
+    constexpr std::uint32_t kKeys = 4;
+    SavedState session_state, default_state;
+    session_state.counts = {5, 0, 9, 1};
+    session_state.ranked = {2, 0, 3};
+    default_state.counts = {1, 7, 2, 8};
+    default_state.ranked = {3, 1};
+
+    // default_identity_is_artifact_id
+    check(default_state_identity(id) == "artifact_id=" + id, "a default's identity is the artifact id");
+    const fs::path shipped = dir / "model.ninfer.expert-state.default";
+    check(save_expert_state(shipped, default_state_identity(id), default_state).empty(), "a default file saves");
+    check(load_expert_state(shipped, default_state_identity(id), kKeys).state.has_value(),
+          "a default loads under the artifact id");
+    check(!load_expert_state(shipped, default_state_identity("ffeeddccbbaa99887766554433221100"), kKeys).state,
+          "a default of another artifact id is ignored");
+    check(!load_expert_state(shipped, session_state_identity(artifact), kKeys).state,
+          "a default is not a session file: path, size and time never match it");
+    // The same bytes under a copy of the artifact elsewhere, with another size and time, still match.
+    const fs::path copy = dir / "elsewhere.ninfer";
+    {
+        std::ofstream out(copy, std::ios::binary);
+        out << "artifact bytes, copied and padded";
+    }
+    check(session_state_identity(copy) != session_state_identity(artifact), "copies differ in session identity");
+    check(load_expert_state(shipped, default_state_identity(id), kKeys).state.has_value(),
+          "every copy of the artifact accepts the default");
+
+    // resolve: names, identities, and off.
+    const auto files = resolve_expert_state_files(true, artifact, {}, {}, id);
+    check(files.primary == fs::path(artifact.string() + ".expert-state") &&
+              files.fallback == fs::path(artifact.string() + ".expert-state.default") &&
+              files.primary_identity == session_state_identity(artifact) &&
+              files.fallback_identity == default_state_identity(id),
+          "the files default to the artifact's expert-state and expert-state.default");
+    const auto named = resolve_expert_state_files(true, artifact, dir / "s", dir / "d", id);
+    check(named.primary == dir / "s" && named.fallback == dir / "d", "explicit paths are used");
+    const auto same = resolve_expert_state_files(true, artifact, dir / "s", dir / "s", id);
+    check(same.fallback.empty(), "a default that is the session file is dropped (a server would write it)");
+    const auto off = resolve_expert_state_files(false, artifact, dir / "s", dir / "d", id);
+    check(off.primary.empty() && off.fallback.empty() && off.primary_identity.empty() && off.fallback_identity.empty(),
+          "--no-expert-state leaves no path, the default included");
+
+    // default_used_when_primary_missing
+    check(!fs::exists(files.primary), "no session file yet");
+    const WarmStartLoad fresh = load_warm_start(files, kKeys);
+    check(fresh.from_fallback && fresh.load.state && fresh.load.state->counts == default_state.counts &&
+              fresh.load.state->ranked == default_state.ranked,
+          "a fresh install warm-starts from the default");
+
+    // primary_wins
+    check(save_expert_state(files.primary, files.primary_identity, session_state).empty(), "the session file saves");
+    const WarmStartLoad primary = load_warm_start(files, kKeys);
+    check(!primary.from_fallback && primary.load.state && primary.load.state->counts == session_state.counts &&
+              primary.load.state->ranked == session_state.ranked,
+          "the session file wins over the default");
+
+    // A session file of another copy (identity mismatch) falls back to the default; a wrong key count too.
+    check(save_expert_state(files.primary, "artifact=/old/copy;size=1;mtime=2", session_state).empty(),
+          "a stale session file saves");
+    const WarmStartLoad stale = load_warm_start(files, kKeys);
+    check(stale.from_fallback && stale.load.state && stale.load.state->counts == default_state.counts,
+          "a session file of another artifact falls back to the default");
+    check(!load_warm_start(files, kKeys + 1).load.state, "a default with another key count is not used");
+
+    // The default is never written, and an absent default is no error.
+    const auto before = fs::last_write_time(shipped);
+    const auto bytes  = fs::file_size(shipped);
+    check(save_expert_state(files.primary, files.primary_identity, session_state).empty(), "a later session saves");
+    check(fs::file_size(shipped) == bytes && fs::last_write_time(shipped) == before, "a save leaves the default alone");
+    fs::remove(files.primary);
+    fs::remove(shipped);
+    const WarmStartLoad none = load_warm_start(files, kKeys);
+    check(!none.load.state && !none.from_fallback && !none.load.message.empty() &&
+              none.load.message.find("default") == std::string::npos,
+          "neither file present: empty start, and no word about a default that was never shipped");
+
+    // --no-expert-state: nothing is read, even with a default present.
+    check(save_expert_state(shipped, default_state_identity(id), default_state).empty(), "the default is back");
+    const WarmStartLoad disabled = load_warm_start(off, kKeys);
+    check(!disabled.load.state && !disabled.from_fallback, "--no-expert-state does not read the default");
+
+    // A damaged default is skipped with the reason.
+    {
+        std::ofstream out(shipped, std::ios::binary | std::ios::trunc);
+        out << "garbage";
+    }
+    const WarmStartLoad bad = load_warm_start(files, kKeys);
+    check(!bad.load.state && bad.load.message.find("default state") != std::string::npos,
+          "a damaged default is skipped and named");
+
+    // export_round_trip
+    const fs::path session = dir / "session.state";
+    const fs::path exported = dir / "exported.default";
+    check(save_expert_state(session, session_state_identity(artifact), session_state).empty(), "a session file for export");
+    check(export_expert_state(session, exported, id, session_state_identity(artifact)).empty(), "the export succeeds");
+    const ExpertStateRead back = read_expert_state(exported);
+    check(back.file && back.file->identity == default_state_identity(id) && back.file->state.counts == session_state.counts &&
+              back.file->state.ranked == session_state.ranked,
+          "the export carries the artifact id and the session's counts and ranking");
+    check(load_expert_state(exported, default_state_identity(id), kKeys).state.has_value(), "an exported file loads as a default");
+    check(!load_expert_state(exported, session_state_identity(artifact), kKeys).state, "an exported file is no session file");
+    check(!export_expert_state(session, exported, id, session_state_identity(copy)).empty(),
+          "a session saved for another artifact is not exported when the artifact is named");
+    check(export_expert_state(session, exported, id).empty(), "the artifact id alone skips that check");
+    check(!export_expert_state(session, exported, "not-an-id").empty(), "a malformed artifact id is refused");
+    check(!export_expert_state(session, exported, "00112233445566778899AABBCCDDEEFF").empty(),
+          "an upper-case artifact id is refused (the id is written in lower case)");
+    check(!export_expert_state(session, session, id).empty(), "exporting over the session file is refused");
+    check(!export_expert_state(dir / "missing", exported, id).empty(), "a missing session file is refused");
+    fs::remove_all(dir);
+}
+
 // Fill-phase landing (design §19.3.5 S4): reserve_free pops free frames only while the policy has
 // room; adopt makes a landed key READY and resident in its frame, drops its queued load (no second
 // copy), refuses a key loading elsewhere, and release returns unused frames.
@@ -639,6 +766,7 @@ int main() {
     test_seed();
     test_landing();
     test_state_file();
+    test_default_state();
     if (g_failures) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);
         return 1;

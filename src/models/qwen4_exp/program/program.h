@@ -359,6 +359,11 @@ struct ProgramOptions {
     // the artifact the state belongs to.
     std::filesystem::path expert_state;
     std::string expert_state_identity;
+    // The default state shipped beside the model: read (never written) only when `expert_state`
+    // is set and could not be used, so a fresh install starts warm. Its identity is the artifact
+    // id, which every copy of the conversion shares. Empty: none.
+    std::filesystem::path default_expert_state;
+    std::string default_expert_state_identity;
     // Device memory left free for the display and other programs once the fixed allocations and
     // the expert frames are made; empty selects it from the display state.
     std::optional<std::uint64_t> vram_headroom;

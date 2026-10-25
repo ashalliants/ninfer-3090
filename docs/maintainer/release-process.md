@@ -30,6 +30,20 @@ or very nearly shipped a broken archive.
    `gh release create vX.Y.Z-rtx3090 <zip> <tar.gz> <both SHA256SUMS files> -R ashalliants/ninfer-3090
    --notes-file RELEASE_NOTES_X.Y.Z.md --title "..." --latest`.
 
+### A default expert state (model releases)
+
+The binary archives ship no model files. When a model release should warm-start a fresh
+Flash-Next install, it ships `<model>.expert-state.default` beside the model. Produce it from a
+server's saved state, after a representative session on that exact artifact:
+
+```
+build/tools/ninfer-qwen4-exp-expert-state-export <model>.expert-state <model>.expert-state.default <model>.ninfer
+```
+
+The file is tied to the artifact id (`artifact_id=<id>` in place of the saved state's path, size and
+time), so it must be regenerated whenever the artifact is converted again (every conversion writes
+a fresh id; a default for another id is ignored). See [A default expert state](../serving.md#a-default-expert-state).
+
 ## Gotchas
 
 **Always pass `-R ashalliants/ninfer-3090` to `gh`.** With no `-R` it resolves to the `upstream` remote

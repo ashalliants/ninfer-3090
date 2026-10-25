@@ -122,7 +122,11 @@ the Qwen3.5 models:
   a headroom for the desktop, holds the most-used experts (about 11,000-12,500 of the 24,576). Its
   state is saved beside the model (`<model>.expert-state`) at shutdown and every ten minutes
   between requests, and loaded at the next start, so the second start is warm. A cold cache fills
-  at one promotion per layer per decoded token; decode speeds up as it fills. Each finished
+  at one promotion per layer per decoded token; decode speeds up as it fills. A model release may also ship a
+  default state (`<model>.expert-state.default`) for the first start: it is read only when the
+  saved state is missing or belongs to another artifact, it is never written, and
+  `--no-expert-state` skips it too. No such file ships yet; see [A default expert
+  state](#a-default-expert-state). Each finished
   request logs one line with its expert hit rate, promotions and decode speed.
 - **Prefill.** A prompt of 512 tokens or more prefills in calls of 4,096 tokens (independent of
   `--prefill-chunk`, which sizes shorter prompts and forced tokens). For the prompt, the expert cache
@@ -168,6 +172,7 @@ the Qwen3.5 models:
 | `--ngram-keepalive-ms N` | read one block of the n-gram volume after N ms idle so the drive does not sleep (SSDs sleep after about 100 ms); `0` turns it off; changes timing only | `40` (was a fixed 100) |
 | `--expert-state FILE` | where the expert cache's state is saved and read | `<model>.expert-state` |
 | `--no-expert-state` | start the expert cache empty and save nothing | off |
+| `--default-expert-state FILE` | a default expert state for a fresh install, read only when the saved state is missing or belongs to another artifact (it is matched by artifact id, so it fits every copy of the model) and never written; absent file: nothing changes; `--no-expert-state` does not read it either | `<model>.expert-state.default` |
 | `--vram-headroom-mib N` | VRAM the expert cache leaves free for the desktop and other programs | 512 with a display, 256 without |
 | `--ram-headroom-mib N` | host RAM left free for Windows once every expert is pinned; startup refuses when it cannot be kept | `2048` |
 | `--expert-cache-mib N` | cap the expert cache (measurement) | what fits |
@@ -183,6 +188,31 @@ prefill calls run between the other lane's decode rounds, so it pauses for up to
 4,096-token call). On the spike's eight-conversation agent burst it finished 6.5% sooner and cut the mean time to
 first token by 19%, which is less than the 1.15x aggregate decode the design aimed for
 ([measurements](maintainer/flash-next-plan.md#pr-16-two-lanes)). One lane stays the default; three or more are refused.
+
+### A default expert state
+
+The saved state (`<model>.expert-state`) is tied to the copy of the model that wrote it (its path,
+size and modification time), so a fresh install, or a re-downloaded model, starts with an empty
+cache. A default state is tied to the artifact id instead, which every copy of one conversion
+shares, so it can ship with the model and warm the first start. The server loads files in this
+order: the saved state, when it exists and belongs to this copy of the model; else the default
+(`<model>.expert-state.default`, or `--default-expert-state FILE`), when it exists and its artifact id
+matches; else it starts empty. The default is only ever read: the server saves to the saved state
+beside it, which takes over from the next start. A default of another model, another expert count
+or a damaged one is skipped with a line in the log. `--no-expert-state` starts empty and does not
+read the default. No default ships with any model yet, so nothing changes until one is present.
+
+To make one for a release, run a representative session so the saved state fills, stop the server,
+and rewrite the saved state with the artifact's identity (the tool is built with the apps, in
+`build/tools/`):
+
+```
+ninfer-qwen4-exp-expert-state-export <model>.expert-state <model>.expert-state.default <model>.ninfer
+```
+
+It reads the artifact id from the model and refuses a saved state written for another copy; pass
+`--artifact-id <32 hex digits>` in place of the model path to skip that check. Not yet measured on a
+GPU: how much a default warms the first start.
 
 ### Vision residency
 
@@ -762,8 +792,9 @@ may not name any model's artifact, n-gram volume or expert state, whether it com
 line or a model's own section; models that name the same file append to one shared log, one record
 at a time. The router accepts a request body up to the largest `--max-request-mib` of any model, and
 that model's own server then applies its limit.
-`--ngram-volume` and `--expert-state` may not give the same file to two models, and one model's
-n-gram volume, expert state and artifact must be three different files.
+`--ngram-volume`, `--expert-state` and `--default-expert-state` may not give the same file to two
+models, and one model's n-gram volume, expert state, default expert state and artifact must be
+different files.
 
 `--models-max N` (default 1, 0 for no limit) bounds how many models are loaded at once. To make room
 the least recently used model without a request in flight **sleeps** when it was started with
@@ -1980,7 +2011,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8\|fp8\|rk8v4\|rk4v4\|nvfp4\|k8v4` | KV-cache storage. `rk8v4` is opt-in RotorQuant and `rk4v4` opt-in Lloyd-Max 4-bit keys; all seven are accepted on this fork's sm_86/sm_89 targets | `bf16` |
-| `--ngram-volume`, `--expert-state`, `--no-expert-state`, `--vram-headroom-mib`, `--ram-headroom-mib`, `--expert-cache-mib`, `--shared-expert-stream`, `--mtp-constrained`, `--mtp-joint-acceptance`, `--ngram-prefetch` | Qwen3.8-Flash-Next only; see [Qwen3.8-Flash-Next](#qwen38-flash-next-preview) | see there |
+| `--ngram-volume`, `--expert-state`, `--no-expert-state`, `--default-expert-state`, `--vram-headroom-mib`, `--ram-headroom-mib`, `--expert-cache-mib`, `--shared-expert-stream`, `--mtp-constrained`, `--mtp-joint-acceptance`, `--ngram-prefetch` | Qwen3.8-Flash-Next only; see [Qwen3.8-Flash-Next](#qwen38-flash-next-preview) | see there |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 | unset |
 | `--lm-head-draft` | optimized proposal head; implied by `--spec`, accepted for compatibility | on with `--spec` |
