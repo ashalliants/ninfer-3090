@@ -332,8 +332,8 @@ and a session log with `[#N]` references to message indices). The output is dete
   - Under `summary` the core never scouts (no scout scratch is allocated) and the selection knobs are ignored; the
     Program's dense/single-device refusal still applies. Usage `prompt_tokens` and prompt progress count the client's
     rendered prompt (which must fit `max_context`); cached tokens map through the shared head and tail
-    (`SummaryRewrite::original_frontier`). The requested output is capped at `max_context` − the client's prompt + 1,
-    as if the original had been prefilled; the backlog prices the submitted (summarised) length. `lossy_prefill` in
+    (`SummaryRewrite::original_frontier`). The output budget is capped at `max_context` − the client's prompt + 1
+    (a binding cap ends the request with `ContextCapacity`, as if the original had been prefilled); the backlog prices the submitted (summarised) length. `lossy_prefill` in
     the request log has `strategy`, and for a summary `summarized_messages` ([first, last) in the client's indices,
     the newest), `summary_reused` and `summary_probe`. A rewritten prompt (new or a substituted summary) is
     `outcome: completed` and a long prompt the probe left whole is `skipped`; `ninfer_lossy_prefill_total` counts the

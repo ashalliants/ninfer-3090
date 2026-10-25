@@ -309,14 +309,6 @@ public:
             publication_order = next_publication_order_++;
         }
 
-        // A prompt the summary strategy shortened may not generate past where the client's own
-        // prompt would reach max_context: the output cap follows the original length, as the
-        // Program's own cap does for a prompt it rewrote.
-        if (summary && summary->rewrite && summary->rewrite->original_tokens <= max_context_) {
-            options.execution.requested_output_tokens =
-                std::min(options.execution.requested_output_tokens,
-                         max_context_ - summary->rewrite->original_tokens + 1U);
-        }
         std::shared_ptr<Request> request;
         std::optional<std::uint32_t> effective_budget;
         try {
@@ -2231,8 +2223,21 @@ private:
             request->base_plan.emplace(instance_.program->plan_request(std::move(request->prompt),
                                                                        request->options.execution));
             const auto& summary = request->base_plan->summary();
-            request->budget.emplace(summary.effective_output_tokens,
-                                    summary.effective_limit_reason);
+            std::uint32_t output_tokens = summary.effective_output_tokens;
+            FinishReason limit_reason   = summary.effective_limit_reason;
+            // A prompt the summary strategy shortened may not generate past where the client's own
+            // prompt would reach max_context, as the Program's cap does for a prompt it rewrote;
+            // when that cap binds, the request ends for context capacity, not its output limit.
+            if (request->summary && request->summary->rewrite &&
+                request->summary->rewrite->original_tokens <= max_context_) {
+                const std::uint32_t capacity =
+                    max_context_ - request->summary->rewrite->original_tokens + 1U;
+                if (capacity < output_tokens) {
+                    output_tokens = capacity;
+                    limit_reason  = FinishReason::ContextCapacity;
+                }
+            }
+            request->budget.emplace(output_tokens, limit_reason);
             request->generated.reserve(summary.effective_output_tokens);
         }
     }
@@ -4504,9 +4509,11 @@ private:
                             failed_ = true;
                         }
                         fail_pending_locked(error);
+                        serve_reuse_probes(true);
                         return;
                     }
                     fail_all_locked(error);
+                    serve_reuse_probes(true);
                     return;
                 }
             }
@@ -4750,7 +4757,11 @@ private:
                 } catch (...) {}
                 // After the latch took effect, so is_available() (and /health) already report it.
                 notify_fault(fault);
-                if (!recovered) { return; }
+                if (!recovered) {
+                    // Probes queued before the latch: answered warm, not left to time out.
+                    serve_reuse_probes(true);
+                    return;
+                }
                 continue;
             }
             execution_lock.unlock();

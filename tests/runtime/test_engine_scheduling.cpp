@@ -1303,10 +1303,13 @@ void test_summary_output_capped_by_original() {
     Rig rig({.chunk = kLossyChunk, .lanes = 1, .lossy_min_tokens = 30000,
              .lossy_strategy = LossyStrategy::Summary});
     const std::uint32_t max_context = 1U << 20; // the Rig's
-    const compaction::SummaryRewrite rewrite{.original_tokens = max_context - 3,
-                                             .prompt_tokens   = 9000,
-                                             .messages        = {4, 180},
-                                             .fresh           = true};
+    const auto rewrite_with = [](std::uint32_t original) {
+        return compaction::SummaryRewrite{.original_tokens = original,
+                                          .prompt_tokens   = 9000,
+                                          .messages        = {4, 180},
+                                          .fresh           = true};
+    };
+    const compaction::SummaryRewrite rewrite = rewrite_with(max_context - 3);
     auto result = rig.run_prompt(lossy_prompt(1, 9000), 64, nullptr, nullptr,
                                  compaction::SummaryRecord{.probe = LossySummaryProbe::Cold,
                                                            .rewrite = rewrite,
@@ -1315,6 +1318,17 @@ void test_summary_output_capped_by_original() {
     require(result.get().generated_token_ids.size() == 4,
             "the output was not capped at max_context - original + 1: " +
                 std::to_string(result.get().generated_token_ids.size()));
+    require(result.get().finish_reason == FinishReason::ContextCapacity,
+            "a request stopped by the summary's context cap must end for context capacity");
+    // A cap that does not bind leaves the request's own output limit.
+    auto roomy = rig.run_prompt(lossy_prompt(2, 9000), 8, nullptr, nullptr,
+                                compaction::SummaryRecord{.probe = LossySummaryProbe::Cold,
+                                                          .rewrite = rewrite_with(40000),
+                                                          .prompt_tokens = 9000});
+    require(finished(roomy), "the request did not finish\n" + rig.dump());
+    require(roomy.get().generated_token_ids.size() == 8 &&
+                roomy.get().finish_reason == FinishReason::OutputLimit,
+            "a non-binding summary cap changed the finish reason");
 }
 
 // SummaryStrategyDisablesTokenPath: under --lossy-prefill-strategy summary the core never scouts,
