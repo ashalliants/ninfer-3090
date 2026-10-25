@@ -214,13 +214,18 @@ def needle_command(eval_python: str, config_path: Path) -> list[str]:
 
 
 def agent_replay_command(*, port: int, out: Path, request_log: Path, sessions: int, seed: int | None,
-                         min_context: int = 30000, max_context: int = 120000) -> list[str]:
+                         min_context: int = 30000, max_context: int = 120000,
+                         repo: Path | None = None, commit: str | None = None) -> list[str]:
     cmd = [sys.executable, "-m", "tools.bench.agent_replay", "run", "--port", str(port),
            "--sessions", str(sessions), "--concurrency", "1",
            "--min-context", str(min_context), "--max-context", str(max_context),
            "--request-log", str(request_log), "--out", str(out)]
     if seed is not None:
         cmd += ["--seed", str(seed)]
+    if repo is not None:
+        cmd += ["--repo", str(repo)]
+    if commit is not None:
+        cmd += ["--commit", commit]
     return cmd
 
 
@@ -252,6 +257,12 @@ def parse_needle_summary(summary: dict[str, Any]) -> dict[str, float]:
     if not out:
         raise RuntimeError("needle run produced no needle_* results")
     return out
+
+
+def parse_needle_samples(summary: dict[str, Any]) -> dict[str, int]:
+    """Completed sample count per needle job, from the same ninfer_eval summary.json."""
+    return {str(r["job_id"]).removeprefix("needle_"): int((r.get("counts") or {}).get("completed") or 0)
+            for r in summary.get("results", []) if str(r.get("job_id", "")).startswith("needle_")}
 
 
 def edit_metrics(transcripts: Sequence[dict[str, Any]],
@@ -287,12 +298,12 @@ def edit_metrics(transcripts: Sequence[dict[str, Any]],
                 ok = isinstance(args, dict) and name in required and required[name] <= args.keys()
                 calls += 1
                 valid_calls += bool(ok)
-                if ok and name == "Edit" and turn.get("category") == "edit_function":
-                    path = str(args["file_path"]).removeprefix("/repo/")
-                    text = read_file(path)
-                    if text is not None and isinstance(args["old_string"], str) \
-                            and args["old_string"] and args["old_string"] in text:
-                        hit = True
+                if isinstance(args, dict) and ok and name == "Edit" and turn.get("category") == "edit_function":
+                    file_path, old = args.get("file_path"), args.get("old_string")
+                    if isinstance(file_path, str) and isinstance(old, str) and old:
+                        text = read_file(file_path.removeprefix("/repo/"))
+                        if text is not None and old in text:
+                            hit = True
             if turn.get("category") == "edit_function":
                 edit_turns += 1
                 edit_hits += hit
@@ -326,6 +337,45 @@ def agreement_summary(reference: Sequence[Sequence[Any]], candidate: Sequence[Se
     }
 
 
+def check_speed_report(stall_report: dict[str, Any], max_context: int, min_tokens: int = 100_000) -> None:
+    """Refuse a stall report that does not measure a 100K cold prefill: the long request must have
+    succeeded (HTTP 200), been uncached, and be between `min_tokens` and the server's max context."""
+    long = stall_report.get("long") or {}
+    if long.get("status") != 200:
+        raise RuntimeError(f"long request failed: status {long.get('status')}, error {long.get('error')}")
+    if long.get("cached_tokens"):
+        raise RuntimeError(f"long prompt was not cold: cached_tokens {long.get('cached_tokens')}")
+    tokens = long.get("prompt_tokens")
+    if not isinstance(tokens, int) or not min_tokens <= tokens <= max_context:
+        raise RuntimeError(f"long prompt has {tokens} tokens, outside {min_tokens}..{max_context}; "
+                           "tune --words-per-token / --speed-tokens")
+
+
+def lossy_outcome_counts(request_log: Path, offset: int = 0) -> dict[str, int]:
+    """Count request_done records after `offset` by `lossy_prefill.outcome`; `requests` counts all of
+    them, `none` those that never took the path (their lossy_prefill is null)."""
+    counts: dict[str, int] = {"requests": 0, "none": 0}
+    if not request_log.exists():
+        return counts
+    with request_log.open("rb") as log:
+        log.seek(offset)
+        for raw in log:
+            try:
+                record = json.loads(raw)
+            except ValueError:
+                continue
+            if record.get("event") != "request_done":
+                continue
+            counts["requests"] += 1
+            lossy = record.get("lossy_prefill")
+            if isinstance(lossy, dict):
+                outcome = str(lossy.get("outcome", "unknown"))
+                counts[outcome] = counts.get(outcome, 0) + 1
+            else:
+                counts["none"] += 1
+    return counts
+
+
 def speed_metrics(stall_report: dict[str, Any], lossy_record: dict[str, Any] | None) -> dict[str, Any]:
     """From run_prefill_stall's report and, for a lossy run, the long request's `lossy_prefill`
     request-log object (scout_ms, main_ms, kept/uncached tokens, outcome)."""
@@ -333,6 +383,7 @@ def speed_metrics(stall_report: dict[str, Any], lossy_record: dict[str, Any] | N
     during = (stall_report.get("stream") or {}).get("during_long_prompt") or {}
     out: dict[str, Any] = {
         "prompt_tokens": long.get("prompt_tokens"),
+        "cached_tokens": long.get("cached_tokens"),
         "total_s": long.get("seconds"),
         "neighbour_gap_max_ms": during.get("gap_max_ms"),
         "neighbour_gap_p99_ms": during.get("gap_p99_ms"),
@@ -381,6 +432,23 @@ def _metric(rows: list[dict[str, Any]], point: str, workload: str) -> dict[str, 
     return found
 
 
+def unresolved_failures(rows: list[dict[str, Any]], point: str) -> list[dict[str, Any]]:
+    """Failed rows of a point that no later ok row supersedes. A later ok row for the same workload
+    repairs it; a failed server start is repaired by any later ok row of the point."""
+    failed = []
+    for i, row in enumerate(rows):
+        if row["point"] != point or row.get("ok"):
+            continue
+        later = [r for r in rows[i + 1:] if r["point"] == point and r.get("ok")]
+        if row["workload"] == "server":
+            repaired = bool(later)
+        else:
+            repaired = any(r["workload"] == row["workload"] for r in later)
+        if not repaired:
+            failed.append(row)
+    return failed
+
+
 def check(name: str, value: float | None, passed: bool | None, detail: str) -> dict[str, Any]:
     return {"name": name, "value": value, "pass": passed, "detail": detail}
 
@@ -417,7 +485,19 @@ def evaluate_point(rows: list[dict[str, Any]], point: str) -> dict[str, Any]:
                             f"(need <= {TIME_MAX_RATIO:.2f}x)"))
     else:
         checks.append(check("time", None, None, "not measured"))
-    failed = [r for r in rows if r["point"] == point and not r.get("ok")]
+    if point != BASELINE:
+        for workload in WORKLOADS:
+            metrics = _metric(rows, point, workload)
+            if metrics is None:
+                continue
+            outcomes = metrics.get("lossy_outcomes")
+            completed = (outcomes or {}).get("completed", 0)
+            checks.append(check(f"lossy_ran_{workload}", completed if outcomes is not None else None,
+                                True if completed > 0 else None,
+                                f"{completed} request(s) completed lossy prefill" if completed > 0 else
+                                "no request completed lossy prefill (or no outcome counts): the gate "
+                                "did not exercise the feature"))
+    failed = unresolved_failures(rows, point)
     if any(c["pass"] is False for c in checks) or failed:
         verdict = "FAIL"
     elif all(c["pass"] for c in checks):
@@ -441,6 +521,19 @@ def points_in(rows: list[dict[str, Any]]) -> list[str]:
     return order
 
 
+def lossy_cell(rows: list[dict[str, Any]], point: str) -> str:
+    cells = []
+    for workload in WORKLOADS:
+        outcomes = (_metric(rows, point, workload) or {}).get("lossy_outcomes")
+        cells.append("-" if outcomes is None else str(outcomes.get("completed", 0)))
+    return "/".join(cells)
+
+
+def needle_samples(rows: list[dict[str, Any]], point: str) -> str:
+    counts = (_metric(rows, point, "needle") or {}).get("samples") or {}
+    return ", ".join(f"{k}:{v}" for k, v in counts.items()) or "-"
+
+
 def render_summary(rows: list[dict[str, Any]]) -> str:
     lines = [
         "# Lossy prefill sweep",
@@ -449,9 +542,9 @@ def render_summary(rows: list[dict[str, Any]]) -> str:
         "baseline; 100K cold prefill <= 0.40x baseline time. Greedy agreement and the speed "
         "columns are reported, not gated.",
         "",
-        "| point | needle 32k | needle 64k | needle 100k | Edit (pts) | time (x) | scout ms | main ms "
-        "| kept/uncached | neighbour gap ms | tool-call valid | greedy median div | verdict |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| point | needle 32k | needle 64k | needle 100k | Edit (pts) | Edit turns | time (x) | scout ms | main ms "
+        "| kept/uncached | neighbour gap ms | tool-call valid | greedy median div | lossy completed (needle/agent/greedy/speed) | needle samples | verdict |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     evals = []
     for point in points_in(rows):
@@ -473,17 +566,17 @@ def render_summary(rows: list[dict[str, Any]]) -> str:
                 if speed.get("kept_tokens") is not None else "-")
         lines.append(
             f"| {point} | {_mark(by['needle_32k'], '.3f')} | {_mark(by['needle_64k'], '.3f')} "
-            f"| {_mark(by['needle_100k'], '.3f')} | {_mark(by['edit'], '+.1f')} | {_mark(by['time'], '.2f')} "
+            f"| {_mark(by['needle_100k'], '.3f')} | {_mark(by['edit'], '+.1f')} | {num(agent.get('edit_turns'), 'd')} | {_mark(by['time'], '.2f')} "
             f"| {num(speed.get('scout_ms'), '.0f')} | {num(speed.get('main_ms'), '.0f')} | {kept} "
             f"| {num(speed.get('neighbour_gap_max_ms'), '.0f')} | {num(agent.get('tool_call_validity'), '.3f')} "
-            f"| {num(agreement['first_divergence_median'], '.0f') if agreement else '-'} | {ev['verdict']} |")
+            f"| {num(agreement['first_divergence_median'], '.0f') if agreement else '-'} "
+            f"| {lossy_cell(rows, point)} | {needle_samples(rows, point)} | {ev['verdict']} |")
     base_speed = _metric(rows, BASELINE, "speed") or {}
     lines += ["", "Baseline: " + (
         f"100K-class prefill {base_speed['total_s']:.1f} s, neighbour worst gap "
         f"{base_speed.get('neighbour_gap_max_ms') or 0:.0f} ms." if base_speed.get("total_s")
         else "no speed measurement; the time check cannot be evaluated.")]
-    errors = [e for ev in evals for e in ev["errors"]] + \
-             [r for r in rows if r["point"] == BASELINE and not r.get("ok")]
+    errors = [e for ev in evals for e in ev["errors"]] + unresolved_failures(rows, BASELINE)
     if errors:
         lines += ["", "## Failures", ""]
         lines += [f"- `{e['point']}` / {e['workload']}: {e.get('error')}" for e in errors]
@@ -525,8 +618,10 @@ class Sweep:
         request_log.touch()
         cmd = server_command(self.args.server_cmd, self.args.port, request_log, params, extra)
         (directory / f"{tag}-server-cmd.txt").write_text(shlex.join(cmd) + "\n", encoding="utf-8")
-        log = open(directory / f"{tag}-server.log", "wb")
-        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=REPO_ROOT)
+        if port_serving(self.base_url):
+            raise RuntimeError(f"{self.base_url} is already serving; refusing to measure another server")
+        with open(directory / f"{tag}-server.log", "wb") as log:
+            proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=REPO_ROOT)
         deadline = time.monotonic() + self.args.start_timeout
         while time.monotonic() < deadline:
             if proc.poll() is not None:
@@ -566,11 +661,14 @@ class Sweep:
                 stop_server(proc)
 
     def run_workload(self, point: str, params: dict[str, str] | None, name: str, request_log: Path) -> None:
+        offset = request_log.stat().st_size
         try:
             metrics = getattr(self, f"workload_{name}")(point, request_log)
         except Exception as exc:  # noqa: BLE001
             self.record(point, params, name, False, error=f"{type(exc).__name__}: {exc}")
         else:
+            # Evidence the feature ran: lossy_prefill outcomes of this workload's requests.
+            metrics["lossy_outcomes"] = lossy_outcome_counts(request_log, offset)
             self.record(point, params, name, True, metrics)
 
     # -- workloads --
@@ -591,21 +689,27 @@ class Sweep:
         summaries = sorted(runs.glob("*/summary.json"))
         if not summaries:
             raise RuntimeError(f"ninfer_eval exit {proc.returncode}; no summary (see {directory / 'needle.log'})")
-        return {"accuracy": parse_needle_summary(json.loads(summaries[-1].read_text(encoding="utf-8"))),
+        document = json.loads(summaries[-1].read_text(encoding="utf-8"))
+        return {"accuracy": parse_needle_summary(document), "samples": parse_needle_samples(document),
                 "run": str(summaries[-1].parent)}
 
     def workload_agent_replay(self, point: str, request_log: Path) -> dict[str, Any]:
         args = self.args
         out = self.out / point / "agent-replay"
         cmd = agent_replay_command(port=args.port, out=out, request_log=request_log,
-                                   sessions=args.agent_sessions, seed=args.agent_seed)
+                                   sessions=args.agent_sessions, seed=args.agent_seed,
+                                   repo=args.agent_repo, commit=args.agent_commit)
         proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
         (self.out / point / "agent-replay.log").write_text(proc.stdout + proc.stderr, encoding="utf-8")
         transcripts_path, summary_path = out / "transcripts.jsonl", out / "summary.json"
         if not transcripts_path.exists() or not summary_path.exists():
             raise RuntimeError(f"agent_replay exit {proc.returncode}; no output (see agent-replay.log)")
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
-        commit = summary.get("corpus_commit") or "HEAD"
+        if proc.returncode != 0 or summary.get("complete") is not True:
+            raise RuntimeError(f"agent_replay incomplete: exit {proc.returncode}, complete={summary.get('complete')}, "
+                               f"{len(summary.get('request_log_missing') or [])} turn(s) missing from the request log "
+                               "(see agent-replay.log)")
+        commit = summary.get("corpus_commit") or args.agent_commit
         repo = str(args.agent_repo)
 
         def read_file(path: str) -> str | None:
@@ -620,14 +724,17 @@ class Sweep:
 
     def workload_greedy_agreement(self, point: str, request_log: Path) -> dict[str, Any]:
         outputs = []
+        cursor = request_log.stat().st_size
         for index in range(self.args.greedy_prompts):
             prompt = greedy_prompt(self.args.agent_repo, index, self.args.greedy_chars)
-            outputs.append(greedy_generate(self.base_url, self.args.model, prompt,
-                                           self.args.greedy_max_tokens, request_log))
+            ids, cursor = greedy_generate(self.base_url, self.args.model, prompt,
+                                          self.args.greedy_max_tokens, request_log, cursor)
+            outputs.append(ids)
         return {"outputs": outputs, "prompts": len(outputs)}
 
     def workload_speed(self, point: str, request_log: Path) -> dict[str, Any]:
         out = self.out / point / "stall.json"
+        out.unlink(missing_ok=True)  # never read a report an earlier run left behind
         offset = request_log.stat().st_size
         cmd = stall_command(base_url=self.base_url, model=self.args.model, output=out,
                             long_tokens=self.args.speed_tokens, words_per_token=self.args.words_per_token)
@@ -636,8 +743,19 @@ class Sweep:
         if not out.exists():
             raise RuntimeError(f"run_prefill_stall exit {proc.returncode}: {proc.stderr[-300:]}")
         report = json.loads(out.read_text(encoding="utf-8"))
+        check_speed_report(report, self.args.max_context)
         lossy = long_request_lossy_record(request_log, offset)
         return speed_metrics(report, lossy)
+
+
+def port_serving(base_url: str) -> bool:
+    try:
+        with urllib.request.urlopen(f"{base_url}/v1/models", timeout=3):
+            return True
+    except urllib.error.HTTPError:
+        return True  # something answered
+    except (urllib.error.URLError, OSError):
+        return False
 
 
 def stop_server(proc: subprocess.Popen) -> None:
@@ -668,10 +786,10 @@ def greedy_prompt(repo: Path, index: int, chars: int) -> str:
     return "".join(parts) + "\nList the first three file names above, in order, and say what each is for."
 
 
-def greedy_generate(base_url: str, model: str, prompt: str, max_tokens: int,
-                    request_log: Path | None) -> list[Any]:
-    """Greedy completion; returns committed token ids from the request log when it has them, else the
-    characters of the text (the divergence index is then a character index)."""
+def greedy_generate(base_url: str, model: str, prompt: str, max_tokens: int, request_log: Path,
+                    cursor: int, wait_seconds: float = 30.0) -> tuple[list[int], int]:
+    """Greedy completion; returns the committed token ids from the request log record of this
+    response and the log offset to continue from. No fallback to text: a missing record fails."""
     body = json.dumps({"model": model, "temperature": 0, "max_tokens": max_tokens, "stream": False,
                        "messages": [{"role": "user", "content": prompt}],
                        "chat_template_kwargs": {"enable_thinking": False}}).encode()
@@ -679,21 +797,30 @@ def greedy_generate(base_url: str, model: str, prompt: str, max_tokens: int,
                                      headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(request, timeout=3600) as response:
         reply = json.load(response)
-    text = reply["choices"][0]["message"].get("content") or ""
-    if request_log is not None:
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            for line in reversed(request_log.read_text(encoding="utf-8").splitlines()[-50:]):
+    response_id = reply.get("id")
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        with request_log.open("rb") as log:
+            log.seek(cursor)
+            while True:
+                start = log.tell()
+                raw = log.readline()
+                if not raw.endswith(b"\n"):  # nothing more, or a record still being written
+                    log.seek(start)
+                    break
                 try:
-                    record = json.loads(line)
+                    record = json.loads(raw)
                 except ValueError:
                     continue
-                if (record.get("request") or {}).get("response_id") == reply.get("id"):
+                if record.get("event") == "request_done" and (record.get("request") or {}).get("response_id") == response_id:
                     ids = (record.get("result") or {}).get("generated_token_ids")
-                    if isinstance(ids, list):
-                        return ids
-            time.sleep(0.5)
-    return list(text)
+                    if not isinstance(ids, list):
+                        raise RuntimeError(f"request log record for {response_id} has no generated_token_ids")
+                    return ids, log.tell()
+            cursor = log.tell()
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"no request-log record for response {response_id} after {wait_seconds:.0f} s")
+        time.sleep(0.5)
 
 
 # ---- CLI -------------------------------------------------------------------------------------
@@ -723,12 +850,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         help="Needle-in-a-Haystack corpus dir (evalscope dataset_args.local_path)")
     parser.add_argument("--needle-limit", type=int, default=None, help="cap samples per length (smoke)")
     parser.add_argument("--eval-python", default=str(REPO_ROOT / "eval/.venv/bin/python"))
-    parser.add_argument("--agent-sessions", type=int, default=4)
+    parser.add_argument("--agent-sessions", type=int, default=26,
+                        help="agent_replay sessions; ~2 Edit turns each (see README), so 26 gives ~50 for the Edit gate")
     parser.add_argument("--agent-seed", type=int, default=None)
+    parser.add_argument("--agent-commit", default="HEAD", help="corpus commit for the replay and its Edit check")
+    parser.add_argument("--max-context", type=int, default=131072,
+                        help="the server's --max-context (the speed prompt must fit below it)")
     parser.add_argument("--agent-repo", type=Path, default=REPO_ROOT,
                         help="git repository the replay reads (and the greedy prompts are cut from)")
     parser.add_argument("--greedy-prompts", type=int, default=GREEDY_PROMPTS)
-    parser.add_argument("--greedy-chars", type=int, default=250_000, help="prompt size, characters (~60K tokens)")
+    parser.add_argument("--greedy-chars", type=int, default=330_000, help="prompt size, characters (~100K tokens at 3.3 chars/token)")
     parser.add_argument("--greedy-max-tokens", type=int, default=96)
     parser.add_argument("--speed-tokens", type=int, default=SPEED_LONG_TOKENS)
     parser.add_argument("--words-per-token", type=float, default=None)

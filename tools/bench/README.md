@@ -66,7 +66,7 @@ knob left out keeps the server default. `strategy=summary` ignores the selection
 `--lossy-prefill-strategy` flag; `select` passes no such flag). Run it in pieces: `--workloads` and `--only REGEX`
 (on point ids) pick a subset, `--resume` skips pairs already ok, `--skip-baseline --baseline-from earlier/results.jsonl`
 reuses a baseline, and `--from-json results.jsonl [more.jsonl]` only re-summarises. A server that fails to start
-is recorded (workload `server`) and the sweep goes on. `python -I tools/bench/test_lossy_prefill_sweep.py` checks the
+is recorded (workload `server`) and the sweep goes on. The speed row fails unless the long request returned 200, was cold, and had 100K..`--max-context` tokens; agent_replay fails unless the replay reports `complete`; a quality row is INCOMPLETE unless the request log shows at least one `completed` lossy request (counts are in `summary.md`). `--agent-sessions` defaults to 26 (about 2 Edit turns per session, about 50 for the gate), and the greedy prompts are about 100K tokens (`--greedy-chars`). `python -I tools/bench/test_lossy_prefill_sweep.py` checks the
 summariser (0.96x passes, 0.94x fails, Edit -2.5 points fails, time 0.39x passes), the grid and the commands. It is
 stdlib-only; the needle workload needs the `eval/.venv` of eval/README.md. Hold the GPU lock for a sweep on a shared card.
 

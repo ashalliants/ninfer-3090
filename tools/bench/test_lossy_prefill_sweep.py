@@ -31,14 +31,22 @@ BASE = [
 ]
 
 
-def point_rows(point, needle=1.0, edit=0.90, total=39.0):
-    return [
+LOSSY = {"requests": 6, "none": 1, "completed": 5}
+
+
+def point_rows(point, needle=1.0, edit=0.90, total=39.0, lossy=LOSSY):
+    rows = [
         row(point, "needle", {"accuracy": {"32k": needle, "64k": needle, "100k": needle}}),
         row(point, "agent_replay", {"edit_rate": edit, "tool_call_validity": 0.99}),
         row(point, "speed", {"total_s": total, "scout_ms": 4000, "main_ms": 30000, "kept_tokens": 20000,
                              "uncached_tokens": 100000, "neighbour_gap_max_ms": 300}),
         row(point, "greedy_agreement", {"outputs": [[1, 2, 3, 9], [1, 2, 3, 4]]}),
     ]
+    if lossy is not None:
+        for r in rows:
+            r["metrics"]["lossy_outcomes"] = lossy
+    rows[1]["metrics"]["edit_turns"] = 52
+    return rows
 
 
 def checks(rows, point):
@@ -185,6 +193,110 @@ def test_divergence_and_speed():
                        + json.dumps({"event": "request_done", "lossy_prefill": {"uncached_tokens": 5, "scout_ms": 1}}) + "\n"
                        + json.dumps({"event": "request_done", "lossy_prefill": {"uncached_tokens": 107000, "scout_ms": 3000}}) + "\n")
         check(sweep.long_request_lossy_record(log, 0)["scout_ms"] == 3000, "biggest lossy record")
+
+
+def test_speed_report_validation():
+    good = {"long": {"status": 200, "prompt_tokens": 108000, "cached_tokens": 0, "seconds": 40.0}}
+    sweep.check_speed_report(good, 131072)
+    bad_reports = [
+        {"long": {"status": 500, "error": "boom", "prompt_tokens": None, "seconds": 0.3}},
+        {"long": {**good["long"], "cached_tokens": 4096}},
+        {"long": {**good["long"], "prompt_tokens": 60000}},
+        {"long": {**good["long"], "prompt_tokens": 140000}},
+        {},
+    ]
+    for report in bad_reports:
+        try:
+            sweep.check_speed_report(report, 131072)
+        except RuntimeError:
+            continue
+        check(False, f"should be refused: {report}")
+    check(sweep.speed_metrics(good, None)["cached_tokens"] == 0, "cached tokens recorded")
+
+
+def test_resume_repairs_failures():
+    rows = BASE + [row("p", "server", {}, ok=False, error="exit 1"), row("p", "needle", {}, ok=False, error="x")]
+    rows += point_rows("p")  # later ok rows for every workload
+    ev = sweep.evaluate_point(rows, "p")
+    check(ev["errors"] == [] and ev["verdict"] == "PASS", f"superseded failures do not count: {ev['errors']}")
+    only_server = BASE + [row("q", "needle", {}, ok=False, error="x"), row("q", "server", {}, ok=False, error="exit 1"),
+                          row("q", "speed", {"total_s": 30.0}, ok=True)]
+    errors = sweep.evaluate_point(only_server, "q")["errors"]
+    check([e["workload"] for e in errors] == ["needle"], "a later ok row clears the server failure, not another workload's")
+    later_fail = BASE + point_rows("r") + [row("r", "speed", {}, ok=False, error="late")]
+    check(sweep.evaluate_point(later_fail, "r")["verdict"] == "FAIL", "a failure after the ok row stands")
+
+
+def test_lossy_evidence():
+    nothing = {"requests": 6, "none": 6}
+    rows = BASE + point_rows("noop", lossy=nothing) + point_rows("unknown", lossy=None) + point_rows("ran")
+    check(sweep.evaluate_point(rows, "noop")["verdict"] == "INCOMPLETE", "zero completed lossy is not a pass")
+    check(sweep.evaluate_point(rows, "unknown")["verdict"] == "INCOMPLETE", "no outcome counts is not a pass")
+    check(sweep.evaluate_point(rows, "ran")["verdict"] == "PASS", "completed lossy requests pass")
+    with tempfile.TemporaryDirectory() as d:
+        log = Path(d) / "rl.jsonl"
+        recs = [{"event": "request_done", "lossy_prefill": None},
+                {"event": "request_done", "lossy_prefill": {"outcome": "completed"}},
+                {"event": "request_done", "lossy_prefill": {"outcome": "completed"}},
+                {"event": "request_done", "lossy_prefill": {"outcome": "skipped"}},
+                {"event": "request_started"}]
+        log.write_text("".join(json.dumps(r) + "\n" for r in recs))
+        counts = sweep.lossy_outcome_counts(log)
+        check(counts == {"requests": 4, "none": 1, "completed": 2, "skipped": 1}, counts)
+    text = sweep.render_summary(rows)
+    ran = next(l for l in text.splitlines() if l.startswith("| ran |"))
+    check("5/5/5/5" in ran and "| 52 |" in ran, ran)
+
+
+def test_agent_command_passes_repo_and_failure_inputs():
+    cmd = sweep.agent_replay_command(port=1, out=Path("o"), request_log=Path("l"), sessions=26, seed=7,
+                                     repo=Path("/r"), commit="abc")
+    check(cmd[cmd.index("--repo") + 1] == "/r" and cmd[cmd.index("--commit") + 1] == "abc"
+          and cmd[cmd.index("--sessions") + 1] == "26", cmd)
+    args = sweep.parse_args(["--from-json", "x.jsonl"])
+    check(args.agent_sessions == 26 and args.greedy_chars == 330_000, "defaults sized for the gate / ~100K tokens")
+
+
+def test_greedy_generate_needs_the_log_record():
+    import http.server
+    import threading
+    with tempfile.TemporaryDirectory() as d:
+        log = Path(d) / "rl.jsonl"
+        log.write_text(json.dumps({"event": "request_done", "request": {"response_id": "old"}, "result": {"generated_token_ids": [9]}}) + "\n")
+        start = log.stat().st_size
+        known = {"logged": True}
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                rid = "r1" if known["logged"] else "r2"
+                if known["logged"]:
+                    with log.open("a") as f:
+                        f.write(json.dumps({"event": "request_done", "request": {"response_id": "r1"},
+                                            "result": {"generated_token_ids": [1, 2, 3]}}) + "\n")
+                body = json.dumps({"id": rid, "choices": [{"message": {"content": "hi"}}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        url = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            ids, cursor = sweep.greedy_generate(url, "m", "p", 8, log, start, wait_seconds=5)
+            check(ids == [1, 2, 3] and cursor == log.stat().st_size, (ids, cursor))
+            known["logged"] = False
+            try:
+                sweep.greedy_generate(url, "m", "p", 8, log, cursor, wait_seconds=1)
+                check(False, "a missing record must fail, not fall back to characters")
+            except RuntimeError:
+                pass
+        finally:
+            server.shutdown()
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
