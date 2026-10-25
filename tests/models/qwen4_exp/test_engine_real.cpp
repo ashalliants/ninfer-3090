@@ -81,6 +81,14 @@
 //   ninfer_qwen4_exp_engine_real_test --cpu-verify-misses-exact --mtp K [--expert-cache-mib N]
 //       [--max-context N] [--generate N] [TOKENS...]
 //
+// GDN commit on a side stream (gdn_async_commit_matches_serial below, --gdn-async-commit): greedy
+// ids, MTP rounds, drafts and acceptances equal those of the commit folded on the device stream, and
+// at least one fold ran on the side stream. The same arguments as --moe-precast-exact; --mtp K is
+// what exercises the option.
+//
+//   ninfer_qwen4_exp_engine_real_test --gdn-async-commit-exact --mtp K [--max-context N]
+//       [--generate N] [TOKENS...]
+//
 // MTP for constrained requests (mtp_constrained_matches_plain below): a greedy JSON-schema request
 // with --mtp-constrained (K drafts, default 3) gives the ids of plain constrained decoding.
 //
@@ -102,6 +110,7 @@
 // TOKENS is @FILE (ids separated by commas or whitespace) or a comma-separated id list.
 
 #include "core/vram_budget.h"
+#include "models/qwen4_exp/program/program.h"
 #include "ninfer/engine.h"
 #include "ninfer/ops/offloaded_sparse_moe.h"
 #include "ninfer/types.h"
@@ -834,6 +843,19 @@ int cpu_verify_misses_matches_plain(const std::string& artifact, const std::vect
                                [] { return ops::offloaded_moe::CpuMissService::process_served_experts(); }});
 }
 
+// gdn_async_commit_matches_serial (--gdn-async-commit-exact, FlashNextOptions::gdn_async_commit):
+// every MTP verification commit a row continues from folds its GDN columns on the Program's fold
+// stream, beside the drafter's catch-up and the next round's drafts, with the next round's front
+// waiting for it. The greedy ids, rounds, drafts and acceptances equal those of the fold on the device
+// stream (a fold the front did not wait for would change the state the next round reads), and the
+// side stream ran at least one fold. Needs --mtp.
+int gdn_async_commit_matches_serial(const std::string& artifact, const std::vector<std::string>& args) {
+    return option_matches_off(artifact, args,
+                              {"device-stream fold", "side-stream fold", "gdn async commit",
+                               [](EngineOptions& o) { o.flash_next.gdn_async_commit = true; },
+                               [] { return ninfer::models::qwen4_exp::Program::process_async_gdn_folds(); }});
+}
+
 // mtp_constrained_matches_plain (--mtp-constrained, FlashNextOptions::mtp_constrained): a greedy
 // JSON-schema request on an MTP Engine with the option gives the ids of plain constrained decoding.
 // The reference is an MTP Engine without the option, where the constrained row runs plain rounds
@@ -1293,6 +1315,9 @@ int main(int argc, char** argv) {
         }
         if (!args.empty() && args.front() == "--cpu-verify-misses-exact") {
             return cpu_verify_misses_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
+        }
+        if (!args.empty() && args.front() == "--gdn-async-commit-exact") {
+            return gdn_async_commit_matches_serial(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
         }
         if (!args.empty() && args.front() == "--mtp-constrained") {
             return mtp_constrained_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));

@@ -21,5 +21,6 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/context_cache.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/nvme_tier.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/checkpoint_image.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/fold_stream.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/program.cpp"
 )

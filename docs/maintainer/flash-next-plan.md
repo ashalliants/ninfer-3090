@@ -863,6 +863,40 @@ None has been measured on the RTX 3090 yet.
     wait that long: check on Windows how often a round's first wait is that late. Measure tok/s on vs off at 6, 12 and 16 workers, and the
     share of layers whose wait finds the answer ready. Works with two lanes and vision. Not
     measured.
+- **GDN commit on a side stream** (`--gdn-async-commit`, needs `--spec mtp`; F10c of the Basalt
+  learnings). `commit_verified` folds the accepted columns into the recurrent state
+  (`GdnReplayFoldPlan`, eager, not captured) on the device stream ahead of the QSA tail and PLE
+  commits and the drafter's catch-up, none of which reads the recurrent state or the GDN records.
+  With the option a commit the row continues from forks the Program's `GdnFoldStream`
+  (`program/fold_stream.h`: a default-priority non-blocking stream and two events) from the device
+  stream, runs the same fold there and records its end; the catch-up, the next round's drafter
+  steps (`mtp_write_pending`, `mtp_draft` and its host wait, which synchronizes the device stream
+  only) and the host's work between rounds overlap it. A terminal commit folds on the device stream
+  as before, so the state is final when the Engine sees the round. Basalt (`verify_kernels.cu:358-450`)
+  goes further: its commit claims work items from a device counter and the next window starts with
+  a finisher kernel that drains what is left. The plain event form is enough here because the next
+  round's first use of the state comes after the drafter's steps and their host wait, so the wait
+  serializes only when the fold outlasts them; whether it does is a GPU-session measurement.
+  - Readers that join (the device stream waits for the fold event, `join_gdn_fold`): the next
+    verification's front (before `replay(verify_front)`, which reads the state and rewrites the
+    records the fold reads) and a plain round's front (`run_decode(Front)`); at entry
+    `advance_prefill`, `append_forced`, a two-lane `decode_rows`, `commit`, `poll_context` (a
+    restore, a fresh lane's zeroing, a capture's publication) and `start_capture` (copies the
+    state); `finish` (endpoint capture), `abort`, `abort_pending`, `fail_all_cleanup` and the
+    destructor settle it (noexcept: the host waits for the side stream when the wait cannot be
+    enqueued). The fold stream is declared after the state and speculation buffers, so its
+    destructor (which synchronizes it) runs before they are freed. Readers that do not join: the
+    QSA tail and PLE commits, the drafter's catch-up and drafts (the drafter has no GDN layer),
+    `settle_round`'s promotions and the VRAM target (expert frames and the KV pool only), and the
+    host-only context-store and checkpoint calls. No join or fork runs inside a stream capture.
+  - Bit-identical by construction: the same Op, plan and row, only on another stream, and every
+    device use of the state is ordered after it. `ninfer_qwen4_exp_gdn_async_commit_test` (greedy
+    ids, MTP rounds, drafts and acceptances on vs off; `Program::process_async_gdn_folds` must
+    count at least one side-stream fold) has not run yet. `gdn_fold_on_side_stream` and the
+    refusal are pinned on the CPU (`ninfer_qwen4_exp_program_plan_test`).
+  - GPU-session checks: nsys should show the fold kernel on its own stream overlapping the catch-up
+    and draft kernels, and the next verification's front starting after it. Measure tok/s with MTP
+    on vs off. No memory. Works with two lanes and vision. Not measured.
 
 ## Artifact decisions
 
