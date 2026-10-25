@@ -88,6 +88,11 @@ ninfer_add_op_test(ninfer_linear_topk_test
 ninfer_add_op_test(ninfer_hyper_connection_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_hyper_connection.cpp"
   LIBRARIES ninfer_linear_test_support)
+# Host-only: the int8 hyper-connection codec (--hc-int8): the group rule the quantize kernel runs,
+# against exact FP64 checks and an independent re-implementation of Basalt's rule.
+ninfer_add_op_test(ninfer_hc_int8_codec_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_hc_int8_codec.cpp"
+  LIBRARIES ninfer_core)
 
 foreach(op IN ITEMS ple projection_fp32 rows)
   ninfer_add_op_test(ninfer_${op}_test

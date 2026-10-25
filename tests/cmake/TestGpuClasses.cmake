@@ -32,6 +32,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_ggml_blocks_decode_test
   ninfer_grammar_test
   ninfer_hadamard_overlap_test
+  ninfer_hc_int8_codec_test
   ninfer_host_arena_replay_test
   ninfer_host_cache_test
   ninfer_host_timing_test

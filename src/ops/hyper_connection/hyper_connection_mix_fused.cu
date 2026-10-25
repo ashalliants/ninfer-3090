@@ -28,6 +28,11 @@
 // No intermediate is rounded to BF16: Rn, z, m and u stay FP32. Each column is computed
 // independently in a fixed order, so a column's result does not depend on how many columns share
 // the call.
+//
+// --hc-int8 adds Int8Codec, a K1a instance over the int8 down copy: each chunk's eight codes share
+// one binary16 scale and decode exactly to q * s, so the same FP32 fmaf chain runs on the
+// represented weights. The BF16 instances are unchanged; the int8 K1b is in
+// hyper_connection_mix_int8.cu.
 
 #include "ops/hyper_connection/hyper_connection_mix_fused.h"
 
@@ -35,6 +40,7 @@
 #include "ops/common/memory.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <stdexcept>
 #include <string>
@@ -115,6 +121,53 @@ struct Bf16Codec {
         const float2 d = bf16x2_bits_to_float2(c.bits.z), e = bf16x2_bits_to_float2(c.bits.w);
         w[0] = a.x, w[1] = a.y, w[2] = b.x, w[3] = b.y, w[4] = d.x, w[5] = d.y, w[6] = e.x,
         w[7] = e.y;
+    }
+};
+
+// The 8-byte form of ld_nc_na_16, for an int8 copy's chunk of eight codes.
+__device__ __forceinline__ uint2 ld_nc_na_8(const void* ptr) {
+    uint2 value;
+    asm("ld.global.nc.L1::no_allocate.v2.u32 {%0, %1}, [%2];"
+        : "=r"(value.x), "=r"(value.y)
+        : "l"(ptr));
+    return value;
+}
+
+// Four int8 codes as floats, exactly: q + 128 as the low byte of 2^23 + (q + 128), less 2^23 + 128
+// (Basalt 8d73a39 hc_fused.cu i8x4_f).
+__device__ __forceinline__ float4 i8x4_to_float4(std::uint32_t q) {
+    const std::uint32_t u = q ^ 0x80808080U;
+    return make_float4(__uint_as_float(__byte_perm(u, 0x4B000000U, 0x7650U)) - 8388736.0F,
+                       __uint_as_float(__byte_perm(u, 0x4B000000U, 0x7651U)) - 8388736.0F,
+                       __uint_as_float(__byte_perm(u, 0x4B000000U, 0x7652U)) - 8388736.0F,
+                       __uint_as_float(__byte_perm(u, 0x4B000000U, 0x7653U)) - 8388736.0F);
+}
+
+// Int8 copies (--hc-int8): rows of `stride` codes and `scale_stride` binary16 scales, one per 32
+// values. A chunk starts at a multiple of 8, so its eight codes share one scale; each decodes to
+// q * s, exact in FP32.
+struct Int8Codec {
+    struct Params {
+        const std::int8_t* codes;
+        const unsigned short* scales;
+        int stride, scale_stride;
+    };
+
+    struct Chunk {
+        uint2 bits;
+        unsigned short scale;
+    };
+
+    __device__ static Chunk load(const Params& p, std::int64_t row, int k) {
+        return {ld_nc_na_8(p.codes + row * p.stride + k),
+                __ldg(p.scales + row * p.scale_stride + k / 32)};
+    }
+
+    __device__ static void decode(const Chunk& c, float (&w)[8]) {
+        const float s  = __half2float(__ushort_as_half(c.scale));
+        const float4 a = i8x4_to_float4(c.bits.x), b = i8x4_to_float4(c.bits.y);
+        w[0] = a.x * s, w[1] = a.y * s, w[2] = a.z * s, w[3] = a.w * s, w[4] = b.x * s,
+        w[5] = b.y * s, w[6] = b.z * s, w[7] = b.w * s;
     }
 };
 
@@ -414,6 +467,37 @@ void hc_mix_fused(const Tensor& residual, const Tensor& norm_weight, const Weigh
     }
     launch<Bf16Codec>(residual, norm_weight, bf16_params(down), bf16_params(up), down.n, rank,
                       streams, eps, x, inject, partials, stream);
+}
+
+std::size_t hc_mix_fused_inv_offset(std::int32_t down_rows, std::int32_t streams,
+                                    std::int32_t columns) noexcept {
+    return (static_cast<std::size_t>(streams) * down_rows * columns * sizeof(float) + 255) / 256 *
+           256;
+}
+
+void hc_mix_down_partials_int8(const Tensor& residual, const Tensor& norm_weight,
+                               const HcInt8Weights& down, std::int32_t streams, float eps,
+                               void* partials, cudaStream_t stream) {
+    static const bool configured = [] {
+        const cudaError_t error = cudaFuncSetAttribute(hc_down_partials_kernel<Int8Codec>,
+                                                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                       static_cast<int>(kDownSharedBytes));
+        if (error != cudaSuccess) {
+            throw std::runtime_error(std::string("hyper_connection_mix: shared memory: ") +
+                                     cudaGetErrorString(error));
+        }
+        return true;
+    }();
+    (void)configured;
+    const int columns = residual.ne[1];
+    auto* inv         = reinterpret_cast<float*>(static_cast<std::byte*>(partials) +
+                                                 hc_mix_fused_inv_offset(down.n, streams, columns));
+    const Int8Codec::Params params{down.codes, down.scales, down.k, down.k / kHcInt8Group};
+    hc_down_partials_kernel<Int8Codec><<<dim3((down.n + kDownRows - 1) / kDownRows, streams),
+                                         kDownThreads, kDownSharedBytes, stream>>>(
+        static_cast<const bf16*>(residual.data), static_cast<const float*>(norm_weight.data),
+        params, down.n, columns, eps, static_cast<float*>(partials), inv);
+    check_launch("int8 down partials");
 }
 
 } // namespace ninfer::ops::detail

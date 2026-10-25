@@ -440,6 +440,11 @@ struct FlashNextOptions {
     // drafter's catch-up and next drafts and the host's work; the next round's forward waits for it.
     // A commit that ends the request folds before the round is reported. The same state, bit for bit.
     bool gdn_async_commit = false;
+    // Int8 copies of every hyper-connection mixer's matrices (--hc-int8), made at startup from the
+    // BF16 weights with one binary16 scale per 32 values; the mixers read them (about 0.54x the
+    // bytes per decode mixer). CHANGES THE NUMERICS (the weights are rounded); the BF16 weights stay
+    // loaded, so it costs about 0.68 GB of VRAM (fewer expert frames). Off: the BF16 weights.
+    bool hc_int8 = false;
     // The context cache's NVMe tier: a scratch file of up to this many bytes holds the checkpoints,
     // with the Host context budget as its RAM cache (a zero Host budget then reuses prefixes from
     // disk alone); 0: none. The file is created in `context_nvme_dir` (empty: beside the artifact),

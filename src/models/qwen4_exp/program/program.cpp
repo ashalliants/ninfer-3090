@@ -583,6 +583,9 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     d.work = execution::Forward::workspace_bytes(c, std::max(d.chunk, static_cast<std::int32_t>(d.lanes)), d.pages * kPagedKVPageSize,
                                                  DeviceExecutionView{nullptr, sms}, o.moe_precast_input) +
              ops::sampling_workspace_capacity_bytes(d.token_domain, 1, static_cast<std::int32_t>(d.lanes));
+    // --hc-int8: a call past 16 columns (a prefill chunk, a drafter's prefill cells) rounds a
+    // mixer's int8 copies to BF16 in the workspace.
+    const std::size_t hc_int8_work = o.hc_int8 ? execution::Forward::hc_int8_workspace_bytes(c) : 0;
     if (d.drafts > 0) {
         // A drafter step (one column and the head's logits), and a prefill call's drafter cells: a
         // sub-chunk's residual rows beside the call's residual. Acceptance's workspace.
@@ -592,10 +595,12 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
         d.work = std::max(d.work, step) + std::size_t(c.residual_width()) * execution::kMtpChunkColumns * 2 * 3 +
                  ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(d.token_domain, 1, d.drafts, 1, 1);
     }
+    d.work += hc_int8_work;
     d.sms       = sms;
     d.wide_work = execution::Forward::workspace_bytes(c, d.wide_chunk, d.pages * kPagedKVPageSize,
                                                       DeviceExecutionView{nullptr, sms}, o.moe_precast_input) +
-                  (o.shared_expert_stream ? execution::Forward::shared_expert_workspace_bytes(c, d.wide_chunk) : 0);
+                  (o.shared_expert_stream ? execution::Forward::shared_expert_workspace_bytes(c, d.wide_chunk) : 0) +
+                  hc_int8_work;
     d.vmm = VmmArena::supported(o.device);
 
     auto& b     = d.bytes;
@@ -608,6 +613,7 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     b.mtp_draft_probs         = plan_mtp_draft_probs(o);
     b.hot_embedding           = plan_hot_embedding(c.vocab_size, c.hidden_size, o.hot_embedding_rows).hot;
     b.cpu_verify_misses       = plan_cpu_verify_misses(o).device;
+    b.hc_int8_bytes           = plan_hc_int8(o, c);
     b.staging   = d.staging;
     b.state     = d.state_total;
     // Logits of the widest round (FP32 and BF16; at least one column per lane), then the sampling
@@ -820,6 +826,15 @@ public:
 
         if (plan_.bytes.cpu_verify_misses != 0) { start_cpu_verify(); }
         allocated += plan_.bytes.cpu_verify_misses;
+        if (plan_.bytes.hc_int8_bytes != 0) {
+            // --hc-int8: the int8 copies of every mixer the forward runs, made from the BF16 weights
+            // (which stay loaded); the forward's mixers read them.
+            hc_int8_ = std::make_unique<execution::HcInt8Copies>(
+                execution::HcInt8Copies::mixers(parameters_.layers, parameters_.final_mixer,
+                                                parameters_.mtp ? &*parameters_.mtp : nullptr),
+                plan_.bytes.hc_int8_bytes, device_.stream);
+        }
+        allocated += plan_.bytes.hc_int8_bytes;
 
         std::vector<const std::uint8_t*> banks;
         std::vector<std::uint64_t> bank_strides;
@@ -1041,7 +1056,8 @@ public:
                                       .gdn_head_map         = options_.gdn_head_map,
                                       .moe_precast_input    = options_.moe_precast_input,
                                       .moe_gate_up_registers = options_.moe_gate_up_registers,
-                                      .moe_fused_route       = options_.moe_fused_route};
+                                      .moe_fused_route       = options_.moe_fused_route,
+                                      .hc_int8               = hc_int8_.get()};
         if (plan_.bytes.hot_embedding == 0) { return out; }
         const Weight& table        = parameters_.token_embedding;
         const auto rows            = static_cast<std::int32_t>(options_.hot_embedding_rows);
@@ -3077,7 +3093,8 @@ private:
             plan_.wide_work,
             execution::Forward::workspace_bytes(c_, widest, keys, DeviceExecutionView{nullptr, plan_.sms},
                                                 options_.moe_precast_input) +
-                (options_.shared_expert_stream ? forward_->max_shared_expert_scratch_bytes(widest) : 0));
+                (options_.shared_expert_stream ? forward_->max_shared_expert_scratch_bytes(widest) : 0) +
+                (options_.hc_int8 ? execution::Forward::hc_int8_workspace_bytes(c_) : 0));
         const std::uint64_t stride  = residency_->frame_stride();
         const std::size_t tables    = align(stream_->table_bytes());
         const auto work_frames      = static_cast<std::uint32_t>((tables + work + stride - 1) / stride);
@@ -4855,6 +4872,8 @@ private:
     std::uint32_t* cpu_error_device_ = nullptr;
     bool cpu_verify_off_reported_    = false;
     std::unique_ptr<ExpertResidency> residency_;
+    // --hc-int8: the mixers' int8 copies (declared before the forward, which reads them).
+    std::unique_ptr<execution::HcInt8Copies> hc_int8_;
     std::unique_ptr<execution::Forward> forward_;
     // Wide prefill: the frames lent for the prompt (workspace, stream tables, ring), the arena over
     // their workspace part, and the stream.
@@ -5039,6 +5058,16 @@ std::uint64_t plan_mtp_constrained_masks(const ProgramOptions& options, std::uin
     if (!options.mtp_constrained || options.mtp_draft_tokens == 0) { return 0; }
     const std::uint64_t words = (static_cast<std::uint64_t>(public_tokens) + 31) / 32;
     return 4ULL * words * (1ULL + options.mtp_draft_tokens);
+}
+
+std::uint64_t plan_hc_int8(const ProgramOptions& options, const TextConfig& config) {
+    if (!options.hc_int8) { return 0; }
+    const std::uint32_t width = config.residual_width(), rank = config.hc.rank;
+    const std::uint64_t block = execution::HcInt8Copies::mixer_bytes(rank + config.hc.streams, width, rank);
+    const std::uint64_t final_mixer = execution::HcInt8Copies::mixer_bytes(rank, width, rank);
+    const bool drafter = options.mtp_draft_tokens > 0;
+    return (2ULL * config.num_hidden_layers + (drafter ? 2U : 0U)) * block + (drafter ? 2U : 1U) * final_mixer +
+           execution::HcInt8Copies::kStatusBytes;
 }
 
 std::uint64_t plan_mtp_draft_probs(const ProgramOptions& options) {

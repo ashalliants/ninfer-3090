@@ -177,7 +177,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--ngram-volume FILE] [--ngram-keepalive-ms N] [--expert-state FILE|--no-expert-state] [--default-expert-state FILE] "
            "[--vram-headroom-mib N] [--shared-expert-stream] [--mtp-constrained] [--mtp-joint-acceptance] [--ngram-prefetch] "
            "[--hot-embedding-rows N] [--gdn-head-map] [--moe-precast-input [--moe-gate-up-registers]] "
-           "[--moe-fused-route] [--cpu-verify-misses [--cpu-verify-workers N]] [--gdn-async-commit] "
+           "[--moe-fused-route] [--cpu-verify-misses [--cpu-verify-workers N]] [--gdn-async-commit] [--hc-int8] "
            "[--ram-headroom-mib N] [--expert-cache-mib N] [--context-nvme-mib N [--context-nvme-dir DIR]] "
            "[--chat-template FILE] "
            "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
@@ -286,6 +286,8 @@ std::string serve_usage_text(const char* argv0) {
            "of reading them over PCIe (the same output, bit for bit; off by default); --gdn-async-commit "
            "(--spec mtp) folds each verification's accepted columns into the GDN state on a side stream "
            "while the drafter catches up and drafts the next round (the same state, bit for bit; off by "
+           "default); --hc-int8 makes int8 copies of the hyper-connection mixers' weights at startup and "
+           "reads those (fewer bytes per token; changes the numerics; about 0.68 GB more VRAM; off by "
            "default); "
            "--vision takes "
            "images when "
@@ -706,6 +708,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.flash_next.cpu_verify_misses = true;
         } else if (arg == "--gdn-async-commit") {
             options.flash_next.gdn_async_commit = true;
+        } else if (arg == "--hc-int8") {
+            options.flash_next.hc_int8 = true;
         } else if (arg == "--cpu-verify-workers") {
             const int workers = parse_nonnegative_int(require_value("--cpu-verify-workers"), "cpu-verify-workers");
             if (workers < 1 || workers > 64) { throw std::invalid_argument("--cpu-verify-workers must be in [1, 64]"); }

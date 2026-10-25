@@ -21,6 +21,7 @@ set(NINFER_HOST_ONLY_TESTS
   ninfer_gdn_replay_records_test
   ninfer_ggml_blocks_decode_test
   ninfer_gpu_telemetry_test
+  ninfer_hc_int8_codec_test
   ninfer_grammar_test
   ninfer_host_arena_replay_test
   ninfer_host_timing_test

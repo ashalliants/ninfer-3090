@@ -21,6 +21,7 @@
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
 #include "models/qwen4_exp/execution/expert_stream.h"
+#include "models/qwen4_exp/execution/hc_int8_copies.h"
 #include "models/qwen4_exp/execution/parameters.h"
 #include "ninfer/ops/offloaded_sparse_moe.h"
 #include "ninfer/ops/qsa.h"
@@ -287,6 +288,12 @@ struct ForwardOptions {
     // moe_route then moe_dispatch: the same routing, counts, offsets, jobs and route log, entries in
     // ascending order within each expert; bitwise the outputs. No workspace.
     bool moe_fused_route = false;
+    // --hc-int8: every hyper-connection mixer (the text model's and the drafter's) reads its int8
+    // copies here (ops::hyper_connection_mix's int8 form) instead of the BF16 weights; null: the
+    // BF16 weights. It must cover every mixer the Forward runs and outlive the Forward. NOT bitwise:
+    // the weights are rounded to int8 codes times binary16 group scales (judged by the KLD gate). A
+    // call of more than 16 columns rounds the copies to BF16 in its workspace (hc_int8_workspace_bytes).
+    const HcInt8Copies* hc_int8 = nullptr;
 };
 
 class Forward {
@@ -341,6 +348,9 @@ public:
     [[nodiscard]] static std::size_t workspace_bytes(const TextConfig& config, std::int32_t columns,
                                                      std::uint32_t max_visible_keys, DeviceExecutionView execution,
                                                      bool moe_precast_input);
+    // With ForwardOptions::hc_int8, the workspace a call needs beyond workspace_bytes: a call of
+    // more than 16 columns rounds the widest mixer's two int8 copies to BF16 there.
+    [[nodiscard]] static std::size_t hc_int8_workspace_bytes(const TextConfig& config);
     // The MoE block's share of workspace_bytes: routing, dispatch, the routed experts' outputs and
     // workspace (with the precast input's planes under moe_precast_input), the shared expert and
     // the combine.
@@ -440,6 +450,7 @@ private:
     bool moe_precast_input_ = false; // ForwardOptions::moe_precast_input
     bool moe_gate_up_registers_ = false; // ForwardOptions::moe_gate_up_registers
     bool moe_fused_route_ = false; // ForwardOptions::moe_fused_route
+    const HcInt8Copies* hc_int8_ = nullptr; // ForwardOptions::hc_int8
     Tensor mtp_frames_; // I32 [E]: every drafter expert resident at its own index
     DeviceBuffer mtp_frames_backing_;
     Tensor residual_; // the call's residual stream, in the workspace from run_front to run_back

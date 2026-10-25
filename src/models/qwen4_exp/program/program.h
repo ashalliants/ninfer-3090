@@ -344,13 +344,16 @@ struct ProgramDevicePlan {
     // (plan_cpu_verify_misses(...).device; 0 when off). Its channel and the round's error word are
     // pinned host memory (.pinned), charged to the RAM ledger.
     std::uint64_t cpu_verify_misses = 0;
+    // --hc-int8: the int8 copies of every mixer's hyper-connection matrices (plan_hc_int8; 0 when
+    // off), beside the BF16 weights, which stay loaded.
+    std::uint64_t hc_int8_bytes = 0;
     std::uint64_t expert_record_stride = 0; // one expert frame
     std::uint32_t max_frames           = 0; // the most frames the expert cache uses
     std::uint32_t graph_bound          = 0; // CUDA graph executables the Program may instantiate (counts both halves of the split decode)
 
     [[nodiscard]] std::uint64_t fixed_bytes() const noexcept {
         return kv + workspace + staging + state + io + residency + speculation + shared_expert_workspace +
-               mtp_constrained_masks + mtp_draft_probs + hot_embedding + cpu_verify_misses;
+               mtp_constrained_masks + mtp_draft_probs + hot_embedding + cpu_verify_misses + hc_int8_bytes;
     }
 };
 
@@ -459,6 +462,11 @@ struct ProgramOptions {
     // the state (the next round's front, any other entry point) waits for it. Requires MTP
     // (mtp_draft_tokens > 0). The same state, bit for bit. No device memory (a stream and two events).
     bool gdn_async_commit = false;
+    // FlashNextOptions::hc_int8: the Program makes int8 copies of every mixer's hyper-connection
+    // matrices at construction (execution::HcInt8Copies, ProgramDevicePlan::hc_int8_bytes) and the
+    // forward's mixers read them (execution::ForwardOptions::hc_int8). Changes the numerics; the
+    // workspace terms include the BF16 rounding of a wide call (Forward::hc_int8_workspace_bytes).
+    bool hc_int8 = false;
 };
 
 // --gdn-async-commit: whether a verification commit runs its GDN replay fold on the fold stream
@@ -466,6 +474,12 @@ struct ProgramOptions {
 // false) goes to the fold stream: a terminal one (the end of the request, or of its budget) folds
 // on the device stream, so the state is final before the Engine sees the round.
 [[nodiscard]] bool gdn_fold_on_side_stream(const ProgramOptions& options, bool terminal) noexcept;
+
+// ProgramDevicePlan::hc_int8_bytes of these options: execution::HcInt8Copies::bytes of the mixers
+// the Program binds, from the configuration (each layer's attn_hc and mlp_hc with their injection
+// rows, the final mixer without, and with MTP the drafter's two block mixers and final mixer: 97,
+// or 100 with MTP, on Flash-Next); 0 without hc_int8.
+[[nodiscard]] std::uint64_t plan_hc_int8(const ProgramOptions& options, const TextConfig& config);
 
 // The CPU miss service of --cpu-verify-misses: its options (CPU-served experts per layer call, the
 // share left on the GPU, the widest call it serves: a verification of 1 + mtp_draft_tokens columns)

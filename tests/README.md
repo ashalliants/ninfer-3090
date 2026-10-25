@@ -220,7 +220,9 @@ compute-sanitizer set; `--bench` times 512 resident experts at T in {256, 1024, 
 
 The Qwen3.8-Flash-Next Ops ported from Infernix have their own suites, each a few seconds:
 `ninfer_hyper_connection_test` (the mixer against its FP64 formula on both arithmetic profiles,
-fused T ≤ 16 and composed above, column invariance, graph equal to eager; inject and expand exact),
+fused T ≤ 16 and composed above, column invariance, graph equal to eager; the `--hc-int8` copies
+bit for bit against the host codec and the int8 form against FP64 on their values; inject and
+expand exact; the codec itself is the host-only `ninfer_hc_int8_codec_test`),
 `ninfer_ple_test` (the IQ4_NL row decode exact against the host decoder; the gate and the stateful
 convolution against FP64, states bit for bit, split calls equal to one call, commit equal to the
 in-place update), `ninfer_projection_fp32_test` (BF16 router segments and the IQ4_XS head against

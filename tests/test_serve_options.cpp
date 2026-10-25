@@ -190,6 +190,15 @@ int main() {
                               (std::string("--cpu-verify-workers ") + bad + " was not refused").c_str());
         }
     }
+    failures += check(!defaults.flash_next.hc_int8, "the int8 hyper-connection copies are on by default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--hc-int8"})).flash_next.hc_int8,
+                      "--hc-int8 does not reach the Engine");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+                                                 "--max-concurrency", "2", "--hc-int8"}))
+                          .flash_next.hc_int8,
+                      "--hc-int8 with MTP and two lanes does not reach the Engine");
+    failures += check(serve_usage_text("ninfer-serve").find("--hc-int8") != std::string::npos,
+                      "the usage text does not name --hc-int8");
     failures += check(!defaults.flash_next.gdn_async_commit, "the GDN commit on a side stream is on by default");
     failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
                                                  "--gdn-async-commit"}))

@@ -380,6 +380,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.cpu_verify_misses     = next.cpu_verify_misses;
     program_options.cpu_verify_workers    = next.cpu_verify_workers;
     program_options.gdn_async_commit      = next.gdn_async_commit;
+    program_options.hc_int8               = next.hc_int8;
     program_options.ngram_volume    = next.ngram_volume_path.empty()
                                           ? models::qwen4_exp::default_ngram_volume(options.artifact_path)
                                           : next.ngram_volume_path;
