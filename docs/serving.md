@@ -171,7 +171,7 @@ the Qwen3.5 models:
 | `--vram-headroom-mib N` | VRAM the expert cache leaves free for the desktop and other programs | 512 with a display, 256 without |
 | `--ram-headroom-mib N` | host RAM left free for Windows once every expert is pinned; startup refuses when it cannot be kept | `2048` |
 | `--expert-cache-mib N` | cap the expert cache (measurement) | what fits |
-| `--shared-expert-stream` | run each MoE block's shared expert on a high-priority CUDA stream beside the routed experts; the same output, bit for bit; works with two lanes, MTP and vision; not measured yet | off |
+| `--shared-expert-stream` | run each MoE block's shared expert on a second CUDA stream beside the routed experts (high priority in eager calls only; CUDA graph replays ignore stream priority). Designed to leave the output bit for bit unchanged and to work with two lanes, MTP and vision; neither the identity nor the speed has been checked on a GPU yet | off |
 | `--max-concurrency 1\|2` | requests that decode in the same rounds (two lanes: see below) | 1 |
 
 Two lanes (`set NINFER_CONCURRENCY=2`, opt-in): a second request no longer waits for the first. Two requests

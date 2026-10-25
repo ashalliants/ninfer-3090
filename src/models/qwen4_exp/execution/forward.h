@@ -243,8 +243,11 @@ struct ForwardOptions {
     // Run each MoE block's shared expert (gate/up, SiLU-mul, down) on a stream of the greatest
     // priority beside the routing and routed experts, forked after the block's input and joined
     // before the combine (in the text model and the MTP drafter). The same Ops on the same inputs:
-    // bitwise the outputs of the serial order. Its Linears' scratch is carved from the call's
-    // workspace (shared_expert_workspace_bytes more per call).
+    // bitwise the outputs of the serial order. The priority applies to eager calls only: CUDA graphs
+    // are instantiated without cudaGraphInstantiateFlagUseNodePriority, so a replay runs the branch
+    // concurrently but unprioritized. Its Linears' scratch is carved from the call's workspace
+    // (shared_expert_scratch_bytes per call; the caller plans and checks it, see
+    // max_shared_expert_scratch_bytes).
     bool shared_expert_stream = false;
 };
 
@@ -297,11 +300,21 @@ public:
     [[nodiscard]] static std::size_t workspace_bytes(const TextConfig& config, std::int32_t columns,
                                                      std::uint32_t max_visible_keys, DeviceExecutionView execution);
     // With ForwardOptions::shared_expert_stream, the workspace a call of up to `columns` columns
-    // needs beyond workspace_bytes: the region each MoE block carves for the shared expert's Linears
-    // (the Q8_1 rows a GGML Linear above 8 columns quantizes its input to), so the side stream never
-    // reuses scratch the device's stream may still be reading. Bounds GGML and BF16 Linears, the
-    // formats the text model's shared expert takes.
+    // is planned to need beyond workspace_bytes, from the configuration alone (before the weights
+    // are read): the Q8_1 rows of the shared expert's widest input, the scratch a GGML Linear above
+    // 8 columns takes. The carve each MoE block takes for the shared expert's Linears, so the side
+    // stream never reuses scratch the device's stream may still be reading, is
+    // shared_expert_scratch_bytes; a caller checks the loaded weights' need against this plan with
+    // max_shared_expert_scratch_bytes.
     [[nodiscard]] static std::size_t shared_expert_workspace_bytes(const TextConfig& config, std::int32_t columns);
+    // The scratch one MoE block's shared expert Linears (gate, up, down) take at calls of `first`
+    // to `last` columns: the largest ops::linear_workspace_capacity_bytes of the three, at least 256
+    // bytes (the carve is never empty).
+    [[nodiscard]] static std::size_t shared_expert_scratch_bytes(const MoeParameters& p, std::int32_t first,
+                                                                 std::int32_t last);
+    // The largest shared_expert_scratch_bytes over the text model's layers at calls of 1 to
+    // `columns` columns (the drafter's shared expert is BF16 rows projected in FP32: no scratch).
+    [[nodiscard]] std::size_t max_shared_expert_scratch_bytes(std::int32_t columns) const;
 
 private:
     void layers(std::uint32_t begin, std::uint32_t end, const ForwardBatch& batch, const ForwardTap* tap);
@@ -327,11 +340,6 @@ private:
     Tensor mtp_attention(const MtpParameters& p, const Tensor& x, const MtpCall& call);
     void mtp_block(const MtpCall& call);
     void mtp_cells(const MtpChunk& chunk, const Tensor& residual);
-    // With the shared expert stream: the side stream waits for the device stream's work so far
-    // (fork), and the device stream for the side stream's (join). Capture-safe.
-    void fork_shared_expert();
-    void join_shared_expert();
-
     // ForwardOptions::shared_expert_stream's stream (the greatest priority) and its two events.
     class SideStream {
     public:
@@ -346,6 +354,24 @@ private:
 
     private:
         void release() noexcept;
+    };
+
+    // The side stream forked from the device stream (it waits for the device stream's work so far),
+    // joined back by join() (the device stream waits for the side stream's work), or by the
+    // destructor when an exception leaves the block first, so the side stream never stays forked.
+    // Capture-safe.
+    class SideFork {
+    public:
+        SideFork(const SideStream& side, cudaStream_t main);
+        ~SideFork();
+        SideFork(const SideFork&)            = delete;
+        SideFork& operator=(const SideFork&) = delete;
+        void join();
+
+    private:
+        const SideStream& side_;
+        cudaStream_t main_ = nullptr;
+        bool joined_       = false;
     };
 
     const Parameters& parameters_;

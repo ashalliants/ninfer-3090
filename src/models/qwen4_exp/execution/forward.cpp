@@ -288,14 +288,39 @@ std::size_t Forward::shared_expert_workspace_bytes(const TextConfig& c, std::int
     return aligned(k * t) + aligned(k / 32 * t * sizeof(float));
 }
 
-void Forward::fork_shared_expert() {
-    CUDA_CHECK(cudaEventRecord(side_->fork, device_.stream));
-    CUDA_CHECK(cudaStreamWaitEvent(side_->stream, side_->fork, 0));
+std::size_t Forward::shared_expert_scratch_bytes(const MoeParameters& p, std::int32_t first, std::int32_t last) {
+    std::size_t bytes = 256;
+    for (const LinearParameters* linear : {&p.shared_gate, &p.shared_up, &p.shared_down}) {
+        bytes = std::max(bytes, ops::linear_workspace_capacity_bytes(linear->weight.qtype, linear->weight.n,
+                                                                     linear->weight.k, linear->policy, first, last));
+    }
+    return bytes;
 }
 
-void Forward::join_shared_expert() {
-    CUDA_CHECK(cudaEventRecord(side_->join, side_->stream));
-    CUDA_CHECK(cudaStreamWaitEvent(device_.stream, side_->join, 0));
+std::size_t Forward::max_shared_expert_scratch_bytes(std::int32_t columns) const {
+    std::size_t bytes = 0;
+    for (const auto& block : parameters_.layers) {
+        bytes = std::max(bytes, shared_expert_scratch_bytes(block.moe, 1, columns));
+    }
+    return bytes;
+}
+
+Forward::SideFork::SideFork(const SideStream& side, cudaStream_t main) : side_(side), main_(main) {
+    CUDA_CHECK(cudaEventRecord(side_.fork, main_));
+    CUDA_CHECK(cudaStreamWaitEvent(side_.stream, side_.fork, 0));
+}
+
+Forward::SideFork::~SideFork() {
+    if (joined_) { return; }
+    // An exception left the block: rejoin so the device stream (and a capture) is not left with an
+    // open branch; the error that is propagating is the one to report.
+    if (cudaEventRecord(side_.join, side_.stream) == cudaSuccess) { (void)cudaStreamWaitEvent(main_, side_.join, 0); }
+}
+
+void Forward::SideFork::join() {
+    joined_ = true;
+    CUDA_CHECK(cudaEventRecord(side_.join, side_.stream));
+    CUDA_CHECK(cudaStreamWaitEvent(main_, side_.join, 0));
 }
 
 void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap) {
@@ -594,9 +619,10 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     // and the carve its Linears take scratch from are allocated before the routed experts' and stay
     // live until the join, so neither stream reuses memory the other may still be reading.
     Tensor shared;
+    std::optional<SideFork> fork;
     if (side_) {
-        fork_shared_expert();
-        WorkspaceArena scratch(work_->alloc_bytes(shared_expert_workspace_bytes(config_, T)));
+        fork.emplace(*side_, s);
+        WorkspaceArena scratch(work_->alloc_bytes(shared_expert_scratch_bytes(p, T, T)));
         shared = shared_expert(p, x, I, H, *work_, scratch, side_->stream);
     }
     Tensor logits = work_->alloc(DType::FP32, {E + 1, T});
@@ -645,8 +671,8 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s);
     if (stream != nullptr) { stream->after_experts(layer, s); }
 
-    if (side_) {
-        join_shared_expert();
+    if (fork) {
+        fork->join();
     } else {
         shared = shared_expert(p, x, I, H, *work_, *work_, s);
     }
@@ -1096,8 +1122,9 @@ void Forward::mtp_block(const MtpCall& call) {
             return project_rows(product, {&p.shared_down}, H, *work_, stream);
         };
         Tensor shared;
+        std::optional<SideFork> fork;
         if (side_) {
-            fork_shared_expert();
+            fork.emplace(*side_, s);
             shared = shared_expert_rows(side_->stream);
         }
         Tensor logits        = work_->alloc(DType::FP32, {E + 1, T});
@@ -1121,8 +1148,8 @@ void Forward::mtp_block(const MtpCall& call) {
         const std::int32_t max_jobs = std::min(E, K * T);
         const DeviceSpan expert_ws  = work_->alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T, T));
         ops::moe_experts(xm, dispatch, source, K, max_jobs, expert_ws.data, outputs, s);
-        if (side_) {
-            join_shared_expert();
+        if (fork) {
+            fork->join();
         } else {
             shared = shared_expert_rows(s);
         }
