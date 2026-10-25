@@ -18,9 +18,19 @@
 // intermediates), so |x - ref| <= 2^-8 |ref| + 2^-12 rms(ref), and injects to 1e-5 relative +
 // 1e-6; the composed route rounds Rn, z, m and u to BF16, so its bound is 2^-5 |ref| + 2^-6
 // rms(ref) and injects to 2^-7 relative + 2^-9.
+//
+// The int8 form (--hc-int8): hc_int8_quantize's copies of the same BF16 weights, every code and
+// scale bitwise against the host codec (hc_int8_codec.h, the exact oracle), a refused group (an
+// infinite weight) and refused sources; then hyper_connection_mix's int8 form against the FP64
+// oracle on the copies' represented weights q * s (decoded on the host from the copied bits) at
+// T = 1, 2, 4, 8, 9, 16 (the int8 fused route: the mma's one and two column tiles) and 17, 64 (the
+// composed route on the copies rounded to BF16), with the fused and composed criteria above (the
+// int8 fused route's FP16 split of m is below 2^-20 of its terms); column invariance, graph
+// capture and the workspace capacity as for the BF16 form; misaligned copies are refused.
 
 #include "ninfer/ops/hyper_connection.h"
 
+#include "ops/hyper_connection/hc_int8_codec.h"
 #include "ops/linear/linear_test_common.h"
 #include "ops/op_tester.h"
 
@@ -200,6 +210,68 @@ Problem make_problem(bool inject) {
     return p;
 }
 
+// The int8 copy of a problem matrix, made on the device, with its represented values decoded on the
+// host from the copied bits.
+struct Int8Copy {
+    std::unique_ptr<Device> codes, scales, status;
+    ninfer::ops::HcInt8Weights weights;
+    std::vector<float> values; // q * s
+};
+
+std::uint16_t payload_bits(const t::quantized_weight::PackedWeight& w, std::size_t i) {
+    return static_cast<std::uint16_t>(w.payload[2 * i] | (w.payload[2 * i + 1] << 8));
+}
+
+Int8Copy make_int8(const t::quantized_weight::PackedWeight& w, const ninfer::Weight& device_w,
+                   cudaStream_t stream, const std::string& label) {
+    namespace hc = ninfer::ops::hc_int8;
+    const int n = w.weight.n, k = w.weight.k;
+    Int8Copy c;
+    const std::size_t code_bytes  = ninfer::ops::hc_int8_code_bytes(n, k),
+                      scale_bytes = ninfer::ops::hc_int8_scale_bytes(n, k);
+    c.codes                       = std::make_unique<Device>(code_bytes);
+    c.scales                      = std::make_unique<Device>(scale_bytes);
+    c.status                      = std::make_unique<Device>(4);
+    t::cuda_check(cudaMemset(c.status->p, 0, 4), "status");
+    ninfer::ops::hc_int8_quantize(device_w, {c.codes->p, code_bytes}, {c.scales->p, scale_bytes},
+                                  {c.status->p, 4}, stream);
+    t::cuda_check(cudaStreamSynchronize(stream), "quantize");
+    std::vector<std::int8_t> codes(code_bytes);
+    std::vector<std::uint16_t> scales(scale_bytes / 2);
+    unsigned status = 1;
+    t::cuda_check(cudaMemcpy(codes.data(), c.codes->p, code_bytes, cudaMemcpyDeviceToHost),
+                  "codes");
+    t::cuda_check(cudaMemcpy(scales.data(), c.scales->p, scale_bytes, cudaMemcpyDeviceToHost),
+                  "scales");
+    t::cuda_check(cudaMemcpy(&status, c.status->p, 4, cudaMemcpyDeviceToHost), "status");
+    check(status == 0, label + ": no group refused");
+    std::size_t differ = 0;
+    std::uint16_t group[hc::kGroup];
+    std::int8_t q[hc::kGroup];
+    for (std::size_t g = 0; g < scales.size(); ++g) {
+        for (int i = 0; i < hc::kGroup; ++i) { group[i] = payload_bits(w, g * hc::kGroup + i); }
+        std::uint16_t scale = 0;
+        (void)hc::quantize_group(group, q, &scale);
+        bool same = scale == scales[g];
+        for (int i = 0; i < hc::kGroup; ++i) { same = same && q[i] == codes[g * hc::kGroup + i]; }
+        differ += same ? 0U : 1U;
+    }
+    check(differ == 0, label + ": every code and scale equals the host codec (" +
+                           std::to_string(differ) + " groups differ)");
+    c.values.resize(code_bytes);
+    for (std::size_t i = 0; i < c.values.size(); ++i) {
+        c.values[i] = hc::dequant(codes[i], scales[i / hc::kGroup]);
+    }
+    c.weights = {static_cast<const std::int8_t*>(c.codes->p),
+                 static_cast<const std::uint16_t*>(c.scales->p), n, k};
+    return c;
+}
+
+struct Int8Pair {
+    const Int8Copy* down = nullptr;
+    const Int8Copy* up   = nullptr;
+};
+
 std::vector<std::uint16_t> residual(int T, std::uint32_t seed) {
     std::vector<std::uint16_t> r(static_cast<std::size_t>(T) * kW);
     std::uint32_t state = seed;
@@ -217,7 +289,8 @@ struct Result {
 };
 
 Result run(Problem& p, const std::vector<std::uint16_t>& r, int T, bool inject,
-           ninfer::WorkspaceArena& ws, cudaStream_t stream, bool graph = false) {
+           ninfer::WorkspaceArena& ws, cudaStream_t stream, bool graph = false,
+           Int8Pair int8 = {}) {
     Device rd(r.size() * 2), xd(static_cast<std::size_t>(kH) * T * 2),
         id(static_cast<std::size_t>(kS) * T * 4);
     t::cuda_check(cudaMemcpy(rd.p, r.data(), r.size() * 2, cudaMemcpyHostToDevice), "residual");
@@ -226,6 +299,12 @@ Result run(Problem& p, const std::vector<std::uint16_t>& r, int T, bool inject,
     Tensor x(xd.p, DType::BF16, {kH, T});
     Tensor inj(id.p, DType::FP32, {kS, T});
     const auto call = [&] {
+        if (int8.down != nullptr) {
+            ninfer::ops::hyper_connection_mix(R, w, int8.down->weights, int8.up->weights,
+                                              ninfer::ops::LinearPolicy::A16Only, kS, kRank, kEps,
+                                              x, inject ? &inj : nullptr, ws, stream);
+            return;
+        }
         ninfer::ops::hyper_connection_mix(R, w, p.down_w, p.up_w, ninfer::ops::LinearPolicy::A16Only,
                                           kS, kRank, kEps, x, inject ? &inj : nullptr, ws, stream);
     };
@@ -290,6 +369,122 @@ void compare(const Result& got, const Reference& ref, bool fused, bool inject,
         check(iworst <= 1.0, label + ": inject within its bound (worst " + std::to_string(iworst) +
                                  " of the bound)");
     }
+}
+
+// The int8 form on one problem: see the file comment.
+void int8_form(bool inject, cudaStream_t stream) {
+    Problem p             = make_problem(inject);
+    const std::string tag = std::string(inject ? "inject" : "no inject") + " int8";
+    const Int8Copy down   = make_int8(p.down, p.down_w, stream, tag + " down copy");
+    const Int8Copy up     = make_int8(p.up, p.up_w, stream, tag + " up copy");
+    const Int8Pair pair{&down, &up};
+    const std::size_t capacity = ninfer::ops::hyper_connection_mix_workspace_capacity_bytes(
+        down.weights, up.weights, ninfer::ops::LinearPolicy::A16Only, kS, kRank, 64);
+    ninfer::WorkspaceArena ws(capacity);
+    for (const int T : {1, 2, 4, 8, 9, 16, 17, 64}) {
+        const auto r     = residual(T, 2000U + static_cast<std::uint32_t>(T));
+        const Result got = run(p, r, T, inject, ws, stream, false, pair);
+        compare(got, oracle(r, p.norm, down.values, p.down_rows, up.values, T), T <= 16, inject,
+                tag + " T=" + std::to_string(T));
+        check(ws.peak_used() <= capacity,
+              tag + ": the workspace capacity covers T=" + std::to_string(T));
+    }
+    // Column invariance of the int8 fused route, across its one- and two-tile kernels.
+    const auto r16   = residual(16, 5151U);
+    const Result all = run(p, r16, 16, inject, ws, stream, false, pair);
+    bool same        = true;
+    for (int c = 0; c < 16 && same; ++c) {
+        const std::vector<std::uint16_t> one(r16.begin() + static_cast<std::ptrdiff_t>(c) * kW,
+                                             r16.begin() + static_cast<std::ptrdiff_t>(c + 1) * kW);
+        const Result alone = run(p, one, 1, inject, ws, stream, false, pair);
+        same = std::equal(alone.x.begin(), alone.x.end(),
+                          all.x.begin() + static_cast<std::ptrdiff_t>(c) * kH) &&
+               (!inject || std::equal(alone.inject.begin(), alone.inject.end(),
+                                      all.inject.begin() + static_cast<std::ptrdiff_t>(c) * kS));
+    }
+    check(same, tag + ": each column of a 16-column call equals that column alone");
+    for (const int T : {5, 9}) {
+        const std::vector<std::uint16_t> head(r16.begin(),
+                                              r16.begin() + static_cast<std::ptrdiff_t>(T) * kW);
+        const Result part = run(p, head, T, inject, ws, stream, false, pair);
+        check(std::equal(part.x.begin(), part.x.end(), all.x.begin()),
+              tag + ": a " + std::to_string(T) + "-column call equals the first " +
+                  std::to_string(T));
+    }
+    for (const int T : {5, 17}) {
+        const auto r          = residual(T, 88U + static_cast<std::uint32_t>(T));
+        const Result eager    = run(p, r, T, inject, ws, stream, false, pair);
+        const Result captured = run(p, r, T, inject, ws, stream, true, pair);
+        check(captured.x == eager.x && captured.inject == eager.inject,
+              tag + ": a graph-captured T=" + std::to_string(T) + " call equals the eager call");
+    }
+    // Misaligned copies are refused.
+    {
+        Device rd(static_cast<std::size_t>(kW) * 2), xd(kH * 2), id(kS * 4);
+        const Tensor R(rd.p, DType::BF16, {kW, 1});
+        const Tensor w(p.norm_device->p, DType::FP32, {kW});
+        Tensor x(xd.p, DType::BF16, {kH, 1});
+        Tensor inj(id.p, DType::FP32, {kS, 1});
+        ninfer::ops::HcInt8Weights shifted = down.weights;
+        shifted.codes += 8;
+        bool threw = false;
+        try {
+            ninfer::ops::hyper_connection_mix(R, w, shifted, up.weights,
+                                              ninfer::ops::LinearPolicy::A16Only, kS, kRank, kEps,
+                                              x, inject ? &inj : nullptr, ws, stream);
+        } catch (const std::invalid_argument&) { threw = true; }
+        check(threw, tag + ": codes off the 16-byte grid are refused");
+    }
+}
+
+// hc_int8_quantize refuses a group holding an infinite value (zero codes and scale, the status word
+// set) and sources it does not serve.
+void int8_refusals(cudaStream_t stream) {
+    namespace hc = ninfer::ops::hc_int8;
+    auto w       = t::linear::make_bf16_weight(4, 64, 901U);
+    randomize_bf16(w, 903U);
+    const std::size_t bad  = 1 * 64 + 40; // row 1, group 1
+    w.payload[2 * bad]     = 0x80;
+    w.payload[2 * bad + 1] = 0x7F; // +inf
+    Device payload(w.payload.size()), codes(4 * 64), scales(4 * 2 * 2), status(4);
+    t::cuda_check(cudaMemcpy(payload.p, w.payload.data(), w.payload.size(), cudaMemcpyHostToDevice),
+                  "payload");
+    t::cuda_check(cudaMemset(status.p, 0, 4), "status");
+    t::cuda_check(cudaMemset(codes.p, 0x55, 4 * 64), "codes");
+    const ninfer::Weight dw = w.device_weight(payload.p);
+    ninfer::ops::hc_int8_quantize(dw, {codes.p, 4 * 64}, {scales.p, 16}, {status.p, 4}, stream);
+    t::cuda_check(cudaStreamSynchronize(stream), "quantize");
+    std::vector<std::int8_t> q(4 * 64);
+    std::vector<std::uint16_t> s(8);
+    unsigned st = 0;
+    t::cuda_check(cudaMemcpy(q.data(), codes.p, q.size(), cudaMemcpyDeviceToHost), "codes");
+    t::cuda_check(cudaMemcpy(s.data(), scales.p, 16, cudaMemcpyDeviceToHost), "scales");
+    t::cuda_check(cudaMemcpy(&st, status.p, 4, cudaMemcpyDeviceToHost), "status");
+    bool zero = s[3] == 0;
+    for (int i = 0; i < hc::kGroup; ++i) { zero = zero && q[3 * hc::kGroup + i] == 0; }
+    check(st != 0, "a group with an infinite weight sets the status word");
+    check(zero, "a refused group has zero codes and scale");
+    check(s[0] != 0 && s[2] != 0, "the other groups are quantized");
+    const auto refused = [&](ninfer::Weight bad_w, const std::string& what) {
+        bool threw = false;
+        try {
+            ninfer::ops::hc_int8_quantize(bad_w, {codes.p, 4 * 64}, {scales.p, 16}, {status.p, 4},
+                                          stream);
+        } catch (const std::invalid_argument&) { threw = true; }
+        check(threw, what + " is refused");
+    };
+    ninfer::Weight odd = dw;
+    odd.k = odd.shape[1] = odd.padded_shape[1] = 48;
+    refused(odd, "K not a multiple of 32");
+    ninfer::Weight q8 = dw;
+    q8.qtype          = ninfer::QType::Q8_G32_FP16;
+    refused(q8, "a non-BF16 source");
+    bool threw = false;
+    try {
+        ninfer::ops::hc_int8_quantize(dw, {codes.p, 4 * 64 - 1}, {scales.p, 16}, {status.p, 4},
+                                      stream);
+    } catch (const std::invalid_argument&) { threw = true; }
+    check(threw, "too small a code plane is refused");
 }
 
 // hyper_connection_inject and hyper_connection_expand: exact against the formula with one FP32
@@ -452,6 +647,8 @@ int main() {
             } catch (const std::invalid_argument&) { threw = true; }
             check(threw, "a misaligned residual is refused");
         }
+        for (const bool inject : {true, false}) { int8_form(inject, stream); }
+        int8_refusals(stream);
         inject_and_expand(stream);
         cudaStreamDestroy(stream);
     } catch (const std::exception& error) {

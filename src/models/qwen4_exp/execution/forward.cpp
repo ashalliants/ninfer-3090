@@ -122,6 +122,17 @@ void require_cpu_channels(const ForwardExperts& experts, std::uint32_t layers) {
     }
 }
 
+// ForwardOptions::hc_int8: none, or copies of every mixer the forward runs (the drafter's with it).
+void require_hc_int8(const Parameters& parameters, const HcInt8Copies* copies) {
+    if (copies == nullptr) { return; }
+    const MtpParameters* drafter = parameters.mtp ? &*parameters.mtp : nullptr;
+    for (const auto* mixer : HcInt8Copies::mixers(parameters.layers, parameters.final_mixer, drafter)) {
+        if (!copies->covers(*mixer)) {
+            throw std::invalid_argument("Qwen4Exp forward: --hc-int8 needs an int8 copy of every hyper-connection mixer");
+        }
+    }
+}
+
 } // namespace
 
 ops::QsaIndexerGeometry qsa_geometry(const TextConfig& c) {
@@ -165,7 +176,8 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
       hot_embedding_rows_(options.hot_embedding_rows), hot_embedding_(options.hot_embedding),
       cold_embedding_(options.cold_embedding), gdn_head_map_(options.gdn_head_map),
       moe_precast_input_(options.moe_precast_input), moe_gate_up_registers_(options.moe_gate_up_registers),
-      moe_fused_route_(options.moe_fused_route) {
+      moe_fused_route_(options.moe_fused_route), hc_int8_(options.hc_int8) {
+    require_hc_int8(parameters_, hc_int8_);
     if (state_.gdn_conv.size() != config_.gdn_layers || state_.gdn_recurrent.size() != config_.gdn_layers ||
         state_.ple_slot.dtype != DType::I32 || state_.ple_slot.numel() != 1 ||
         state_.qsa_tails.size() != config_.attention_layers || kv_.layers.size() != config_.attention_layers ||
@@ -194,7 +206,8 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
       hot_embedding_rows_(options.hot_embedding_rows), hot_embedding_(options.hot_embedding),
       cold_embedding_(options.cold_embedding), gdn_head_map_(options.gdn_head_map),
       moe_precast_input_(options.moe_precast_input), moe_gate_up_registers_(options.moe_gate_up_registers),
-      moe_fused_route_(options.moe_fused_route) {
+      moe_fused_route_(options.moe_fused_route), hc_int8_(options.hc_int8) {
+    require_hc_int8(parameters_, hc_int8_);
     if (mtp.has_value() != parameters_.mtp.has_value()) {
         throw std::invalid_argument("Qwen4Exp forward: the MTP drafter's parameters and state go together");
     }
@@ -323,6 +336,14 @@ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, 
     // Linear's activation casts and the composed mixer route, plus alignment slack per allocation.
     bytes += w * t * (bf + f) * 2 + (256ULL << 20);
     return bytes;
+}
+
+std::size_t Forward::hc_int8_workspace_bytes(const TextConfig& c) {
+    // The composed route's BF16 roundings of a block mixer's down (rank + S rows, the widest) and up
+    // matrices, each 256-byte aligned as the Op allocates them.
+    const auto aligned = [](std::size_t n) { return (n + 255) / 256 * 256; };
+    const std::size_t w = c.residual_width(), bf = 2;
+    return aligned(std::size_t(c.hc.rank + c.hc.streams) * w * bf) + aligned(w * c.hc.rank * bf);
 }
 
 std::size_t Forward::shared_expert_workspace_bytes(const TextConfig& c, std::int32_t columns) {
@@ -476,6 +497,13 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
 Tensor Forward::mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject) {
     const std::int32_t T = residual.ne[1], H = dim(config_.hidden_size);
     Tensor x = work_->alloc(DType::BF16, {H, T});
+    if (hc_int8_ != nullptr) {
+        const HcInt8Mixer& copies = hc_int8_->at(p);
+        ops::hyper_connection_mix(residual, p.norm, copies.down, copies.up, p.down.policy, dim(config_.hc.streams),
+                                  dim(config_.hc.rank), config_.rms_norm_eps, x, p.combine ? inject : nullptr, *work_,
+                                  device_.stream);
+        return x;
+    }
     ops::hyper_connection_mix(residual, p.norm, p.down.weight, p.up.weight, p.down.policy, dim(config_.hc.streams),
                               dim(config_.hc.rank), config_.rms_norm_eps, x, p.combine ? inject : nullptr, *work_,
                               device_.stream);

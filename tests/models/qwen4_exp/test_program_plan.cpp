@@ -15,6 +15,8 @@
 // pinned one), zero when off or without MTP; MTP off and worker counts outside [1, 64] are refused.
 // --gdn-async-commit: no device memory; only a verification commit the row continues from folds on
 // the side stream; MTP off is refused.
+// --hc-int8: the int8 copies are a named term, the size of the copies of the mixers the Program
+// binds (97, or 100 with the drafter), zero when off; the wide-call workspace term.
 
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/program/program.h"
@@ -27,6 +29,7 @@
 #include <exception>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace q4 = ninfer::models::qwen4_exp;
 namespace ex = ninfer::models::qwen4_exp::execution;
@@ -96,6 +99,69 @@ bool refused(std::uint64_t need, std::uint64_t planned) {
 }
 
 } // namespace
+
+// --hc-int8: ProgramDevicePlan::hc_int8_bytes, from the configuration, is the size of the copies of
+// the mixers the Program binds (HcInt8Copies::mixers over the parameters: each layer's attn_hc and
+// mlp_hc, the final mixer, and with the drafter its attn_hc, mlp_hc and final_mixer), each matrix
+// rows * cols codes and rows * cols / 32 binary16 scales, plus the status word; 0 when off.
+void hc_int8_plan_bytes() {
+    constexpr std::uint32_t kLayers = 48, kStreams = 4, kRank = 320, kWidth = kStreams * kHidden;
+    q4::TextConfig c       = config();
+    c.num_hidden_layers    = kLayers;
+    c.hc.streams           = kStreams;
+    c.hc.rank              = kRank;
+    const auto mixer       = [](std::uint32_t down_rows) {
+        ex::HyperConnectionParameters p;
+        p.down.weight.n = static_cast<std::int32_t>(down_rows);
+        p.down.weight.k = static_cast<std::int32_t>(kWidth);
+        p.up.weight.n   = static_cast<std::int32_t>(kWidth);
+        p.up.weight.k   = static_cast<std::int32_t>(kRank);
+        p.combine       = down_rows != kRank;
+        return p;
+    };
+    std::vector<ex::BlockParameters> layers(kLayers);
+    for (auto& block : layers) {
+        block.attn_hc = mixer(kRank + kStreams);
+        block.mlp_hc  = mixer(kRank + kStreams);
+    }
+    const ex::HyperConnectionParameters final_mixer = mixer(kRank);
+    ex::MtpParameters drafter;
+    drafter.attn_hc     = mixer(kRank + kStreams);
+    drafter.mlp_hc      = mixer(kRank + kStreams);
+    drafter.final_mixer = mixer(kRank);
+    // rows * cols codes and rows * cols / 32 scales (every plane is a multiple of 256 bytes here).
+    const auto copy        = [](std::uint64_t rows, std::uint64_t cols) { return rows * cols + rows * cols / 32 * 2; };
+    const std::uint64_t block_mixer = copy(kRank + kStreams, kWidth) + copy(kWidth, kRank);
+    const std::uint64_t last_mixer  = copy(kRank, kWidth) + copy(kWidth, kRank);
+    for (const bool with_drafter : {false, true}) {
+        const std::string tag = with_drafter ? "with MTP" : "without MTP";
+        q4::ProgramOptions o;
+        o.max_context      = 32768;
+        o.mtp_draft_tokens = with_drafter ? 3 : 0;
+        check(q4::plan_hc_int8(o, c) == 0, tag + ": --hc-int8 off plans no copies");
+        o.hc_int8 = true;
+        const auto mixers = ex::HcInt8Copies::mixers(layers, final_mixer, with_drafter ? &drafter : nullptr);
+        check(mixers.size() == (with_drafter ? 100U : 97U), tag + ": the Program binds 97 mixers, 100 with the drafter");
+        check(mixers.front() == &layers[0].attn_hc && mixers[1] == &layers[0].mlp_hc &&
+                  mixers[2 * kLayers] == &final_mixer && (!with_drafter || mixers.back() == &drafter.final_mixer),
+              tag + ": the mixers are each layer's two, the final mixer, then the drafter's");
+        const std::uint64_t bound   = ex::HcInt8Copies::bytes(mixers);
+        const std::uint64_t planned = q4::plan_hc_int8(o, c);
+        check(planned == bound, tag + ": the plan (" + std::to_string(planned) + ") equals the bound mixers' copies (" +
+                                    std::to_string(bound) + ")");
+        const std::uint64_t expected = (2ULL * kLayers + (with_drafter ? 2U : 0U)) * block_mixer +
+                                       (with_drafter ? 2U : 1U) * last_mixer + ex::HcInt8Copies::kStatusBytes;
+        check(bound == expected, tag + ": the copies are rows * cols + rows * cols / 32 * 2 bytes per matrix");
+        q4::ProgramDevicePlan plan;
+        plan.hc_int8_bytes = planned;
+        check(plan.fixed_bytes() == planned, tag + ": the copies are a term of fixed_bytes()");
+        std::printf("--hc-int8 %s: %zu mixers, %.1f MiB of copies\n", tag.c_str(), mixers.size(),
+                    static_cast<double>(planned) / (1 << 20));
+    }
+    // A call past 16 columns rounds the widest mixer's copies to BF16 in the workspace.
+    check(ex::Forward::hc_int8_workspace_bytes(c) == 2ULL * (kRank + kStreams) * kWidth + 2ULL * kWidth * kRank,
+          "the wide-call workspace holds a block mixer's two matrices in BF16");
+}
 
 int main() {
     try {
@@ -366,6 +432,8 @@ int main() {
         check(!q4::gdn_fold_on_side_stream(fold, false), "without MTP nothing folds on the side stream");
         check(refuses(fold, "--gdn-async-commit") && refuses(fold, "--spec mtp"),
               "--gdn-async-commit without MTP is refused naming the flag and --spec mtp");
+
+        hc_int8_plan_bytes();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

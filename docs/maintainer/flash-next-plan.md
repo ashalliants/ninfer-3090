@@ -232,6 +232,12 @@ Basalt found about 0.01-0.02 KLD of noise in the reference itself, so compare bu
 other: the same base, chunks and window, with the change off and on, in one GPU-lock hold. The
 mode has not been run yet; no result is recorded here.
 
+Numerics options under the gate, each a harness flag:
+
+- `--hc-int8`: the mixers read their int8 copies (Basalt items, below). The harness makes the
+  copies once and every chunk's forward reads them; the prompt half (more than 16 columns) takes
+  the copies rounded to BF16.
+
 ## PR 9 (M1) measurements
 
 RTX 3090 (WDDM, display attached), CUDA 12.8, Ryzen 9 5950X, DDR4-2133; artifact and volume on K:
@@ -897,6 +903,50 @@ None has been measured on the RTX 3090 yet.
   - GPU-session checks: nsys should show the fold kernel on its own stream overlapping the catch-up
     and draft kernels, and the next verification's front starting after it. Measure tok/s with MTP
     on vs off. No memory. Works with two lanes and vision. Not measured.
+- **Int8 hyper-connection copies with FP32 activations** (`--hc-int8`; F1 of the Basalt
+  learnings). The BF16 mixer reads 13.2 MB per decode call at about 50% of 936 GB/s (PR 6), about
+  2.8 ms of the token over its 97 mixers. With the option the Program makes int8 copies of every
+  mixer's down (with the injection rows) and up matrices at construction (`execution::HcInt8Copies`,
+  `ops::hc_int8_quantize`): int8 codes with one binary16 scale per 32 consecutive inputs of a row,
+  Basalt's `hc8_quant_kernel` rule `s = f16(absmax / 127)`, `q = clamp(rint(w / s), -127, 127)`
+  (`src/ops/hyper_connection/hc_int8_codec.h`, shared by the kernel and the host tests). The
+  mixers then read 7.0 MB per block mixer, about 0.53 of the BF16 bytes.
+  - **Numerics change.** Each weight becomes `q * s`, within half a step of the BF16 value; the
+    activations stay FP32 (Basalt notes that llama.cpp's Q8_0 *activation* quantization in this
+    read costs about 1% error; there is none here). So the output is not bit for bit the BF16
+    route's, and there is no identity gate: judge it with the decode-path KLD gate above
+    (`--hc-int8` in the harness's `--kld-base` mode, on vs off against the same base, chunks and
+    window in one GPU-lock hold).
+  - The rule differs from Basalt's only for a low binary16-subnormal scale (a group whose largest
+    value is below about 1e-3): Basalt's rounded scale can leave that value clamped by more than
+    half a step (or, rounded to zero, unencoded), and the copy raises it to the next binary16. The
+    persistent `q8_g32_fp16` format is not reused: its encoder picks codes by a reciprocal multiply
+    and never writes a zero scale, so its bits differ (this copy is a runtime form, never stored).
+  - Kernels (`src/ops/hyper_connection/hyper_connection_mix_int8.cu`, sm_86, no TMA or
+    mbarriers): K1a is the BF16 route's kernel template with an `Int8Codec` (each 8-code chunk
+    decoded exactly to `q * s`, then the same FP32 `fmaf` chain against FP32 Rn); K1b is new: a
+    warp per 4 features (their 16 W_up rows are one `mma.sync.m16n8k16` tile), the codes as exact
+    FP16 pairs, `m` split into FP16 high and low parts, two mma per 16 values with FP32
+    accumulation, each 32-value group's sums times its row's scale (Basalt's `hc_up_main_mma8`
+    arithmetic), then the collapse. The codes and scales are loaded straight into the registers
+    the arithmetic reads, before any activation, as the BF16 kernels do; nothing is staged in
+    shared memory but `m`. 80 CTAs of 8 warps. A column's result does not depend on T within
+    1..16. Calls past 16 columns (prefill) round the copies to BF16 in the workspace
+    (`Forward::hc_int8_workspace_bytes`, 12.6 MiB) and take the composed BF16 route. The BF16
+    kernels compile to the same SASS as before.
+  - Memory: the copies are `ProgramDevicePlan::hc_int8_bytes` (`plan_hc_int8`: 97 mixers, 648 MiB;
+    100 with the drafter, 668 MiB, plus a 256-byte status word), checked against the mixers the
+    Program binds at construction. The BF16 weights stay loaded in this change (about 0.68 GB more
+    VRAM, about 450 fewer expert frames); dropping them is a later step once the gate passes.
+  - Qualification: `ninfer_hc_int8_codec_test` (host only: bounds, zero groups, subnormal scales
+    and refusals, 1,000 groups against an independent FP64 re-implementation of Basalt's rule);
+    `ninfer_qwen4_exp_program_plan_test` (the plan term against the bound mixers);
+    `ninfer_hyper_connection_test` (GPU, not run: the quantize kernel bit for bit against the
+    codec, the int8 form against the FP64 oracle on the copies' values at T = 1, 2, 4, 8, 9, 16, 17
+    and 64 at the model's shapes, column invariance, graph capture, refusals).
+  - GPU-session checks: the KLD gate on vs off; the mixer's time at T = 1, 2, 4, 8, 16 against the
+    BF16 route (target: the bytes' 0.53); tok/s on vs off. Works with two lanes, MTP and vision.
+    Not measured.
 
 ## Artifact decisions
 
@@ -964,9 +1014,9 @@ Infernix is Apache-2.0; each adapted file carries the notice the spec's licensin
 | `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu` | `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu` (`398cf2cc`) | Route, dispatch, staging, CPU plan/wait and combine kept; narrow kernels rewritten for GGML sub-blocks |
 | `src/ops/offloaded_sparse_moe/cuda/wide_expert.{h,cu}` (PR 10) | `src/ops/offloaded_sparse_moe/cuda/wide_expert.{h,cu}` (`17681db5`) | The plan kernel (tiles per pass) kept; the GEMMs are new: exact int8 `mma.sync` over decoded GGML codes in the canonical leaf order, cp.async instead of TMA/mbarrier, the A8 cast of h fused into gate/up |
 | `src/models/qwen4_exp/execution/expert_stream.{h,cpp}` (PR 10) | `src/models/qwen4_exp/execution/expert_stream.{h,cpp}` | The ring is lent frames, published as per-layer frame tables (no `prefetched` source); 2-D run copies; no gated chunks or SSD holds |
-| `include/ninfer/ops/hyper_connection.h` | `include/infernix/ops/hyper_connection.h` | FP32 multiplier norm weight; no Q8 weight form |
-| `src/ops/hyper_connection/hyper_connection.cu` | `src/ops/hyper_connection/hyper_connection.cu` | BF16 weights only |
-| `src/ops/hyper_connection/hyper_connection_mix_fused.{h,cu}` | `src/ops/hyper_connection/hyper_connection_mix_fused.{h,cu}` | Grids re-fitted to 82 SMs |
+| `include/ninfer/ops/hyper_connection.h` | `include/infernix/ops/hyper_connection.h` | FP32 multiplier norm weight; Infernix's Q8 weight form dropped, Basalt's int8 copies (`--hc-int8`) in its place |
+| `src/ops/hyper_connection/hyper_connection.cu` | `src/ops/hyper_connection/hyper_connection.cu` | BF16 weights; the int8 form's composed route rounds its copies to BF16 |
+| `src/ops/hyper_connection/hyper_connection_mix_fused.{h,cu}` | `src/ops/hyper_connection/hyper_connection_mix_fused.{h,cu}` | Grids re-fitted to 82 SMs; an int8 codec instance of K1a (`--hc-int8`) |
 | `include/ninfer/ops/ple.h`, `src/ops/ple/ple.cu` | `include/infernix/ops/ple.h`, `src/ops/ple/ple.cu` | IQ4_NL `ple_embed`; FP32 multiplier norms; FP32 `[K, C]` conv weight (the F16 taps widened) |
 | `include/ninfer/ops/projection_fp32.h`, `src/ops/projection_fp32/projection_fp32.cu` | `include/infernix/ops/projection_fp32.h`, `src/ops/projection_fp32/projection_fp32.cu` | BF16 segment form plus a GGML IQ4_XS head |
 | `include/ninfer/ops/rows.h`, `src/ops/rows/rows.cu` | `include/infernix/ops/rows.h`, `src/ops/rows/rows.cu` | Verbatim |

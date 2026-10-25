@@ -50,7 +50,7 @@
 // KLD mode (the decode-path quality gate against a llama.cpp base; docs/maintainer/flash-next-plan.md):
 //
 //   ninfer_qwen4_exp_forward_real_test --kld-base FILE [--chunks N] [--window T] [--tsv OUT.tsv]
-//       [--staging SLOTS]
+//       [--staging SLOTS] [--hc-int8]
 //
 // FILE is a `llama-perplexity --kl-divergence-base` file; its n_ctx-token chunks hold the tokens.
 // Each chunk (the first N, default all) is a fresh sequence: positions [0, n_ctx/2) are prefilled as
@@ -59,7 +59,9 @@
 // the verification call the Program runs for an MTP round (T - 1 drafts) with every column committed
 // by the GDN fold, qsa_commit_tails and ple_conv_commit; a partial last window is a narrower round.
 // Each row's FP32 logits over the public token domain are scored against the base row (score_row);
-// the rows go to OUT.tsv (default kld-rows.tsv) and the summary to stdout.
+// the rows go to OUT.tsv (default kld-rows.tsv) and the summary to stdout. Numerics options run
+// under the gate as flags: --hc-int8 makes the mixers' int8 copies once (ex::HcInt8Copies) and every
+// chunk's forward reads them (ForwardOptions::hc_int8).
 //
 // Shared-expert-stream mode (ForwardOptions::shared_expert_stream is bit-exact):
 //
@@ -297,7 +299,8 @@ struct Harness {
         work = std::make_unique<WorkspaceArena>(
             ex::Forward::workspace_bytes(c, columns, static_cast<std::uint32_t>(context), device.execution_view(),
                                          options.moe_precast_input) +
-            (options.shared_expert_stream ? ex::Forward::shared_expert_workspace_bytes(c, columns) : 0));
+            (options.shared_expert_stream ? ex::Forward::shared_expert_workspace_bytes(c, columns) : 0) +
+            (options.hc_int8 != nullptr ? ex::Forward::hc_int8_workspace_bytes(c) : 0));
         views   = state;
         forward = std::make_unique<ex::Forward>(parameters, device, *work, std::move(state), std::move(kv),
                                                 std::move(experts), std::nullopt, options);
@@ -1106,8 +1109,13 @@ int kld_mode(int argc, char** argv, const char* artifact_env) {
     std::optional<int> chunks;
     std::int32_t window = ppl::kDefaultDecodeWindow, staging_slots = 64;
     std::string tsv_path = "kld-rows.tsv";
+    bool hc_int8         = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
+        if (arg == "--hc-int8") {
+            hc_int8 = true;
+            continue;
+        }
         if (i + 1 >= argc) { throw std::invalid_argument(arg + " needs a value"); }
         const std::string value = argv[++i];
         if (arg == "--kld-base") {
@@ -1133,8 +1141,9 @@ int kld_mode(int argc, char** argv, const char* artifact_env) {
     const int chunk_count    = ppl::kld_chunk_count(base, chunks);
     const auto n_ctx         = static_cast<std::int32_t>(base.n_ctx);
     const std::int32_t first = static_cast<std::int32_t>(base.n_ctx / 2U) + 1; // the first target
-    std::printf("KLD base %s: n_ctx %d, n_vocab %d, %d of %d chunks; window T = %d, staging slots %d\n",
-                base.path.string().c_str(), n_ctx, base.n_vocab, chunk_count, base.n_chunk, window, staging_slots);
+    std::printf("KLD base %s: n_ctx %d, n_vocab %d, %d of %d chunks; window T = %d, staging slots %d%s\n",
+                base.path.string().c_str(), n_ctx, base.n_vocab, chunk_count, base.n_chunk, window, staging_slots,
+                hc_int8 ? "; --hc-int8" : "");
 
     print_memory("start");
     DeviceContext device(0);
@@ -1155,6 +1164,17 @@ int kld_mode(int argc, char** argv, const char* artifact_env) {
                                                 : q4::default_ngram_volume(artifact_env),
                            c.ple.table);
     volume.set_keepalive(std::chrono::milliseconds(100), std::chrono::milliseconds(60000));
+    // --hc-int8: the mixers' int8 copies, made once from the BF16 weights for every chunk's forward.
+    std::unique_ptr<ex::HcInt8Copies> hc_int8_copies;
+    ex::ForwardOptions options;
+    if (hc_int8) {
+        auto mixers = ex::HcInt8Copies::mixers(parameters.layers, parameters.final_mixer,
+                                               parameters.mtp ? &*parameters.mtp : nullptr);
+        const std::uint64_t bytes = ex::HcInt8Copies::bytes(mixers);
+        hc_int8_copies = std::make_unique<ex::HcInt8Copies>(std::move(mixers), bytes, device.stream);
+        options.hc_int8 = hc_int8_copies.get();
+        std::printf("--hc-int8: %.1f MiB of int8 copies\n", static_cast<double>(bytes) / (1 << 20));
+    }
     const std::size_t vocab = c.vocab_size;
     // The comparison domain is the public token domain (llama.cpp may pad n_vocab past it).
     const auto valid_vocab = static_cast<std::int32_t>(model->resources().public_token_count);
@@ -1179,7 +1199,7 @@ int kld_mode(int argc, char** argv, const char* artifact_env) {
         // [first, n_ctx) predicted by a decode forward: targets [b, e) are the logits of positions
         // [b - 1, e - 1), one plain decode call when e - b = 1, else one verification call of
         // e - b columns (an MTP round of e - b - 1 drafts) committed in full.
-        Harness harness(parameters, device, context, std::max(first - 1, window), staging_slots);
+        Harness harness(parameters, device, context, std::max(first - 1, window), staging_slots, options);
         std::optional<Verifier> verifier;
         if (window > 1) { verifier.emplace(harness, window); }
         {
