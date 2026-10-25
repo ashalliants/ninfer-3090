@@ -164,6 +164,74 @@ over positions): hyper-connection mixers 0.2-1.0%, GDN 0.7-1.0%, QSA 2.5-2.9% (t
 exact K/V, the engine INT8-G64), MoE <= 0.07% (most positions bit-equal after BF16 rounding),
 residual updates <= 0.6%, layers 0-3, 7-9, 46 and 47.
 
+### Decode-path KLD gate
+
+The quality gate above scores teacher-forced prefill chunks, so it cannot see a change to the
+decode or MTP verify forward. Flash-Next has no CausalScoring Engine, so `ninfer-perplexity
+--kld-base` ([perplexity.md](../perplexity.md#decode-path-kl-divergence-gate)) cannot score it.
+The forward harness has the same gate instead, with the same scoring code (`score_row`,
+`summarize`). Use it to judge a numerics change to the Flash-Next forward. Each such change adds
+its own option to this mode as a harness flag.
+
+The base is a llama.cpp KL-divergence file from a reference model of the same weights. Basalt
+uses a Q8_0 GGUF of Qwen3.8-Flash-Next, the sibling of the GSQ-RCO IQ2_XS GGUF the artifact is
+converted from, with wikitext-2 in 512-token chunks. The llama.cpp build must know the `qwen4exp`
+architecture; Basalt's quality doc names the commit it used (436f6f89e). The base fixes the tokens,
+so the artifact's tokenizer is not involved:
+
+```bash
+llama-perplexity -m qwen3.8-flash-next-q8_0.gguf -f wiki.test.raw -c 512 \
+  --kl-divergence-base flash-next-q8_0-512.kld
+```
+
+Then score the same tokens under the GPU lock:
+
+```powershell
+$env:NINFER_TEST_QWEN4EXP_ARTIFACT = "K:\ninfer-models\qwen4exp\qwen4exp-iq2xs.ninfer"
+. tools/gpu-lock.ps1
+Invoke-WithGpuLock {
+  build-ninja\tests\ninfer_tests.exe ninfer_qwen4_exp_forward_real_test `
+    --kld-base flash-next-q8_0-512.kld --chunks 20 --window 3 --tsv kld-t3.tsv
+}
+```
+
+Each chunk of `n_ctx` tokens (the first `--chunks N`, default all) is a fresh sequence:
+
+- Positions `[0, n_ctx/2)` are prefilled as one call.
+- Every target in `[n_ctx/2 + 1, n_ctx)` is predicted by a decode forward, `T` targets per call
+  (`--window T`, default 3). These are exactly the base's rows, including row 0, as in
+  `ninfer-perplexity`'s Qwen3.5 gate.
+- `T = 1` is the plain decode call.
+- `T` from 2 to 8 is the verification call of an MTP round with `T - 1` drafts. Every column is
+  committed through the GDN replay fold, `qsa_commit_tails` and `ple_conv_commit`, as
+  `commit_verified` commits an accepted round.
+- The last window of a chunk may be partial. It runs as a narrower round; one column runs as a
+  plain decode call.
+- `T` above 8 is refused: the Program verifies at most the anchor and 7 drafts.
+
+The verification forward is built to give every column the logits of a one-column decode call,
+bit for bit (`ninfer_qwen4_exp_mtp_real_test`). On the current code the window therefore changes
+which code runs but should not change the rows. A change that breaks that shows up as a
+difference between `T = 1` and a wider window.
+
+What differs from the served Program:
+
+- every call runs eagerly, without CUDA graphs;
+- every routed expert is read from the pinned bank through staging slots (`--staging`, default
+  64); placement does not change bits;
+- rows are scored from the forward's FP32 logits, while the Program samples a BF16 cast of them;
+- the prompt half goes through the harness's single prefill call, not the Program's chunked or wide
+  prefill. Only the state and KV it leaves can differ; no row is scored from it;
+- no MTP drafter runs.
+
+Rows are compared over the model's public token domain; rows past it in the base (llama.cpp's
+padded vocabulary) are left out. stdout shows PPL with its standard error and the base's PPL, the
+KLD mean, median, p99 and max, and the top-1 agreement, with a running line per chunk. `--tsv`
+(default `kld-rows.tsv`) gets one line per row, in the columns of `ninfer-perplexity`'s `rows.tsv`.
+Basalt found about 0.01-0.02 KLD of noise in the reference itself, so compare builds with each
+other: the same base, chunks and window, with the change off and on, in one GPU-lock hold. The
+mode has not been run yet; no result is recorded here.
+
 ## PR 9 (M1) measurements
 
 RTX 3090 (WDDM, display attached), CUDA 12.8, Ryzen 9 5950X, DDR4-2133; artifact and volume on K:

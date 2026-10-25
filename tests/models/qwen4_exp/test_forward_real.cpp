@@ -46,11 +46,28 @@
 //     distinct experts per layer and misses per round, and the cost per extra row.
 //     --configs LIST (0 = the single-sequence call, B = B rows) instead runs the listed
 //     configurations once each inside a cudaProfilerStart/Stop range, for an nsys kernel breakdown.
+//
+// KLD mode (the decode-path quality gate against a llama.cpp base; docs/maintainer/flash-next-plan.md):
+//
+//   ninfer_qwen4_exp_forward_real_test --kld-base FILE [--chunks N] [--window T] [--tsv OUT.tsv]
+//       [--staging SLOTS]
+//
+// FILE is a `llama-perplexity --kl-divergence-base` file; its n_ctx-token chunks hold the tokens.
+// Each chunk (the first N, default all) is a fresh sequence: positions [0, n_ctx/2) are prefilled as
+// one call, then every target in [n_ctx/2 + 1, n_ctx) is predicted by a decode forward, T targets
+// per call (default 3, at most 8): one column through the plain decode call, wider windows through
+// the verification call the Program runs for an MTP round (T - 1 drafts) with every column committed
+// by the GDN fold, qsa_commit_tails and ple_conv_commit; a partial last window is a narrower round.
+// Each row's FP32 logits over the public token domain are scored against the base row (score_row);
+// the rows go to OUT.tsv (default kld-rows.tsv) and the summary to stdout.
 
 #include "artifact/reader.h"
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
+#include "core/gdn_replay_records.h"
+#include "core/layout.h"
+#include "core/linear_attention_state.h"
 #include "core/paged_kv_cache.h"
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/execution/parameters.h"
@@ -58,6 +75,11 @@
 #include "models/qwen4_exp/model.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
+#include "ninfer/ops/gdn_replay.h"
+#include "ninfer/ops/ple.h"
+#include "ninfer/ops/qsa.h"
+
+#include "evaluation.h"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
@@ -67,10 +89,14 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iterator>
 #include <memory>
 #include <numeric>
+#include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -86,6 +112,7 @@
 using namespace ninfer;
 namespace q4 = ninfer::models::qwen4_exp;
 namespace ex = ninfer::models::qwen4_exp::execution;
+namespace ppl = ninfer::perplexity;
 
 namespace {
 
@@ -221,11 +248,13 @@ struct Harness {
         }
         work = std::make_unique<WorkspaceArena>(
             ex::Forward::workspace_bytes(c, columns, static_cast<std::uint32_t>(context), device.execution_view()));
+        views   = state;
         forward = std::make_unique<ex::Forward>(parameters, device, *work, std::move(state), std::move(kv),
                                                 std::move(experts));
     }
 
     const q4::TextConfig& config;
+    ex::ForwardState views; // the state's tensors (the Forward holds the same views)
     DeviceBuffer state_backing, kv_backing, frames_backing, staging;
     std::unique_ptr<WorkspaceArena> work;
     std::unique_ptr<ex::Forward> forward;
@@ -901,6 +930,269 @@ int rows_mode(int argc, char** argv, const char* artifact_env) {
     return 0;
 }
 
+// -------------------------------------------------------------------------------- KLD mode
+
+// The widest verification call the Program runs: the anchor and at most 7 MTP drafts
+// (program.cpp plan_layout).
+constexpr std::int32_t kMaxVerifyColumns = 8;
+
+// The bytes from layer 0's tensor to layer 1's (uniform per-layer strides), or `single` with one layer.
+std::size_t layer_stride(const std::vector<Tensor>& layers, std::size_t single) {
+    if (layers.size() < 2) { return single; }
+    return static_cast<std::size_t>(static_cast<const std::byte*>(layers[1].data) -
+                                    static_cast<const std::byte*>(layers[0].data));
+}
+
+// What a Harness's one sequence needs for W-column verification calls (W in [2, max_width]) and
+// their commit, as the Program's SpecLayout holds it: the GDN records planned at the widest width
+// (a narrower width's planes fit in them), the PLE convolution inputs, the raw index keys, copies of
+// the QSA tails, the convolution's discarded window, the slot word (0) and commit words 0..max_width.
+struct Verifier {
+    static std::int32_t dim(std::uint64_t v) { return static_cast<std::int32_t>(v); }
+    static std::size_t align256(std::size_t v) { return (v + 255) / 256 * 256; }
+
+    Verifier(const Harness& h, std::int32_t max_width) : h(h), c(h.config) {
+        di = dim(c.qsa.index_head_dim);
+        r  = dim(c.qsa.compress_ratio);
+        LayoutBuilder builder;
+        records_bytes = align256(plan_gdn_replay_records(builder, records_spec(max_width)).payload_bytes());
+        tail_stride   = layer_stride(h.views.qsa_tails, h.views.qsa_tails[0].bytes());
+        const auto W  = static_cast<std::size_t>(max_width);
+        const std::size_t ple_bytes   = align256(std::size_t(c.residual_width()) * W * 2);
+        const std::size_t keys_bytes  = align256(std::size_t(di) * W * c.attention_layers * 2);
+        const std::size_t tails_bytes = align256(tail_stride * c.attention_layers);
+        const std::size_t conv_bytes  = align256(std::size_t(c.gdn.conv_channels()) * (c.gdn.conv_kernel - 1) * 2);
+        backing = DeviceBuffer(records_bytes + ple_bytes + keys_bytes + tails_bytes + conv_bytes + 256 +
+                               align256(4 * (W + 1)));
+        backing.fill(0);
+        auto* p      = static_cast<std::byte*>(backing.p);
+        ple_inputs   = p + records_bytes;
+        qsa_keys     = ple_inputs + ple_bytes;
+        tail_copies  = qsa_keys + keys_bytes;
+        conv         = tail_copies + tails_bytes;
+        slot         = conv + conv_bytes; // holds 0
+        commit_words = slot + 256;
+        std::vector<std::int32_t> words(W + 1);
+        std::iota(words.begin(), words.end(), 0);
+        backing.copy_from_host(words.data(), words.size() * 4, static_cast<std::size_t>(commit_words - p));
+        folds.resize(W + 1);
+    }
+
+    // SpecLayout::records_spec.
+    GdnReplayRecordSpec records_spec(std::int32_t width) const {
+        return {.layers          = dim(c.gdn_layers),
+                .record_capacity = 1,
+                .width           = width,
+                .conv_channels   = dim(c.gdn.conv_channels()),
+                .qk_heads        = dim(c.gdn.value_heads), // tiled: one per value head
+                .value_heads     = dim(c.gdn.value_heads),
+                .key_dim         = dim(c.gdn.key_head_dim),
+                .value_dim       = dim(c.gdn.value_head_dim)};
+    }
+
+    ex::ForwardVerify view(std::int32_t W) const {
+        LayoutBuilder builder;
+        ex::ForwardVerify v;
+        v.gdn        = GdnReplayRecords(DeviceSpan{backing.p, records_bytes},
+                                        plan_gdn_replay_records(builder, records_spec(W)));
+        v.ple_inputs = Tensor(ple_inputs, DType::BF16, {dim(c.residual_width()), W});
+        v.qsa_keys   = Tensor(qsa_keys, DType::BF16, {di, W, dim(c.attention_layers)});
+        for (std::uint32_t l = 0; l < c.attention_layers; ++l) {
+            v.qsa_tails.emplace_back(tail_copies + tail_stride * l, DType::BF16,
+                                     std::initializer_list<std::int32_t>{di, r - 1});
+        }
+        v.conv_scratch = Tensor(conv, DType::BF16, {dim(c.gdn.conv_channels()), dim(c.gdn.conv_kernel - 1)});
+        v.initial_slot = Tensor(slot, DType::I32, {1});
+        return v;
+    }
+
+    // Before a verification call: it pools from copies of the live tails.
+    void copy_tails(cudaStream_t s) const {
+        CUDA_CHECK(cudaMemcpyAsync(tail_copies, h.views.qsa_tails[0].data, tail_stride * c.attention_layers,
+                                   cudaMemcpyDeviceToDevice, s));
+    }
+
+    // After a W-column verification call over `positions`: commits all W columns, as
+    // commit_verified commits an accepted round (the GDN fold, qsa_commit_tails, ple_conv_commit).
+    void commit(const ex::ForwardVerify& view, std::int32_t W, const Tensor& positions, cudaStream_t s) {
+        auto& fold = folds.at(static_cast<std::size_t>(W));
+        if (!fold) {
+            // The one sequence's convolution windows and recurrences, one slot, a uniform layer stride.
+            const auto stride = static_cast<std::int64_t>(layer_stride(h.views.gdn_conv, 0));
+            LinearAttentionStateAllLayersView state;
+            state.conv_layer0      = Tensor(h.views.gdn_conv[0].data, DType::BF16,
+                                            {dim(c.gdn.conv_channels()), dim(c.gdn.conv_kernel - 1), 1});
+            state.recurrent_layer0 = Tensor(h.views.gdn_recurrent[0].data, DType::FP32,
+                                            {dim(c.gdn.key_head_dim), dim(c.gdn.value_head_dim),
+                                             dim(c.gdn.value_heads), 1});
+            state.conv_layer_stride_bytes      = stride;
+            state.recurrent_layer_stride_bytes = stride;
+            state.spec = LinearAttentionStatePoolSpec{.layers         = c.gdn_layers,
+                                                      .conv_channels  = dim(c.gdn.conv_channels()),
+                                                      .conv_width     = dim(c.gdn.conv_kernel - 1),
+                                                      .value_heads    = dim(c.gdn.value_heads),
+                                                      .value_head_dim = dim(c.gdn.value_head_dim),
+                                                      .key_head_dim   = dim(c.gdn.key_head_dim),
+                                                      .slot_count     = 1};
+            fold.emplace(view.gdn, state);
+        }
+        const ops::GdnReplayFoldRow row{0, 0, W};
+        fold->execute(std::span<const ops::GdnReplayFoldRow>(&row, 1), s);
+        const Tensor count(reinterpret_cast<std::int32_t*>(commit_words) + W, DType::I32, {1});
+        Tensor tail0 = h.views.qsa_tails[0];
+        ops::qsa_commit_tails(view.qsa_keys, positions, count, tail0, static_cast<std::int64_t>(tail_stride), s);
+        Tensor ple_state = h.views.ple_conv;
+        ops::ple_conv_commit(view.ple_inputs.view({dim(c.residual_width()), W, 1}), count, ple_state,
+                             h.views.ple_slot, s);
+    }
+
+    const Harness& h;
+    const q4::TextConfig& c;
+    std::int32_t di = 0, r = 0;
+    std::size_t records_bytes = 0, tail_stride = 0;
+    DeviceBuffer backing;
+    std::byte *ple_inputs = nullptr, *qsa_keys = nullptr, *tail_copies = nullptr, *conv = nullptr, *slot = nullptr,
+              *commit_words = nullptr;
+    std::vector<std::optional<ops::GdnReplayFoldPlan>> folds;
+};
+
+// KLD mode: see the file comment.
+int kld_mode(int argc, char** argv, const char* artifact_env) {
+    std::optional<std::filesystem::path> base_path;
+    std::optional<int> chunks;
+    std::int32_t window = ppl::kDefaultDecodeWindow, staging_slots = 64;
+    std::string tsv_path = "kld-rows.tsv";
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (i + 1 >= argc) { throw std::invalid_argument(arg + " needs a value"); }
+        const std::string value = argv[++i];
+        if (arg == "--kld-base") {
+            base_path = value;
+        } else if (arg == "--chunks") {
+            chunks = ppl::parse_kld_chunks(value);
+        } else if (arg == "--window") {
+            window = std::stoi(value);
+            if (window < 1 || window > kMaxVerifyColumns) {
+                throw std::invalid_argument("--window must be 1 to " + std::to_string(kMaxVerifyColumns) +
+                                            ": the Flash-Next verify forward is at most the anchor and 7 MTP drafts");
+            }
+        } else if (arg == "--tsv") {
+            tsv_path = value;
+        } else if (arg == "--staging") {
+            staging_slots = std::stoi(value);
+        } else {
+            throw std::invalid_argument("unknown option " + arg + " in --kld-base mode");
+        }
+    }
+    if (!base_path) { throw std::invalid_argument("--kld-base FILE is required"); }
+    const ppl::KldBase base  = ppl::read_kld_base(*base_path);
+    const int chunk_count    = ppl::kld_chunk_count(base, chunks);
+    const auto n_ctx         = static_cast<std::int32_t>(base.n_ctx);
+    const std::int32_t first = static_cast<std::int32_t>(base.n_ctx / 2U) + 1; // the first target
+    std::printf("KLD base %s: n_ctx %d, n_vocab %d, %d of %d chunks; window T = %d, staging slots %d\n",
+                base.path.string().c_str(), n_ctx, base.n_vocab, chunk_count, base.n_chunk, window, staging_slots);
+
+    print_memory("start");
+    DeviceContext device(0);
+    auto t0 = std::chrono::steady_clock::now();
+    artifact::Reader reader(artifact_env);
+    if (!q4::is_qwen4_exp(reader)) {
+        std::printf("SKIP: %s is not a Qwen4Exp artifact\n", artifact_env);
+        return 77;
+    }
+    const auto model = q4::load_model(reader, device);
+    device.synchronize();
+    std::printf("loaded in %.1f s: %.2f GiB device, %.2f GiB pinned host\n", seconds_since(t0),
+                gib(model->storage_stats().device_capacity_bytes), gib(model->storage_stats().pinned_bytes));
+    const ex::Parameters parameters(*model);
+    const auto& c         = model->config();
+    const char* ngram_env = std::getenv("NINFER_TEST_QWEN4EXP_NGRAM");
+    q4::NgramVolume volume(ngram_env != nullptr ? std::filesystem::path(ngram_env)
+                                                : q4::default_ngram_volume(artifact_env),
+                           c.ple.table);
+    volume.set_keepalive(std::chrono::milliseconds(100), std::chrono::milliseconds(60000));
+    const std::size_t vocab = c.vocab_size;
+    // The comparison domain is the public token domain (llama.cpp may pad n_vocab past it).
+    const auto valid_vocab = static_cast<std::int32_t>(model->resources().public_token_count);
+    if (base.n_vocab < valid_vocab) {
+        throw std::runtime_error(base.path.string() + " has " + std::to_string(base.n_vocab) +
+                                 " vocabulary rows, fewer than the model's " + std::to_string(valid_vocab) +
+                                 " public tokens");
+    }
+
+    std::ofstream tsv(tsv_path, std::ios::binary | std::ios::trunc);
+    if (!tsv) { throw std::runtime_error("cannot create " + tsv_path); }
+    tsv << "chunk\tposition\ttarget\tnll\tnll_base\tkld\tsame_top1\tdlogp_top1\n" << std::setprecision(9);
+    std::vector<ppl::ScoredRow> rows;
+    DeviceBuffer logits(vocab * static_cast<std::size_t>(window) * sizeof(float));
+    std::vector<float> host(vocab * static_cast<std::size_t>(window));
+    const std::int32_t context = std::max<std::int32_t>(256, (n_ctx + 63) / 64 * 64);
+    const auto scoring_started = std::chrono::steady_clock::now();
+    for (int chunk = 0; chunk < chunk_count; ++chunk) {
+        const ppl::KldChunk input = ppl::kld_chunk(base, chunk);
+        const auto& tokens        = input.tokens;
+        // A fresh sequence: positions [0, first - 1) prefilled as one call, then every target
+        // [first, n_ctx) predicted by a decode forward: targets [b, e) are the logits of positions
+        // [b - 1, e - 1), one plain decode call when e - b = 1, else one verification call of
+        // e - b columns (an MTP round of e - b - 1 drafts) committed in full.
+        Harness harness(parameters, device, context, std::max(first - 1, window), staging_slots);
+        std::optional<Verifier> verifier;
+        if (window > 1) { verifier.emplace(harness, window); }
+        {
+            auto prompt = make_call(c, volume, tokens, 0, first - 1, false);
+            Tensor last(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), 1});
+            harness.forward->run(prompt.batch, last);
+            device.synchronize();
+        }
+        for (std::int32_t b = first; b < n_ctx; b += window) {
+            const std::int32_t W = std::min(window, n_ctx - b);
+            auto call            = make_call(c, volume, tokens, b - 1, W, W > 1);
+            Tensor out(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), W});
+            if (W == 1) {
+                harness.forward->run(call.batch, out);
+                device.synchronize();
+            } else {
+                const ex::ForwardVerify view = verifier->view(W);
+                call.batch.verify            = &view;
+                verifier->copy_tails(device.stream);
+                harness.forward->run(call.batch, out);
+                verifier->commit(view, W, call.batch.positions, device.stream);
+                device.synchronize();
+            }
+            logits.copy_to_host(host.data(), vocab * static_cast<std::size_t>(W) * sizeof(float));
+            for (std::int32_t j = 0; j < W; ++j) {
+                const std::int32_t position = b + j;
+                const auto base_logprobs    = ppl::kld_base_logprobs(base, chunk, ppl::kld_row(base, position));
+                const std::span<const float> row(host.data() + vocab * static_cast<std::size_t>(j), vocab);
+                const ppl::ScoredRow scored =
+                    ppl::score_row(row, base_logprobs, tokens[static_cast<std::size_t>(position)], valid_vocab);
+                rows.push_back(scored);
+                tsv << chunk << '\t' << position << '\t' << tokens[static_cast<std::size_t>(position)] << '\t'
+                    << scored.nll << '\t' << scored.nll_base << '\t' << scored.kld << '\t' << (scored.same_top1 ? 1 : 0)
+                    << '\t' << scored.dlogp_top1 << '\n';
+            }
+        }
+        if (!tsv) { throw std::runtime_error("cannot write " + tsv_path); }
+        const ppl::KldSummary partial = ppl::summarize(rows);
+        std::printf("chunk %d/%d: PPL %.4f, KLD mean %.5f, same top-1 %.2f%%, %.1f s elapsed\n", chunk + 1, chunk_count,
+                    partial.ppl, partial.kld_mean, 100.0 * partial.same_top1, seconds_since(scoring_started));
+    }
+    tsv.flush();
+    if (!tsv) { throw std::runtime_error("cannot write " + tsv_path); }
+    const ppl::KldSummary summary = ppl::summarize(rows);
+    double base_nll = 0.0;
+    for (const auto& row : rows) { base_nll += row.nll_base; }
+    std::printf("KL-divergence gate (decode path, T = %d, %d chunks, %zu rows)\n"
+                "PPL:        %.6f +/- %.6f  (base %.6f)\n"
+                "KLD mean:   %.6f\nKLD median: %.6f\nKLD p99:    %.6f\nKLD max:    %.6f\n"
+                "same top-1: %.4f%%\nrows: %s\n",
+                window, chunk_count, summary.rows, summary.ppl, summary.ppl_err,
+                std::exp(base_nll / static_cast<double>(rows.size())), summary.kld_mean, summary.kld_median,
+                summary.kld_p99, summary.kld_max, 100.0 * summary.same_top1, tsv_path.c_str());
+    print_memory("done");
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -918,6 +1210,9 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     try {
         if (std::string(argv[1]) == "--rows") { return rows_mode(argc, argv, artifact_env); }
+        if (std::any_of(argv + 1, argv + argc, [](const char* a) { return std::string(a) == "--kld-base"; })) {
+            return kld_mode(argc, argv, artifact_env);
+        }
         std::vector<Job> jobs;
         std::int32_t staging_slots = 64;
         for (int i = 1; i < argc; ++i) {
