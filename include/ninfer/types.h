@@ -378,6 +378,10 @@ struct FlashNextOptions {
     // relative to a plain round, and a measurement mode that always drafts --draft-tokens.
     double mtp_width_cost = 0.38;
     bool mtp_fixed_drafts = false;
+    // Run each MoE block's shared expert on a high-priority CUDA stream beside the routed experts,
+    // joined before they are combined (--shared-expert-stream). The same outputs, bit for bit;
+    // the workspace grows by the shared expert's Linear scratch at its widest call.
+    bool shared_expert_stream = false;
     // The context cache's NVMe tier: a scratch file of up to this many bytes holds the checkpoints,
     // with the Host context budget as its RAM cache (a zero Host budget then reuses prefixes from
     // disk alone); 0: none. The file is created in `context_nvme_dir` (empty: beside the artifact),

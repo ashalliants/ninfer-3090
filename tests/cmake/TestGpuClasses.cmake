@@ -76,6 +76,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_qwen4_exp_memory_plan_test
   ninfer_qwen4_exp_ngram_hash_test
   ninfer_qwen4_exp_ngram_volume_test
+  ninfer_qwen4_exp_program_plan_test
   ninfer_qwen4_exp_rope_positions_test
   ninfer_read_only_file_test
   ninfer_regex_choice_oracle_test

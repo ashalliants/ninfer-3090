@@ -171,6 +171,7 @@ the Qwen3.5 models:
 | `--vram-headroom-mib N` | VRAM the expert cache leaves free for the desktop and other programs | 512 with a display, 256 without |
 | `--ram-headroom-mib N` | host RAM left free for Windows once every expert is pinned; startup refuses when it cannot be kept | `2048` |
 | `--expert-cache-mib N` | cap the expert cache (measurement) | what fits |
+| `--shared-expert-stream` | run each MoE block's shared expert on a high-priority CUDA stream beside the routed experts; the same output, bit for bit; works with two lanes, MTP and vision; not measured yet | off |
 | `--max-concurrency 1\|2` | requests that decode in the same rounds (two lanes: see below) | 1 |
 
 Two lanes (`set NINFER_CONCURRENCY=2`, opt-in): a second request no longer waits for the first. Two requests
@@ -1976,7 +1977,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8\|fp8\|rk8v4\|rk4v4\|nvfp4\|k8v4` | KV-cache storage. `rk8v4` is opt-in RotorQuant and `rk4v4` opt-in Lloyd-Max 4-bit keys; all seven are accepted on this fork's sm_86/sm_89 targets | `bf16` |
-| `--ngram-volume`, `--expert-state`, `--no-expert-state`, `--vram-headroom-mib`, `--ram-headroom-mib`, `--expert-cache-mib` | Qwen3.8-Flash-Next only; see [Qwen3.8-Flash-Next](#qwen38-flash-next-preview) | see there |
+| `--ngram-volume`, `--expert-state`, `--no-expert-state`, `--vram-headroom-mib`, `--ram-headroom-mib`, `--expert-cache-mib`, `--shared-expert-stream` | Qwen3.8-Flash-Next only; see [Qwen3.8-Flash-Next](#qwen38-flash-next-preview) | see there |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 | unset |
 | `--lm-head-draft` | optimized proposal head; implied by `--spec`, accepted for compatibility | on with `--spec` |

@@ -58,6 +58,21 @@ void project_pair(const Tensor& x, const LinearParameters& a, const LinearParame
     project(x, b, out_b, work, s);
 }
 
+// A MoE block's shared expert: gate/up, SiLU-mul, down on `s`. Its tensors come from `tensors`, its
+// Linears' scratch from `scratch` (the same arena, or the side stream's carve of it).
+Tensor shared_expert(const MoeParameters& p, const Tensor& x, std::int32_t I, std::int32_t H, WorkspaceArena& tensors,
+                     WorkspaceArena& scratch, cudaStream_t s) {
+    const std::int32_t T = x.ne[1];
+    Tensor g = tensors.alloc(DType::BF16, {I, T});
+    Tensor u = tensors.alloc(DType::BF16, {I, T});
+    project_pair(x, p.shared_gate, p.shared_up, g, u, scratch, s);
+    Tensor product = tensors.alloc(DType::BF16, {I, T});
+    ops::silu_mul(g, u, product, s);
+    Tensor shared = tensors.alloc(DType::BF16, {H, T});
+    project(product, p.shared_down, shared, scratch, s);
+    return shared;
+}
+
 void copy_tap(std::vector<Tensor>* targets, std::uint32_t layer, const Tensor& source, cudaStream_t s) {
     if (targets == nullptr) { return; }
     if (cudaMemcpyAsync(targets->at(layer).data, source.data, source.bytes(), cudaMemcpyDeviceToDevice, s) !=
@@ -90,10 +105,33 @@ ops::QsaIndexerGeometry qsa_geometry(const TextConfig& c) {
             .unit_offset_norm = true};
 }
 
+Forward::SideStream::SideStream() {
+    try {
+        // The greatest priority: the side kernels' blocks are scheduled ahead of the routed experts'.
+        int least = 0, greatest = 0;
+        CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+        CUDA_CHECK(cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking, greatest));
+        CUDA_CHECK(cudaEventCreateWithFlags(&fork, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&join, cudaEventDisableTiming));
+    } catch (...) {
+        release();
+        throw;
+    }
+}
+
+Forward::SideStream::~SideStream() { release(); }
+
+void Forward::SideStream::release() noexcept {
+    if (join != nullptr) { (void)cudaEventDestroy(join); }
+    if (fork != nullptr) { (void)cudaEventDestroy(fork); }
+    if (stream != nullptr) { (void)cudaStreamDestroy(stream); }
+}
+
 Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceArena& work, ForwardState state,
-                 ForwardKV kv, ForwardExperts experts, std::optional<ForwardMtp> mtp)
+                 ForwardKV kv, ForwardExperts experts, std::optional<ForwardMtp> mtp, ForwardOptions options)
     : parameters_(parameters), config_(parameters.model.config()), device_(device), work_(&work),
-      state_(std::move(state)), kv_(std::move(kv)), experts_(std::move(experts)), mtp_(std::move(mtp)) {
+      state_(std::move(state)), kv_(std::move(kv)), experts_(std::move(experts)), mtp_(std::move(mtp)),
+      side_(options.shared_expert_stream ? std::make_unique<SideStream>() : nullptr) {
     if (state_.gdn_conv.size() != config_.gdn_layers || state_.gdn_recurrent.size() != config_.gdn_layers ||
         state_.ple_slot.dtype != DType::I32 || state_.ple_slot.numel() != 1 ||
         state_.qsa_tails.size() != config_.attention_layers || kv_.layers.size() != config_.attention_layers ||
@@ -115,9 +153,9 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
 }
 
 Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceArena& work, ForwardRowsState state,
-                 ForwardRowsKV kv, ForwardExperts experts, std::optional<ForwardRowsMtp> mtp)
+                 ForwardRowsKV kv, ForwardExperts experts, std::optional<ForwardRowsMtp> mtp, ForwardOptions options)
     : parameters_(parameters), config_(parameters.model.config()), device_(device), work_(&work),
-      experts_(std::move(experts)) {
+      experts_(std::move(experts)), side_(options.shared_expert_stream ? std::make_unique<SideStream>() : nullptr) {
     if (mtp.has_value() != parameters_.mtp.has_value()) {
         throw std::invalid_argument("Qwen4Exp forward: the MTP drafter's parameters and state go together");
     }
@@ -239,6 +277,25 @@ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, 
     // Linear's activation casts and the composed mixer route, plus alignment slack per allocation.
     bytes += w * t * (bf + f) * 2 + (256ULL << 20);
     return bytes;
+}
+
+std::size_t Forward::shared_expert_workspace_bytes(const TextConfig& c, std::int32_t columns) {
+    // The Q8_1 rows of the widest input (codes, then one FP32 scale per 32 values, each 256-byte
+    // aligned as the GGML Linear allocates them); gate/up and down take their scratch in turn.
+    const auto aligned = [](std::size_t n) { return (n + 255) / 256 * 256; };
+    const std::size_t t = static_cast<std::size_t>(columns);
+    const std::size_t k = std::max(c.hidden_size, c.moe.shared_intermediate);
+    return aligned(k * t) + aligned(k / 32 * t * sizeof(float));
+}
+
+void Forward::fork_shared_expert() {
+    CUDA_CHECK(cudaEventRecord(side_->fork, device_.stream));
+    CUDA_CHECK(cudaStreamWaitEvent(side_->stream, side_->fork, 0));
+}
+
+void Forward::join_shared_expert() {
+    CUDA_CHECK(cudaEventRecord(side_->join, side_->stream));
+    CUDA_CHECK(cudaStreamWaitEvent(device_.stream, side_->join, 0));
 }
 
 void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap) {
@@ -532,6 +589,16 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     const cudaStream_t s = device_.stream;
     const auto& m        = config_.moe;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size), E = dim(m.experts), K = dim(m.top_k);
+    const std::int32_t I = dim(m.shared_intermediate);
+    // With the side stream the shared expert is enqueued first, beside everything below: its tensors
+    // and the carve its Linears take scratch from are allocated before the routed experts' and stay
+    // live until the join, so neither stream reuses memory the other may still be reading.
+    Tensor shared;
+    if (side_) {
+        fork_shared_expert();
+        WorkspaceArena scratch(work_->alloc_bytes(shared_expert_workspace_bytes(config_, T)));
+        shared = shared_expert(p, x, I, H, *work_, scratch, side_->stream);
+    }
     Tensor logits = work_->alloc(DType::FP32, {E + 1, T});
     {
         const Tensor* rows[] = {&p.router, &p.shared_score};
@@ -578,14 +645,11 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s);
     if (stream != nullptr) { stream->after_experts(layer, s); }
 
-    const std::int32_t I = dim(m.shared_intermediate);
-    Tensor g = work_->alloc(DType::BF16, {I, T});
-    Tensor u = work_->alloc(DType::BF16, {I, T});
-    project_pair(x, p.shared_gate, p.shared_up, g, u, *work_, s);
-    Tensor product = work_->alloc(DType::BF16, {I, T});
-    ops::silu_mul(g, u, product, s);
-    Tensor shared = work_->alloc(DType::BF16, {H, T});
-    project(product, p.shared_down, shared, *work_, s);
+    if (side_) {
+        join_shared_expert();
+    } else {
+        shared = shared_expert(p, x, I, H, *work_, *work_, s);
+    }
     Tensor y = work_->alloc(DType::BF16, {H, T});
     ops::moe_combine(outputs, routing, shared, y, s);
     return y;
@@ -1016,6 +1080,26 @@ void Forward::mtp_block(const MtpCall& call) {
         Tensor xm            = mix(p.mlp_hc, residual, &inject);
         const auto& mc       = config_.moe;
         const std::int32_t E = dim(mc.experts), K = dim(mc.top_k), SI = dim(mc.shared_intermediate);
+        // The shared expert (BF16 rows projected in FP32: no Linear scratch), on the side stream
+        // beside the routed experts or after them on `s`; its tensors are allocated where it is
+        // enqueued and stay live until the combine.
+        const auto shared_expert_rows = [&](cudaStream_t stream) {
+            Tensor gu = project_rows(xm, {&p.shared_gate, &p.shared_up}, 2 * SI, *work_, stream);
+            Tensor g  = work_->alloc(DType::BF16, {SI, T});
+            Tensor u  = work_->alloc(DType::BF16, {SI, T});
+            {
+                Tensor* parts[] = {&g, &u};
+                ops::split_rows(gu, parts, stream);
+            }
+            Tensor product = work_->alloc(DType::BF16, {SI, T});
+            ops::silu_mul(g, u, product, stream);
+            return project_rows(product, {&p.shared_down}, H, *work_, stream);
+        };
+        Tensor shared;
+        if (side_) {
+            fork_shared_expert();
+            shared = shared_expert_rows(side_->stream);
+        }
         Tensor logits        = work_->alloc(DType::FP32, {E + 1, T});
         {
             const Tensor* rows[] = {&p.router, &p.shared_score};
@@ -1037,16 +1121,11 @@ void Forward::mtp_block(const MtpCall& call) {
         const std::int32_t max_jobs = std::min(E, K * T);
         const DeviceSpan expert_ws  = work_->alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T, T));
         ops::moe_experts(xm, dispatch, source, K, max_jobs, expert_ws.data, outputs, s);
-        Tensor gu = project_rows(xm, {&p.shared_gate, &p.shared_up}, 2 * SI, *work_, s);
-        Tensor g  = work_->alloc(DType::BF16, {SI, T});
-        Tensor u  = work_->alloc(DType::BF16, {SI, T});
-        {
-            Tensor* parts[] = {&g, &u};
-            ops::split_rows(gu, parts, s);
+        if (side_) {
+            join_shared_expert();
+        } else {
+            shared = shared_expert_rows(s);
         }
-        Tensor product = work_->alloc(DType::BF16, {SI, T});
-        ops::silu_mul(g, u, product, s);
-        Tensor shared = project_rows(product, {&p.shared_down}, H, *work_, s);
         Tensor ym     = work_->alloc(DType::BF16, {H, T});
         ops::moe_combine(outputs, routing, shared, ym, s);
         if (call.tap != nullptr) {

@@ -578,7 +578,8 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     }
     d.sms       = sms;
     d.wide_work = execution::Forward::workspace_bytes(c, d.wide_chunk, d.pages * kPagedKVPageSize,
-                                                      DeviceExecutionView{nullptr, sms});
+                                                      DeviceExecutionView{nullptr, sms}) +
+                  (o.shared_expert_stream ? execution::Forward::shared_expert_workspace_bytes(c, d.wide_chunk) : 0);
     d.vmm = VmmArena::supported(o.device);
 
     auto& b     = d.bytes;
@@ -586,6 +587,7 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     b.kv_max    = d.kv.bytes;
     b.kv        = d.vmm ? d.kv.mapped_bytes(d.base_pages) : d.kv.bytes;
     b.workspace = d.work;
+    b.shared_expert_workspace = plan_shared_expert_workspace(o, c);
     b.staging   = d.staging;
     b.state     = d.state_total;
     // Logits of the widest round (FP32 and BF16; at least one column per lane), then the sampling
@@ -749,8 +751,9 @@ public:
         at = align(at + 4ULL * plan_.mask_words * plan_.lanes);
         if (at > io_device_.bytes) { throw std::logic_error("Qwen3.8-Flash-Next: io layout exceeds its plan"); }
 
-        work_ = std::make_unique<WorkspaceArena>(plan_.work);
-        allocated += plan_.work;
+        // The shared expert's side-stream carve (when on) comes out of the same arena.
+        work_ = std::make_unique<WorkspaceArena>(plan_.work + plan_.bytes.shared_expert_workspace);
+        allocated += plan_.work + plan_.bytes.shared_expert_workspace;
         staging_ = DeviceBuffer(plan_.staging);
         allocated += plan_.staging;
         if (plan_.drafts > 0) {
@@ -921,8 +924,9 @@ public:
             experts.stream = stream_.get();
         }
         ngram_next_ = PinnedHostBuffer(plan_.io.bytes - plan_.io.ngram);
-        forward_ = std::make_unique<execution::Forward>(parameters_, device_, *work_, std::move(state), std::move(kv),
-                                                        std::move(experts), std::move(drafter));
+        forward_ = std::make_unique<execution::Forward>(
+            parameters_, device_, *work_, std::move(state), std::move(kv), std::move(experts), std::move(drafter),
+            execution::ForwardOptions{.shared_expert_stream = options_.shared_expert_stream});
         lane_graphs_.resize(plan_.lanes);
         select_lane(0);
         warm_vision();
@@ -1983,7 +1987,7 @@ public:
         out.kv_capacity_max_page_groups  = plan_.pool_pages;
         out.kv_cache                     = KvCacheStorage::Int8Group64;
         out.kv_payload_bytes             = kv_vmm_ ? kv_vmm_->mapped_bytes() : kv_backing_.bytes;
-        out.workspace_logical_peak_bytes = plan_.work;
+        out.workspace_logical_peak_bytes = plan_.work + plan_.bytes.shared_expert_workspace;
         out.cuda_graph_allowance_bytes   = kGraphExecutableBytes * plan_.bytes.graph_bound;
         if (cache_) {
             const auto use                  = usage();
@@ -2873,7 +2877,9 @@ private:
         const std::int32_t widest   = std::min(plan_.wide_chunk, remaining);
         const std::uint32_t keys    = plan_.pages * kPagedKVPageSize;
         const std::size_t work      = std::min<std::size_t>(
-            plan_.wide_work, execution::Forward::workspace_bytes(c_, widest, keys, DeviceExecutionView{nullptr, plan_.sms}));
+            plan_.wide_work,
+            execution::Forward::workspace_bytes(c_, widest, keys, DeviceExecutionView{nullptr, plan_.sms}) +
+                (options_.shared_expert_stream ? execution::Forward::shared_expert_workspace_bytes(c_, widest) : 0));
         const std::uint64_t stride  = residency_->frame_stride();
         const std::size_t tables    = align(stream_->table_bytes());
         const auto work_frames      = static_cast<std::uint32_t>((tables + work + stride - 1) / stride);
@@ -4709,6 +4715,13 @@ Program::Program(const execution::Parameters& parameters, DeviceContext& device,
     : impl_(std::make_unique<detail::ProgramImpl>(parameters, device, std::move(options))) {}
 
 Program::~Program() noexcept = default;
+
+std::uint64_t plan_shared_expert_workspace(const ProgramOptions& options, const TextConfig& config) {
+    if (!options.shared_expert_stream) { return 0; }
+    const std::uint32_t widest = std::max({std::min(options.prefill_chunk, options.max_context), options.max_concurrency,
+                                           1U + options.mtp_draft_tokens});
+    return execution::Forward::shared_expert_workspace_bytes(config, static_cast<std::int32_t>(widest));
+}
 
 ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const TextConfig& config,
                                        std::uint32_t public_tokens, std::span<const std::uint64_t> record_strides) {

@@ -588,6 +588,24 @@ Gates (RTX 3090, WDDM, artifact `qwen4exp-iq2xs-mtp-vision.ninfer`, every run un
 Decision: C = 2 beats C = 1 in makespan and queued time to first token but not by the aggregate decode the
 spike promised (about 1.07x against 1.18x modelled). It ships opt-in; the launcher default stays at one lane.
 
+## Basalt items (issue #383)
+
+Speed items taken from Basalt (commit 8d73a39), each behind its own option that is off by default.
+None has been measured on the RTX 3090 yet.
+
+- **Shared expert on a side stream** (`--shared-expert-stream`). Each MoE block (and the MTP
+  drafter's) forks a high-priority stream after the block's input and runs the shared expert's
+  gate/up, SiLU-mul and down there while the routing and routed experts run on the device stream;
+  the device stream waits for it before the combine. The fork and join are events, so the decode and
+  verification graphs capture them. The same Ops run on the same inputs, so the output is unchanged,
+  bit for bit: `ninfer_qwen4_exp_forward_real_test --shared-expert-stream TOKENS` checks that, eager
+  and in CUDA graphs (not run yet). The shared expert's Linears take their scratch from a region
+  carved out of the call's workspace, never from scratch the device stream frees and reuses; the
+  static workspace plans it as `ProgramDevicePlan::shared_expert_workspace` (the Q8_1 rows of the
+  shared expert's widest input, 1.125 bytes per value, at the widest static call) and a wide
+  prefill's lent arena grows by the same at its width. Basalt estimates 0.25-0.5 ms
+  per token. Works with two lanes, MTP and vision.
+
 ## Artifact decisions
 
 Taken in PR 1 and revised in PR 2b, which aligned the artifact with Infernix (the model code and

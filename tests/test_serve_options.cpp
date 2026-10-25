@@ -103,7 +103,7 @@ int main() {
                           defaults.flash_next.save_expert_state && !defaults.flash_next.vram_headroom_bytes &&
                           !defaults.flash_next.expert_cache_bytes &&
                           defaults.flash_next.ram_headroom_bytes == (2ULL << 30) &&
-                          defaults.flash_next.ngram_keepalive_ms == 40,
+                          defaults.flash_next.ngram_keepalive_ms == 40 && !defaults.flash_next.shared_expert_stream,
                       "Flash-Next defaults mismatch");
     const ServeOptions flash = parse({"ninfer-serve", "model.ninfer", "--ngram-volume", "K:/v.ngram",
                                       "--expert-state", "K:/s.state", "--vram-headroom-mib", "300",
@@ -118,6 +118,9 @@ int main() {
                       "Flash-Next options do not reach the Engine");
     failures += check(!parse({"ninfer-serve", "model.ninfer", "--no-expert-state"}).flash_next.save_expert_state,
                       "--no-expert-state did not turn the saved state off");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--shared-expert-stream"}))
+                          .flash_next.shared_expert_stream,
+                      "--shared-expert-stream does not reach the Engine");
     failures += check(parse({"ninfer-serve", "model.ninfer", "--ngram-keepalive-ms", "25"})
                               .flash_next.ngram_keepalive_ms == 25,
                       "--ngram-keepalive-ms was not parsed");

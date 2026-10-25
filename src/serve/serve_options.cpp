@@ -175,7 +175,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--vision] [--vision-residency resident|overlay] [--vision-max-merged N] "
            "[--no-cuda-graph] [--no-prefix-reuse] [--devices N,M,...] [--stage-layers A,B,...] "
            "[--ngram-volume FILE] [--ngram-keepalive-ms N] [--expert-state FILE|--no-expert-state] "
-           "[--vram-headroom-mib N] "
+           "[--vram-headroom-mib N] [--shared-expert-stream] "
            "[--ram-headroom-mib N] [--expert-cache-mib N] [--context-nvme-mib N [--context-nvme-dir DIR]] "
            "[--chat-template FILE] "
            "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
@@ -258,7 +258,9 @@ std::string serve_usage_text(const char* argv0) {
            "the expert cache leaves free for the desktop (default 512 with a display, 256 without); "
            "--ram-headroom-mib N is the RAM left free for Windows once every expert is pinned "
            "(default 2048; startup refuses when it cannot be kept); --expert-cache-mib N caps the "
-           "expert cache (for measurement); --vision takes images when the model was converted with "
+           "expert cache (for measurement); --shared-expert-stream runs each MoE block's shared "
+           "expert on a high-priority CUDA stream beside the routed experts (the same output, bit for "
+           "bit; off by default); --vision takes images when the model was converted with "
            "--mmproj (its vision tower stays in host memory and borrows expert-cache memory per image)\n"
            "       --ngram-draft-tokens 15 adds n-gram copy drafting beside --spec dflash2: when the "
            "text being written already appeared in the request (a tool result, the prompt or the "
@@ -654,6 +656,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             const int ms = parse_nonnegative_int(require_value("--ngram-keepalive-ms"), "ngram-keepalive-ms");
             if (ms > 60000) { throw std::invalid_argument("--ngram-keepalive-ms must be in [0, 60000]"); }
             options.flash_next.ngram_keepalive_ms = static_cast<std::uint32_t>(ms);
+        } else if (arg == "--shared-expert-stream") {
+            options.flash_next.shared_expert_stream = true;
         } else if (arg == "--expert-state") {
             options.flash_next.expert_state_path = require_value("--expert-state");
             if (options.flash_next.expert_state_path.empty()) {

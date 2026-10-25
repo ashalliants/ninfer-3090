@@ -326,12 +326,15 @@ struct ProgramDevicePlan {
     std::uint64_t residency = 0; // the expert frame tables and route log
     // MTP speculation: verification records, tail copies, the drafter's residuals and round words.
     std::uint64_t speculation = 0;
+    // --shared-expert-stream: the static workspace's room for the shared expert's side-stream carve
+    // at its widest call (plan_shared_expert_workspace; 0 when off), allocated with `workspace`.
+    std::uint64_t shared_expert_workspace = 0;
     std::uint64_t expert_record_stride = 0; // one expert frame
     std::uint32_t max_frames           = 0; // the most frames the expert cache uses
     std::uint32_t graph_bound          = 0; // CUDA graph executables the Program may instantiate (counts both halves of the split decode)
 
     [[nodiscard]] std::uint64_t fixed_bytes() const noexcept {
-        return kv + workspace + staging + state + io + residency + speculation;
+        return kv + workspace + staging + state + io + residency + speculation + shared_expert_workspace;
     }
 };
 
@@ -386,7 +389,15 @@ struct ProgramOptions {
     std::uint64_t context_nvme_bytes = 0;
     std::filesystem::path context_nvme_path;
     std::uint64_t context_bounce_bytes = 128ULL << 20;
+    // Each MoE block's shared expert on a high-priority side stream beside the routed experts
+    // (execution::ForwardOptions::shared_expert_stream); the same outputs, bit for bit.
+    bool shared_expert_stream = false;
 };
+
+// ProgramDevicePlan::shared_expert_workspace of these options: the side-stream carve
+// (execution::Forward::shared_expert_workspace_bytes) of the static workspace's widest call, a
+// prefill chunk, a round over every lane or an MTP verification; 0 without shared_expert_stream.
+[[nodiscard]] std::uint64_t plan_shared_expert_workspace(const ProgramOptions& options, const TextConfig& config);
 
 class Program {
 public:

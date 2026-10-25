@@ -60,6 +60,16 @@
 // by the GDN fold, qsa_commit_tails and ple_conv_commit; a partial last window is a narrower round.
 // Each row's FP32 logits over the public token domain are scored against the base row (score_row);
 // the rows go to OUT.tsv (default kld-rows.tsv) and the summary to stdout.
+//
+// Shared-expert-stream mode (ForwardOptions::shared_expert_stream is bit-exact):
+//
+//   ninfer_qwen4_exp_forward_real_test --shared-expert-stream TOKENS [--decode N] [--staging SLOTS]
+//
+// All but the last N tokens (default 4) are prefilled as one call, then each of the N is decoded by
+// one call, from a fresh state, four times: the shared expert after the routed experts or beside them
+// on its side stream, with the decode calls eager or each captured in a CUDA graph and replayed. The
+// prompt call's last logits and every decode call's must be bitwise equal between the serial and the
+// side-stream run of the same decode mode.
 
 #include "artifact/reader.h"
 #include "core/arena.h"
@@ -89,6 +99,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -160,7 +171,7 @@ double seconds_since(std::chrono::steady_clock::time_point t) {
 // sources: no resident experts, misses staged through `staging_slots` device slots.
 struct Harness {
     Harness(const ex::Parameters& parameters, DeviceContext& device, std::int32_t context, std::int32_t columns,
-            std::int32_t staging_slots)
+            std::int32_t staging_slots, ex::ForwardOptions options = {})
         : config(parameters.model.config()) {
         const auto& c = config;
         const auto gdn_layers = static_cast<std::size_t>(c.gdn_layers);
@@ -247,10 +258,11 @@ struct Harness {
             experts.staging_slots = staging_slots;
         }
         work = std::make_unique<WorkspaceArena>(
-            ex::Forward::workspace_bytes(c, columns, static_cast<std::uint32_t>(context), device.execution_view()));
+            ex::Forward::workspace_bytes(c, columns, static_cast<std::uint32_t>(context), device.execution_view()) +
+            (options.shared_expert_stream ? ex::Forward::shared_expert_workspace_bytes(c, columns) : 0));
         views   = state;
         forward = std::make_unique<ex::Forward>(parameters, device, *work, std::move(state), std::move(kv),
-                                                std::move(experts));
+                                                std::move(experts), std::nullopt, options);
     }
 
     const q4::TextConfig& config;
@@ -1195,6 +1207,98 @@ int kld_mode(int argc, char** argv, const char* artifact_env) {
 
 } // namespace
 
+// The identity check of ForwardOptions::shared_expert_stream (see the header): four runs from a
+// fresh state over the same device inputs, the shared expert serial or on its side stream, the
+// decode calls eager or each captured in a CUDA graph and replayed once (the Program's decode). Each
+// side-stream run's logits must be bitwise those of the serial run with the same decode mode.
+int shared_expert_mode(int argc, char** argv, const char* artifact_env) {
+    std::vector<std::int32_t> tokens;
+    std::int32_t decode = 4, staging_slots = 64;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--shared-expert-stream") { continue; }
+        if (arg.rfind("--", 0) != 0) {
+            if (!tokens.empty()) { throw std::invalid_argument("--shared-expert-stream takes one token list"); }
+            tokens = parse_tokens(arg);
+            continue;
+        }
+        if (i + 1 >= argc) { throw std::invalid_argument(arg + " needs a value"); }
+        const std::string value = argv[++i];
+        if (arg == "--decode") {
+            decode = std::stoi(value);
+        } else if (arg == "--staging") {
+            staging_slots = std::stoi(value);
+        } else {
+            throw std::invalid_argument("unknown option " + arg + " in --shared-expert-stream mode");
+        }
+    }
+    const auto n = static_cast<std::int32_t>(tokens.size());
+    if (decode < 1 || decode >= n) { throw std::invalid_argument("--decode must be in [1, tokens)"); }
+
+    DeviceContext device(0);
+    artifact::Reader reader(artifact_env);
+    if (!q4::is_qwen4_exp(reader)) {
+        std::printf("SKIP: %s is not a Qwen4Exp artifact\n", artifact_env);
+        return 77;
+    }
+    const auto model = q4::load_model(reader, device);
+    device.synchronize();
+    const ex::Parameters parameters(*model);
+    const auto& c         = model->config();
+    const char* ngram_env = std::getenv("NINFER_TEST_QWEN4EXP_NGRAM");
+    q4::NgramVolume volume(ngram_env != nullptr ? std::filesystem::path(ngram_env)
+                                                : q4::default_ngram_volume(artifact_env),
+                           c.ple.table);
+    const std::size_t vocab    = c.vocab_size;
+    const std::int32_t context = std::max<std::int32_t>(256, (n + 63) / 64 * 64);
+    const std::int32_t head    = n - decode;
+    // Every run reads the same device inputs: the prompt as one call (wider than 8 columns, the side
+    // stream's Linears take their Q8_1 scratch from the carve), then one call per decode token.
+    const Call prompt = make_call(c, volume, tokens, 0, head, false);
+    std::vector<Call> steps;
+    for (std::int32_t p = head; p < n; ++p) { steps.push_back(make_call(c, volume, tokens, p, 1, false)); }
+    DeviceBuffer logits(vocab * sizeof(float));
+    Tensor out(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), 1});
+    std::printf("prompt %d tokens as one call, then %d decode calls; staging slots %d\n", head, decode, staging_slots);
+
+    // The logits of the prompt call, then of every decode call.
+    const auto run = [&](bool side, bool graphs) {
+        Harness harness(parameters, device, context, head, staging_slots, ex::ForwardOptions{.shared_expert_stream = side});
+        std::vector<std::vector<float>> rows;
+        harness.forward->run(prompt.batch, out);
+        device.synchronize();
+        rows.push_back(to_float(logits, vocab));
+        for (const Call& step : steps) {
+            if (graphs) {
+                DecodeGraphDefinition graph;
+                DecodeGraphExecutable exec;
+                graph.capture(device.stream, [&] { harness.forward->run(step.batch, out); });
+                exec.instantiate(graph);
+                exec.launch(device.stream);
+            } else {
+                harness.forward->run(step.batch, out);
+            }
+            device.synchronize();
+            rows.push_back(to_float(logits, vocab));
+        }
+        return rows;
+    };
+    bool ok = true;
+    for (const bool graphs : {false, true}) {
+        const auto serial = run(false, graphs);
+        const auto side   = run(true, graphs);
+        std::size_t equal = 0;
+        for (std::size_t r = 0; r < serial.size(); ++r) {
+            equal += std::memcmp(serial[r].data(), side[r].data(), vocab * sizeof(float)) == 0 ? 1 : 0;
+        }
+        std::printf("decode %s: %zu of %zu calls' logits bitwise equal with --shared-expert-stream\n",
+                    graphs ? "in CUDA graphs" : "eager", equal, serial.size());
+        ok &= equal == serial.size();
+    }
+    std::printf(ok ? "shared expert stream checks passed\n" : "FAIL: the shared expert stream changed the logits\n");
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
     const char* artifact_env = std::getenv("NINFER_TEST_QWEN4EXP_ARTIFACT");
     if (artifact_env == nullptr || argc < 2) {
@@ -1212,6 +1316,9 @@ int main(int argc, char** argv) {
         if (std::string(argv[1]) == "--rows") { return rows_mode(argc, argv, artifact_env); }
         if (std::any_of(argv + 1, argv + argc, [](const char* a) { return std::string(a) == "--kld-base"; })) {
             return kld_mode(argc, argv, artifact_env);
+        }
+        if (std::any_of(argv + 1, argv + argc, [](const char* a) { return std::string(a) == "--shared-expert-stream"; })) {
+            return shared_expert_mode(argc, argv, artifact_env);
         }
         std::vector<Job> jobs;
         std::int32_t staging_slots = 64;
