@@ -682,12 +682,27 @@ def unresolved_failures(rows: list[dict[str, Any]], point: str) -> list[dict[str
 
 
 def edit_rows(rows: list[dict[str, Any]], point: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str]:
-    """The Edit gate's rows: agent_edit (cold edit turns) when the point and the baseline both have
-    it, else agent_replay."""
+    """The Edit gate's rows: agent_edit (cold edit turns) of the point and of the baseline. No
+    fallback to agent_replay (its Edit turns are warm, so the lossy path barely runs on them): when
+    either lacks agent_edit the gate is not measured and both are None."""
     agent, base = _metric(rows, point, "agent_edit"), _metric(rows, BASELINE, "agent_edit")
     if agent and base:
         return agent, base, "cold"
-    return _metric(rows, point, "agent_replay"), _metric(rows, BASELINE, "agent_replay"), "replay"
+    return None, None, "cold"
+
+
+def paired_edit_turns(rows: list[dict[str, Any]], point: str) -> dict[str, int] | None:
+    """Per-turn Edit comparison of a point against the baseline over the agent_edit turns both ran
+    (matched by session and turn id): turns the baseline hit and the point missed, and the reverse."""
+    agent, base = _metric(rows, point, "agent_edit"), _metric(rows, BASELINE, "agent_edit")
+    if not agent or not base or not agent.get("turns") or not base.get("turns"):
+        return None
+    mine = {(t.get("session"), t.get("turn")): bool(t.get("hit")) for t in agent["turns"]}
+    ref = {(t.get("session"), t.get("turn")): bool(t.get("hit")) for t in base["turns"]}
+    common = mine.keys() & ref.keys()
+    return {"paired": len(common),
+            "lost": sum(ref[k] and not mine[k] for k in common),
+            "gained": sum(mine[k] and not ref[k] for k in common)}
 
 
 def agent_edit_turns(transcripts: Sequence[dict[str, Any]], samples: Sequence[dict[str, Any]],
@@ -741,11 +756,20 @@ def evaluate_point(rows: list[dict[str, Any]], point: str) -> dict[str, Any]:
     agent, base_agent, source = edit_rows(rows, point)
     if agent and base_agent and agent.get("edit_rate") is not None and base_agent.get("edit_rate") is not None:
         delta = (agent["edit_rate"] - base_agent["edit_rate"]) * 100.0
-        checks.append(check("edit", delta, delta >= -EDIT_MAX_DROP_POINTS - 1e-9,
-                            f"{delta:+.1f} points vs baseline over {agent.get('edit_turns')} {source} Edit "
-                            f"turns (need >= -{EDIT_MAX_DROP_POINTS:.0f})"))
+        turns, lossy_turns = agent.get("edit_turns"), agent.get("lossy_turns")
+        detail = (f"{delta:+.1f} points vs baseline over {turns} {source} Edit "
+                  f"turns (need >= -{EDIT_MAX_DROP_POINTS:.0f})")
+        pairs = paired_edit_turns(rows, point)
+        if pairs:
+            detail += (f"; of {pairs['paired']} paired turns {pairs['lost']} hit by baseline only, "
+                       f"{pairs['gained']} by the point only")
+        if point != BASELINE and (not turns or lossy_turns != turns):
+            # Ruling R24: a score is only evidence if lossy prefill ran on the turns it scores.
+            checks.append(check("edit", None, None, f"lossy ran on {lossy_turns or 0}/{turns or 0} turns; " + detail))
+        else:
+            checks.append(check("edit", delta, delta >= -EDIT_MAX_DROP_POINTS - 1e-9, detail))
     else:
-        checks.append(check("edit", None, None, "not measured"))
+        checks.append(check("edit", None, None, "not measured (needs agent_edit on this point and the baseline)"))
     speed, base_speed = _metric(rows, point, "speed"), _metric(rows, BASELINE, "speed")
     if speed and base_speed and speed.get("total_s") and base_speed.get("total_s"):
         ratio = speed["total_s"] / base_speed["total_s"]
@@ -843,9 +867,9 @@ def render_summary(rows: list[dict[str, Any]]) -> str:
         "baseline; 100K cold prefill <= 0.40x baseline time. Greedy agreement and the speed "
         "columns are reported, not gated.",
         "",
-        "| point | needle 32k | needle 64k | needle 100k | Edit (pts) | Edit turns | time (x) | scout ms | main ms "
+        "| point | needle 32k | needle 64k | needle 100k | Edit (pts) | Edit turns | Edit lost/gained vs baseline | replay Edit rate (ungated) | time (x) | scout ms | main ms "
         "| kept/uncached | neighbour gap ms | tool-call valid | greedy median div | lossy completed (needle/agent/edit/greedy/speed) | needle samples | verdict |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     evals = []
     for point in points_in(rows):
@@ -853,7 +877,10 @@ def render_summary(rows: list[dict[str, Any]]) -> str:
         evals.append(ev)
         by = {c["name"]: c for c in ev["checks"]}
         speed = _metric(rows, point, "speed") or {}
-        agent = edit_rows(rows, point)[0] or {}
+        agent = _metric(rows, point, "agent_edit") or {}
+        replay = _metric(rows, point, "agent_replay") or {}
+        pairs = paired_edit_turns(rows, point)
+        pair_cell = f"-{pairs['lost']}/+{pairs['gained']} of {pairs['paired']}" if pairs else "-"
         greedy = _metric(rows, point, "greedy_agreement") or {}
         base_greedy = _metric(rows, BASELINE, "greedy_agreement") or {}
         agreement = None
@@ -867,9 +894,9 @@ def render_summary(rows: list[dict[str, Any]]) -> str:
                 if speed.get("kept_tokens") is not None else "-")
         lines.append(
             f"| {point} | {_mark(by['needle_32k'], '.3f')} | {_mark(by['needle_64k'], '.3f')} "
-            f"| {_mark(by['needle_100k'], '.3f')} | {_mark(by['edit'], '+.1f')} | {num(agent.get('edit_turns'), 'd')} | {_mark(by['time'], '.2f')} "
+            f"| {_mark(by['needle_100k'], '.3f')} | {_mark(by['edit'], '+.1f')} | {num(agent.get('edit_turns'), 'd')} | {pair_cell} | {num(replay.get('edit_rate'), '.3f')} | {_mark(by['time'], '.2f')} "
             f"| {num(speed.get('scout_ms'), '.0f')} | {num(speed.get('main_ms'), '.0f')} | {kept} "
-            f"| {num(speed.get('neighbour_gap_max_ms'), '.0f')} | {num(agent.get('tool_call_validity'), '.3f')} "
+            f"| {num(speed.get('neighbour_gap_max_ms'), '.0f')} | {num(replay.get('tool_call_validity') if replay.get('tool_call_validity') is not None else agent.get('tool_call_validity'), '.3f')} "
             f"| {num(agreement['first_divergence_median'], '.0f') if agreement else '-'} "
             f"| {lossy_cell(rows, point)} | {needle_samples(rows, point)} | {ev['verdict']} |")
     a4_points = [p for p in points_in(rows) if (point_params(rows, p) or {}).get("scout_a4") == "1"]

@@ -27,6 +27,7 @@ BASE = [
     row("baseline", "needle", {"accuracy": {"32k": 1.0, "64k": 1.0, "100k": 1.0},
                                "samples": {"32k": 22, "64k": 22, "100k": 22}}),
     row("baseline", "agent_replay", {"edit_rate": 0.90, "tool_call_validity": 1.0}),
+    row("baseline", "agent_edit", {"edit_rate": 0.90, "edit_turns": 40}),
     row("baseline", "speed", {"total_s": 100.0, "neighbour_gap_max_ms": 900}),
     row("baseline", "greedy_agreement", {"outputs": [[1, 2, 3, 4]] * 2}),
 ]
@@ -40,6 +41,7 @@ def point_rows(point, needle=1.0, edit=0.90, total=39.0, lossy=LOSSY, samples=22
         row(point, "needle", {"accuracy": {"32k": needle, "64k": needle, "100k": needle},
                               "samples": {"32k": samples, "64k": samples, "100k": samples}}),
         row(point, "agent_replay", {"edit_rate": edit, "tool_call_validity": 0.99}),
+        row(point, "agent_edit", {"edit_rate": edit, "edit_turns": 40, "lossy_turns": 40}),
         row(point, "speed", {"total_s": total, "scout_ms": 4000, "main_ms": 30000, "kept_tokens": 20000,
                              "uncached_tokens": 100000, "neighbour_gap_max_ms": 300}),
         row(point, "greedy_agreement", {"outputs": [[1, 2, 3, 9], [1, 2, 3, 4]]}),
@@ -276,7 +278,7 @@ def test_lossy_evidence():
     check("3 (t2)" in sweep.lossy_cell(timed, "sum"), sweep.lossy_cell(timed, "sum"))
     text = sweep.render_summary(rows)
     ran = next(l for l in text.splitlines() if l.startswith("| ran |"))
-    check("5/5/-/5/5" in ran and "| 52 |" in ran, ran)
+    check("5/5/5/5/5" in ran and "| 40 |" in ran, ran)
 
 
 def test_agent_command_passes_repo_and_failure_inputs():
@@ -521,13 +523,42 @@ def test_agent_edit_turns_and_gate_source():
                {"response_id": "c", "prompt_tokens": 20000, "max_tokens": 700}]
     got = sweep.agent_edit_turns(transcripts, samples)
     check(len(got) == 1 and got[0]["turn"] == 1 and got[0]["messages"] == msgs and got[0]["max_tokens"] == 700, got)
-    # The Edit gate reads agent_edit when the point and the baseline have it, else agent_replay.
-    rows = BASE + point_rows("p", edit=0.90)
-    check(checks(rows, "p")["edit"]["pass"] is True, "replay rows gate when no agent_edit")
-    rows += [row("baseline", "agent_edit", {"edit_rate": 0.9, "edit_turns": 30}),
-             row("p", "agent_edit", {"edit_rate": 0.8, "edit_turns": 30, "lossy_outcomes": LOSSY})]
+    # R24: the Edit gate reads agent_edit only; no fallback to the warm agent_replay.
+    rows = [r for r in BASE + point_rows("p", edit=0.90) if not (r["point"] == "p" and r["workload"] == "agent_edit")]
+    c = checks(rows, "p")["edit"]
+    check(c["pass"] is None and "not measured" in c["detail"], c)
+    rows = [r for r in BASE + point_rows("p", edit=0.90) if not (r["point"] == "baseline" and r["workload"] == "agent_edit")]
+    check(checks(rows, "p")["edit"]["pass"] is None, "baseline without agent_edit: not measured")
+    rows = BASE + point_rows("p", edit=0.80)
     c = checks(rows, "p")["edit"]
     check(c["pass"] is False and abs(c["value"] + 10.0) < 1e-9 and "cold" in c["detail"], c)
+
+
+def test_edit_requires_lossy_turns():
+    ok = BASE + point_rows("p", edit=0.90)
+    check(checks(ok, "p")["edit"]["pass"] is True, "lossy ran on every turn")
+    part = BASE + point_rows("q", edit=0.50)
+    next(r for r in part if r["point"] == "q" and r["workload"] == "agent_edit")["metrics"]["lossy_turns"] = 30
+    c = checks(part, "q")["edit"]
+    check(c["pass"] is None and "lossy ran on 30/40 turns" in c["detail"], c)
+    check(sweep.evaluate_point(part, "q")["verdict"] == "INCOMPLETE", "low edit with partial lossy is incomplete")
+    missing = BASE + point_rows("r", edit=0.90)
+    del next(r for r in missing if r["point"] == "r" and r["workload"] == "agent_edit")["metrics"]["lossy_turns"]
+    check(checks(missing, "r")["edit"]["pass"] is None, "no lossy_turns recorded: incomplete")
+    check(checks(BASE, "baseline")["edit"]["pass"] is True, "baseline rows are exempt")
+
+
+def test_paired_edit_view():
+    def turns(hits):
+        return [{"session": 0, "turn": i, "hit": h} for i, h in enumerate(hits)]
+    rows = BASE + point_rows("p", edit=0.75)
+    next(r for r in rows if r["point"] == "baseline" and r["workload"] == "agent_edit")["metrics"]["turns"] = turns([1, 1, 0, 0])
+    next(r for r in rows if r["point"] == "p" and r["workload"] == "agent_edit")["metrics"]["turns"] = turns([1, 0, 1, 0])
+    check(sweep.paired_edit_turns(rows, "p") == {"paired": 4, "lost": 1, "gained": 1}, sweep.paired_edit_turns(rows, "p"))
+    check(sweep.paired_edit_turns(BASE + point_rows("z"), "z") is None, "no per-turn data")
+    text = sweep.render_summary(rows)
+    line = next(l for l in text.splitlines() if l.startswith("| p |"))
+    check("-1/+1 of 4" in line and "0.750" in line, line)  # paired cell and the ungated replay rate
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
