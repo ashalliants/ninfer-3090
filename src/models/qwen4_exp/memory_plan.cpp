@@ -136,18 +136,19 @@ std::string HostMemoryLedger::summary() const {
                       gib(*snapshot.lock_limit), gib(pinned_total));
     } else if (fits) {
         std::snprintf(line, sizeof(line), "RAM: %.1f of %.1f GiB free; every expert fits in RAM (%.1f GiB pinned)",
-                      gib(snapshot.available_physical), gib(snapshot.total_physical), gib(demand.expert_banks));
+                      gib(snapshot.available_physical), gib(snapshot.total_physical),
+                      gib(demand.expert_banks + demand.other_pinned));
     } else {
         // What the reserve, every planned allocation and the experts need beyond what is available.
         const std::uint64_t need      = demand.reserve + planned + full_need;
         const std::uint64_t available = commit_limited ? snapshot.available_commit : snapshot.available_physical;
         const std::uint64_t short_by  = need > available ? need - available : 0;
         std::snprintf(line, sizeof(line),
-                      "RAM: %.1f of %.1f GiB free, but Qwen3.8-Flash-Next pins %.1f GiB of experts and keeps %.1f GiB "
+                      "RAM: %.1f of %.1f GiB free, but Qwen3.8-Flash-Next pins %.1f GiB of experts and weights and keeps %.1f GiB "
                       "free for Windows: %.1f GiB short%s. Close other programs (WSL, Docker, browsers) and start "
                       "again",
-                      gib(snapshot.available_physical), gib(snapshot.total_physical), gib(demand.expert_banks),
-                      gib(demand.reserve), gib(short_by), commit_limited ? " (the page file is too small)" : "");
+                      gib(snapshot.available_physical), gib(snapshot.total_physical),
+                      gib(demand.expert_banks + demand.other_pinned), gib(demand.reserve), gib(short_by), commit_limited ? " (the page file is too small)" : "");
     }
     return line;
 }

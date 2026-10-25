@@ -404,7 +404,7 @@ struct FlashNextOptions {
     bool shared_expert_stream = false;
     // Keep only the token embedding's first N rows (the lowest ids, the most frequent tokens) in VRAM
     // (--hot-embedding-rows N; Basalt keeps 8192): the whole table moves to the pinned host block,
-    // the GPU reads the other rows from it over PCIe, and the device memory saved (about 320 MiB at
+    // the GPU reads the other rows from it over PCIe, and the device memory saved (about 311 MiB at
     // 8192) goes to the expert cache. The same embedding values, bit for bit. 0: the table stays in
     // VRAM. At most the vocabulary.
     std::uint32_t hot_embedding_rows = 0;

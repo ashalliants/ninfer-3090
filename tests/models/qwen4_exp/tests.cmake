@@ -121,3 +121,10 @@ set_tests_properties(ninfer_qwen4_exp_engine_real_test PROPERTIES SKIP_RETURN_CO
 add_test(NAME ninfer_qwen4_exp_mtp_constrained_test
   COMMAND ninfer_tests ninfer_qwen4_exp_engine_real_test --mtp-constrained)
 set_tests_properties(ninfer_qwen4_exp_mtp_constrained_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# GPU, real artifact (skips otherwise): hot_embedding_matches_plain, the engine test's
+# --hot-embedding-exact mode. Greedy ids with --hot-embedding-rows 8192 (the embedding's first rows in
+# VRAM, the rest read from pinned RAM) equal those with the whole table in VRAM.
+add_test(NAME ninfer_qwen4_exp_hot_embedding_test
+  COMMAND ninfer_tests ninfer_qwen4_exp_engine_real_test --hot-embedding-exact 8192)
+set_tests_properties(ninfer_qwen4_exp_hot_embedding_test PROPERTIES SKIP_RETURN_CODE 77)

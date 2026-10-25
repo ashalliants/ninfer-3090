@@ -36,6 +36,14 @@
 //       [--mtp-fixed] [--mtp-joint-acceptance] TOKENS...
 //   --mtp-joint-acceptance: the MTP Engines choose their windows by the joint-acceptance rule.
 //
+// Hot embedding rows (hot_embedding_matches_plain below, --hot-embedding-rows): greedy ids with only
+// the embedding's first N rows in VRAM (the rest read from the pinned block) equal those of an Engine
+// with the whole table in VRAM. --mtp K runs both Engines with MTP, so the drafter's embedding takes
+// the split route too. Without TOKENS the chat fixture's first 300 tokens are the prompt.
+//
+//   ninfer_qwen4_exp_engine_real_test --hot-embedding-exact N [--mtp K] [--max-context N] [--generate N]
+//       [TOKENS...]
+//
 // MTP for constrained requests (mtp_constrained_matches_plain below): a greedy JSON-schema request
 // with --mtp-constrained (K drafts, default 3) gives the ids of plain constrained decoding.
 //
@@ -62,6 +70,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -74,6 +83,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -548,6 +558,83 @@ int mtp_exact(const std::string& artifact, const std::vector<std::string>& args)
     return ok ? 0 : 1;
 }
 
+// hot_embedding_matches_plain (--hot-embedding-exact, FlashNextOptions::hot_embedding_rows): the
+// whole route through the Program (the table bound in the pinned block, its device pointer, the hot
+// rows' copy and the forward's two planes) gives the greedy ids of the table in VRAM. Each job must
+// gather ids on both sides of the boundary (its prompt and its output together), so both planes ran.
+int hot_embedding_matches_plain(const std::string& artifact, const std::vector<std::string>& args) {
+    std::uint32_t max_context = 8192, tokens = 128, rows = 0, mtp = 0;
+    std::vector<std::string> jobs;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (a == "--max-context" && i + 1 < args.size()) {
+            max_context = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        } else if (a == "--generate" && i + 1 < args.size()) {
+            tokens = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        } else if (a == "--mtp" && i + 1 < args.size()) {
+            mtp = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        } else if (rows == 0 && a.find_first_not_of("0123456789") == std::string::npos) {
+            rows = static_cast<std::uint32_t>(std::stoul(a));
+        } else {
+            jobs.push_back(a);
+        }
+    }
+    if (rows == 0) { throw std::invalid_argument("--hot-embedding-exact needs a nonzero row count"); }
+    std::vector<std::vector<TokenId>> prompts;
+    for (const std::string& job : jobs) { prompts.push_back(parse_tokens(job)); }
+    if (prompts.empty()) {
+        auto ids = parse_tokens("@" + std::string(NINFER_SOURCE_DIR) + "/tests/fixtures/qwen4_exp/ppl_tokens-chat.ids");
+        ids.resize(std::min<std::size_t>(ids.size(), 300));
+        prompts.push_back(std::move(ids));
+        jobs.push_back("ppl_tokens-chat[0:300]");
+    }
+    const auto engine_options = [&](std::uint32_t hot_rows) {
+        EngineOptions options                  = base_options(artifact, max_context);
+        options.flash_next.save_expert_state   = false;
+        options.flash_next.hot_embedding_rows  = hot_rows;
+        if (mtp != 0) {
+            options.speculative.backend      = SpeculativeBackend::Mtp;
+            options.speculative.draft_tokens = mtp;
+        }
+        return options;
+    };
+    const double ram_before = available_ram_gib();
+    std::vector<std::vector<TokenId>> plain;
+    {
+        Engine engine(engine_options(0));
+        for (std::size_t j = 0; j < prompts.size(); ++j) {
+            const Run run = generate(engine, prompts[j], tokens);
+            print_run(("whole table in VRAM " + jobs[j]).c_str(), run, prompts[j].size());
+            plain.push_back(run.ids);
+        }
+    }
+    wait_for_ram(ram_before);
+    bool ok = true;
+    Engine engine(engine_options(rows));
+    for (std::size_t j = 0; j < prompts.size(); ++j) {
+        const Run run           = generate(engine, prompts[j], tokens);
+        const std::string label = "hot rows " + std::to_string(rows) + " " + jobs[j];
+        print_run(label.c_str(), run, prompts[j].size());
+        if (mtp != 0) { print_speculation(label.c_str(), run.speculative); }
+        ok = same(label.c_str(), plain[j], run.ids) && ok;
+        std::size_t hot = 0, cold = 0;
+        for (const std::vector<TokenId>* ids : {&std::as_const(prompts[j]), &run.ids}) {
+            for (const TokenId id : *ids) { (static_cast<std::uint32_t>(id) < rows ? hot : cold) += 1; }
+        }
+        std::printf("%s: %zu hot and %zu cold gathers\n", label.c_str(), hot, cold);
+        if (hot == 0 || cold == 0) {
+            std::printf("FAIL: %s did not gather on both sides of the boundary\n", label.c_str());
+            ok = false;
+        }
+        if (mtp != 0 && run.speculative.rounds == 0) {
+            std::printf("FAIL: %s ran no MTP round, so the drafter's embedding was not exercised\n", label.c_str());
+            ok = false;
+        }
+    }
+    std::printf(ok ? "qwen4_exp hot embedding exactness passed\n" : "FAIL: qwen4_exp hot embedding exactness\n");
+    return ok ? 0 : 1;
+}
+
 // mtp_constrained_matches_plain (--mtp-constrained, FlashNextOptions::mtp_constrained): a greedy
 // JSON-schema request on an MTP Engine with the option gives the ids of plain constrained decoding.
 // The reference is an MTP Engine without the option, where the constrained row runs plain rounds
@@ -989,6 +1076,9 @@ int main(int argc, char** argv) {
         }
         if (!args.empty() && args.front() == "--mtp-exact") {
             return mtp_exact(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
+        }
+        if (!args.empty() && args.front() == "--hot-embedding-exact") {
+            return hot_embedding_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
         }
         if (!args.empty() && args.front() == "--mtp-constrained") {
             return mtp_constrained_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
