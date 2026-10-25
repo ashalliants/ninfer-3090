@@ -7,6 +7,12 @@ ninfer_add_test(ninfer_qwen4_exp_ngram_hash_test
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_model_loading)
 
+# Host only, header only: the draft-length policies (the EMA rule the Program uses and Basalt's
+# joint-acceptance rule with its adaptive threshold).
+ninfer_add_test(ninfer_qwen4_exp_draft_policy_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_draft_policy.cpp"
+  LIBRARIES ninfer_core)
+
 ninfer_add_test(ninfer_qwen4_exp_ngram_volume_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_volume.cpp"
   LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_core)
