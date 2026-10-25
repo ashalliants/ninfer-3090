@@ -19,6 +19,7 @@ set(NINFER_HOST_ONLY_TESTS
   ninfer_context_store_test
   ninfer_effective_thinking_budget_test
   ninfer_flash_next_perf_model_test
+  ninfer_gdn_head_map_test
   ninfer_gdn_replay_records_test
   ninfer_ggml_blocks_decode_test
   ninfer_gpu_telemetry_test

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/device.h"
+#include "core/gdn_head_map.h"
 #include "core/layout.h"
 #include "ops/common/math.h"
 #include "ops/linear_attention/gated_delta_net/common.h"
@@ -22,9 +23,22 @@ struct Arguments {
     __nv_bfloat16* out;
     int qk_heads, value_heads, tokens;
     float scale;
+    GdnHeadMap map = GdnHeadMap::Blocked;
 };
 
-// Q/K are independent of value-head gates. One packet is shared by the entire Q/K group.
+// Value head `head`'s Q/K head (core/gdn_head_map.h), and whether it is the first value head
+// reading that Q/K head (the one that publishes its packet).
+__host__ __device__ inline int qk_head_of(const Arguments& args, int head) {
+    return args.map == GdnHeadMap::Tiled ? head % args.qk_heads
+                                         : head / (args.value_heads / args.qk_heads);
+}
+
+__host__ __device__ inline bool publishes_qk(const Arguments& args, int head) {
+    return args.map == GdnHeadMap::Tiled ? head < args.qk_heads
+                                         : head % (args.value_heads / args.qk_heads) == 0;
+}
+
+// Q/K are independent of value-head gates. One packet is shared by every value head reading it.
 struct alignas(256) QkChunk {
     __nv_bfloat16 q[kChunkSize * kStateDim];
     __nv_bfloat16 k[kChunkSize * kStateDim];

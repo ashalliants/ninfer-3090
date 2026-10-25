@@ -2,7 +2,8 @@
 # volume reader on a synthetic volume. GPU, real artifact (skips without
 # NINFER_TEST_QWEN4EXP_ARTIFACT): the whole forward pass, teacher-forced scoring, block taps, the
 # decode-path KLD gate (--kld-base, scored by ninfer-perplexity's evaluation code) and the bitwise
-# identity of the shared expert on its side stream (--shared-expert-stream).
+# identities of the shared expert on its side stream (--shared-expert-stream) and of the GDN's tiled
+# head map (--gdn-head-map: prefill, a verification round with its fold, and decode logits).
 ninfer_add_test(ninfer_qwen4_exp_ngram_hash_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_hash.cpp"
   NEEDS_SOURCE_DIR
@@ -128,3 +129,10 @@ set_tests_properties(ninfer_qwen4_exp_mtp_constrained_test PROPERTIES SKIP_RETUR
 add_test(NAME ninfer_qwen4_exp_hot_embedding_test
   COMMAND ninfer_tests ninfer_qwen4_exp_engine_real_test --hot-embedding-exact 8192)
 set_tests_properties(ninfer_qwen4_exp_hot_embedding_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# GPU, real artifact with the MTP drafter (skips otherwise): gdn_head_map_matches_copies, the engine
+# test's --gdn-head-map-exact mode. Greedy ids with --gdn-head-map (the GDN's 16 key heads read in
+# place, MTP's replay records holding 16 key heads) equal those with the q/k copies, MTP rounds included.
+add_test(NAME ninfer_qwen4_exp_gdn_head_map_test
+  COMMAND ninfer_tests ninfer_qwen4_exp_engine_real_test --gdn-head-map-exact --mtp 3)
+set_tests_properties(ninfer_qwen4_exp_gdn_head_map_test PROPERTIES SKIP_RETURN_CODE 77)

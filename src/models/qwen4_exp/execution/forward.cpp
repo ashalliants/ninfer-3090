@@ -93,6 +93,23 @@ void tile_heads(const Tensor& in, Tensor& out, cudaStream_t s) {
     }
 }
 
+// The recurrence's q/k [D, H, T(, B)] and their head map: the convolution's Hk key heads read in place
+// through the tiled map (ForwardOptions::gdn_head_map), or copies tiled to one head per value head
+// (tile_heads) under the blocked map, which is then the identity.
+struct GdnQk {
+    Tensor q, k;
+    ops::GdnHeadMap map = ops::GdnHeadMap::Blocked;
+};
+
+GdnQk gdn_qk(const Tensor& q, const Tensor& k, std::int32_t D, std::int32_t Hk, std::int32_t Hv, std::int32_t T,
+             bool head_map, WorkspaceArena& work, cudaStream_t s) {
+    if (head_map) { return {q.view({D, Hk, T}), k.view({D, Hk, T}), ops::GdnHeadMap::Tiled}; }
+    GdnQk out{work.alloc(DType::BF16, {D, Hv, T}), work.alloc(DType::BF16, {D, Hv, T})};
+    tile_heads(q.view({D, Hk, T}), out.q, s);
+    tile_heads(k.view({D, Hk, T}), out.k, s);
+    return out;
+}
+
 } // namespace
 
 ops::QsaIndexerGeometry qsa_geometry(const TextConfig& c) {
@@ -134,7 +151,7 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
       state_(std::move(state)), kv_(std::move(kv)), experts_(std::move(experts)), mtp_(std::move(mtp)),
       side_(options.shared_expert_stream ? std::make_unique<SideStream>() : nullptr),
       hot_embedding_rows_(options.hot_embedding_rows), hot_embedding_(options.hot_embedding),
-      cold_embedding_(options.cold_embedding) {
+      cold_embedding_(options.cold_embedding), gdn_head_map_(options.gdn_head_map) {
     if (state_.gdn_conv.size() != config_.gdn_layers || state_.gdn_recurrent.size() != config_.gdn_layers ||
         state_.ple_slot.dtype != DType::I32 || state_.ple_slot.numel() != 1 ||
         state_.qsa_tails.size() != config_.attention_layers || kv_.layers.size() != config_.attention_layers ||
@@ -160,7 +177,7 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
     : parameters_(parameters), config_(parameters.model.config()), device_(device), work_(&work),
       experts_(std::move(experts)), side_(options.shared_expert_stream ? std::make_unique<SideStream>() : nullptr),
       hot_embedding_rows_(options.hot_embedding_rows), hot_embedding_(options.hot_embedding),
-      cold_embedding_(options.cold_embedding) {
+      cold_embedding_(options.cold_embedding), gdn_head_map_(options.gdn_head_map) {
     if (mtp.has_value() != parameters_.mtp.has_value()) {
         throw std::invalid_argument("Qwen4Exp forward: the MTP drafter's parameters and state go together");
     }
@@ -517,25 +534,24 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     // Verification reads the live convolution window and discards the advanced one.
     Tensor conv_out = batch.verify != nullptr ? batch.verify->conv_scratch : conv_state;
     ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state, conv_out, q, k, v, s);
-    Tensor qt = work_->alloc(DType::BF16, {DK, NV, T});
-    Tensor kt = work_->alloc(DType::BF16, {DK, NV, T});
-    tile_heads(q.view({DK, NK, T}), qt, s);
-    tile_heads(k.view({DK, NK, T}), kt, s);
+    const GdnQk qk     = gdn_qk(q, k, DK, NK, NV, T, gdn_head_map_, *work_, s);
+    const std::int32_t NQ = qk.q.ne[1];
     Tensor o = work_->alloc(DType::BF16, {DV, NV, T});
     const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(DK)));
     if (batch.verify != nullptr) {
-        // The recurrence from the live state, which it leaves unchanged; the tiled q/k (one key
-        // head per value head), v and {g, beta} go to the records the commit folds.
+        // The recurrence from the live state, which it leaves unchanged; the q/k (one key head per
+        // value head, or the key heads under the tiled map), v and {g, beta} go to the records the
+        // commit folds.
         Tensor& recurrent = state_.gdn_recurrent.at(index);
         const Tensor states = recurrent.view({DK, DV, NV, 1});
         Tensor out          = o.view({DV, NV, T, 1});
-        ops::gated_delta_net_replay_record(qt.view({DK, NV, T, 1}), kt.view({DK, NV, T, 1}), v.view({DV, NV, T, 1}),
+        ops::gated_delta_net_replay_record(qk.q.view({DK, NQ, T, 1}), qk.k.view({DK, NQ, T, 1}), v.view({DV, NV, T, 1}),
                                            gate.view({NV, T, 1}), beta.view({NV, T, 1}), scale, states, Tensor{},
                                            batch.verify->initial_slot, records.key, records.value, records.gate,
-                                           out, s);
+                                           out, s, qk.map);
     } else {
-        ops::gated_delta_net(qt, kt, v.view({DV, NV, T}), gate, beta, scale, /*normalize_qk=*/true, *work_,
-                             state_.gdn_recurrent.at(index), o, device_.execution_view());
+        ops::gated_delta_net(qk.q, qk.k, v.view({DV, NV, T}), gate, beta, scale, /*normalize_qk=*/true, *work_,
+                             state_.gdn_recurrent.at(index), o, device_.execution_view(), qk.map);
     }
     Tensor normed = work_->alloc(DType::BF16, {DV, NV * T});
     ops::gated_rmsnorm(o.view({DV, NV * T}), p.norm, z.view({DV, NV * T}),
@@ -828,17 +844,16 @@ Tensor Forward::gdn_rows(const GdnParameters& p, const Tensor& x, std::uint32_t 
         Tensor* parts[] = {&q, &k, &v};
         ops::split_rows(conv, parts, s);
     }
-    Tensor qt = work_->alloc(DType::BF16, {DK, NV, B});
-    Tensor kt = work_->alloc(DType::BF16, {DK, NV, B});
-    tile_heads(q.view({DK, NK, B}), qt, s);
-    tile_heads(k.view({DK, NK, B}), kt, s);
+    const GdnQk qk     = gdn_qk(q, k, DK, NK, NV, B, gdn_head_map_, *work_, s);
+    const std::int32_t NQ = qk.q.ne[1];
     // Each row's recurrence from its slot, in place (the one-token kernel of a T = 1 call).
     Tensor o           = work_->alloc(DType::BF16, {DV, NV, B});
     Tensor o_rows      = o.view({DV, NV, 1, B});
     const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(DK)));
-    ops::gated_delta_net_batch_update(qt.view({DK, NV, 1, B}), kt.view({DK, NV, 1, B}), v.view({DV, NV, 1, B}),
+    ops::gated_delta_net_batch_update(qk.q.view({DK, NQ, 1, B}), qk.k.view({DK, NQ, 1, B}), v.view({DV, NV, 1, B}),
                                       gate.view({NV, 1, B}), beta.view({NV, 1, B}), scale, /*normalize_qk=*/true,
-                                      rows_->state.gdn_recurrent.at(index), batch.slot_ids, batch.slot_ids, o_rows, s);
+                                      rows_->state.gdn_recurrent.at(index), batch.slot_ids, batch.slot_ids, o_rows, s,
+                                      qk.map);
     Tensor normed = work_->alloc(DType::BF16, {DV, NV * B});
     ops::gated_rmsnorm(o.view({DV, NV * B}), p.norm, z.view({DV, NV * B}),
                        g.output_gate == GateActivation::Sigmoid ? ops::RmsGate::Sigmoid : ops::RmsGate::Silu,

@@ -86,6 +86,7 @@ struct Case {
     int tokens;
     bool normalize_qk;
     bool near_zero_qk = false;
+    GdnHeadMap map    = GdnHeadMap::Blocked;
 };
 
 void fill_uniform(std::vector<float>& values, std::mt19937& generator, float low, float high) {
@@ -116,6 +117,7 @@ gdn_ref::Inputs make_inputs(const Case& test_case, std::uint32_t seed,
     in.qk_heads    = test_case.qk_heads;
     in.value_heads = test_case.value_heads;
     in.tokens      = test_case.tokens;
+    in.head_map    = test_case.map;
 
     const std::size_t qk_size =
         static_cast<std::size_t>(kStateDim * test_case.qk_heads * test_case.tokens);
@@ -364,6 +366,7 @@ gdn_ref::Result reference_prefix(const gdn_ref::Inputs& in, int tokens, float sc
     prefix.qk_heads    = in.qk_heads;
     prefix.value_heads = in.value_heads;
     prefix.tokens      = tokens;
+    prefix.head_map    = in.head_map;
     prefix.q.assign(in.q.begin(), in.q.begin() + tokens * in.qk_heads * kStateDim);
     prefix.k.assign(in.k.begin(), in.k.begin() + tokens * in.qk_heads * kStateDim);
     prefix.v.assign(in.v.begin(), in.v.begin() + tokens * in.value_heads * kStateDim);
@@ -387,6 +390,7 @@ int run_case(const Case& test_case, std::uint32_t seed,
     const std::string label =
         std::string(test_case.name) + " H=" + std::to_string(test_case.qk_heads) + "/" +
         std::to_string(test_case.value_heads) + " T=" + std::to_string(test_case.tokens) +
+        (test_case.map == GdnHeadMap::Tiled ? " tiled" : "") +
         (test_case.normalize_qk ? " normalized" : " raw") +
         (inplace ? " inplace" : " distinct-state");
     std::cout << "GDN_CASE " << label << " calls=" << partitions.size() << std::endl;
@@ -432,10 +436,10 @@ int run_case(const Case& test_case, std::uint32_t seed,
         Tensor bs = beta.slice(1, begin, length), os = output.slice(2, begin, length);
         if (inplace) {
             ops::gated_delta_net(qs, ks, vs, gs, bs, scale, test_case.normalize_qk, workspace,
-                                 output_state, os, device_execution);
+                                 output_state, os, device_execution, test_case.map);
         } else {
             ops::gated_delta_net(qs, ks, vs, gs, bs, scale, test_case.normalize_qk, workspace,
-                                 input_state, output_state, os, device_execution);
+                                 input_state, output_state, os, device_execution, test_case.map);
         }
         cuda_synchronize();
         begin += length;
@@ -534,6 +538,7 @@ int batch_update_case(const Case& test_case, const std::vector<int>& source_slot
     aggregate.qk_heads    = test_case.qk_heads;
     aggregate.value_heads = test_case.value_heads;
     aggregate.tokens      = static_cast<std::int64_t>(width) * batch;
+    aggregate.head_map    = test_case.map;
     aggregate.q.reserve(qk_row_size * static_cast<std::size_t>(batch));
     aggregate.k.reserve(qk_row_size * static_cast<std::size_t>(batch));
     aggregate.v.reserve(value_row_size * static_cast<std::size_t>(batch));
@@ -590,7 +595,7 @@ int batch_update_case(const Case& test_case, const std::vector<int>& source_slot
     Tensor out_tensor(out.data(), DType::BF16, {kStateDim, test_case.value_heads, width, batch});
     ops::gated_delta_net_batch_update(q, k, v, g, beta, scale, test_case.normalize_qk,
                                       states_tensor, source_slots_tensor, destination_slots_tensor,
-                                      out_tensor, nullptr);
+                                      out_tensor, nullptr, test_case.map);
     cuda_synchronize();
 
     const std::string label =
@@ -633,6 +638,97 @@ int batch_update_case(const Case& test_case, const std::vector<int>& source_slot
     failures += out.verify_guards((label + " out").c_str());
     failures += verify_common_inputs_unchanged(label, aggregate, device.q, device.k, device.v,
                                                device.g, device.beta);
+    return failures;
+}
+
+// q/k [D, Hqk, T] -> [D, Hv, T] with head h = head h % Hqk: the copy route of a tiled head map.
+std::vector<float> tile_heads(const std::vector<float>& in, int qk_heads, int value_heads,
+                              int columns) {
+    std::vector<float> out(static_cast<std::size_t>(kStateDim) * value_heads * columns);
+    for (int t = 0; t < columns; ++t) {
+        for (int h = 0; h < value_heads; ++h) {
+            std::copy_n(in.begin() + (static_cast<std::ptrdiff_t>(t) * qk_heads + h % qk_heads) *
+                                         kStateDim,
+                        kStateDim,
+                        out.begin() + (static_cast<std::ptrdiff_t>(t) * value_heads + h) * kStateDim);
+        }
+    }
+    return out;
+}
+
+// GdnHeadMap::Tiled on the 16 key heads against GdnHeadMap::Blocked on q/k tiled to 48 heads (the
+// copy route, where the blocked map is the identity): the same values reach the same arithmetic,
+// so every route must give the same output and state bits. T < 16 takes the recurrent kernel, T >= 16
+// the chunked route; batch > 0 takes the batch update instead (T = 1 per row, `batch` slots).
+int tiled_matches_expanded_case(int tokens, bool normalize_qk, int batch, std::uint32_t seed) {
+    constexpr int kQk = 16, kValue = 48;
+    const bool rows   = batch > 0;
+    const int columns = rows ? batch : tokens;
+    Case tiled_case{"flash-next tiled", kQk, kValue, columns, normalize_qk, false,
+                    GdnHeadMap::Tiled};
+    const gdn_ref::Inputs in = make_inputs(tiled_case, seed);
+    gdn_ref::Inputs expanded = in;
+    expanded.qk_heads        = kValue;
+    expanded.head_map        = GdnHeadMap::Blocked;
+    expanded.q               = tile_heads(in.q, kQk, kValue, columns);
+    expanded.k               = tile_heads(in.k, kQk, kValue, columns);
+    const std::string label  = std::string("tiled map against expanded q/k ") +
+                              (rows ? "batch update B=" + std::to_string(batch)
+                                    : "T=" + std::to_string(tokens)) +
+                              (normalize_qk ? " normalized" : " raw");
+    std::cout << "GDN_CASE " << label << std::endl;
+    const float scale     = 1.0F / std::sqrt(static_cast<float>(kStateDim));
+    const int slots       = rows ? batch : 1;
+    const auto state_size = static_cast<std::size_t>(kStateDim) * kStateDim * kValue;
+    std::vector<float> initial(state_size * static_cast<std::size_t>(slots));
+    for (int slot = 0; slot < slots; ++slot) {
+        std::copy(in.state.begin(), in.state.end(), initial.begin() + slot * state_size);
+    }
+    std::vector<int> slot_ids(static_cast<std::size_t>(std::max(batch, 1)));
+    std::iota(slot_ids.begin(), slot_ids.end(), 0);
+    DeviceBuffer device_slots = to_device(slot_ids);
+
+    // One run of either form: its output and final state bits.
+    const auto run = [&](const gdn_ref::Inputs& x, GdnHeadMap map) {
+        DeviceInputs device(x);
+        DeviceBuffer states = to_device(initial);
+        DeviceBuffer out(x.v.size() * sizeof(std::uint16_t));
+        out.fill(0xff);
+        const int qk = static_cast<int>(x.qk_heads);
+        if (rows) {
+            Tensor q(device.q.p, DType::BF16, {kStateDim, qk, 1, batch});
+            Tensor k(device.k.p, DType::BF16, {kStateDim, qk, 1, batch});
+            Tensor v(device.v.p, DType::BF16, {kStateDim, kValue, 1, batch});
+            Tensor g(device.g.p, DType::FP32, {kValue, 1, batch});
+            Tensor beta(device.beta.p, DType::FP32, {kValue, 1, batch});
+            Tensor state(states.p, DType::FP32, {kStateDim, kStateDim, kValue, slots});
+            Tensor selected(device_slots.p, DType::I32, {batch});
+            Tensor output(out.p, DType::BF16, {kStateDim, kValue, 1, batch});
+            ops::gated_delta_net_batch_update(q, k, v, g, beta, scale, normalize_qk, state, selected,
+                                              selected, output, nullptr, map);
+        } else {
+            Tensor q(device.q.p, DType::BF16, {kStateDim, qk, tokens});
+            Tensor k(device.k.p, DType::BF16, {kStateDim, qk, tokens});
+            Tensor v(device.v.p, DType::BF16, {kStateDim, kValue, tokens});
+            Tensor g(device.g.p, DType::FP32, {kValue, tokens});
+            Tensor beta(device.beta.p, DType::FP32, {kValue, tokens});
+            Tensor state(states.p, DType::FP32, {kStateDim, kStateDim, kValue});
+            Tensor output(out.p, DType::BF16, {kStateDim, kValue, tokens});
+            const auto bytes = ops::gated_delta_net_workspace_capacity_bytes(qk, kValue, 1, tokens);
+            DeviceBuffer scratch(std::max<std::size_t>(bytes, 256));
+            WorkspaceArena workspace(DeviceSpan{scratch.p, scratch.bytes});
+            ops::gated_delta_net(q, k, v, g, beta, scale, normalize_qk, workspace, state, output,
+                                 execution(), map);
+        }
+        cuda_synchronize();
+        return std::make_pair(from_device<std::uint16_t>(out, x.v.size()),
+                              from_device<std::uint32_t>(states, initial.size()));
+    };
+    const auto tiled = run(in, GdnHeadMap::Tiled);
+    const auto copy  = run(expanded, GdnHeadMap::Blocked);
+    int failures     = 0;
+    failures += verify_exact(label + " out bits", tiled.first, copy.first);
+    failures += verify_exact(label + " state bits", tiled.second, copy.second);
     return failures;
 }
 
@@ -778,6 +874,29 @@ int main() {
         failures += run_case({"zero beta", 1, 3, 17, normalize}, 14517U, InputPattern::ZeroBeta);
         failures +=
             run_case({"unit beta", 1, 3, 257, normalize}, 14657U, InputPattern::UnitBeta, true);
+    }
+
+    // Qwen3.8-Flash-Next's tiled head map (value head h reads key head h % 16): against the oracle
+    // over every route, then bitwise against the blocked map on q/k expanded to 48 heads.
+    for (int tokens : {1, 7, 15, 16, 17, 65, 1025}) {
+        failures += run_case({"flash-next tiled", 16, 48, tokens, true, false, GdnHeadMap::Tiled},
+                             17000U + tokens, InputPattern::Ordinary, tokens % 2 != 0);
+    }
+    failures += run_case({"flash-next tiled raw", 16, 48, 33, false, false, GdnHeadMap::Tiled},
+                         17100U);
+    failures += run_case({"flash-next tiled continuation", 16, 48, 49, true, false,
+                          GdnHeadMap::Tiled},
+                         17200U, InputPattern::Ordinary, false, {32, 16, 1});
+    failures += batch_update_case(
+        {"flash-next tiled selected-slot", 16, 48, 1, true, false, GdnHeadMap::Tiled}, {3, 1},
+        {3, 1}, 4, 17300U);
+    for (int tokens : {1, 7, 15, 16, 17, 64, 65, 1025}) {
+        for (bool normalize : {true, false}) {
+            failures += tiled_matches_expanded_case(tokens, normalize, 0, 17400U + tokens);
+        }
+    }
+    for (int batch : {1, 2, 8}) {
+        failures += tiled_matches_expanded_case(1, true, batch, 17500U + batch);
     }
 
     // The production decode path updates selected state-pool slots in place at width one.

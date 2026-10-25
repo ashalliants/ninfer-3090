@@ -695,6 +695,27 @@ None has been measured on the RTX 3090 yet.
     gathers one row per column. The 322 MiB join the pinned block (one `cudaHostAlloc` at load,
     so no extra `cudaHostRegister` under WDDM); the RAM ledger counts them, so a host that only
     just fits the banks does not start with the option. Not measured.
+- **GDN key heads through a head map** (`--gdn-head-map`). The GGUF pairs value head h with key
+  head h mod 16 (tiled order). Without the option `tile_heads` copies q and k to 48 heads, one per
+  value head, before each GDN layer's recurrence: 3 `cudaMemcpy2DAsync` per tensor, 216 copy nodes
+  per decode token (0.25 ms of the "QSA, GDN, norms, copies" row above). With it the
+  GatedDeltaNet Ops take an `ops::GdnHeadMap`: `Tiled` reads key head h mod Hqk, `Blocked` (the
+  default, Qwen3.5's grouped heads) h / (Hv / Hqk). Every route Flash-Next calls takes it: the
+  recurrent kernel (decode, prefill calls under 16 tokens), the chunked route (prefill; the Q/K
+  packet is published by the first value head that reads it, h < 16), the rows route's batch update
+  (two lanes), and MTP's replay record and fold.
+  - The same values reach the same arithmetic in the same order, so the outputs and the state are
+    designed to equal the copy route's bit for bit. `ninfer_gdn_head_map_test` (cpu) checks it on
+    the FP64 oracle; the GPU checks (`ninfer_gated_delta_net_test`,
+    `ninfer_gated_delta_net_replay_record_test`, `ninfer_gdn_replay_fold_test`: the tiled map
+    against the blocked map on expanded q/k, bitwise) and end to end
+    `ninfer_qwen4_exp_forward_real_test --gdn-head-map TOKENS` (the prompt, a verification round and
+    its fold, and decode calls: logits bitwise against off) have not run yet.
+  - MTP's GDN replay records hold the 16 key heads (`gdn_records_spec`, `spec.head_map` Tiled), so
+    their key plane is a third of the copy route's (`plan_gdn_record_bytes`, part of
+    `ProgramDevicePlan::speculation`); the fold registers the [16, 48, 10240, Tiled] geometry. Off,
+    the copies, the records and the fold are those of master. Works with two lanes, MTP and vision.
+    Not measured.
 
 ## Artifact decisions
 

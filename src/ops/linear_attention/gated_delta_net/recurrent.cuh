@@ -441,7 +441,7 @@ struct RecordAccess {
     __device__ __forceinline__ void store_key(const RecurrentCoordinates& coord, std::int32_t token,
                                               const RawQkLane& raw) const {
         if (coord.state_tile == 0 && coord.warp == 0 &&
-            static_cast<int>(coord.value_head) % heads.group_size() == 0) {
+            heads.first_reader(static_cast<int>(coord.value_head))) {
             __nv_bfloat16* destination =
                 key_record + (column(coord, token) * heads.H_qk + coord.qk_head) * kStateDim;
             store_vec(destination + coord.dqk_base, raw.bits);
@@ -468,20 +468,27 @@ struct RecordAccess {
 // The per-layer shape of a fold. The number of layers is not part of it: each layer folds
 // independently, so the launch grid takes the count from the records. That is what lets a model split
 // into pipeline stages fold each stage's layers with the same kernel.
-template <int QkHeads, int ValueHeads, int ConvChannels>
+template <int QkHeads, int ValueHeads, int ConvChannels, GdnHeadMap Map = GdnHeadMap::Blocked>
 struct FoldGeometry {
-    static constexpr int kQkHeads      = QkHeads;
-    static constexpr int kValueHeads   = ValueHeads;
-    static constexpr int kConvChannels = ConvChannels;
+    static constexpr int kQkHeads        = QkHeads;
+    static constexpr int kValueHeads     = ValueHeads;
+    static constexpr int kConvChannels   = ConvChannels;
+    static constexpr GdnHeadMap kHeadMap = Map;
     static_assert(ValueHeads % QkHeads == 0);
     static_assert(ConvChannels % 128 == 0);
+
+    __device__ __forceinline__ static std::uint32_t qk_head(std::uint32_t value_head) {
+        if constexpr (Map == GdnHeadMap::Tiled) { return value_head % QkHeads; }
+        return value_head / (ValueHeads / QkHeads);
+    }
 };
 
 using FoldGeometry16x48 = FoldGeometry<16, 48, 10240>;
 using FoldGeometry16x32 = FoldGeometry<16, 32, 8192>;
-// Qwen3.8-Flash-Next: the GGUF's tiled value heads (value head h reads key head h % 16) reach the
-// recurrence as 48 key heads, one per value head.
-using FoldGeometry48x48 = FoldGeometry<48, 48, 10240>;
+// Qwen3.8-Flash-Next: the GGUF's tiled value heads (value head h reads key head h % 16), either
+// expanded by the caller to 48 key heads, one per value head, or read in place through the map.
+using FoldGeometry48x48      = FoldGeometry<48, 48, 10240>;
+using FoldGeometry16x48Tiled = FoldGeometry<16, 48, 10240, GdnHeadMap::Tiled>;
 
 template <class Geometry, class StateT = float>
 struct FoldAccess {
@@ -504,8 +511,7 @@ struct FoldAccess {
         const int warp                 = threadIdx.y;
         const std::int32_t state_tile  = layer_tile & 7;
         const std::uint32_t value_head = static_cast<std::uint32_t>(blockIdx.x);
-        constexpr std::uint32_t kGroup = Geometry::kValueHeads / Geometry::kQkHeads;
-        const std::uint32_t qk_head    = value_head / kGroup;
+        const std::uint32_t qk_head    = Geometry::qk_head(value_head);
         const std::uint32_t dv_base =
             static_cast<std::uint32_t>(state_tile * kBlockDv + warp * kDvPerWarp);
         return {lane,
