@@ -855,10 +855,10 @@ None has been measured on the RTX 3090 yet.
     round is committed and the lane's state is reset. The round is not retried. Later requests use
     the CPU leg again unless the service thread itself has died (`failure()` set): it never answers
     again, so the Program then stops speculating (plain rounds, the same output) and says so once.
-  - Memory: the service's 4-byte device counter is `ProgramDevicePlan::cpu_verify_misses`; its
+  - Memory: the service's 4-byte device counter is `ProgramDevicePlan::cpu_misses`; its
     mapped channel (request, x for 1 + drafts columns, y for 4 jobs of 8 columns, the done line)
     and the error word (220 KiB at 7 drafts) are pinned and charged to the RAM ledger
-    (`plan_cpu_verify_misses`). On Windows a pinned allocation is mapped into the GPU's address
+    (`plan_cpu_misses`; with `--prefill-cpu-share` too the one channel is sized for that, below). On Windows a pinned allocation is mapped into the GPU's address
     space too.
   - GPU-session checks: the GPU spins on a mapped host flag inside the verification graph. With a
     display attached (WDDM) a kernel that spins past TdrDelay (2 s) resets the driver; a healthy
@@ -1056,6 +1056,58 @@ None has been measured on the RTX 3090 yet.
     driver may also hold the launch in its command buffer until the next synchronization; nsys
     should show the front running while the host reads. Measure tok/s on vs off, plain and with MTP.
     Untested under WDDM. Works with MTP and vision. Not measured.
+- **Prefill CPU share for short calls** (`--prefill-cpu-share F`; F9 of the Basalt learnings,
+  Basalt's `--prefill-cpu-share`, default 0.6 there). Short prompts are staging-bound (PR 12's
+  reproduction: 1,260 tok/s at 1K against 2,450 at 8K): a prefill call that does not stream its
+  experts stages each layer's misses over PCIe through the MoE's staging kernel. With the option, the
+  CPU miss service computes a share of them while the GPU stages and runs the rest. Basalt takes
+  llround(share × n) of a layer's n streamed experts, the candidates (at most 8 rows, a host copy)
+  ordered by (rows, id); ours takes the same count exactly, (2 × num × n + den) / (2 × den) with F stored as
+  num / den (0.6 is 3 / 5), the fewest-column misses of at most 8 columns first, ties to the lower
+  expert id (job order: jobs are in ascending id).
+  - Which calls: the share applies to calls that do not use the expert stream (`ForwardBatch::cpu_share`,
+    set by `run_call` for every non-wide call: prompts and tails under `kStreamMinColumns` = 512,
+    forced tokens, and every call when the cache cannot lend the ring). The stream decides its copies
+    before routing (two layers ahead, the non-resident experts in id order up to half the ring), so
+    leaving the CPU's experts out of its tables would need the routing first; a streamed chunk also
+    routes nearly every expert with many rows, which the CPU does not take. So `expert_stream.cpp` is
+    unchanged, and `Forward::cpu_channels` ignores `cpu_share` while the stream is active. The static
+    route stages after routing, on the device, per call, so excluding the CPU's jobs there is the
+    existing `cpu_flags` path: the stage kernel and the narrow and wide expert kernels skip them.
+  - Design: the same `CpuMissService` as `--cpu-verify-misses`, started for either option, with its
+    buffers sized for the larger use (`plan_cpu_misses`). `MoeCpuChannel` gains `share_num` /
+    `share_den` beside `pcie_divisor` (declared last, so the other fields keep their kernel-parameter
+    offsets); `share_den > 0` selects the share rule in `cpu_plan_kernel`, otherwise the divisor
+    rule, so verification keeps Task 17's divisor. `ForwardExperts::prefill_cpu` holds the prefill
+    channels (512 jobs, calls up to the static chunk, at most `kMaxCpuCallColumns`), narrowed from
+    the same service channel as the verification's. Layer calls run in stream order and each wait
+    precedes the next call's plan, so one request buffer serves both. The order is the
+    verification's: experts without the wait, the shared expert, then `moe_experts_cpu_wait`.
+  - Bit-identical by construction (the CPU engine equals every GPU placement). Host mirror:
+    `offloaded_moe::cpu_share_take` and `select_prefill_cpu_jobs`
+    (`src/ops/offloaded_sparse_moe/cpu_share.h`, in `ninfer_moe_cpu_selection_test`: the take equals
+    llround(0.6 n) for n <= 1024, the row cap, (rows, id) order, share 0). GPU
+    (`ninfer_offloaded_moe_wide_test`, prefill_cpu_share): shares 3/5, 1/1 and 1/3, staged through 4
+    or 64 slots and zero-copy, at T in {1, 16, 65, 300, 600} (wide experts beside the CPU's; 600 puts
+    every GPU job on the wide route), eagerly and in two graph replays: outputs against the CPU engine
+    bit for bit, each `MissRequest` against `select_prefill_cpu_jobs` with compacted columns. End to
+    end `ninfer_qwen4_exp_prefill_cpu_share_test` (greedy ids of the 300-token prompt with a 4 GiB
+    cache equal those without the option, and the CPU served at least one expert). None has run yet.
+  - Failure: as for verification, a layer whose wait times out writes the error word; each prefill
+    and forced-token call checks it after its synchronization and throws (the request ends, the
+    lane is released). Once the service thread has died the Program stops setting `cpu_share` and
+    says so once.
+  - Memory: one 4-byte device counter (`ProgramDevicePlan::cpu_misses`, shared with
+    `--cpu-verify-misses`); pinned for the RAM ledger: the request, x for the chunk's columns (5 MiB
+    at 1,024) and y for 512 jobs of 8 columns (20 MiB), about 26 MiB. The worker team's own buffers
+    for 512 jobs (about 14 MiB pageable) are not in the ledger.
+  - Costs to measure: `cpu_plan_kernel` publishes the chosen jobs' x columns with one CTA, which for a
+    call of hundreds of columns is a few MiB over PCIe from one CTA per layer; the CPU computes up to
+    hundreds of experts per layer (about 100 µs each at 6 workers in PR 11, so raise
+    `--cpu-verify-workers`); the GPU's staging of the rest runs meanwhile. GPU-session checks: tok/s
+    at 1K and on 300-token prompts on vs off at shares 0.4-0.8 and 6, 12 and 16 workers, the plan
+    kernel's time at 1,024 columns, and the WDDM/TDR check of `--cpu-verify-misses` (a layer's wait
+    here is milliseconds, not microseconds). Works with two lanes, MTP and vision. Not measured.
 
 ## Artifact decisions
 

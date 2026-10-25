@@ -9,9 +9,20 @@
 //   - divisor_zero_takes_all: divisor 0 takes every eligible miss up to the cap;
 //   - divisor_three: M / 3 misses stay on the GPU (M - M / 3 go to the CPU);
 //   - cap_limits: never more than the cap; inconsistent inputs are refused.
+//
+// And the prefill CPU share (cpu_share.h: cpu_share_take, select_prefill_cpu_jobs), the rule a call
+// whose channel sets share_num / share_den applies instead of the divisor:
+//   - share_matches_llround: at 3 / 5 the take is llround(0.6 * n) for every n <= 1024 (0.6 * n
+//     never ends in .5), and at 1 / 2 halves round up;
+//   - prefill_rows_cap: experts with more than max_rows rows are never taken but count toward n;
+//   - prefill_sorted_by_rows_then_id: the fewest rows first, then the lower expert id, whatever the
+//     job order;
+//   - share_zero_takes_none: num 0 takes nothing; bad fractions are refused.
 
 #include "ops/offloaded_sparse_moe/cpu_selection.h"
+#include "ops/offloaded_sparse_moe/cpu_share.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <stdexcept>
@@ -124,6 +135,83 @@ void cap_limits() {
           "cap_limits: a negative cap is refused");
 }
 
+void share_matches_llround() {
+    for (int n = 0; n <= 1024; ++n) {
+        const auto want = static_cast<int>(std::llround(0.6 * n));
+        if (om::cpu_share_take(n, n, 3, 5) != want) {
+            check(false, "share_matches_llround: n = " + std::to_string(n) + " takes " +
+                             std::to_string(om::cpu_share_take(n, n, 3, 5)) + ", llround gives " +
+                             std::to_string(want));
+        }
+    }
+    // The candidates bound the take; a half rounds up (n = 5 at 1 / 2 takes 3).
+    check(om::cpu_share_take(1024, 100, 3, 5) == 100, "share_matches_llround: the candidates bound the take");
+    check(om::cpu_share_take(5, 5, 1, 2) == 3, "share_matches_llround: 2.5 rounds up");
+    check(om::cpu_share_take(7, 7, 1, 1) == 7, "share_matches_llround: share 1 takes every candidate");
+}
+
+void prefill_rows_cap() {
+    // Rows 1, 9, 8, 12, 2: experts 1 and 3 are too wide, n = 5 misses, take llround(3) = 3 of the
+    // three candidates.
+    const ints experts = {0, 1, 2, 3, 4}, rows = {1, 9, 8, 12, 2};
+    const auto none    = residency(5, {});
+    check(om::select_prefill_cpu_jobs(experts, rows, none, 3, 5, 8) == picks{0, 4, 2},
+          "prefill_rows_cap: only experts of at most 8 rows, fewest first");
+    check(om::select_prefill_cpu_jobs(experts, rows, none, 3, 5, 2) == picks{0, 4},
+          "prefill_rows_cap: max_rows 2 leaves the 8-row expert");
+    // n counts the wide misses: 10 misses (5 narrow, 5 wide) at 3 / 5 take 6, bounded to the 5 narrow.
+    const ints many = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, many_rows = {1, 20, 1, 20, 1, 20, 1, 20, 1, 20};
+    check(om::select_prefill_cpu_jobs(many, many_rows, residency(10, {}), 3, 5, 8) == picks{0, 2, 4, 6, 8},
+          "prefill_rows_cap: wide misses count toward n");
+    // 10 narrow misses take 6; 2 of them resident: n = 8 takes 5.
+    const ints ones(10, 1);
+    check(om::select_prefill_cpu_jobs(many, ones, residency(10, {}), 3, 5, 8).size() == 6,
+          "prefill_rows_cap: 10 misses take 6");
+    check(om::select_prefill_cpu_jobs(many, ones, residency(10, {0, 5}), 3, 5, 8) == picks{1, 2, 3, 4, 6},
+          "prefill_rows_cap: resident experts are not misses");
+    check(om::select_prefill_cpu_jobs(many, ones, residency(10, {}), 3, 5, 8, 4).size() == 4,
+          "prefill_rows_cap: the channel's cap bounds the take");
+}
+
+void prefill_sorted_by_rows_then_id() {
+    // Jobs listed out of id order: the result is by (rows, expert id), not job order.
+    const ints experts = {7, 3, 5, 1, 6}, rows = {2, 2, 1, 2, 1};
+    check(om::select_prefill_cpu_jobs(experts, rows, residency(8, {}), 1, 1, 8) == picks{2, 4, 3, 1, 0},
+          "prefill_sorted_by_rows_then_id: rows 1 (ids 5, 6), then rows 2 (ids 1, 3, 7)");
+    // In dispatch order (ascending ids) the rule orders like the device's: fewest rows, then job order.
+    const ints sorted = {1, 3, 5, 6, 7}, sorted_rows = {2, 2, 1, 1, 2};
+    check(om::select_prefill_cpu_jobs(sorted, sorted_rows, residency(8, {}), 1, 1, 8) ==
+              om::select_cpu_jobs(sorted, sorted_rows, residency(8, {}), 64, 0, 8),
+          "prefill_sorted_by_rows_then_id: on ascending ids it orders like select_cpu_jobs");
+    check(om::select_prefill_cpu_jobs(experts, rows, residency(8, {}), 3, 5, 8) == picks{2, 4, 3},
+          "prefill_sorted_by_rows_then_id: 3 / 5 of 5 takes the first 3");
+}
+
+void share_zero_takes_none() {
+    const ints experts = {0, 1, 2}, rows = {1, 1, 1};
+    const auto none    = residency(3, {});
+    check(om::select_prefill_cpu_jobs(experts, rows, none, 0, 5, 8).empty(), "share_zero_takes_none: 0 / 5");
+    check(om::cpu_share_take(1024, 1024, 0, 1) == 0, "share_zero_takes_none: 0 / 1 of 1024");
+    check(om::cpu_share_take(0, 0, 3, 5) == 0, "share_zero_takes_none: no misses");
+    const auto refused = [](auto&& f) {
+        try {
+            f();
+        } catch (const std::invalid_argument&) { return true; }
+        return false;
+    };
+    check(refused([&] { (void)om::cpu_share_take(4, 4, 1, 0); }), "share_zero_takes_none: den 0 is refused");
+    check(refused([&] { (void)om::cpu_share_take(4, 4, 6, 5); }), "share_zero_takes_none: a share above 1 is refused");
+    check(refused([&] { (void)om::cpu_share_take(4, 4, -1, 5); }), "share_zero_takes_none: a negative num is refused");
+    check(refused([&] { (void)om::cpu_share_take(4, 5, 3, 5); }),
+          "share_zero_takes_none: more candidates than misses is refused");
+    check(refused([&] { (void)om::select_prefill_cpu_jobs(experts, ints{1}, none, 3, 5, 8); }),
+          "share_zero_takes_none: mismatched spans are refused");
+    check(refused([&] { (void)om::select_prefill_cpu_jobs(experts, rows, none, 3, 5, 9); }),
+          "share_zero_takes_none: max_rows above 8 is refused");
+    check(refused([&] { (void)om::select_prefill_cpu_jobs(experts, rows, none, 3, 5, 8, -1); }),
+          "share_zero_takes_none: a negative cap is refused");
+}
+
 } // namespace
 
 int main() {
@@ -133,6 +221,10 @@ int main() {
     divisor_zero_takes_all();
     divisor_three();
     cap_limits();
+    share_matches_llround();
+    prefill_rows_cap();
+    prefill_sorted_by_rows_then_id();
+    share_zero_takes_none();
     if (failures != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;

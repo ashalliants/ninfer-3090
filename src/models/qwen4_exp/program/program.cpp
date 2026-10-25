@@ -527,6 +527,11 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     if (o.cpu_verify_workers < 1 || o.cpu_verify_workers > 64) {
         throw std::invalid_argument("Qwen3.8-Flash-Next: --cpu-verify-workers must be in [1, 64]");
     }
+    if (o.prefill_cpu_share_den < 1 || o.prefill_cpu_share_den > 32767 ||
+        o.prefill_cpu_share_num > o.prefill_cpu_share_den) {
+        throw std::invalid_argument(
+            "Qwen3.8-Flash-Next: --prefill-cpu-share must be a fraction in [0, 1] (denominator 1..32767)");
+    }
     if (o.gdn_async_commit && o.mtp_draft_tokens == 0) {
         throw std::invalid_argument("Qwen3.8-Flash-Next: --gdn-async-commit folds MTP verification commits on a side "
                                     "stream and needs --spec mtp: add --spec mtp or remove --gdn-async-commit");
@@ -632,7 +637,7 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     b.mtp_constrained_masks   = plan_mtp_constrained_masks(o, public_tokens);
     b.mtp_draft_probs         = plan_mtp_draft_probs(o);
     b.hot_embedding           = plan_hot_embedding(c.vocab_size, c.hidden_size, o.hot_embedding_rows).hot;
-    b.cpu_verify_misses       = plan_cpu_verify_misses(o).device;
+    b.cpu_misses              = plan_cpu_misses(o).device;
     b.hc_int8_bytes           = plan_hc_int8(o, c);
     b.ngram_flag_wait         = plan_ngram_flag_wait(o).device;
     b.staging   = d.staging;
@@ -846,8 +851,8 @@ public:
             if (options_.gdn_async_commit) { fold_stream_ = std::make_unique<GdnFoldStream>(); }
         }
 
-        if (plan_.bytes.cpu_verify_misses != 0) { start_cpu_verify(); }
-        allocated += plan_.bytes.cpu_verify_misses;
+        if (plan_.bytes.cpu_misses != 0) { start_cpu_misses(); }
+        allocated += plan_.bytes.cpu_misses;
         if (plan_.bytes.ngram_flag_wait != 0) { start_ngram_flag(); }
         allocated += plan_.bytes.ngram_flag_wait;
         if (plan_.bytes.hc_int8_bytes != 0) {
@@ -1011,11 +1016,30 @@ public:
         experts.zero_copy_misses = kZeroCopyMisses;
         for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) { experts.frames.push_back(residency_->table(l)); }
         if (cpu_misses_) {
-            // --cpu-verify-misses: verification calls hand misses to the service; a timed-out wait
-            // reports to the error word, which every verification round checks.
-            experts.error = cpu_error_device_;
+            // --cpu-verify-misses: verification calls hand misses to the service; --prefill-cpu-share:
+            // prefill calls that do not stream hand it their share. A timed-out wait reports to the
+            // error word, which every verification round and prefill call checks. Both channels use
+            // the service's one buffer (layer calls run in stream order, each wait before the next
+            // call's plan), each narrowed to its own jobs, columns and rule.
+            const CpuMissPlan p = plan_cpu_misses(options_);
+            experts.error       = cpu_error_device_;
             for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) {
-                experts.cpu.push_back(cpu_misses_->channel(static_cast<int>(l)));
+                ops::MoeCpuChannel channel = cpu_misses_->channel(static_cast<int>(l));
+                if (p.verify_jobs > 0) {
+                    ops::MoeCpuChannel verify = channel;
+                    verify.max_jobs           = p.verify_jobs;
+                    verify.max_columns        = p.verify_columns;
+                    verify.pcie_divisor       = p.pcie_divisor;
+                    experts.cpu.push_back(verify);
+                }
+                if (p.prefill_jobs > 0) {
+                    ops::MoeCpuChannel prefill = channel;
+                    prefill.max_jobs           = p.prefill_jobs;
+                    prefill.max_columns        = p.prefill_columns;
+                    prefill.share_num          = static_cast<std::int16_t>(p.share_num);
+                    prefill.share_den          = static_cast<std::int16_t>(p.share_den);
+                    experts.prefill_cpu.push_back(prefill);
+                }
             }
         }
         if (residency_->frames() > 0 && plan_.wide_work > 0) {
@@ -1062,7 +1086,7 @@ public:
             // The service outlives the forward (declared before it) and stops after this
             // synchronization, when no call can be waiting for it.
             try {
-                diagnostic("cpu verify misses: " + std::to_string(cpu_misses_->served_requests()) + " requests, " +
+                diagnostic("cpu miss service: " + std::to_string(cpu_misses_->served_requests()) + " requests, " +
                            std::to_string(cpu_misses_->served_experts()) + " experts served on the CPU");
             } catch (...) {}
         }
@@ -1105,31 +1129,33 @@ public:
         return out;
     }
 
-    // --cpu-verify-misses: the CPU miss service over the text model's expert banks (the CPU reads
-    // each bank's host address) and the zeroed error word, through its device address.
-    void start_cpu_verify() {
-        const CpuVerifyPlan p = plan_cpu_verify_misses(options_);
+    // --cpu-verify-misses or --prefill-cpu-share: the CPU miss service over the text model's expert
+    // banks (the CPU reads each bank's host address), its buffers sized for both uses, and the zeroed
+    // error word, through its device address.
+    void start_cpu_misses() {
+        const CpuMissPlan p = plan_cpu_misses(options_);
         std::vector<ops::offloaded_moe::CpuMissService::Layer> layers;
         for (const auto& bank : parameters_.model.expert_banks()) {
             if (bank.host_records == nullptr) {
-                throw std::logic_error("Qwen3.8-Flash-Next: --cpu-verify-misses needs every expert bank in host memory");
+                throw std::logic_error("Qwen3.8-Flash-Next: the CPU miss service (--cpu-verify-misses, "
+                                       "--prefill-cpu-share) needs every expert bank in host memory");
             }
             layers.push_back({bank.host_records, bank.record_stride, bank.format});
         }
         if (layers.size() != c_.num_hidden_layers) {
-            throw std::logic_error("Qwen3.8-Flash-Next: --cpu-verify-misses needs one expert bank per layer");
+            throw std::logic_error("Qwen3.8-Flash-Next: the CPU miss service (--cpu-verify-misses, "
+                                   "--prefill-cpu-share) needs one expert bank per layer");
         }
         ops::offloaded_moe::CpuMissService::Options o;
-        o.workers      = p.workers;
-        o.max_jobs     = p.max_jobs;
-        o.max_columns  = p.max_columns;
-        o.pcie_divisor = p.pcie_divisor;
+        o.workers     = p.workers;
+        o.max_jobs    = p.max_jobs;
+        o.max_columns = p.max_columns;
         cpu_error_.emplace(64);
         std::memset(cpu_error_->data(), 0, 64);
         void* mapped = nullptr;
         if (cudaHostGetDevicePointer(&mapped, cpu_error_->data(), 0) != cudaSuccess || mapped == nullptr) {
             (void)cudaGetLastError();
-            throw std::runtime_error("--cpu-verify-misses: the error word has no device address");
+            throw std::runtime_error("the CPU miss service's error word has no device address");
         }
         cpu_error_device_ = static_cast<std::uint32_t*>(mapped);
         cpu_misses_       = std::make_unique<ops::offloaded_moe::CpuMissService>(std::move(layers), o);
@@ -1231,13 +1257,8 @@ public:
     // service whose thread has failed never answers again (each layer's wait would time out), so
     // rounds decode plain from then on; the output is the same.
     bool cpu_verify_failed() noexcept {
-        if (!cpu_misses_) { return false; }
-        std::string why;
-        try {
-            why = cpu_misses_->failure();
-        } catch (...) {
-            why = "unknown";
-        }
+        if (!options_.cpu_verify_misses || !cpu_misses_) { return false; }
+        const std::string why = cpu_service_failure();
         if (why.empty()) { return false; }
         if (!cpu_verify_off_reported_) {
             cpu_verify_off_reported_ = true;
@@ -1247,24 +1268,52 @@ public:
         return true;
     }
 
-    // --cpu-verify-misses, after a verification synchronized: a call whose CPU leg timed out wrote
-    // layer << 16 | code to the error word and left its CPU outputs unwritten (later layers computed
-    // their misses on the GPU), so the round throws: its lane is released, nothing is committed and
-    // the request ends with an error. The word is cleared for the next round.
-    void check_cpu_verify() {
+    // --prefill-cpu-share, before a prefill or forced-token call: whether it hands its share to the
+    // CPU. Once the service thread has failed (it never answers again) prefill stays on the GPU, with
+    // the same output; a one-time diagnostic says so.
+    bool prefill_cpu_share_live() noexcept {
+        if (options_.prefill_cpu_share_num == 0 || !cpu_misses_) { return false; }
+        const std::string why = cpu_service_failure();
+        if (why.empty()) { return true; }
+        if (!prefill_share_off_reported_) {
+            prefill_share_off_reported_ = true;
+            diagnostic("prefill cpu share: the CPU miss service stopped (" + why +
+                       "); prefill stays on the GPU for the rest of this run");
+        }
+        return false;
+    }
+
+    // Why the CPU miss service's thread stopped serving; empty while it serves (or without one).
+    std::string cpu_service_failure() const noexcept {
+        if (!cpu_misses_) { return {}; }
+        try {
+            return cpu_misses_->failure();
+        } catch (...) {
+            return "unknown";
+        }
+    }
+
+    // After a call that may have used the CPU miss service synchronized (`flag` names the option,
+    // `call` the call): a layer whose CPU leg timed out wrote layer << 16 | code to the error word and
+    // left its CPU outputs unwritten (later layers computed their misses on the GPU), so the call
+    // throws: its lane is released, nothing is committed and the request ends with an error. The word
+    // is cleared for the next call.
+    void check_cpu_misses(const char* flag, const char* call) {
         if (!cpu_misses_) { return; }
         auto* word                 = static_cast<volatile std::uint32_t*>(cpu_error_->data());
         const std::uint32_t failed = *word;
         if (failed == 0) { return; }
         *word = 0;
         release_lane();
-        const std::string why = cpu_misses_->failure();
+        const std::string why = cpu_service_failure();
         char code[64];
         std::snprintf(code, sizeof(code), "layer %u, code 0x%04X", failed >> 16U, failed & 0xFFFFU);
-        throw std::runtime_error(std::string("Qwen3.8-Flash-Next: --cpu-verify-misses: the CPU miss service did not "
-                                             "answer a verification (") +
-                                 code + (why.empty() ? std::string() : "; " + why) + ")");
+        throw std::runtime_error(std::string("Qwen3.8-Flash-Next: ") + flag +
+                                 ": the CPU miss service did not answer " + call + " (" + code +
+                                 (why.empty() ? std::string() : "; " + why) + ")");
     }
+    void check_cpu_verify() { check_cpu_misses("--cpu-verify-misses", "a verification"); }
+    void check_cpu_prefill() { check_cpu_misses("--prefill-cpu-share", "a prefill call"); }
 
     const ProgramDevicePlan& device_plan() const noexcept { return plan_.bytes; }
     const VramSizing& vram_sizing() const noexcept { return sizing_; }
@@ -1675,6 +1724,7 @@ public:
                 out.timing.device_wait_ns = elapsed_ns(wait);
                 const TokenId token = sampled_token();
                 residency_->after_round(device_.stream, width, promotions);
+                check_cpu_prefill(); // before anything of the call is kept
                 if (owns_lease) { return_lease(); }
                 return_vision();
                 apply_vram_target(false);
@@ -1690,6 +1740,7 @@ public:
                 device_.synchronize();
                 out.timing.device_wait_ns = elapsed_ns(wait);
                 residency_->after_round(device_.stream, width, promotions);
+                check_cpu_prefill();
                 apply_vram_target(false);
                 out.timing.submit_host_ns = elapsed_ns(start) - out.timing.device_wait_ns;
             }
@@ -1832,6 +1883,7 @@ public:
                 residency_->enqueue_route_download(device_.stream, width);
                 device_.synchronize();
                 residency_->after_round(device_.stream, width, kDecodePromotionsPerLayer);
+                check_cpu_prefill();
                 L().state_tokens += static_cast<std::uint32_t>(width);
                 begin += width;
             }
@@ -3586,6 +3638,8 @@ private:
         stage(begin, width);
         residency_->before_round(device_.stream);
         auto b = batch(width);
+        // --prefill-cpu-share: a call that does not stream its experts hands the CPU its share.
+        b.cpu_share = !wide && prefill_cpu_share_live();
         if (mtp_chunk_) { b.mtp_chunk = &*mtp_chunk_; }
         b.vision = call_vision_;
         if (!wide) {
@@ -5024,13 +5078,14 @@ private:
     DeviceBuffer verify_masks_;
     std::unique_ptr<WorkspaceArena> work_;
     DeviceBuffer staging_;
-    // --cpu-verify-misses: the CPU miss service (its thread runs for the Program's life; declared
-    // before the forward and the graphs so it is destroyed after them, once the destructor has
-    // synchronized) and the mapped error word its verification calls' waits report to.
+    // --cpu-verify-misses or --prefill-cpu-share: the CPU miss service (its thread runs for the
+    // Program's life; declared before the forward and the graphs so it is destroyed after them, once
+    // the destructor has synchronized) and the mapped error word its calls' waits report to.
     std::unique_ptr<ops::offloaded_moe::CpuMissService> cpu_misses_;
-    std::optional<PinnedHostBuffer> cpu_error_; // set only with the option
+    std::optional<PinnedHostBuffer> cpu_error_; // set only with either option
     std::uint32_t* cpu_error_device_ = nullptr;
     bool cpu_verify_off_reported_    = false;
+    bool prefill_share_off_reported_ = false;
     // --ngram-flag-wait: the mapped flag and error word (64 bytes apart), their device addresses, the
     // round graphs' wait counter, and the flag's last raised value (the count of round launches).
     // Declared before the forward and the graphs, like the CPU miss service's words. Unset when off.
@@ -5255,18 +5310,33 @@ std::uint64_t plan_mtp_draft_probs(const ProgramOptions& options) {
     return 4ULL * options.mtp_draft_tokens;
 }
 
-CpuVerifyPlan plan_cpu_verify_misses(const ProgramOptions& options) {
-    if (!options.cpu_verify_misses || options.mtp_draft_tokens == 0) { return {}; }
-    namespace om = ops::offloaded_moe;
-    // The service's defaults (PR 11: one or two misses hide behind a verification layer's GPU work)
-    // but its column cap: the widest verification.
-    const om::CpuMissService::Options defaults;
-    CpuVerifyPlan p;
-    p.workers      = static_cast<int>(options.cpu_verify_workers);
-    p.max_jobs     = defaults.max_jobs;
-    p.max_columns  = static_cast<int>(1 + options.mtp_draft_tokens);
-    p.pcie_divisor = defaults.pcie_divisor;
-    p.device       = sizeof(std::uint32_t);
+CpuMissPlan plan_cpu_misses(const ProgramOptions& options) {
+    namespace om        = ops::offloaded_moe;
+    const bool verify   = options.cpu_verify_misses && options.mtp_draft_tokens > 0;
+    const bool prefill  = options.prefill_cpu_share_num > 0;
+    if (!verify && !prefill) { return {}; }
+    CpuMissPlan p;
+    p.workers = static_cast<int>(options.cpu_verify_workers);
+    if (verify) {
+        // The service's defaults (PR 11: one or two misses hide behind a verification layer's GPU
+        // work) but its column cap: the widest verification.
+        const om::CpuMissService::Options defaults;
+        p.verify_jobs    = defaults.max_jobs;
+        p.verify_columns = static_cast<int>(1 + options.mtp_draft_tokens);
+        p.pcie_divisor   = defaults.pcie_divisor;
+    }
+    if (prefill) {
+        // Every miss may go (Basalt's share has no count cap), in calls of up to the static chunk
+        // (prefill and forced-token calls that do not stream; a wider one stays on the GPU).
+        p.prefill_jobs    = om::kMaxCpuJobs;
+        p.prefill_columns = static_cast<int>(std::min<std::uint32_t>(
+            {options.prefill_chunk, options.max_context, static_cast<std::uint32_t>(om::kMaxCpuCallColumns)}));
+        p.share_num = static_cast<int>(options.prefill_cpu_share_num);
+        p.share_den = static_cast<int>(options.prefill_cpu_share_den);
+    }
+    p.max_jobs    = std::max(p.verify_jobs, p.prefill_jobs);
+    p.max_columns = std::max(p.verify_columns, p.prefill_columns);
+    p.device      = sizeof(std::uint32_t);
     // The service's mapped request, x [H, max_columns], y [H, max_jobs * 8] and its done/heartbeat
     // line (CpuMissService's constructor), then the Program's 64-byte error word.
     p.pinned = sizeof(om::MissRequest) + 2ULL * om::kHidden * static_cast<std::uint64_t>(p.max_columns) +

@@ -5,8 +5,8 @@
 // decode); NInfer's single-sequence QSA Ops and paged INT8 KV; the PLE rows come from the caller
 // already read; experts are served by the GPU narrow route from device frames, staging slots or the
 // pinned bank, for a wide prefill call from the expert stream's ring, and optionally a verification
-// call's misses by the caller's CPU miss service (no overlap streams, landing frames or
-// prefix-cache events). Image columns take their visual
+// call's misses or a static prefill call's CPU share by the caller's CPU miss service (no overlap
+// streams, landing frames or prefix-cache events). Image columns take their visual
 // embeddings after the token embedding, in the text model and the drafter (Infernix's VisionInput). Speculative verification and the
 // MTP drafter follow Infernix's ForwardVerify and mtp_block; QSA tails are pooled from scratch
 // copies (this repo's qsa_pool_keys always advances the tail it is given) and committed with
@@ -72,6 +72,10 @@ struct ForwardExperts {
     // shared expert; the outputs are the same bits. Requires `error`: a wait whose host stopped
     // answering writes it, and the caller must fail the round. Empty: every call stays on the GPU.
     std::vector<ops::MoeCpuChannel> cpu;
+    // Optional, per layer: the same service's channels with the share rule (MoeCpuChannel::share_num
+    // / share_den) for a prefill call that asks for it (ForwardBatch::cpu_share) while the expert
+    // stream is not active. Requires `error`, like `cpu`. Empty: prefill stays on the GPU.
+    std::vector<ops::MoeCpuChannel> prefill_cpu;
     // Optional prefill expert stream: while it is active the MoE reads its per-layer frame tables
     // (streamed experts resident in the ring) and orders itself with the stream's copies.
     ExpertStream* stream = nullptr;
@@ -132,6 +136,10 @@ struct ForwardBatch {
     Tensor ngram_rows;       // U8 [row bytes, heads, T]: each column's n-gram rows (NgramVolume)
     Tensor logit_columns;    // I32 [n]: the columns whose logits are produced
     const ForwardVerify* verify = nullptr; // set for a speculative verification call (T = W >= 2)
+    // A prefill or forced-token call whose routed experts hand the CPU share of their misses to
+    // ForwardExperts::prefill_cpu (ignored without those channels or while the expert stream is
+    // active: a streamed chunk's misses are in the ring).
+    bool cpu_share = false;
     Tensor residual_out;     // when set: BF16 [S*H, T] copy of the final residual (the drafter's input)
     const MtpChunk* mtp_chunk = nullptr; // when set: the call's drafter cells (run_back writes them)
     const VisionInput* vision = nullptr; // when set: the image columns of a prefill call
@@ -427,10 +435,13 @@ private:
     [[nodiscard]] std::int32_t* route_log(std::uint32_t layer, std::size_t entries) const;
     Tensor gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch);
     Tensor attention(const AttentionParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch);
-    // `verify`: a verification call's block, whose misses may go to ForwardExperts::cpu. `read`: the
-    // block's input as the fused read left it (x is read->x), whose routing it uses.
-    Tensor moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap, bool verify,
-               const MoeRead* read = nullptr);
+    // The CPU channels a call of `batch` hands misses to: ForwardExperts::cpu for a verification,
+    // prefill_cpu for a cpu_share call without an active stream, else none (null).
+    [[nodiscard]] const std::vector<ops::MoeCpuChannel>* cpu_channels(const ForwardBatch& batch) const noexcept;
+    // `cpu`: the call's CPU channels (cpu_channels; null or empty: every expert on the GPU). `read`:
+    // the block's input as the fused read left it (x is read->x), whose routing it uses.
+    Tensor moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,
+               const std::vector<ops::MoeCpuChannel>* cpu, const MoeRead* read = nullptr);
     // A BF16 Linear of a verification call: one column at a time, so each column takes the
     // one-column route a decode call takes (their T > 1 routes sum in other orders).
     void project_verify(const Tensor& x, const LinearParameters& p, Tensor& out, bool columnwise);

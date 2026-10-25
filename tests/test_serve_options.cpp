@@ -181,14 +181,53 @@ int main() {
                           "--cpu-verify-misses without --spec mtp was not refused naming both flags");
         failures += check(refused({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
                                    "--cpu-verify-workers", "8"},
-                                  {"--cpu-verify-workers", "--cpu-verify-misses"}),
-                          "--cpu-verify-workers without --cpu-verify-misses was not refused naming both flags");
+                                  {"--cpu-verify-workers", "--cpu-verify-misses", "--prefill-cpu-share"}),
+                          "--cpu-verify-workers without --cpu-verify-misses or --prefill-cpu-share was not refused "
+                          "naming the flags");
         for (const char* bad : {"0", "65"}) {
             failures += check(refused({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
                                        "--cpu-verify-misses", "--cpu-verify-workers", bad},
                                       {"--cpu-verify-workers"}),
                               (std::string("--cpu-verify-workers ") + bad + " was not refused").c_str());
         }
+    }
+    {
+        // --prefill-cpu-share F: off by default (0 / 1); a decimal of at most two places is kept as the
+        // reduced fraction; needs no MTP, and --cpu-verify-workers then sizes its team.
+        failures += check(defaults.flash_next.prefill_cpu_share.num == 0 && defaults.flash_next.prefill_cpu_share.den == 1,
+                          "the prefill CPU share is on by default");
+        const auto share = [](const char* value) {
+            return make_engine_options(parse({"ninfer-serve", "model.ninfer", "--prefill-cpu-share", value}))
+                .flash_next.prefill_cpu_share;
+        };
+        const struct {
+            const char* text;
+            std::uint32_t num, den;
+        } kept[] = {{"0.6", 3, 5}, {"0.60", 3, 5}, {".6", 3, 5}, {"0.55", 11, 20}, {"0.5", 1, 2},
+                    {"1", 1, 1},   {"1.00", 1, 1}, {"0", 0, 1},  {"0.01", 1, 100}, {"0.25", 1, 4}};
+        for (const auto& k : kept) {
+            const auto got = share(k.text);
+            failures += check(got.num == k.num && got.den == k.den,
+                              (std::string("--prefill-cpu-share ") + k.text + " is not kept as " +
+                               std::to_string(k.num) + " / " + std::to_string(k.den))
+                                  .c_str());
+        }
+        for (const char* bad : {"0.125", "1.01", "2", "-0.5", "0.6.1", ".", "", "abc", "0,6", "1e-1"}) {
+            bool refused = false;
+            try {
+                (void)parse({"ninfer-serve", "model.ninfer", "--prefill-cpu-share", bad});
+            } catch (const std::invalid_argument& error) {
+                refused = std::string(error.what()).find("--prefill-cpu-share") != std::string::npos;
+            }
+            failures += check(refused, (std::string("--prefill-cpu-share '") + bad + "' was not refused").c_str());
+        }
+        const ninfer::EngineOptions workers = make_engine_options(
+            parse({"ninfer-serve", "model.ninfer", "--prefill-cpu-share", "0.6", "--cpu-verify-workers", "16"}));
+        failures += check(workers.flash_next.prefill_cpu_share.num == 3 && workers.flash_next.cpu_verify_workers == 16 &&
+                              !workers.flash_next.cpu_verify_misses,
+                          "--prefill-cpu-share 0.6 --cpu-verify-workers 16 does not reach the Engine without MTP");
+        failures += check(serve_usage_text("ninfer-serve").find("--prefill-cpu-share") != std::string::npos,
+                          "the usage text does not list --prefill-cpu-share");
     }
     failures += check(!defaults.flash_next.hc_int8, "the int8 hyper-connection copies are on by default");
     failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--hc-int8"})).flash_next.hc_int8,

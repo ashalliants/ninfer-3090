@@ -368,36 +368,72 @@ int main() {
         check(!q4::ProgramOptions{}.moe_fused_route, "the one-launch MoE route and dispatch is off by default");
 
         // --cpu-verify-misses: the CPU miss service's device counter is a term of fixed_bytes and its
-        // mapped channel (with the round's error word) is pinned host memory for the RAM ledger, both
-        // zero when off or without MTP. The service serves calls of up to a verification's width and
-        // its default 4 jobs; without MTP, or with a worker count outside [1, 64], startup refuses
-        // naming the flag before the device is asked anything.
+        // mapped channel (with the calls' error word) is pinned host memory for the RAM ledger, both
+        // zero when off or without MTP. The verification channel serves calls of up to a
+        // verification's width and its default 4 jobs; without MTP, or with a worker count outside
+        // [1, 64], startup refuses naming the flag before the device is asked anything.
         namespace om = ops::offloaded_moe;
         q4::ProgramOptions leg;
         leg.max_context = 32768;
         check(!leg.cpu_verify_misses && leg.cpu_verify_workers == 6,
               "the CPU leg is off by default and its team has 6 threads");
         leg.mtp_draft_tokens = 7;
-        check(q4::plan_cpu_verify_misses(leg).device == 0 && q4::plan_cpu_verify_misses(leg).pinned == 0,
+        check(q4::plan_cpu_misses(leg).device == 0 && q4::plan_cpu_misses(leg).pinned == 0,
               "off plans no CPU channel");
         leg.cpu_verify_misses   = true;
         leg.cpu_verify_workers  = 12;
-        const q4::CpuVerifyPlan served = q4::plan_cpu_verify_misses(leg);
+        const q4::CpuMissPlan served = q4::plan_cpu_misses(leg);
         check(served.device == 4, "on plans the service's 4-byte request counter on the device");
         check(served.pinned == sizeof(om::MissRequest) + 2ULL * 2560 * 8 + 2ULL * 2560 * 4 * 8 + 64 + 64,
               "on pins the request, x for 8 columns, y for 4 jobs of 8 columns, the done line and the error word");
-        check(served.workers == 12 && served.max_jobs == 4 && served.max_columns == 8 && served.pcie_divisor == 3,
+        check(served.workers == 12 && served.verify_jobs == 4 && served.verify_columns == 8 &&
+                  served.pcie_divisor == 3 && served.max_jobs == 4 && served.max_columns == 8,
               "the service takes the worker count, 4 jobs, the verification's 8 columns and divisor 3");
+        check(served.prefill_jobs == 0 && served.prefill_columns == 0 && served.share_den == 0,
+              "--cpu-verify-misses alone plans no prefill channel");
         leg.mtp_draft_tokens = 3;
-        check(q4::plan_cpu_verify_misses(leg).max_columns == 4 &&
-                  q4::plan_cpu_verify_misses(leg).pinned == served.pinned - 2ULL * 2560 * 4,
+        check(q4::plan_cpu_misses(leg).max_columns == 4 &&
+                  q4::plan_cpu_misses(leg).pinned == served.pinned - 2ULL * 2560 * 4,
               "the column cap and the x buffer follow --draft-tokens");
         leg.mtp_draft_tokens = 0;
-        check(q4::plan_cpu_verify_misses(leg).device == 0, "without MTP there is nothing to verify");
+        check(q4::plan_cpu_misses(leg).device == 0, "without MTP there is nothing to verify");
         q4::ProgramDevicePlan with_leg;
-        with_leg.io                = 500;
-        with_leg.cpu_verify_misses = 4;
+        with_leg.io         = 500;
+        with_leg.cpu_misses = 4;
         check(with_leg.fixed_bytes() == 504, "fixed_bytes counts the CPU service's counter");
+
+        // --prefill-cpu-share: the same service, started for it alone (no MTP needed), its buffers sized
+        // for every miss of a static prefill call (kMaxCpuJobs jobs, the chunk's columns, at most
+        // kMaxCpuCallColumns); with --cpu-verify-misses too, one service holds both channels.
+        q4::ProgramOptions share;
+        share.max_context   = 32768;
+        share.prefill_chunk = 1024;
+        check(share.prefill_cpu_share_num == 0 && share.prefill_cpu_share_den == 1, "the prefill CPU share is off by default");
+        check(q4::plan_cpu_misses(share).device == 0, "the share off plans no service");
+        share.prefill_cpu_share_num = 3;
+        share.prefill_cpu_share_den = 5;
+        const q4::CpuMissPlan prefill = q4::plan_cpu_misses(share);
+        check(prefill.device == 4 && prefill.workers == 6, "the share alone starts the service: its counter, 6 threads");
+        check(prefill.prefill_jobs == om::kMaxCpuJobs && prefill.prefill_columns == 1024 && prefill.share_num == 3 &&
+                  prefill.share_den == 5 && prefill.verify_jobs == 0 && prefill.max_jobs == om::kMaxCpuJobs &&
+                  prefill.max_columns == 1024,
+              "the prefill channel takes up to 512 jobs of calls of up to the 1024-column chunk at 3 / 5");
+        check(prefill.pinned == sizeof(om::MissRequest) + 2ULL * 2560 * 1024 + 2ULL * 2560 * 512 * 8 + 64 + 64,
+              "the share pins x for the chunk's 1024 columns and y for 512 jobs of 8 columns");
+        share.prefill_chunk = 8192;
+        check(q4::plan_cpu_misses(share).prefill_columns == om::kMaxCpuCallColumns,
+              "a chunk above 4096 columns leaves its wider calls on the GPU");
+        share.prefill_chunk = 1024;
+        share.max_context   = 300;
+        check(q4::plan_cpu_misses(share).prefill_columns == 300, "the context bounds the chunk");
+        share.max_context       = 32768;
+        share.cpu_verify_misses = true;
+        share.mtp_draft_tokens  = 7;
+        const q4::CpuMissPlan both_uses = q4::plan_cpu_misses(share);
+        check(both_uses.verify_jobs == 4 && both_uses.verify_columns == 8 && both_uses.prefill_jobs == om::kMaxCpuJobs &&
+                  both_uses.max_jobs == om::kMaxCpuJobs && both_uses.max_columns == 1024 && both_uses.pinned == prefill.pinned &&
+                  both_uses.device == 4,
+              "both options share one service sized for the larger use");
         const auto refuses = [&](const q4::ProgramOptions& o, const char* flag) {
             try {
                 (void)q4::Program::plan_device(o, model, 248077, {});
@@ -413,6 +449,17 @@ int main() {
         check(refuses(leg, "--cpu-verify-workers"), "--cpu-verify-workers 0 is refused naming the flag");
         leg.cpu_verify_workers = 65;
         check(refuses(leg, "--cpu-verify-workers"), "--cpu-verify-workers 65 is refused naming the flag");
+        q4::ProgramOptions bad_share = leg;
+        bad_share.cpu_verify_workers    = 6;
+        bad_share.cpu_verify_misses     = false;
+        bad_share.prefill_cpu_share_num = 6;
+        bad_share.prefill_cpu_share_den = 5;
+        check(refuses(bad_share, "--prefill-cpu-share"), "a share above 1 is refused naming the flag");
+        bad_share.prefill_cpu_share_num = 0;
+        bad_share.prefill_cpu_share_den = 0;
+        check(refuses(bad_share, "--prefill-cpu-share"), "a zero denominator is refused naming the flag");
+        bad_share.prefill_cpu_share_den = 32768;
+        check(refuses(bad_share, "--prefill-cpu-share"), "a denominator above 32767 is refused naming the flag");
 
         // --gdn-async-commit: a stream and two events, no device memory (no ProgramDevicePlan term).
         // A verification commit folds on the side stream only when the option is on, MTP is on and

@@ -64,7 +64,8 @@ ninfer_add_op_test(ninfer_moe_dispatch_plan_test
   LIBRARIES ninfer_core)
 # Host-only: offloaded_moe::select_cpu_jobs, the experts a call with a CPU channel hands the CPU
 # miss service (the fewest-column misses first, the divisor's share left on the GPU), and the oracle
-# the layer test checks the published request against.
+# the layer test checks the published request against; and the prefill share's cpu_share_take and
+# select_prefill_cpu_jobs (cpu_share.h), the oracle of the wide test's prefill_cpu_share.
 ninfer_add_op_test(ninfer_moe_cpu_selection_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_moe_cpu_selection.cpp"
   LIBRARIES ninfer_core)

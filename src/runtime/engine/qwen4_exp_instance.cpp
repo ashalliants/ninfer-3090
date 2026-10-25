@@ -191,6 +191,10 @@ void validate(const EngineOptions& options) {
                "--spec mtp or remove --cpu-verify-misses");
     }
     if (next.cpu_verify_workers < 1 || next.cpu_verify_workers > 64) { refuse("--cpu-verify-workers must be in [1, 64]"); }
+    if (next.prefill_cpu_share.den < 1 || next.prefill_cpu_share.den > 32767 ||
+        next.prefill_cpu_share.num > next.prefill_cpu_share.den) {
+        refuse("--prefill-cpu-share must be a fraction in [0, 1] (denominator 1..32767)");
+    }
     if (next.gdn_async_commit && spec.backend != SpeculativeBackend::Mtp) {
         refuse("--gdn-async-commit folds MTP verification commits on a side stream and needs --spec mtp: add "
                "--spec mtp or remove --gdn-async-commit");
@@ -296,12 +300,17 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     models::qwen4_exp::plan_pinned_weights(demand, plan.pinned_bytes(), hot_embedding);
     demand.later_pinned = kProgramPinnedAllowance;
     {
-        // --cpu-verify-misses: the CPU miss service's mapped channel and the round's error word.
+        // --cpu-verify-misses or --prefill-cpu-share: the CPU miss service's mapped channel and the
+        // calls' error word.
         models::qwen4_exp::ProgramOptions cpu;
-        cpu.cpu_verify_misses  = next.cpu_verify_misses;
-        cpu.cpu_verify_workers = next.cpu_verify_workers;
-        cpu.mtp_draft_tokens   = mtp ? options.speculative.draft_tokens : 0;
-        demand.later_pinned += models::qwen4_exp::plan_cpu_verify_misses(cpu).pinned;
+        cpu.cpu_verify_misses     = next.cpu_verify_misses;
+        cpu.cpu_verify_workers    = next.cpu_verify_workers;
+        cpu.mtp_draft_tokens      = mtp ? options.speculative.draft_tokens : 0;
+        cpu.prefill_cpu_share_num = next.prefill_cpu_share.num;
+        cpu.prefill_cpu_share_den = next.prefill_cpu_share.den;
+        cpu.prefill_chunk         = options.prefill_chunk;
+        cpu.max_context           = options.max_context;
+        demand.later_pinned += models::qwen4_exp::plan_cpu_misses(cpu).pinned;
     }
     {
         // --ngram-flag-wait: the round graphs' mapped flag and error word.
@@ -389,6 +398,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.moe_fused_route       = next.moe_fused_route;
     program_options.cpu_verify_misses     = next.cpu_verify_misses;
     program_options.cpu_verify_workers    = next.cpu_verify_workers;
+    program_options.prefill_cpu_share_num = next.prefill_cpu_share.num;
+    program_options.prefill_cpu_share_den = next.prefill_cpu_share.den;
     program_options.gdn_async_commit      = next.gdn_async_commit;
     program_options.hc_int8               = next.hc_int8;
     program_options.hc_fused_read         = next.hc_fused_read;

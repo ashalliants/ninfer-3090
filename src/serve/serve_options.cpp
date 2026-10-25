@@ -34,6 +34,41 @@ float parse_float_in(const char* text, const char* label, float lo, float hi) {
     return static_cast<float>(value);
 }
 
+// --prefill-cpu-share F: a decimal in [0, 1] with at most two digits after the point ("0.6", "0.55",
+// "1", ".5"), kept exactly as the reduced fraction F * 100 / 100 (0.6 is 3 / 5). More digits are
+// refused rather than rounded, so the share the CPU takes is the one asked for.
+ninfer::FlashNextOptions::Fraction parse_share(const char* text) {
+    const std::string_view v(text);
+    const auto refuse = [&] {
+        return std::invalid_argument("--prefill-cpu-share takes a value in [0, 1] with at most two decimal places "
+                                     "(for example 0.6): " +
+                                     std::string(v));
+    };
+    const std::size_t point = v.find('.');
+    const std::string_view whole = v.substr(0, point);
+    const std::string_view part  = point == std::string_view::npos ? std::string_view() : v.substr(point + 1);
+    const auto digits = [](std::string_view d) {
+        return std::all_of(d.begin(), d.end(), [](char c) { return c >= '0' && c <= '9'; });
+    };
+    if ((whole.empty() && part.empty()) || whole.size() > 3 || part.size() > 2 || !digits(whole) || !digits(part)) {
+        throw refuse();
+    }
+    std::uint32_t hundredths = 0;
+    for (const char c : whole) { hundredths = hundredths * 10 + static_cast<std::uint32_t>(c - '0'); }
+    hundredths *= 100;
+    for (std::size_t i = 0; i < 2; ++i) {
+        hundredths += (i < part.size() ? static_cast<std::uint32_t>(part[i] - '0') : 0U) * (i == 0 ? 10U : 1U);
+    }
+    if (hundredths > 100) { throw refuse(); }
+    std::uint32_t a = hundredths, b = 100; // a becomes gcd(hundredths, 100)
+    while (b != 0) {
+        const std::uint32_t r = a % b;
+        a                     = b;
+        b                     = r;
+    }
+    return {hundredths / a, 100 / a}; // 0 reduces to 0 / 1
+}
+
 std::uint64_t parse_u64(const char* text, const char* label) {
     if (text == nullptr || *text == '\0' || *text == '-') {
         throw std::invalid_argument(std::string("invalid ") + label + ": " +
@@ -177,7 +212,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--ngram-volume FILE] [--ngram-keepalive-ms N] [--expert-state FILE|--no-expert-state] [--default-expert-state FILE] "
            "[--vram-headroom-mib N] [--shared-expert-stream] [--mtp-constrained] [--mtp-joint-acceptance] [--ngram-prefetch] "
            "[--hot-embedding-rows N] [--gdn-head-map] [--moe-precast-input [--moe-gate-up-registers]] "
-           "[--moe-fused-route] [--cpu-verify-misses [--cpu-verify-workers N]] [--gdn-async-commit] [--hc-int8 [--hc-fused-read]] "
+           "[--moe-fused-route] [--cpu-verify-misses] [--prefill-cpu-share F] [--cpu-verify-workers N] [--gdn-async-commit] [--hc-int8 [--hc-fused-read]] "
            "[--ngram-flag-wait] "
            "[--ram-headroom-mib N] [--expert-cache-mib N] [--context-nvme-mib N [--context-nvme-dir DIR]] "
            "[--chat-template FILE] "
@@ -284,7 +319,11 @@ std::string serve_usage_text(const char* argv0) {
            "experts of a decode call in one launch instead of two (the same output, bit for bit; off by "
            "default); --cpu-verify-misses (--spec mtp) computes some of each verification round's "
            "uncached experts on N CPU threads (--cpu-verify-workers, default 6) beside the GPU instead "
-           "of reading them over PCIe (the same output, bit for bit; off by default); --gdn-async-commit "
+           "of reading them over PCIe (the same output, bit for bit; off by default); --prefill-cpu-share F "
+           "computes the share F (0..1, two decimals; Basalt uses 0.6) of each layer's uncached experts of "
+           "a prefill call shorter than 512 tokens (or of any call that does not stream its experts) on the "
+           "same CPU threads, the ones routed fewest tokens first, while the GPU stages the rest (the same "
+           "output, bit for bit; 0, the default, is off); --gdn-async-commit "
            "(--spec mtp) folds each verification's accepted columns into the GDN state on a side stream "
            "while the drafter catches up and drafts the next round (the same state, bit for bit; off by "
            "default); --hc-int8 makes int8 copies of the hyper-connection mixers' weights at startup and "
@@ -720,6 +759,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.flash_next.hc_fused_read = true;
         } else if (arg == "--ngram-flag-wait") {
             options.flash_next.ngram_flag_wait = true;
+        } else if (arg == "--prefill-cpu-share") {
+            options.flash_next.prefill_cpu_share = parse_share(require_value("--prefill-cpu-share"));
         } else if (arg == "--cpu-verify-workers") {
             const int workers = parse_nonnegative_int(require_value("--cpu-verify-workers"), "cpu-verify-workers");
             if (workers < 1 || workers > 64) { throw std::invalid_argument("--cpu-verify-workers must be in [1, 64]"); }
@@ -1001,9 +1042,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--gdn-async-commit folds MTP verification commits on a side stream and needs "
                                     "--spec mtp");
     }
-    if (cpu_verify_workers_set && !options.flash_next.cpu_verify_misses) {
-        throw std::invalid_argument("--cpu-verify-workers sizes the CPU team of --cpu-verify-misses: add "
-                                    "--cpu-verify-misses");
+    if (cpu_verify_workers_set && !options.flash_next.cpu_verify_misses &&
+        options.flash_next.prefill_cpu_share.num == 0) {
+        throw std::invalid_argument("--cpu-verify-workers sizes the CPU team of --cpu-verify-misses and "
+                                    "--prefill-cpu-share: add one of them");
     }
     if (options.context_store_path.empty() &&
         (context_store_tuning || options.context_store_max_gib)) {

@@ -340,10 +340,10 @@ struct ProgramDevicePlan {
     // --hot-embedding-rows: the device copy of the token embedding's first rows
     // (plan_hot_embedding(...).hot; 0 when off). The whole table is in the pinned block then.
     std::uint64_t hot_embedding = 0;
-    // --cpu-verify-misses: the CPU miss service's device counter of published requests
-    // (plan_cpu_verify_misses(...).device; 0 when off). Its channel and the round's error word are
-    // pinned host memory (.pinned), charged to the RAM ledger.
-    std::uint64_t cpu_verify_misses = 0;
+    // --cpu-verify-misses or --prefill-cpu-share: the CPU miss service's device counter of published
+    // requests (plan_cpu_misses(...).device; 0 when both are off). Its channel and the calls' error
+    // word are pinned host memory (.pinned), charged to the RAM ledger.
+    std::uint64_t cpu_misses = 0;
     // --hc-int8: the int8 copies of every mixer's hyper-connection matrices (plan_hc_int8; 0 when
     // off), beside the BF16 weights, which stay loaded.
     std::uint64_t hc_int8_bytes = 0;
@@ -357,7 +357,7 @@ struct ProgramDevicePlan {
 
     [[nodiscard]] std::uint64_t fixed_bytes() const noexcept {
         return kv + workspace + staging + state + io + residency + speculation + shared_expert_workspace +
-               mtp_constrained_masks + mtp_draft_probs + hot_embedding + cpu_verify_misses + hc_int8_bytes +
+               mtp_constrained_masks + mtp_draft_probs + hot_embedding + cpu_misses + hc_int8_bytes +
                ngram_flag_wait;
     }
 };
@@ -462,6 +462,14 @@ struct ProgramOptions {
     // included (1..64).
     bool cpu_verify_misses           = false;
     std::uint32_t cpu_verify_workers = 6;
+    // FlashNextOptions::prefill_cpu_share (num / den, num 0: off): the same service (started for
+    // either option) takes that share of each layer's misses in prefill and forced-token calls that do
+    // not stream their experts (execution::ForwardExperts::prefill_cpu, ForwardBatch::cpu_share), the
+    // fewest-column ones of at most 8 columns first, while the GPU stages and runs the rest. The same
+    // outputs, bit for bit. A call whose CPU leg times out throws (its request ends with an error);
+    // once the service thread has failed, prefill stays on the GPU. 0 <= num <= den, 1 <= den <= 32767.
+    std::uint32_t prefill_cpu_share_num = 0;
+    std::uint32_t prefill_cpu_share_den = 1;
     // FlashNextOptions::gdn_async_commit: a verification commit the row continues from folds its
     // GDN columns on the Program's fold stream (gdn_fold_on_side_stream); every later device use of
     // the state (the next round's front, any other entry point) waits for it. Requires MTP
@@ -524,17 +532,24 @@ struct NgramFlagPlan {
 [[nodiscard]] std::size_t plan_hc_fused_read_workspace(const ProgramOptions& options, const TextConfig& config,
                                                        std::int32_t columns);
 
-// The CPU miss service of --cpu-verify-misses: its options (CPU-served experts per layer call, the
-// share left on the GPU, the widest call it serves: a verification of 1 + mtp_draft_tokens columns)
-// and its memory. `device` is ProgramDevicePlan::cpu_verify_misses (the service's 4-byte request
-// counter); `pinned` its mapped channel (the request, the x columns and the outputs, the done and
-// heartbeat words) and the Program's error word. Both 0 without cpu_verify_misses or MTP.
-struct CpuVerifyPlan {
-    int workers = 0, max_jobs = 0, max_columns = 0, pcie_divisor = 0;
+// The CPU miss service of --cpu-verify-misses and --prefill-cpu-share (one service, started for
+// either) and its memory. Its channel buffers fit the larger use: max_jobs CPU-served experts per
+// layer call and calls of up to max_columns columns. The verification channel (0 without
+// cpu_verify_misses or MTP): verify_jobs experts per call (the service's default 4), calls of up to
+// 1 + mtp_draft_tokens columns, M / pcie_divisor misses left on the GPU. The prefill channel (0
+// without prefill_cpu_share): up to offloaded_moe::kMaxCpuJobs experts per call (every miss may go),
+// calls of up to the static prefill chunk (at most kMaxCpuCallColumns; a wider call stays on the
+// GPU), share_num / share_den of the misses. `device` is ProgramDevicePlan::cpu_misses (the
+// service's 4-byte request counter); `pinned` its mapped channel (the request, the x columns and the
+// outputs, the done and heartbeat words) and the Program's error word. Both 0 when neither use is on.
+struct CpuMissPlan {
+    int workers = 0, max_jobs = 0, max_columns = 0;
+    int verify_jobs = 0, verify_columns = 0, pcie_divisor = 0;
+    int prefill_jobs = 0, prefill_columns = 0, share_num = 0, share_den = 0;
     std::uint64_t device = 0;
     std::uint64_t pinned = 0;
 };
-[[nodiscard]] CpuVerifyPlan plan_cpu_verify_misses(const ProgramOptions& options);
+[[nodiscard]] CpuMissPlan plan_cpu_misses(const ProgramOptions& options);
 
 // ProgramDevicePlan::shared_expert_workspace of these options: the side-stream carve
 // (execution::Forward::shared_expert_workspace_bytes) of the static workspace's widest call, a
