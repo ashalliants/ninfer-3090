@@ -82,9 +82,11 @@ std::string context_capacity_error(std::size_t prompt_tokens, std::uint32_t max_
            " tokens, exceeding Engine max_context " + std::to_string(max_context);
 }
 
-// The summary strategy's reuse probe waits at most this long for the worker's lock; a busy worker
-// counts as warm (docs/maintainer/lossy-long-prefill.md, "Alternative strategy").
-constexpr std::chrono::milliseconds kSummaryProbeWait{50};
+// The summary strategy's reuse probe waits at most this long for the worker to answer it between
+// cycles: a decode cycle is far shorter, a prefill step (about 1.5 s at chunk 4096) longer. An
+// unanswered probe counts as warm and as a timeout (docs/maintainer/lossy-long-prefill.md,
+// "Alternative strategy").
+constexpr std::chrono::milliseconds kSummaryProbeWait{250};
 
 // Images queued for the writer thread. Each holds a whole continuation, several GB for a deep one;
 // beyond the bound an idle continuation is simply written later.
@@ -126,8 +128,9 @@ public:
     PromptPreparationStats prepare;
     SamplingMode sampling_mode = SamplingMode::Thinking;
     models::qwen3_5::PreparedPrompt value;
-    // Summary strategy: `value` replaced messages of the client's prompt (summary_strategy.h).
-    std::optional<runtime::compaction::SummaryRewrite> rewrite;
+    // Summary strategy: what it did for this prompt (summary_strategy.h); unset when it did not
+    // look at it (off, or too short to probe).
+    std::optional<runtime::compaction::SummaryRecord> summary_record;
 };
 
 PreparedPrompt::PreparedPrompt() noexcept                            = default;
@@ -366,7 +369,9 @@ public:
             const auto& data = models::qwen3_5::PreparedPromptAccess::view(prompt);
             return !data.has_media() && data.external_prefix_tokens == 0;
         }
-        bool has_private_reuse(const Prepared& prompt) const { return impl.has_private_reuse(prompt); }
+        LossySummaryProbe probe_reuse(const Prepared& prompt) const {
+            return impl.has_private_reuse(prompt, exact_end(prompt));
+        }
         static std::span<const TokenId> token_ids(const Prepared& prompt) {
             return models::qwen3_5::PreparedPromptAccess::view(prompt).token_ids;
         }
@@ -386,21 +391,22 @@ public:
                     options.max_context, options.lossy_prefill.summary_max_tokens)};
     }
 
-    // True when a private (conversation) record would be reused by this prompt, so it is warm and
-    // is not summarised. Thread-safe (Engine::prepare runs on caller threads): EngineCore probes
-    // under the worker's execution lock, waiting at most kSummaryProbeWait; a timeout, or any
-    // doubt, is warm.
-    [[nodiscard]] bool has_private_reuse(const models::qwen3_5::PreparedPrompt& prompt) const {
+    // Warm when a private (conversation) record, in the cache or the context store, would be
+    // reused by this prompt, so it is not summarised. Thread-safe (Engine::prepare runs on caller
+    // threads): the probe is posted to the worker and waits at most kSummaryProbeWait; Timeout,
+    // or any doubt, is treated as warm.
+    [[nodiscard]] LossySummaryProbe has_private_reuse(const models::qwen3_5::PreparedPrompt& prompt,
+                                                      std::uint32_t exact_end) const {
         const auto* generation = std::get_if<std::unique_ptr<GenerationCore>>(&core);
-        if (generation == nullptr || *generation == nullptr) { return true; }
+        if (generation == nullptr || *generation == nullptr) { return LossySummaryProbe::Warm; }
         try {
             auto execution = resolve_request_options(sampling_defaults, SamplingMode::Thinking, {})
                                  .execution;
             execution.requested_output_tokens = 1;
             return (*generation)
                 ->has_private_reuse(models::qwen3_5::PreparedPromptAccess::copy(prompt), execution,
-                                    kSummaryProbeWait);
-        } catch (...) { return true; }
+                                    exact_end, kSummaryProbeWait);
+        } catch (...) { return LossySummaryProbe::Warm; }
     }
 
     EngineOptions options;
@@ -800,7 +806,12 @@ PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& cont
     const PromptPreparationStats preparation = prepared.preparation_stats();
     auto impl = std::make_unique<PreparedPrompt::Impl>(info, preparation, sampling_mode,
                                                        std::move(prepared));
-    impl->rewrite = strategy.rewrite;
+    if (strategy.probe || strategy.rewrite) {
+        impl->summary_record = runtime::compaction::SummaryRecord{
+            .probe         = strategy.probe,
+            .rewrite       = strategy.rewrite,
+            .prompt_tokens = impl->value.summary().prompt_tokens};
+    }
     return PreparedPrompt(std::move(impl));
 }
 
@@ -948,7 +959,7 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                 auto submission =
                     core->submit(std::move(prompt.impl_->value), prompt_summary, prepare_seconds,
                                  std::move(resolved_options), consumer_mode, std::move(observation),
-                                 pending_deadline, prompt.impl_->rewrite);
+                                 pending_deadline, prompt.impl_->summary_record);
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
                     impl_, std::move(submission), resolved_sampling));
             }

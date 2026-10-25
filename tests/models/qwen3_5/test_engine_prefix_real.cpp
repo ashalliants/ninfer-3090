@@ -1552,6 +1552,8 @@ int exercise_lossy_summary(const char* artifact) {
     const auto& first_report         = first.lossy_prefill;
     if (first_tokens != client_size || first.prompt.prompt_tokens != client_size || !first_report ||
         first_report->strategy != ninfer::LossyStrategy::Summary || first_report->summary_reused ||
+        first_report->summary_probe != ninfer::LossySummaryProbe::Cold ||
+        after.lossy_prefills_completed != before.lossy_prefills_completed + 1 ||
         !first_report->summarized_messages || first_report->uncached_tokens != client_size ||
         first_report->kept_tokens >= client_size / 2 ||
         first.computed_prefill_tokens + first.reused_prompt_tokens > client_size ||

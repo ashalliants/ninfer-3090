@@ -243,6 +243,22 @@ def test_lossy_evidence():
         log.write_text("".join(json.dumps(r) + "\n" for r in recs))
         counts = sweep.lossy_outcome_counts(log)
         check(counts == {"requests": 4, "none": 1, "completed": 2, "skipped": 1}, counts)
+        summary = [{"event": "request_done", "lossy_prefill": {"outcome": "completed", "strategy": "summary",
+                                                                "summary_probe": "cold"}},
+                   {"event": "request_done", "lossy_prefill": {"outcome": "skipped", "strategy": "summary",
+                                                                "summary_probe": "timeout"}},
+                   {"event": "request_done", "lossy_prefill": {"outcome": "completed", "strategy": "summary",
+                                                                "summary_probe": None}}]
+        log.write_text("".join(json.dumps(r) + "\n" for r in summary))
+        counts = sweep.lossy_outcome_counts(log)
+        check(counts == {"requests": 3, "none": 0, "completed": 2, "skipped": 1, "summary_probe_cold": 1,
+                         "summary_probe_timeout": 1}, counts)
+    timed = BASE + point_rows("sum", lossy={"requests": 5, "none": 0, "completed": 3, "skipped": 2,
+                                           "summary_probe_timeout": 2})
+    ev = sweep.evaluate_point(timed, "sum")
+    ran_checks = [c for c in ev["checks"] if c["name"].startswith("lossy_ran_")]
+    check(ran_checks and all("2 summary probe timeout(s)" in c["detail"] for c in ran_checks), ran_checks)
+    check("3 (t2)" in sweep.lossy_cell(timed, "sum"), sweep.lossy_cell(timed, "sum"))
     text = sweep.render_summary(rows)
     ran = next(l for l in text.splitlines() if l.startswith("| ran |"))
     check("5/5/5/5" in ran and "| 52 |" in ran, ran)

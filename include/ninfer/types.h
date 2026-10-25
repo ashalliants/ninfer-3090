@@ -284,6 +284,11 @@ enum class LossyStrategy : std::uint8_t {
     Summary,
 };
 
+// The summary strategy's coldness probe for one long prompt: no private conversation record would
+// serve it (cold: summarised), one would (warm), or the worker did not answer in time (timeout,
+// treated as warm).
+enum class LossySummaryProbe : std::uint8_t { Cold, Warm, Timeout };
+
 // Lossy long-prompt prefill: past a threshold, a cheap scout pass scores blocks of the prompt and
 // only the kept blocks are prefilled (the rest never enter the KV cache). Off by default.
 struct LossyPrefillOptions {
@@ -1356,10 +1361,13 @@ struct LossyPrefillReport {
     // rendered prompt, kept_tokens the prompt as prefilled), filter_layer and the times are 0,
     // `summarized_messages` is the newest summarised range [first, last) in the client's message
     // indices, and `summary_reused` says a recorded summary was substituted (a later turn of a
-    // summarised conversation) rather than written by this request.
+    // summarised conversation) rather than written by this request. A long prompt the probe found
+    // warm (or that timed out), and so left whole, is reported as skipped with both counts the
+    // prompt's length. `summary_probe` is the probe's answer, unset when the prompt was not probed.
     LossyStrategy strategy = LossyStrategy::Select;
     std::optional<std::array<std::uint32_t, 2>> summarized_messages;
     bool summary_reused = false;
+    std::optional<LossySummaryProbe> summary_probe;
 };
 
 struct GenerationResult {
@@ -1610,6 +1618,9 @@ struct RuntimeStats {
     // that substituted a recorded summary (reused, a later turn of a summarised conversation).
     std::uint64_t lossy_prefill_summaries_new    = 0;
     std::uint64_t lossy_prefill_summaries_reused = 0;
+    // Summary-strategy coldness probes the worker did not answer in time (the prompt was then
+    // treated as warm and not summarised).
+    std::uint64_t lossy_prefill_summary_probe_timeouts = 0;
 
     std::uint64_t root_selections               = 0;
     std::uint64_t checkpoint_selections         = 0;

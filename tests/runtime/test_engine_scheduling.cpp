@@ -109,22 +109,23 @@ public:
     }
 
     // `sink`, when given, streams the request (with prompt progress); it must outlive the Rig.
-    // `rewrite`: the prompt as the summary strategy rewrote it (Engine::prepare reports the
-    // client's length in the summary, as here).
+    // `record`: what the summary strategy did for the prompt (Engine::prepare reports the client's
+    // length in the summary when it rewrote it, as here).
     Result run_prompt(fake::PreparedPrompt prompt, std::uint32_t output_tokens,
                       std::shared_ptr<std::atomic<bool>> cancel = nullptr,
                       OutputSink* sink                         = nullptr,
-                      std::optional<compaction::SummaryRewrite> rewrite = std::nullopt) {
+                      std::optional<compaction::SummaryRecord> record = std::nullopt) {
         ResolvedRequestOptions request;
         request.execution.requested_output_tokens = output_tokens;
         PromptSummary summary;
-        summary.prompt_tokens = rewrite ? rewrite->original_tokens : prompt.tokens;
+        summary.prompt_tokens =
+            record && record->rewrite ? record->rewrite->original_tokens : prompt.tokens;
         GenerationObservationOptions observation;
         observation.prompt_progress = sink != nullptr;
         auto submission = std::make_shared<EngineCore<fake::Instance>::Submission>(core_->submit(
             prompt, summary, 0.0, std::move(request),
             sink != nullptr ? OutputConsumerMode::Streaming : OutputConsumerMode::Aggregate,
-            observation, {}, rewrite));
+            observation, {}, record));
         // A promise, not std::async: a future from async blocks in its destructor, which would
         // deadlock a failing test that still holds the worker.
         auto promise = std::make_shared<std::promise<GenerationResult>>();
@@ -1236,8 +1237,12 @@ void test_summary_rewrite_reports_original() {
                                              .common_suffix   = 6000,
                                              .messages        = {4, 180},
                                              .fresh           = true};
+    const auto record = [](compaction::SummaryRewrite r) {
+        return compaction::SummaryRecord{.probe = LossySummaryProbe::Cold, .rewrite = r,
+                                         .prompt_tokens = r.prompt_tokens};
+    };
     ProgressSink sink;
-    auto result = rig.run_prompt(lossy_prompt(1, 9000), 2, nullptr, &sink, rewrite);
+    auto result = rig.run_prompt(lossy_prompt(1, 9000), 2, nullptr, &sink, record(rewrite));
     require(finished(result), "the summarised request did not finish\n" + rig.dump());
     const auto& generation = result.get();
     require(generation.prompt.prompt_tokens == 40000, "usage prompt_tokens is not the client's");
@@ -1251,7 +1256,7 @@ void test_summary_rewrite_reports_original() {
                 report->uncached_tokens == 40000 && report->kept_tokens == 9000 &&
                 report->summarized_messages ==
                     std::optional(std::array<std::uint32_t, 2>{4, 180}) &&
-                !report->summary_reused,
+                !report->summary_reused && report->summary_probe == LossySummaryProbe::Cold,
             "the summary report is wrong");
     {
         std::lock_guard lock(sink.mutex);
@@ -1269,15 +1274,47 @@ void test_summary_rewrite_reports_original() {
     }
     auto reused       = rewrite;
     reused.fresh      = false;
-    auto second       = rig.run_prompt(lossy_prompt(2, 9000), 1, nullptr, nullptr, reused);
+    auto second       = rig.run_prompt(lossy_prompt(2, 9000), 1, nullptr, nullptr, record(reused));
     require(finished(second), "the reused-summary request did not finish\n" + rig.dump());
     require(second.get().lossy_prefill && second.get().lossy_prefill->summary_reused,
             "a substituted summary was not reported as reused");
+    // A long prompt the probe could not settle is left whole: skipped, with the probe's answer.
+    auto timed = rig.run_prompt(lossy_prompt(3, kLossyPrompt), 1, nullptr, nullptr,
+                                compaction::SummaryRecord{.probe         = LossySummaryProbe::Timeout,
+                                                          .prompt_tokens = kLossyPrompt});
+    require(finished(timed), "the probed request did not finish\n" + rig.dump());
+    const auto& skipped = timed.get().lossy_prefill;
+    require(skipped && skipped->strategy == LossyStrategy::Summary &&
+                skipped->outcome == LossyPrefillOutcome::Skipped &&
+                skipped->summary_probe == LossySummaryProbe::Timeout &&
+                skipped->uncached_tokens == kLossyPrompt && skipped->kept_tokens == kLossyPrompt &&
+                !skipped->summarized_messages && timed.get().prompt.prompt_tokens == kLossyPrompt,
+            "a probed, unsummarised prompt's report is wrong");
     const auto stats = rig.core().runtime_stats();
     require(stats.lossy_prefill_summaries_new == 1 && stats.lossy_prefill_summaries_reused == 1 &&
-                stats.lossy_prefills_completed == 0 && stats.lossy_prefill_scouted_tokens == 0 &&
-                stats.prompt_tokens == 80000,
-            "the summary counters are wrong");
+                stats.lossy_prefills_completed == 2 && stats.lossy_prefills_skipped == 1 &&
+                stats.lossy_prefill_scouted_tokens == 0 && stats.prompt_tokens == 80000 + kLossyPrompt,
+            "the summary counters must match the logged outcomes");
+}
+
+// SummaryOutputCappedByOriginal: a shortened prompt may not generate past where the client's own
+// prompt would reach max_context.
+void test_summary_output_capped_by_original() {
+    Rig rig({.chunk = kLossyChunk, .lanes = 1, .lossy_min_tokens = 30000,
+             .lossy_strategy = LossyStrategy::Summary});
+    const std::uint32_t max_context = 1U << 20; // the Rig's
+    const compaction::SummaryRewrite rewrite{.original_tokens = max_context - 3,
+                                             .prompt_tokens   = 9000,
+                                             .messages        = {4, 180},
+                                             .fresh           = true};
+    auto result = rig.run_prompt(lossy_prompt(1, 9000), 64, nullptr, nullptr,
+                                 compaction::SummaryRecord{.probe = LossySummaryProbe::Cold,
+                                                           .rewrite = rewrite,
+                                                           .prompt_tokens = 9000});
+    require(finished(result), "the request did not finish\n" + rig.dump());
+    require(result.get().generated_token_ids.size() == 4,
+            "the output was not capped at max_context - original + 1: " +
+                std::to_string(result.get().generated_token_ids.size()));
 }
 
 // SummaryStrategyDisablesTokenPath: under --lossy-prefill-strategy summary the core never scouts,
@@ -1303,21 +1340,67 @@ void test_private_reuse_probe() {
              .shared_prefixes = {{7, kMarker}}});
     ResolvedExecutionOptions execution;
     execution.requested_output_tokens = 1;
-    require(!rig.core().has_private_reuse(lossy_prompt(1, kLossyPrompt, 7), execution,
-                                          std::chrono::milliseconds(50)),
-            "a prompt only the shared prefix serves was probed warm");
+    require(rig.core().has_private_reuse(lossy_prompt(1, kLossyPrompt, 7), execution, kMarker,
+                                         std::chrono::milliseconds(250)) == LossySummaryProbe::Cold,
+            "a prompt only the shared prefix serves was not probed cold");
     rig.hold_at([](const Event& e) { return e.kind == Event::Kind::Prefill && e.request == 2; });
     auto busy = rig.run_prompt(lossy_prompt(2, 8192), 1);
     require(rig.wait_held(), "the worker was not held\n" + rig.dump());
     const auto started = Clock::now();
-    const bool warm    = rig.core().has_private_reuse(lossy_prompt(3, kLossyPrompt, 7), execution,
-                                                      std::chrono::milliseconds(50));
+    const auto answer  = rig.core().has_private_reuse(lossy_prompt(3, kLossyPrompt, 7), execution,
+                                                      kMarker, std::chrono::milliseconds(50));
     const auto waited  = Clock::now() - started;
     rig.release();
-    require(warm, "a probe that could not get the worker's lock was not warm");
+    require(answer == LossySummaryProbe::Timeout,
+            "a probe the busy worker could not answer was not a timeout");
     require(waited >= std::chrono::milliseconds(45) && waited < std::chrono::seconds(2),
             "the probe did not wait its bound");
+    require(rig.core().runtime_stats().lossy_prefill_summary_probe_timeouts == 1,
+            "the timeout was not counted");
     require(finished(busy), "the held request did not finish\n" + rig.dump());
+    // Between cycles of a running request, the worker answers: a long decode leaves gaps.
+    auto decoding = rig.run_prompt(lossy_prompt(4, 2048), 200);
+    require(rig.wait_for([&] { return !rig.events_of(4, Event::Kind::Decode).empty(); }),
+            "the decode did not start\n" + rig.dump());
+    require(rig.core().has_private_reuse(lossy_prompt(5, kLossyPrompt, 7), execution, kMarker,
+                                         std::chrono::milliseconds(250)) == LossySummaryProbe::Cold,
+            "a decoding worker did not answer the probe between cycles");
+    require(finished(decoding), "the decoding request did not finish\n" + rig.dump());
+}
+
+// StoredSessionProbedWarm: a conversation only the context store holds (admission would hydrate
+// it) is warm, so it is not summarised; one the store does not hold, or holds only within the
+// product prompt, is cold.
+void test_stored_session_probed_warm() {
+    auto bucket = std::make_shared<MemoryBucket>();
+    StoreDirectory directory;
+    ContextStore store(bucket_store_options(directory.path(), bucket));
+    require(store_drained(store), "the start-up refresh did not finish");
+    const auto put = [&](std::uint64_t id, std::uint32_t frontier) {
+        ContextStore::Description description;
+        description.id      = "5e57" + std::to_string(id);
+        description.binding = "fake-binding";
+        description.tokens  = frontier;
+        description.checkpoints.push_back({.frontier = frontier, .digests = {id, 0}, .identity_tag = 0});
+        std::vector<std::uint8_t> image(64 + 4096, static_cast<std::uint8_t>(id));
+        (void)store.put(description, image, std::array{ContextStore::Region{64, 4096}});
+        require(store.find(description.id).has_value(), "the session was not stored");
+    };
+    put(7, 30'000);
+    put(9, 1'000);
+    Rig rig({.chunk = kLossyChunk, .lanes = 1, .lossy_min_tokens = 30000,
+             .lossy_strategy = LossyStrategy::Summary});
+    rig.attach_store(store, std::chrono::seconds(2));
+    ResolvedExecutionOptions execution;
+    execution.requested_output_tokens = 1;
+    const auto probe = [&](std::uint64_t id) {
+        return rig.core().has_private_reuse(fake::PreparedPrompt{kLossyPrompt, id}, execution, kMarker,
+                                            std::chrono::milliseconds(250));
+    };
+    require(probe(7) == LossySummaryProbe::Warm, "a session the store holds was probed cold");
+    require(probe(8) == LossySummaryProbe::Cold, "a session the store does not hold was probed warm");
+    require(probe(9) == LossySummaryProbe::Cold,
+            "a stored prefix within the product prompt made the prompt warm");
 }
 
 // LossyCountersAndRequestLog: one completed, one skipped (the selection kept everything) and one
@@ -1496,5 +1579,7 @@ int main() {
     run("SummaryRewriteReportsOriginal", test_summary_rewrite_reports_original);
     run("SummaryStrategyDisablesTokenPath", test_summary_strategy_disables_token_path);
     run("PrivateReuseProbe", test_private_reuse_probe);
+    run("StoredSessionProbedWarm", test_stored_session_probed_warm);
+    run("SummaryOutputCappedByOriginal", test_summary_output_capped_by_original);
     return failures == 0 ? 0 : 1;
 }

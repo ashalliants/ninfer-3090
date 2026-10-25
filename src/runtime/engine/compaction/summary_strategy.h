@@ -81,6 +81,8 @@ template <class Prepared>
 struct SummaryPreparation {
     Prepared prepared;
     std::optional<SummaryRewrite> rewrite;
+    // The coldness probe's answer; unset when the prompt was not long enough to be probed.
+    std::optional<LossySummaryProbe> probe;
 };
 
 // At most this many recorded summaries are applied in a row (each later one was recorded on a
@@ -92,13 +94,15 @@ inline constexpr int kMaximumSummaryChain = 8;
 //   std::uint32_t tokens(const Prepared&)              its prompt tokens
 //   std::uint32_t exact_end(const Prepared&)           the product prompt's end (shared marker)
 //   bool eligible(const Prepared&)                     text only, no installed graft
-//   bool has_private_reuse(const Prepared&)            a private record would serve it (warm)
+//   LossySummaryProbe probe_reuse(const Prepared&)     Cold unless a private record would serve it
+//                                                      (Warm) or the probe timed out (Timeout)
 //   std::span<const TokenId> token_ids(const Prepared&)
 //
 // 1. Recorded summaries the messages start with are substituted, oldest first.
-// 2. The result is prepared. A cold (no private reuse), eligible prompt with more than min_tokens
-//    after the product prompt is split (split_for_summary); a non-empty middle is replaced by its
-//    summary and prepared again, kept only when it is shorter, and recorded.
+// 2. The result is prepared. A cold, eligible prompt with more than min_tokens after the product
+//    prompt is split (split_for_summary, told which messages are substituted summaries); a
+//    non-empty middle is replaced by its summary and prepared again, kept only when it is
+//    shorter, and recorded.
 // 3. When anything was replaced, the client's original prompt is prepared too (once), so usage
 //    reports its length.
 template <class Ops>
@@ -106,9 +110,11 @@ template <class Ops>
                                       SummaryRegistry& registry, Ops& ops)
     -> SummaryPreparation<decltype(ops.prepare(std::move(input)))> {
     using Prepared = decltype(ops.prepare(std::move(input)));
-    // The client's index of each current message (a summary message: the first it replaced).
+    // The client's index of each current message (a summary message: the first it replaced), and
+    // which current messages are summaries this function substituted.
     std::vector<std::size_t> origin(input.messages.size());
     std::iota(origin.begin(), origin.end(), std::size_t{0});
+    std::vector<std::uint8_t> substituted(input.messages.size(), 0);
     const auto client_range = [&](std::size_t first, std::size_t last) {
         return std::array<std::uint32_t, 2>{static_cast<std::uint32_t>(origin[first]),
                                             static_cast<std::uint32_t>(origin[last - 1] + 1)};
@@ -116,6 +122,9 @@ template <class Ops>
     const auto replace_origin = [&](std::size_t first, std::size_t last) {
         origin.erase(origin.begin() + static_cast<std::ptrdiff_t>(first + 1),
                      origin.begin() + static_cast<std::ptrdiff_t>(last));
+        substituted.erase(substituted.begin() + static_cast<std::ptrdiff_t>(first + 1),
+                          substituted.begin() + static_cast<std::ptrdiff_t>(last));
+        substituted[first] = 1;
     };
 
     std::optional<PromptInput> original;
@@ -133,13 +142,18 @@ template <class Ops>
 
     Prepared prepared = ops.prepare(current);
     std::optional<Prepared> original_prepared;
+    std::optional<LossySummaryProbe> probe;
     bool fresh = false;
     const std::uint32_t tokens    = ops.tokens(prepared);
     const std::uint32_t exact_end = ops.exact_end(prepared);
     if (config.min_tokens > 0 && ops.eligible(prepared) && tokens > exact_end &&
-        tokens - exact_end > config.min_tokens && !ops.has_private_reuse(prepared)) {
-        const SummarySplit split = split_for_summary(current.messages, config.protect_first,
-                                                     config.protect_last, config.min_tail_users);
+        tokens - exact_end > config.min_tokens) {
+        probe = ops.probe_reuse(prepared);
+    }
+    if (probe == LossySummaryProbe::Cold) {
+        const SummarySplit split =
+            split_for_summary(current.messages, config.protect_first, config.protect_last,
+                              config.min_tail_users, substituted);
         if (!split.empty()) {
             std::string text =
                 build_summary_text(current.messages, split.first, split.last, config.budget_chars);
@@ -159,7 +173,7 @@ template <class Ops>
             }
         }
     }
-    if (!range) { return {std::move(prepared), std::nullopt}; }
+    if (!range) { return {std::move(prepared), std::nullopt, probe}; }
     if (!original_prepared) { original_prepared.emplace(ops.prepare(std::move(*original))); }
 
     SummaryRewrite rewrite;
@@ -171,7 +185,7 @@ template <class Ops>
     rewrite.common_suffix = suffix;
     rewrite.messages      = *range;
     rewrite.fresh         = fresh;
-    return {std::move(prepared), rewrite};
+    return {std::move(prepared), rewrite, probe};
 }
 
 // Engine::prepare's entry point: the summary strategy when it is on, otherwise one ordinary
@@ -181,7 +195,9 @@ template <class Ops>
                                         const SummaryStrategyConfig& config,
                                         SummaryRegistry& registry, Ops& ops)
     -> SummaryPreparation<decltype(ops.prepare(std::move(input)))> {
-    if (!summary_strategy_active(options)) { return {ops.prepare(std::move(input)), std::nullopt}; }
+    if (!summary_strategy_active(options)) {
+        return {ops.prepare(std::move(input)), std::nullopt, std::nullopt};
+    }
     return prepare_summarized(std::move(input), config, registry, ops);
 }
 

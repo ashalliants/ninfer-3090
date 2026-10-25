@@ -217,8 +217,8 @@ struct RequestRecord {
 
     std::optional<BasePlan> base_plan;
     std::optional<LossyPrefillState> lossy;
-    // Summary strategy: the prompt as submitted replaced messages of the client's (set by submit).
-    std::optional<compaction::SummaryRewrite> summary_rewrite;
+    // Summary strategy: what it did for this prompt (probe, rewrite), set by submit.
+    std::optional<compaction::SummaryRecord> summary;
     std::optional<ResumeState> suspended;
     ContinuationOwnerToken continuation_owner = 0;
     // Shared checkpoints this request published at its progress anchors, oldest first. Only the

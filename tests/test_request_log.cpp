@@ -656,7 +656,8 @@ int main() {
             .kept_tokens         = 9000,
             .strategy            = ninfer::LossyStrategy::Summary,
             .summarized_messages = std::array<std::uint32_t, 2>{4, 180},
-            .summary_reused      = true};
+            .summary_reused      = true,
+            .summary_probe       = ninfer::LossySummaryProbe::Cold};
         const auto summary_done =
             Json::parse(format_request_done_json("serve-test", 3003, context, summarized));
         failures += check(summary_done.at("lossy_prefill") == Json{{"outcome", "completed"},
@@ -668,8 +669,21 @@ int main() {
                                                                    {"main_ms", 0.0},
                                                                    {"summarized_messages",
                                                                     Json::array({4, 180})},
-                                                                   {"summary_reused", true}},
+                                                                   {"summary_reused", true},
+                                                                   {"summary_probe", "cold"}},
                           "the summary strategy's fields are missing from the request log");
+        summarized.metrics.lossy_prefill = ninfer::LossyPrefillReport{
+            .outcome         = ninfer::LossyPrefillOutcome::Skipped,
+            .uncached_tokens = 40000,
+            .kept_tokens     = 40000,
+            .strategy        = ninfer::LossyStrategy::Summary,
+            .summary_probe   = ninfer::LossySummaryProbe::Timeout};
+        const auto timed_out =
+            Json::parse(format_request_done_json("serve-test", 3003, context, summarized));
+        failures += check(timed_out.at("lossy_prefill").at("outcome") == "skipped" &&
+                              timed_out.at("lossy_prefill").at("summary_probe") == "timeout" &&
+                              timed_out.at("lossy_prefill").at("summarized_messages").is_null(),
+                          "a probe timeout must be logged");
     }
     // kept_runs appear only under --request-log-lossy-detail.
     observed.metrics.lossy_prefill->kept_runs = {{0, 256}, {1024, 1088}, {33856, 37952}};

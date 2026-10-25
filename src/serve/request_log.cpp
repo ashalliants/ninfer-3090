@@ -388,7 +388,7 @@ const char* lossy_prefill_outcome_name(ninfer::LossyPrefillOutcome outcome) {
 // docs/maintainer/lossy-long-prefill.md, "Observability": null unless the request took the path.
 // `detail` (--request-log-lossy-detail) adds kept_runs: the kept offsets of the filtered part as
 // [begin, end) pairs, which the sweep's kept-block overlap (Jaccard) reads. `strategy` is "select"
-// or "summary"; a summary adds summarized_messages and summary_reused.
+// or "summary"; a summary adds summarized_messages, summary_reused and summary_probe.
 Json lossy_prefill_json(const std::optional<ninfer::LossyPrefillReport>& report, bool detail) {
     if (!report) { return nullptr; }
     const bool summary = report->strategy == ninfer::LossyStrategy::Summary;
@@ -407,6 +407,22 @@ Json lossy_prefill_json(const std::optional<ninfer::LossyPrefillReport>& report,
                 ? Json::array({(*report->summarized_messages)[0], (*report->summarized_messages)[1]})
                 : Json(nullptr);
         out["summary_reused"] = report->summary_reused;
+        // The coldness probe's answer; null when the prompt was too short to be probed.
+        const char* probe = nullptr;
+        if (report->summary_probe) {
+            switch (*report->summary_probe) {
+            case ninfer::LossySummaryProbe::Cold:
+                probe = "cold";
+                break;
+            case ninfer::LossySummaryProbe::Warm:
+                probe = "warm";
+                break;
+            case ninfer::LossySummaryProbe::Timeout:
+                probe = "timeout";
+                break;
+            }
+        }
+        out["summary_probe"] = probe != nullptr ? Json(probe) : Json(nullptr);
     }
     if (detail) {
         Json runs = Json::array();

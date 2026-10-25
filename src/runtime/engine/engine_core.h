@@ -276,7 +276,7 @@ public:
                       ResolvedRequestOptions options, OutputConsumerMode consumer_mode,
                       GenerationObservationOptions observation,
                       Clock::time_point pending_deadline = {},
-                      std::optional<compaction::SummaryRewrite> summary_rewrite = std::nullopt) {
+                      std::optional<compaction::SummaryRecord> summary = std::nullopt) {
         const Clock::time_point submitted = Clock::now();
         if (pending_deadline == Clock::time_point{}) {
             pending_deadline = submitted + pending_timeout_;
@@ -309,6 +309,14 @@ public:
             publication_order = next_publication_order_++;
         }
 
+        // A prompt the summary strategy shortened may not generate past where the client's own
+        // prompt would reach max_context: the output cap follows the original length, as the
+        // Program's own cap does for a prompt it rewrote.
+        if (summary && summary->rewrite && summary->rewrite->original_tokens <= max_context_) {
+            options.execution.requested_output_tokens =
+                std::min(options.execution.requested_output_tokens,
+                         max_context_ - summary->rewrite->original_tokens + 1U);
+        }
         std::shared_ptr<Request> request;
         std::optional<std::uint32_t> effective_budget;
         try {
@@ -337,7 +345,7 @@ public:
                                                 std::move(options), consumer_mode,
                                                 std::move(observation), pending_deadline, ready);
             effective_budget         = request->output.thinking_stats().effective_budget;
-            request->summary_rewrite = summary_rewrite;
+            request->summary         = std::move(summary);
         } catch (...) {
             release_reserved_capacity();
             throw;
@@ -378,29 +386,43 @@ public:
     }
 
     [[nodiscard]] RuntimeStats runtime_stats() const {
-        std::lock_guard lock(stats_mutex_);
-        return published_stats_;
+        RuntimeStats stats;
+        {
+            std::lock_guard lock(stats_mutex_);
+            stats = published_stats_;
+        }
+        stats.lossy_prefill_summary_probe_timeouts = probe_timeouts_.load(std::memory_order_relaxed);
+        return stats;
     }
 
-    // The summary strategy's reuse probe, from a caller thread (Engine::prepare): whether the cache
-    // holds a private (conversation) record this prompt starts with, so admission would reuse it
-    // and the prompt is warm. `prompt` is a copy the probe plans and drops. It runs under the
-    // worker's execution lock, between worker cycles, the way memory_summary reads the Program; a
-    // lock not obtained within `wait`, a suspended or failed Engine, or any error count as warm,
-    // so nothing is summarised on doubt.
-    [[nodiscard]] bool has_private_reuse(PreparedPrompt prompt, const ResolvedExecutionOptions& execution,
-                                         std::chrono::milliseconds wait) {
-        std::unique_lock lock(execution_mutex_, std::defer_lock);
-        if (!lock.try_lock_for(wait)) { return true; }
+    // The summary strategy's reuse probe, from a caller thread (Engine::prepare): Warm when a
+    // private (conversation) record this prompt starts with would be reused, from the cache or from
+    // the context store (deeper than `exact_end`, the product prompt), Cold otherwise. `prompt` is
+    // a copy the probe plans and drops. The probe is posted to the worker, which answers it between
+    // cycles (serve_reuse_probes); an answer not given within `wait` is Timeout, counted in
+    // lossy_prefill_summary_probe_timeouts and treated as warm by the caller. A stopping or failed
+    // Engine answers Warm at once.
+    [[nodiscard]] LossySummaryProbe has_private_reuse(PreparedPrompt prompt,
+                                                      const ResolvedExecutionOptions& execution,
+                                                      std::uint32_t exact_end,
+                                                      std::chrono::milliseconds wait) {
+        auto probe       = std::make_shared<ReuseProbe>();
+        probe->prompt    = std::move(prompt);
+        probe->execution = execution;
+        probe->exact_end = exact_end;
         {
-            std::lock_guard queue_lock(queue_mutex_);
-            if (stopping_ || failed_) { return true; }
+            std::lock_guard lock(queue_mutex_);
+            if (stopping_ || failed_) { return LossySummaryProbe::Warm; }
+            probes_.push_back(probe);
         }
-        if (suspended_.load(std::memory_order_acquire)) { return true; }
-        try {
-            const auto plan = instance_.program->plan_request(std::move(prompt), execution);
-            return resources_.has_private_match(*instance_.program, plan);
-        } catch (...) { return true; }
+        queue_cv_.notify_all();
+        std::unique_lock lock(probe->mutex);
+        if (!probe->cv.wait_for(lock, wait, [&] { return probe->warm.has_value(); })) {
+            probe->abandoned = true;
+            probe_timeouts_.fetch_add(1, std::memory_order_relaxed);
+            return LossySummaryProbe::Timeout;
+        }
+        return *probe->warm ? LossySummaryProbe::Warm : LossySummaryProbe::Cold;
     }
 
     // An Engine-wide failure: every queued request failed, every new one is refused, and the
@@ -1208,8 +1230,8 @@ private:
         }
         if (request->lossy) {
             result.lossy_prefill = request->lossy->report;
-        } else if (request->summary_rewrite) {
-            result.lossy_prefill = summary_report(*request->summary_rewrite);
+        } else if (request->summary) {
+            result.lossy_prefill = summary_report(*request->summary);
         }
         result.timings                 = request->generation_timings;
         result.timings.prepare_seconds = request->prepare_seconds;
@@ -1964,7 +1986,9 @@ private:
 
     // The client's prompt length: what prompt progress counts to.
     [[nodiscard]] static std::uint32_t reported_prompt_tokens(const Request& request) noexcept {
-        if (request.summary_rewrite) { return request.summary_rewrite->original_tokens; }
+        if (request.summary && request.summary->rewrite) {
+            return request.summary->rewrite->original_tokens;
+        }
         const auto& summary = request.base_plan->summary();
         return summary.reported_prompt_tokens != 0 ? summary.reported_prompt_tokens
                                                    : summary.prompt_tokens;
@@ -1976,17 +2000,27 @@ private:
                                                          std::uint32_t frontier) noexcept {
         const std::uint32_t planned =
             request.base_plan ? reported_frontier(*request.base_plan, frontier) : frontier;
-        return request.summary_rewrite ? request.summary_rewrite->original_frontier(planned) : planned;
+        return request.summary && request.summary->rewrite
+                   ? request.summary->rewrite->original_frontier(planned)
+                   : planned;
     }
 
-    // The request log's report for a prompt the summary strategy rewrote.
-    [[nodiscard]] static LossyPrefillReport summary_report(const compaction::SummaryRewrite& rewrite) {
-        return LossyPrefillReport{.outcome             = LossyPrefillOutcome::Completed,
-                                  .uncached_tokens     = rewrite.original_tokens,
-                                  .kept_tokens         = rewrite.prompt_tokens,
-                                  .strategy            = LossyStrategy::Summary,
-                                  .summarized_messages = rewrite.messages,
-                                  .summary_reused      = !rewrite.fresh};
+    // The request log's report for a prompt the summary strategy rewrote (completed) or probed
+    // and left whole (skipped); the outcome counters count the same outcomes.
+    [[nodiscard]] static LossyPrefillReport summary_report(const compaction::SummaryRecord& record) {
+        LossyPrefillReport report{.outcome         = LossyPrefillOutcome::Skipped,
+                                  .uncached_tokens = record.prompt_tokens,
+                                  .kept_tokens     = record.prompt_tokens,
+                                  .strategy        = LossyStrategy::Summary,
+                                  .summary_probe   = record.probe};
+        if (const auto& rewrite = record.rewrite) {
+            report.outcome             = LossyPrefillOutcome::Completed;
+            report.uncached_tokens     = rewrite->original_tokens;
+            report.kept_tokens         = rewrite->prompt_tokens;
+            report.summarized_messages = rewrite->messages;
+            report.summary_reused      = !rewrite->fresh;
+        }
+        return report;
     }
 
     // At admission, once the source is chosen: whether this request takes the lossy path
@@ -2293,9 +2327,12 @@ private:
                 cumulative_stats_.reused_prompt_tokens +=
                     reported_frontier(*request, control.summary.reused_prompt_tokens);
                 cumulative_stats_.prompt_tokens += reported_prompt_tokens(*request);
-                if (request->summary_rewrite) {
-                    ++(request->summary_rewrite->fresh ? cumulative_stats_.lossy_prefill_summaries_new
-                                                       : cumulative_stats_.lossy_prefill_summaries_reused);
+                if (const auto& summary = request->summary; summary && summary->rewrite) {
+                    ++(summary->rewrite->fresh ? cumulative_stats_.lossy_prefill_summaries_new
+                                               : cumulative_stats_.lossy_prefill_summaries_reused);
+                    ++cumulative_stats_.lossy_prefills_completed;
+                } else if (summary) {
+                    ++cumulative_stats_.lossy_prefills_skipped;
                 }
                 cumulative_stats_.last_selected_frontier_tokens =
                     control.summary.reused_prompt_tokens;
@@ -3960,29 +3997,22 @@ private:
         std::string best_id;
         std::uint32_t best_frontier = resident;
         try {
-            for (const ContextStore::Info& info : store_.store->list()) {
-                // The binding does not include the context length: an image deeper than this
-                // Engine's context could never be restored, and reading it would only cost time.
-                if (info.binding != store_.binding || info.tokens > max_context_) { continue; }
-                if (info.fetch_bytes > 0 && remote_fetch_ns(info.fetch_bytes) >= wait_ns) { continue; }
+            // The binding does not include the context length: an image deeper than this Engine's
+            // context could never be restored, and reading it would only cost time
+            // (for_each_stored_match leaves it out).
+            for_each_stored_match(base, [&](const ContextStore::Info& info,
+                                            const ContextStore::CheckpointKey& key) {
+                if (info.fetch_bytes > 0 && remote_fetch_ns(info.fetch_bytes) >= wait_ns) { return; }
                 const auto restore = resources_.store_restore_ns(info.image_bytes);
-                if (restore >= best_cost) { continue; }
-                for (const ContextStore::CheckpointKey& key : info.checkpoints) {
-                    if (key.frontier <= resident || key.frontier > prompt_tokens) { continue; }
-                    const auto prefill = resources_.prefill_ns(
-                        instance_.program->prefill_work(base, key.frontier, prompt_tokens));
-                    const auto cost = prefill > UINT64_MAX - restore ? UINT64_MAX
-                                                                     : restore + prefill;
-                    if (cost >= best_cost) { continue; }
-                    const auto mine = base.prefix_shortlist_key(key.frontier);
-                    if (mine && mine->digests == key.digests &&
-                        mine->identity_tag == key.identity_tag) {
-                        best_id       = info.id;
-                        best_frontier = key.frontier;
-                        best_cost     = cost;
-                    }
-                }
-            }
+                if (restore >= best_cost || key.frontier <= resident) { return; }
+                const auto prefill = resources_.prefill_ns(
+                    instance_.program->prefill_work(base, key.frontier, prompt_tokens));
+                const auto cost = prefill > UINT64_MAX - restore ? UINT64_MAX : restore + prefill;
+                if (cost >= best_cost) { return; }
+                best_id       = info.id;
+                best_frontier = key.frontier;
+                best_cost     = cost;
+            });
         } catch (...) { return false; }
         if (best_id.empty()) {
             // Nothing here, but another engine may have stored this session since the bucket was
@@ -4375,23 +4405,95 @@ private:
         published_residency_ = std::move(status);
     }
 
+    // ---- the summary strategy's reuse probes (has_private_reuse) ----
+
+    struct ReuseProbe {
+        PreparedPrompt prompt{};
+        ResolvedExecutionOptions execution;
+        std::uint32_t exact_end = 0;
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::optional<bool> warm;
+        bool abandoned = false;
+    };
+
+    // Visits every checkpoint key of a context-store image on this binding that this Engine could
+    // restore (at most max_context) and whose prefix the plan's prompt starts with, as admission's
+    // hydration compares them (prefix shortlist key and identity tag). Images only the bucket holds
+    // are included once a listing has registered them.
+    template <class Visit>
+    void for_each_stored_match(const BasePlan& base, Visit&& visit) {
+        const auto prompt_tokens = base.summary().prompt_tokens;
+        for (const ContextStore::Info& info : store_.store->list()) {
+            if (info.binding != store_.binding || info.tokens > max_context_) { continue; }
+            for (const ContextStore::CheckpointKey& key : info.checkpoints) {
+                if (key.frontier > prompt_tokens) { continue; }
+                const auto mine = base.prefix_shortlist_key(key.frontier);
+                if (mine && mine->digests == key.digests && mine->identity_tag == key.identity_tag) {
+                    visit(info, key);
+                }
+            }
+        }
+    }
+
+    // On the worker, under the execution lock: the probe's answer (true: warm).
+    [[nodiscard]] bool private_reuse_locked(ReuseProbe& probe) {
+        const auto plan = instance_.program->plan_request(std::move(probe.prompt), probe.execution);
+        if (resources_.has_private_match(*instance_.program, plan)) { return true; }
+        if (store_.store == nullptr) { return false; }
+        bool stored = false;
+        for_each_stored_match(plan, [&](const ContextStore::Info&, const ContextStore::CheckpointKey& key) {
+            stored = stored || key.frontier > probe.exact_end;
+        });
+        return stored;
+    }
+
+    // Answers the queued probes; `warm_only` (suspended or stopping) answers warm without looking.
+    void serve_reuse_probes(bool warm_only) noexcept {
+        std::deque<std::shared_ptr<ReuseProbe>> probes;
+        {
+            std::lock_guard lock(queue_mutex_);
+            probes.swap(probes_);
+        }
+        for (const auto& probe : probes) {
+            {
+                std::lock_guard lock(probe->mutex);
+                if (probe->abandoned) { continue; }
+            }
+            bool warm = true;
+            if (!warm_only) {
+                try {
+                    warm = private_reuse_locked(*probe);
+                } catch (...) { warm = true; }
+            }
+            {
+                std::lock_guard lock(probe->mutex);
+                probe->warm = warm;
+            }
+            probe->cv.notify_all();
+        }
+    }
+
     void worker_loop() noexcept {
         for (;;) {
             {
                 std::unique_lock lock(queue_mutex_);
-                if (!stopping_ && pending_.empty() && resident_empty() && paused_.empty() &&
-                    !instance_.program->has_context_transaction()) {
+                if (!stopping_ && pending_.empty() && probes_.empty() && resident_empty() &&
+                    paused_.empty() && !instance_.program->has_context_transaction()) {
+                    const auto woken = [&] {
+                        return stopping_ || !pending_.empty() || !probes_.empty();
+                    };
                     if (store_.sink && store_.idle_persist.count() > 0) {
                         // Wake up now and then to write idle continuations to the store.
-                        queue_cv_.wait_for(lock, std::chrono::seconds(1),
-                                           [&] { return stopping_ || !pending_.empty(); });
+                        queue_cv_.wait_for(lock, std::chrono::seconds(1), woken);
                     } else {
-                        queue_cv_.wait(lock, [&] { return stopping_ || !pending_.empty(); });
+                        queue_cv_.wait(lock, woken);
                     }
                 }
                 if (stopping_) {
                     lock.unlock();
                     std::scoped_lock execution_lock(execution_mutex_);
+                    serve_reuse_probes(true);
                     const auto error = std::make_exception_ptr(RequestError(
                         RequestErrorKind::Unavailable, "inference engine is shutting down"));
                     if (suspended_.load(std::memory_order_acquire)) {
@@ -4411,10 +4513,14 @@ private:
             std::unique_lock execution_lock(execution_mutex_);
             if (suspended_.load(std::memory_order_acquire)) {
                 // Nothing executes while suspended. The wait above returned because work was
-                // queued: resume for it, or refuse it when the model is held suspended.
+                // queued: resume for it, or refuse it when the model is held suspended. A probe
+                // does not resume the model: it is answered warm.
+                serve_reuse_probes(true);
                 serve_suspended_queue_locked();
                 continue;
             }
+            // Between cycles: the summary strategy's probes, before this cycle changes the cache.
+            serve_reuse_probes(false);
             bool executed = false;
             // The execution unit in progress, for the fault event.
             const char* unit = "boundary";
@@ -4679,8 +4785,10 @@ private:
     const std::function<void(const EngineFaultEvent&)> fault_listener_;
     ResourceManagement resources_;
 
-    // Timed: the summary strategy's reuse probe (has_private_reuse) waits for it only briefly.
-    mutable std::timed_mutex execution_mutex_;
+    mutable std::mutex execution_mutex_;
+    // Summary-strategy reuse probes waiting for the worker (guarded by queue_mutex_).
+    std::deque<std::shared_ptr<ReuseProbe>> probes_;
+    std::atomic<std::uint64_t> probe_timeouts_{0};
     mutable std::mutex queue_mutex_;
     mutable std::mutex stats_mutex_;
     std::condition_variable queue_cv_;

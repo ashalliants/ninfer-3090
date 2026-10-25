@@ -15,17 +15,19 @@ bool is_summary_message(const ChatMessage& message) noexcept {
     return false;
 }
 
-namespace {
-
-bool is_real_user(const ChatMessage& message) noexcept {
-    return message.role == ChatRole::User && !is_summary_message(message);
-}
-
-} // namespace
-
 SummarySplit split_for_summary(std::span<const ChatMessage> messages, std::size_t protect_first,
-                               std::size_t protect_last, std::size_t min_tail_users) {
+                               std::size_t protect_last, std::size_t min_tail_users,
+                               std::span<const std::uint8_t> substituted) {
     const std::size_t n = messages.size();
+    if (!substituted.empty() && substituted.size() != n) {
+        throw std::invalid_argument("summary substitution mask does not match the conversation");
+    }
+    const auto is_summary = [&](std::size_t i) {
+        return substituted.empty() ? is_summary_message(messages[i]) : substituted[i] != 0;
+    };
+    const auto is_real_user = [&](std::size_t i) {
+        return messages[i].role == ChatRole::User && !is_summary(i);
+    };
     std::size_t head    = 0;
     while (head < n && (messages[head].role == ChatRole::System ||
                         messages[head].role == ChatRole::Developer)) {
@@ -33,7 +35,7 @@ SummarySplit split_for_summary(std::span<const ChatMessage> messages, std::size_
     }
     head = std::min(n, head + protect_first);
     for (std::size_t i = n; i > head; --i) {
-        if (is_summary_message(messages[i - 1])) {
+        if (is_summary(i - 1)) {
             head = i;
             break;
         }
@@ -43,10 +45,10 @@ SummarySplit split_for_summary(std::span<const ChatMessage> messages, std::size_
     if (n <= protect_last) { return {head, head}; }
     std::size_t tail  = n - protect_last;
     std::size_t users = 0;
-    for (std::size_t i = tail; i < n; ++i) { users += is_real_user(messages[i]) ? 1U : 0U; }
+    for (std::size_t i = tail; i < n; ++i) { users += is_real_user(i) ? 1U : 0U; }
     while (users < min_tail_users && tail > head) {
         --tail;
-        users += is_real_user(messages[tail]) ? 1U : 0U;
+        users += is_real_user(tail) ? 1U : 0U;
     }
     while (tail > 0 && messages[tail].role == ChatRole::Tool) { --tail; }
     if (tail <= head) { return {head, head}; }

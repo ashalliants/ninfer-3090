@@ -158,6 +158,7 @@ int main() {
     fork.lossy_prefill_alias_hits         = baseline.lossy_prefill_alias_hits + 4;
     fork.lossy_prefill_summaries_new      = baseline.lossy_prefill_summaries_new + 5;
     fork.lossy_prefill_summaries_reused   = baseline.lossy_prefill_summaries_reused + 6;
+    fork.lossy_prefill_summary_probe_timeouts = baseline.lossy_prefill_summary_probe_timeouts + 7;
     fork.context_store_images             = 5;
     fork.context_store_used_bytes         = 123456789;
     fork.context_store_writes             = 9;
@@ -196,7 +197,8 @@ int main() {
               has_line(series, "ninfer_lossy_prefill_kept_tokens_total 15182") &&
               has_line(series, "ninfer_lossy_prefill_alias_hits_total 4") &&
               has_line(series, "ninfer_lossy_prefill_summaries_total{kind=\"new\"} 5") &&
-              has_line(series, "ninfer_lossy_prefill_summaries_total{kind=\"reused\"} 6"),
+              has_line(series, "ninfer_lossy_prefill_summaries_total{kind=\"reused\"} 6") &&
+              has_line(series, "ninfer_lossy_prefill_summary_probe_timeouts_total 7"),
           "lossy prefill series must be reported by outcome");
     check(has_line(series, "ninfer_context_store_images 5") &&
               has_line(series, "ninfer_context_store_used_bytes 123456789") &&

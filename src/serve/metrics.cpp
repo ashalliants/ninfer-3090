@@ -414,6 +414,9 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
         out << "ninfer_lossy_prefill_summaries_total{kind=\"" << kind << "\"} " << current - baseline
             << '\n';
     }
+    COUNTER(lossy_prefill_summary_probe_timeouts, "lossy_prefill_summary_probe_timeouts_total",
+            "Summary-strategy coldness probes the worker did not answer in time; the prompt was "
+            "treated as warm and not summarised.");
     COUNTER(engine_recoveries, "engine_recoveries_total",
             "Host-side worker failures survived by failing in-flight requests and clearing the "
             "context cache.");

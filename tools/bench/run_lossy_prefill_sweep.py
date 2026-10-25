@@ -463,7 +463,10 @@ def check_speed_report(stall_report: dict[str, Any], max_context: int, min_token
 
 def lossy_outcome_counts(request_log: Path, offset: int = 0) -> dict[str, int]:
     """Count request_done records after `offset` by `lossy_prefill.outcome`; `requests` counts all of
-    them, `none` those that never took the path (their lossy_prefill is null)."""
+    them, `none` those that never took the path (their lossy_prefill is null). The summary strategy's
+    coldness probe answers are counted as `summary_probe_cold|warm|timeout`: a timeout left a cold
+    prompt whole because the busy worker did not answer, which explains a summary point with few
+    completions."""
     counts: dict[str, int] = {"requests": 0, "none": 0}
     if not request_log.exists():
         return counts
@@ -481,6 +484,10 @@ def lossy_outcome_counts(request_log: Path, offset: int = 0) -> dict[str, int]:
             if isinstance(lossy, dict):
                 outcome = str(lossy.get("outcome", "unknown"))
                 counts[outcome] = counts.get(outcome, 0) + 1
+                probe = lossy.get("summary_probe")
+                if probe:
+                    key = f"summary_probe_{probe}"
+                    counts[key] = counts.get(key, 0) + 1
             else:
                 counts["none"] += 1
     return counts
@@ -639,11 +646,14 @@ def evaluate_point(rows: list[dict[str, Any]], point: str) -> dict[str, Any]:
                 continue
             outcomes = metrics.get("lossy_outcomes")
             completed = (outcomes or {}).get("completed", 0)
+            timeouts = (outcomes or {}).get("summary_probe_timeout", 0)
+            probe_note = (f"; {timeouts} summary probe timeout(s) left cold prompts whole"
+                          if timeouts else "")
             checks.append(check(f"lossy_ran_{workload}", completed if outcomes is not None else None,
                                 True if completed > 0 else None,
-                                f"{completed} request(s) completed lossy prefill" if completed > 0 else
-                                "no request completed lossy prefill (or no outcome counts): the gate "
-                                "did not exercise the feature"))
+                                (f"{completed} request(s) completed lossy prefill" if completed > 0 else
+                                 "no request completed lossy prefill (or no outcome counts): the gate "
+                                 "did not exercise the feature") + probe_note))
     failed = unresolved_failures(rows, point)
     if any(c["pass"] is False for c in checks) or failed:
         verdict = "FAIL"
@@ -672,7 +682,11 @@ def lossy_cell(rows: list[dict[str, Any]], point: str) -> str:
     cells = []
     for workload in WORKLOADS:
         outcomes = (_metric(rows, point, workload) or {}).get("lossy_outcomes")
-        cells.append("-" if outcomes is None else str(outcomes.get("completed", 0)))
+        if outcomes is None:
+            cells.append("-")
+            continue
+        timeouts = outcomes.get("summary_probe_timeout", 0)
+        cells.append(str(outcomes.get("completed", 0)) + (f" (t{timeouts})" if timeouts else ""))
     return "/".join(cells)
 
 

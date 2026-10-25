@@ -3,9 +3,12 @@
 // The summary strategy's record of one prompt it rewrote (summary_strategy.h), carried with the
 // request so usage, prompt progress and the request log count the client's prompt.
 
+#include "ninfer/types.h"
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <optional>
 
 namespace ninfer::runtime::compaction {
 
@@ -36,6 +39,15 @@ struct SummaryRewrite {
         }
         return common_prefix;
     }
+};
+
+// What the summary strategy did for one prompt, carried with the request: the probe's answer
+// (set when the prompt was long enough to be probed) and the rewrite (set when messages were
+// replaced). `prompt_tokens` is the submitted prompt's length.
+struct SummaryRecord {
+    std::optional<LossySummaryProbe> probe;
+    std::optional<SummaryRewrite> rewrite;
+    std::uint32_t prompt_tokens = 0;
 };
 
 } // namespace ninfer::runtime::compaction

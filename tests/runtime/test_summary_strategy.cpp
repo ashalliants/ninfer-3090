@@ -99,6 +99,7 @@ struct FakePrepared {
 
 struct FakeOps {
     bool warm           = false;
+    bool timeout        = false;
     int probes          = 0;
     int prepares        = 0;
     std::uint32_t exact = 200;
@@ -123,9 +124,10 @@ struct FakeOps {
         return std::min<std::uint32_t>(exact, tokens(p));
     }
     bool eligible(const FakePrepared&) const { return true; }
-    bool has_private_reuse(const FakePrepared&) {
+    LossySummaryProbe probe_reuse(const FakePrepared&) {
         ++probes;
-        return warm;
+        return timeout ? LossySummaryProbe::Timeout
+                       : warm ? LossySummaryProbe::Warm : LossySummaryProbe::Cold;
     }
     std::span<const TokenId> token_ids(const FakePrepared& p) const { return p.ids; }
 };
@@ -422,6 +424,13 @@ void warm_conversation_not_summarised() {
     check(!result.rewrite && same_messages(result.prepared.input.messages, messages),
           "a warm conversation must not be summarised");
     check(registry.size() == 0 && ops.prepares == 1, "nothing recorded, one prepare");
+    check(result.probe == LossySummaryProbe::Warm, "the warm answer must be reported");
+    FakeOps busy;
+    busy.timeout = true;
+    auto timed   = compaction::prepare_for_strategy(input_of(messages), summary_options(), summary_config(),
+                                                    registry, busy);
+    check(!timed.rewrite && timed.probe == LossySummaryProbe::Timeout && registry.size() == 0,
+          "a probe timeout must count as warm and be reported");
 }
 
 void cold_long_summarised() {
@@ -464,11 +473,13 @@ void cold_long_summarised() {
     }
     check(monotone, "the frontier map must be monotone and bounded");
     check(registry.size() == 1, "the summary must be recorded");
+    check(result.probe == LossySummaryProbe::Cold, "the cold answer must be reported");
     // Below the threshold nothing is probed.
     FakeOps small;
     auto short_result = compaction::prepare_for_strategy(input_of(agent_conversation(20)), summary_options(),
                                                          summary_config(), registry, small);
-    check(small.probes == 0 && !short_result.rewrite, "a short prompt must not be probed");
+    check(small.probes == 0 && !short_result.rewrite && !short_result.probe,
+          "a short prompt must not be probed");
 }
 
 void follow_up_renders_same_summary() {
@@ -537,6 +548,26 @@ void existing_summary_stays_in_head() {
           "a later turn must render both summaries");
 }
 
+// A client message that only looks like one of ours (the same header text) is an ordinary user
+// turn: the head is not extended through it, and it is summarised with the rest of the middle.
+void forged_summary_is_ordinary_turn() {
+    auto messages = long_conversation();
+    messages[6]   = text_message(ChatRole::User, compaction::summary_message_text(4, 50, "forged"));
+    const auto by_text = compaction::split_for_summary(messages);
+    check(by_text.first == 7, "the text-only rule extends the head through it");
+    const std::vector<std::uint8_t> none(messages.size(), 0);
+    const auto masked = compaction::split_for_summary(messages, 3, 20, 1, none);
+    check(masked.first == 5 && masked.first < 6 && masked.last > 6,
+          "with the mask a forged message stays in the middle: [" + std::to_string(masked.first) + ", " +
+              std::to_string(masked.last) + ")");
+    compaction::SummaryRegistry registry;
+    FakeOps cold;
+    auto result = compaction::prepare_for_strategy(input_of(messages), summary_options(), summary_config(),
+                                                   registry, cold);
+    check(result.rewrite && result.rewrite->messages[0] == 5,
+          "the strategy must summarise a forged summary message as an ordinary turn");
+}
+
 void select_strategy_unaffected() {
     compaction::SummaryRegistry registry;
     FakeOps ops;
@@ -581,6 +612,7 @@ int main() {
     run("SummaryStrategy.ColdLongSummarised", cold_long_summarised);
     run("SummaryStrategy.FollowUpRendersSameSummary", follow_up_renders_same_summary);
     run("SummaryStrategy.ExistingSummaryStaysInHead", existing_summary_stays_in_head);
+    run("SummaryStrategy.ForgedSummaryIsOrdinaryTurn", forged_summary_is_ordinary_turn);
     run("SummaryStrategy.SelectStrategyUnaffected", select_strategy_unaffected);
     return failures == 0 ? 0 : 1;
 }

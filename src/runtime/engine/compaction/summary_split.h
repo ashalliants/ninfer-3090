@@ -7,6 +7,7 @@
 #include "ninfer/types.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <span>
 #include <string>
 #include <string_view>
@@ -16,8 +17,10 @@ namespace ninfer::runtime::compaction {
 // Every summary message the Engine writes starts with this text (summary_message_text).
 inline constexpr std::string_view kSummaryMessagePrefix = "[Server-side summary of messages ";
 
-// A User message whose first text part starts with kSummaryMessagePrefix: one the Engine wrote in
-// place of earlier messages. It is never summarised again as an ordinary user turn.
+// A User message whose first text part starts with kSummaryMessagePrefix: the shape of one the
+// Engine wrote in place of earlier messages. Only a test of the text; the strategy itself passes
+// split_for_summary the messages it substituted, so a client message that merely starts the same
+// way stays an ordinary user turn.
 [[nodiscard]] bool is_summary_message(const ChatMessage& message) noexcept;
 
 // The middle of a conversation to summarise: messages [first, last). Empty if first >= last.
@@ -35,10 +38,13 @@ struct SummarySplit {
 // `min_tail_users` real user messages (User, not a summary), moved earlier so it never starts at a
 // Tool message, which would separate an Assistant tool call from its results.
 // The middle is what lies between; empty when head and tail meet.
+// `substituted`, when not empty (one entry per message), names the summary messages: those the
+// Engine substituted from its registry. Empty: is_summary_message decides.
 [[nodiscard]] SummarySplit split_for_summary(std::span<const ChatMessage> messages,
                                              std::size_t protect_first  = 3,
                                              std::size_t protect_last   = 20,
-                                             std::size_t min_tail_users = 1);
+                                             std::size_t min_tail_users = 1,
+                                             std::span<const std::uint8_t> substituted = {});
 
 // "[Server-side summary of messages <first>-<last-1>; originals omitted]\n" + projection.
 [[nodiscard]] std::string summary_message_text(std::size_t first, std::size_t last,

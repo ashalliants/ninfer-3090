@@ -314,19 +314,30 @@ and a session log with `[#N]` references to message indices). The output is dete
     `edit`/`NotebookEdit` → `edit_file`, `Grep`/`Glob`/`grep`/`glob` → `search_files`, `apply_patch` → `patch`;
     `filePath` → `file_path` and `notebook_path` → `path` when the target key is absent.
   - The projection's `session_search` instructions are replaced by plain statements that the originals were omitted.
-  - The registry (256 entries, 256 MiB, LRU) keys on the conversation as it stood when summarised. Recorded summaries
-    are substituted first (a chain, oldest first), then the split runs; an earlier summary message is part of the head,
-    so it is never summarised again. Reasoning inside the summarised range is not compared (the summary ignores it).
-  - The coldness probe (`EngineCore::has_private_reuse`) plans a copy of the prepared prompt under the worker's
-    execution lock and asks the prefix index for a valid non-SharedPrefix checkpoint. It waits at most 50 ms for the
-    lock; a busy worker, a suspended or failed Engine, or any error counts as warm, so a cold prompt that arrives
-    during another request's prefill step is not summarised. A session only the context store holds counts as cold.
+  - The registry (256 entries, 256 MiB, LRU) keys on the conversation as it stood when summarised. It is in memory
+    only: a restart loses the substitutions, so the next turn of a summarised conversation renders its originals
+    (and, if it is long and cold, is summarised afresh). Recorded summaries are substituted first (a chain, oldest
+    first), then the split runs; a summary message the Engine substituted is part of the head, so it is never
+    summarised again (a client message that only starts with the same header is an ordinary user turn). Reasoning
+    inside the summarised range is not compared (the summary ignores it).
+  - The coldness probe (`EngineCore::has_private_reuse`) is posted to the worker, which answers it between cycles: it
+    plans a copy of the prepared prompt and is warm when the prefix index holds a valid non-SharedPrefix checkpoint
+    the prompt starts with, or when the context store holds an image on this binding (local, or listed from the
+    bucket) whose checkpoint the prompt starts with deeper than the product prompt — the same keys admission's
+    hydration compares, without its cost gate. A bucket image no listing has registered yet stays cold. The caller
+    waits 250 ms (a decode cycle is far shorter, a prefill step longer); no answer is a timeout, treated as warm,
+    counted in `ninfer_lossy_prefill_summary_probe_timeouts_total` and logged as `lossy_prefill.summary_probe`
+    (`cold`, `warm`, `timeout`; null when the prompt was too short to probe). A suspended or stopping Engine answers
+    warm.
   - Under `summary` the core never scouts (no scout scratch is allocated) and the selection knobs are ignored; the
     Program's dense/single-device refusal still applies. Usage `prompt_tokens` and prompt progress count the client's
     rendered prompt (which must fit `max_context`); cached tokens map through the shared head and tail
-    (`SummaryRewrite::original_frontier`). `lossy_prefill` in the request log has `strategy`, and for a summary
-    `summarized_messages` ([first, last) in the client's indices, the newest) and `summary_reused`; counters
-    `ninfer_lossy_prefill_summaries_total{kind="new|reused"}`.
+    (`SummaryRewrite::original_frontier`). The requested output is capped at `max_context` − the client's prompt + 1,
+    as if the original had been prefilled; the backlog prices the submitted (summarised) length. `lossy_prefill` in
+    the request log has `strategy`, and for a summary `summarized_messages` ([first, last) in the client's indices,
+    the newest), `summary_reused` and `summary_probe`. A rewritten prompt (new or a substituted summary) is
+    `outcome: completed` and a long prompt the probe left whole is `skipped`; `ninfer_lossy_prefill_total` counts the
+    same outcomes, and `ninfer_lossy_prefill_summaries_total{kind="new|reused"}` splits the completed ones.
 
 ## Expected numbers (predicted, 27B, 100K uncached, chunk 4096)
 
@@ -386,8 +397,9 @@ pass times separately, neighbour worst gap with layer slices on, peak KV pages d
 ## Observability
 
 - Counters: lossy prefills started/skipped/completed, tokens scouted, tokens kept, alias hits.
-- Request log (`--request-log-jsonl`): `lossy_prefill: {uncached_tokens, kept_tokens, filter_layer,
-  scout_ms, main_ms}` when used. `--request-log-lossy-detail` adds `kept_runs`, the kept offsets of U as
+- Request log (`--request-log-jsonl`): `lossy_prefill: {outcome, strategy, uncached_tokens, kept_tokens,
+  filter_layer, scout_ms, main_ms}` when used (a summary adds `summarized_messages`, `summary_reused`,
+  `summary_probe`). `--request-log-lossy-detail` adds `kept_runs`, the kept offsets of U as
   `[begin, end)` pairs (all of U when skipped, none when declined), which the sweep's Jaccard reads.
 - `ninfer_prefill_backlog_seconds` / `/v1/load` predict the lossy cost for requests that will take the path.
 
