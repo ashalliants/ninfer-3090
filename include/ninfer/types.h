@@ -1334,6 +1334,10 @@ struct LossyPrefillReport {
     double scout_ms               = 0.0;
     // Prefill after the selection: the kept tokens (or all of U when nothing was dropped).
     double main_ms                = 0.0;
+    // The kept offsets of the filtered part as [begin, end) runs, ascending: all of it when
+    // skipped, none when declined or aborted. Serve logs them only under
+    // --request-log-lossy-detail (the int4 scout's kept-block overlap gate reads them).
+    std::vector<std::array<std::uint32_t, 2>> kept_runs;
 };
 
 struct GenerationResult {

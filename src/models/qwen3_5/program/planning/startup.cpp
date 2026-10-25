@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <initializer_list>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -415,12 +416,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                             ops::linear_add_workspace_capacity_bytes(
                                 p.weight.qtype, p.weight.n, p.weight.k, p.policy, first, last)));
     };
-    const auto target_body = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
-                                 std::int32_t last, TextPhase phase, GdnWorkspacePath path,
-                                 std::int32_t batch_size, std::int32_t min_width,
-                                 std::int32_t max_width,
-                                 ops::CausalAttentionExecutionEnvelope envelope) {
-        for (const auto& block : parameters.text.layers) {
+    // `layers` is the model's own parameters everywhere but the int4 scout (scout_a4_layers).
+    const auto target_layers = [&](WorkspaceLayoutBuilder& layout,
+                                   std::span<const execution::BlockParameters> layers,
+                                   std::int32_t first, std::int32_t last, TextPhase phase,
+                                   GdnWorkspacePath path, std::int32_t batch_size,
+                                   std::int32_t min_width, std::int32_t max_width,
+                                   ops::CausalAttentionExecutionEnvelope envelope) {
+        for (const auto& block : layers) {
             {
                 auto stage = layout.scope();
                 if (const auto* attention =
@@ -473,6 +476,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         if (!plan.causal_scoring) {
             linear_scratch(layout, parameters.text.output_head, first, last);
         }
+    };
+    const auto target_body = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
+                                 std::int32_t last, TextPhase phase, GdnWorkspacePath path,
+                                 std::int32_t batch_size, std::int32_t min_width,
+                                 std::int32_t max_width,
+                                 ops::CausalAttentionExecutionEnvelope envelope) {
+        target_layers(layout, parameters.text.layers, first, last, phase, path, batch_size,
+                      min_width, max_width, envelope);
     };
     const auto mtp_post_mixer = [&](WorkspaceLayoutBuilder& layout, int first, int last) {
         linear_scratch(layout, parameters.mtp->output, first, last);
@@ -844,25 +855,38 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     if (scout_planned(plan)) {
         // A scout chunk: the prefill roots, the layers below the filter layer, then the filter
         // layer's attention input and the key-mass reduction over every key the Program can hold.
-        const auto& filter_block = parameters.text.layers.at(plan.lossy_prefill.filter_layer);
-        const auto& filter_attention =
-            std::get<execution::AttentionParameters>(filter_block.mixer);
-        WorkspaceLayoutBuilder scout;
-        text_common_root(scout, chunk);
-        target_body(scout, 1, chunk, qwen3_5::TextPhase::Prefill, GdnWorkspacePath::Prefill, 1, 1,
-                    chunk, text_envelope);
-        {
-            auto filter = scout.scope();
-            (void)workspace::text_attention_projection(scout, config, chunk);
-            scratch(scout,
-                    execution::attention_projection_workspace_bytes(filter_attention, 1, chunk));
-            (void)workspace::text_attention_results(scout, config, chunk);
-            scratch(scout, ops::attention_key_mass_workspace_capacity_bytes(
-                               dimension(config.attention->num_attention_heads),
-                               static_cast<std::int32_t>(plan.lossy_prefill.query_rows),
-                               static_cast<std::int32_t>(plan.capacity)));
+        // The int4 scout (--lossy-prefill-scout-a4) runs its own copies of layers
+        // [0, filter_layer], whose Q4 projections stage int4 activations (and gate_up its whole
+        // gate/up plane for the separate SwiGLU); they are planned only when it is on.
+        const std::vector<execution::BlockParameters> a4_layers =
+            plan.lossy_prefill.scout_a4
+                ? execution::scout_a4_layers(parameters.text, plan.lossy_prefill.filter_layer)
+                : std::vector<execution::BlockParameters>{};
+        const auto scout_body = [&](std::span<const execution::BlockParameters> layers) {
+            const auto& filter_block = layers[plan.lossy_prefill.filter_layer];
+            const auto& filter_attention =
+                std::get<execution::AttentionParameters>(filter_block.mixer);
+            WorkspaceLayoutBuilder scout;
+            text_common_root(scout, chunk);
+            target_layers(scout, layers, 1, chunk, qwen3_5::TextPhase::Prefill,
+                          GdnWorkspacePath::Prefill, 1, 1, chunk, text_envelope);
+            {
+                auto filter = scout.scope();
+                (void)workspace::text_attention_projection(scout, config, chunk);
+                scratch(scout,
+                        execution::attention_projection_workspace_bytes(filter_attention, 1, chunk));
+                (void)workspace::text_attention_results(scout, config, chunk);
+                scratch(scout, ops::attention_key_mass_workspace_capacity_bytes(
+                                   dimension(config.attention->num_attention_heads),
+                                   static_cast<std::int32_t>(plan.lossy_prefill.query_rows),
+                                   static_cast<std::int32_t>(plan.capacity)));
+            }
+            return finish(scout);
+        };
+        out.scout_prefill = scout_body(parameters.text.layers);
+        if (!a4_layers.empty()) {
+            out.scout_prefill = std::max(out.scout_prefill, scout_body(a4_layers));
         }
-        out.scout_prefill = finish(scout);
     }
 
     out.general_capacity =
@@ -940,6 +964,18 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
                                options.lossy_prefill.filter_layer);
         if (options.lossy_prefill.query_rows == 0 || options.lossy_prefill.query_rows > 256) {
             throw std::invalid_argument("lossy prefill query rows must be in [1,256]");
+        }
+        // The int4 scout replaces the integer-A8 prefill route of the Q4 matrices; with none on
+        // that route (no --prefill-a8, or a build without the sm86 integer routes) it would
+        // silently be the int8 scout.
+        if (options.lossy_prefill.scout_a4) {
+            const auto layers =
+                execution::scout_a4_layers(parameters.text, options.lossy_prefill.filter_layer);
+            if (std::none_of(layers.begin(), layers.end(), execution::holds_scout_policy)) {
+                throw std::invalid_argument(
+                    "--lossy-prefill-scout-a4 needs Q4 projections on the integer-A8 prefill "
+                    "route (--prefill-a8 on an sm86 build)");
+            }
         }
     }
     if (parameters.draft &&

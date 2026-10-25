@@ -2,6 +2,7 @@
 #include "models/qwen3_5/program/lossy/selection.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
@@ -12,6 +13,7 @@
 namespace {
 
 using ninfer::LossyPrefillOptions;
+using ninfer::models::qwen3_5::detail::kept_runs;
 using ninfer::models::qwen3_5::detail::select_tokens;
 using ninfer::models::qwen3_5::detail::SelectionInput;
 using ninfer::models::qwen3_5::detail::SelectionResult;
@@ -125,6 +127,36 @@ void test_forced_exceeds_budget() {
     for (std::uint32_t i = 7000; i < n; ++i) require(contains(r, i), "recent kept");
 }
 
+void test_kept_runs() {
+    // Maximal runs of consecutive offsets, [begin, end).
+    const std::vector<std::uint32_t> kept{0, 1, 2, 5, 7, 8, 63, 64, 65};
+    const auto runs = kept_runs(kept);
+    require(runs.size() == 4 && runs[0] == std::array<std::uint32_t, 2>{0, 3} &&
+                runs[1] == std::array<std::uint32_t, 2>{5, 6} &&
+                runs[2] == std::array<std::uint32_t, 2>{7, 9} &&
+                runs[3] == std::array<std::uint32_t, 2>{63, 66},
+            "kept runs");
+    require(kept_runs(std::vector<std::uint32_t>{}).empty(), "no kept offsets, no runs");
+    bool threw = false;
+    try {
+        (void)kept_runs(std::vector<std::uint32_t>{3, 3});
+    } catch (const std::invalid_argument&) { threw = true; }
+    require(threw, "kept runs refuse repeated offsets");
+    // A selection's runs cover exactly its kept offsets.
+    const std::size_t n = 5000;
+    std::vector<float> scores(n, 0.0F);
+    for (std::size_t i = 1000; i < 1300; ++i) scores[i] = 1.0F;
+    std::vector<std::uint8_t> forced(n, 0);
+    const auto r     = select_tokens({scores, forced}, make_options(0.3F, 64, 512));
+    std::size_t total = 0;
+    for (const auto& run : kept_runs(r.kept)) {
+        require(run[0] < run[1], "a run is non-empty");
+        total += run[1] - run[0];
+        for (std::uint32_t i = run[0]; i < run[1]; ++i) require(contains(r, i), "run inside kept");
+    }
+    require(total == r.kept.size(), "runs cover the kept offsets");
+}
+
 } // namespace
 
 int main() {
@@ -136,6 +168,7 @@ int main() {
         test_deterministic();
         test_sorted_unique();
         test_forced_exceeds_budget();
+        test_kept_runs();
         std::cout << "lossy selection tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

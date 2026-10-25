@@ -646,6 +646,26 @@ int main() {
                                                              {"scout_ms", 12.5},
                                                              {"main_ms", 40.25}},
                       "the lossy prefill fields are missing from the request log");
+    // kept_runs appear only under --request-log-lossy-detail.
+    observed.metrics.lossy_prefill->kept_runs = {{0, 256}, {1024, 1088}, {33856, 37952}};
+    failures += check(
+        !Json::parse(format_request_done_json("serve-test", 3003, context, observed))
+             .at("lossy_prefill")
+             .contains("kept_runs"),
+        "kept_runs were logged without --request-log-lossy-detail");
+    const auto detailed_done =
+        Json::parse(format_request_done_json("serve-test", 3003, context, observed, true));
+    failures += check(detailed_done.at("lossy_prefill").at("kept_runs") ==
+                              Json::array({Json::array({0, 256}), Json::array({1024, 1088}),
+                                           Json::array({33856, 37952})}) &&
+                          detailed_done.at("lossy_prefill").at("kept_tokens") == 7591,
+                      "--request-log-lossy-detail did not log the kept runs");
+    observed.metrics.lossy_prefill->kept_runs.clear();
+    failures += check(Json::parse(format_request_done_json("serve-test", 3003, context, observed,
+                                                           true))
+                              .at("lossy_prefill")
+                              .at("kept_runs") == Json::array(),
+                      "an empty kept run list is not an empty array");
     observed.metrics.lossy_prefill.reset();
 
     const ninfer::GenerationSchedulingObservation scheduling{

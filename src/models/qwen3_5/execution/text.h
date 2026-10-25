@@ -89,6 +89,9 @@ struct ScoutScratch {
     Tensor filter_keys;  // BF16 [head_dim, kv_heads, capacity], rows [0, |U|)
     Tensor last_queries; // BF16 [head_dim, q_heads, query_rows]
     Tensor scores;       // F32 [capacity]
+    // The int4 scout's layers [0, filter_layer] (scout_a4_layers); empty runs the int8 scout on
+    // the model's own parameters. Only scout_chunk reads them.
+    std::span<const BlockParameters> a4_layers;
 };
 
 class VisionPrefillSession;
@@ -333,6 +336,9 @@ private:
     GdnStateAction gdn_state_action_          = GdnStateAction::UpdateInPlace;
     const GdnReplayRecords* replay_records_   = nullptr;
     std::int64_t prefill_split_frontier_      = -1;
+    // The int4 scout's layer parameters while scout_chunk runs (ScoutScratch::a4_layers); empty
+    // everywhere else, so every other pass reads the model's own parameters.
+    std::span<const BlockParameters> scout_layers_{};
     PrefillSliceState* prefill_slice_         = nullptr;
     Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
     std::uint32_t mtp_proposal_extent_        = 0;

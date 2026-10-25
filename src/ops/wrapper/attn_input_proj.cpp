@@ -15,6 +15,7 @@
 #include "ops/linear/nvfp4/nvfp4_layout.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -94,9 +95,18 @@ void validate_policy(LinearPolicy policy) {
     // this policy means exactly what AllowA8Int means, and is accepted rather than rejected so that
     // one engine-wide setting does not have to be threaded per Op.
     case LinearPolicy::AllowPrefillCublas:
+    // The lossy scout's int4 route, registered for the split Q4/Q5 pair only.
+    case LinearPolicy::ScoutA4Int:
         return;
     }
     throw std::invalid_argument("attn_input_proj: invalid compute policy");
+}
+
+// Only the split Q4/Q5 pair has a ScoutA4Int route; every other form refuses the policy.
+void reject_scout_a4(LinearPolicy policy) {
+    if (allows_scout_a4(policy)) {
+        throw std::invalid_argument("attn_input_proj: ScoutA4Int needs the split Q4/Q5 pair");
+    }
 }
 
 // No single-parent qtype registers an integer-activation route, and their resolvers reject a policy
@@ -109,6 +119,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
                             Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                             cudaStream_t stream) {
     validate_policy(policy);
+    reject_scout_a4(policy);
     policy = without_integer(policy);
     if (weight.qtype == QType::BF16) {
         constexpr std::int32_t kHidden = 5120;
@@ -189,6 +200,7 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
                                                      std::int32_t min_tokens,
                                                      std::int32_t max_tokens) {
     validate_policy(policy);
+    reject_scout_a4(policy);
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("attn_input_proj workspace: invalid token interval");
     }
@@ -301,11 +313,19 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
                      LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream) {
     validate_policy(policy);
+    if (query_key_weight.qtype == QType::T2_G128_FP16) { reject_scout_a4(policy); }
     if (t2_pair_project(x, query_key_weight, gate_value_weight, q, gate, k, v, policy, &workspace,
                         stream)) {
         return;
     }
     require_split_profile(x, query_key_weight, gate_value_weight, q, gate, k, v);
+    // The lossy scout's int4 route replaces the integer route where that one would run.
+    if (allows_scout_a4(policy) &&
+        detail::q4_q5_attn_input_a8_supported(query_key_weight, gate_value_weight, x.ne[1])) {
+        detail::q4_q5_attn_input_scout_a4_launch(x, query_key_weight, gate_value_weight, q, gate,
+                                                 k, v, workspace, stream);
+        return;
+    }
     // Both parents split into a query/gate half and a key/value half, and both read the same
     // activations, so the cuBLAS route materialises each parent once and shares one quantisation
     // across all four destinations.
@@ -342,6 +362,7 @@ std::size_t attn_input_proj_split_workspace_capacity_bytes(
         throw std::invalid_argument("attn_input_proj workspace: invalid token interval");
     }
     if (query_key_qtype == QType::T2_G128_FP16 || gate_value_qtype == QType::T2_G128_FP16) {
+        reject_scout_a4(policy);
         if (query_key_qtype != gate_value_qtype || query_key_rows != 7168 ||
             gate_value_rows != 7168 || input_rows != 5120) {
             throw std::invalid_argument("attn_input_proj workspace: unregistered T2 pair");
@@ -360,6 +381,11 @@ std::size_t attn_input_proj_split_workspace_capacity_bytes(
     if (!allows_a8_int(policy) || !registered) { return 0; }
     const std::size_t a8 = detail::q4_q5_attn_input_a8_workspace_capacity_bytes(min_tokens,
                                                                                 max_tokens);
+    if (allows_scout_a4(policy)) {
+        // Both routes decline the same widths, and the int4 one holds the s8 planes too.
+        return std::max(a8, detail::q4_q5_attn_input_scout_a4_workspace_capacity_bytes(
+                                min_tokens, max_tokens));
+    }
     if (allows_cublas_prefill(policy) && max_tokens >= kCublasPrefillMinTokens) {
         return std::max(a8, detail::w4_cublas_projection_workspace_capacity_bytes(
                                 std::max(query_key_rows, gate_value_rows), input_rows,

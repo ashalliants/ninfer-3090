@@ -101,4 +101,19 @@ SelectionResult select_tokens(const SelectionInput& input, const LossyPrefillOpt
     return result;
 }
 
+std::vector<std::array<std::uint32_t, 2>> kept_runs(std::span<const std::uint32_t> kept) {
+    std::vector<std::array<std::uint32_t, 2>> runs;
+    for (std::size_t i = 0; i < kept.size(); ++i) {
+        if (i != 0 && kept[i] <= kept[i - 1]) {
+            throw std::invalid_argument("kept offsets must be ascending and unique");
+        }
+        if (!runs.empty() && runs.back()[1] == kept[i]) {
+            runs.back()[1] = kept[i] + 1;
+        } else {
+            runs.push_back({kept[i], kept[i] + 1});
+        }
+    }
+    return runs;
+}
+
 } // namespace ninfer::models::qwen3_5::detail

@@ -248,6 +248,30 @@ costs about 7% relative L2 on outlier-free activations (cosine about 0.997 again
 20% (cosine about 0.98) when every 431st channel is 24x, because such a channel zeroes the other 63 of its
 group; whether that spoils the ranking is the Jaccard gate's question.
 
+As built (routing, 2026-10-25, **compiled, not run**): `--lossy-prefill-scout-a4` gives the scout its own
+copies of layers `[0, L]` (`execution::scout_a4_layers`, held by the Program's scout buffers) in which every
+Q4 matrix already on the integer-A8 prefill route carries `LinearPolicy::ScoutA4Int`; the model's own
+parameters never hold it (asserted when they are built, and `run_stage_layers` refuses the copies outside
+the scout's prefill pass). Under that policy, at exactly the widths the A8 route serves (full 128-token tiles):
+
+- `linear_swiglu` (gate_up, Q4): `quantize_a4_g64`, one `q4_a4_linear` over all 34816 gate/up rows into a
+  staged plane, then `silu_mul` over its halves (the A8 route fuses SwiGLU; this one cannot).
+- `linear_add` (down and the mixer outputs, where Q4): `quantize_a4_g64`, `q4_a4_linear`, `residual_add`.
+  Q5 matrices are not promoted and keep their own route (A8, or cuBLAS under `--prefill-cublas`).
+- split `attn_input_proj`: q and k from row slices of the Q4 parent through `q4_a4_linear` straight into
+  their tensors; gate and v from the Q5 parent through the A8 route (its own s8 activations), also
+  under `--prefill-cublas`, whose route takes the pair whole.
+- split `gdn_input_proj`: query/key rows through `q4_a4_linear` into a staged `[4096,T]` plane copied
+  into the head of each `qkv` column (`cudaMemcpy2DAsync`); value and z through the A8 route.
+
+Any other Op rejects the policy (`valid_linear_policy` excludes it). Unaligned final chunks take whatever
+the int8 scout takes there (A16). The scout's workspace plan adds the int4 planes only when the option is on,
+and startup refuses the option when no Q4 matrix is on the integer route (no `--prefill-a8`). Gate
+evidence: `ninfer_qwen3_5_scout_a4_kept_overlap_real_test` (32K and 100K haystacks: kept-block Jaccard
+>= 0.9, pass key kept by both), the `PERF ... scout` lines of `ninfer_q4_a4_linear_test` (the Op under
+`ScoutA4Int` against the same Op under `AllowA8Int`, so gate_up's separate SwiGLU is counted), and the
+sweep's `--workloads jaccard`.
+
 ### Alternative strategy: deterministic conversation summary (`--lossy-prefill-strategy summary`)
 
 Added 2026-10-25 at the user's request as a flagged option for comparison, not the production choice.
@@ -341,7 +365,8 @@ pass times separately, neighbour worst gap with layer slices on, peak KV pages d
 
 - Counters: lossy prefills started/skipped/completed, tokens scouted, tokens kept, alias hits.
 - Request log (`--request-log-jsonl`): `lossy_prefill: {uncached_tokens, kept_tokens, filter_layer,
-  scout_ms, main_ms}` when used.
+  scout_ms, main_ms}` when used. `--request-log-lossy-detail` adds `kept_runs`, the kept offsets of U as
+  `[begin, end)` pairs (all of U when skipped, none when declined), which the sweep's Jaccard reads.
 - `ninfer_prefill_backlog_seconds` / `/v1/load` predict the lossy cost for requests that will take the path.
 
 As built (engine): `ninfer_lossy_prefill_total{outcome="completed|skipped|aborted"}`, where

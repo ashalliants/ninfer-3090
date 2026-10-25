@@ -89,6 +89,8 @@ struct LossyOutcome {
     bool skipped                  = false;
     double scout_seconds          = 0.0;
     bool declined                 = false;
+    // The fake keeps the first kept_tokens of U: one run.
+    std::vector<std::array<std::uint32_t, 2>> kept_runs;
 };
 
 struct SequenceHandle {
@@ -1112,7 +1114,8 @@ private:
                                  .uncached_tokens = span,
                                  .kept_tokens     = kept,
                                  .skipped         = kept == span,
-                                 .scout_seconds   = lossy.scout_seconds};
+                                 .scout_seconds   = lossy.scout_seconds,
+                                 .kept_runs       = {{0U, kept}}};
             if (kept != span) {
                 lane.base_plan          = lane.base_plan.compacted(lossy.exact_end, kept);
                 lane.prompt             = lossy.exact_end + kept;

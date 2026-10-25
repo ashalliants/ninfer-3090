@@ -457,6 +457,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             buffers.gdn_saved = std::make_unique<LinearAttentionStatePool>(backing, *layout.gdn_state);
         }
         buffers.filter_layer = layout.filter_layer;
+        if (plan.lossy_prefill.scout_a4) {
+            buffers.a4_layers         = execution::scout_a4_layers(parameters.text, layout.filter_layer);
+            buffers.scratch.a4_layers = buffers.a4_layers;
+        }
         lossy_options        = plan.lossy_prefill;
         // Selection always keeps the chat structure: role markers, tool-call delimiters and every
         // other added token of the tokenizer, special or not.

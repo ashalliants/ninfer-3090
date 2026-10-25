@@ -2029,6 +2029,7 @@ private:
                 report.uncached_tokens    = outcome.uncached_tokens;
                 report.kept_tokens        = outcome.kept_tokens;
                 report.scout_ms           = outcome.scout_seconds * 1000.0;
+                report.kept_runs          = outcome.kept_runs;
                 report.outcome            = outcome.declined ? LossyPrefillOutcome::Declined
                                             : outcome.skipped ? LossyPrefillOutcome::Skipped
                                                               : LossyPrefillOutcome::Completed;

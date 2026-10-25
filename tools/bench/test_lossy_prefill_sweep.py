@@ -299,6 +299,76 @@ def test_greedy_generate_needs_the_log_record():
             server.shutdown()
 
 
+def test_kept_blocks_and_jaccard():
+    # Blocks of 64 kept whole; a partial run covers no block; the last block is clipped to the span.
+    check(sweep.kept_blocks([[0, 128], [130, 200], [256, 300]], 300, 64) == {0, 1, 4}, "whole blocks only")
+    check(sweep.kept_blocks([[10, 70]], 300, 64) == set(), "a run inside two blocks keeps neither")
+    # scored_only drops the forced head (first 64) and recent (last 100 -> blocks ending past 200).
+    check(sweep.kept_blocks([[0, 300]], 300, 64, True, 64, 100) == {1, 2}, "head and recent left out")
+    check(sweep.jaccard({1, 2, 3}, {2, 3, 4}) == 0.5 and sweep.jaccard(set(), set()) == 1.0, "jaccard")
+
+
+def jaccard_rows(a4_runs, int8_runs, outcome="completed", uncached=1000):
+    def kept(runs):
+        return [{"prompt": i, "outcome": outcome, "uncached_tokens": uncached, "kept_runs": r}
+                for i, r in enumerate(runs)]
+    common = {"block": "64", "strategy": "select"}
+    return [
+        {"point": "b64_a1", "params": dict(common, scout_a4="1"), "workload": "jaccard", "ok": True,
+         "error": None, "metrics": {"kept": kept(a4_runs), "lossy_outcomes": LOSSY}},
+        {"point": "b64_a0", "params": dict(common, scout_a4="0"), "workload": "jaccard", "ok": True,
+         "error": None, "metrics": {"kept": kept(int8_runs), "lossy_outcomes": LOSSY}},
+    ]
+
+
+def test_jaccard_gate():
+    same = [[[0, 640]], [[0, 64], [640, 1000]]]
+    rows = BASE + jaccard_rows(same, same)
+    check(sweep.scout_a4_partner(rows, "b64_a1") == "b64_a0", "the partner is the scout_a4=0 twin")
+    check(sweep.scout_a4_partner(rows, "b64_a0") is None, "an int8 point has no partner")
+    gate = checks(rows, "b64_a1")["jaccard"]
+    check(gate["pass"] is True and gate["value"] == 1.0, gate)
+    check("jaccard" not in checks(rows, "b64_a0"), "only the a4 point carries the gate")
+    # 9 of 10 blocks shared -> 0.9 passes; 8 of 10 -> 0.8 fails (the minimum over prompts).
+    tenth = [[[0, 640]], [[0, 640]]]
+    nine = [[[0, 576], [640, 704]], [[0, 640]]]
+    eight = [[[0, 512], [640, 768]], [[0, 640]]]
+    check(abs(checks(BASE + jaccard_rows(nine, tenth), "b64_a1")["jaccard"]["value"] - 9 / 11) < 1e-9,
+          "9 shared of 11 distinct blocks")
+    check(checks(BASE + jaccard_rows(nine, tenth), "b64_a1")["jaccard"]["pass"] is False, "9/11 < 0.9 fails")
+    check(checks(BASE + jaccard_rows(eight, tenth), "b64_a1")["jaccard"]["pass"] is False, "0.67 fails")
+    nineteen = [[[0, 1216]], [[0, 1216]]]
+    near = [[[0, 1152], [1216, 1280]], [[0, 1216]]]
+    near_rows = BASE + jaccard_rows(near, nineteen, uncached=2000)
+    value = checks(near_rows, "b64_a1")["jaccard"]["value"]
+    check(abs(value - 18 / 20) < 1e-9 and checks(near_rows, "b64_a1")["jaccard"]["pass"] is True,
+          ("18/20 = 0.9 passes", value))
+    # A prompt that did not complete lossy prefill on one side fails rather than being skipped.
+    broken = jaccard_rows(same, same)
+    broken[1]["metrics"]["kept"][1]["outcome"] = "skipped"
+    gate = checks(BASE + broken, "b64_a1")["jaccard"]
+    check(gate["pass"] is False and "unmatched" in gate["detail"], gate)
+    # Without the partner's rows the gate is not measured, and the point is INCOMPLETE, not PASS.
+    alone = BASE + jaccard_rows(same, same)[:1]
+    check(checks(alone, "b64_a1")["jaccard"]["pass"] is None, "no partner, not measured")
+    text = sweep.render_summary(BASE + jaccard_rows(same, same))
+    check("## Int4 scout" in text and "| b64_a1 | b64_a0 | 2 | 1.000 |" in text, text)
+
+
+def test_jaccard_record_needs_the_detail_flag():
+    rec = sweep.jaccard_record(3, {"outcome": "completed", "uncached_tokens": 10, "kept_tokens": 4,
+                                   "kept_runs": [[0, 4]]})
+    check(rec["prompt"] == 3 and rec["kept_runs"] == [[0, 4]], rec)
+    check(sweep.jaccard_record(1, None)["outcome"] is None, "a request without lossy prefill")
+    try:
+        sweep.jaccard_record(1, {"outcome": "completed"})
+        check(False, "a record without kept_runs must fail")
+    except RuntimeError:
+        pass
+    args = sweep.parse_args(["--from-json", "x.jsonl", "--workloads", "jaccard"])
+    check(args.workload_names == ["jaccard"] and "jaccard" not in sweep.WORKLOADS, "jaccard is opt-in")
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 for t in TESTS:
     t()

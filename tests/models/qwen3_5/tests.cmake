@@ -177,6 +177,13 @@ add_test(NAME ninfer_qwen3_5_mtp_after_lossy_real_test
 set_tests_properties(ninfer_qwen3_5_mtp_after_lossy_real_test PROPERTIES
   ENVIRONMENT "NINFER_LOSSY_SPEC_REAL=mtp")
 
+# scout_a4_kept_overlap: the int4 lossy scout (--lossy-prefill-scout-a4) against the int8 one on 32K
+# and 100K haystack prompts (rk4v4, max_context 110592): kept-block Jaccard >= 0.9, and both keep
+# the pass key.
+ninfer_add_test(ninfer_qwen3_5_scout_a4_kept_overlap_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_scout_a4_real.cpp"
+  LIBRARIES ninfer_engine)
+
 # A real-model test owns the single GPU while its artifact is resident.
 set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_loading_real_test
@@ -186,6 +193,7 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_lossy_prefill_real_test
   ninfer_qwen3_5_dflash2_after_lossy_real_test
   ninfer_qwen3_5_mtp_after_lossy_real_test
+  ninfer_qwen3_5_scout_a4_kept_overlap_real_test
   ninfer_qwen3_5_context_store_real_test
   ninfer_qwen3_5_context_store_dflash2_real_test
   ninfer_qwen3_5_context_store_ngram_real_test
@@ -225,6 +233,12 @@ ninfer_add_test(ninfer_qwen3_5_speculative_round_shapes_test
 
 ninfer_add_test(ninfer_qwen3_5_mlp_a8_decode_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mlp_a8_decode_wiring.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_ops)
+
+# The int4 lossy scout's host-side wiring: which matrices go int4, its scratch planning, and every
+# other Op refusing the policy.
+ninfer_add_test(ninfer_qwen3_5_scout_a4_wiring_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_scout_a4_wiring.cpp"
   LIBRARIES ninfer_model_runtime ninfer_ops)
 
 # Token selection for lossy long-prefill. selection.cpp is compiled into the test directly, so it

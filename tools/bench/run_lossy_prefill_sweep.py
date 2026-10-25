@@ -26,6 +26,13 @@ needle accuracy at 32K/64K/100K >= 95% of baseline; agent-replay Edit exact-matc
 file) no more than 2 points under baseline; 100K cold prefill <= 40% of the baseline's time.
 Greedy agreement (first divergence from the baseline's greedy output) replaces the spec's
 teacher-forced KL in v1 and has no pass/fail threshold; it is reported only.
+
+Int4 scout gate (`--workloads jaccard`, opt-in, not in the default list): a `scout_a4=1` point and
+its partner (the same knobs with scout_a4 off) each send the same long prompts; the kept-block
+Jaccard between the two runs' `lossy_prefill.kept_runs` (logged under --request-log-lossy-detail,
+which the harness adds for this workload) must be >= 0.9 on every prompt. The rest of that gate --
+quality unchanged within noise, scout GEMMs >= 1.4x -- is the a4 point's own quality rows against
+its partner's, and the GPU test ninfer_q4_a4_linear_test's PERF lines.
 """
 
 from __future__ import annotations
@@ -61,7 +68,19 @@ SPEED_LAYER_SLICES = 8
 GREEDY_PROMPTS = 20
 
 WORKLOADS = ("needle", "agent_replay", "greedy_agreement", "speed")
+# Run only when named in --workloads.
+OPTIONAL_WORKLOADS = ("jaccard",)
+ALL_WORKLOADS = WORKLOADS + OPTIONAL_WORKLOADS
 BASELINE = "baseline"
+
+# The int4 scout's ranking gate (fixed): kept-block Jaccard against the int8 scout, every prompt.
+JACCARD_MIN = 0.9
+# Jaccard prompts: cut from the repository like the greedy ones, ~32K and ~100K tokens at 3.3
+# chars/token, JACCARD_PROMPTS of each size.
+JACCARD_CHARS = (105_000, 330_000)
+JACCARD_PROMPTS = 3
+# The server's selection defaults, for points that leave the knob out.
+SELECTION_DEFAULTS = {"block": 64, "head": 256, "recent": 4096}
 
 # ---- grid ------------------------------------------------------------------------------------
 
@@ -153,6 +172,87 @@ def lossy_flags(params: dict[str, str]) -> list[str]:
     if params.get("strategy") == "summary":
         flags += ["--lossy-prefill-strategy", "summary"]
     return flags
+
+
+# ---- kept-block overlap (the int4 scout's gate) -----------------------------------------------
+
+def kept_blocks(runs: Sequence[Sequence[int]], uncached: int, block: int, scored_only: bool = False,
+                head: int = 0, recent: int = 0) -> set[int]:
+    """Blocks of `block` tokens (the last one clipped to the span of `uncached` tokens) that the
+    [begin, end) runs keep whole. `scored_only` leaves out the blocks the head and recent rules
+    force (any block starting before `head` or ending in the last `recent` tokens), so only the
+    blocks the scores chose are compared."""
+    out: set[int] = set()
+    for begin, end in runs:
+        b = (begin + block - 1) // block
+        while b * block < end:
+            lo, hi = b * block, min(b * block + block, uncached)
+            if hi > end:
+                break
+            if not (scored_only and (lo < head or hi + recent > uncached)):
+                out.add(b)
+            b += 1
+    return out
+
+
+def jaccard(a: set[int], b: set[int]) -> float:
+    either = len(a | b)
+    return 1.0 if either == 0 else len(a & b) / either
+
+
+def point_params(rows: list[dict[str, Any]], point: str) -> dict[str, str] | None:
+    for row in rows:
+        if row["point"] == point:
+            return row.get("params") or {}
+    return None
+
+
+def scout_a4_partner(rows: list[dict[str, Any]], point: str) -> str | None:
+    """The int8 point a `scout_a4=1` point is compared with: the same params with scout_a4 off
+    (absent or 0). None for any other point, or when no such point has rows."""
+    params = point_params(rows, point)
+    if not params or params.get("scout_a4") != "1":
+        return None
+    want = {k: v for k, v in params.items() if k != "scout_a4"}
+    for row in rows:
+        other = row.get("params") or {}
+        if row["point"] != point and other.get("scout_a4", "0") == "0" and \
+                {k: v for k, v in other.items() if k != "scout_a4"} == want:
+            return row["point"]
+    return None
+
+
+def jaccard_metrics(rows: list[dict[str, Any]], point: str) -> dict[str, Any] | None:
+    """Per-prompt kept-block Jaccard of a scout_a4=1 point against its partner, from both points'
+    `jaccard` rows. None unless both rows exist. A prompt missing from either side, or one that
+    did not complete lossy prefill on both, is listed in `unmatched` and fails the gate."""
+    partner = scout_a4_partner(rows, point)
+    mine = _metric(rows, point, "jaccard")
+    theirs = _metric(rows, partner, "jaccard") if partner else None
+    if mine is None or theirs is None:
+        return None
+    params = point_params(rows, point) or {}
+    block = int(params.get("block", SELECTION_DEFAULTS["block"]))
+    head = int(params.get("head", SELECTION_DEFAULTS["head"]))
+    recent = int(params.get("recent", SELECTION_DEFAULTS["recent"]))
+    by_prompt = {r["prompt"]: r for r in theirs.get("kept") or []}
+    values, scored, unmatched = [], [], []
+    for record in mine.get("kept") or []:
+        other = by_prompt.get(record["prompt"])
+        if other is None or record.get("outcome") != "completed" or other.get("outcome") != "completed" \
+                or record.get("uncached_tokens") != other.get("uncached_tokens"):
+            unmatched.append(record["prompt"])
+            continue
+        n = record["uncached_tokens"]
+        values.append(jaccard(kept_blocks(record["kept_runs"], n, block),
+                              kept_blocks(other["kept_runs"], n, block)))
+        scored.append(jaccard(kept_blocks(record["kept_runs"], n, block, True, head, recent),
+                              kept_blocks(other["kept_runs"], n, block, True, head, recent)))
+    unmatched += [p for p in by_prompt if p not in {r["prompt"] for r in mine.get("kept") or []}]
+    return {"partner": partner, "prompts": len(values), "jaccard": values,
+            "jaccard_min": min(values) if values else None,
+            "jaccard_mean": statistics.fmean(values) if values else None,
+            "scored_min": min(scored) if scored else None, "unmatched": unmatched}
 
 
 def server_command(base_cmd: str, port: int, request_log: Path, params: dict[str, str] | None,
@@ -394,6 +494,18 @@ def speed_metrics(stall_report: dict[str, Any], lossy_record: dict[str, Any] | N
     return out
 
 
+def jaccard_record(prompt: int, lossy: dict[str, Any] | None) -> dict[str, Any]:
+    """One jaccard-workload prompt's kept set from its request_done `lossy_prefill` object, which
+    must carry kept_runs (the server needs --request-log-lossy-detail)."""
+    if not isinstance(lossy, dict):
+        return {"prompt": prompt, "outcome": None, "uncached_tokens": None, "kept_runs": []}
+    if "kept_runs" not in lossy:
+        raise RuntimeError("lossy_prefill has no kept_runs: the server needs --request-log-lossy-detail")
+    return {"prompt": prompt, "outcome": lossy.get("outcome"),
+            "uncached_tokens": lossy.get("uncached_tokens"), "kept_tokens": lossy.get("kept_tokens"),
+            "scout_ms": lossy.get("scout_ms"), "kept_runs": lossy["kept_runs"]}
+
+
 def long_request_lossy_record(request_log: Path, offset: int) -> dict[str, Any] | None:
     """The `lossy_prefill` object with the most uncached tokens among the request_done records
     written after `offset` (the long prompt; the stream's short request never takes the path)."""
@@ -485,8 +597,20 @@ def evaluate_point(rows: list[dict[str, Any]], point: str) -> dict[str, Any]:
                             f"(need <= {TIME_MAX_RATIO:.2f}x)"))
     else:
         checks.append(check("time", None, None, "not measured"))
+    if (point_params(rows, point) or {}).get("scout_a4") == "1":
+        overlap = jaccard_metrics(rows, point)
+        if overlap is None or not overlap["prompts"]:
+            checks.append(check("jaccard", None, None, "not measured (needs the jaccard workload on "
+                                "this point and on its scout_a4=0 partner)"))
+        else:
+            ok = overlap["jaccard_min"] >= JACCARD_MIN - 1e-9 and not overlap["unmatched"]
+            checks.append(check("jaccard", overlap["jaccard_min"], ok,
+                                f"min {overlap['jaccard_min']:.3f} over {overlap['prompts']} prompt(s) vs "
+                                f"`{overlap['partner']}` (need >= {JACCARD_MIN:.2f}); scored blocks only "
+                                f"{overlap['scored_min']:.3f}"
+                                + (f"; unmatched prompts {overlap['unmatched']}" if overlap["unmatched"] else "")))
     if point != BASELINE:
-        for workload in WORKLOADS:
+        for workload in ALL_WORKLOADS:
             metrics = _metric(rows, point, workload)
             if metrics is None:
                 continue
@@ -571,6 +695,26 @@ def render_summary(rows: list[dict[str, Any]]) -> str:
             f"| {num(speed.get('neighbour_gap_max_ms'), '.0f')} | {num(agent.get('tool_call_validity'), '.3f')} "
             f"| {num(agreement['first_divergence_median'], '.0f') if agreement else '-'} "
             f"| {lossy_cell(rows, point)} | {needle_samples(rows, point)} | {ev['verdict']} |")
+    a4_points = [p for p in points_in(rows) if (point_params(rows, p) or {}).get("scout_a4") == "1"]
+    if a4_points:
+        lines += ["", "## Int4 scout (scout_a4=1 against its int8 partner)", "",
+                  f"Gate: kept-block Jaccard >= {JACCARD_MIN} on every prompt; quality as the table above "
+                  "against the partner's row; scout GEMMs >= 1.4x (ninfer_q4_a4_linear_test PERF lines).", "",
+                  "| point | partner | prompts | Jaccard min | Jaccard mean | scored blocks min | scout ms int8 / int4 (speed) | gate |",
+                  "|---|---|---|---|---|---|---|---|"]
+        for point in a4_points:
+            overlap = jaccard_metrics(rows, point)
+            partner = scout_a4_partner(rows, point)
+            mine = (_metric(rows, point, "speed") or {}).get("scout_ms")
+            theirs = (_metric(rows, partner, "speed") or {}).get("scout_ms") if partner else None
+            scout = f"{theirs:.0f} / {mine:.0f} ({theirs / mine:.2f}x)" if mine and theirs else "-"
+            gate = {c["name"]: c for c in evaluate_point(rows, point)["checks"]}["jaccard"]
+            if overlap and overlap["prompts"]:
+                lines.append(f"| {point} | {partner} | {overlap['prompts']} | {overlap['jaccard_min']:.3f} "
+                             f"| {overlap['jaccard_mean']:.3f} | {overlap['scored_min']:.3f} | {scout} "
+                             f"| {_mark(gate, '.3f')} |")
+            else:
+                lines.append(f"| {point} | {partner or '-'} | - | - | - | - | {scout} | - |")
     base_speed = _metric(rows, BASELINE, "speed") or {}
     lines += ["", "Baseline: " + (
         f"100K-class prefill {base_speed['total_s']:.1f} s, neighbour worst gap "
@@ -639,10 +783,14 @@ class Sweep:
     def run_point(self, point: str, params: dict[str, str] | None, workloads: Sequence[str]) -> None:
         done = self.done()
         todo = [w for w in workloads if (point, w) not in done]
+        if point == BASELINE:
+            todo = [w for w in todo if w != "jaccard"]  # lossy prefill is off there: nothing kept
         quality = [w for w in todo if w != "speed"]
         groups = []
         if quality:
-            groups.append(("quality", quality, []))
+            # jaccard reads lossy_prefill.kept_runs, which only the detail flag logs.
+            groups.append(("quality", quality,
+                           ["--request-log-lossy-detail"] if "jaccard" in quality else []))
         if "speed" in todo:
             # The stall probe needs a lane for the stream next to the long prompt; the slices flag is
             # the scheduling setting the neighbour-gap number is defined for.
@@ -732,6 +880,21 @@ class Sweep:
             outputs.append(ids)
         return {"outputs": outputs, "prompts": len(outputs)}
 
+    def workload_jaccard(self, point: str, request_log: Path) -> dict[str, Any]:
+        """The same long prompts on every point (cut from --agent-repo), one output token each; the
+        kept runs of each come from its request_done record."""
+        kept = []
+        cursor = request_log.stat().st_size
+        index = 0
+        for chars in JACCARD_CHARS:
+            for _ in range(self.args.jaccard_prompts):
+                prompt = greedy_prompt(self.args.agent_repo, 1000 + index, chars)
+                record, cursor = chat_request_done(self.base_url, self.args.model, prompt, 1,
+                                                   request_log, cursor)
+                kept.append(jaccard_record(index, record.get("lossy_prefill")))
+                index += 1
+        return {"kept": kept, "prompts": len(kept)}
+
     def workload_speed(self, point: str, request_log: Path) -> dict[str, Any]:
         out = self.out / point / "stall.json"
         out.unlink(missing_ok=True)  # never read a report an earlier run left behind
@@ -790,6 +953,19 @@ def greedy_generate(base_url: str, model: str, prompt: str, max_tokens: int, req
                     cursor: int, wait_seconds: float = 30.0) -> tuple[list[int], int]:
     """Greedy completion; returns the committed token ids from the request log record of this
     response and the log offset to continue from. No fallback to text: a missing record fails."""
+    record, cursor = chat_request_done(base_url, model, prompt, max_tokens, request_log, cursor,
+                                       wait_seconds)
+    ids = (record.get("result") or {}).get("generated_token_ids")
+    if not isinstance(ids, list):
+        raise RuntimeError(f"request log record for {(record.get('request') or {}).get('response_id')} "
+                           "has no generated_token_ids")
+    return ids, cursor
+
+
+def chat_request_done(base_url: str, model: str, prompt: str, max_tokens: int, request_log: Path,
+                      cursor: int, wait_seconds: float = 30.0) -> tuple[dict[str, Any], int]:
+    """Greedy completion; returns this response's request_done record from the request log and the
+    log offset to continue from. A missing record fails."""
     body = json.dumps({"model": model, "temperature": 0, "max_tokens": max_tokens, "stream": False,
                        "messages": [{"role": "user", "content": prompt}],
                        "chat_template_kwargs": {"enable_thinking": False}}).encode()
@@ -813,10 +989,7 @@ def greedy_generate(base_url: str, model: str, prompt: str, max_tokens: int, req
                 except ValueError:
                     continue
                 if record.get("event") == "request_done" and (record.get("request") or {}).get("response_id") == response_id:
-                    ids = (record.get("result") or {}).get("generated_token_ids")
-                    if not isinstance(ids, list):
-                        raise RuntimeError(f"request log record for {response_id} has no generated_token_ids")
-                    return ids, log.tell()
+                    return record, log.tell()
             cursor = log.tell()
         if time.monotonic() > deadline:
             raise RuntimeError(f"no request-log record for response {response_id} after {wait_seconds:.0f} s")
@@ -833,7 +1006,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         help=f"keys: {', '.join(GRID_KEYS)}; omitted knobs keep the server default; "
                         "strategy=select,summary (summary ignores the knobs and runs once)")
     parser.add_argument("--workloads", default=",".join(WORKLOADS), help="comma list of "
-                        + ", ".join(WORKLOADS))
+                        + ", ".join(ALL_WORKLOADS) + f" (default {','.join(WORKLOADS)}; jaccard is the int4 "
+                        "scout's kept-block overlap: run it on a scout_a4=0,1 grid)")
     parser.add_argument("--only", default=None, help="regex: run only the grid points whose id matches")
     parser.add_argument("--out", type=Path, default=Path("profiles/lossy-sweep"))
     parser.add_argument("--from-json", nargs="+", type=Path, default=None, metavar="RESULTS.jsonl",
@@ -861,12 +1035,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--greedy-prompts", type=int, default=GREEDY_PROMPTS)
     parser.add_argument("--greedy-chars", type=int, default=330_000, help="prompt size, characters (~100K tokens at 3.3 chars/token)")
     parser.add_argument("--greedy-max-tokens", type=int, default=96)
+    parser.add_argument("--jaccard-prompts", type=int, default=JACCARD_PROMPTS,
+                        help="jaccard workload prompts per size (~32K and ~100K tokens)")
     parser.add_argument("--speed-tokens", type=int, default=SPEED_LONG_TOKENS)
     parser.add_argument("--words-per-token", type=float, default=None)
     args = parser.parse_args(argv)
     names = [w for w in args.workloads.split(",") if w]
-    if any(w not in WORKLOADS for w in names):
-        parser.error(f"--workloads: choose from {', '.join(WORKLOADS)}")
+    if any(w not in ALL_WORKLOADS for w in names):
+        parser.error(f"--workloads: choose from {', '.join(ALL_WORKLOADS)}")
     args.workload_names = names
     if args.from_json is None:
         if not args.server_cmd or not args.model:

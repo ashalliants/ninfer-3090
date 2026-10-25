@@ -6,6 +6,7 @@
 
 #include "ninfer/types.h"
 
+#include <array>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -27,5 +28,10 @@ struct SelectionResult {
 // descending block score (ties: lower index first) until the budget ceil(keep_fraction * |U|) is
 // reached; the last block may overshoot by less than one block.
 [[nodiscard]] SelectionResult select_tokens(const SelectionInput& input, const LossyPrefillOptions& options);
+
+// The maximal runs of consecutive offsets in `kept` (ascending, unique), as [begin, end) pairs:
+// what the request log's lossy_prefill.kept_runs reports (--request-log-lossy-detail).
+[[nodiscard]] std::vector<std::array<std::uint32_t, 2>>
+kept_runs(std::span<const std::uint32_t> kept);
 
 } // namespace ninfer::models::qwen3_5::detail

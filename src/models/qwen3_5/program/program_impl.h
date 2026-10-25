@@ -578,6 +578,9 @@ public:
         // layer lies below it.
         std::unique_ptr<LinearAttentionStatePool> gdn_saved;
         std::uint32_t filter_layer = 0;
+        // --lossy-prefill-scout-a4: the int4 scout's layer parameters (execution::scout_a4_layers),
+        // which scratch.a4_layers views. Empty for the int8 scout.
+        std::vector<execution::BlockParameters> a4_layers;
     };
     std::optional<ScoutBuffers> scout_buffers;
     struct ScoutSession {

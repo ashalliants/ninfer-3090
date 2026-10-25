@@ -13,10 +13,17 @@
 //      a group holding a 24x channel quantises its other 63 channels to zero at 4 bits, and the
 //      host simulation of exactly these fixtures predicts a cosine of about 0.98 there.
 //   4. Timing at T = 4096 against the A8 routes (printed; the brief's target is >= 1.4x).
+//   5. The lossy scout's routes through the policy-bearing Ops (LinearPolicy::ScoutA4Int): the
+//      LinearSwiGLU route (int4 GEMM over all gate/up rows, then a separate SwiGLU) and the
+//      LinearAdd route (int4 GEMM, then residual_add) must agree with this Op's own output
+//      (cosine >= 0.9999), and at T = 4096 they are timed against the same Ops under AllowA8Int,
+//      whose gate_up route fuses SwiGLU. That ratio is the scout GEMM gate (>= 1.4x).
 //
 // Shapes: the 27B mlp gate_up [34816,5120] and down [5120,17408] at T = 512 and 4096, plus small
 // cases for the N/T tails, odd N, T = 1, the RowSplitPanel layout and FP16 input/output.
 
+#include "ninfer/ops/linear_add.h"
+#include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/q4_a4_linear.h"
 
 #include "ops/linear_swiglu/q4a8/q4a8_linear_swiglu.h"
@@ -51,6 +58,7 @@ namespace a4 = ninfer::test::a4_g64;
 constexpr ReductionCriterion kExactPath{1.0e-2, 0.0, 1.0e-2};
 constexpr double kA8CosineTarget = 0.995;
 constexpr double kSpeedupTarget  = 1.4;
+constexpr double kRouteCosine    = 0.9999;
 
 enum class Fixture { Uniform, Outlier };
 
@@ -336,6 +344,48 @@ int run_case(const Case& c) {
         ++failures;
     }
 
+    // 5. The scout's routes through the policy-bearing Ops, against this Op's own output.
+    std::unique_ptr<GuardedDeviceBuffer> route_out;
+    std::unique_ptr<WorkspaceArena> route_ws;
+    std::function<void(ops::LinearPolicy)> run_route;
+    {
+        const bool gate_up       = c.a8 == A8Route::GateUp;
+        const std::int32_t rows  = gate_up ? c.n / 2 : c.n;
+        const std::size_t words  = static_cast<std::size_t>(rows) * c.t;
+        route_out                = std::make_unique<GuardedDeviceBuffer>(words * sizeof(std::uint16_t));
+        std::size_t route_bytes  = 0;
+        for (const auto policy : {ops::LinearPolicy::ScoutA4Int, ops::LinearPolicy::AllowA8Int}) {
+            route_bytes = std::max(
+                route_bytes, gate_up ? ops::linear_swiglu_workspace_capacity_bytes(
+                                           QType::Q4_G64_FP16, c.n, c.k, policy, c.t, c.t)
+                                     : ops::linear_add_workspace_capacity_bytes(
+                                           QType::Q4_G64_FP16, c.n, c.k, policy, c.t, c.t));
+        }
+        route_ws  = std::make_unique<WorkspaceArena>(std::max<std::size_t>(route_bytes, 256));
+        run_route = [&, gate_up, rows](ops::LinearPolicy policy) {
+            route_ws->reset();
+            Tensor dst(route_out->data(), DType::BF16, {rows, c.t});
+            if (gate_up) {
+                ops::linear_swiglu(tx_bf16, weight, dst, policy, *route_ws, nullptr);
+            } else {
+                ops::linear_add(tx_bf16, weight, dst, policy, *route_ws, nullptr);
+            }
+        };
+        if (!gate_up) { route_out->fill(0); } // a zero residual
+        run_route(ops::LinearPolicy::ScoutA4Int);
+        test::cuda_check(cudaDeviceSynchronize(), "synchronize scout a4 route");
+        failures += route_out->verify_guards(label + " scout route out");
+        const double route_cos = cosine(read_output(*route_out, words, DType::BF16), a4_view);
+        std::cout << "  " << label << ": ScoutA4Int "
+                  << (gate_up ? "linear_swiglu" : "linear_add") << " route vs this Op "
+                  << route_cos << " (gated >= " << kRouteCosine << ")\n";
+        if (!(route_cos >= kRouteCosine)) {
+            std::cerr << label << ": the ScoutA4Int route disagrees with q4_a4_linear (cosine "
+                      << route_cos << ")\n";
+            ++failures;
+        }
+    }
+
     if (c.time) {
         constexpr int kIterations = 20;
         const float ms_gemm  = elapsed_ms([&] { ops::q4_a4_linear(txq, txs, weight, tout, nullptr); },
@@ -354,6 +404,18 @@ int run_case(const Case& c) {
                   << (c.a8 == A8Route::GateUp ? " and the fused SwiGLU" : "") << "); speedup "
                   << ms_a8 / ms_a4 << "x with quantize, " << ms_a8 / ms_gemm
                   << "x GEMM only (target >= " << kSpeedupTarget << "x)\n";
+        // The scout as it runs: the Op under ScoutA4Int against the same Op under AllowA8Int.
+        // For gate_up that is quantise + int4 GEMM + separate SwiGLU against the fused A8 route.
+        const float ms_scout = elapsed_ms([&] { run_route(ops::LinearPolicy::ScoutA4Int); },
+                                          kIterations);
+        const float ms_int8  = elapsed_ms([&] { run_route(ops::LinearPolicy::AllowA8Int); },
+                                          kIterations);
+        std::cout << "  PERF " << label << ": scout "
+                  << (c.a8 == A8Route::GateUp ? "linear_swiglu (A4 + SwiGLU)" : "linear_add (A4)")
+                  << " " << ms_scout << " ms vs AllowA8Int "
+                  << (c.a8 == A8Route::GateUp ? "(A8 fused SwiGLU) " : "") << ms_int8
+                  << " ms: " << ms_int8 / ms_scout << "x (scout GEMM gate >= " << kSpeedupTarget
+                  << "x)\n";
     }
     return failures;
 }

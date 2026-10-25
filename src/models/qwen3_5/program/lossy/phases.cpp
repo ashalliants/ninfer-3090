@@ -172,7 +172,9 @@ void ProgramImpl::finish_lossy_scout(std::uint32_t lane, PrefillProgress& progre
     if (outcome.skipped) {
         // Nothing is dropped: Main is the ordinary prefill of all of U, with no gap map.
         outcome.kept_tokens = span;
+        outcome.kept_runs   = {{0U, span}};
     } else {
+        outcome.kept_runs = kept_runs(selection.kept);
         auto map = std::make_shared<const GapMap>(make_gap_map(staged.prompt, begin, selection.kept));
         install_compacted_prompt(lane, compact_prompt(staged.prompt, *map), std::move(map));
         progress.compacted_plan =

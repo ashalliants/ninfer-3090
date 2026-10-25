@@ -68,6 +68,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_qwen3_5_lossy_scout_plan_test
   ninfer_qwen3_5_lossy_selection_test
   ninfer_qwen3_5_mlp_a8_decode_test
+  ninfer_qwen3_5_scout_a4_wiring_test
   ninfer_qwen3_5_mtp_graph_profiles_test
   ninfer_qwen3_5_ngram_proposer_test
   ninfer_qwen3_5_reasoning_loop_test

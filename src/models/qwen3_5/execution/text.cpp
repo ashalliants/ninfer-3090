@@ -1148,8 +1148,13 @@ void TextContext::run_stage_layers(std::size_t stage, Tensor& x, Phase ph, Tap& 
     const std::uint32_t end = parameters_.text.stage_end(stage);
     const std::uint32_t run_begin = first == UINT32_MAX ? parameters_.text.stage_begin[stage] : first;
     const std::uint32_t run_end   = last == UINT32_MAX ? end : last;
+    // The scout's int4 layers (ScoutScratch::a4_layers) exist for its prefill pass only.
+    if (!scout_layers_.empty() && (ph != Phase::Prefill || run_end > scout_layers_.size())) {
+        throw std::logic_error("the scout's int4 layer parameters reached a non-scout pass");
+    }
     for (std::uint32_t layer = run_begin; layer < run_end; ++layer) {
-        const auto& block  = parameters_.text.layers[layer];
+        const auto& block  = scout_layers_.empty() ? parameters_.text.layers[layer]
+                                                   : scout_layers_[layer];
         const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
         const auto compact = dimension(config_.compact_layer_indices[layer]);
         nvtx::ScopedRange layer_range(
@@ -1916,6 +1921,19 @@ PrefillChunkResult TextContext::scout_chunk(const TextPrefill& prompt, std::uint
         throw std::invalid_argument("scout query rows are invalid");
     }
     const auto query_rows = static_cast<std::uint32_t>(queries_root.ne[2]);
+    // The int4 scout (--lossy-prefill-scout-a4) runs its own copies of layers [0, filter_layer],
+    // which carry ops::LinearPolicy::ScoutA4Int; the int8 scout runs the model's own.
+    if (!scratch.a4_layers.empty() && scratch.a4_layers.size() != filter_layer + 1) {
+        throw std::invalid_argument("scout int4 layers do not end at the filter layer");
+    }
+    struct ScopedScoutLayers {
+        std::span<const BlockParameters>& slot;
+        ~ScopedScoutLayers() { slot = {}; }
+    } scoped_scout_layers{scout_layers_};
+    scout_layers_ = scratch.a4_layers;
+    const BlockParameters& filter_block =
+        scratch.a4_layers.empty() ? parameters_.text.layers[filter_layer]
+                                  : scratch.a4_layers[filter_layer];
 
     cudaStream_t s           = ctx_.stream;
     const int T              = static_cast<int>(std::min(len, prefill_chunk_));
@@ -1958,7 +1976,7 @@ PrefillChunkResult TextContext::scout_chunk(const TextPrefill& prompt, std::uint
                                        filter_layer);
         try {
             auto scope                   = work_.scope();
-            const AttentionInputs inputs = attention_inputs(parameters_.text.layers[filter_layer], x);
+            const AttentionInputs inputs = attention_inputs(filter_block, x);
             Tensor keys = keys_root.slice(2, static_cast<std::int32_t>(begin - u_begin), T);
             if (!inputs.key.is_contiguous() || inputs.key.bytes() != keys.bytes()) {
                 throw std::logic_error("scout keys do not match their scratch rows");

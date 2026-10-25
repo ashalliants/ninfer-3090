@@ -486,6 +486,10 @@ int main() {
                               a.query_rows == 32 && a.pool_window == 17 && a.skip_fraction == 0.5F &&
                               a.scout_a4,
                           "a --lossy-prefill-* flag did not reach serving options");
+        failures += check(!defaults.request_log_lossy_detail &&
+                              parse({"ninfer-serve", "model.ninfer", "--request-log-lossy-detail"})
+                                  .request_log_lossy_detail,
+                          "--request-log-lossy-detail is not off by default or did not parse");
         const std::vector<std::vector<std::string>> bad = {
             {"--lossy-prefill-keep", "0"},        {"--lossy-prefill-keep", "1.5"},
             {"--lossy-prefill-block", "24"},      {"--lossy-prefill-pool-window", "32"},

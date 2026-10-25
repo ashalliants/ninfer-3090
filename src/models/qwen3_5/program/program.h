@@ -339,6 +339,9 @@ struct LossyOutcome {
     // The request reached M while another lane held the Program's one scout: it took no lossy path
     // and prefilled all of U (skipped is set too, kept_tokens == uncached_tokens, no scout ran).
     bool declined = false;
+    // The kept offsets of U as maximal [begin, end) runs: all of U when skipped, none when
+    // declined. The request log reports them under --request-log-lossy-detail.
+    std::vector<std::array<std::uint32_t, 2>> kept_runs;
 };
 
 struct PrefillProgress {

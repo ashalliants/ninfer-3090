@@ -158,7 +158,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--media-preprocess-threads N] "
            "[--device-state-slots N] [--host-context-mib N | --auto-host-cache "
            "[--host-cache-reserve-mib N] [--host-cache-max-mib N] [--host-cache-percent N]] "
-           "[--request-log-jsonl FILE] "
+           "[--request-log-jsonl FILE] [--request-log-lossy-detail] "
            "[--context-store DIR [--context-store-max-gib N] [--context-store-ttl-hours N] "
            "[--context-store-idle-seconds N] [--context-store-restore-seconds N] "
            "[--context-store-flush-seconds N] [--context-store-compress] "
@@ -202,6 +202,8 @@ std::string serve_usage_text(const char* argv0) {
            "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
            "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
+           "       --request-log-lossy-detail adds lossy_prefill.kept_runs (the kept offsets of the "
+           "filtered part) to request_done records, for the lossy sweep's kept-block overlap\n"
            "       --model-id overrides the artifact metadata.name reported by the server\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
@@ -532,6 +534,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 require_value("--lossy-prefill-skip"), "lossy-prefill-skip", 0.0F, 1000.0F);
         } else if (arg == "--lossy-prefill-scout-a4") {
             options.lossy_prefill.scout_a4 = true;
+        } else if (arg == "--request-log-lossy-detail") {
+            options.request_log_lossy_detail = true;
         } else if (arg == "--yield-long-prefill-ms") {
             options.prefill_schedule.yield_remaining_ms = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--yield-long-prefill-ms"),

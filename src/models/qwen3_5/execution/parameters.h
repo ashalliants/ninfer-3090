@@ -147,6 +147,17 @@ struct ProposalParameters {
     std::uint32_t rows = 0;
 };
 
+// The lossy-prefill scout's int4 parameters (ops::LinearPolicy::ScoutA4Int,
+// docs/maintainer/lossy-long-prefill.md "Int4 scout GEMMs"): copies of layers [0, filter_layer]
+// in which every Q4 matrix that takes the integer-A8 prefill route takes the int4 one instead (the
+// Q4 half of a split Q4/Q5 input projection too). Q5 matrices keep their route, and a matrix with
+// no integer route keeps A16. The weights are the model's own: only the policies differ. These
+// copies are the only place the policy is ever written; TextContext::scout_chunk runs them.
+[[nodiscard]] std::vector<BlockParameters> scout_a4_layers(const TextParameters& text,
+                                                           std::uint32_t filter_layer);
+// Whether any projection of the block carries the scout's int4 policy.
+[[nodiscard]] bool holds_scout_policy(const BlockParameters& block) noexcept;
+
 // Cold native preparation for the fixed model implementation. This owner is stable before
 // startup sizing, execution, or Graph capture; all weight addresses borrow the source Model.
 // Shape-dependent kernel selection and scratch remain with the calling implementation and Op.
