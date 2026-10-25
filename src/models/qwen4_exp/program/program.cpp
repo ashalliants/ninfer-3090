@@ -51,6 +51,7 @@
 #include "models/qwen4_exp/model.h"
 #include "models/qwen4_exp/program/checkpoint_image.h"
 #include "models/qwen4_exp/program/context_cache.h"
+#include "models/qwen4_exp/program/draft_policy.h"
 #include "models/qwen4_exp/program/expert_cache/expert_state.h"
 #include "models/qwen4_exp/program/expert_residency.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
@@ -3875,21 +3876,12 @@ private:
         return drafts_;
     }
 
-    // Infernix choose_draft_length: the K in [0, limit] maximizing expected tokens per round time,
-    // where a round of K drafts costs 1 + width_cost * K plain rounds; every kProbeInterval rounds
-    // one draft more than the choice keeps the next position's estimate current.
+    // Infernix choose_draft_length: ema_draft_length (draft_policy.h) picks the K in [0, limit]
+    // maximizing expected tokens per round time, where a round of K drafts costs 1 + width_cost * K
+    // plain rounds; every kProbeInterval rounds one draft more than the choice keeps the next
+    // position's estimate current.
     std::int32_t choose_draft_length(std::int32_t limit) {
-        std::int32_t best = 0;
-        double best_score = 1.0, reach = 1.0, tokens = 1.0;
-        for (std::int32_t k = 1; k <= limit; ++k) {
-            reach *= L().mtp_accept[static_cast<std::size_t>(k - 1)];
-            tokens += reach;
-            const double score = tokens / (1.0 + width_cost() * k);
-            if (score > best_score) {
-                best_score = score;
-                best       = k;
-            }
-        }
+        std::int32_t best = ema_draft_length(L().mtp_accept, limit, width_cost());
         if (++L().mtp_policy_rounds % kProbeInterval == 0) { best = std::min(best + 1, limit); }
         if (options_.mtp_fixed_drafts) { best = limit; }
         return best;

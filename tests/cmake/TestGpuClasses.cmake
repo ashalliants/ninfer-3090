@@ -71,6 +71,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_qwen3_5_tool_constraints_test
   ninfer_qwen3_5_tool_schema_oracle_test
   ninfer_qwen4_exp_context_cache_test
+  ninfer_qwen4_exp_draft_policy_test
   ninfer_qwen4_exp_expert_cache_test
   ninfer_qwen4_exp_memory_plan_test
   ninfer_qwen4_exp_ngram_hash_test
