@@ -56,6 +56,11 @@ bool ProgramImpl::abort_lossy_scout(SequenceHandle handle) {
     // pages. end_scout puts back the GDN states and the growth reservation and releases every page
     // past M; the lane is then the Prefilling lane at M the scout started from.
     end_scout(handle);
+    // end_scout puts back the growth reservation of the unit that opened the scout. Between units
+    // (no permit) that unit is long settled, so settle the lane as any unit end would: otherwise
+    // it keeps a chunk of pages reserved with no unit to use them, which the Engine's abort for a
+    // pause is meant to free.
+    if (!request.permit) { settle_unit(lane); }
     // Cannot happen: a scout begins only with the cursor at M (advance_lossy_scout checks it) and
     // its steps never move the cursor. A lane found elsewhere is corrupt, and the throw sends the
     // Engine to its worker recovery (clear every lane, verify the baseline), which is the right
