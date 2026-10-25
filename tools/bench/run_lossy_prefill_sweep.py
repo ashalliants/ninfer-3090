@@ -18,7 +18,10 @@ lock on a shared card (CLAUDE.md). The unit test (test_lossy_prefill_sweep.py) n
 Pieces: `--workloads` and `--only REGEX` (on point ids) run a subset; `--resume` skips (point,
 workload) pairs already ok in results.jsonl; `--from-json results.jsonl [more.jsonl]` only
 re-summarises (no server). A server that fails to start for a point is recorded (workload "server")
-and the sweep goes on. The baseline runs first unless `--skip-baseline`; then give the earlier run's
+and the sweep goes on. Before its workloads every lossy server gets a preflight: one long cold
+conversation whose request_done must log lossy_prefill.outcome "completed"; otherwise the point is
+recorded as failed (workload "preflight", with what the record showed) and skipped, so a trigger
+that cannot fire never passes as a measurement of the lossy path. The baseline runs first unless `--skip-baseline`; then give the earlier run's
 results to `--baseline-from`.
 
 Acceptance (fixed, docs and the task's Global Constraints; not to be changed after seeing results):
@@ -64,10 +67,23 @@ EDIT_MAX_DROP_POINTS = 2.0
 TIME_MAX_RATIO = 0.40
 
 NEEDLE_LENGTHS = {"32k": 32768, "64k": 65536, "100k": 100000}
-NEEDLE_DEPTHS = 5  # 0, 25, 50, 75, 100 percent
+# Samples per length: NEEDLE_DEPTHS document depths (0, 10, ..., 100 percent) x NEEDLE_SUBSETS
+# (evalscope's needle_haystack makes one sample per subset, length and depth) = 22. Against a perfect
+# baseline the 0.95x gate then allows one miss (21/22 = 0.955) and fails two (20/22 = 0.909); with
+# the earlier 5 samples one miss was already 0.80x, so the gate could not tell 95% from 80%.
+NEEDLE_DEPTHS = 11
+NEEDLE_SUBSETS = ("english", "chinese")
+# A needle check with fewer samples on either side is reported as not measured (a --needle-limit
+# smoke run, a truncated job), never as pass or fail.
+NEEDLE_MIN_SAMPLES = 20
 SPEED_LONG_TOKENS = 108_000
 SPEED_LAYER_SLICES = 8
 GREEDY_PROMPTS = 20
+# Preflight (every lossy server, before its workloads): one long cold conversation that must log
+# lossy_prefill.outcome == "completed", else the point is aborted. ~60K tokens at 3.3 chars/token, in
+# PREFLIGHT_TURNS user turns so the summary strategy has history to summarise too.
+PREFLIGHT_CHARS = 200_000
+PREFLIGHT_TURNS = 30
 
 WORKLOADS = ("needle", "agent_replay", "greedy_agreement", "speed")
 # Run only when named in --workloads.
@@ -280,8 +296,9 @@ def server_command(base_cmd: str, port: int, request_log: Path, params: dict[str
 def needle_config(*, base_url: str, model: str, corpus: str, tokenizer_path: str, runs_dir: str,
                   lengths: dict[str, int] = NEEDLE_LENGTHS, depths: int = NEEDLE_DEPTHS,
                   limit: int | None = None) -> dict[str, Any]:
-    """An eval/ config (JSON, which is YAML) after eval/configs/qwen3_6_35b_needle_haystack.yaml:
-    one evalscope needle_haystack job per context length, `depths` document depths 0-100%."""
+    """An eval/ config (JSON, which is YAML) after eval/configs/qwen3_6_35b_needle_haystack.yaml
+    (native_long): one evalscope needle_haystack job per context length, `depths` document depths
+    0-100% in each of NEEDLE_SUBSETS, so len(NEEDLE_SUBSETS) x depths samples per length."""
     jobs = []
     for name, tokens in lengths.items():
         job: dict[str, Any] = {
@@ -293,7 +310,7 @@ def needle_config(*, base_url: str, model: str, corpus: str, tokenizer_path: str
             "generation": {"temperature": 0, "max_tokens": 512, "seed": 42,
                            "extra_body": {"enable_thinking": False}},
             "backend_args": {
-                "subset_list": ["english"],
+                "subset_list": list(NEEDLE_SUBSETS),
                 "judge_strategy": "rule",
                 "dataset_args": {"local_path": corpus, "extra_params": {
                     "context_lengths_min": tokens, "context_lengths_max": tokens,
@@ -463,7 +480,7 @@ def check_speed_report(stall_report: dict[str, Any], max_context: int, min_token
 
 def lossy_outcome_counts(request_log: Path, offset: int = 0) -> dict[str, int]:
     """Count request_done records after `offset` by `lossy_prefill.outcome`; `requests` counts all of
-    them, `none` those that never took the path (their lossy_prefill is null). The summary strategy's
+    them, `none` those that never took the path (no lossy_prefill key). The summary strategy's
     coldness probe answers are counted as `summary_probe_cold|warm|timeout`: a timeout left a cold
     prompt whole because the busy worker did not answer, which explains a summary point with few
     completions."""
@@ -542,6 +559,36 @@ def long_request_lossy_record(request_log: Path, offset: int) -> dict[str, Any] 
     return best
 
 
+def preflight_messages(text: str, nonce: str, turns: int = PREFLIGHT_TURNS) -> list[dict[str, str]]:
+    """A conversation of `turns` user turns over `text` (each answered "Noted."), then a question.
+    `nonce` leads the first turn so no earlier run's cached prefix can make it warm."""
+    size = max(1, len(text) // turns)
+    messages: list[dict[str, str]] = []
+    for index in range(turns):
+        chunk = text[index * size:(index + 1) * size if index + 1 < turns else len(text)]
+        lead = f"[preflight {nonce}]\n" if index == 0 else ""
+        messages.append({"role": "user", "content": f"{lead}Part {index + 1}:\n{chunk}"})
+        messages.append({"role": "assistant", "content": "Noted."})
+    messages.append({"role": "user", "content": "Name the first file shown above."})
+    return messages
+
+
+def check_preflight(record: dict[str, Any] | None) -> dict[str, Any]:
+    """The preflight request's `lossy_prefill` object, which must report outcome "completed": a lossy
+    server whose long cold request did not take the path would measure the baseline under a lossy
+    label. Raises with what the record showed instead."""
+    lossy = (record or {}).get("lossy_prefill")
+    if not isinstance(lossy, dict):
+        raise RuntimeError("preflight: the long cold request did not take the lossy path (no lossy_prefill "
+                           "in its request_done record); the trigger cannot fire for this point")
+    if lossy.get("outcome") != "completed":
+        raise RuntimeError(f"preflight: lossy_prefill.outcome is {lossy.get('outcome')!r}, not 'completed' "
+                           f"(uncached {lossy.get('uncached_tokens')}, kept {lossy.get('kept_tokens')}"
+                           + (f", summary_probe {lossy.get('summary_probe')}" if "summary_probe" in lossy else "")
+                           + ")")
+    return lossy
+
+
 # ---- the summariser --------------------------------------------------------------------------
 
 def load_rows(paths: Sequence[Path]) -> list[dict[str, Any]]:
@@ -596,9 +643,17 @@ def evaluate_point(rows: list[dict[str, Any]], point: str) -> dict[str, Any]:
         if value is None or not base:
             checks.append(check(f"needle_{length}", None, None, "not measured"))
             continue
+        samples = ((needle or {}).get("samples") or {}).get(length)
+        base_samples = ((base_needle or {}).get("samples") or {}).get(length)
+        if not samples or not base_samples or min(samples, base_samples) < NEEDLE_MIN_SAMPLES:
+            checks.append(check(f"needle_{length}", None, None,
+                                f"{samples or 0} / baseline {base_samples or 0} samples, need >= "
+                                f"{NEEDLE_MIN_SAMPLES} each for the {NEEDLE_MIN_RATIO:.2f}x gate"))
+            continue
         ratio = value / base
         checks.append(check(f"needle_{length}", ratio, ratio >= NEEDLE_MIN_RATIO - 1e-9,
-                            f"{value:.3f} / baseline {base:.3f} (need >= {NEEDLE_MIN_RATIO:.2f}x)"))
+                            f"{value:.3f} ({samples} samples) / baseline {base:.3f} ({base_samples}) "
+                            f"(need >= {NEEDLE_MIN_RATIO:.2f}x)"))
     agent, base_agent = _metric(rows, point, "agent_replay"), _metric(rows, BASELINE, "agent_replay")
     if agent and base_agent and agent.get("edit_rate") is not None and base_agent.get("edit_rate") is not None:
         delta = (agent["edit_rate"] - base_agent["edit_rate"]) * 100.0
@@ -843,6 +898,16 @@ class Sweep:
                 self.record(point, params, "server", False, error=str(exc))
                 continue
             try:
+                if params is not None:
+                    try:
+                        lossy = self.preflight(request_log)
+                    except Exception as exc:  # noqa: BLE001 - abort this point, keep sweeping
+                        self.record(point, params, "preflight", False, error=f"{tag} server: {exc}")
+                        return
+                    self.record(point, params, "preflight", True,
+                                {"server": tag, **{key: lossy.get(key) for key in (
+                                    "outcome", "strategy", "uncached_tokens", "kept_tokens", "scout_ms",
+                                    "main_ms")}})
                 for name in names:
                     self.run_workload(point, params, name, request_log)
             finally:
@@ -858,6 +923,13 @@ class Sweep:
             # Evidence the feature ran: lossy_prefill outcomes of this workload's requests.
             metrics["lossy_outcomes"] = lossy_outcome_counts(request_log, offset)
             self.record(point, params, name, True, metrics)
+
+    def preflight(self, request_log: Path) -> dict[str, Any]:
+        text = greedy_prompt(self.args.agent_repo, 5000, self.args.preflight_chars)
+        messages = preflight_messages(text, f"{time.time_ns():x}")
+        record, _ = chat_request_done(self.base_url, self.args.model, None, 1, request_log,
+                                      request_log.stat().st_size, messages=messages)
+        return check_preflight(record)
 
     # -- workloads --
 
@@ -1002,12 +1074,16 @@ def greedy_generate(base_url: str, model: str, prompt: str, max_tokens: int, req
     return ids, cursor
 
 
-def chat_request_done(base_url: str, model: str, prompt: str, max_tokens: int, request_log: Path,
-                      cursor: int, wait_seconds: float = 30.0) -> tuple[dict[str, Any], int]:
-    """Greedy completion; returns this response's request_done record from the request log and the
-    log offset to continue from. A missing record fails."""
+def chat_request_done(base_url: str, model: str, prompt: str | None, max_tokens: int, request_log: Path,
+                      cursor: int, wait_seconds: float = 30.0,
+                      messages: list[dict[str, str]] | None = None) -> tuple[dict[str, Any], int]:
+    """Greedy completion of `prompt` (one user message) or `messages`; returns this response's
+    request_done record from the request log and the log offset to continue from. A missing record
+    fails."""
+    if messages is None:
+        messages = [{"role": "user", "content": prompt or ""}]
     body = json.dumps({"model": model, "temperature": 0, "max_tokens": max_tokens, "stream": False,
-                       "messages": [{"role": "user", "content": prompt}],
+                       "messages": messages,
                        "chat_template_kwargs": {"enable_thinking": False}}).encode()
     request = urllib.request.Request(f"{base_url}/v1/chat/completions", data=body,
                                      headers={"Content-Type": "application/json"})
@@ -1077,6 +1153,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--greedy-max-tokens", type=int, default=96)
     parser.add_argument("--jaccard-prompts", type=int, default=JACCARD_PROMPTS,
                         help="jaccard workload prompts per size (~32K and ~100K tokens)")
+    parser.add_argument("--preflight-chars", type=int, default=PREFLIGHT_CHARS,
+                        help="size of each lossy server's preflight conversation, characters (~60K tokens); "
+                        "it must exceed the point's min_tokens")
     parser.add_argument("--speed-tokens", type=int, default=SPEED_LONG_TOKENS)
     parser.add_argument("--words-per-token", type=float, default=None)
     args = parser.parse_args(argv)

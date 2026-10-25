@@ -24,7 +24,8 @@ def row(point, workload, metrics, ok=True, error=None):
 
 
 BASE = [
-    row("baseline", "needle", {"accuracy": {"32k": 1.0, "64k": 1.0, "100k": 1.0}}),
+    row("baseline", "needle", {"accuracy": {"32k": 1.0, "64k": 1.0, "100k": 1.0},
+                               "samples": {"32k": 22, "64k": 22, "100k": 22}}),
     row("baseline", "agent_replay", {"edit_rate": 0.90, "tool_call_validity": 1.0}),
     row("baseline", "speed", {"total_s": 100.0, "neighbour_gap_max_ms": 900}),
     row("baseline", "greedy_agreement", {"outputs": [[1, 2, 3, 4]] * 2}),
@@ -34,9 +35,10 @@ BASE = [
 LOSSY = {"requests": 6, "none": 1, "completed": 5}
 
 
-def point_rows(point, needle=1.0, edit=0.90, total=39.0, lossy=LOSSY):
+def point_rows(point, needle=1.0, edit=0.90, total=39.0, lossy=LOSSY, samples=22):
     rows = [
-        row(point, "needle", {"accuracy": {"32k": needle, "64k": needle, "100k": needle}}),
+        row(point, "needle", {"accuracy": {"32k": needle, "64k": needle, "100k": needle},
+                              "samples": {"32k": samples, "64k": samples, "100k": samples}}),
         row(point, "agent_replay", {"edit_rate": edit, "tool_call_validity": 0.99}),
         row(point, "speed", {"total_s": total, "scout_ms": 4000, "main_ms": 30000, "kept_tokens": 20000,
                              "uncached_tokens": 100000, "neighbour_gap_max_ms": 300}),
@@ -58,6 +60,15 @@ def test_needle_threshold():
     check(all(c["pass"] for n, c in checks(rows, "good").items() if n.startswith("needle")), "0.96x passes")
     check(all(c["pass"] is False for n, c in checks(rows, "bad").items() if n.startswith("needle")), "0.94x fails")
     check(abs(checks(rows, "good")["needle_32k"]["value"] - 0.96) < 1e-9, "ratio value")
+    # 22 samples: one miss against a perfect baseline passes, two fail.
+    rows = BASE + point_rows("one_miss", needle=21 / 22) + point_rows("two_miss", needle=20 / 22)
+    check(checks(rows, "one_miss")["needle_64k"]["pass"] is True, "21/22 passes")
+    check(checks(rows, "two_miss")["needle_64k"]["pass"] is False, "20/22 fails")
+    # Too few samples on either side: not measured, never a pass or a fail.
+    rows = BASE + point_rows("smoke", needle=1.0, samples=5)
+    c = checks(rows, "smoke")["needle_100k"]
+    check(c["pass"] is None and "5 / baseline 22 samples" in c["detail"], c)
+    check(sweep.evaluate_point(rows, "smoke")["verdict"] == "INCOMPLETE", "a smoke needle run decides nothing")
 
 
 def test_edit_threshold():
@@ -140,7 +151,11 @@ def test_needle_config():
     check([j["id"] for j in jobs] == ["needle_32k", "needle_64k", "needle_100k"], jobs)
     extra = jobs[2]["backend_args"]["dataset_args"]["extra_params"]
     check(extra["context_lengths_min"] == extra["context_lengths_max"] == 100000
-          and extra["document_depth_percent_intervals"] == 5 and extra["tokenizer_path"] == "/t", extra)
+          and extra["document_depth_percent_intervals"] == 11 and extra["tokenizer_path"] == "/t", extra)
+    subsets = jobs[2]["backend_args"]["subset_list"]
+    check(subsets == ["english", "chinese"], subsets)
+    check(len(subsets) * extra["document_depth_percent_intervals"] >= sweep.NEEDLE_MIN_SAMPLES,
+          "the config yields enough samples per length for the 0.95x gate")
     check(jobs[0]["backend_args"]["dataset_args"]["local_path"] == "/c", "corpus path from the argument")
     check("neroued" not in json.dumps(config), "no hard-coded home paths")
     summary = {"results": [{"job_id": "needle_32k", "status": "completed", "primary_metric": "accuracy", "metrics": {"accuracy": 0.8}},
@@ -404,6 +419,66 @@ def test_jaccard_record_needs_the_detail_flag():
         pass
     args = sweep.parse_args(["--from-json", "x.jsonl", "--workloads", "jaccard"])
     check(args.workload_names == ["jaccard"] and "jaccard" not in sweep.WORKLOADS, "jaccard is opt-in")
+
+
+def test_preflight():
+    # The record must show the path completed; anything else names what it showed.
+    ok = {"event": "request_done", "lossy_prefill": {"outcome": "completed", "uncached_tokens": 60000,
+                                                       "kept_tokens": 12000}}
+    check(sweep.check_preflight(ok)["kept_tokens"] == 12000, "a completed preflight passes")
+    for record, needle in (({"event": "request_done"}, "did not take the lossy path"),
+                           (None, "did not take the lossy path"),
+                           ({"lossy_prefill": {"outcome": "skipped", "summary_probe": "timeout"}},
+                            "'skipped'")):
+        try:
+            sweep.check_preflight(record)
+            check(False, f"preflight accepted {record}")
+        except RuntimeError as exc:
+            check(needle in str(exc), str(exc))
+    # A conversation, long enough for the summary strategy's protected head and tail, nonce first.
+    messages = sweep.preflight_messages("x" * 3000, "n1", turns=30)
+    check(len(messages) == 61 and messages[0]["content"].startswith("[preflight n1]")
+          and messages[-1]["role"] == "user", messages[:2])
+    check(sum(len(m["content"]) for m in messages if m["role"] == "user") > 3000, "all the text is sent")
+
+    # run_point: a failed preflight aborts the point before any workload; the baseline has none.
+    with tempfile.TemporaryDirectory() as d:
+        args = sweep.parse_args(["--server-cmd", "serve", "--model", "m", "--out", d,
+                                 "--workloads", "agent_replay,speed"])
+        s = sweep.Sweep(args)
+        calls = []
+
+        class Proc:
+            pass
+
+        s.start_server = lambda point, params, extra, tag: (calls.append(("start", tag)) or (Proc(), Path(d) / "rl"))
+        real_stop = sweep.stop_server
+        sweep.stop_server = lambda proc: calls.append(("stop",))
+        s.run_workload = lambda point, params, name, log: calls.append(("run", name))
+        outcomes = iter([RuntimeError("preflight: lossy_prefill.outcome is 'skipped'")])
+
+        def failing(log):
+            raise next(outcomes)
+
+        s.preflight = failing
+        s.run_point("p1", {"keep": "0.2"}, ["agent_replay", "speed"])
+        check(calls == [("start", "quality"), ("stop",)], calls)
+        rows = sweep.load_rows([s.results])
+        check(rows[-1]["workload"] == "preflight" and not rows[-1]["ok"]
+              and "quality server" in rows[-1]["error"], rows[-1])
+        check(sweep.evaluate_point(rows, "p1")["verdict"] == "FAIL", "an aborted point fails")
+        calls.clear()
+        s.preflight = lambda log: {"outcome": "completed", "kept_tokens": 1}
+        s.run_point("p2", {"keep": "0.2"}, ["agent_replay", "speed"])
+        check(calls == [("start", "quality"), ("run", "agent_replay"), ("stop",),
+                        ("start", "speed"), ("run", "speed"), ("stop",)], calls)
+        check(sum(1 for r in sweep.load_rows([s.results]) if r["point"] == "p2" and r["workload"] == "preflight"
+                  and r["ok"]) == 2, "one preflight per lossy server")
+        calls.clear()
+        s.preflight = failing  # never called for the baseline
+        s.run_point(sweep.BASELINE, None, ["agent_replay"])
+        check(calls == [("start", "quality"), ("run", "agent_replay"), ("stop",)], calls)
+        sweep.stop_server = real_stop
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
