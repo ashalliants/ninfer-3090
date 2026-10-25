@@ -1,7 +1,8 @@
 # Qwen3.8-Flash-Next (qwen4exp). Host only: the n-gram hash against its fixture, and the n-gram
 # volume reader on a synthetic volume. GPU, real artifact (skips without
-# NINFER_TEST_QWEN4EXP_ARTIFACT): the whole forward pass, teacher-forced scoring, block taps and the
-# decode-path KLD gate (--kld-base, scored by ninfer-perplexity's evaluation code).
+# NINFER_TEST_QWEN4EXP_ARTIFACT): the whole forward pass, teacher-forced scoring, block taps, the
+# decode-path KLD gate (--kld-base, scored by ninfer-perplexity's evaluation code) and the bitwise
+# identity of the shared expert on its side stream (--shared-expert-stream).
 ninfer_add_test(ninfer_qwen4_exp_ngram_hash_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_hash.cpp"
   NEEDS_SOURCE_DIR
@@ -25,7 +26,8 @@ set_tests_properties(ninfer_qwen4_exp_forward_real_test PROPERTIES SKIP_RETURN_C
 
 # GPU, real artifact with the MTP drafter (skips otherwise): verification reproduces one-column
 # decode bit for bit and its commit leaves the decode's state; the drafter's fusion, MoE and head
-# against FP64 oracles on its tapped inputs.
+# against FP64 oracles on its tapped inputs; the shared expert stream leaves the prompt's logits and
+# the drafter's step bitwise unchanged.
 ninfer_add_test(ninfer_qwen4_exp_mtp_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mtp_real.cpp"
   NEEDS_SOURCE_DIR
@@ -65,6 +67,12 @@ ninfer_add_test(ninfer_qwen4_exp_expert_cache_test
 ninfer_add_test(ninfer_qwen4_exp_memory_plan_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_memory_plan.cpp"
   LIBRARIES ninfer_model_loading ninfer_core)
+
+# Host only: the Program's planned device terms computed from the options and the configuration
+# (the shared expert's side-stream workspace).
+ninfer_add_test(ninfer_qwen4_exp_program_plan_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_program_plan.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_core)
 
 # Host only: the context cache's Host tier (slabs, checkpoints sharing KV pages, release quotes and
 # sets, lineage recovery loss), the RAM ledger's sizing of it beside the experts, and the context

@@ -24,6 +24,7 @@
 #include "ninfer/ops/qsa.h"
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -235,15 +236,29 @@ struct ForwardTap {
     std::vector<Tensor>* moe_outputs   = nullptr;
 };
 
+// Opt-in execution choices of a Forward. Off (the default) runs every Op on the device's stream in
+// the order the forward has always run them; each option leaves the outputs bitwise unchanged
+// unless its comment says otherwise.
+struct ForwardOptions {
+    // Run each MoE block's shared expert (gate/up, SiLU-mul, down) on a stream of the greatest
+    // priority beside the routing and routed experts, forked after the block's input and joined
+    // before the combine (in the text model and the MTP drafter). The same Ops on the same inputs:
+    // bitwise the outputs of the serial order. Its Linears' scratch is carved from the call's
+    // workspace (shared_expert_workspace_bytes more per call).
+    bool shared_expert_stream = false;
+};
+
 class Forward {
 public:
     Forward(const Parameters& parameters, DeviceContext& device, WorkspaceArena& work, ForwardState state,
-            ForwardKV kv, ForwardExperts experts, std::optional<ForwardMtp> mtp = std::nullopt);
+            ForwardKV kv, ForwardExperts experts, std::optional<ForwardMtp> mtp = std::nullopt,
+            ForwardOptions options = {});
     // Several sequences: single-sequence calls act on the selected slot (slot 0 at first); run_rows
     // decodes several slots at once. With the MTP drafter, `mtp` holds its layer over the slots and
     // select_row also selects the slot's drafter state.
     Forward(const Parameters& parameters, DeviceContext& device, WorkspaceArena& work, ForwardRowsState state,
-            ForwardRowsKV kv, ForwardExperts experts, std::optional<ForwardRowsMtp> mtp = std::nullopt);
+            ForwardRowsKV kv, ForwardExperts experts, std::optional<ForwardRowsMtp> mtp = std::nullopt,
+            ForwardOptions options = {});
 
     // Several sequences: the slot later single-sequence calls (run, run_front, run_back) act on.
     void select_row(std::int32_t slot);
@@ -281,6 +296,12 @@ public:
     // Workspace one call of up to `columns` columns needs, at the given context.
     [[nodiscard]] static std::size_t workspace_bytes(const TextConfig& config, std::int32_t columns,
                                                      std::uint32_t max_visible_keys, DeviceExecutionView execution);
+    // With ForwardOptions::shared_expert_stream, the workspace a call of up to `columns` columns
+    // needs beyond workspace_bytes: the region each MoE block carves for the shared expert's Linears
+    // (the Q8_1 rows a GGML Linear above 8 columns quantizes its input to), so the side stream never
+    // reuses scratch the device's stream may still be reading. Bounds GGML and BF16 Linears, the
+    // formats the text model's shared expert takes.
+    [[nodiscard]] static std::size_t shared_expert_workspace_bytes(const TextConfig& config, std::int32_t columns);
 
 private:
     void layers(std::uint32_t begin, std::uint32_t end, const ForwardBatch& batch, const ForwardTap* tap);
@@ -306,6 +327,26 @@ private:
     Tensor mtp_attention(const MtpParameters& p, const Tensor& x, const MtpCall& call);
     void mtp_block(const MtpCall& call);
     void mtp_cells(const MtpChunk& chunk, const Tensor& residual);
+    // With the shared expert stream: the side stream waits for the device stream's work so far
+    // (fork), and the device stream for the side stream's (join). Capture-safe.
+    void fork_shared_expert();
+    void join_shared_expert();
+
+    // ForwardOptions::shared_expert_stream's stream (the greatest priority) and its two events.
+    class SideStream {
+    public:
+        SideStream();
+        ~SideStream();
+        SideStream(const SideStream&)            = delete;
+        SideStream& operator=(const SideStream&) = delete;
+
+        cudaStream_t stream = nullptr;
+        cudaEvent_t fork    = nullptr;
+        cudaEvent_t join    = nullptr;
+
+    private:
+        void release() noexcept;
+    };
 
     const Parameters& parameters_;
     const TextConfig& config_;
@@ -315,6 +356,7 @@ private:
     ForwardKV kv_;
     ForwardExperts experts_;
     std::optional<ForwardMtp> mtp_;
+    std::unique_ptr<SideStream> side_; // set with ForwardOptions::shared_expert_stream
     Tensor mtp_frames_; // I32 [E]: every drafter expert resident at its own index
     DeviceBuffer mtp_frames_backing_;
     Tensor residual_; // the call's residual stream, in the workspace from run_front to run_back
