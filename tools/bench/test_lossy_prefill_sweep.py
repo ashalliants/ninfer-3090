@@ -276,7 +276,7 @@ def test_lossy_evidence():
     check("3 (t2)" in sweep.lossy_cell(timed, "sum"), sweep.lossy_cell(timed, "sum"))
     text = sweep.render_summary(rows)
     ran = next(l for l in text.splitlines() if l.startswith("| ran |"))
-    check("5/5/5/5" in ran and "| 52 |" in ran, ran)
+    check("5/5/-/5/5" in ran and "| 52 |" in ran, ran)
 
 
 def test_agent_command_passes_repo_and_failure_inputs():
@@ -507,6 +507,27 @@ def test_needle_answer_judge():
         check(r["accuracy"] == {"32k": 0.5, "64k": 0.5, "100k": 0.5}, r)
         check(r["samples"] == {"32k": 2, "64k": 2, "100k": 2} and r["rule_accuracy"]["32k"] == 0.0, r)
         check(sweep.rescore_needle_run(run / "missing") is None, "no reviews -> None")
+
+
+def test_agent_edit_turns_and_gate_source():
+    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"},
+            {"role": "assistant", "content": "", "tool_calls": []}, {"role": "tool", "content": "obs"}]
+    transcripts = [{"session": 0, "tools": [], "messages": msgs + [{"role": "assistant", "content": "x"}],
+                    "turns": [{"turn": 0, "message_count": 2, "category": "explore", "response_id": "a"},
+                              {"turn": 1, "message_count": 4, "category": "edit_function", "response_id": "b"},
+                              {"turn": 2, "message_count": 4, "category": "edit_function", "response_id": "c"}]}]
+    samples = [{"response_id": "a", "prompt_tokens": 50000, "max_tokens": 10},
+               {"response_id": "b", "prompt_tokens": 40000, "max_tokens": 700},
+               {"response_id": "c", "prompt_tokens": 20000, "max_tokens": 700}]
+    got = sweep.agent_edit_turns(transcripts, samples)
+    check(len(got) == 1 and got[0]["turn"] == 1 and got[0]["messages"] == msgs and got[0]["max_tokens"] == 700, got)
+    # The Edit gate reads agent_edit when the point and the baseline have it, else agent_replay.
+    rows = BASE + point_rows("p", edit=0.90)
+    check(checks(rows, "p")["edit"]["pass"] is True, "replay rows gate when no agent_edit")
+    rows += [row("baseline", "agent_edit", {"edit_rate": 0.9, "edit_turns": 30}),
+             row("p", "agent_edit", {"edit_rate": 0.8, "edit_turns": 30, "lossy_outcomes": LOSSY})]
+    c = checks(rows, "p")["edit"]
+    check(c["pass"] is False and abs(c["value"] + 10.0) < 1e-9 and "cold" in c["detail"], c)
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

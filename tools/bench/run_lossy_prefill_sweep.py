@@ -85,7 +85,13 @@ GREEDY_PROMPTS = 20
 PREFLIGHT_CHARS = 200_000
 PREFLIGHT_TURNS = 30
 
-WORKLOADS = ("needle", "agent_replay", "greedy_agreement", "speed")
+WORKLOADS = ("needle", "agent_replay", "agent_edit", "greedy_agreement", "speed")
+# agent_edit: the baseline agent_replay's edit_function turns whose prompt has at least this many
+# tokens, each sent cold on its own (a server with --no-prefix-reuse), so lossy prefill filters
+# every one of them. agent_replay itself grows each session from a few thousand tokens and every
+# later turn reuses the conversation's private record, which lossy prefill never filters, so its
+# Edit rate does not exercise the feature.
+AGENT_EDIT_MIN_PROMPT = 34_000
 # Run only when named in --workloads.
 OPTIONAL_WORKLOADS = ("jaccard",)
 ALL_WORKLOADS = WORKLOADS + OPTIONAL_WORKLOADS
@@ -675,6 +681,34 @@ def unresolved_failures(rows: list[dict[str, Any]], point: str) -> list[dict[str
     return failed
 
 
+def edit_rows(rows: list[dict[str, Any]], point: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str]:
+    """The Edit gate's rows: agent_edit (cold edit turns) when the point and the baseline both have
+    it, else agent_replay."""
+    agent, base = _metric(rows, point, "agent_edit"), _metric(rows, BASELINE, "agent_edit")
+    if agent and base:
+        return agent, base, "cold"
+    return _metric(rows, point, "agent_replay"), _metric(rows, BASELINE, "agent_replay"), "replay"
+
+
+def agent_edit_turns(transcripts: Sequence[dict[str, Any]], samples: Sequence[dict[str, Any]],
+                     min_prompt: int = AGENT_EDIT_MIN_PROMPT) -> list[dict[str, Any]]:
+    """The agent_edit workload's requests from an agent_replay run: every edit_function turn whose
+    prompt (agent_replay's turns.jsonl `prompt_tokens`, by response id) has at least `min_prompt`
+    tokens, as {session, turn, messages (the prompt), tools, max_tokens}."""
+    by_id = {s.get("response_id"): s for s in samples if s.get("response_id")}
+    out = []
+    for session in transcripts:
+        for turn in session.get("turns", []):
+            sample = by_id.get(turn.get("response_id")) or {}
+            if turn.get("category") != "edit_function" or int(sample.get("prompt_tokens") or 0) < min_prompt:
+                continue
+            out.append({"session": session.get("session"), "turn": turn.get("turn"),
+                        "messages": session["messages"][:turn["message_count"]], "tools": session.get("tools", []),
+                        "max_tokens": int(sample.get("max_tokens") or 6000),
+                        "baseline_prompt_tokens": int(sample.get("prompt_tokens") or 0)})
+    return out
+
+
 def check(name: str, value: float | None, passed: bool | None, detail: str) -> dict[str, Any]:
     return {"name": name, "value": value, "pass": passed, "detail": detail}
 
@@ -704,11 +738,12 @@ def evaluate_point(rows: list[dict[str, Any]], point: str) -> dict[str, Any]:
         checks.append(check(f"needle_{length}", ratio, ratio >= NEEDLE_MIN_RATIO - 1e-9,
                             f"{value:.3f} ({samples} samples) / baseline {base:.3f} ({base_samples}) "
                             f"(need >= {NEEDLE_MIN_RATIO:.2f}x)"))
-    agent, base_agent = _metric(rows, point, "agent_replay"), _metric(rows, BASELINE, "agent_replay")
+    agent, base_agent, source = edit_rows(rows, point)
     if agent and base_agent and agent.get("edit_rate") is not None and base_agent.get("edit_rate") is not None:
         delta = (agent["edit_rate"] - base_agent["edit_rate"]) * 100.0
         checks.append(check("edit", delta, delta >= -EDIT_MAX_DROP_POINTS - 1e-9,
-                            f"{delta:+.1f} points vs baseline (need >= -{EDIT_MAX_DROP_POINTS:.0f})"))
+                            f"{delta:+.1f} points vs baseline over {agent.get('edit_turns')} {source} Edit "
+                            f"turns (need >= -{EDIT_MAX_DROP_POINTS:.0f})"))
     else:
         checks.append(check("edit", None, None, "not measured"))
     speed, base_speed = _metric(rows, point, "speed"), _metric(rows, BASELINE, "speed")
@@ -809,7 +844,7 @@ def render_summary(rows: list[dict[str, Any]]) -> str:
         "columns are reported, not gated.",
         "",
         "| point | needle 32k | needle 64k | needle 100k | Edit (pts) | Edit turns | time (x) | scout ms | main ms "
-        "| kept/uncached | neighbour gap ms | tool-call valid | greedy median div | lossy completed (needle/agent/greedy/speed) | needle samples | verdict |",
+        "| kept/uncached | neighbour gap ms | tool-call valid | greedy median div | lossy completed (needle/agent/edit/greedy/speed) | needle samples | verdict |",
         "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     evals = []
@@ -818,7 +853,7 @@ def render_summary(rows: list[dict[str, Any]]) -> str:
         evals.append(ev)
         by = {c["name"]: c for c in ev["checks"]}
         speed = _metric(rows, point, "speed") or {}
-        agent = _metric(rows, point, "agent_replay") or {}
+        agent = edit_rows(rows, point)[0] or {}
         greedy = _metric(rows, point, "greedy_agreement") or {}
         base_greedy = _metric(rows, BASELINE, "greedy_agreement") or {}
         agreement = None
@@ -930,12 +965,15 @@ class Sweep:
         todo = [w for w in workloads if (point, w) not in done]
         if point == BASELINE:
             todo = [w for w in todo if w != "jaccard"]  # lossy prefill is off there: nothing kept
-        quality = [w for w in todo if w != "speed"]
+        quality = [w for w in todo if w not in ("speed", "agent_edit")]
         groups = []
         if quality:
             # jaccard reads lossy_prefill.kept_runs, which only the detail flag logs.
             groups.append(("quality", quality,
                            ["--request-log-lossy-detail"] if "jaccard" in quality else []))
+        if "agent_edit" in todo:
+            # Every edit turn cold: no request may reuse another's conversation record.
+            groups.append(("edit", ["agent_edit"], ["--no-prefix-reuse"]))
         if "speed" in todo:
             # The stall probe needs a lane for the stream next to the long prompt; the slices flag is
             # the scheduling setting the neighbour-gap number is defined for.
@@ -1060,6 +1098,58 @@ class Sweep:
                        turns=(summary.get("all") or {}).get("turns"))
         return metrics
 
+    def workload_agent_edit(self, point: str, request_log: Path) -> dict[str, Any]:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        from tools.bench.agent_replay.run import send
+        from tools.ninfer_serve.client import NInferServeClient
+
+        args = self.args
+        source = args.agent_source or (self.out / BASELINE / "agent-replay")
+        summary = json.loads((source / "summary.json").read_text(encoding="utf-8"))
+        transcripts = [json.loads(l) for l in (source / "transcripts.jsonl").read_text(encoding="utf-8").splitlines() if l]
+        samples = [json.loads(l) for l in (source / "turns.jsonl").read_text(encoding="utf-8").splitlines() if l]
+        requests = agent_edit_turns(transcripts, samples)
+        if not requests:
+            raise RuntimeError(f"no edit_function turn of >= {AGENT_EDIT_MIN_PROMPT} tokens in {source}")
+        commit = summary.get("corpus_commit") or args.agent_commit
+        repo = str(args.agent_repo)
+        cache: dict[str, str | None] = {}
+
+        def read_file(path: str) -> str | None:
+            if path not in cache:
+                shown = subprocess.run(["git", "-C", repo, "show", f"{commit}:{path}"], capture_output=True)
+                cache[path] = shown.stdout.decode("utf-8", "replace") if shown.returncode == 0 else None
+            return cache[path]
+
+        client = NInferServeClient(self.base_url, 3600.0)
+        cursor = request_log.stat().st_size
+        per_turn = []
+        for item in requests:
+            reply = send(client, args.model, item["messages"], item["max_tokens"])
+            if reply.error is not None:
+                raise RuntimeError(f"session {item['session']} turn {item['turn']}: {reply.error}")
+            record, cursor = find_request_done(request_log, cursor, reply.response_id)
+            assistant: dict[str, Any] = {"role": "assistant", "content": reply.content, "tool_calls": [
+                {"id": c["id"] or f"call_{i}", "type": "function",
+                 "function": {"name": c["name"], "arguments": c["arguments"]}} for i, c in enumerate(reply.tool_calls)]}
+            m = edit_metrics([{"tools": item["tools"], "messages": item["messages"] + [assistant],
+                               "turns": [{"message_count": len(item["messages"]), "category": "edit_function"}]}],
+                             read_file)
+            lossy = record.get("lossy_prefill") or {}
+            per_turn.append({"session": item["session"], "turn": item["turn"], "hit": m["edit_rate"] == 1.0,
+                             "prompt_tokens": int(reply.usage.get("prompt_tokens") or 0),
+                             "cached_tokens": int((reply.usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0),
+                             "outcome": lossy.get("outcome"), "kept_tokens": lossy.get("kept_tokens"),
+                             "uncached_tokens": lossy.get("uncached_tokens"), "valid_calls": m["tool_call_validity"]})
+        hits = sum(t["hit"] for t in per_turn)
+        return {"edit_turns": len(per_turn), "edit_rate": hits / len(per_turn), "turns": per_turn,
+                "lossy_turns": sum(t["outcome"] == "completed" for t in per_turn),
+                "tool_call_validity": statistics.fmean(t["valid_calls"] for t in per_turn
+                                                       if t["valid_calls"] is not None)
+                if any(t["valid_calls"] is not None for t in per_turn) else None,
+                "source": str(source), "min_prompt": AGENT_EDIT_MIN_PROMPT}
+
     def workload_greedy_agreement(self, point: str, request_log: Path) -> dict[str, Any]:
         outputs = []
         cursor = request_log.stat().st_size
@@ -1152,6 +1242,31 @@ def greedy_generate(base_url: str, model: str, prompt: str, max_tokens: int, req
     return ids, cursor
 
 
+def find_request_done(request_log: Path, cursor: int, response_id: str | None,
+                      wait_seconds: float = 30.0) -> tuple[dict[str, Any], int]:
+    """The request_done record of `response_id` written after `cursor`, and the offset after it."""
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        with request_log.open("rb") as log:
+            log.seek(cursor)
+            while True:
+                start = log.tell()
+                raw = log.readline()
+                if not raw.endswith(b"\n"):
+                    log.seek(start)
+                    break
+                try:
+                    record = json.loads(raw)
+                except ValueError:
+                    continue
+                if record.get("event") == "request_done" and \
+                        (record.get("request") or {}).get("response_id") == response_id:
+                    return record, log.tell()
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"no request-log record for response {response_id} after {wait_seconds:.0f} s")
+        time.sleep(0.5)
+
+
 def chat_request_done(base_url: str, model: str, prompt: str | None, max_tokens: int, request_log: Path,
                       cursor: int, wait_seconds: float = 30.0,
                       messages: list[dict[str, str]] | None = None) -> tuple[dict[str, Any], int]:
@@ -1234,6 +1349,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--preflight-chars", type=int, default=PREFLIGHT_CHARS,
                         help="size of each lossy server's preflight conversation, characters (~60K tokens); "
                         "it must exceed the point's min_tokens")
+    parser.add_argument("--agent-source", type=Path, default=None,
+                        help="agent_replay output directory whose edit turns agent_edit replays cold "
+                        "(default OUT/baseline/agent-replay)")
     parser.add_argument("--rescore-needle", action="store_true",
                         help="re-judge recorded needle runs (needle_answer_hit) and re-summarise; no server")
     parser.add_argument("--speed-tokens", type=int, default=SPEED_LONG_TOKENS)
