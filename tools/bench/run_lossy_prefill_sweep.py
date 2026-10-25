@@ -1211,7 +1211,8 @@ def stop_server(proc: subprocess.Popen) -> None:
 
 
 def greedy_prompt(repo: Path, index: int, chars: int) -> str:
-    """A long, deterministic prompt per index: tracked source files in a seeded order, then a question."""
+    """A long, deterministic prompt per index: tracked source files in a seeded order, cut to `chars`
+    characters, then a question."""
     listing = subprocess.run(["git", "-C", str(repo), "ls-files", "*.py", "*.cpp", "*.h", "*.md", "*.cu"],
                              capture_output=True, text=True, check=True).stdout.split()
     random.Random(20261025 + index).shuffle(listing)
@@ -1226,7 +1227,9 @@ def greedy_prompt(repo: Path, index: int, chars: int) -> str:
         size += len(parts[-1])
         if size >= chars:
             break
-    return "".join(parts) + "\nList the first three file names above, in order, and say what each is for."
+    # Cut at `chars`: the last file can be large (one prompt reached 505K characters, 134K tokens,
+    # past --max-context 131072 at 330K requested).
+    return "".join(parts)[:chars] + "\nList the first three file names above, in order, and say what each is for."
 
 
 def greedy_generate(base_url: str, model: str, prompt: str, max_tokens: int, request_log: Path,
