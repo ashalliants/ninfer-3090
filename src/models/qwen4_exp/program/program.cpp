@@ -55,6 +55,7 @@
 #include "models/qwen4_exp/program/draft_policy.h"
 #include "models/qwen4_exp/program/expert_cache/expert_state.h"
 #include "models/qwen4_exp/program/expert_residency.h"
+#include "models/qwen4_exp/program/fold_stream.h"
 #include "models/qwen4_exp/program/ngram_rows.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "models/qwen4_exp/program/nvme_tier.h"
@@ -71,6 +72,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -202,6 +204,9 @@ inline std::int32_t dim(std::uint64_t v) { return static_cast<std::int32_t>(v); 
 inline std::size_t align(std::size_t v, std::size_t a = 256) { return (v + a - 1) / a * a; }
 
 double seconds(std::uint64_t ns) { return static_cast<double>(ns) * 1e-9; }
+
+// --gdn-async-commit: folds run on fold streams in this process (Program::process_async_gdn_folds).
+std::atomic<std::uint64_t> g_async_gdn_folds{0};
 
 // The KV pool's chunk: the VMM allocation granularity of the RTX 3090 (2 MiB).
 constexpr std::size_t kKvChunkBytes = 2ULL << 20;
@@ -504,6 +509,10 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     if (o.cpu_verify_workers < 1 || o.cpu_verify_workers > 64) {
         throw std::invalid_argument("Qwen3.8-Flash-Next: --cpu-verify-workers must be in [1, 64]");
     }
+    if (o.gdn_async_commit && o.mtp_draft_tokens == 0) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next: --gdn-async-commit folds MTP verification commits on a side "
+                                    "stream and needs --spec mtp: add --spec mtp or remove --gdn-async-commit");
+    }
     (void)plan_hot_embedding(c.vocab_size, c.hidden_size, o.hot_embedding_rows); // refuses N above the vocabulary
     Layout d;
     d.drafts       = static_cast<std::int32_t>(o.mtp_draft_tokens);
@@ -805,6 +814,8 @@ public:
             spec_backing_.fill(0);
             allocated += plan_.spec.bytes;
             spec_host_ = PinnedHostBuffer(4 * plan_.spec.w_count + 64);
+            // --gdn-async-commit: a stream and two events, no device memory.
+            if (options_.gdn_async_commit) { fold_stream_ = std::make_unique<GdnFoldStream>(); }
         }
 
         if (plan_.bytes.cpu_verify_misses != 0) { start_cpu_verify(); }
@@ -1004,6 +1015,7 @@ public:
     }
 
     ~ProgramImpl() noexcept {
+        settle_gdn_fold(); // the synchronization below then covers the fold in flight
         try {
             device_.synchronize();
         } catch (...) {}
@@ -1380,6 +1392,7 @@ public:
             out.kind = ContextOperationKind::Bind;
             return out;
         }
+        join_gdn_fold(); // a restore or a fresh lane's zeroing writes the state, a capture reads it
         select_lane(tx_lane_);
         if (tx_ == Tx::Capture) { return finish_capture(cancellation); }
         out.kind = ContextOperationKind::Bind;
@@ -1472,6 +1485,7 @@ public:
         PrefillProgress out;
         out.summary = L().begin;
         try {
+            join_gdn_fold();
             // An exact hit: the restored state is the prompt's, and its last position's logits
             // were restored with it. The first token is sampled from them as the prompt's last call
             // would (same logits, position and seed).
@@ -1577,7 +1591,10 @@ public:
         }
         // Several rows decode together in one plain round (MTP drafts only when one row decodes:
         // docs/maintainer/flash-next-lanes-spike.md); one row runs the single-sequence round.
-        if (sequences.size() > 1) { return decode_rows(sequences, failed, masks, start); }
+        if (sequences.size() > 1) {
+            join_gdn_fold();
+            return decode_rows(sequences, failed, masks, start);
+        }
         const nvtx::ScopedRange range(nvtx::Name::DecodeOrdinaryRound, nvtx::Category::Decode);
         try {
             // With the MTP drafter, a verification round when the policy drafts.
@@ -1594,6 +1611,7 @@ public:
             // the volume; the rest of the forward follows their upload.
             upload_inputs(position, 1);
             residency_->before_round(device_.stream);
+            join_gdn_fold(); // the front reads and writes the recurrent state
             run_decode(Part::Front);
             {
                 const nvtx::ScopedRange rows(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode);
@@ -1654,6 +1672,7 @@ public:
             if (token < 0 || token >= plan_.token_domain) { throw std::invalid_argument("forced token outside the domain"); }
         }
         try {
+            join_gdn_fold();
             // The model reads the pending input token and every forced token but the last, which
             // becomes the next decode input.
             L().history.insert(L().history.end(), tokens.begin(), tokens.end());
@@ -1700,6 +1719,7 @@ public:
         for (const auto& row : rows) {
             if (!valid(row)) { throw std::logic_error("Qwen3.8-Flash-Next: commit decisions are not row aligned"); }
         }
+        join_gdn_fold(); // none in flight after a decode round, which joined; kept for the rule
         if (rows.size() > 1) {
             std::array<bool, kMaximumLanes> constraint{};
             for (std::size_t row = 0; row < rows.size(); ++row) { constraint[row] = pending.constraint_failed(row); }
@@ -1781,6 +1801,7 @@ public:
         const std::size_t count = rows.size();
         ContractAccess::consume(pending);
         pending_     = 0;
+        settle_gdn_fold();
         // The round ran on the device: settle its cache update before the lanes go, as a commit would.
         try {
             settle_round(count > 1 ? static_cast<std::int32_t>(count) : round_width_, 0);
@@ -1803,6 +1824,7 @@ public:
             if (!valid(sequence)) { return out; }
             select_lane(ContractAccess::lane(sequence));
             if (L().phase != Phase::Finishable || pending_ != 0) { return out; }
+            settle_gdn_fold(); // the endpoint capture reads the state
             out.timings     = timings();
             out.speculative = speculative_stats();
             out.checkpoint  = capture_endpoint();
@@ -1822,6 +1844,7 @@ public:
             select_lane(ContractAccess::lane(sequence));
             out.timings     = timings();
             out.speculative = speculative_stats();
+            settle_gdn_fold();
             device_.synchronize();
             release_lane();
             apply_vram_target(true);
@@ -1840,6 +1863,7 @@ public:
     }
 
     void fail_all_cleanup() noexcept {
+        settle_gdn_fold();
         (void)device_.synchronize_status();
         abandon_capture();
         tx_          = Tx::None;
@@ -2101,6 +2125,7 @@ public:
         const auto start = Clock::now();
         std::optional<HostCheckpoint> captured;
         try {
+            join_gdn_fold(); // the capture copies the lane's state
             captured = capture_record(std::move(slabs), true);
         } catch (const std::system_error& error) {
             // The tier could not store the bytes (an NVMe tier's I/O failure, a full disk): the
@@ -3909,6 +3934,18 @@ private:
         return *plan;
     }
 
+    // --gdn-async-commit: the device stream waits for the fold in flight (none: nothing). Every
+    // entry point that enqueues device work joins first, except a single-row decode round, which
+    // joins just before its forward's front (verify, or a plain round's run_decode): its drafter
+    // steps before that read no GDN state or records, so they overlap the fold. Never inside a
+    // capture.
+    void join_gdn_fold() {
+        if (fold_stream_) { fold_stream_->join(device_.stream); }
+    }
+    void settle_gdn_fold() noexcept {
+        if (fold_stream_) { fold_stream_->settle(device_.stream); }
+    }
+
     // Runs `body` eagerly on its first use (the kernels' one-time setup runs outside a capture),
     // then captures it once and replays it.
     void replay(DecodeGraphDefinition& graph, DecodeGraphExecutable& exec, std::uint64_t& runs,
@@ -4140,6 +4177,9 @@ private:
         const Tensor wide32(logits32_.data, DType::FP32, {vocab_, W});
         Tensor wide16(logits16_.data, DType::BF16, {vocab_, W});
         const auto w = static_cast<std::size_t>(W);
+        // --gdn-async-commit: the previous commit's fold lands before the front reads the state and
+        // rewrites the records the fold reads.
+        join_gdn_fold();
         replay(G().verify_front.at(w), G().verify_front_exec.at(w), G().verify_runs.at(w), [&] {
             // The verification pools from copies of the live tails.
             // (the lane's tails sit one lane stride apart per layer; the copies are packed)
@@ -4344,7 +4384,17 @@ private:
         words[sp.w_commit]  = k;
         upload_pinned(spec_words_device() + sp.w_commit, words + sp.w_commit, 4, s);
         const ops::GdnReplayFoldRow row{0, 0, k};
-        fold(W).execute(std::span<const ops::GdnReplayFoldRow>(&row, 1), s);
+        const std::span<const ops::GdnReplayFoldRow> rows(&row, 1);
+        if (fold_stream_ && gdn_fold_on_side_stream(options_, d.terminal)) {
+            // --gdn-async-commit, a row that continues: the fold runs on the fold stream beside the
+            // commits and the drafter's catch-up below (none reads the recurrent state or the GDN
+            // records) and the next round's drafts; the next device use of the state joins it.
+            const ops::GdnReplayFoldPlan& plan = fold(W);
+            fold_stream_->run(s, [&](cudaStream_t side) { plan.execute(rows, side); });
+            g_async_gdn_folds.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            fold(W).execute(rows, s);
+        }
         auto* base = static_cast<std::byte*>(io_device_.p);
         const Tensor positions(base + plan_.io.positions, DType::I32, {W});
         const Tensor commit = spec_word(sp.w_commit, 1);
@@ -4850,6 +4900,9 @@ private:
     const execution::VisionInput* call_vision_ = nullptr;
     std::vector<execution::VisionInput> mtp_vision_inputs_;
     std::vector<std::optional<GdnReplayRecords>> records_;
+    // --gdn-async-commit: the fold stream (null when off). Declared after the state and the
+    // speculation buffers, so it is destroyed (waiting for the fold in flight) before they are freed.
+    std::unique_ptr<GdnFoldStream> fold_stream_;
     std::vector<TokenId> pending_tokens_, drafts_;
     std::int32_t pending_count_ = 0, round_width_ = 1;
     bool plain_round_           = false;
@@ -5012,6 +5065,10 @@ CpuVerifyPlan plan_cpu_verify_misses(const ProgramOptions& options) {
     return p;
 }
 
+bool gdn_fold_on_side_stream(const ProgramOptions& options, bool terminal) noexcept {
+    return options.gdn_async_commit && options.mtp_draft_tokens > 0 && !terminal;
+}
+
 GdnReplayRecordSpec gdn_records_spec(const TextConfig& c, std::int32_t width, bool gdn_head_map) {
     // The copy route tiles q/k to one key head per value head; the map reads the key heads in place.
     const std::uint32_t qk_heads = gdn_head_map ? c.gdn.key_heads : c.gdn.value_heads;
@@ -5050,6 +5107,9 @@ ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const Text
 const ProgramDevicePlan& Program::device_plan() const noexcept { return impl_->device_plan(); }
 const VramSizing& Program::vram_sizing() const noexcept { return impl_->vram_sizing(); }
 Program::ExpertCacheCounters Program::expert_cache_counters() const noexcept { return impl_->cache_counters(); }
+std::uint64_t Program::process_async_gdn_folds() noexcept {
+    return detail::g_async_gdn_folds.load(std::memory_order_relaxed);
+}
 
 RequestBasePlan Program::plan_request(PreparedPrompt&& prompt, const runtime::ResolvedExecutionOptions& options) {
     return impl_->plan_request(std::move(prompt), options);

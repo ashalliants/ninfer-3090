@@ -13,6 +13,8 @@
 // holds the call's A8-cast input (codes and scales, T * (2560 + 320) bytes).
 // --cpu-verify-misses: the CPU miss service's device counter is a named term (its mapped channel a
 // pinned one), zero when off or without MTP; MTP off and worker counts outside [1, 64] are refused.
+// --gdn-async-commit: no device memory; only a verification commit the row continues from folds on
+// the side stream; MTP off is refused.
 
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/program/program.h"
@@ -346,6 +348,24 @@ int main() {
         check(refuses(leg, "--cpu-verify-workers"), "--cpu-verify-workers 0 is refused naming the flag");
         leg.cpu_verify_workers = 65;
         check(refuses(leg, "--cpu-verify-workers"), "--cpu-verify-workers 65 is refused naming the flag");
+
+        // --gdn-async-commit: a stream and two events, no device memory (no ProgramDevicePlan term).
+        // A verification commit folds on the side stream only when the option is on, MTP is on and
+        // the row continues; a terminal commit folds on the device stream before the Engine sees the
+        // round. Without MTP startup refuses naming the flag, before the device is asked anything.
+        q4::ProgramOptions fold;
+        fold.max_context = 32768;
+        check(!fold.gdn_async_commit, "the GDN commit on a side stream is off by default");
+        fold.mtp_draft_tokens = 3;
+        check(!q4::gdn_fold_on_side_stream(fold, false) && !q4::gdn_fold_on_side_stream(fold, true),
+              "off folds every commit on the device stream");
+        fold.gdn_async_commit = true;
+        check(q4::gdn_fold_on_side_stream(fold, false), "on, a commit the row continues from folds on the side stream");
+        check(!q4::gdn_fold_on_side_stream(fold, true), "on, a terminal commit folds on the device stream");
+        fold.mtp_draft_tokens = 0;
+        check(!q4::gdn_fold_on_side_stream(fold, false), "without MTP nothing folds on the side stream");
+        check(refuses(fold, "--gdn-async-commit") && refuses(fold, "--spec mtp"),
+              "--gdn-async-commit without MTP is refused naming the flag and --spec mtp");
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

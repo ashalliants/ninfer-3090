@@ -190,6 +190,24 @@ int main() {
                               (std::string("--cpu-verify-workers ") + bad + " was not refused").c_str());
         }
     }
+    failures += check(!defaults.flash_next.gdn_async_commit, "the GDN commit on a side stream is on by default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+                                                 "--gdn-async-commit"}))
+                          .flash_next.gdn_async_commit,
+                      "--gdn-async-commit does not reach the Engine");
+    for (const auto& spec : {std::vector<std::string>{}, std::vector<std::string>{"--spec", "dflash"}}) {
+        std::vector<std::string> args{"ninfer-serve", "model.ninfer", "--gdn-async-commit"};
+        args.insert(args.end(), spec.begin(), spec.end());
+        bool named = false;
+        try {
+            (void)parse(std::move(args));
+        } catch (const std::invalid_argument& error) {
+            const std::string what = error.what();
+            named = what.find("--gdn-async-commit") != std::string::npos &&
+                    what.find("--spec mtp") != std::string::npos;
+        }
+        failures += check(named, "--gdn-async-commit without --spec mtp was not refused naming both flags");
+    }
     failures += check(!defaults.flash_next.mtp_constrained, "MTP for constrained requests is on by default");
     failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
                                                  "--mtp-constrained"}))

@@ -113,7 +113,7 @@ set_tests_properties(ninfer_qwen4_exp_lanes_real_test PROPERTIES SKIP_RETURN_COD
 ninfer_add_test(ninfer_qwen4_exp_engine_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_real.cpp"
   NEEDS_SOURCE_DIR
-  LIBRARIES ninfer_engine ninfer_ops ninfer_core)
+  LIBRARIES ninfer_engine ninfer_model_runtime ninfer_ops ninfer_core)
 set_tests_properties(ninfer_qwen4_exp_engine_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
 # GPU, real artifact with the MTP drafter (skips otherwise): mtp_constrained_matches_plain, the
@@ -166,3 +166,12 @@ set_tests_properties(ninfer_qwen4_exp_moe_fused_route_test PROPERTIES SKIP_RETUR
 add_test(NAME ninfer_qwen4_exp_cpu_verify_misses_test
   COMMAND ninfer_tests ninfer_qwen4_exp_engine_real_test --cpu-verify-misses-exact --mtp 3 --expert-cache-mib 4096)
 set_tests_properties(ninfer_qwen4_exp_cpu_verify_misses_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# GPU, real artifact with the MTP drafter (skips otherwise): gdn_async_commit_matches_serial, the
+# engine test's --gdn-async-commit-exact mode. Greedy ids with --gdn-async-commit (a continuing
+# verification commit folds its GDN columns on a side stream; the next round's front waits for it)
+# equal those of the fold on the device stream, and so do the MTP rounds, drafts and acceptances; at
+# least one fold must run on the side stream.
+add_test(NAME ninfer_qwen4_exp_gdn_async_commit_test
+  COMMAND ninfer_tests ninfer_qwen4_exp_engine_real_test --gdn-async-commit-exact --mtp 3)
+set_tests_properties(ninfer_qwen4_exp_gdn_async_commit_test PROPERTIES SKIP_RETURN_CODE 77)

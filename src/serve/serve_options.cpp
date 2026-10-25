@@ -177,7 +177,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--ngram-volume FILE] [--ngram-keepalive-ms N] [--expert-state FILE|--no-expert-state] [--default-expert-state FILE] "
            "[--vram-headroom-mib N] [--shared-expert-stream] [--mtp-constrained] [--mtp-joint-acceptance] [--ngram-prefetch] "
            "[--hot-embedding-rows N] [--gdn-head-map] [--moe-precast-input [--moe-gate-up-registers]] "
-           "[--moe-fused-route] [--cpu-verify-misses [--cpu-verify-workers N]] "
+           "[--moe-fused-route] [--cpu-verify-misses [--cpu-verify-workers N]] [--gdn-async-commit] "
            "[--ram-headroom-mib N] [--expert-cache-mib N] [--context-nvme-mib N [--context-nvme-dir DIR]] "
            "[--chat-template FILE] "
            "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
@@ -283,7 +283,10 @@ std::string serve_usage_text(const char* argv0) {
            "experts of a decode call in one launch instead of two (the same output, bit for bit; off by "
            "default); --cpu-verify-misses (--spec mtp) computes some of each verification round's "
            "uncached experts on N CPU threads (--cpu-verify-workers, default 6) beside the GPU instead "
-           "of reading them over PCIe (the same output, bit for bit; off by default); "
+           "of reading them over PCIe (the same output, bit for bit; off by default); --gdn-async-commit "
+           "(--spec mtp) folds each verification's accepted columns into the GDN state on a side stream "
+           "while the drafter catches up and drafts the next round (the same state, bit for bit; off by "
+           "default); "
            "--vision takes "
            "images when "
            "the model was converted with "
@@ -701,6 +704,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.flash_next.moe_fused_route = true;
         } else if (arg == "--cpu-verify-misses") {
             options.flash_next.cpu_verify_misses = true;
+        } else if (arg == "--gdn-async-commit") {
+            options.flash_next.gdn_async_commit = true;
         } else if (arg == "--cpu-verify-workers") {
             const int workers = parse_nonnegative_int(require_value("--cpu-verify-workers"), "cpu-verify-workers");
             if (workers < 1 || workers > 64) { throw std::invalid_argument("--cpu-verify-workers must be in [1, 64]"); }
@@ -977,6 +982,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.flash_next.cpu_verify_misses && options.speculative.backend != SpeculativeBackend::Mtp) {
         throw std::invalid_argument("--cpu-verify-misses computes MTP verification rounds' misses on the CPU and "
                                     "needs --spec mtp");
+    }
+    if (options.flash_next.gdn_async_commit && options.speculative.backend != SpeculativeBackend::Mtp) {
+        throw std::invalid_argument("--gdn-async-commit folds MTP verification commits on a side stream and needs "
+                                    "--spec mtp");
     }
     if (cpu_verify_workers_set && !options.flash_next.cpu_verify_misses) {
         throw std::invalid_argument("--cpu-verify-workers sizes the CPU team of --cpu-verify-misses: add "

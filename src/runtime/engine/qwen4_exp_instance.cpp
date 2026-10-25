@@ -187,6 +187,10 @@ void validate(const EngineOptions& options) {
                "--spec mtp or remove --cpu-verify-misses");
     }
     if (next.cpu_verify_workers < 1 || next.cpu_verify_workers > 64) { refuse("--cpu-verify-workers must be in [1, 64]"); }
+    if (next.gdn_async_commit && spec.backend != SpeculativeBackend::Mtp) {
+        refuse("--gdn-async-commit folds MTP verification commits on a side stream and needs --spec mtp: add "
+               "--spec mtp or remove --gdn-async-commit");
+    }
     if (next.ngram_prefetch && spec.backend != SpeculativeBackend::Mtp) {
         refuse("--ngram-prefetch reads the anchor column's n-gram rows while the MTP drafter runs and needs "
                "--spec mtp: add --spec mtp or remove --ngram-prefetch");
@@ -375,6 +379,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.moe_fused_route       = next.moe_fused_route;
     program_options.cpu_verify_misses     = next.cpu_verify_misses;
     program_options.cpu_verify_workers    = next.cpu_verify_workers;
+    program_options.gdn_async_commit      = next.gdn_async_commit;
     program_options.ngram_volume    = next.ngram_volume_path.empty()
                                           ? models::qwen4_exp::default_ngram_volume(options.artifact_path)
                                           : next.ngram_volume_path;

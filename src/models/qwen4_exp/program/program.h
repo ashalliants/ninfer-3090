@@ -454,7 +454,18 @@ struct ProgramOptions {
     // included (1..64).
     bool cpu_verify_misses           = false;
     std::uint32_t cpu_verify_workers = 6;
+    // FlashNextOptions::gdn_async_commit: a verification commit the row continues from folds its
+    // GDN columns on the Program's fold stream (gdn_fold_on_side_stream); every later device use of
+    // the state (the next round's front, any other entry point) waits for it. Requires MTP
+    // (mtp_draft_tokens > 0). The same state, bit for bit. No device memory (a stream and two events).
+    bool gdn_async_commit = false;
 };
+
+// --gdn-async-commit: whether a verification commit runs its GDN replay fold on the fold stream
+// (true) or on the device stream as before. Only a commit the row continues from (`terminal`
+// false) goes to the fold stream: a terminal one (the end of the request, or of its budget) folds
+// on the device stream, so the state is final before the Engine sees the round.
+[[nodiscard]] bool gdn_fold_on_side_stream(const ProgramOptions& options, bool terminal) noexcept;
 
 // The CPU miss service of --cpu-verify-misses: its options (CPU-served experts per layer call, the
 // share left on the GPU, the widest call it serves: a verification of 1 + mtp_draft_tokens columns)
@@ -516,6 +527,9 @@ public:
         std::uint32_t frames = 0;
     };
     [[nodiscard]] ExpertCacheCounters expert_cache_counters() const noexcept;
+    // --gdn-async-commit: the GDN replay folds every Program in this process has run on its fold
+    // stream (a test's proof that the option's route ran).
+    [[nodiscard]] static std::uint64_t process_async_gdn_folds() noexcept;
 
     [[nodiscard]] RequestBasePlan plan_request(PreparedPrompt&& prompt,
                                                const runtime::ResolvedExecutionOptions& options);

@@ -435,6 +435,11 @@ struct FlashNextOptions {
     // same output. Plain decode and prefill are unchanged.
     bool cpu_verify_misses           = false;
     std::uint32_t cpu_verify_workers = 6;
+    // Run an MTP verification commit's GDN replay fold (the accepted columns folded into the
+    // recurrent state) on a stream of its own (--gdn-async-commit; needs --spec mtp), beside the
+    // drafter's catch-up and next drafts and the host's work; the next round's forward waits for it.
+    // A commit that ends the request folds before the round is reported. The same state, bit for bit.
+    bool gdn_async_commit = false;
     // The context cache's NVMe tier: a scratch file of up to this many bytes holds the checkpoints,
     // with the Host context budget as its RAM cache (a zero Host budget then reuses prefixes from
     // disk alone); 0: none. The file is created in `context_nvme_dir` (empty: beside the artifact),
