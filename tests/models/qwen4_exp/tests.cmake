@@ -9,7 +9,7 @@ ninfer_add_test(ninfer_qwen4_exp_ngram_hash_test
   LIBRARIES ninfer_model_loading)
 
 # Host only, header only: the draft-length policies (the EMA rule the Program uses and Basalt's
-# joint-acceptance rule with its adaptive threshold).
+# joint-acceptance rule with its adaptive threshold and the window --mtp-joint-acceptance verifies).
 ninfer_add_test(ninfer_qwen4_exp_draft_policy_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_draft_policy.cpp"
   LIBRARIES ninfer_core)
@@ -76,7 +76,7 @@ ninfer_add_test(ninfer_qwen4_exp_memory_plan_test
 
 # Host only: the Program's planned device terms computed from the options and the configuration
 # and their startup checks (the shared expert's side-stream workspace against the Linear Op's own
-# capacity; a constrained verification's grammar masks).
+# capacity; a constrained verification's grammar masks; the joint-acceptance draft probabilities).
 ninfer_add_test(ninfer_qwen4_exp_program_plan_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_program_plan.cpp"
   LIBRARIES ninfer_model_runtime ninfer_ops ninfer_core)

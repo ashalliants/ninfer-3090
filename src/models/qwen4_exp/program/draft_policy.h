@@ -67,6 +67,15 @@ inline int joint_acceptance_length(std::span<const float> probs, float threshold
     return n;
 }
 
+// The drafts a round verifies once `probs.size()` drafts were made: joint_acceptance_length, but at
+// least one; 0 only when nothing was drafted. Basalt picks the window before verifying and may pick
+// no draft (a plain round). Here the drafts are already made when the rule runs and the round goes
+// on to a verification, so the first draft is always verified.
+inline int joint_acceptance_window(std::span<const float> probs, float threshold) {
+    if (probs.empty()) { return 0; }
+    return std::max(1, joint_acceptance_length(probs, threshold));
+}
+
 // Basalt DraftCumAdapt: the per-request threshold. It falls from `base` toward `low` while drafts
 // are accepted more often than the table predicts (longer windows then pay) and returns to `base`
 // when they are accepted less often. The observed and expected accepted counts decay by 0.97 per

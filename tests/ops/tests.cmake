@@ -16,6 +16,7 @@ set(ninfer_op_tests
   layer_norm
   embedding
   argmax
+  argmax_probability
   gdn_gating
   gdn_gating_proj
   rope

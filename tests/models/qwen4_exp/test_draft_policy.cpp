@@ -103,6 +103,22 @@ void joint_length_stops() {
     require(joint_acceptance_length(sure, 0.01f) == 2, "capped at the window");
 }
 
+void joint_window_verifies_one() {
+    // The window the Program verifies after drafting: the rule's length, at least one draft.
+    const std::array<float, 3> low_third{0.99f, 0.99f, 0.4f};
+    require(joint_acceptance_window(low_third, 0.35f) == 2, "the window is the rule's length");
+    const std::array<float, 2> weak{0.1f, 0.99f};
+    require(joint_acceptance_length(weak, 0.35f) == 0, "the rule alone keeps no draft");
+    require(joint_acceptance_window(weak, 0.35f) == 1, "a round that drafted verifies its first draft");
+    require(joint_acceptance_window(std::span<const float>{}, 0.35f) == 0, "nothing drafted, nothing verified");
+    const std::array<float, 7> sure{0.99f, 0.99f, 0.99f, 0.99f, 0.99f, 0.99f, 0.99f};
+    // .96^k >= .25 up to k = 33: all seven kept at the floor; at base .35 too (.96^7 = .7514).
+    require(joint_acceptance_window(sure, 0.35f) == 7, "never longer than the drafts made");
+    // The window follows the threshold the lane's JointAcceptanceThreshold holds.
+    JointAcceptanceThreshold fresh;
+    require(joint_acceptance_window(low_third, fresh.current()) == 2, "a new request starts from base");
+}
+
 void joint_threshold_adapts() {
     JointAcceptanceThreshold t;
     require(t.current() == 0.35f, "starts at base");
@@ -155,6 +171,7 @@ int main() {
         ema_matches_master();
         joint_table_bins();
         joint_length_stops();
+        joint_window_verifies_one();
         joint_threshold_adapts();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
