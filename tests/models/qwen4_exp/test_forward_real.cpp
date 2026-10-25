@@ -98,6 +98,14 @@
 // The same calls, first with the default gate/up kernel (per-block casts, rows staged in shared
 // memory), then with the precast input and the register gate/up kernel. Every logits column must be
 // bitwise equal.
+//
+// MoE one-launch route and dispatch mode (ForwardOptions::moe_fused_route is bit-exact):
+//
+//   ninfer_qwen4_exp_forward_real_test --moe-fused-route TOKENS [--window W] [--decode N] [--staging SLOTS]
+//
+// The same calls, first with moe_route then moe_dispatch, then with moe_route_dispatch (one launch
+// for the verification and decode calls; the prompt call, wider than 8 columns, takes the two Ops
+// either way). Every logits column must be bitwise equal.
 
 #include "artifact/reader.h"
 #include "core/arena.h"
@@ -1326,10 +1334,10 @@ int shared_expert_mode(int argc, char** argv, const char* artifact_env) {
     return ok ? 0 : 1;
 }
 
-// The identity checks of ForwardOptions::gdn_head_map, ForwardOptions::moe_precast_input and
-// ForwardOptions::moe_gate_up_registers (see the header; `flag` names the one checked, the last with
-// the precast input it needs): the same calls from a fresh state without and with the option; every
-// logits column must be bitwise equal.
+// The identity checks of ForwardOptions::gdn_head_map, ForwardOptions::moe_precast_input,
+// ForwardOptions::moe_gate_up_registers and ForwardOptions::moe_fused_route (see the header; `flag`
+// names the one checked, moe_gate_up_registers with the precast input it needs): the same calls from
+// a fresh state without and with the option; every logits column must be bitwise equal.
 int identity_mode(int argc, char** argv, const char* artifact_env, const std::string& flag) {
     std::vector<std::int32_t> tokens;
     std::int32_t window = 3, decode = 2, staging_slots = 64;
@@ -1395,9 +1403,11 @@ int identity_mode(int argc, char** argv, const char* artifact_env, const std::st
     const bool head_map_mode = flag == "--gdn-head-map";
     const auto run = [&](bool on) {
         const bool registers = on && flag == "--moe-gate-up-registers";
+        const bool precast   = registers || (on && flag == "--moe-precast-input");
         const ex::ForwardOptions options{.gdn_head_map          = on && head_map_mode,
-                                         .moe_precast_input     = on && !head_map_mode,
-                                         .moe_gate_up_registers = registers};
+                                         .moe_precast_input     = precast,
+                                         .moe_gate_up_registers = registers,
+                                         .moe_fused_route       = on && flag == "--moe-fused-route"};
         Harness harness(parameters, device, context, head, staging_slots, options);
         Verifier verifier(harness, window, options.gdn_head_map);
         std::vector<std::vector<float>> rows;
@@ -1463,7 +1473,8 @@ int main(int argc, char** argv) {
         if (std::any_of(argv + 1, argv + argc, [](const char* a) { return std::string(a) == "--shared-expert-stream"; })) {
             return shared_expert_mode(argc, argv, artifact_env);
         }
-        for (const char* flag : {"--gdn-head-map", "--moe-precast-input", "--moe-gate-up-registers"}) {
+        for (const char* flag :
+             {"--gdn-head-map", "--moe-precast-input", "--moe-gate-up-registers", "--moe-fused-route"}) {
             if (std::any_of(argv + 1, argv + argc, [&](const char* a) { return std::string(a) == flag; })) {
                 return identity_mode(argc, argv, artifact_env, flag);
             }

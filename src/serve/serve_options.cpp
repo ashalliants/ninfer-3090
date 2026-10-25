@@ -177,6 +177,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--ngram-volume FILE] [--ngram-keepalive-ms N] [--expert-state FILE|--no-expert-state] [--default-expert-state FILE] "
            "[--vram-headroom-mib N] [--shared-expert-stream] [--mtp-constrained] [--mtp-joint-acceptance] [--ngram-prefetch] "
            "[--hot-embedding-rows N] [--gdn-head-map] [--moe-precast-input [--moe-gate-up-registers]] "
+           "[--moe-fused-route] "
            "[--ram-headroom-mib N] [--expert-cache-mib N] [--context-nvme-mib N [--context-nvme-dir DIR]] "
            "[--chat-template FILE] "
            "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
@@ -278,7 +279,9 @@ std::string serve_usage_text(const char* argv0) {
            "casts each routed-expert call's input to A8 once instead of in every gate/up block (the same "
            "output, bit for bit; off by default); --moe-gate-up-registers computes the routed experts' "
            "gate/up rows from registers in a grid that stays resident (the same output, bit for bit; off "
-           "by default; needs --moe-precast-input); "
+           "by default; needs --moe-precast-input); --moe-fused-route routes and dispatches the routed "
+           "experts of a decode call in one launch instead of two (the same output, bit for bit; off by "
+           "default); "
            "--vision takes "
            "images when "
            "the model was converted with "
@@ -691,6 +694,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.flash_next.moe_precast_input = true;
         } else if (arg == "--moe-gate-up-registers") {
             options.flash_next.moe_gate_up_registers = true;
+        } else if (arg == "--moe-fused-route") {
+            options.flash_next.moe_fused_route = true;
         } else if (arg == "--hot-embedding-rows") {
             options.flash_next.hot_embedding_rows = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--hot-embedding-rows"), "hot-embedding-rows"));

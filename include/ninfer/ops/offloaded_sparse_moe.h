@@ -218,11 +218,26 @@ struct MoeDispatch {
 [[nodiscard]] MoeDispatch carve_moe_dispatch(void* base, std::int32_t experts, std::int32_t entries);
 /// Fills `dispatch` from routing.ids: counts, offsets (exclusive scan, offsets[E] = k*T), jobs in
 /// ascending expert id, job_count, and entries grouped by expert (their order within an expert is
-/// unspecified). When `route_log` is not null it also receives a copy of the k*T ids. An id outside
-/// [0, E) (moe_route never writes one) is logged but not dispatched, and offsets[E] counts only the
-/// dispatched entries. The arrays need no clearing between calls, so a captured call replays correctly.
+/// unspecified: atomics; moe_route_dispatch fixes it for decode-width calls). When `route_log` is
+/// not null it also receives a copy of the k*T ids. An id outside [0, E) (moe_route writes one only
+/// for a column it cannot rank, an all-NaN one) is logged but not dispatched, and offsets[E] counts
+/// only the dispatched entries. The arrays need no clearing between calls, so a captured call replays correctly.
 void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& dispatch,
                   std::int32_t* route_log, cudaStream_t stream);
+
+/// The widest call moe_route_dispatch routes and dispatches in one launch (decode, MTP rounds).
+inline constexpr std::int32_t kMoeRouteDispatchColumns = 8;
+
+/// moe_route(logits, top_k, routing) then moe_dispatch(routing, E, dispatch, route_log) with
+/// E = logits.ne[0] - 1, with the same requirements: the same routing bits (the same device code),
+/// counts, offsets, jobs, job_count and route log. A call of at most kMoeRouteDispatchColumns
+/// columns runs as one launch (one CTA) whose entries are in a fixed order: within each expert in
+/// ascending entry index (t * k + slot), so every array equals offloaded_moe::plan_dispatch
+/// (src/ops/offloaded_sparse_moe/dispatch_plan.h) of the routed ids. A wider call runs the two Ops,
+/// whose order within an expert is unspecified. Consumers still must not depend on that order (both
+/// routes feed them): moe_experts and moe_combine give the same bits for any order.
+void moe_route_dispatch(const Tensor& logits, std::int32_t top_k, MoeRouting& routing, MoeDispatch& dispatch,
+                        std::int32_t* route_log, cudaStream_t stream);
 
 /// CPU-served misses. When enabled for a call (max_jobs > 0 and the call has at most max_columns
 /// columns), up to max_jobs of its non-resident experts with at most max_job_columns columns, the

@@ -56,6 +56,12 @@ ninfer_add_op_test(ninfer_gdn_head_map_test
 ninfer_add_op_test(ninfer_offloaded_moe_cpu_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_cpu.cpp"
   LIBRARIES ninfer_ops)
+# Host-only: offloaded_moe::plan_dispatch, the exact dispatch (counts, offsets, jobs ascending,
+# entries ascending within each expert) that moe_route_dispatch's one-launch route writes for a
+# decode-width call, and the oracle the layer test checks it against.
+ninfer_add_op_test(ninfer_moe_dispatch_plan_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_moe_dispatch_plan.cpp"
+  LIBRARIES ninfer_core)
 ninfer_add_op_test(ninfer_offloaded_moe_layer_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_layer.cu"
   LIBRARIES ninfer_ops ninfer_artifact)

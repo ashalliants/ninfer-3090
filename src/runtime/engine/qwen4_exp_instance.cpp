@@ -359,6 +359,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.gdn_head_map         = next.gdn_head_map;
     program_options.moe_precast_input    = next.moe_precast_input;
     program_options.moe_gate_up_registers = next.moe_gate_up_registers;
+    program_options.moe_fused_route       = next.moe_fused_route;
     program_options.ngram_volume    = next.ngram_volume_path.empty()
                                           ? models::qwen4_exp::default_ngram_volume(options.artifact_path)
                                           : next.ngram_volume_path;

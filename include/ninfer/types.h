@@ -423,6 +423,10 @@ struct FlashNextOptions {
     // the same order, so the same output bit for bit. Reads the precast input, so it requires
     // moe_precast_input.
     bool moe_gate_up_registers = false;
+    // Route and dispatch the routed experts of a call of at most 8 columns (decode, MTP rounds) in
+    // one launch instead of two (--moe-fused-route), with each expert's columns in a fixed order. The
+    // same routing and the same output, bit for bit.
+    bool moe_fused_route = false;
     // The context cache's NVMe tier: a scratch file of up to this many bytes holds the checkpoints,
     // with the Host context budget as its RAM cache (a zero Host budget then reuses prefixes from
     // disk alone); 0: none. The file is created in `context_nvme_dir` (empty: beside the artifact),

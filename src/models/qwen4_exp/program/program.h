@@ -436,6 +436,9 @@ struct ProgramOptions {
     // FlashNextOptions::moe_gate_up_registers: the routed experts' gate/up rows from registers
     // (execution::ForwardOptions::moe_gate_up_registers); requires moe_precast_input. No memory.
     bool moe_gate_up_registers = false;
+    // FlashNextOptions::moe_fused_route: decode-width routed-expert calls route and dispatch in one
+    // launch (execution::ForwardOptions::moe_fused_route). No memory.
+    bool moe_fused_route = false;
 };
 
 // ProgramDevicePlan::shared_expert_workspace of these options: the side-stream carve

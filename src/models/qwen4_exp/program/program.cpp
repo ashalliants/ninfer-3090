@@ -1001,7 +1001,8 @@ public:
         execution::ForwardOptions out{.shared_expert_stream = options_.shared_expert_stream,
                                       .gdn_head_map         = options_.gdn_head_map,
                                       .moe_precast_input    = options_.moe_precast_input,
-                                      .moe_gate_up_registers = options_.moe_gate_up_registers};
+                                      .moe_gate_up_registers = options_.moe_gate_up_registers,
+                                      .moe_fused_route       = options_.moe_fused_route};
         if (plan_.bytes.hot_embedding == 0) { return out; }
         const Weight& table        = parameters_.token_embedding;
         const auto rows            = static_cast<std::int32_t>(options_.hot_embedding_rows);

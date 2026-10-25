@@ -46,6 +46,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_load_report_test
   ninfer_media_decode_test
   ninfer_metrics_test
+  ninfer_moe_dispatch_plan_test
   ninfer_offloaded_moe_cpu_test
   ninfer_openai_responses_store_test
   ninfer_openai_responses_test

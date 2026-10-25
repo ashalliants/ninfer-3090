@@ -153,6 +153,10 @@ int main() {
         }
         failures += check(refused, "--moe-gate-up-registers without --moe-precast-input was not refused naming both flags");
     }
+    failures += check(!defaults.flash_next.moe_fused_route, "the one-launch MoE route and dispatch is on by default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--moe-fused-route"}))
+                          .flash_next.moe_fused_route,
+                      "--moe-fused-route does not reach the Engine");
     failures += check(!defaults.flash_next.mtp_constrained, "MTP for constrained requests is on by default");
     failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
                                                  "--mtp-constrained"}))

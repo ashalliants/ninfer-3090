@@ -157,7 +157,8 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
       side_(options.shared_expert_stream ? std::make_unique<SideStream>() : nullptr),
       hot_embedding_rows_(options.hot_embedding_rows), hot_embedding_(options.hot_embedding),
       cold_embedding_(options.cold_embedding), gdn_head_map_(options.gdn_head_map),
-      moe_precast_input_(options.moe_precast_input), moe_gate_up_registers_(options.moe_gate_up_registers) {
+      moe_precast_input_(options.moe_precast_input), moe_gate_up_registers_(options.moe_gate_up_registers),
+      moe_fused_route_(options.moe_fused_route) {
     if (state_.gdn_conv.size() != config_.gdn_layers || state_.gdn_recurrent.size() != config_.gdn_layers ||
         state_.ple_slot.dtype != DType::I32 || state_.ple_slot.numel() != 1 ||
         state_.qsa_tails.size() != config_.attention_layers || kv_.layers.size() != config_.attention_layers ||
@@ -184,7 +185,8 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
       experts_(std::move(experts)), side_(options.shared_expert_stream ? std::make_unique<SideStream>() : nullptr),
       hot_embedding_rows_(options.hot_embedding_rows), hot_embedding_(options.hot_embedding),
       cold_embedding_(options.cold_embedding), gdn_head_map_(options.gdn_head_map),
-      moe_precast_input_(options.moe_precast_input), moe_gate_up_registers_(options.moe_gate_up_registers) {
+      moe_precast_input_(options.moe_precast_input), moe_gate_up_registers_(options.moe_gate_up_registers),
+      moe_fused_route_(options.moe_fused_route) {
     if (mtp.has_value() != parameters_.mtp.has_value()) {
         throw std::invalid_argument("Qwen4Exp forward: the MTP drafter's parameters and state go together");
     }
@@ -674,13 +676,18 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     }
     ops::MoeRouting routing{work_->alloc(DType::I32, {K, T}), work_->alloc(DType::FP32, {K, T}),
                             work_->alloc(DType::FP32, {T})};
-    ops::moe_route(logits, K, routing, s);
-    if (route_tap != nullptr &&
-        cudaMemcpyAsync(route_tap->data, routing.ids.data, routing.ids.bytes(), cudaMemcpyDeviceToDevice, s) !=
-            cudaSuccess) {
-        throw std::runtime_error("Qwen4Exp forward: route tap copy failed");
+    const auto copy_route_tap = [&] {
+        if (route_tap != nullptr &&
+            cudaMemcpyAsync(route_tap->data, routing.ids.data, routing.ids.bytes(), cudaMemcpyDeviceToDevice, s) !=
+                cudaSuccess) {
+            throw std::runtime_error("Qwen4Exp forward: route tap copy failed");
+        }
+    };
+    if (!moe_fused_route_) {
+        ops::moe_route(logits, K, routing, s);
+        copy_route_tap();
     }
-    std::int32_t* route_log = nullptr; // moe_dispatch writes the raw ids there (same layout as routing.ids)
+    std::int32_t* route_log = nullptr; // the dispatch writes the raw ids there (same layout as routing.ids)
     if (experts_.route_log != nullptr) {
         if (static_cast<std::size_t>(K) * T > experts_.route_stride) {
             throw std::logic_error("Qwen4Exp forward: the call exceeds the route log");
@@ -689,7 +696,14 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     }
     const DeviceSpan dispatch_bytes = work_->alloc_bytes(ops::moe_dispatch_bytes(E, K * T));
     ops::MoeDispatch dispatch       = ops::carve_moe_dispatch(dispatch_bytes.data, E, K * T);
-    ops::moe_dispatch(routing, E, dispatch, route_log, s);
+    if (moe_fused_route_) {
+        // ForwardOptions::moe_fused_route: one launch for a call of at most 8 columns, the two Ops
+        // otherwise; the tap then copies the same ids.
+        ops::moe_route_dispatch(logits, K, routing, dispatch, route_log, s);
+        copy_route_tap();
+    } else {
+        ops::moe_dispatch(routing, E, dispatch, route_log, s);
+    }
     ops::MoeExpertSource source{.format        = p.bank->format,
                                 .frame_base    = experts_.frame_base,
                                 .frames        = experts_.frames.at(layer),
@@ -1179,10 +1193,14 @@ void Forward::mtp_block(const MtpCall& call) {
         }
         ops::MoeRouting routing{work_->alloc(DType::I32, {K, T}), work_->alloc(DType::FP32, {K, T}),
                                 work_->alloc(DType::FP32, {T})};
-        ops::moe_route(logits, K, routing, s);
+        if (!moe_fused_route_) { ops::moe_route(logits, K, routing, s); }
         const DeviceSpan dispatch_bytes = work_->alloc_bytes(ops::moe_dispatch_bytes(E, K * T));
         ops::MoeDispatch dispatch       = ops::carve_moe_dispatch(dispatch_bytes.data, E, K * T);
-        ops::moe_dispatch(routing, E, dispatch, nullptr, s);
+        if (moe_fused_route_) {
+            ops::moe_route_dispatch(logits, K, routing, dispatch, nullptr, s);
+        } else {
+            ops::moe_dispatch(routing, E, dispatch, nullptr, s);
+        }
         const ops::MoeExpertSource source{.format        = p.bank->format,
                                           .precast_input = moe_precast_input_,
                                           .gate_up_variant = gate_up_variant(moe_gate_up_registers_),
