@@ -52,8 +52,9 @@ ninfer::EngineOptions lossy_options(const char* artifact, const Spec* spec) {
         options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
     } else if (spec) {
         options.speculative.backend      = ninfer::SpeculativeBackend::DFlash2;
-        options.speculative.draft_tokens = 7;
-        options.gdn_state_fp16           = true;
+        options.speculative.draft_tokens  = 7;
+        options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+        options.gdn_state_fp16            = true;
     }
     return options;
 }
