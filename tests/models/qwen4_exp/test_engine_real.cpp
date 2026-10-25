@@ -681,13 +681,17 @@ int gdn_head_map_matches_copies(const std::string& artifact, const std::vector<s
     };
     const double ram_before = available_ram_gib();
     std::vector<std::vector<TokenId>> copies;
-    {
+    try {
         Engine engine(engine_options(false));
         for (std::size_t j = 0; j < prompts.size(); ++j) {
             const Run run = generate(engine, prompts[j], tokens);
             print_run(("q/k copies " + jobs[j]).c_str(), run, prompts[j].size());
             copies.push_back(run.ids);
         }
+    } catch (const std::exception& error) {
+        if (mtp == 0 || std::string(error.what()).find("no MTP drafter") == std::string::npos) { throw; }
+        std::printf("SKIP: the artifact has no MTP drafter (%s)\n", error.what());
+        return 77;
     }
     wait_for_ram(ram_before);
     bool ok = true;

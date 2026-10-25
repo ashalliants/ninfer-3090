@@ -43,9 +43,10 @@ the experts are `offloaded_sparse_moe` (canonical A8 arithmetic).
 `g = decay * softplus(a + dt_bias)`, `beta = sigmoid(b)` (`gdn_gating_decay`; `decay` is the
 stored `-exp(A_log)`); the causal SiLU convolution splits into q [128, 16], k [128, 16], v
 [128, 48]; value head h reads key head `h mod 16` (tiled order), so q and k are tiled to 48 heads
-and the recurrence runs with one key head per value head (with `--gdn-head-map` the recurrence reads
-the 16 key heads in place through `ops::GdnHeadMap::Tiled` instead); `o = GatedDeltaNet(...)` (normalized
-q/k, scale 1/sqrt(128)); `y = W_out (norm(o) * w * act(z))` per value head.
+and the recurrence runs with one key head per value head (with `--gdn-head-map` the recurrence
+reads the 16 key heads in place through `ops::GdnHeadMap::Tiled` instead);
+`o = GatedDeltaNet(...)` (normalized q/k, scale 1/sqrt(128)); `y = W_out (norm(o) * w * act(z))`
+per value head.
 
 **QSA.** `W_q` rows interleave per head: 256 query rows, then 256 gate rows. q and k are
 RMS-normalized with `1 + gamma`, rotated (64 of 256 dims), K/V appended to the INT8-G64 paged

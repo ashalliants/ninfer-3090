@@ -771,6 +771,44 @@ int contract_rejection_cases() {
         std::cerr << "gated_delta_net accepted a non-divisible head map\n";
         ++failures;
     }
+    // The tiled head map is instantiated for normalized q/k over an FP32 state only.
+    const auto tiled_rejected = [&](bool normalize, DType state_dtype, bool batch) {
+        Tensor q(q_buffer.p, DType::BF16, {kStateDim, 4, 1, 1});
+        Tensor k(k_buffer.p, DType::BF16, {kStateDim, 4, 1, 1});
+        Tensor v(v_buffer.p, DType::BF16, {kStateDim, 8, 1, 1});
+        Tensor g(g_buffer.p, DType::FP32, {8, 1, 1});
+        Tensor beta(beta_buffer.p, DType::FP32, {8, 1, 1});
+        Tensor state(state_buffer.p, state_dtype, {kStateDim, kStateDim, 8, 1});
+        Tensor out(out_buffer.p, DType::BF16, {kStateDim, 8, 1, 1});
+        DeviceBuffer slot = to_device(std::vector<int>{0});
+        Tensor slots(slot.p, DType::I32, {1});
+        try {
+            if (batch) {
+                ops::gated_delta_net_batch_update(q, k, v, g, beta, scale, normalize, state, slots,
+                                                  slots, out, nullptr, GdnHeadMap::Tiled);
+            } else {
+                Tensor q3 = q.view({kStateDim, 4, 1}), k3 = k.view({kStateDim, 4, 1});
+                Tensor v3 = v.view({kStateDim, 8, 1}), o3 = out.view({kStateDim, 8, 1});
+                Tensor g2 = g.view({8, 1}), b2 = beta.view({8, 1});
+                Tensor s3 = state.view({kStateDim, kStateDim, 8});
+                ops::gated_delta_net(q3, k3, v3, g2, b2, scale, normalize, workspace, s3, o3,
+                                     execution(), GdnHeadMap::Tiled);
+            }
+        } catch (const std::invalid_argument&) { return true; }
+        cuda_synchronize();
+        return false;
+    };
+    for (const bool batch : {false, true}) {
+        const std::string form = batch ? "gated_delta_net_batch_update" : "gated_delta_net";
+        if (!tiled_rejected(false, DType::FP32, batch)) {
+            std::cerr << form << " accepted the tiled map with raw q/k\n";
+            ++failures;
+        }
+        if (!tiled_rejected(true, DType::FP16, batch)) {
+            std::cerr << form << " accepted the tiled map with an FP16 state\n";
+            ++failures;
+        }
+    }
     return failures;
 }
 
@@ -882,8 +920,6 @@ int main() {
         failures += run_case({"flash-next tiled", 16, 48, tokens, true, false, GdnHeadMap::Tiled},
                              17000U + tokens, InputPattern::Ordinary, tokens % 2 != 0);
     }
-    failures += run_case({"flash-next tiled raw", 16, 48, 33, false, false, GdnHeadMap::Tiled},
-                         17100U);
     failures += run_case({"flash-next tiled continuation", 16, 48, 49, true, false,
                           GdnHeadMap::Tiled},
                          17200U, InputPattern::Ordinary, false, {32, 16, 1});
@@ -891,9 +927,7 @@ int main() {
         {"flash-next tiled selected-slot", 16, 48, 1, true, false, GdnHeadMap::Tiled}, {3, 1},
         {3, 1}, 4, 17300U);
     for (int tokens : {1, 7, 15, 16, 17, 64, 65, 1025}) {
-        for (bool normalize : {true, false}) {
-            failures += tiled_matches_expanded_case(tokens, normalize, 0, 17400U + tokens);
-        }
+        failures += tiled_matches_expanded_case(tokens, true, 0, 17400U + tokens);
     }
     for (int batch : {1, 2, 8}) {
         failures += tiled_matches_expanded_case(1, true, batch, 17500U + batch);

@@ -117,6 +117,11 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     if (states.ne[3] <= 0) {
         throw std::invalid_argument(std::string(kOp) + ": state slot count must be positive");
     }
+    // The tiled map is instantiated for Qwen3.8-Flash-Next's call only.
+    if (map == GdnHeadMap::Tiled && (valid_columns.data != nullptr || states.dtype != DType::FP32)) {
+        throw std::invalid_argument(std::string(kOp) +
+                                    ": the tiled head map needs dense rows and an FP32 state");
+    }
 
     require_tensor(q, DType::BF16, {kStateDim, qk_heads, width, rows}, 8, kOp, "q");
     require_tensor(k, DType::BF16, {kStateDim, qk_heads, width, rows}, 8, kOp, "k");
@@ -328,6 +333,10 @@ GdnReplayFoldPlan::GdnReplayFoldPlan(const GdnReplayRecords& records,
     : records_(records), states_(states) {
     validate_fold_records(records_);
     validate_fold_states(records_, states_);
+    // The tiled map is instantiated for Qwen3.8-Flash-Next's FP32 state only.
+    if (records_.spec.head_map == GdnHeadMap::Tiled && states_.recurrent_layer0.dtype != DType::FP32) {
+        throw std::invalid_argument("gdn_replay_fold: the tiled head map needs an FP32 recurrent state");
+    }
     require_records_disjoint_from_states(records_, states_);
 }
 

@@ -383,6 +383,35 @@ int tiled_matches_expanded(std::int32_t width, std::int32_t batch,
     return failures;
 }
 
+// The tiled map is instantiated for Qwen3.8-Flash-Next's dense rows only: masked rows are refused.
+int tiled_rejects_masked_rows() {
+    constexpr std::int32_t kQk = 16, kValue = 48, kWidth = 2;
+    DeviceBuffer q(static_cast<std::size_t>(kStateDim) * kQk * kWidth * 2);
+    DeviceBuffer k(q.bytes), key(q.bytes);
+    DeviceBuffer v(static_cast<std::size_t>(kStateDim) * kValue * kWidth * 2);
+    DeviceBuffer value(v.bytes), out(v.bytes);
+    DeviceBuffer g(static_cast<std::size_t>(kValue) * kWidth * 4), beta(g.bytes), gate(g.bytes * 2);
+    DeviceBuffer states(static_cast<std::size_t>(kStateDim) * kStateDim * kValue * 4);
+    DeviceBuffer slot = to_device(std::vector<std::int32_t>{0});
+    DeviceBuffer valid = to_device(std::vector<std::int32_t>{1});
+    Tensor qt(q.p, DType::BF16, {kStateDim, kQk, kWidth, 1}), kt(k.p, DType::BF16, {kStateDim, kQk, kWidth, 1});
+    Tensor vt(v.p, DType::BF16, {kStateDim, kValue, kWidth, 1});
+    Tensor gt(g.p, DType::FP32, {kValue, kWidth, 1}), bt(beta.p, DType::FP32, {kValue, kWidth, 1});
+    Tensor st(states.p, DType::FP32, {kStateDim, kStateDim, kValue, 1});
+    Tensor validt(valid.p, DType::I32, {1}), slott(slot.p, DType::I32, {1});
+    Tensor keyt(key.p, DType::BF16, {kStateDim, kQk, kWidth, 1});
+    Tensor valuet(value.p, DType::BF16, {kStateDim, kValue, kWidth, 1});
+    Tensor gatet(gate.p, DType::FP32, {2, kValue, kWidth, 1});
+    Tensor outt(out.p, DType::BF16, {kStateDim, kValue, kWidth, 1});
+    try {
+        ops::gated_delta_net_replay_record(qt, kt, vt, gt, bt, 1.0F / std::sqrt(128.0F), st, validt, slott,
+                                           keyt, valuet, gatet, outt, nullptr, GdnHeadMap::Tiled);
+    } catch (const std::invalid_argument&) { return 0; }
+    cuda_synchronize();
+    std::cerr << "gated_delta_net_replay_record accepted the tiled map with masked rows\n";
+    return 1;
+}
+
 } // namespace
 
 int main() {
@@ -410,8 +439,9 @@ int main() {
         failures += run_case(48, width, 1, {}, 1810U + width, 16, GdnHeadMap::Tiled);
         failures += tiled_matches_expanded(width, 1, {}, 1820U + width);
     }
-    failures += run_case(48, 16, 8, {16, 1, 2, 3, 9, 15, 4, 7}, 1831U, 16, GdnHeadMap::Tiled);
-    failures += tiled_matches_expanded(6, 3, {6, 2, 5}, 1841U);
+    failures += run_case(48, 16, 8, {}, 1831U, 16, GdnHeadMap::Tiled);
+    failures += tiled_matches_expanded(6, 3, {}, 1841U);
+    failures += tiled_rejects_masked_rows();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net_replay_record\n";
     return failures == 0 ? 0 : 1;
 }

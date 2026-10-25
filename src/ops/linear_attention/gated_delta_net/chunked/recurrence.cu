@@ -60,12 +60,12 @@ struct RecurrenceShared {
     float delta[kChunkSize * DV];
 };
 
-template <int DV>
+template <int DV, GdnHeadMap Map>
 __device__ __forceinline__ void load_stage(typename RecurrenceShared<DV>::Stage& stage,
                                            const Arguments& args, const QkChunk* qk_workspace,
                                            const ControlChunk* control_workspace, int head,
                                            int value_start, int chunk, int tid) {
-    const int qh       = qk_head_of(args, head);
+    const int qh       = qk_head_of<Map>(args, head);
     const int chunks   = chunk_count(args.tokens);
     const auto* qk_src = reinterpret_cast<const uint4*>(
         qk_workspace + static_cast<std::int64_t>(qh) * chunks + chunk);
@@ -138,7 +138,7 @@ __device__ __forceinline__ void store_output(const Arguments& args, float (&acc)
     }
 }
 
-template <int DV>
+template <int DV, GdnHeadMap Map>
 __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurrence_kernel(
     Arguments args, const QkChunk* __restrict__ qk_workspace,
     const ControlChunk* __restrict__ control_workspace) {
@@ -173,9 +173,9 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
             state[ni][mi][3] = args.state_in[state_base + (value + 1) * kStateDim + key + 8];
         }
     }
-    load_stage<DV>(sm.stage[0], args, qk_workspace, control_workspace, head, value_start, 0, tid);
+    load_stage<DV, Map>(sm.stage[0], args, qk_workspace, control_workspace, head, value_start, 0, tid);
     if (chunks > 1)
-        load_stage<DV>(sm.stage[1], args, qk_workspace, control_workspace, head, value_start, 1,
+        load_stage<DV, Map>(sm.stage[1], args, qk_workspace, control_workspace, head, value_start, 1,
                        tid);
 
     for (int chunk = 0; chunk < chunks; ++chunk) {
@@ -331,7 +331,7 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
         }
         __syncthreads();
         if (chunk + 2 < chunks) {
-            load_stage<DV>(sm.stage[chunk & 1], args, qk_workspace, control_workspace, head,
+            load_stage<DV, Map>(sm.stage[chunk & 1], args, qk_workspace, control_workspace, head,
                            value_start, chunk + 2, tid);
         }
     }
@@ -350,13 +350,13 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
     }
 }
 
-template <int DV>
+template <int DV, GdnHeadMap Map>
 void launch(const Arguments& args, const QkChunk* qk, const ControlChunk* control,
             cudaStream_t stream) {
     constexpr int shared_bytes = sizeof(RecurrenceShared<DV>);
-    CUDA_CHECK(cudaFuncSetAttribute(chunk_recurrence_kernel<DV>,
+    CUDA_CHECK(cudaFuncSetAttribute(chunk_recurrence_kernel<DV, Map>,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
-    chunk_recurrence_kernel<DV>
+    chunk_recurrence_kernel<DV, Map>
         <<<args.value_heads*(kStateDim / DV), kThreads<DV>, shared_bytes, stream>>>(args, qk,
                                                                                     control);
     CUDA_CHECK(cudaGetLastError());
@@ -388,18 +388,25 @@ int value_tile(int value_heads, int multiprocessor_count) {
     return best;
 }
 
-void launch_recurrence(const Arguments& args, const QkChunk* qk, const ControlChunk* control,
-                       DeviceExecutionView execution) {
+template <GdnHeadMap Map>
+void launch_mapped(const Arguments& args, const QkChunk* qk, const ControlChunk* control,
+                   DeviceExecutionView execution) {
     switch (value_tile(args.value_heads, execution.multiprocessor_count)) {
     case 64:
-        return launch<64>(args, qk, control, execution.stream);
+        return launch<64, Map>(args, qk, control, execution.stream);
     case 32:
-        return launch<32>(args, qk, control, execution.stream);
+        return launch<32, Map>(args, qk, control, execution.stream);
     case 16:
-        return launch<16>(args, qk, control, execution.stream);
+        return launch<16, Map>(args, qk, control, execution.stream);
     default:
-        return launch<8>(args, qk, control, execution.stream);
+        return launch<8, Map>(args, qk, control, execution.stream);
     }
+}
+
+void launch_recurrence(const Arguments& args, const QkChunk* qk, const ControlChunk* control,
+                       DeviceExecutionView execution, GdnHeadMap map) {
+    if (map == GdnHeadMap::Tiled) { return launch_mapped<GdnHeadMap::Tiled>(args, qk, control, execution); }
+    launch_mapped<GdnHeadMap::Blocked>(args, qk, control, execution);
 }
 
 } // namespace ninfer::ops::detail::gated_delta_net::chunked

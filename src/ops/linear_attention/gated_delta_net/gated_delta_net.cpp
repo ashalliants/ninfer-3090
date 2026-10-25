@@ -160,6 +160,14 @@ Geometry validate_recurrent_batch_update(const Tensor& q, const Tensor& k, const
     return geometry;
 }
 
+// The tiled head map is instantiated for Qwen3.8-Flash-Next's calls only.
+void require_tiled_domain(GdnHeadMap map, bool normalize_qk, const Tensor& state) {
+    if (map == GdnHeadMap::Tiled && (!normalize_qk || state.dtype != DType::FP32)) {
+        throw std::invalid_argument(
+            "gated_delta_net: the tiled head map needs normalized q/k and an FP32 state");
+    }
+}
+
 void validate_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                       const Tensor& beta, float scale, const Tensor& ssm_state_in,
                       const Tensor& ssm_state_out, const Tensor& out) {
@@ -213,6 +221,7 @@ void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor
                                   cudaStream_t stream, GdnHeadMap map) {
     validate_recurrent_batch_update(q, k, v, g, beta, scale, ssm_states, source_state_slots,
                                     destination_state_slots, out);
+    require_tiled_domain(map, normalize_qk, ssm_states);
 
     detail::gated_delta_net::launch_recurrent_batch_update(q, k, v, g, beta, scale, normalize_qk,
                                                            ssm_states, source_state_slots,
@@ -225,6 +234,7 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
                      const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
                      DeviceExecutionView execution, GdnHeadMap map) {
     validate_chunked(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out, out);
+    require_tiled_domain(map, normalize_qk, ssm_state_out);
     if (execution.multiprocessor_count <= 0) {
         throw std::invalid_argument("gated_delta_net: invalid SM count");
     }
@@ -265,10 +275,9 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
                                   q.ne[1],
                                   v.ne[1],
                                   q.ne[2],
-                                  scale,
-                                  map};
-    chunked::launch_prepare(args, qk, control, normalize_qk, execution.stream);
-    chunked::launch_recurrence(args, qk, control, execution);
+                                  scale};
+    chunked::launch_prepare(args, qk, control, normalize_qk, execution.stream, map);
+    chunked::launch_recurrence(args, qk, control, execution, map);
     if (ssm_state_out.dtype == DType::FP16) {
         detail::gated_delta_net::narrow_state_fp32_to_fp16(state_fp32, ssm_state_out,
                                                            execution.stream);
