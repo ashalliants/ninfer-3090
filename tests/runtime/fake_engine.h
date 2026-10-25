@@ -233,6 +233,7 @@ struct CommitRowResult {
         std::uint64_t ngram_rounds          = 0;
         std::uint64_t ngram_drafted_tokens  = 0;
         std::uint64_t ngram_accepted_tokens = 0;
+        std::uint64_t relaxed_kept          = 0;
     } speculative_counters;
 };
 

@@ -11,6 +11,7 @@
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "models/qwen3_5/frontend/tokenizer.h"
 
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
@@ -434,6 +435,10 @@ public:
     const std::uint32_t ngram_draft_tokens;
     const std::uint32_t ngram_min_match;
     const SpeculativeBackend speculative_backend;
+    // EngineOptions::relaxed_drafting is set: verification runs the relaxed acceptance instances,
+    // with the tokenizer facts below (found at startup; empty when off).
+    const bool relaxed_drafting;
+    frontend::RelaxedDraftingTokens relaxed_tokens;
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;
     const bool vision_enabled;
@@ -513,6 +518,14 @@ public:
     std::optional<DFlashDraftHandoff> dflash_draft_handoff;
     std::array<std::uint32_t, kMaximumConcurrency> grammar_dead_positions{};
     ops::SamplingMask bind_grammar_mask(runtime::TokenMaskProvider*, std::size_t row);
+    // Relaxed drafting's request-lifetime config fields: the added-token floor, and threshold 0
+    // when the Program runs without it.
+    void apply_relaxed_drafting(ops::SamplingConfig& config) const;
+    // A verification row's relaxed drafting threshold: the request's, or 0 for a constrained row
+    // (`mask` set) and for a request whose committed ids end inside a tool call.
+    [[nodiscard]] float round_relaxed_threshold(const SequenceState& sequence,
+                                                const RequestControl& request,
+                                                const ops::SamplingMask& mask) const;
     ops::SamplingMask fill_grammar_mask(runtime::TokenMaskProvider*, std::size_t row,
                                         std::span<const TokenId> drafts);
     Tensor token_counts;

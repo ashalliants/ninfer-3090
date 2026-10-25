@@ -44,6 +44,7 @@
 #include "core/tensor.h"
 #include "core/vmm_arena.h"
 #include "core/vram_budget.h"
+#include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/program/vision_control.h"
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/execution/parameters.h"
@@ -70,6 +71,7 @@
 #include "ninfer/ops/qsa.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
+#include "ops/common/relaxed_accept.h"
 
 #include <cuda_runtime.h>
 
@@ -285,6 +287,7 @@ ops::SamplingConfig translate(const ResolvedSamplingParameters& s) {
     out.presence_penalty  = s.presence_penalty;
     out.frequency_penalty = s.frequency_penalty;
     out.seed              = s.seed;
+    out.relaxed_threshold = s.relaxed_drafting;
     return out;
 }
 
@@ -416,8 +419,9 @@ struct SpecLayout {
     // each lane's verification (`slot`: a word per lane holding the lane's index).
     std::size_t saved_stride = 0;
     // Round words (I32): the drafts, verification targets, licensed tokens, then one word each.
+    // w_relaxed: the relaxed drafting count of a round that ran the relaxed instance.
     std::size_t w_drafts = 0, w_target = 0, w_licensed = 0, w_counts = 0, w_accepted = 0, w_extents = 0,
-                w_lengths = 0, w_anchors = 0, w_commit = 0, w_mtp_ids = 0, w_count = 0;
+                w_lengths = 0, w_anchors = 0, w_commit = 0, w_mtp_ids = 0, w_relaxed = 0, w_count = 0;
 
     static SpecLayout plan(const TextConfig& c, std::int32_t drafts, std::size_t tail_bytes, std::size_t conv_bytes,
                            std::size_t lanes, const ProgramOptions& o) {
@@ -461,7 +465,8 @@ struct SpecLayout {
         out.w_anchors  = out.w_lengths + 1;
         out.w_commit   = out.w_anchors + 1;
         out.w_mtp_ids  = out.w_commit + 1;
-        out.w_count    = out.w_mtp_ids + W;
+        out.w_relaxed  = out.w_mtp_ids + W;
+        out.w_count    = out.w_relaxed + 1;
         out.words      = take(4 * out.w_count);
         out.bytes      = at;
         return out;
@@ -743,6 +748,10 @@ public:
           volume_(options_.ngram_volume, c_.ple.table), hash_(c_.ple.ngram, 0),
           plan_(plan_layout(options_, c_, parameters.model.resources().public_token_count, strides(parameters))) {
         exempt_process_from_power_throttling();
+        // Relaxed drafting's tokenizer facts, refused here when the tokenizer cannot give them.
+        if (options_.relaxed_drafting) {
+            relaxed_tokens_ = qwen3_5::frontend::relaxed_drafting_tokens(*parameters.model.resources().tokenizer);
+        }
         // A read after ngram_keepalive_ms of idleness within a minute of a request keeps the volume's
         // drive awake (a zero period leaves the keep-alive off).
         volume_.set_keepalive(std::chrono::milliseconds(options_.ngram_keepalive_ms), std::chrono::milliseconds(60000));
@@ -1361,6 +1370,9 @@ public:
                                                     ? FinishReason::OutputLimit
                                                     : FinishReason::ContextCapacity;
         base->sampling      = translate(options.sampling);
+        // The added-token floor relaxed drafting compares drafts against (zero relaxes nothing).
+        base->sampling.added_token_floor = relaxed_tokens_.added_token_floor;
+        if (!options_.relaxed_drafting) { base->sampling.relaxed_threshold = 0.0F; }
         base->context_cache = data.context_cache;
         // Prefix reuse (the Qwen3.5 Program's plan_request): the prompt's identity and its capture
         // groups, an InputReplay point at the typed recovery frontier (else the prompt's end) and the
@@ -4450,7 +4462,8 @@ private:
         // Acceptance from BF16 logits, as plain decode samples them.
         Tensor target = spec_word(sp.w_target, W);
         ops::argmax(wide16, target, plan_.token_domain, s);
-        install_round_config(mask);
+        // A positive threshold runs the relaxed acceptance instance (relaxed drafting).
+        const bool relaxed = install_round_config(mask) > 0.0F;
         {
             auto scope = work_->scope();
             Tensor licensed = spec_word(sp.w_licensed, W).view({W, 1});
@@ -4458,13 +4471,18 @@ private:
             Tensor accepted = spec_word(sp.w_accepted, 1);
             Tensor lengths  = spec_word(sp.w_lengths, 1);
             Tensor anchors  = spec_word(sp.w_anchors, 1);
+            Tensor kept     = spec_word(sp.w_relaxed, 1);
             ops::speculative_accept_greedy_drafts(target.view({W, 1}), wide16.view({vocab_, W, 1}),
                                                   spec_word(sp.w_drafts, K).view({K, 1}), spec_word(sp.w_extents, 1),
                                                   lengths, anchors, licensed, counts, accepted, plan_.token_domain,
-                                                  configs_, *work_, s);
+                                                  configs_, *work_, s, relaxed ? &kept : nullptr);
         }
         CUDA_CHECK(cudaMemcpyAsync(words + sp.w_licensed, spec_words_device() + sp.w_licensed,
                                    4ULL * (sp.w_accepted + 1 - sp.w_licensed), cudaMemcpyDeviceToHost, s));
+        if (relaxed) {
+            CUDA_CHECK(cudaMemcpyAsync(words + sp.w_relaxed, spec_words_device() + sp.w_relaxed, 4,
+                                       cudaMemcpyDeviceToHost, s));
+        }
         const auto wait = Clock::now();
         {
             const nvtx::ScopedRange waiting(nvtx::Name::DecodeMtpWait, nvtx::Category::Decode);
@@ -4478,7 +4496,8 @@ private:
         check_cpu_verify();
         throw_ngram_flag(flag_error);
         const std::int32_t LC = words[sp.w_counts], A = words[sp.w_accepted];
-        if (LC < 1 || LC > W || A != LC - 1) {
+        const std::int32_t kept = relaxed ? words[sp.w_relaxed] : 0;
+        if (LC < 1 || LC > W || A != LC - 1 || kept < 0 || kept > A) {
             release_lane();
             throw std::logic_error("Qwen3.8-Flash-Next: acceptance returned an invalid extent");
         }
@@ -4497,6 +4516,7 @@ private:
         ++stats.rounds;
         stats.drafted_tokens += static_cast<std::uint64_t>(K);
         stats.accepted_tokens += static_cast<std::uint64_t>(A);
+        stats.relaxed_kept += static_cast<std::uint64_t>(kept);
         if (stats.accepted_per_position.size() < static_cast<std::size_t>(plan_.drafts)) {
             stats.accepted_per_position.resize(static_cast<std::size_t>(plan_.drafts), 0);
         }
@@ -4541,12 +4561,21 @@ private:
     }
 
     // The row's sampling config on the device (acceptance reads it), with a constrained row's
-    // per-position grammar masks (null: none).
-    void install_round_config(ops::SamplingMask mask) {
+    // per-position grammar masks (null: none). Returns the round's relaxed drafting threshold: the
+    // request's, or 0 for a constrained row, a greedy one and one whose committed ids end inside a
+    // tool call (a tool call's name and arguments are sampled exactly).
+    float install_round_config(ops::SamplingMask mask) {
         auto* host_config = static_cast<ops::SamplingConfig*>(config_host_.data());
         *host_config      = L().sampling;
         host_config->mask = mask;
+        if (!options_.relaxed_drafting || !(host_config->relaxed_threshold > 0.0F) ||
+            !(host_config->temperature > 0.0F) || mask.words != nullptr ||
+            ops::ledger_in_tool_call(L().history, relaxed_tokens_.tool_call_open,
+                                     relaxed_tokens_.tool_call_close)) {
+            host_config->relaxed_threshold = 0.0F;
+        }
         upload_pinned(configs_, host_config, sizeof(ops::SamplingConfig), device_.stream);
+        return host_config->relaxed_threshold;
     }
 
     // The drafter's cells of `k` committed positions from S (Infernix mtp_catch_up, the committed
@@ -4680,7 +4709,7 @@ private:
     CommitRowResult::SpeculativeCounters speculative_counters() const {
         if (plan_.drafts == 0) { return {}; }
         const auto& s = L().speculative;
-        return {s.rounds, s.drafted_tokens, s.accepted_tokens, s.fallback_steps};
+        return {s.rounds, s.drafted_tokens, s.accepted_tokens, s.fallback_steps, 0, 0, 0, s.relaxed_kept};
     }
 
     // ---------------------------------------------------------------- expert cache
@@ -5087,6 +5116,8 @@ private:
     DeviceBuffer hot_embedding_;
     const void* cold_embedding_ = nullptr; // the whole table's device pointer in the mapped pinned block
     PinnedHostBuffer config_host_{1};
+    // Relaxed drafting's tokenizer facts (ProgramOptions::relaxed_drafting; empty when off).
+    qwen3_5::frontend::RelaxedDraftingTokens relaxed_tokens_;
     Tensor logits32_, logits16_, sampled_, sample_position_, token_counts_;
     Tensor lane_logits_; // BF16 [V, lanes]: each lane's last prefill call's logits (checkpoints, exact hits)
     ops::SamplingConfig* configs_ = nullptr;

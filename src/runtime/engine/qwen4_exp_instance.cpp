@@ -386,6 +386,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.mtp_fixed_drafts = next.mtp_fixed_drafts;
     program_options.mtp_constrained  = next.mtp_constrained;
     program_options.mtp_joint_acceptance = next.mtp_joint_acceptance;
+    program_options.relaxed_drafting     = options.relaxed_drafting.has_value();
     program_options.ngram_prefetch       = next.ngram_prefetch;
     program_options.vision           = vision;
     program_options.context_cache_bytes  = cache_fit.bytes;

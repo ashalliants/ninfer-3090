@@ -58,13 +58,14 @@ DeviceContext initialize_device(const EngineOptions& options) {
 }
 
 runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefaults& defaults,
-                                                        SamplingMode mode, RequestOptions options) {
+                                                        SamplingMode mode, RequestOptions options,
+                                                        std::optional<float> relaxed_drafting) {
     if (options.execution.thinking.budget && *options.execution.thinking.budget == 0) {
         throw std::invalid_argument("thinking budget must be positive");
     }
     runtime::ResolvedRequestOptions resolved;
     resolved.execution.sampling =
-        runtime::resolve_sampling(defaults, mode, options.execution.sampling);
+        runtime::resolve_sampling(defaults, mode, options.execution.sampling, relaxed_drafting);
     resolved.execution.requested_output_tokens = options.execution.requested_output_tokens;
     resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
     resolved.execution.thinking                = options.execution.thinking;
@@ -819,8 +820,9 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
         throw std::invalid_argument("live generation observations require a Streaming consumer");
     }
 
-    runtime::ResolvedRequestOptions resolved_options = resolve_request_options(
-        impl_->sampling_defaults, prompt.impl_->sampling_mode, std::move(options));
+    runtime::ResolvedRequestOptions resolved_options =
+        resolve_request_options(impl_->sampling_defaults, prompt.impl_->sampling_mode,
+                                std::move(options), impl_->options.relaxed_drafting);
     const ResolvedSamplingParameters resolved_sampling = resolved_options.execution.sampling;
 
     const PromptSummary prompt_summary = prompt.impl_->summary;

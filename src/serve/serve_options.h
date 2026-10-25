@@ -59,6 +59,8 @@ struct ServeOptions {
     std::vector<std::uint32_t> stage_layers;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
+    // --relaxed-drafting [P]: EngineOptions::relaxed_drafting (nullopt: off; bare: 0.5).
+    std::optional<float> relaxed_drafting;
     ContextCacheOptions context_cache;
     PrefillScheduleOptions prefill_schedule;
     bool enable_vision      = false;

@@ -47,6 +47,7 @@ set(NINFER_HOST_ONLY_TESTS
   ninfer_read_only_file_test
   ninfer_regex_choice_oracle_test
   ninfer_regex_choice_test
+  ninfer_relaxed_accept_test
   ninfer_resource_manager_test
   ninfer_s3_object_store_test
   ninfer_scheduler_test

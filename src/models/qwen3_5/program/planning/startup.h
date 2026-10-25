@@ -102,6 +102,8 @@ struct SequencePlanningInputs {
     std::uint32_t ngram_draft_tokens        = 0;
     std::uint32_t ngram_min_match           = 0;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
+    // EngineOptions::relaxed_drafting is set: verification runs the relaxed acceptance instances.
+    bool relaxed_drafting                   = false;
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
     ProposalHead proposal_head              = ProposalHead::Full;
     models::LoadOptions features;
@@ -128,6 +130,8 @@ struct SequencePlanImpl {
     std::uint32_t ngram_draft_tokens        = 0;
     std::uint32_t ngram_min_match           = 0;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
+    // EngineOptions::relaxed_drafting is set: verification runs the relaxed acceptance instances.
+    bool relaxed_drafting                   = false;
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
     ProposalHead proposal_head              = ProposalHead::Full;
     models::LoadOptions features;

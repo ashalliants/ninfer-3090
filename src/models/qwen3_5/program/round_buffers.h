@@ -92,6 +92,8 @@ struct MtpDecodeEgress {
     // Step-major: all B rows for proposal step 0, followed by all B rows for step 1, etc.
     std::array<TokenId, kMaximumConcurrency * kMtpDecodeMaximumDrafts> next_drafts{};
     std::array<std::int32_t, kMaximumConcurrency> next_extents{};
+    // Relaxed drafting only (else never written): the accepted drafts the threshold kept.
+    std::array<std::int32_t, kMaximumConcurrency> relaxed_kept{};
 };
 
 // Prefill binds the current chunk independently of the compact decode batch.
@@ -135,6 +137,8 @@ struct DFlashDecodeEgress {
     std::array<TokenId, kMaximumConcurrency * kDFlashDecodeMaximumWidth> licensed_tokens{};
     std::array<std::int32_t, kMaximumConcurrency> licensed_counts{};
     std::array<std::int32_t, kMaximumConcurrency> accepted_drafts{};
+    // Relaxed drafting only (else never written): the accepted drafts the threshold kept.
+    std::array<std::int32_t, kMaximumConcurrency> relaxed_kept{};
 };
 
 struct OrdinaryDecodeStateLayout {
@@ -312,6 +316,8 @@ struct MtpDecodeState {
     Tensor accepted_drafts;
     Tensor next_drafts;
     Tensor next_extents;
+    // Empty (no data) when the Program runs without relaxed drafting.
+    Tensor relaxed_kept;
     Tensor verify_ids;
     Tensor target_positions;
     Tensor target_argmax;
@@ -353,6 +359,8 @@ struct DFlashDecodeState {
     Tensor licensed_tokens;
     Tensor licensed_counts;
     Tensor accepted_drafts;
+    // Empty (no data) when the Program runs without relaxed drafting.
+    Tensor relaxed_kept;
     Tensor proposal_ids;
     Tensor proposal_positions;
     Tensor verify_positions;

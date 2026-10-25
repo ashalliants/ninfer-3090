@@ -5,6 +5,7 @@
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "core/nvtx.h"
 #include "core/device.h"
+#include "ops/common/relaxed_accept.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scatter.h"
@@ -85,7 +86,17 @@ void ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
 
 namespace ninfer::models::qwen3_5::detail {
 
-namespace {} // namespace
+namespace {
+
+// A row's relaxed keeps from the round egress: a subset of its accepted drafts.
+std::uint64_t checked_relaxed_kept(std::int32_t kept, std::int32_t accepted) {
+    if (kept < 0 || kept > accepted) {
+        throw std::runtime_error("speculative batch returned an invalid relaxed drafting count");
+    }
+    return static_cast<std::uint64_t>(kept);
+}
+
+} // namespace
 
 const GdnReplayRecords* ProgramImpl::round_replay_records(std::uint32_t verify_drafts) const {
     if (!replay_records) { return nullptr; }
@@ -126,6 +137,7 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
     Tensor counts = token_counts.slice(1, static_cast<std::int32_t>(sequence.lane), 1)
                         .view({dimension(parameters.model.resources().public_token_count)});
     request.sampling_host     = config;
+    apply_relaxed_drafting(request.sampling_host);
     request.speculative_stats = SpeculativeStats{
         .backend               = speculative_backend,
         .enabled               = speculative_backend != SpeculativeBackend::None,
@@ -142,6 +154,28 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
     CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &request.sampling_host,
                                sizeof(request.sampling_host), cudaMemcpyHostToDevice,
                                device.stream));
+}
+
+void ProgramImpl::apply_relaxed_drafting(ops::SamplingConfig& config) const {
+    // The tokenizer's added-token floor; zero, which relaxes nothing, without relaxed drafting.
+    config.added_token_floor = relaxed_tokens.added_token_floor;
+    if (!relaxed_drafting) { config.relaxed_threshold = 0.0F; }
+}
+
+float ProgramImpl::round_relaxed_threshold(const SequenceState& sequence,
+                                           const RequestControl& request,
+                                           const ops::SamplingMask& mask) const {
+    const ops::SamplingConfig& config = request.sampling_host;
+    if (!relaxed_drafting || !(config.relaxed_threshold > 0.0F) || !(config.temperature > 0.0F) ||
+        mask.words != nullptr) {
+        return 0.0F;
+    }
+    // A tool call's name and arguments are sampled exactly.
+    if (ops::ledger_in_tool_call(sequence.ledger, relaxed_tokens.tool_call_open,
+                                 relaxed_tokens.tool_call_close)) {
+        return 0.0F;
+    }
+    return config.relaxed_threshold;
 }
 
 void ProgramImpl::copy_tail(SequenceState& sequence, const Tensor& source) {
@@ -485,6 +519,8 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
             mtp_host_ingress->rope_deltas[row]             = sequence.rope_delta;
             mtp_host_ingress->sampling[row]                = request.sampling_host;
             mtp_host_ingress->sampling[row].mask           = bind_grammar_mask(masks, row);
+            mtp_host_ingress->sampling[row].relaxed_threshold =
+                round_relaxed_threshold(sequence, request, mtp_host_ingress->sampling[row].mask);
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1,
                                       std::min(capacity, frontier + extent + draft_window));
         }
@@ -551,6 +587,10 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
                 for (std::int32_t i = 0; i < accepted_i; ++i) {
                     request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
                         1;
+                }
+                if (relaxed_drafting) {
+                    request.speculative_stats.relaxed_kept +=
+                        checked_relaxed_kept(mtp_host_egress->relaxed_kept[row], accepted_i);
                 }
             }
             request.pending = PendingCandidate{
@@ -781,6 +821,8 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             dflash_host_ingress->state_destination_slots[row] = selectors.destination;
             dflash_host_ingress->sampling[row]                = request.sampling_host;
             dflash_host_ingress->sampling[row].mask           = bind_grammar_mask(masks, row);
+            dflash_host_ingress->sampling[row].relaxed_threshold = round_relaxed_threshold(
+                sequence, request, dflash_host_ingress->sampling[row].mask);
             if (copy_round) {
                 // The copy at the round's [k, B] layout; columns past it hold the anchor, which
                 // verification never reads.
@@ -867,6 +909,10 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                 request.speculative_stats.rounds += 1;
                 request.speculative_stats.drafted_tokens += extent;
                 request.speculative_stats.accepted_tokens += static_cast<std::uint32_t>(accepted_i);
+                if (relaxed_drafting) {
+                    request.speculative_stats.relaxed_kept +=
+                        checked_relaxed_kept(dflash_host_egress->relaxed_kept[row], accepted_i);
+                }
                 if (copies_row(row)) {
                     request.speculative_stats.ngram_rounds += 1;
                     request.speculative_stats.ngram_drafted_tokens += extent;

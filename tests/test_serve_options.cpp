@@ -478,6 +478,36 @@ int main() {
                                      "--draft-tokens", "7", "--ngram-draft-tokens", "31"},
                                     "31, 63"),
                       "serve accepted a copy window other than 15, or did not name the wider ones");
+    // Relaxed drafting: off by default, bare is 0.5, a value in [0,1] is kept, the next flag is
+    // never taken as its value, and it needs a speculative backend.
+    failures += check(!default_engine.relaxed_drafting, "relaxed drafting is on by default");
+    const auto relaxed = [&](std::vector<std::string> extra) {
+        std::vector<std::string> args{"ninfer-serve", "model.ninfer", "--spec", "mtp",
+                                      "--draft-tokens", "3"};
+        args.insert(args.end(), extra.begin(), extra.end());
+        return make_engine_options(parse(std::move(args))).relaxed_drafting;
+    };
+    failures += check(relaxed({"--relaxed-drafting"}) == 0.5F, "bare --relaxed-drafting is not 0.5");
+    failures += check(relaxed({"--relaxed-drafting", "0.3"}) == 0.3F &&
+                          relaxed({"--relaxed-drafting", "0"}) == 0.0F &&
+                          relaxed({"--relaxed-drafting", "1"}) == 1.0F,
+                      "a --relaxed-drafting value did not reach the Engine");
+    const ninfer::EngineOptions followed = make_engine_options(
+        parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--relaxed-drafting",
+               "--draft-tokens", "3"}));
+    failures += check(followed.relaxed_drafting == 0.5F && followed.speculative.draft_tokens == 3,
+                      "--relaxed-drafting took the next flag as its value");
+    for (const char* bad : {"-1", "2", "1.5"}) {
+        failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--spec", "mtp",
+                                         "--draft-tokens", "3", "--relaxed-drafting", bad},
+                                        "relaxed-drafting"),
+                          "an out-of-range --relaxed-drafting was accepted");
+    }
+    failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--relaxed-drafting"},
+                                    "--relaxed-drafting changes which drafts"),
+                      "--relaxed-drafting without --spec was not refused naming the flag");
+    failures += check(kv_help.find("--relaxed-drafting") != std::string::npos,
+                      "serve help omits --relaxed-drafting");
     // 2^44 MiB shifted by 20 bits wraps a uint64_t to 0; it must be refused, not wrapped.
     for (const char* flag : {"--vram-headroom-mib", "--ram-headroom-mib", "--expert-cache-mib"}) {
         failures += check(serve_rejects({"ninfer-serve", "model.ninfer", flag, "17592186044416"}, "out of range"),

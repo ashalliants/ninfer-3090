@@ -467,7 +467,7 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
             out.rows[row].speculative_counters = {
                 stats.rounds,         stats.drafted_tokens, stats.accepted_tokens,
                 stats.fallback_steps, stats.ngram_rounds,   stats.ngram_drafted_tokens,
-                stats.ngram_accepted_tokens};
+                stats.ngram_accepted_tokens, stats.relaxed_kept};
             if (pending_kinds[row] != PendingKind::Begin || discarded[row]) { continue; }
             RequestControl& request = requests[lanes[row]];
             if (decisions[row].terminal) {

@@ -86,6 +86,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_read_only_file_test
   ninfer_regex_choice_oracle_test
   ninfer_regex_choice_test
+  ninfer_relaxed_accept_test
   ninfer_request_log_test
   ninfer_resource_manager_test
   ninfer_route_coverage_test

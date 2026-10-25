@@ -26,20 +26,22 @@ void target_verify_forward(ExecutionCore& execution, TextContext& card, TargetVe
 
 void target_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                    TargetVerifyFrameView frame) {
+    // Relaxed drafting: a relaxed_kept output selects the Ops' relaxed instances.
+    Tensor* const relaxed_kept = frame.relaxed_kept.data != nullptr ? &frame.relaxed_kept : nullptr;
     if (frame.proposal_q.data != nullptr) {
         ops::speculative_accept_sparse_drafts(
             frame.target_tokens, frame.target_logits, frame.drafts, frame.candidate_ids,
             frame.proposal_q, frame.current_extents, frame.frontiers, frame.anchors,
             frame.licensed_tokens, frame.licensed_counts, frame.accepted_drafts,
             dimension(execution.parameters.model.resources().public_token_count), frame.sampling,
-            {false}, execution.work, execution.device.stream);
+            {false}, execution.work, execution.device.stream, relaxed_kept);
     } else {
         ops::speculative_accept_greedy_drafts(
             frame.target_tokens, frame.target_logits, frame.drafts, frame.current_extents,
             frame.frontiers, frame.anchors, frame.licensed_tokens, frame.licensed_counts,
             frame.accepted_drafts,
             dimension(execution.parameters.model.resources().public_token_count), frame.sampling,
-            execution.work, execution.device.stream);
+            execution.work, execution.device.stream, relaxed_kept);
     }
     ops::speculative_select_accepted_hidden(frame.target_hidden, frame.accepted_drafts,
                                             frame.selected_hidden, execution.device.stream);

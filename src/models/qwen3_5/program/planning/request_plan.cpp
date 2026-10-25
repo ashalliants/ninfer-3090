@@ -36,6 +36,7 @@ ops::SamplingConfig translate_sampling(const ResolvedSamplingParameters& source)
     out.frequency_penalty = source.frequency_penalty;
     out.seed              = source.seed;
     out.token_counts      = nullptr;
+    out.relaxed_threshold = source.relaxed_drafting;
     return out;
 }
 

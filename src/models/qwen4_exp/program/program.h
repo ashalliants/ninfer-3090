@@ -249,6 +249,7 @@ struct CommitRowResult {
         std::uint64_t ngram_rounds          = 0;
         std::uint64_t ngram_drafted_tokens  = 0;
         std::uint64_t ngram_accepted_tokens = 0;
+        std::uint64_t relaxed_kept          = 0;
     } speculative_counters;
 };
 
@@ -414,6 +415,10 @@ struct ProgramOptions {
     // JointAcceptanceThreshold. It replaces the acceptance-estimate policy; with mtp_fixed_drafts
     // it is refused. Off: the drafter graphs, the drafts and the window are as before.
     bool mtp_joint_acceptance = false;
+    // EngineOptions::relaxed_drafting is set: a sampled verification whose request has a threshold
+    // runs the relaxed acceptance instance (relaxed drafting; changes the output distribution).
+    // Off: every verification runs the exact instance, as before.
+    bool relaxed_drafting = false;
     // FlashNextOptions::ngram_prefetch: each MTP round reads the anchor column's n-gram rows into
     // the volume's host cache while the draft graph runs, so verification finds them cached. Only
     // the host work moves; the rows, the drafts and the output are unchanged.

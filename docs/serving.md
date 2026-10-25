@@ -88,6 +88,8 @@ the Qwen3.5 models:
   ceiling: each round drafts as many tokens as the recent acceptance pays for, mostly two on prose;
   a ceiling of 3 measured best or tied against 2 and against deeper fixed drafts (the
   [plan's PR 13 measurements](maintainer/flash-next-plan.md#pr-13-measurements)), about 1.4x plain decode.
+  [Relaxed drafting](#relaxed-drafting) (`--relaxed-drafting`) applies to its verification rounds
+  as to the Qwen3.5 models' and changes the output distribution the same way.
 - **Prefix reuse** through the same context cache as the other models, with checkpoints in pinned
   host RAM or on local disk ([design](maintainer/flash-next-context-cache.md)). A conversation's next turn
   (or an agent's next tool round) restores the previous turn's state and prefills only the new
@@ -892,6 +894,7 @@ server restarts.
 | `ninfer_decode_rounds_total`, `ninfer_decode_row_rounds_total` | decode batch executions and the sum of their batch sizes |
 | `ninfer_spec_decode_{rounds,draft_tokens,accepted_tokens,fallback_steps}_total` | live native speculative work, including MTP and DFlash/DFlash2 |
 | `ninfer_spec_decode_ngram_{rounds,draft_tokens,accepted_tokens}_total` | the n-gram copy rounds among them (`--ngram-draft-tokens`); zero when it is off |
+| `ninfer_spec_decode_relaxed_kept_tokens_total` | accepted drafts that [relaxed drafting](#relaxed-drafting) kept and exact verification would have rejected, a subset of the accepted tokens; zero when it is off |
 | `ninfer_root_selections_total`, `ninfer_checkpoint_selections_total` | admissions by the context-cache source they started from: root is a miss (full prefill), checkpoint a reuse. Hit rate is `checkpoint / (root + checkpoint)` |
 | `ninfer_{preemptions,snapshot_restores,replay_restores}_total` | resource-pressure pauses and recovery routes |
 | `ninfer_admission_fit_deferrals_total` | fresh requests queued by `--admission-fit-check` because their whole prompt could not fit in the KV pool beside the resident requests; zero when the flag is off |
@@ -982,6 +985,8 @@ The endpoint supports:
   [default output limit](#default-output-limit);
 - `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
 - the compatible `top_k` (`0..20`) and `min_p` (`0..1`) sampler extensions;
+- the NInfer `relaxed_drafting` extension (a number in `[0,1]`, `true` for 0.5, `false` for
+  exact), which CHANGES THE OUTPUT DISTRIBUTION; see [Relaxed drafting](#relaxed-drafting);
 - up to four non-empty stop strings, applied to both reasoning and answer output;
 - the `ignore_eos` benchmarking extension shared with vLLM, SGLang and llama.cpp: a boolean,
   default `false`, that drops the checkpoint's own stop tokens so generation runs to the output
@@ -1562,6 +1567,7 @@ wire response contains typed `output` Items.
 | `preserve_thinking` | alias for `chat_template_kwargs.preserve_thinking`; conflicting values are rejected |
 | `graft` | NInfer extension: name of a [prompt graft](#prompt-grafts), or `null`; also accepted by input token count |
 | `thinking_budget` | NInfer extension: positive per-request [thinking cap](#openai-chat-completions), or `null`; rejected by input token count, which does not generate |
+| `relaxed_drafting` | NInfer extension: this request's [relaxed drafting](#relaxed-drafting) threshold, a number in `[0,1]`, `true` (0.5), `false` (exact) or `null` (the server default); CHANGES THE OUTPUT DISTRIBUTION |
 | `text.format` | `text` (default), `json_object`, or `json_schema`; see [Output constraints](#output-constraints) |
 | `tools` | direct function and free-form `custom` definitions, or namespace groups containing them; see below |
 | `tool_choice` | `auto`, `none`, `required`, a named function or `custom` tool, or `allowed_tools` of function and custom entries with mode `auto`/`required`; namespaced selection carries both `namespace` and `name` |
@@ -1859,7 +1865,8 @@ enabled.
 [default output limit](#default-output-limit); a positive
 value is the complete output budget. `max_tokens:0` is rejected because NInfer does not expose a
 completed zero-output cache-prewarm lifecycle. `temperature`, `top_p`, `top_k`, and
-`stop_sequences` enter Engine execution. A matched custom stop is returned as
+`stop_sequences` enter Engine execution, as does the NInfer `relaxed_drafting` extension
+([Relaxed drafting](#relaxed-drafting), which changes the output distribution). A matched custom stop is returned as
 `stop_reason:"stop_sequence"` together with the actual `stop_sequence`; context exhaustion returns
 `model_context_window_exceeded`.
 
@@ -2028,6 +2035,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 | unset |
 | `--lm-head-draft` | optimized proposal head; implied by `--spec`, accepted for compatibility | on with `--spec` |
 | `--ngram-draft-tokens 0\|15` | n-gram copy drafting beside `--spec dflash2`: when the text being written already appeared in the request (the prompt, a tool result -- including `cat -n` numbered ones -- or the output so far), a round verifies up to 15 copied tokens instead of the draft model's proposal; verification licenses every token, so a wrong copy costs speed, never output. Copies run when a round holds one or two requests (at two only for copies of 12 or more tokens, and only while the other request, whose row pays the copy width too, has the balance for it: about 3% of its round time if it never copies); see [the CLI guide](cli.md#n-gram-copy-drafting) | `0` (off) |
+| `--relaxed-drafting [P]` | [relaxed drafting](#relaxed-drafting), opt-in and it CHANGES THE OUTPUT DISTRIBUTION: under sampling, keep a draft the model gives probability `P` or more (`0..1`; `0.5` without a value) even where exact speculative sampling would draw another token. The default `P` of requests that do not set `relaxed_drafting`; `0` leaves requests exact unless they ask. Needs `--spec` (refused otherwise) | off (exact; requests asking for it are refused) |
 | `--ngram-min-match N` | tokens the end of the text must match before a copy is proposed, `4..64` | `12` |
 | `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [performance](performance.md)) | off |
 | `--no-prefill-cublas-projections` | with `--prefill-cublas`, keep the attention and GDN input projections off that route | projections on |
@@ -2427,6 +2435,47 @@ responses. NInfer does not execute tools or enforce tool-argument schemas throug
 
 Prompt-token usage includes chat-template and expanded media tokens. Generated-token usage comes
 from accepted output token IDs, including a stop token whose decoded text may be withheld.
+
+### Relaxed drafting
+
+`--relaxed-drafting [P]` (off by default) and the request key `relaxed_drafting` give up exact
+speculative sampling for speed. **They change the output distribution.** With them off, speculative
+decoding (MTP, DFlash, DFlash2, n-gram copies, and Qwen3.8-Flash-Next MTP) keeps a draft only as
+the exact rejection rule allows, so the output has the model's own sampling distribution. With a
+threshold `P`, a sampled request also keeps a draft whenever the target gives it probability `P` or
+more under the request's final distribution (after the penalties, any token mask, `top_k`, `min_p`,
+`top_p` and `temperature`), even where exact sampling would have drawn another token. At such a
+row the output is the draft every time instead of a draw: that row is greedy, its total-variation
+distance from the model's distribution is `1 - p(draft)`, and every other row is unchanged. The
+logits are unchanged, so a teacher-forced perplexity or KLD check cannot see this change.
+
+What stays exact:
+
+- greedy requests (`temperature: 0` or `--greedy`): nothing is drawn;
+- constrained requests (`response_format` JSON or schema, `structured_outputs`, a required or named
+  `tool_choice`): their grammar rows are never relaxed;
+- every token inside a tool call (from `<tool_call>` to `</tool_call>`), so a tool's name and
+  arguments are sampled exactly: a request whose committed text ends inside an open call is not
+  relaxed, and no position at or after a drafted control token, think or tool tag (the tokenizer's
+  added tokens) in a round is relaxed;
+- `logit_bias`: nonzero values are refused on Chat Completions, so no biased request reaches it.
+
+The server option sets the default threshold and turns the relaxed acceptance kernels on; with it
+off (the default) only the exact kernels run and a request with `relaxed_drafting` above 0 fails
+with 400 `relaxed_drafting_not_enabled`.
+A request overrides the default with a number in `[0,1]`, `true` (0.5) or `false` (exact); other
+values fail with 400 `invalid_relaxed_drafting`. `--relaxed-drafting 0` keeps requests exact unless
+they ask. The startup refuses the option without `--spec`, and with a tokenizer whose added tokens
+are not one contiguous id range or whose tool tags are not single added tokens.
+`ninfer_spec_decode_relaxed_kept_tokens_total` counts the drafts it kept.
+
+Basalt, which introduced the rule, measured on its own engine and model (an RTX 5090; the numbers
+are context, not NInfer measurements, and nothing here has been measured on an RTX 3090): at
+`P = 0.5` about +3 to +7% tokens per window for a total-variation cost of 0.02 to 0.04 per token,
+at `P = 0.3` +6 to +12% for 0.04 to 0.07, at `P = 0.2` +7 to +15% for 0.05 to 0.09, roughly +1.5%
+per 0.01 of total variation at every threshold; decode speed +3 to +20% at temperature 0.6 and 1.0;
+no measurable loss on gsm8k and MMLU-Pro at 300 and 280 items, and tool calls with declared names
+only. The cost is diversity, which those tasks do not measure.
 
 ### Automatic host cache
 

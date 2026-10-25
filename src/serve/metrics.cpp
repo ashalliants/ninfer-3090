@@ -319,6 +319,8 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
             "N-gram copy tokens evaluated by native verification.");
     COUNTER(speculative_ngram_accepted_tokens, "spec_decode_ngram_accepted_tokens_total",
             "N-gram copy tokens accepted by native verification.");
+    COUNTER(speculative_relaxed_kept, "spec_decode_relaxed_kept_tokens_total",
+            "Accepted drafts that relaxed drafting kept and exact verification would have rejected.");
     GAUGE(device_state_occupied_slots, "device_state_used_slots",
           "Occupied device StateImage slots.");
     gauge("device_state_capacity_slots",

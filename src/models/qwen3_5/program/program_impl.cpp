@@ -214,7 +214,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       draft_window(plan.draft_window),
       max_verify_drafts(detail::max_verify_drafts(plan.round_shapes)),
       ngram_draft_tokens(plan.ngram_draft_tokens), ngram_min_match(plan.ngram_min_match),
-      speculative_backend(plan.speculative_backend),
+      speculative_backend(plan.speculative_backend), relaxed_drafting(plan.relaxed_drafting),
+      relaxed_tokens(plan.relaxed_drafting
+                         ? frontend::relaxed_drafting_tokens(*parameters_in.model.resources().tokenizer)
+                         : frontend::RelaxedDraftingTokens{}),
       kv_storage(plan.kv_storage), proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
       causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
@@ -440,6 +443,12 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     }
 
     io = qwen3_5::RoundState(backing, plan.persistent.round);
+    // Without relaxed drafting the verification Ops get no relaxed_kept output, which selects their
+    // exact instances. Cleared before any graph is captured.
+    if (!relaxed_drafting) {
+        if (io.mtp_decode) { io.mtp_decode->relaxed_kept = Tensor{}; }
+        if (io.dflash_decode) { io.dflash_decode->relaxed_kept = Tensor{}; }
+    }
     if (io.mtp.has_value() != (speculative_backend == SpeculativeBackend::Mtp)) {
         throw std::logic_error("round-state MTP extension does not match the sequence plan");
     }

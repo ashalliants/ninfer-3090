@@ -752,6 +752,9 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                 .licensed_tokens = licensed_tokens,
                 .licensed_counts = licensed_counts,
                 .accepted_drafts = accepted,
+                .relaxed_kept    = frame.relaxed_kept.data
+                                       ? frame.relaxed_kept.slice(0, 0, batch_size)
+                                       : Tensor{},
                 .selected_hidden = selected_hidden,
                 .replay_records  = state.execution.replay_records,
                 .sampling        = frame.sampling,

@@ -557,6 +557,15 @@ struct EngineOptions {
     bool progress_anchors_shared = false;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
+    // Relaxed drafting (opt-in; CHANGES THE OUTPUT DISTRIBUTION). Under sampling, a draft whose
+    // final target probability (after penalties, mask, top-k, min-p, top-p and temperature) is at
+    // least P is kept even when the exact speculative rule would have rejected it, so that row is
+    // greedy. nullopt keeps the exact acceptance kernels and refuses requests that ask for it; a
+    // value in [0,1] selects the relaxed kernels and is the default P of requests that do not set
+    // SamplingOverrides::relaxed_drafting (0: exact unless the request asks). Never applies to
+    // greedy rows, constrained rows, tokens inside a tool call or drafted added tokens. Needs a
+    // speculative backend.
+    std::optional<float> relaxed_drafting;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
     // Zero selects a bounded worker count from the detected host concurrency.
@@ -652,6 +661,10 @@ struct ModelSamplingDefaults {
     }
 };
 
+// Relaxed drafting's threshold for `--relaxed-drafting` without a value and a request's
+// `"relaxed_drafting": true`.
+inline constexpr float kRelaxedDraftingDefault = 0.5F;
+
 // Public request-side overrides. std::nullopt means "use the registered model/mode default";
 // explicit zero remains a real override (including temperature=0 for exact argmax).
 struct SamplingOverrides {
@@ -662,6 +675,9 @@ struct SamplingOverrides {
     std::optional<float> presence_penalty;
     std::optional<float> frequency_penalty;
     std::optional<std::uint64_t> seed;
+    // Relaxed drafting threshold P in [0,1] for this request (0: exact); nullopt takes the Engine
+    // default (EngineOptions::relaxed_drafting). Changes the output distribution; see there.
+    std::optional<float> relaxed_drafting;
 };
 
 // Complete parameters after Engine resolution. Target runtimes consume only this type.
@@ -673,6 +689,8 @@ struct ResolvedSamplingParameters {
     float presence_penalty  = 0.0F;
     float frequency_penalty = 0.0F;
     std::uint64_t seed      = 0;
+    // Relaxed drafting threshold in [0,1]; 0 is the exact speculative rule.
+    float relaxed_drafting = 0.0F;
 };
 
 enum class OutputChannel : std::uint8_t {
@@ -1345,6 +1363,9 @@ struct SpeculativeStats {
     std::uint64_t ngram_rounds          = 0;
     std::uint64_t ngram_drafted_tokens  = 0;
     std::uint64_t ngram_accepted_tokens = 0;
+    // Relaxed drafting: accepted drafts the exact rule would have rejected and the threshold kept,
+    // a subset of `accepted_tokens`. Zero unless the request ran with a threshold.
+    std::uint64_t relaxed_kept = 0;
 };
 
 struct ThinkingBudgetStats {
@@ -1578,6 +1599,8 @@ struct RuntimeStats {
     std::uint64_t speculative_ngram_rounds          = 0;
     std::uint64_t speculative_ngram_draft_tokens    = 0;
     std::uint64_t speculative_ngram_accepted_tokens = 0;
+    // Relaxed drafting: accepted drafts kept by the threshold, a subset of the accepted tokens.
+    std::uint64_t speculative_relaxed_kept = 0;
     // Initial prompt tokens evaluated by prefill. Reused checkpoint-prefix tokens and replay
     // recomputation are excluded; replayed_tokens separately counts that additional model work.
     std::uint64_t computed_prefill_tokens = 0;

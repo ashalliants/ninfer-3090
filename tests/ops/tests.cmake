@@ -94,6 +94,11 @@ ninfer_add_op_test(ninfer_hyper_connection_test
 ninfer_add_op_test(ninfer_hc_int8_codec_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_hc_int8_codec.cpp"
   LIBRARIES ninfer_core)
+# Host-only: relaxed drafting's acceptance rule and eligibility (--relaxed-drafting), the rule the
+# speculative acceptance kernels run and the host checks the Programs make.
+ninfer_add_op_test(ninfer_relaxed_accept_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_relaxed_accept.cpp"
+  LIBRARIES ninfer_core)
 
 foreach(op IN ITEMS ple projection_fp32 rows)
   ninfer_add_op_test(ninfer_${op}_test

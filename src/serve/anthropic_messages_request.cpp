@@ -919,6 +919,7 @@ void parse_generation_fields(const Json& body, GenerationRequest& request) {
     request.sampling.temperature = optional_number(body, "temperature");
     request.sampling.top_p       = optional_number(body, "top_p");
     request.sampling.top_k       = optional_int(body, "top_k");
+    request.sampling.relaxed_drafting = parse_relaxed_drafting_field(body);
     if (request.sampling.temperature &&
         (*request.sampling.temperature < 0.0 || *request.sampling.temperature > 1.0)) {
         bad_request("temperature must be in [0,1]", "temperature");

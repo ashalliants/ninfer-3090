@@ -131,6 +131,8 @@ struct SamplingParams {
     std::optional<double> presence_penalty;
     std::optional<double> frequency_penalty;
     std::optional<std::uint64_t> seed;
+    // The `relaxed_drafting` extension: a threshold in [0,1] (0: exact), absent for the default.
+    std::optional<double> relaxed_drafting;
 };
 
 // Protocol-level effort vocabulary. Each wire adapter accepts the values from

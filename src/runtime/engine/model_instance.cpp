@@ -11,6 +11,7 @@
 #include "runtime/engine/validate_options.h"
 
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <cstdio>
 #include <limits>
@@ -87,6 +88,18 @@ void validate_engine_options(const EngineOptions& options) {
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
+    }
+    if (options.relaxed_drafting) {
+        const float threshold = *options.relaxed_drafting;
+        if (!std::isfinite(threshold) || threshold < 0.0F || threshold > 1.0F) {
+            throw std::invalid_argument("--relaxed-drafting P must be in [0,1]");
+        }
+        if (options.purpose != EnginePurpose::Generation ||
+            options.speculative.backend == SpeculativeBackend::None) {
+            throw std::invalid_argument(
+                "--relaxed-drafting changes which drafts speculative decoding keeps and needs "
+                "--spec mtp, dflash or dflash2");
+        }
     }
     if (options.max_pending_requests == 0 || options.pending_timeout_ms == 0) {
         throw std::invalid_argument("Engine pending request capacity and timeout must be nonzero");
@@ -258,6 +271,18 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
+    }
+    if (options.relaxed_drafting) {
+        const float threshold = *options.relaxed_drafting;
+        if (!std::isfinite(threshold) || threshold < 0.0F || threshold > 1.0F) {
+            throw std::invalid_argument("--relaxed-drafting P must be in [0,1]");
+        }
+        if (options.purpose != EnginePurpose::Generation ||
+            options.speculative.backend == SpeculativeBackend::None) {
+            throw std::invalid_argument(
+                "--relaxed-drafting changes which drafts speculative decoding keeps and needs "
+                "--spec mtp, dflash or dflash2");
+        }
     }
 
     if (options.prefill_schedule.stall_budget_ms > kMaximumPrefillStallBudgetMs) {

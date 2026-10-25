@@ -1016,6 +1016,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->ngram_draft_tokens   = inputs.ngram_draft_tokens;
     impl->ngram_min_match      = inputs.ngram_min_match;
     impl->speculative_backend  = inputs.speculative_backend;
+    impl->relaxed_drafting     = inputs.relaxed_drafting;
     impl->proposal_head        = inputs.proposal_head;
     impl->features             = inputs.features;
     impl->use_cuda_graph       = inputs.use_cuda_graph;
@@ -1185,6 +1186,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .ngram_draft_tokens   = options.speculative.ngram_draft_tokens,
         .ngram_min_match      = options.speculative.ngram_min_match,
         .speculative_backend  = options.speculative.backend,
+        .relaxed_drafting     = options.relaxed_drafting.has_value(),
         .kv_storage           = options.kv_cache,
         .proposal_head        = options.speculative.proposal_head,
         .features             = models::load_options(options),
