@@ -14,6 +14,7 @@
 #
 # A cpu test that links no kernel also belongs on HostOnlyTests.cmake, which CI builds without nvcc.
 set(NINFER_CPU_ONLY_TESTS
+  ninfer_a4_g64_reference_test
   ninfer_anthropic_schema_test
   ninfer_artifact_reader_test
   ninfer_bench_support_test

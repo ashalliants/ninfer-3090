@@ -9,6 +9,7 @@
 # The other cpu tests link the kernels, so they still need the full build (tools/run-tests.ps1
 # -CpuOnly runs all of them).
 set(NINFER_HOST_ONLY_TESTS
+  ninfer_a4_g64_reference_test
   ninfer_artifact_reader_test
   ninfer_chat_templates_test
   ninfer_chunked_reservation_test

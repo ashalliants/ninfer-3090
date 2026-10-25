@@ -239,6 +239,15 @@ gate below measures. Prior art for the 3090: QuaRot (CUTLASS int4, ~2x over FP16
 3090, [arXiv 2606.08761](https://arxiv.org/pdf/2606.08761)). Against our int8 route the expected gain on
 the scout's GEMMs is about 1.6x **(predicted)**.
 
+The Ops are `quantize_a4_g64` and `q4_a4_linear` (`include/ninfer/ops/q4_a4_linear.h`, qualified by
+`ninfer_q4_a4_linear_test`; the host oracle is checked by `ninfer_a4_g64_reference_test`). The activation
+codes are symmetric in [-7,7] and packed in the Q4 row-split nibble order, so both operands enter the MMA
+as stored, and Q4 codes are already two's complement, so there is no zero-point correction. Status
+**compiled, not run** on a GPU (2026-10-25). A host simulation of the test fixtures predicts the A4 cast
+costs about 7% relative L2 on outlier-free activations (cosine about 0.997 against the A8 route) but about
+20% (cosine about 0.98) when every 431st channel is 24x, because such a channel zeroes the other 63 of its
+group; whether that spoils the ranking is the Jaccard gate's question.
+
 ### Alternative strategy: deterministic conversation summary (`--lossy-prefill-strategy summary`)
 
 Added 2026-10-25 at the user's request as a flagged option for comparison, not the production choice.
