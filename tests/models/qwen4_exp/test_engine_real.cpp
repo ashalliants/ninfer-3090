@@ -67,6 +67,13 @@
 //   ninfer_qwen4_exp_engine_real_test --moe-gate-up-registers-exact [--mtp K] [--max-context N]
 //       [--generate N] [TOKENS...]
 //
+// MoE one-launch route and dispatch (moe_fused_route_matches_plain below, --moe-fused-route): greedy
+// ids equal those of an Engine that routes and dispatches with two launches. The same arguments as
+// --moe-precast-exact.
+//
+//   ninfer_qwen4_exp_engine_real_test --moe-fused-route-exact [--mtp K] [--max-context N]
+//       [--generate N] [TOKENS...]
+//
 // MTP for constrained requests (mtp_constrained_matches_plain below): a greedy JSON-schema request
 // with --mtp-constrained (K drafts, default 3) gives the ids of plain constrained decoding.
 //
@@ -769,6 +776,16 @@ int moe_gate_up_registers_matches_plain(const std::string& artifact, const std::
                                }});
 }
 
+// moe_fused_route_matches_plain (--moe-fused-route-exact, FlashNextOptions::moe_fused_route): every
+// routed-expert call of at most 8 columns routed and dispatched in one launch (decode, with MTP the
+// drafter's and the verification's calls; prefill chunks take the two Ops) gives the greedy ids of
+// the two-launch route.
+int moe_fused_route_matches_plain(const std::string& artifact, const std::vector<std::string>& args) {
+    return option_matches_off(artifact, args,
+                              {"two-launch route", "one-launch route", "moe fused route",
+                               [](EngineOptions& o) { o.flash_next.moe_fused_route = true; }});
+}
+
 // mtp_constrained_matches_plain (--mtp-constrained, FlashNextOptions::mtp_constrained): a greedy
 // JSON-schema request on an MTP Engine with the option gives the ids of plain constrained decoding.
 // The reference is an MTP Engine without the option, where the constrained row runs plain rounds
@@ -1222,6 +1239,9 @@ int main(int argc, char** argv) {
         }
         if (!args.empty() && args.front() == "--moe-gate-up-registers-exact") {
             return moe_gate_up_registers_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
+        }
+        if (!args.empty() && args.front() == "--moe-fused-route-exact") {
+            return moe_fused_route_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
         }
         if (!args.empty() && args.front() == "--mtp-constrained") {
             return mtp_constrained_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));

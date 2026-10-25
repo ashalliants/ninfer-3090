@@ -274,6 +274,11 @@ struct ForwardOptions {
     // (ops::GateUpVariant::Registers), reading the precast input: requires moe_precast_input. The
     // same arithmetic, bitwise the outputs; no workspace.
     bool moe_gate_up_registers = false;
+    // Every routed-expert call of at most ops::kMoeRouteDispatchColumns columns (the text model's
+    // and the drafter's) routes and dispatches in one launch (ops::moe_route_dispatch) instead of
+    // moe_route then moe_dispatch: the same routing, counts, offsets, jobs and route log, entries in
+    // ascending order within each expert; bitwise the outputs. No workspace.
+    bool moe_fused_route = false;
 };
 
 class Forward {
@@ -425,6 +430,7 @@ private:
     bool gdn_head_map_ = false; // ForwardOptions::gdn_head_map
     bool moe_precast_input_ = false; // ForwardOptions::moe_precast_input
     bool moe_gate_up_registers_ = false; // ForwardOptions::moe_gate_up_registers
+    bool moe_fused_route_ = false; // ForwardOptions::moe_fused_route
     Tensor mtp_frames_; // I32 [E]: every drafter expert resident at its own index
     DeviceBuffer mtp_frames_backing_;
     Tensor residual_; // the call's residual stream, in the workspace from run_front to run_back

@@ -230,15 +230,13 @@ __global__ void __launch_bounds__(kThreads)
 
 __device__ __forceinline__ float negative_infinity() { return __int_as_float(static_cast<int>(0xFF800000U)); }
 
-// One warp per column: exact top-k by repeated arg-max with lower-id ties, then the weights.
-// Every array index is a compile-time constant (unrolled loops guarded by top_k), so the values,
-// the selection and the weights stay in registers; the selection and softmax order are fixed.
-__global__ void route_kernel(const float* __restrict__ logits, int experts, int columns, int top_k,
-                             std::int32_t* __restrict__ ids, float* __restrict__ weights,
-                             float* __restrict__ shared_gate) {
-    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
-    const int lane = threadIdx.x % 32;
-    if (warp >= columns) { return; }
+// One column's routing by one warp: exact top-k by repeated arg-max with lower-id ties, then the
+// weights, written by lane 0. Every array index is a compile-time constant (unrolled loops guarded
+// by top_k), so the values, the selection and the weights stay in registers; the selection and
+// softmax order are fixed. route_kernel and route_dispatch_kernel both run this code.
+__device__ __forceinline__ void route_column(const float* __restrict__ logits, int experts, int top_k, int warp,
+                                             int lane, std::int32_t* __restrict__ ids, float* __restrict__ weights,
+                                             float* __restrict__ shared_gate) {
     const float* column = logits + static_cast<std::size_t>(warp) * (experts + 1);
     constexpr int kPerLane = 16, kMaxTopK = 16; // 512 experts: 16 per lane
     float values[kPerLane];
@@ -296,6 +294,16 @@ __global__ void route_kernel(const float* __restrict__ logits, int experts, int 
         }
         shared_gate[warp] = 1.0F / (1.0F + expf(-score));
     }
+}
+
+// One warp per column.
+__global__ void route_kernel(const float* __restrict__ logits, int experts, int columns, int top_k,
+                             std::int32_t* __restrict__ ids, float* __restrict__ weights,
+                             float* __restrict__ shared_gate) {
+    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    const int lane = threadIdx.x % 32;
+    if (warp >= columns) { return; }
+    route_column(logits, experts, top_k, warp, lane, ids, weights, shared_gate);
 }
 
 // ------------------------------------------------------------------------------------- dispatch
@@ -377,6 +385,46 @@ __global__ void __launch_bounds__(kDispatchThreads)
     dispatch_scan(c, experts, dispatch.offsets, cursor, dispatch.jobs, dispatch.job_count, warp_totals);
     __syncthreads();
     if (valid) { dispatch.entries[atomicAdd(&cursor[id], 1)] = i; }
+}
+
+// moe_route_dispatch's one launch for a call of at most kMoeRouteDispatchColumns columns: warp t
+// routes column t (route_column, as route_kernel), then the CTA dispatches the k*T entries as
+// dispatch_small_kernel does, except that an entry's place within its expert is its rank among the
+// entries of that expert (the earlier entries routed to it), so each expert's entries are in
+// ascending entry index: offloaded_moe::plan_dispatch, independent of the order atomics resolve in.
+constexpr int kRouteDispatchEntries = kMoeRouteDispatchColumns * 16; // top-16
+
+__global__ void __launch_bounds__(kDispatchThreads)
+    route_dispatch_kernel(const float* __restrict__ logits, int experts, int columns, int top_k, std::int32_t* ids,
+                          float* __restrict__ weights, float* __restrict__ shared_gate, MoeDispatch dispatch,
+                          std::int32_t* __restrict__ route_log) {
+    __shared__ std::int32_t count[kDispatchThreads];
+    __shared__ std::int32_t cursor[kDispatchThreads];
+    __shared__ std::int32_t warp_totals[2][kDispatchThreads / 32];
+    __shared__ std::int32_t routed[kRouteDispatchEntries];
+    const int i = threadIdx.x, warp = i / 32;
+    count[i]    = 0;
+    if (warp < columns) { route_column(logits, experts, top_k, warp, i % 32, ids, weights, shared_gate); }
+    // The barrier makes the CTA's global writes of the ids visible to every thread of the CTA.
+    __syncthreads();
+    const int entries = columns * top_k;
+    const int id      = i < entries ? ids[i] : 0;
+    const bool valid  = i < entries && id >= 0 && id < experts;
+    if (i < entries) {
+        routed[i] = id;
+        if (route_log != nullptr) { route_log[i] = id; }
+    }
+    if (valid) { atomicAdd(&count[id], 1); }
+    __syncthreads();
+    const int c = count[i];
+    if (i < experts) { dispatch.counts[i] = c; }
+    dispatch_scan(c, experts, dispatch.offsets, cursor, dispatch.jobs, dispatch.job_count, warp_totals);
+    __syncthreads();
+    if (valid) {
+        int rank = 0;
+        for (int j = 0; j < i; ++j) { rank += routed[j] == id ? 1 : 0; }
+        dispatch.entries[cursor[id] + rank] = i;
+    }
 }
 
 __global__ void count_kernel(const std::int32_t* __restrict__ ids, int entries, int experts,
@@ -1260,9 +1308,8 @@ bool cpu_served(const Tensor& x, const MoeExpertSource& source) {
     return source.cpu.max_jobs > 0 && x.ne[1] <= source.cpu.max_columns;
 }
 
-} // namespace
-
-void moe_route(const Tensor& logits, std::int32_t top_k, MoeRouting& routing, cudaStream_t stream) {
+// moe_route's checks.
+void require_route(const Tensor& logits, std::int32_t top_k, const MoeRouting& routing) {
     require(contiguous(logits, DType::FP32) && contiguous(routing.ids, DType::I32) &&
                 contiguous(routing.weights, DType::FP32) && contiguous(routing.shared_gate, DType::FP32),
             "route requires contiguous FP32 logits and I32/FP32 outputs");
@@ -1272,6 +1319,13 @@ void moe_route(const Tensor& logits, std::int32_t top_k, MoeRouting& routing, cu
     require(routing.ids.ne[0] == top_k && routing.ids.ne[1] == columns && routing.weights.ne[0] == top_k &&
                 routing.weights.ne[1] == columns && routing.shared_gate.numel() == columns,
             "route output shapes disagree");
+}
+
+} // namespace
+
+void moe_route(const Tensor& logits, std::int32_t top_k, MoeRouting& routing, cudaStream_t stream) {
+    require_route(logits, top_k, routing);
+    const int experts = logits.ne[0] - 1, columns = logits.ne[1];
     route_kernel<<<grid_blocks(columns, kWarps, kGridMaxX, "route columns exceed the launch grid"), kThreads, 0,
                    stream>>>(
         static_cast<const float*>(logits.data), experts, columns, top_k, static_cast<std::int32_t*>(routing.ids.data),
@@ -1320,6 +1374,23 @@ void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& 
     check_launch("scan");
     scatter_kernel<<<entry_blocks, kThreads, 0, stream>>>(ids, entries, experts, dispatch.cursor, dispatch.entries);
     check_launch("scatter");
+}
+
+void moe_route_dispatch(const Tensor& logits, std::int32_t top_k, MoeRouting& routing, MoeDispatch& dispatch,
+                        std::int32_t* route_log, cudaStream_t stream) {
+    require_route(logits, top_k, routing);
+    const int experts = logits.ne[0] - 1, columns = logits.ne[1];
+    if (columns > kMoeRouteDispatchColumns) {
+        moe_route(logits, top_k, routing, stream);
+        moe_dispatch(routing, experts, dispatch, route_log, stream);
+        return;
+    }
+    static_assert(kRouteDispatchEntries <= kDispatchThreads && kMoeRouteDispatchColumns <= kDispatchThreads / 32,
+                  "one CTA routes every column and dispatches every entry");
+    route_dispatch_kernel<<<1, kDispatchThreads, 0, stream>>>(
+        static_cast<const float*>(logits.data), experts, columns, top_k, static_cast<std::int32_t*>(routing.ids.data),
+        static_cast<float*>(routing.weights.data), static_cast<float*>(routing.shared_gate.data), dispatch, route_log);
+    check_launch("route and dispatch");
 }
 
 // A call wider than a narrow job may route an expert more than kMaxColumns columns: the wide route's

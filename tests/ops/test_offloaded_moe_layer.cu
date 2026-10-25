@@ -6,6 +6,13 @@
 //     FP64.
 //   - moe_dispatch: counts, offsets, jobs, entries and the route log exactly, on the one-CTA and
 //     three-kernel routes.
+//   - moe_route_dispatch (fused_route): at T in {1, 2, 3, 7, 8} (one launch) and 9 (the two Ops),
+//     with all-equal, tied and all-NaN (unrankable: ids outside [0, E), logged, not dispatched)
+//     columns: ids, weights, shared gate and route log bitwise those of moe_route then moe_dispatch;
+//     the one launch's counts, offsets, jobs, job_count and entries exactly
+//     offloaded_moe::plan_dispatch (entries ascending within each expert), also on a second call into
+//     the same arrays. The whole layer (moe_experts over every placement, then moe_combine) from the
+//     fused routing bitwise equals the two-launch one at T in {1, 2, 7, 8}.
 //   - moe_experts: every routed (column, expert) output equals the CPU engine's (expert_forward_cpu,
 //     scalar) bit for bit, for each record format at T in {1, 2, 7, 8, 16}, with the records in
 //     device frames (record-stride apart, or wider: frame_stride), read zero-copy, staged through
@@ -43,6 +50,7 @@
 #include "ninfer/ops/offloaded_sparse_moe.h"
 #include "ninfer/ops/silu_mul.h"
 #include "offloaded_moe_fixtures.h"
+#include "ops/offloaded_sparse_moe/dispatch_plan.h"
 
 #include <cuda_runtime.h>
 
@@ -53,6 +61,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -154,20 +163,31 @@ struct DeviceRouting {
     ops::MoeDispatch view;
     int experts = 0, k = 0, columns = 0;
 
-    DeviceRouting(const std::vector<float>& host_logits, int e, int top_k, int t)
+    // fused: moe_route_dispatch instead of moe_route then moe_dispatch.
+    DeviceRouting(const std::vector<float>& host_logits, int e, int top_k, int t, bool fused = false)
         : logits(host_logits.size() * 4), ids(static_cast<std::size_t>(top_k) * t * 4),
           weights(static_cast<std::size_t>(top_k) * t * 4), shared_gate(static_cast<std::size_t>(t) * 4),
           dispatch(ops::moe_dispatch_bytes(e, top_k * t)), route_log(static_cast<std::size_t>(top_k) * t * 4),
           experts(e), k(top_k), columns(t) {
-        logits.copy_from_host(host_logits.data(), host_logits.size() * 4);
         routing.ids         = Tensor(ids.p, DType::I32, {top_k, t});
         routing.weights     = Tensor(weights.p, DType::FP32, {top_k, t});
         routing.shared_gate = Tensor(shared_gate.p, DType::FP32, {t});
         view                = ops::carve_moe_dispatch(dispatch.p, e, top_k * t);
-        const Tensor l(logits.p, DType::FP32, {e + 1, t});
-        ops::moe_route(l, top_k, routing, nullptr);
+        route(host_logits, fused);
+    }
+
+    // Routes and dispatches `host_logits` into the same arrays (the dispatch arrays are not cleared).
+    void route(const std::vector<float>& host_logits, bool fused) {
+        logits.copy_from_host(host_logits.data(), host_logits.size() * 4);
+        const Tensor l(logits.p, DType::FP32, {experts + 1, columns});
         cuda_ok(cudaMemset(route_log.p, 0xFF, route_log.bytes), "poison the route log");
-        ops::moe_dispatch(routing, e, view, static_cast<std::int32_t*>(route_log.p), nullptr);
+        auto* log = static_cast<std::int32_t*>(route_log.p);
+        if (fused) {
+            ops::moe_route_dispatch(l, k, routing, view, log, nullptr);
+        } else {
+            ops::moe_route(l, k, routing, nullptr);
+            ops::moe_dispatch(routing, experts, view, log, nullptr);
+        }
         cuda_ok(cudaDeviceSynchronize(), "route/dispatch");
     }
 };
@@ -523,6 +543,119 @@ void test_synthetic_banks() {
         for (int e = 0; e < kExperts; ++e) { records.push_back(random_record(format, rng)); }
         const auto bank = make_bank(format, records, align256(om::record_geometry(format).bytes));
         check_bank(bank, kTopK, g_small ? std::vector<int>{1} : std::vector<int>{1, 2, 4, 8}, rng, true);
+    }
+}
+
+// The device dispatch arrays of `r` against plan_dispatch of its routed ids: counts, offsets and jobs
+// exactly; entries exactly (`ordered`, the one-launch route) or as a set within each expert.
+void check_dispatch_plan(const DeviceRouting& r, bool ordered, const std::string& what) {
+    const int entries  = r.k * r.columns;
+    const auto ids     = download<std::int32_t>(r.ids.p, static_cast<std::size_t>(entries));
+    const auto plan    = om::plan_dispatch(ids, r.experts);
+    const auto counts  = download<std::int32_t>(r.view.counts, r.experts);
+    const auto offsets = download<std::int32_t>(r.view.offsets, r.experts + 1);
+    const int jobs     = download<std::int32_t>(r.view.job_count, 1)[0];
+    check(counts == plan.counts && offsets == plan.offsets, what + ": counts and offsets equal plan_dispatch's");
+    check(jobs == static_cast<int>(plan.jobs.size()) &&
+              download<std::int32_t>(r.view.jobs, static_cast<std::size_t>(jobs)) == plan.jobs,
+          what + ": jobs equal plan_dispatch's");
+    auto got = download<std::int32_t>(r.view.entries, plan.entries.size());
+    if (!ordered) {
+        for (int e = 0; e < r.experts; ++e) {
+            std::sort(got.begin() + plan.offsets[e], got.begin() + plan.offsets[e + 1]);
+        }
+    }
+    check(got == plan.entries, what + (ordered ? ": entries equal plan_dispatch's, in order" : ": entries per expert"));
+}
+
+template <class T>
+bool same_bits(const DeviceBuffer& a, const DeviceBuffer& b, std::size_t count) {
+    const auto x = download<T>(a.p, count), y = download<T>(b.p, count);
+    return std::memcmp(x.data(), y.data(), count * sizeof(T)) == 0;
+}
+
+// moe_route_dispatch against moe_route then moe_dispatch and plan_dispatch.
+void test_fused_route_dispatch() {
+    std::mt19937 rng(303);
+    constexpr int kExperts = 512, kTopK = 10;
+    for (int columns : {1, 2, 3, 7, 8, 9}) {
+        std::vector<float> f32;
+        (void)random_logits(kExperts, columns, rng, f32);
+        // Column 0 all equal (ids 0..9); column 1 a tie across the selection boundary; column 2 all
+        // NaN, which no rank selects: its ids are outside [0, E), logged but not dispatched.
+        for (int e = 0; e < kExperts; ++e) { f32[e] = 0.25F; }
+        if (columns > 1) {
+            for (int e = 0; e < 12; ++e) { f32[(kExperts + 1) + 300 + e] = 50.0F; }
+        }
+        if (columns > 2) {
+            for (int e = 0; e < kExperts; ++e) {
+                f32[2 * (kExperts + 1) + e] = std::numeric_limits<float>::quiet_NaN();
+            }
+        }
+        const DeviceRouting two(f32, kExperts, kTopK, columns);
+        DeviceRouting one(f32, kExperts, kTopK, columns, /*fused=*/true);
+        const std::size_t entries = static_cast<std::size_t>(kTopK) * columns;
+        const std::string at      = "fused route T=" + std::to_string(columns);
+        check(same_bits<std::int32_t>(one.ids, two.ids, entries), at + ": ids differ from moe_route's");
+        check(same_bits<std::uint32_t>(one.weights, two.weights, entries), at + ": weights differ from moe_route's");
+        check(same_bits<std::uint32_t>(one.shared_gate, two.shared_gate, columns), at + ": shared gate differs");
+        check(same_bits<std::int32_t>(one.route_log, two.route_log, entries), at + ": route log differs");
+        check(download<std::int32_t>(one.route_log.p, entries) == download<std::int32_t>(one.ids.p, entries),
+              at + ": the route log holds the routed ids");
+        const bool one_launch = columns <= ops::kMoeRouteDispatchColumns;
+        check_dispatch_plan(one, one_launch, at);
+        check_dispatch_plan(two, false, at + " (two launches)");
+        if (columns > 2) {
+            const auto ids = download<std::int32_t>(one.ids.p, entries);
+            check(std::all_of(ids.begin() + 2 * kTopK, ids.begin() + 3 * kTopK, [](int id) { return id >= kExperts; }),
+                  at + ": the all-NaN column routes outside [0, E)");
+        }
+        // A second call into the same arrays (as a replayed graph does): nothing needs clearing.
+        (void)random_logits(kExperts, columns, rng, f32);
+        one.route(f32, true);
+        check_dispatch_plan(one, one_launch, at + " second call");
+        std::printf("%s: routing bitwise moe_route's, dispatch %s\n", at.c_str(),
+                    one_launch ? "exactly plan_dispatch (one launch)" : "plan_dispatch per expert (two Ops)");
+    }
+
+    // The whole layer from the fused routing: every placement's expert outputs, then the combine,
+    // bitwise those from the two-launch routing.
+    constexpr int kBankExperts = 64;
+    const QType format         = QType::GGML_REC_IQ2_S_Q2_0;
+    std::vector<std::vector<std::uint8_t>> records;
+    for (int e = 0; e < kBankExperts; ++e) { records.push_back(random_record(format, rng)); }
+    const auto bank = make_bank(format, records, align256(om::record_geometry(format).bytes));
+    for (int columns : g_small ? std::vector<int>{1, 8} : std::vector<int>{1, 2, 7, 8}) {
+        std::vector<float> f32;
+        (void)random_logits(kBankExperts, columns, rng, f32);
+        const DeviceRouting two(f32, kBankExperts, kTopK, columns);
+        const DeviceRouting one(f32, kBankExperts, kTopK, columns, /*fused=*/true);
+        check_dispatch_plan(one, true, "fused route, 64 experts, T=" + std::to_string(columns));
+        const auto x = random_x(columns, rng), shared = random_x(columns, rng);
+        DeviceBuffer x_dev(x.size() * 2), d_shared(shared.size() * 2);
+        x_dev.copy_from_host(x.data(), x.size() * 2);
+        d_shared.copy_from_host(shared.data(), shared.size() * 2);
+        const auto combine = [&](const DeviceRouting& r, const std::vector<std::uint16_t>& outputs) {
+            DeviceBuffer d_out(outputs.size() * 2), d_y(shared.size() * 2);
+            d_out.copy_from_host(outputs.data(), outputs.size() * 2);
+            const Tensor ot(d_out.p, DType::BF16, {om::kHidden, kTopK * columns});
+            const Tensor st(d_shared.p, DType::BF16, {om::kHidden, columns});
+            Tensor yt(d_y.p, DType::BF16, {om::kHidden, columns});
+            ops::moe_combine(ot, r.routing, st, yt, nullptr);
+            cuda_ok(cudaDeviceSynchronize(), "combine");
+            return download<std::uint16_t>(d_y.p, shared.size());
+        };
+        for (const Config& cfg : configs()) {
+            const auto a = run_config(bank, cfg, two, x_dev, columns);
+            const auto b = run_config(bank, cfg, one, x_dev, columns);
+            check(a == b, "fused route T=" + std::to_string(columns) + " " + cfg.name +
+                              ": expert outputs differ from the two-launch route's");
+            check(combine(two, a) == combine(one, b),
+                  "fused route T=" + std::to_string(columns) + " " + cfg.name + ": layer output differs");
+        }
+        std::printf("fused route T=%d: %zu placements, expert outputs and layer output bitwise the two-launch "
+                    "route's\n",
+                    columns, configs().size());
     }
 }
 
@@ -948,6 +1081,7 @@ int main(int argc, char** argv) {
     test_route_and_dispatch();
     test_combine();
     test_synthetic_banks();
+    test_fused_route_dispatch();
     test_layer_fp64();
     test_host_silent();
     test_precast_read_proof();

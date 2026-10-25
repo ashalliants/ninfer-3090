@@ -774,6 +774,38 @@ None has been measured on the RTX 3090 yet.
     under the zero-copy rule, no staging) are read with the decoders' small loads instead of 16-byte
     `cp.async` copies, which may cost more over PCIe; unmeasured. Refused without
     `--moe-precast-input` (parser and startup). Works with two lanes, MTP and vision. Not measured.
+- **The routed experts' route and dispatch in one launch** (`--moe-fused-route`; F4d of the Basalt
+  learnings, narrowed). The learnings' plan put the expert union's planning inside the gate/up
+  kernel; here the staging pass (misses copied to slots before the expert kernels) needs the
+  dispatch before gate/up in every decode call, so the narrower change fuses the two launches that
+  precede the experts: `ops::moe_route_dispatch` runs, for a call of at most 8 columns
+  (`kMoeRouteDispatchColumns`: decode, MTP drafting and verification), one CTA of 1,024 threads in
+  which warp t routes column t with `route_kernel`'s own code (`route_column`: the top 10 of 512 in
+  FP32 with the lower id on ties, their weights as the renormalised softmax, and the shared gate)
+  and the CTA then dispatches the k*T entries as `dispatch_small_kernel` does (counts, the shared
+  scan, the route log), except that an entry's place in its expert is its rank among that expert's
+  entries, so each expert's entries are in ascending entry index instead of the order the atomics
+  resolve in. Wider calls run the two Ops. One launch fewer per routed-expert call (each layer's MoE
+  block, the drafter's too); the kernel is tiny and latency-bound, so the gain is the launch (a
+  graph node) and the dependency between the two. Not measured.
+  - The routing is the same code on the same values, so ids, weights and the shared gate are
+    designed to equal `moe_route`'s bit for bit (the PTX of the route's floating-point operations is
+    the same sequence in both kernels; NVVM has already made every contraction, so ptxas has none
+    to choose). Under the 1,024-thread CTA's 64-register cap the route spills 48 bytes per thread to
+    local memory (L1); `route_kernel` keeps its 72. The counts, offsets, jobs and route log equal
+    `moe_dispatch`'s, and the entries equal `offloaded_moe::plan_dispatch`
+    (`src/ops/offloaded_sparse_moe/dispatch_plan.h`, `ninfer_moe_dispatch_plan_test`, cpu and
+    host-only). Consumers do not depend on the order within an expert (each column's expert output
+    is computed alone), so the layer's output is unchanged. `ninfer_offloaded_moe_layer_test`
+    (fused_route) checks the routing bitwise against `moe_route`, the arrays against
+    `plan_dispatch` (all-equal, tied and all-NaN columns; a second call into the same arrays), and
+    the whole layer (every placement, then the combine) bitwise against the two launches at
+    T in {1, 2, 7, 8}; end to end `ninfer_qwen4_exp_forward_real_test --moe-fused-route TOKENS`
+    (logits bitwise against off) and `ninfer_qwen4_exp_moe_fused_route_test` (greedy ids with MTP).
+    None has run yet.
+  - Off path: every existing kernel of `moe_layer.cu` (49, `route_kernel` and the dispatch kernels
+    included) has the same SASS as d262e955, encodings included; `wide_expert.cu`'s six too. No
+    memory. Works with two lanes, MTP (the drafter's calls too) and vision.
 
 ## Artifact decisions
 

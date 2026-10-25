@@ -294,6 +294,9 @@ int main() {
         // --moe-gate-up-registers allocates nothing: the register kernel reads the precast planes in
         // place and needs no workspace of its own (moe_experts_workspace_bytes does not take it).
         check(!q4::ProgramOptions{}.moe_gate_up_registers, "the register gate/up kernel is off by default");
+        // --moe-fused-route allocates nothing either: the one launch writes the same routing and
+        // dispatch arrays the two Ops write, in the same carve.
+        check(!q4::ProgramOptions{}.moe_fused_route, "the one-launch MoE route and dispatch is off by default");
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;
