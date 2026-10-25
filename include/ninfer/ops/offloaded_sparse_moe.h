@@ -331,16 +331,26 @@ struct MoeExpertSource {
 /// With source.precast_input one kernel casts every column of x to A8 before the passes (skipped
 /// in a call where every expert takes the wide route, which casts x itself) and the narrow gate/up
 /// kernels copy a column's codes and scales instead of casting it in every CTA. With
-/// source.gate_up_variant == GateUpVariant::Registers (which requires precast_input; refused
-/// otherwise) the narrow gate/up rows are computed from registers by a co-resident grid instead,
+/// source.gate_up_variant == GateUpVariant::Registers (which requires precast_input or an `input`
+/// cast; refused otherwise) the narrow gate/up rows are computed from registers by a co-resident grid instead,
 /// reading the precast codes in place; the down kernel is the same.
 ///
 /// With wait_for_cpu == false the call returns before placing CPU-served outputs; the caller may
 /// enqueue unrelated work (the shared expert) and must call moe_experts_cpu_wait with the same
 /// arguments before reading `outputs`. The workspace stays reserved until then.
+///
+/// `input`, when its planes are set, is x's A8 cast already made by the caller (hc_fused_read
+/// writes it beside x): codes [T][2560] and FP32 scales [T][80], 16-byte aligned, the canonical
+/// cast's bits (those the precast kernel writes). The call then runs as with source.precast_input,
+/// reading these planes instead of casting x (no cast kernel), and the workspace needs no planes of
+/// its own (moe_experts_workspace_bytes with precast_input false suffices). The same outputs.
+struct MoeA8Input {
+    const std::int8_t* codes = nullptr;
+    const float* scales      = nullptr;
+};
 void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
                  std::int32_t top_k, std::int32_t max_jobs, void* workspace, Tensor& outputs,
-                 cudaStream_t stream, bool wait_for_cpu = true);
+                 cudaStream_t stream, bool wait_for_cpu = true, MoeA8Input input = {});
 
 /// Waits for the host's answer to a moe_experts call made with wait_for_cpu == false and places
 /// its outputs; a no-op when that call published no request.

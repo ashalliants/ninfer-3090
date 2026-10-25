@@ -295,6 +295,18 @@ struct ForwardOptions {
     // Forward. NOT bitwise at decode width: the weights are rounded to int8 codes times binary16
     // group scales (judged by the KLD gate). No workspace beyond the BF16 form's.
     const HcInt8Copies* hc_int8 = nullptr;
+    // --hc-fused-read (requires hc_int8): every routed-expert block's input of at most
+    // ops::kHcInt8MaxColumns columns (the text model's and the drafter's) is read by one
+    // ops::hc_fused_read: the attention block's inject applied to the residual as the int8 mixer
+    // reads it, then the router logits, routing and dispatch (entries in ascending order within each
+    // expert, as moe_fused_route orders them) and the mixer output's A8 cast, which the routed
+    // experts read in place of casting it (ops::MoeA8Input). Three launches instead of the inject,
+    // the mixer's two, the router projection, the routing and the dispatch (and the precast with
+    // moe_precast_input). The same Ops' arithmetic: bitwise the outputs of hc_int8 alone. With
+    // shared_expert_stream the shared expert forks once the mixer's output is written (before the
+    // routing). Wider calls run as off. Workspace: hc_fused_read_workspace_bytes beyond
+    // workspace_bytes.
+    bool hc_fused_read = false;
 };
 
 class Forward {
@@ -349,6 +361,11 @@ public:
     [[nodiscard]] static std::size_t workspace_bytes(const TextConfig& config, std::int32_t columns,
                                                      std::uint32_t max_visible_keys, DeviceExecutionView execution,
                                                      bool moe_precast_input);
+    // With ForwardOptions::hc_fused_read, the workspace a call of up to `columns` columns needs beyond
+    // workspace_bytes (and mtp_workspace_bytes): the fused read's second inject [S, T], the A8 planes
+    // of x (ops::hc_fused_read_a8_code_bytes / _scale_bytes) and the Op's counters, each 256-byte
+    // aligned, at T = min(columns, ops::kHcInt8MaxColumns) (wider calls do not take the fused read).
+    [[nodiscard]] static std::size_t hc_fused_read_workspace_bytes(const TextConfig& config, std::int32_t columns);
     // The MoE block's share of workspace_bytes: routing, dispatch, the routed experts' outputs and
     // workspace (with the precast input's planes under moe_precast_input), the shared expert and
     // the combine.
@@ -386,10 +403,30 @@ private:
     Tensor attention_rows(const AttentionParameters& p, const Tensor& x, std::uint32_t index,
                           const ForwardRowsBatch& batch);
     Tensor mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject);
+    // ForwardOptions::hc_fused_read's view of a routed-expert block's input: the mixer's output and
+    // inject, the routing and dispatch, and the A8 planes of x, all in the call's workspace.
+    struct MoeRead {
+        Tensor x;
+        Tensor inject;
+        ops::MoeRouting routing;
+        ops::MoeDispatch dispatch;
+        ops::MoeA8Input cast;
+        bool forked = false; // the side stream's fork event is recorded after x
+    };
+    // Whether a routed-expert block's input of T columns read by `mixer` takes the fused read.
+    [[nodiscard]] bool fused_read(const HyperConnectionParameters& mixer, std::int32_t T) const noexcept;
+    // The fused read: `y` and `inject` (the attention block's output and inject) applied to
+    // `residual`, then `mixer`, the router (`router` then `shared_score`) and the A8 cast.
+    MoeRead read_moe(const HyperConnectionParameters& mixer, const Tensor& router, const Tensor& shared_score,
+                     Tensor& residual, const Tensor& y, const Tensor& inject, std::int32_t* route_log);
+    // ForwardExperts::route_log's rows of `layer` for `entries` routed ids (null without a log).
+    [[nodiscard]] std::int32_t* route_log(std::uint32_t layer, std::size_t entries) const;
     Tensor gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch);
     Tensor attention(const AttentionParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch);
-    // `verify`: a verification call's block, whose misses may go to ForwardExperts::cpu.
-    Tensor moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap, bool verify);
+    // `verify`: a verification call's block, whose misses may go to ForwardExperts::cpu. `read`: the
+    // block's input as the fused read left it (x is read->x), whose routing it uses.
+    Tensor moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap, bool verify,
+               const MoeRead* read = nullptr);
     // A BF16 Linear of a verification call: one column at a time, so each column takes the
     // one-column route a decode call takes (their T > 1 routes sum in other orders).
     void project_verify(const Tensor& x, const LinearParameters& p, Tensor& out, bool columnwise);
@@ -414,13 +451,13 @@ private:
         void release() noexcept;
     };
 
-    // The side stream forked from the device stream (it waits for the device stream's work so far),
-    // joined back by join() (the device stream waits for the side stream's work), or by the
-    // destructor when an exception leaves the block first, so the side stream never stays forked.
-    // Capture-safe.
+    // The side stream forked from the device stream (it waits for the device stream's work so far, or
+    // with `recorded` for the work before the fork event's last record), joined back by join() (the
+    // device stream waits for the side stream's work), or by the destructor when an exception leaves
+    // the block first, so the side stream never stays forked. Capture-safe.
     class SideFork {
     public:
-        SideFork(const SideStream& side, cudaStream_t main);
+        SideFork(const SideStream& side, cudaStream_t main, bool recorded = false);
         ~SideFork();
         SideFork(const SideFork&)            = delete;
         SideFork& operator=(const SideFork&) = delete;
@@ -449,6 +486,7 @@ private:
     bool moe_gate_up_registers_ = false; // ForwardOptions::moe_gate_up_registers
     bool moe_fused_route_ = false; // ForwardOptions::moe_fused_route
     const HcInt8Copies* hc_int8_ = nullptr; // ForwardOptions::hc_int8
+    bool hc_fused_read_ = false; // ForwardOptions::hc_fused_read
     Tensor mtp_frames_; // I32 [E]: every drafter expert resident at its own index
     DeviceBuffer mtp_frames_backing_;
     Tensor residual_; // the call's residual stream, in the workspace from run_front to run_back

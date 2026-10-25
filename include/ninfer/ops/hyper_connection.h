@@ -10,11 +10,13 @@
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/offloaded_sparse_moe.h"
 
 #include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 namespace ninfer::ops {
 
@@ -145,6 +147,100 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight,
                                                                         std::int32_t streams,
                                                                         std::int32_t rank,
                                                                         std::int32_t max_tokens);
+
+/// hc_fused_read's outputs (device memory). x BF16 [H, T]; inject FP32 [S, T]; logits FP32
+/// [E + 1, T]; routing as moe_route writes it (ids I32 [k, T], weights FP32 [k, T], shared_gate
+/// FP32 [T]); dispatch carved for E experts and k * T entries (carve_moe_dispatch); route_log
+/// optional I32 [k * T]; a8_codes int8 [T][H] (hc_fused_read_a8_code_bytes) and a8_scales FP32
+/// [T][H / 32] (hc_fused_read_a8_scale_bytes), the planes MoeA8Input passes to moe_experts.
+struct HcFusedReadOutputs {
+    Tensor x;
+    Tensor inject;
+    Tensor logits;
+    MoeRouting routing;
+    MoeDispatch dispatch;
+    std::int32_t* route_log = nullptr;
+    DeviceSpan a8_codes;
+    DeviceSpan a8_scales;
+};
+
+[[nodiscard]] constexpr std::size_t hc_fused_read_a8_code_bytes(std::int32_t hidden,
+                                                                std::int32_t columns) noexcept {
+    return static_cast<std::size_t>(hidden) * static_cast<std::size_t>(columns);
+}
+
+[[nodiscard]] constexpr std::size_t hc_fused_read_a8_scale_bytes(std::int32_t hidden,
+                                                                 std::int32_t columns) noexcept {
+    return static_cast<std::size_t>(hidden / 32) * static_cast<std::size_t>(columns) *
+           sizeof(float);
+}
+
+/**
+ * Op: hc_fused_read (a routed-expert block's input read from the hyper-connection residual: the
+ *     previous block's inject, the int8 mixer, the router, the routing and dispatch, and the A8
+ *     cast of the mixer's output)
+ *
+ * Math / indexing:
+ *   The composition, for every column t of T:
+ *     1. residual = hyper_connection_inject(y, prev_inject, residual)  (in place)
+ *     2. x, inject = hyper_connection_mix(residual, norm_weight, down, up), the int8 form
+ *     3. logits = projection_fp32(x, router)       (the E router rows, then the shared-gate row)
+ *     4. routing = moe_route(logits, top_k)
+ *     5. dispatch, route_log = moe_dispatch(routing, E), the entries within each expert in
+ *        ascending entry index t * k + slot (offloaded_moe::plan_dispatch, as moe_route_dispatch
+ *        writes them)
+ *     6. a8 = the canonical A8 cast of x (offloaded_sparse_moe.h, A8): per 32 values of a column,
+ *        codes and the FP32 scale d, as moe_experts' precast input holds them.
+ *
+ * Logical shapes:
+ *   residual BF16 [S*H, T]; y BF16 [H, T]; prev_inject FP32 [S, T]; norm_weight FP32 [S*H]; down
+ *   [rank + S, S*H] and up [S*H, rank] (HcInt8Weights); router BF16 [H, N_i] per segment,
+ *   sum N_i = E + 1; outputs as HcFusedReadOutputs. 1 <= T <= kHcInt8MaxColumns.
+ *
+ * Supported domain:
+ *   The int8 mixer's domain (hyper_connection_mix, int8 form: S = 4, H = 2560, rank a multiple of
+ *   32 up to 512) with the injection rows; one to four router segments, each contiguous and
+ *   16-byte aligned; 1 <= E <= 512 and 1 <= top_k <= min(16, E). residual, y, x and the A8
+ *   planes are 16-byte aligned; every tensor is contiguous. eps > 0.
+ *
+ * Numeric:
+ *   Each step's own contract: steps 1, 3, 4, 5 and 6 are exact given their inputs, and step 2 is
+ *   the int8 mixer's arithmetic, so every output is bitwise that of the composition of those Ops
+ *   (the fixed dispatch order included). The oracle is that composition; x also meets the int8
+ *   mixer's FP64 criterion.
+ *
+ * Effects:
+ *   Updates residual in place (step 1); writes every output. y, prev_inject, norm_weight, the
+ *   weights and the router are read only. No output may overlap an input or another output (in
+ *   particular inject must not overlap prev_inject).
+ *
+ * Workspace:
+ *   hc_fused_read_workspace_capacity_bytes() for every T in [1, max_tokens]. It must not overlap
+ *   any operand.
+ *
+ * Execution:
+ *   Stream-ordered; graph capturable; no host synchronization. When `mixed` is set it is recorded
+ *   on `stream` once residual, x, inject and the A8 planes are written and before the routing
+ *   (steps 3 to 5) is enqueued, so a side stream can wait for x alone.
+ */
+void hc_fused_read(Tensor& residual, const Tensor& y, const Tensor& prev_inject,
+                   const Tensor& norm_weight, const HcInt8Weights& down, const HcInt8Weights& up,
+                   std::int32_t streams, std::int32_t rank, float eps,
+                   std::span<const Tensor* const> router, std::int32_t top_k,
+                   HcFusedReadOutputs& out, WorkspaceArena& workspace, cudaStream_t stream,
+                   cudaEvent_t mixed = nullptr);
+
+/// The workspace hc_fused_read needs beyond the int8 mixer's (its routing kernel's counters).
+inline constexpr std::size_t kHcFusedReadExtraWorkspaceBytes = 256;
+
+/// The workspace hc_fused_read needs for every T in [1, max_tokens] (max_tokens <=
+/// kHcInt8MaxColumns): hyper_connection_mix_workspace_capacity_bytes of the int8 form plus
+/// kHcFusedReadExtraWorkspaceBytes.
+[[nodiscard]] std::size_t hc_fused_read_workspace_capacity_bytes(const HcInt8Weights& down,
+                                                                 const HcInt8Weights& up,
+                                                                 std::int32_t streams,
+                                                                 std::int32_t rank,
+                                                                 std::int32_t max_tokens);
 
 /**
  * Op: hyper_connection_inject

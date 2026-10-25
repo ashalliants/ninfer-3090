@@ -19,7 +19,12 @@
 // tile, two tiles at T > 8); a column's sums depend only on its own m, so they do not depend on T.
 // The collapse pairs the lanes holding a feature's four streams and each writes one (d, t): x =
 // bf16((1/S) * sum_s sigmoid(u_s) * Rn_s), s in order.
+//
+// --hc-fused-read adds a Read instance of K1b (hc_fused_read.cu): the collapse reads the residual
+// with the previous block's inject applied and writes it back, then each CTA casts its 32 features
+// of x (one A8 group per column) to A8. The other instances are unchanged.
 
+#include "ops/common/canonical_ggml.h"
 #include "ops/hyper_connection/hc_int8_codec.h"
 #include "ops/hyper_connection/hyper_connection_mix_fused.h"
 #include "ops/hyper_connection/hyper_connection_mix_kernels.cuh"
@@ -46,6 +51,8 @@ constexpr int kUpWarps      = 8;
 constexpr int kUpThreads    = kUpWarps * 32;
 constexpr int kCtaFeatures  = kUpWarps * kWarpFeatures; // 80 CTAs: one wave on 82 SMs
 constexpr int kQuantThreads = 256;
+static_assert(kHidden % kCtaFeatures == 0 && kCtaFeatures == canon::kA8Values,
+              "every K1b warp is live and a CTA's features are one A8 group per column");
 
 __device__ __forceinline__ float h2f(unsigned short h) { return __half2float(__ushort_as_half(h)); }
 
@@ -102,12 +109,19 @@ __global__ void __launch_bounds__(kQuantThreads)
     scales[gi]         = scale;
 }
 
-template <int Tiles> // 8-column mma tiles: 1 for T <= 8, 2 for T <= 16
+// Read (hc_fused_read): the residual is read through `read.residual` as R' = bf16(R + g y) (g the
+// previous block's inject read.inject[t][s], y its output read.y[t][d]: hyper_connection_inject's
+// bits) and R' is written back in place, each element by the one thread that reads it; the CTA's
+// 32 features of x are then cast to A8 (canon::a8_quantize_f32, one column per thread) into
+// read.codes and read.scales, and CTA 0 zeroes the routing kernel's counters. `residual` is unused
+// then. Without Read, `read` is unused.
+template <int Tiles, bool Read> // Tiles: 8-column mma tiles, 1 for T <= 8, 2 for T <= 16
 __global__ __launch_bounds__(kUpThreads, 1) void hc_up_collapse_int8_kernel(
     const float* __restrict__ partial, const float* __restrict__ inv_in,
     const bf16* __restrict__ residual, const float* __restrict__ norm_weight,
     const std::int8_t* __restrict__ codes, const unsigned short* __restrict__ scales, int rank,
-    int down_rows, int columns, float* __restrict__ inject, bf16* __restrict__ x) {
+    int down_rows, int columns, float* __restrict__ inject, bf16* __restrict__ x,
+    HcMixReadTail read) {
     __shared__ __align__(16) float m[kHcMixFusedMaxColumns * (kMaxRank + 4)]; // [T][rank + 4]
     __shared__ float inv[kStreams * kHcMixFusedMaxColumns];                   // [S][T]
     const int lane = static_cast<int>(threadIdx.x) & 31, warp = static_cast<int>(threadIdx.x) >> 5;
@@ -117,6 +131,11 @@ __global__ __launch_bounds__(kUpThreads, 1) void hc_up_collapse_int8_kernel(
     constexpr int width = kStreams * kHidden;
     const int groups    = rank / kHcInt8Group;
     const int ldm       = rank + 4; // = 4 mod 32: a quarter-warp's float4 B loads on distinct banks
+    if constexpr (Read) {
+        if (blockIdx.x == 0 && static_cast<int>(threadIdx.x) < read.counter_words) {
+            read.counters[threadIdx.x] = 0U;
+        }
+    }
 
     // 1. Weights first: this thread's 8 codes of each group in tile rows g (stream g / 4) and g + 8
     //    (stream 2 + g / 4) and the two rows' scales.
@@ -158,7 +177,9 @@ __global__ __launch_bounds__(kUpThreads, 1) void hc_up_collapse_int8_kernel(
         inv[i] = inv_in[i];
     }
     __syncthreads();
-    if (!live) { return; }
+    if constexpr (!Read) {
+        if (!live) { return; }
+    }
 
     // 3. u = W_up m on tensor cores. Within each 16 values of a group, mma k slots (2 t4, 2 t4 + 1)
     //    hold values 8 t4 + 4 h + {0, 1} and slots (2 t4 + 8, 2 t4 + 9) values 8 t4 + 4 h + {2, 3},
@@ -233,13 +254,69 @@ __global__ __launch_bounds__(kUpThreads, 1) void hc_up_collapse_int8_kernel(
             float sum = 0.0F;
 #pragma unroll
             for (int s = 0; s < kStreams; ++s) {
-                const float r =
-                    __bfloat162float(residual[static_cast<std::int64_t>(t) * width +
-                                              static_cast<std::int64_t>(s) * kHidden + d]);
+                const std::int64_t at = static_cast<std::int64_t>(t) * width +
+                                        static_cast<std::int64_t>(s) * kHidden + d;
+                float r;
+                if constexpr (Read) {
+                    const std::int64_t tt = t;
+                    const float g         = read.inject[tt * kStreams + s];
+                    const float y         = __bfloat162float(read.y[tt * kHidden + d]);
+                    const float old       = __bfloat162float(read.residual[at]);
+                    const bf16 folded     = __float2bfloat16_rn(__fmaf_rn(g, y, old));
+                    read.residual[at] = folded;
+                    r                 = __bfloat162float(folded);
+                } else {
+                    r = __bfloat162float(residual[at]);
+                }
                 const float rn = r * inv[s * columns + t] * w_norm[s];
                 sum += sigmoidf(u[s]) * rn;
             }
             x[static_cast<std::int64_t>(t) * kHidden + d] = __float2bfloat16_rn(sum * inv_streams);
+        }
+    }
+    if constexpr (Read) {
+        // 5. The A8 cast of the CTA's group of x per column, from the BF16 values just written (the
+        //    barrier makes the block's global writes visible to the block).
+        __syncthreads();
+        const int t = static_cast<int>(threadIdx.x);
+        if (t < columns) {
+            const bf16* group =
+                x + static_cast<std::int64_t>(t) * kHidden + blockIdx.x * kCtaFeatures;
+            float v[canon::kA8Values];
+#pragma unroll
+            for (int i = 0; i < canon::kA8Values / 8; ++i) {
+                const uint4 raw = *reinterpret_cast<const uint4*>(group + 8 * i);
+                const std::uint32_t w[4] = {raw.x, raw.y, raw.z, raw.w};
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    v[8 * i + 2 * k]     = __uint_as_float(w[k] << 16);
+                    v[8 * i + 2 * k + 1] = __uint_as_float(w[k] & 0xFFFF0000U);
+                }
+            }
+            // canon::a8_quantize_f32 step for step (as ggml::quantize_q8_1_group, which the MoE
+            // precast kernel runs), the codes packed four to a word in registers.
+            float amax = 0.0F;
+#pragma unroll
+            for (int j = 0; j < canon::kA8Values; ++j) { amax = canon::a8_amax_step(amax, v[j]); }
+            const float prescale = canon::a8_prescale(amax);
+            const float inverse  = canon::a8_inverse(amax);
+            std::uint32_t words[canon::kA8Values / 4];
+#pragma unroll
+            for (int w = 0; w < canon::kA8Values / 4; ++w) {
+                std::uint32_t word = 0;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const int q = canon::a8_code(v[4 * w + j], prescale, inverse);
+                    word |= (static_cast<std::uint32_t>(q) & 0xFFU) << (8 * j);
+                }
+                words[w] = word;
+            }
+            const std::int64_t g =
+                static_cast<std::int64_t>(t) * (kHidden / canon::kA8Values) + blockIdx.x;
+            auto* out      = reinterpret_cast<uint4*>(read.codes + g * canon::kA8Values);
+            out[0]         = make_uint4(words[0], words[1], words[2], words[3]);
+            out[1]         = make_uint4(words[4], words[5], words[6], words[7]);
+            read.scales[g] = canon::a8_scale(amax);
         }
     }
 }
@@ -265,7 +342,8 @@ bool hc_mix_int8_fused_supported(const HcInt8Weights& down, const HcInt8Weights&
 
 void hc_mix_int8_fused(const Tensor& residual, const Tensor& norm_weight, const HcInt8Weights& down,
                        const HcInt8Weights& up, std::int32_t streams, std::int32_t rank, float eps,
-                       Tensor& x, Tensor* inject, void* partials, cudaStream_t stream) {
+                       Tensor& x, Tensor* inject, void* partials, cudaStream_t stream,
+                       const HcMixReadTail* read) {
     const int columns = residual.ne[1];
     if (!hc_mix_int8_fused_supported(down, up, x.ne[0], streams, rank, columns) ||
         reinterpret_cast<std::uintptr_t>(residual.data) % 16 != 0) {
@@ -276,18 +354,24 @@ void hc_mix_int8_fused(const Tensor& residual, const Tensor& norm_weight, const 
         throw std::invalid_argument(
             "hyper_connection_mix: injects need the down projection's injection rows");
     }
-    hc_mix_down_partials_int8(residual, norm_weight, down, streams, eps, partials, stream);
+    hc_mix_down_partials_int8(residual, norm_weight, down, streams, eps, partials, stream,
+                              read != nullptr ? read->y : nullptr,
+                              read != nullptr ? read->inject : nullptr);
     const auto* partial = static_cast<const float*>(partials);
     const auto* inv =
         reinterpret_cast<const float*>(static_cast<const std::byte*>(partials) +
                                        hc_mix_fused_inv_offset(down.n, streams, columns));
-    auto* kernel = columns <= 8 ? hc_up_collapse_int8_kernel<1> : hc_up_collapse_int8_kernel<2>;
+    const bool fold = read != nullptr;
+    auto* kernel    = fold ? (columns <= 8 ? hc_up_collapse_int8_kernel<1, true>
+                                           : hc_up_collapse_int8_kernel<2, true>)
+                           : (columns <= 8 ? hc_up_collapse_int8_kernel<1, false>
+                                           : hc_up_collapse_int8_kernel<2, false>);
     kernel<<<kHidden / kCtaFeatures, kUpThreads, 0, stream>>>(
-        partial, inv, static_cast<const bf16*>(residual.data),
+        partial, inv, fold ? nullptr : static_cast<const bf16*>(residual.data),
         static_cast<const float*>(norm_weight.data), up.codes, up.scales, rank, down.n, columns,
         inject != nullptr ? static_cast<float*>(inject->data) : nullptr,
-        static_cast<bf16*>(x.data));
-    check_mix_launch("int8 up collapse");
+        static_cast<bf16*>(x.data), fold ? *read : HcMixReadTail{});
+    check_mix_launch(fold ? "int8 up collapse (read)" : "int8 up collapse");
 }
 
 } // namespace detail

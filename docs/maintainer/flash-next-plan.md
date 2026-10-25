@@ -951,6 +951,49 @@ None has been measured on the RTX 3090 yet.
   - GPU-session checks: `--hc-int8-prefill`; the KLD gate on vs off; the mixer's time at T = 1, 2,
     4, 8, 16 against the BF16 route (target: the bytes' 0.53); tok/s on vs off. Works with two lanes, MTP and vision.
     Not measured.
+- **One fused hyper-connection read per routed-expert block** (`--hc-fused-read`, requires
+  `--hc-int8`; F10d of the Basalt learnings, Basalt's `hc_fused_kernel` in `hc_fused.cu`). Basalt
+  reads a block's input in one persistent kernel: the previous half's inject applied as the residual
+  is read, the mixer, the router logits with the top-10, and the q8_1 codes of the output for the
+  next projections. On this card a one-kernel persistent mixer has already lost: PR 11's variant
+  (ticket counters, both weights' loads up front, B items waiting on finished A items) measured
+  47-50 us against 26.6-27.0 us for the two-kernel route (above, "Rejected in PR 11"), and Basalt's
+  own full-layer fusion lost too (its `docs/unified-kernel.md`). So this item keeps the int8 mixer's
+  two kernels and their arithmetic and removes the launches and passes around them instead.
+  `ops::hc_fused_read` (`src/ops/hyper_connection/hc_fused_read.cu`) is three launches where the
+  MLP side ran six (five with `--moe-fused-route`, seven with `--moe-precast-input`): the
+  attention block's inject, the mixer's two kernels, the router projection, `moe_route` and
+  `moe_dispatch` (and the experts' precast).
+  - K1a and K1b take the inject as they read the residual (`R' = bf16(R + g y)`, the inject Op's
+    one fma); K1b writes `R'` back in place, each element from the one thread that reads it, so no
+    separate inject pass reads and writes the residual. K1b's CTAs each own 32 features, one A8
+    group of every column, and cast their group of x to A8 (the canonical cast) after the collapse;
+    the routed experts read those planes in place of their own cast (`ops::MoeA8Input`).
+  - A third kernel computes the router and shared-gate logits, a warp per row in
+    `projection_fp32`'s order (the same bits). The last CTA of each 8-column group to take a
+    ticket routes that group's columns with `moe_route`'s code (`route_column`, now in
+    `route_column.cuh`). The last group then dispatches every entry in ascending entry order
+    (`plan_dispatch`, as `--moe-fused-route` orders them). No CTA waits on another, so it cannot
+    deadlock without co-residency. K1b zeroes the tickets every call, so graph replays need no
+    memset.
+  - Bit-exact against `--hc-int8` alone: every output is the composition's, bit for bit. Checked by
+    `ninfer_hyper_connection_test` (against the composed Ops at T = 1, 2, 5, 8, 9, 16, repeated calls
+    and graph replays) and end to end by `ninfer_qwen4_exp_forward_real_test --hc-fused-read
+    TOKENS` (prompt, verification and decode logits). Neither has run yet. The existing kernels'
+    SASS is unchanged. cuobjdump shows every instance identical to 73276277, including the encodings
+    of all 50 `moe_layer.cu` kernels after `route_column` moved; the Fold/Read instances are new.
+  - Not fused: the shared expert's GGML Linears still cast x themselves (Linear takes no
+    prequantized input). The MoE output's inject into the residual also stays its own launch: the
+    next block's PLE, the block taps and the layer's workspace scope sit between it and the next
+    mixer. With `--shared-expert-stream` the side stream forks from an event recorded after K1b, so
+    the shared expert still overlaps the routing.
+  - Memory: workspace only. `Forward::hc_fused_read_workspace_bytes` (the second inject, the A8
+    planes and the tickets at 16 columns, about 46 KiB) is in `ProgramDevicePlan::workspace` through
+    `plan_hc_fused_read_workspace`. Works with two lanes, MTP (the drafter's MoE block too) and
+    vision; prefill (more than 16 columns) runs as off.
+  - GPU-session checks: the identity mode above; nsys of a decode step on vs off (three kernels per
+    MLP side, the routing kernel against `projection_fp32`'s 10.2 us at T = 1); tok/s on vs off.
+    Not measured.
 
 ## Artifact decisions
 

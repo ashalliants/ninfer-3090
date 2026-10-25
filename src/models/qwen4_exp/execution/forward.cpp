@@ -122,8 +122,12 @@ void require_cpu_channels(const ForwardExperts& experts, std::uint32_t layers) {
     }
 }
 
-// ForwardOptions::hc_int8: none, or copies of every mixer the forward runs (the drafter's with it).
-void require_hc_int8(const Parameters& parameters, const HcInt8Copies* copies) {
+// ForwardOptions::hc_int8: none, or copies of every mixer the forward runs (the drafter's with it);
+// ForwardOptions::hc_fused_read reads them.
+void require_hc_int8(const Parameters& parameters, const HcInt8Copies* copies, bool fused_read) {
+    if (fused_read && copies == nullptr) {
+        throw std::invalid_argument("Qwen4Exp forward: --hc-fused-read reads the int8 copies of --hc-int8");
+    }
     if (copies == nullptr) { return; }
     const MtpParameters* drafter = parameters.mtp ? &*parameters.mtp : nullptr;
     for (const auto* mixer : HcInt8Copies::mixers(parameters.layers, parameters.final_mixer, drafter)) {
@@ -176,8 +180,8 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
       hot_embedding_rows_(options.hot_embedding_rows), hot_embedding_(options.hot_embedding),
       cold_embedding_(options.cold_embedding), gdn_head_map_(options.gdn_head_map),
       moe_precast_input_(options.moe_precast_input), moe_gate_up_registers_(options.moe_gate_up_registers),
-      moe_fused_route_(options.moe_fused_route), hc_int8_(options.hc_int8) {
-    require_hc_int8(parameters_, hc_int8_);
+      moe_fused_route_(options.moe_fused_route), hc_int8_(options.hc_int8), hc_fused_read_(options.hc_fused_read) {
+    require_hc_int8(parameters_, hc_int8_, hc_fused_read_);
     if (state_.gdn_conv.size() != config_.gdn_layers || state_.gdn_recurrent.size() != config_.gdn_layers ||
         state_.ple_slot.dtype != DType::I32 || state_.ple_slot.numel() != 1 ||
         state_.qsa_tails.size() != config_.attention_layers || kv_.layers.size() != config_.attention_layers ||
@@ -206,8 +210,8 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
       hot_embedding_rows_(options.hot_embedding_rows), hot_embedding_(options.hot_embedding),
       cold_embedding_(options.cold_embedding), gdn_head_map_(options.gdn_head_map),
       moe_precast_input_(options.moe_precast_input), moe_gate_up_registers_(options.moe_gate_up_registers),
-      moe_fused_route_(options.moe_fused_route), hc_int8_(options.hc_int8) {
-    require_hc_int8(parameters_, hc_int8_);
+      moe_fused_route_(options.moe_fused_route), hc_int8_(options.hc_int8), hc_fused_read_(options.hc_fused_read) {
+    require_hc_int8(parameters_, hc_int8_, hc_fused_read_);
     if (mtp.has_value() != parameters_.mtp.has_value()) {
         throw std::invalid_argument("Qwen4Exp forward: the MTP drafter's parameters and state go together");
     }
@@ -338,6 +342,15 @@ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, 
     return bytes;
 }
 
+std::size_t Forward::hc_fused_read_workspace_bytes(const TextConfig& c, std::int32_t columns) {
+    const auto aligned  = [](std::size_t n) { return (n + 255) / 256 * 256; };
+    const std::int32_t t = std::min(columns, ops::kHcInt8MaxColumns);
+    const auto h         = dim(c.hidden_size);
+    return aligned(std::size_t(c.hc.streams) * static_cast<std::size_t>(t) * sizeof(float)) +
+           aligned(ops::hc_fused_read_a8_code_bytes(h, t)) + aligned(ops::hc_fused_read_a8_scale_bytes(h, t)) +
+           aligned(ops::kHcFusedReadExtraWorkspaceBytes);
+}
+
 std::size_t Forward::shared_expert_workspace_bytes(const TextConfig& c, std::int32_t columns) {
     // The Q8_1 rows of the widest input (codes, then one FP32 scale per 32 values, each 256-byte
     // aligned as the GGML Linear allocates them); gate/up and down take their scratch in turn.
@@ -364,8 +377,8 @@ std::size_t Forward::max_shared_expert_scratch_bytes(std::int32_t columns) const
     return bytes;
 }
 
-Forward::SideFork::SideFork(const SideStream& side, cudaStream_t main) : side_(side), main_(main) {
-    CUDA_CHECK(cudaEventRecord(side_.fork, main_));
+Forward::SideFork::SideFork(const SideStream& side, cudaStream_t main, bool recorded) : side_(side), main_(main) {
+    if (!recorded) { CUDA_CHECK(cudaEventRecord(side_.fork, main_)); }
     CUDA_CHECK(cudaStreamWaitEvent(side_.stream, side_.fork, 0));
 }
 
@@ -472,11 +485,20 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
     Tensor y = config_.layer_types[layer] == MixerKind::Gdn
                    ? gdn(std::get<GdnParameters>(block.mixer), xa, compact, batch)
                    : attention(std::get<AttentionParameters>(block.mixer), xa, compact, batch);
-    ops::hyper_connection_inject(y, inject, residual, s);
-    Tensor xm = mix(block.mlp_hc, residual, &inject);
-    Tensor ym = moe(block.moe, xm, layer, tap != nullptr && tap->routes != nullptr ? &tap->routes->at(layer) : nullptr,
-                    batch.verify != nullptr);
-    ops::hyper_connection_inject(ym, inject, residual, s);
+    Tensor* route_tap = tap != nullptr && tap->routes != nullptr ? &tap->routes->at(layer) : nullptr;
+    Tensor xm, ym, mlp_inject = inject;
+    if (fused_read(block.mlp_hc, T)) {
+        const MoeRead read = read_moe(block.mlp_hc, block.moe.router, block.moe.shared_score, residual, y, inject,
+                                      route_log(layer, static_cast<std::size_t>(config_.moe.top_k) * T));
+        xm         = read.x;
+        mlp_inject = read.inject;
+        ym         = moe(block.moe, xm, layer, route_tap, batch.verify != nullptr, &read);
+    } else {
+        ops::hyper_connection_inject(y, inject, residual, s);
+        xm = mix(block.mlp_hc, residual, &inject);
+        ym = moe(block.moe, xm, layer, route_tap, batch.verify != nullptr);
+    }
+    ops::hyper_connection_inject(ym, mlp_inject, residual, s);
     if (tap != nullptr) {
         copy_tap(tap->mixer_inputs, layer, xa, s);
         copy_tap(tap->mixer_outputs, layer, y, s);
@@ -501,6 +523,47 @@ Tensor Forward::mix(const HyperConnectionParameters& p, const Tensor& residual, 
                               dim(config_.hc.rank), config_.rms_norm_eps, x, p.combine ? inject : nullptr, *work_,
                               device_.stream);
     return x;
+}
+
+bool Forward::fused_read(const HyperConnectionParameters& mixer, std::int32_t T) const noexcept {
+    return hc_fused_read_ && hc_int8_ != nullptr && mixer.combine && T <= ops::kHcInt8MaxColumns;
+}
+
+Forward::MoeRead Forward::read_moe(const HyperConnectionParameters& mixer, const Tensor& router,
+                                   const Tensor& shared_score, Tensor& residual, const Tensor& y, const Tensor& inject,
+                                   std::int32_t* route_log) {
+    const std::int32_t T = residual.ne[1], H = dim(config_.hidden_size), S = dim(config_.hc.streams);
+    const std::int32_t E = dim(config_.moe.experts), K = dim(config_.moe.top_k);
+    MoeRead read;
+    read.x       = work_->alloc(DType::BF16, {H, T});
+    read.inject  = work_->alloc(DType::FP32, {S, T});
+    read.routing = {work_->alloc(DType::I32, {K, T}), work_->alloc(DType::FP32, {K, T}), work_->alloc(DType::FP32, {T})};
+    const DeviceSpan dispatch_bytes = work_->alloc_bytes(ops::moe_dispatch_bytes(E, K * T));
+    read.dispatch                   = ops::carve_moe_dispatch(dispatch_bytes.data, E, K * T);
+    const DeviceSpan codes  = work_->alloc_bytes(ops::hc_fused_read_a8_code_bytes(H, T));
+    const DeviceSpan scales = work_->alloc_bytes(ops::hc_fused_read_a8_scale_bytes(H, T));
+    read.cast   = {static_cast<const std::int8_t*>(codes.data), static_cast<const float*>(scales.data)};
+    read.forked = side_ != nullptr;
+    ops::HcFusedReadOutputs out{.x         = read.x,
+                                .inject    = read.inject,
+                                .logits    = work_->alloc(DType::FP32, {E + 1, T}),
+                                .routing   = read.routing,
+                                .dispatch  = read.dispatch,
+                                .route_log = route_log,
+                                .a8_codes  = codes,
+                                .a8_scales = scales};
+    const HcInt8Mixer& copies = hc_int8_->at(mixer);
+    const Tensor* rows[]      = {&router, &shared_score};
+    ops::hc_fused_read(residual, y, inject, mixer.norm, copies.down, copies.up, S, dim(config_.hc.rank),
+                       config_.rms_norm_eps, rows, K, out, *work_, device_.stream,
+                       side_ != nullptr ? side_->fork : nullptr);
+    return read;
+}
+
+std::int32_t* Forward::route_log(std::uint32_t layer, std::size_t entries) const {
+    if (experts_.route_log == nullptr) { return nullptr; }
+    if (entries > experts_.route_stride) { throw std::logic_error("Qwen4Exp forward: the call exceeds the route log"); }
+    return experts_.route_log + static_cast<std::size_t>(layer) * experts_.route_stride;
 }
 
 void Forward::ple(const PleParameters& p, Tensor& residual, const ForwardBatch& batch) {
@@ -685,7 +748,8 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, std::ui
     return y;
 }
 
-Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap, bool verify) {
+Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap, bool verify,
+                    const MoeRead* read) {
     const cudaStream_t s = device_.stream;
     const auto& m        = config_.moe;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size), E = dim(m.experts), K = dim(m.top_k);
@@ -696,17 +760,13 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     Tensor shared;
     std::optional<SideFork> fork;
     if (side_) {
-        fork.emplace(*side_, s);
+        // After the fused read the side stream waits for x alone (the fork event the read recorded).
+        fork.emplace(*side_, s, read != nullptr && read->forked);
         WorkspaceArena scratch(work_->alloc_bytes(shared_expert_scratch_bytes(p, T, T)));
         shared = shared_expert(p, x, I, H, *work_, scratch, side_->stream);
     }
-    Tensor logits = work_->alloc(DType::FP32, {E + 1, T});
-    {
-        const Tensor* rows[] = {&p.router, &p.shared_score};
-        ops::projection_fp32(x, rows, logits, s);
-    }
-    ops::MoeRouting routing{work_->alloc(DType::I32, {K, T}), work_->alloc(DType::FP32, {K, T}),
-                            work_->alloc(DType::FP32, {T})};
+    ops::MoeRouting routing;
+    ops::MoeDispatch dispatch;
     const auto copy_route_tap = [&] {
         if (route_tap != nullptr &&
             cudaMemcpyAsync(route_tap->data, routing.ids.data, routing.ids.bytes(), cudaMemcpyDeviceToDevice, s) !=
@@ -714,26 +774,34 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
             throw std::runtime_error("Qwen4Exp forward: route tap copy failed");
         }
     };
-    if (!moe_fused_route_) {
-        ops::moe_route(logits, K, routing, s);
-        copy_route_tap();
-    }
-    std::int32_t* route_log = nullptr; // the dispatch writes the raw ids there (same layout as routing.ids)
-    if (experts_.route_log != nullptr) {
-        if (static_cast<std::size_t>(K) * T > experts_.route_stride) {
-            throw std::logic_error("Qwen4Exp forward: the call exceeds the route log");
-        }
-        route_log = experts_.route_log + static_cast<std::size_t>(layer) * experts_.route_stride;
-    }
-    const DeviceSpan dispatch_bytes = work_->alloc_bytes(ops::moe_dispatch_bytes(E, K * T));
-    ops::MoeDispatch dispatch       = ops::carve_moe_dispatch(dispatch_bytes.data, E, K * T);
-    if (moe_fused_route_) {
-        // ForwardOptions::moe_fused_route: one launch for a call of at most 8 columns, the two Ops
-        // otherwise; the tap then copies the same ids.
-        ops::moe_route_dispatch(logits, K, routing, dispatch, route_log, s);
+    if (read != nullptr) {
+        // ForwardOptions::hc_fused_read: routed and dispatched (and logged) by the read.
+        routing  = read->routing;
+        dispatch = read->dispatch;
         copy_route_tap();
     } else {
-        ops::moe_dispatch(routing, E, dispatch, route_log, s);
+        Tensor logits = work_->alloc(DType::FP32, {E + 1, T});
+        {
+            const Tensor* rows[] = {&p.router, &p.shared_score};
+            ops::projection_fp32(x, rows, logits, s);
+        }
+        routing = {work_->alloc(DType::I32, {K, T}), work_->alloc(DType::FP32, {K, T}), work_->alloc(DType::FP32, {T})};
+        if (!moe_fused_route_) {
+            ops::moe_route(logits, K, routing, s);
+            copy_route_tap();
+        }
+        // The dispatch writes the raw ids to the route log (same layout as routing.ids).
+        std::int32_t* const log         = route_log(layer, static_cast<std::size_t>(K) * T);
+        const DeviceSpan dispatch_bytes = work_->alloc_bytes(ops::moe_dispatch_bytes(E, K * T));
+        dispatch                        = ops::carve_moe_dispatch(dispatch_bytes.data, E, K * T);
+        if (moe_fused_route_) {
+            // ForwardOptions::moe_fused_route: one launch for a call of at most 8 columns, the two Ops
+            // otherwise; the tap then copies the same ids.
+            ops::moe_route_dispatch(logits, K, routing, dispatch, log, s);
+            copy_route_tap();
+        } else {
+            ops::moe_dispatch(routing, E, dispatch, log, s);
+        }
     }
     ops::MoeExpertSource source{.format        = p.bank->format,
                                 .frame_base    = experts_.frame_base,
@@ -763,7 +831,8 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     const std::int32_t max_jobs = std::min(E, K * T);
     const DeviceSpan expert_ws  =
         work_->alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T, T, moe_precast_input_));
-    ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/!cpu);
+    ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/!cpu,
+                     read != nullptr ? read->cast : ops::MoeA8Input{});
     if (stream != nullptr) { stream->after_experts(layer, s); }
 
     if (fork) {
@@ -871,6 +940,13 @@ void Forward::layer_rows(std::uint32_t layer, const ForwardRowsBatch& batch) {
     Tensor y = config_.layer_types[layer] == MixerKind::Gdn
                    ? gdn_rows(std::get<GdnParameters>(block.mixer), xa, compact, batch)
                    : attention_rows(std::get<AttentionParameters>(block.mixer), xa, compact, batch);
+    if (fused_read(block.mlp_hc, B)) {
+        const MoeRead read = read_moe(block.mlp_hc, block.moe.router, block.moe.shared_score, residual_, y, inject,
+                                      route_log(layer, static_cast<std::size_t>(config_.moe.top_k) * B));
+        Tensor ym          = moe(block.moe, read.x, layer, nullptr, /*verify=*/false, &read);
+        ops::hyper_connection_inject(ym, read.inject, residual_, s);
+        return;
+    }
     ops::hyper_connection_inject(y, inject, residual_, s);
     Tensor xm = mix(block.mlp_hc, residual_, &inject);
     Tensor ym = moe(block.moe, xm, layer, nullptr, /*verify=*/false);
@@ -1198,10 +1274,18 @@ void Forward::mtp_block(const MtpCall& call) {
             tap(call.tap->mixer_in, xa);
             tap(call.tap->attention, y);
         }
-        ops::hyper_connection_inject(y, inject, residual, s);
-
-        // MoE over the device-resident Q2_0 experts, with the shared expert.
-        Tensor xm            = mix(p.mlp_hc, residual, &inject);
+        // MoE over the device-resident Q2_0 experts, with the shared expert. ForwardOptions::hc_fused_read
+        // reads the block's input, routing and dispatch (no route log) in one Op.
+        std::optional<MoeRead> read;
+        Tensor xm, mlp_inject = inject;
+        if (fused_read(p.mlp_hc, T)) {
+            read       = read_moe(p.mlp_hc, p.router, p.shared_score, residual, y, inject, nullptr);
+            xm         = read->x;
+            mlp_inject = read->inject;
+        } else {
+            ops::hyper_connection_inject(y, inject, residual, s);
+            xm = mix(p.mlp_hc, residual, &inject);
+        }
         const auto& mc       = config_.moe;
         const std::int32_t E = dim(mc.experts), K = dim(mc.top_k), SI = dim(mc.shared_intermediate);
         // The shared expert (BF16 rows projected in FP32: no Linear scratch), on the side stream
@@ -1222,23 +1306,30 @@ void Forward::mtp_block(const MtpCall& call) {
         Tensor shared;
         std::optional<SideFork> fork;
         if (side_) {
-            fork.emplace(*side_, s);
+            fork.emplace(*side_, s, read.has_value() && read->forked);
             shared = shared_expert_rows(side_->stream);
         }
-        Tensor logits        = work_->alloc(DType::FP32, {E + 1, T});
-        {
-            const Tensor* rows[] = {&p.router, &p.shared_score};
-            ops::projection_fp32(xm, rows, logits, s);
-        }
-        ops::MoeRouting routing{work_->alloc(DType::I32, {K, T}), work_->alloc(DType::FP32, {K, T}),
-                                work_->alloc(DType::FP32, {T})};
-        if (!moe_fused_route_) { ops::moe_route(logits, K, routing, s); }
-        const DeviceSpan dispatch_bytes = work_->alloc_bytes(ops::moe_dispatch_bytes(E, K * T));
-        ops::MoeDispatch dispatch       = ops::carve_moe_dispatch(dispatch_bytes.data, E, K * T);
-        if (moe_fused_route_) {
-            ops::moe_route_dispatch(logits, K, routing, dispatch, nullptr, s);
+        ops::MoeRouting routing;
+        ops::MoeDispatch dispatch;
+        if (read) {
+            routing  = read->routing;
+            dispatch = read->dispatch;
         } else {
-            ops::moe_dispatch(routing, E, dispatch, nullptr, s);
+            Tensor logits = work_->alloc(DType::FP32, {E + 1, T});
+            {
+                const Tensor* rows[] = {&p.router, &p.shared_score};
+                ops::projection_fp32(xm, rows, logits, s);
+            }
+            routing = {work_->alloc(DType::I32, {K, T}), work_->alloc(DType::FP32, {K, T}),
+                       work_->alloc(DType::FP32, {T})};
+            if (!moe_fused_route_) { ops::moe_route(logits, K, routing, s); }
+            const DeviceSpan dispatch_bytes = work_->alloc_bytes(ops::moe_dispatch_bytes(E, K * T));
+            dispatch                        = ops::carve_moe_dispatch(dispatch_bytes.data, E, K * T);
+            if (moe_fused_route_) {
+                ops::moe_route_dispatch(logits, K, routing, dispatch, nullptr, s);
+            } else {
+                ops::moe_dispatch(routing, E, dispatch, nullptr, s);
+            }
         }
         const ops::MoeExpertSource source{.format        = p.bank->format,
                                           .precast_input = moe_precast_input_,
@@ -1252,7 +1343,8 @@ void Forward::mtp_block(const MtpCall& call) {
         const std::int32_t max_jobs = std::min(E, K * T);
         const DeviceSpan expert_ws  =
             work_->alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T, T, moe_precast_input_));
-        ops::moe_experts(xm, dispatch, source, K, max_jobs, expert_ws.data, outputs, s);
+        ops::moe_experts(xm, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/true,
+                         read ? read->cast : ops::MoeA8Input{});
         if (fork) {
             fork->join();
         } else {
@@ -1265,7 +1357,7 @@ void Forward::mtp_block(const MtpCall& call) {
             tap(call.tap->routes, routing.ids);
             tap(call.tap->moe_out, ym);
         }
-        ops::hyper_connection_inject(ym, inject, residual, s);
+        ops::hyper_connection_inject(ym, mlp_inject, residual, s);
         CUDA_CHECK(cudaMemcpyAsync(call.residual_out.data, residual.data, residual.bytes(), cudaMemcpyDeviceToDevice, s));
 
         // The draft: argmax of the text head over the public tokens, from BF16 logits.

@@ -23,6 +23,7 @@
 #include "ops/offloaded_sparse_moe/coresident.h"
 #include "ops/offloaded_sparse_moe/cpu_selection.h"
 #include "ops/offloaded_sparse_moe/cuda/expert_decode.cuh"
+#include "ops/offloaded_sparse_moe/cuda/route_column.cuh"
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
 
 #include <cuda_bf16.h>
@@ -229,73 +230,7 @@ __global__ void __launch_bounds__(kThreads)
 
 // -------------------------------------------------------------------------------------- routing
 
-__device__ __forceinline__ float negative_infinity() { return __int_as_float(static_cast<int>(0xFF800000U)); }
-
-// One column's routing by one warp: exact top-k by repeated arg-max with lower-id ties, then the
-// weights, written by lane 0. Every array index is a compile-time constant (unrolled loops guarded
-// by top_k), so the values, the selection and the weights stay in registers; the selection and
-// softmax order are fixed. route_kernel and route_dispatch_kernel both run this code.
-__device__ __forceinline__ void route_column(const float* __restrict__ logits, int experts, int top_k, int warp,
-                                             int lane, std::int32_t* __restrict__ ids, float* __restrict__ weights,
-                                             float* __restrict__ shared_gate) {
-    const float* column = logits + static_cast<std::size_t>(warp) * (experts + 1);
-    constexpr int kPerLane = 16, kMaxTopK = 16; // 512 experts: 16 per lane
-    float values[kPerLane];
-#pragma unroll
-    for (int i = 0; i < kPerLane; ++i) {
-        const int e = lane + 32 * i;
-        values[i]   = e < experts ? column[e] : negative_infinity();
-    }
-    const float score = lane == 0 ? column[experts] : 0.0F;
-    float selected[kMaxTopK];
-    int chosen[kMaxTopK];
-#pragma unroll
-    for (int k = 0; k < kMaxTopK; ++k) {
-        if (k >= top_k) { break; }
-        float best  = negative_infinity();
-        int best_id = 0x7FFFFFFF;
-#pragma unroll
-        for (int i = 0; i < kPerLane; ++i) {
-            const int e = lane + 32 * i;
-            if (e < experts && (values[i] > best || (values[i] == best && e < best_id))) {
-                best    = values[i];
-                best_id = e;
-            }
-        }
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            const float other  = __shfl_xor_sync(0xFFFFFFFFU, best, offset);
-            const int other_id = __shfl_xor_sync(0xFFFFFFFFU, best_id, offset);
-            if (other > best || (other == best && other_id < best_id)) {
-                best    = other;
-                best_id = other_id;
-            }
-        }
-        selected[k] = best;
-        chosen[k]   = best_id;
-#pragma unroll
-        for (int i = 0; i < kPerLane; ++i) {
-            if (lane + 32 * i == best_id) { values[i] = negative_infinity(); }
-        }
-    }
-    if (lane == 0) {
-        // softmax over all experts then renormalized over the selected ones equals the softmax of
-        // the selected logits.
-        const float top = selected[0];
-        float sum       = 0.0F;
-#pragma unroll
-        for (int k = 0; k < kMaxTopK; ++k) {
-            if (k < top_k) { sum += expf(selected[k] - top); }
-        }
-#pragma unroll
-        for (int k = 0; k < kMaxTopK; ++k) {
-            if (k < top_k) {
-                ids[static_cast<std::size_t>(warp) * top_k + k]     = chosen[k];
-                weights[static_cast<std::size_t>(warp) * top_k + k] = expf(selected[k] - top) / sum;
-            }
-        }
-        shared_gate[warp] = 1.0F / (1.0F + expf(-score));
-    }
-}
+using moe_routing::route_column; // ops/offloaded_sparse_moe/cuda/route_column.cuh
 
 // One warp per column.
 __global__ void route_kernel(const float* __restrict__ logits, int experts, int columns, int top_k,
@@ -1423,7 +1358,8 @@ void moe_experts_cpu_wait(const Tensor& x, const MoeDispatch& dispatch, const Mo
 }
 
 void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source, std::int32_t top_k,
-                 std::int32_t max_jobs, void* workspace, Tensor& outputs, cudaStream_t stream, bool wait_for_cpu) {
+                 std::int32_t max_jobs, void* workspace, Tensor& outputs, cudaStream_t stream, bool wait_for_cpu,
+                 MoeA8Input input) {
     require(contiguous(x, DType::BF16) && contiguous(outputs, DType::BF16), "experts need BF16 x and outputs");
     require(x.ne[0] == moe::kHidden && outputs.ne[0] == moe::kHidden && outputs.ne[1] == x.ne[1] * top_k &&
                 top_k > 0,
@@ -1438,10 +1374,17 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
                 source.staging_slots >= 0 && (source.staging_slots == 0 || source.staging_base != nullptr) &&
                 workspace != nullptr,
             "experts source is incomplete");
+    // A caller's cast (`input`) takes the place of the precast planes.
+    const bool cast_given = input.codes != nullptr || input.scales != nullptr;
+    require(!cast_given || (input.codes != nullptr && input.scales != nullptr &&
+                            reinterpret_cast<std::uintptr_t>(input.codes) % 16 == 0 &&
+                            reinterpret_cast<std::uintptr_t>(input.scales) % 16 == 0),
+            "the given A8 input needs both 16-byte aligned planes");
     require(source.gate_up_variant == GateUpVariant::Staged ||
-                (source.gate_up_variant == GateUpVariant::Registers && source.precast_input),
+                (source.gate_up_variant == GateUpVariant::Registers && (source.precast_input || cast_given)),
             "the register gate/up kernel (GateUpVariant::Registers) reads the precast input: set precast_input");
-    const auto layout = carve_workspace(workspace, max_jobs, outputs.ne[1], source.precast_input ? x.ne[1] : 0);
+    const auto layout =
+        carve_workspace(workspace, max_jobs, outputs.ne[1], source.precast_input && !cast_given ? x.ne[1] : 0);
     const bool cpu    = cpu_served(x, source);
     if (cpu) {
         require(source.cpu.request != nullptr && source.cpu.x != nullptr && source.cpu.y != nullptr &&
@@ -1479,7 +1422,11 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     const bool narrow = !wide || !moe::wide::all_wide(x.ne[1]);
     // The input's A8 cast, once for every pass's narrow gate/up CTAs (the wide route casts its own).
     PrecastInput precast;
-    if (source.precast_input && narrow) {
+    if (cast_given && narrow) {
+        // The kernels only read the planes (PrecastInput also carries the planes the cast writes).
+        precast.q = const_cast<std::int8_t*>(input.codes);
+        precast.d = const_cast<float*>(input.scales);
+    } else if (source.precast_input && narrow) {
         require(reinterpret_cast<std::uintptr_t>(x.data) % 16 == 0, "precast input needs 16-byte aligned x");
         const std::int64_t groups = static_cast<std::int64_t>(x.ne[1]) * kXGroups;
         require(groups <= std::numeric_limits<int>::max(), "precast input exceeds INT_MAX groups");
