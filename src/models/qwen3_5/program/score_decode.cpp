@@ -2,6 +2,7 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/execution_context.h"
+#include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "core/device.h"
 #include "ninfer/engine.h"
 #include "ninfer/ops/gdn_replay.h"
@@ -78,6 +79,17 @@ std::vector<float> ProgramImpl::causal_score_decode(const PreparedPromptData& pr
         records.emplace(window == planned ? *replay_records : replay_records->narrowed(width));
         fold.emplace(*records, state_images->linear(0).all_layers_view());
     }
+
+    // Eager, but at the envelopes served graph decode captures for this width, so attention picks
+    // the route a served Engine at this context replays (it is chosen from the envelope).
+    const auto& attention_config = *parameters.model.config().text.attention;
+    const std::vector<GraphExecutionProfile> served = served_decode_profiles(
+        capacity, window,
+        MtpGraphAttention{.geometry             = {dimension(attention_config.head_dim),
+                                                   dimension(attention_config.num_attention_heads),
+                                                   dimension(attention_config.num_key_value_heads)},
+                          .storage              = kv_storage,
+                          .multiprocessor_count = device.multiprocessor_count()});
 
     std::optional<StateImageHandle> state;
     std::optional<KVAddressSpaceHandle> address;
@@ -175,6 +187,8 @@ std::vector<float> ProgramImpl::causal_score_decode(const PreparedPromptData& pr
                                        cudaMemcpyHostToDevice, device.stream));
 
             mark_workspace_usage(workspace_plan.score_decode);
+            const ops::CausalAttentionExecutionEnvelope envelope =
+                served_decode_envelope(served, capacity, window, frontier);
             if (window == 1) {
                 Tensor hidden = frame.hidden.slice(1, 0, 1);
                 Tensor logits = frame.logits.slice(1, 0, 1);
@@ -182,20 +196,18 @@ std::vector<float> ProgramImpl::causal_score_decode(const PreparedPromptData& pr
                                            frame.cache_positions.slice(0, 0, 1),
                                            frame.rope_positions.slice(0, 0, 1),
                                            frame.text_kv_table_row, frame.state_source_slot,
-                                           frame.state_destination_slot,
-                                           {frontier + 1U, frontier + 1U}, hidden, logits);
+                                           frame.state_destination_slot, envelope, hidden,
+                                           logits);
             } else {
                 const std::int32_t rows = dimension(parameters.model.config().text.hidden_size);
                 Tensor hidden = frame.hidden.slice(1, 0, width).view({rows, width, 1});
                 Tensor logits = frame.logits.slice(1, 0, width).view({vocab_rows, width, 1});
                 Tensor argmax = frame.target_tokens.slice(0, 0, width).view({width, 1});
-                const auto visible = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                    capacity, static_cast<std::uint64_t>(frontier) + window));
                 card.target_verify_batch(frame.tokens.slice(0, 0, width).view({width, 1}),
                                          frame.cache_positions.slice(0, 0, width).view({width, 1}),
                                          frame.rope_positions.slice(0, 0, width).view({width, 1}),
                                          frame.valid_columns, frame.text_kv_table_row,
-                                         frame.state_source_slot, {1, visible}, hidden, logits,
+                                         frame.state_source_slot, envelope, hidden, logits,
                                          argmax);
                 // Every live column is accepted: fold the whole live prefix into the state.
                 const ops::GdnReplayFoldRow row{.source_state_slot      = state_slot,

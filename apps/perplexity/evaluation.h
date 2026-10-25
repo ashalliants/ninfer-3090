@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ninfer/types.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -85,9 +87,6 @@ struct KldSummary {
 
 [[nodiscard]] KldSummary summarize(std::span<const ScoredRow> rows);
 
-// Half-open windows covering [first, end) in order, each at most `width` long, the last partial.
-[[nodiscard]] std::vector<std::pair<int, int>> decode_windows(int first, int end, int width);
-
 // ---------------------------------------------------------------------------------------------
 // The --kld-base command line: the gate scores chunks of a base through the decode path.
 // ---------------------------------------------------------------------------------------------
@@ -95,7 +94,8 @@ struct KldSummary {
 // Tokens per decode forward when --decode-window is not given (Basalt's --quality-t default).
 inline constexpr int kDefaultDecodeWindow = 3;
 
-// A --decode-window value: an integer in [1,16]. Throws std::invalid_argument naming the flag.
+// A --decode-window value: an integer in [1,kMaximumScoringDecodeWindow]. Throws
+// std::invalid_argument naming the flag.
 [[nodiscard]] int parse_decode_window(std::string_view text);
 // A --chunks value: a positive integer. Throws std::invalid_argument naming the flag.
 [[nodiscard]] int parse_kld_chunks(std::string_view text);

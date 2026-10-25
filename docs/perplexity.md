@@ -127,12 +127,16 @@ Each chunk of `n_ctx` tokens is one scoring window, with `n_ctx` taken from the 
   column committed through the ReplaySSM fold, so `T=3` runs the verify forward of an MTP round
   with two drafts. The last window of a chunk may be partial: it runs at width `T` with the
   remaining columns live, as a speculative round with fewer drafts does.
-- Verify-phase routes such as `--mlp-a8-decode` run in these windows. With `--corpus` and `--text`
-  they are inert.
+- Verify-phase routes run in these windows once `T` is wide enough for them. `--mlp-a8-decode`,
+  for example, is admitted only at 16 to 32 columns, so a batch-one window reaches it only at
+  `T=16`. With `--corpus` and `--text` these routes are inert.
 
 `--chunks N` scores the first `N` chunks (default all). `--context` and `--stride` are refused:
 the base fixes the context. Decode scoring loads only the Text backbone, plans no MTP or drafter
-weights, and runs one device without CUDA graphs.
+weights, and runs on one device. It runs eagerly, without CUDA graphs, but with the attention
+envelopes served graph decode captures (the ordinary step's for `T=1`, an MTP round's target verify
+with `T-1` drafts otherwise) for an Engine at the same context. The attention route is chosen from
+the envelope, so scoring selects the route served decode replays.
 
 Each row compares the model's logits over its public token domain with the base row. llama.cpp may
 pad the vocabulary beyond the public token count (to 248,320 rows, for example); those rows are

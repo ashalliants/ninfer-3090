@@ -287,27 +287,6 @@ int check_summarize_percentiles() {
     return failures;
 }
 
-int check_decode_windows_cover() {
-    int failures = 0;
-    constexpr int first = 4;
-    constexpr int end   = 15;
-    for (int width = 1; width <= 16; ++width) {
-        const auto windows = ninfer::perplexity::decode_windows(first, end, width);
-        int next           = first;
-        for (const auto& [begin, stop] : windows) {
-            failures += require(begin == next, "windows are contiguous and in order");
-            failures += require(stop > begin && stop - begin <= width, "window size within width");
-            next = stop;
-        }
-        failures += require(next == end, "windows tile the range exactly once");
-        failures += require(windows.size() == static_cast<std::size_t>((end - first + width - 1) / width),
-                            "only the last window is partial");
-    }
-    failures += require(ninfer::perplexity::decode_windows(5, 5, 3).empty(), "empty range has no windows");
-    return failures;
-}
-
-
 template <class Function> bool throws_invalid(Function&& function) {
     try {
         (void)function();
@@ -465,7 +444,6 @@ int main() {
     failures += check_score_row_identical_is_zero();
     failures += check_score_row_hand_case();
     failures += check_summarize_percentiles();
-    failures += check_decode_windows_cover();
     failures += check_kld_flag_values();
     failures += check_scoring_source_flags();
     failures += check_kld_chunks();
