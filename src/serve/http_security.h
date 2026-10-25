@@ -56,8 +56,8 @@ struct HostPolicy {
 [[nodiscard]] bool exposed_without_key(std::string_view bind_host, bool has_key);
 
 // The relay from the router to a model drops these request headers: credentials (the model needs
-// none) and Origin (the router has checked it, and the model, keyless on loopback and never with
-// --cors, would refuse a foreign one).
+// none), and Origin and every Sec-Fetch-* header (the router has checked them, and the model,
+// keyless on loopback and never with --cors, would refuse what the router's key or --cors let in).
 [[nodiscard]] bool dropped_when_relaying(std::string_view header_name);
 
 // This machine's host name, empty when the system will not say.

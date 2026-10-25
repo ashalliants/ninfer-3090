@@ -709,7 +709,8 @@ void RouterServer::relay(const httplib::Request& req, httplib::Response& res,
     for (const auto& [name, value] : req.headers) {
         const std::string lower = lower_ascii(name);
         // The model needs no credentials (it listens on loopback for the router alone) and no
-        // Origin (the router has checked it, and the keyless model would refuse a foreign one), and
+        // Origin or Sec-Fetch-* (the router has checked them, and the keyless model would refuse
+        // what the router's key or --cors let in), and
         // compression is the router's business with its client, not the model's.
         if (hop_by_hop(name) || dropped_when_relaying(name) || lower == "accept-encoding") {
             continue;

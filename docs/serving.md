@@ -798,8 +798,8 @@ without its leading dashes). A section named after a model found in `--models-di
 The command line wins over a preset where they repeat an option. Comments sit on lines of their own
 (`;` or `#` first). The router's own options (`models-max`, `models-autoload`, `sleep-idle-seconds`,
 `unload-idle-seconds`) are command-line only, as are the options the router overrides for every
-model (`api-key`, `allowed-host`, `host`, `port`, `model-id`): a preset that sets one is rejected at startup. A model
-id may not contain `/`, `?`, `#`, `%` or `\`. With
+model (`api-key`, `allowed-host`, `host`, `port`, `model-id`): a preset that sets one is rejected
+at startup. A model id may not contain `/`, `?`, `#`, `%` or `\`. With
 `--context-store DIR` each model keeps its store in `DIR/<model id>` (and under `<prefix><model id>/`
 in S3; characters other than letters, digits, `-` and `_` are written as `%XX`). `--request-log-jsonl`
 may not name any model's artifact, n-gram volume or expert state, whether it comes from the command
@@ -833,7 +833,8 @@ The router answers llama.cpp's model API itself:
 model that last served, without waking or loading it (a 503 while it is unloaded). Everything
 else (chat completions, Responses, Messages and the rest) is forwarded to the model it names: each model runs the ordinary
 single-model server on a loopback port of its own, so every endpoint, request log and metric works
-per model unchanged. The router checks `--api-key`, runs the [Host and Origin checks](#host-and-origin-checks) and applies `--cors`; models need none of them.
+per model unchanged. The router checks `--api-key`, runs the
+[Host and Origin checks](#host-and-origin-checks) and applies `--cors`; models need none of them.
 Streamed responses stream, and a client that disconnects cancels the generation, also while the
 model is still loading or working on the prompt. The router rewrites only the `"model"` member of a
 body it forwards (to the model's id), so every other value reaches the model as you wrote it.
@@ -2030,12 +2031,12 @@ page in a browser on this machine (or on the LAN) from using the server behind y
   so a page elsewhere cannot make the router load, wake or evict a model. `same-origin`,
   `same-site`, `none` (an address typed by the user) and no header at all pass.
 
-A refused request gets `403` in the error shape of the endpoint it called: the OpenAI shape (code
-`host_not_allowed`, `origin_not_allowed` or `cross_site_request`) everywhere else, and the Anthropic shape (type
-`permission_error`) under `/v1/messages`.
+A refused request gets `403` in the error shape of the endpoint it called: the Anthropic shape (type
+`permission_error`) under `/v1/messages`, and the OpenAI shape (code `host_not_allowed`,
+`origin_not_allowed` or `cross_site_request`) everywhere else.
 
 ```json
-{"error": {"message": "Host 'evil.example:8080' is not a name this server answers to; start it with --allowed-host NAME to accept another name",
+{"error": {"message": "Host 'evil.example:8080' is not a name this server answers to; ...",
            "type": "invalid_request_error", "param": null, "code": "host_not_allowed"}}
 ```
 

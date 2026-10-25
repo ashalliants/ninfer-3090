@@ -18,8 +18,8 @@
 //     refuses wildcards, ports, schemes, paths, userinfo and characters no name holds;
 //   - exposure_warning_cases: 0.0.0.0, :: and a LAN address without a key warn; loopback, or a
 //     key, does not;
-//   - relay_drops_origin_and_credentials: the router drops Origin, Authorization and x-api-key
-//     (in any case) when relaying, and keeps the rest.
+//   - relay_drops_origin_and_credentials: the router drops Origin, every Sec-Fetch-* header,
+//     Authorization and x-api-key (in any case) when relaying, and keeps the rest.
 
 #include "serve/http_security.h"
 
@@ -217,11 +217,12 @@ void exposure_warning_cases() {
 
 void relay_drops_origin_and_credentials() {
     for (const char* dropped : {"Origin", "origin", "ORIGIN", "Authorization", "x-api-key",
-                                "X-Api-Key"}) {
+                                "X-Api-Key", "Sec-Fetch-Site", "sec-fetch-mode",
+                                "SEC-FETCH-DEST", "Sec-Fetch-User"}) {
         check(dropped_when_relaying(dropped), std::string("relayed: ") + dropped);
     }
     for (const char* kept : {"Accept", "anthropic-version", "x-request-id", "Referer",
-                             "User-Agent", "Originator"}) {
+                             "User-Agent", "Originator", "Sec-Fetch", "Sec-CH-UA"}) {
         check(!dropped_when_relaying(kept), std::string("dropped: ") + kept);
     }
 }
