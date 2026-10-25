@@ -288,11 +288,12 @@ struct ForwardOptions {
     // moe_route then moe_dispatch: the same routing, counts, offsets, jobs and route log, entries in
     // ascending order within each expert; bitwise the outputs. No workspace.
     bool moe_fused_route = false;
-    // --hc-int8: every hyper-connection mixer (the text model's and the drafter's) reads its int8
-    // copies here (ops::hyper_connection_mix's int8 form) instead of the BF16 weights; null: the
-    // BF16 weights. It must cover every mixer the Forward runs and outlive the Forward. NOT bitwise:
-    // the weights are rounded to int8 codes times binary16 group scales (judged by the KLD gate). A
-    // call of more than 16 columns rounds the copies to BF16 in its workspace (hc_int8_workspace_bytes).
+    // --hc-int8: every hyper-connection mixer call (the text model's and the drafter's) of at most
+    // ops::kHcInt8MaxColumns columns reads its int8 copies here (ops::hyper_connection_mix's int8
+    // form) instead of the BF16 weights; wider calls (prefill) read the BF16 weights, bitwise as
+    // off. Null: the BF16 weights. It must cover every mixer the Forward runs and outlive the
+    // Forward. NOT bitwise at decode width: the weights are rounded to int8 codes times binary16
+    // group scales (judged by the KLD gate). No workspace beyond the BF16 form's.
     const HcInt8Copies* hc_int8 = nullptr;
 };
 
@@ -348,9 +349,6 @@ public:
     [[nodiscard]] static std::size_t workspace_bytes(const TextConfig& config, std::int32_t columns,
                                                      std::uint32_t max_visible_keys, DeviceExecutionView execution,
                                                      bool moe_precast_input);
-    // With ForwardOptions::hc_int8, the workspace a call needs beyond workspace_bytes: a call of
-    // more than 16 columns rounds the widest mixer's two int8 copies to BF16 there.
-    [[nodiscard]] static std::size_t hc_int8_workspace_bytes(const TextConfig& config);
     // The MoE block's share of workspace_bytes: routing, dispatch, the routed experts' outputs and
     // workspace (with the precast input's planes under moe_precast_input), the shared expert and
     // the combine.

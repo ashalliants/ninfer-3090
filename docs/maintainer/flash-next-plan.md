@@ -235,8 +235,8 @@ mode has not been run yet; no result is recorded here.
 Numerics options under the gate, each a harness flag:
 
 - `--hc-int8`: the mixers read their int8 copies (Basalt items, below). The harness makes the
-  copies once and every chunk's forward reads them; the prompt half (more than 16 columns) takes
-  the copies rounded to BF16.
+  copies once and every chunk's decode and verification calls read them; the prompt half (one
+  call of more than 16 columns) reads the BF16 weights, as the Program's prefill does.
 
 ## PR 9 (M1) measurements
 
@@ -931,21 +931,25 @@ None has been measured on the RTX 3090 yet.
     arithmetic), then the collapse. The codes and scales are loaded straight into the registers
     the arithmetic reads, before any activation, as the BF16 kernels do; nothing is staged in
     shared memory but `m`. 80 CTAs of 8 warps. A column's result does not depend on T within
-    1..16. Calls past 16 columns (prefill) round the copies to BF16 in the workspace
-    (`Forward::hc_int8_workspace_bytes`, 12.6 MiB) and take the composed BF16 route. The BF16
-    kernels compile to the same SASS as before.
+    1..16, and the FP16 split represents each `m[k]` within `max(2^-22 |m[k]|, 2^-25)` (for
+    `|m[k]| < 65520`). The int8 form serves only calls of up to 16 columns: wider calls (prefill)
+    keep the BF16 weights and route, bit for bit as off, since the BF16 copies stay loaded. A
+    composed int8 route (the copies rounded to BF16 in the workspace) returns with the later step
+    that drops the BF16 weights. The BF16 kernels compile to the same SASS as before.
   - Memory: the copies are `ProgramDevicePlan::hc_int8_bytes` (`plan_hc_int8`: 97 mixers, 648 MiB;
     100 with the drafter, 668 MiB, plus a 256-byte status word), checked against the mixers the
-    Program binds at construction. The BF16 weights stay loaded in this change (about 0.68 GB more
+    Program binds at construction. No workspace beyond the BF16 route's. The BF16 weights stay loaded in this change (about 0.68 GB more
     VRAM, about 450 fewer expert frames); dropping them is a later step once the gate passes.
   - Qualification: `ninfer_hc_int8_codec_test` (host only: bounds, zero groups, subnormal scales
     and refusals, 1,000 groups against an independent FP64 re-implementation of Basalt's rule);
     `ninfer_qwen4_exp_program_plan_test` (the plan term against the bound mixers);
     `ninfer_hyper_connection_test` (GPU, not run: the quantize kernel bit for bit against the
-    codec, the int8 form against the FP64 oracle on the copies' values at T = 1, 2, 4, 8, 9, 16, 17
-    and 64 at the model's shapes, column invariance, graph capture, refusals).
-  - GPU-session checks: the KLD gate on vs off; the mixer's time at T = 1, 2, 4, 8, 16 against the
-    BF16 route (target: the bytes' 0.53); tok/s on vs off. Works with two lanes, MTP and vision.
+    codec, the int8 form against the FP64 oracle on the copies' values at T = 1, 2, 4, 8, 9, 16 at
+    the model's shapes, column invariance, graph capture, refusals including T = 17);
+    `ninfer_qwen4_exp_forward_real_test --hc-int8-prefill TOKENS` (GPU, not run: a prompt call of
+    more than 16 columns gives bitwise the logits of off, and the decode call after it differs).
+  - GPU-session checks: `--hc-int8-prefill`; the KLD gate on vs off; the mixer's time at T = 1, 2,
+    4, 8, 16 against the BF16 route (target: the bytes' 0.53); tok/s on vs off. Works with two lanes, MTP and vision.
     Not measured.
 
 ## Artifact decisions

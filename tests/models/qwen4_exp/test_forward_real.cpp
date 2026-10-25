@@ -61,7 +61,17 @@
 // Each row's FP32 logits over the public token domain are scored against the base row (score_row);
 // the rows go to OUT.tsv (default kld-rows.tsv) and the summary to stdout. Numerics options run
 // under the gate as flags: --hc-int8 makes the mixers' int8 copies once (ex::HcInt8Copies) and every
-// chunk's forward reads them (ForwardOptions::hc_int8).
+// chunk's forward reads them (ForwardOptions::hc_int8) in its decode and verification calls; the
+// prompt half (more than 16 columns) reads the BF16 weights.
+//
+// --hc-int8 prefill mode (ForwardOptions::hc_int8 leaves calls of more than 16 columns bit-exact):
+//
+//   ninfer_qwen4_exp_forward_real_test --hc-int8-prefill TOKENS [--staging SLOTS]
+//
+// From a fresh state, twice (off, then with the mixers' int8 copies): all but the last token are
+// prefilled as one call (at least 17 tokens, so every mixer call is wider than the int8 route),
+// then the last is decoded by one call. The prompt call's logits must be bitwise equal; the decode
+// call's must differ (it reads the copies, a check that the option is in effect).
 //
 // Shared-expert-stream mode (ForwardOptions::shared_expert_stream is bit-exact):
 //
@@ -299,8 +309,7 @@ struct Harness {
         work = std::make_unique<WorkspaceArena>(
             ex::Forward::workspace_bytes(c, columns, static_cast<std::uint32_t>(context), device.execution_view(),
                                          options.moe_precast_input) +
-            (options.shared_expert_stream ? ex::Forward::shared_expert_workspace_bytes(c, columns) : 0) +
-            (options.hc_int8 != nullptr ? ex::Forward::hc_int8_workspace_bytes(c) : 0));
+            (options.shared_expert_stream ? ex::Forward::shared_expert_workspace_bytes(c, columns) : 0));
         views   = state;
         forward = std::make_unique<ex::Forward>(parameters, device, *work, std::move(state), std::move(kv),
                                                 std::move(experts), std::nullopt, options);
@@ -1259,6 +1268,83 @@ int kld_mode(int argc, char** argv, const char* artifact_env) {
 
 } // namespace
 
+// The --hc-int8 prefill mode: see the file comment.
+int hc_int8_prefill_mode(int argc, char** argv, const char* artifact_env) {
+    std::vector<std::int32_t> tokens;
+    std::int32_t staging_slots = 64;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--hc-int8-prefill") { continue; }
+        if (arg.rfind("--", 0) != 0) {
+            if (!tokens.empty()) { throw std::invalid_argument("--hc-int8-prefill takes one token list"); }
+            tokens = parse_tokens(arg);
+            continue;
+        }
+        if (i + 1 >= argc) { throw std::invalid_argument(arg + " needs a value"); }
+        const std::string value = argv[++i];
+        if (arg == "--staging") {
+            staging_slots = std::stoi(value);
+        } else {
+            throw std::invalid_argument("unknown option " + arg + " in --hc-int8-prefill mode");
+        }
+    }
+    const auto n            = static_cast<std::int32_t>(tokens.size());
+    const std::int32_t head = n - 1;
+    if (head <= ops::kHcInt8MaxColumns) {
+        throw std::invalid_argument("--hc-int8-prefill needs at least " + std::to_string(ops::kHcInt8MaxColumns + 2) +
+                                    " tokens: a prompt call wider than the int8 route, then one decode token");
+    }
+    DeviceContext device(0);
+    artifact::Reader reader(artifact_env);
+    if (!q4::is_qwen4_exp(reader)) {
+        std::printf("SKIP: %s is not a Qwen4Exp artifact\n", artifact_env);
+        return 77;
+    }
+    const auto model = q4::load_model(reader, device);
+    device.synchronize();
+    const ex::Parameters parameters(*model);
+    const auto& c         = model->config();
+    const char* ngram_env = std::getenv("NINFER_TEST_QWEN4EXP_NGRAM");
+    q4::NgramVolume volume(ngram_env != nullptr ? std::filesystem::path(ngram_env)
+                                                : q4::default_ngram_volume(artifact_env),
+                           c.ple.table);
+    auto mixers = ex::HcInt8Copies::mixers(parameters.layers, parameters.final_mixer,
+                                           parameters.mtp ? &*parameters.mtp : nullptr);
+    const std::uint64_t bytes = ex::HcInt8Copies::bytes(mixers);
+    const ex::HcInt8Copies copies(std::move(mixers), bytes, device.stream);
+    const std::size_t vocab    = c.vocab_size;
+    const std::int32_t context = std::max<std::int32_t>(256, (n + 63) / 64 * 64);
+    const Call prompt          = make_call(c, volume, tokens, 0, head, false);
+    const Call step            = make_call(c, volume, tokens, head, 1, false);
+    DeviceBuffer logits(vocab * sizeof(float));
+    std::printf("prompt %d tokens as one call, then one decode call; staging slots %d\n", head, staging_slots);
+    const auto run = [&](bool on) {
+        const ex::ForwardOptions options{.hc_int8 = on ? &copies : nullptr};
+        Harness harness(parameters, device, context, head, staging_slots, options);
+        std::vector<std::vector<float>> rows;
+        Tensor one(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), 1});
+        for (const Call* call : {&prompt, &step}) {
+            harness.forward->run(call->batch, one);
+            device.synchronize();
+            rows.push_back(to_float(logits, vocab));
+        }
+        return rows;
+    };
+    const auto off           = run(false);
+    const auto on            = run(true);
+    const bool prompt_equal  = std::memcmp(off[0].data(), on[0].data(), vocab * sizeof(float)) == 0;
+    const bool decode_differ = std::memcmp(off[1].data(), on[1].data(), vocab * sizeof(float)) != 0;
+    std::printf("prompt logits %s; decode logits %s with --hc-int8\n", prompt_equal ? "bitwise equal" : "DIFFER",
+                decode_differ ? "differ" : "are bitwise EQUAL");
+    if (prompt_equal && decode_differ) {
+        std::printf("--hc-int8-prefill checks passed\n");
+        return 0;
+    }
+    if (!prompt_equal) { std::printf("FAIL: --hc-int8 changed a call wider than 16 columns\n"); }
+    if (!decode_differ) { std::printf("FAIL: the decode call did not read the int8 copies\n"); }
+    return 1;
+}
+
 // The identity check of ForwardOptions::shared_expert_stream (see the header): four runs from a
 // fresh state over the same device inputs, the shared expert serial or on its side stream, the
 // decode calls eager or each captured in a CUDA graph and replayed once (the Program's decode). Each
@@ -1489,6 +1575,9 @@ int main(int argc, char** argv) {
         if (std::string(argv[1]) == "--rows") { return rows_mode(argc, argv, artifact_env); }
         if (std::any_of(argv + 1, argv + argc, [](const char* a) { return std::string(a) == "--kld-base"; })) {
             return kld_mode(argc, argv, artifact_env);
+        }
+        if (std::any_of(argv + 1, argv + argc, [](const char* a) { return std::string(a) == "--hc-int8-prefill"; })) {
+            return hc_int8_prefill_mode(argc, argv, artifact_env);
         }
         if (std::any_of(argv + 1, argv + argc, [](const char* a) { return std::string(a) == "--shared-expert-stream"; })) {
             return shared_expert_mode(argc, argv, artifact_env);

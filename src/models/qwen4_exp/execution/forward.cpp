@@ -338,14 +338,6 @@ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, 
     return bytes;
 }
 
-std::size_t Forward::hc_int8_workspace_bytes(const TextConfig& c) {
-    // The composed route's BF16 roundings of a block mixer's down (rank + S rows, the widest) and up
-    // matrices, each 256-byte aligned as the Op allocates them.
-    const auto aligned = [](std::size_t n) { return (n + 255) / 256 * 256; };
-    const std::size_t w = c.residual_width(), bf = 2;
-    return aligned(std::size_t(c.hc.rank + c.hc.streams) * w * bf) + aligned(w * c.hc.rank * bf);
-}
-
 std::size_t Forward::shared_expert_workspace_bytes(const TextConfig& c, std::int32_t columns) {
     // The Q8_1 rows of the widest input (codes, then one FP32 scale per 32 values, each 256-byte
     // aligned as the GGML Linear allocates them); gate/up and down take their scratch in turn.
@@ -497,9 +489,10 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
 Tensor Forward::mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject) {
     const std::int32_t T = residual.ne[1], H = dim(config_.hidden_size);
     Tensor x = work_->alloc(DType::BF16, {H, T});
-    if (hc_int8_ != nullptr) {
+    if (hc_int8_ != nullptr && T <= ops::kHcInt8MaxColumns) {
+        // --hc-int8: decode-width calls read the int8 copies; wider ones keep the BF16 weights.
         const HcInt8Mixer& copies = hc_int8_->at(p);
-        ops::hyper_connection_mix(residual, p.norm, copies.down, copies.up, p.down.policy, dim(config_.hc.streams),
+        ops::hyper_connection_mix(residual, p.norm, copies.down, copies.up, dim(config_.hc.streams),
                                   dim(config_.hc.rank), config_.rms_norm_eps, x, p.combine ? inject : nullptr, *work_,
                                   device_.stream);
         return x;

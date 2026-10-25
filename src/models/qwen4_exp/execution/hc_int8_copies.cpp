@@ -88,7 +88,8 @@ HcInt8Copies::HcInt8Copies(std::vector<const HyperConnectionParameters*> mixers,
     if (refused != 0) {
         throw std::runtime_error(
             "--hc-int8: a hyper-connection matrix holds a value its int8 copy cannot represent "
-            "(infinite, NaN, or a group whose largest value is past 127 * 65504); remove "
+            "(infinite, NaN, or a group whose largest value over 127 rounds to 65520 or more); "
+            "remove "
             "--hc-int8");
     }
 }

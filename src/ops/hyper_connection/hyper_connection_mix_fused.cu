@@ -1,8 +1,10 @@
 // Adapted from Infernix a3edb450 src/ops/hyper_connection/hyper_connection_mix_fused.cu
 // (Apache-2.0).
-// Modified for NInfer-3090: BF16 contiguous weights only (Infernix's Q8 codec is dropped), its
-// no-L1-allocate weight load kept local to this file, the norm weight is the stored FP32
-// multiplier (Rn = R * inv * w), and the namespaces and includes are NInfer's. Re-fitted to the
+// Adapted from Basalt 8d73a39 src/kernels/cuda/hc_fused.cu (MIT, third_party/basalt/LICENSE).
+// Modified for NInfer-3090: BF16 contiguous weights (Infernix's Q8 codec is dropped; Basalt's int8
+// copies take its place, below), its no-L1-allocate weight load kept private to the Op
+// (hyper_connection_mix_kernels.cuh), the norm weight is the stored FP32 multiplier
+// (Rn = R * inv * w), and the namespaces and includes are NInfer's. Re-fitted to the
 // RTX 3090's 82 SMs: K1a stages 4 columns per pass (40 KiB) at two CTAs per SM, and K1b spreads a
 // warp's S * rank / 8 W_up chunks over all lanes (5 per lane at rank 320, where Infernix's layout
 // left 24 of 32 lanes idle on the second chunk) at two 512-thread CTAs per SM, so each kernel's
@@ -37,6 +39,7 @@
 #include "ops/hyper_connection/hyper_connection_mix_fused.h"
 
 #include "ops/common/math.cuh"
+#include "ops/hyper_connection/hyper_connection_mix_kernels.cuh"
 #include "ops/common/memory.cuh"
 
 #include <cuda_bf16.h>
@@ -62,26 +65,6 @@ constexpr int kUpThreads   = kUpFeatures * 32;
 constexpr int kUpMinBlocks = 2; // 160 CTAs in one wave on 82 SMs
 constexpr std::size_t kDownSharedBytes =
     static_cast<std::size_t>(kPassColumns) * kHidden * sizeof(float);
-
-void check_launch(const char* what) {
-    const cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess) {
-        throw std::runtime_error(std::string("hyper_connection_mix ") + what + ": " +
-                                 cudaGetErrorString(error));
-    }
-}
-
-// Read-only global load that does not allocate in L1: weights streamed once per call (Infernix's
-// ops/common/memory.cuh ld_nc_na, 16-byte form; sm_70+).
-__device__ __forceinline__ uint4 ld_nc_na_16(const void* ptr) {
-    uint4 value;
-    asm("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];"
-        : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
-        : "l"(ptr));
-    return value;
-}
-
-__device__ __forceinline__ float sigmoidf(float x) { return 1.0F / (1.0F + expf(-x)); }
 
 __device__ __forceinline__ float warp_sum(float value) {
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -123,25 +106,6 @@ struct Bf16Codec {
         w[7] = e.y;
     }
 };
-
-// The 8-byte form of ld_nc_na_16, for an int8 copy's chunk of eight codes.
-__device__ __forceinline__ uint2 ld_nc_na_8(const void* ptr) {
-    uint2 value;
-    asm("ld.global.nc.L1::no_allocate.v2.u32 {%0, %1}, [%2];"
-        : "=r"(value.x), "=r"(value.y)
-        : "l"(ptr));
-    return value;
-}
-
-// Four int8 codes as floats, exactly: q + 128 as the low byte of 2^23 + (q + 128), less 2^23 + 128
-// (Basalt 8d73a39 hc_fused.cu i8x4_f).
-__device__ __forceinline__ float4 i8x4_to_float4(std::uint32_t q) {
-    const std::uint32_t u = q ^ 0x80808080U;
-    return make_float4(__uint_as_float(__byte_perm(u, 0x4B000000U, 0x7650U)) - 8388736.0F,
-                       __uint_as_float(__byte_perm(u, 0x4B000000U, 0x7651U)) - 8388736.0F,
-                       __uint_as_float(__byte_perm(u, 0x4B000000U, 0x7652U)) - 8388736.0F,
-                       __uint_as_float(__byte_perm(u, 0x4B000000U, 0x7653U)) - 8388736.0F);
-}
 
 // Int8 copies (--hc-int8): rows of `stride` codes and `scale_stride` binary16 scales, one per 32
 // values. A chunk starts at a multiple of 8, so its eight codes share one scale; each decodes to
@@ -412,15 +376,14 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
     (void)configured;
     const int columns = residual.ne[1];
     auto* partial     = static_cast<float*>(partials);
-    const std::size_t partial_bytes =
-        (static_cast<std::size_t>(streams) * down_rows * columns * sizeof(float) + 255) / 256 * 256;
-    auto* inv = reinterpret_cast<float*>(static_cast<std::byte*>(partials) + partial_bytes);
+    const std::size_t at = hc_mix_fused_inv_offset(down_rows, streams, columns);
+    auto* inv            = reinterpret_cast<float*>(static_cast<std::byte*>(partials) + at);
     hc_down_partials_kernel<Codec>
         <<<dim3((down_rows + kDownRows - 1) / kDownRows, streams), kDownThreads, kDownSharedBytes,
            stream>>>(static_cast<const bf16*>(residual.data),
                      static_cast<const float*>(norm_weight.data), down, down_rows, columns, eps,
                      partial, inv);
-    check_launch("down partials");
+    check_mix_launch("down partials");
     using UpLaunch = void (*)(const float*, const float*, const bf16*, const float*,
                               typename Codec::Params, int, int, int, float*, bf16*, cudaStream_t);
     // Chunks per lane: ceil(S * rank / 8 / 32), 1..8 for rank 8..512.
@@ -432,7 +395,7 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
                       static_cast<const float*>(norm_weight.data), up, rank, down_rows, columns,
                       inject != nullptr ? static_cast<float*>(inject->data) : nullptr,
                       static_cast<bf16*>(x.data), stream);
-    check_launch("up collapse");
+    check_mix_launch("up collapse");
 }
 
 } // namespace
@@ -449,9 +412,8 @@ bool hc_mix_fused_supported(const Weight& down, const Weight& up, std::int32_t h
 
 std::size_t hc_mix_fused_workspace_bytes(std::int32_t down_rows, std::int32_t streams,
                                          std::int32_t columns) noexcept {
-    const auto align = [](std::size_t bytes) { return (bytes + 255) / 256 * 256; };
-    return align(static_cast<std::size_t>(streams) * down_rows * columns * sizeof(float)) +
-           align(static_cast<std::size_t>(streams) * columns * sizeof(float));
+    return hc_mix_fused_inv_offset(down_rows, streams, columns) +
+           (static_cast<std::size_t>(streams) * columns * sizeof(float) + 255) / 256 * 256;
 }
 
 void hc_mix_fused(const Tensor& residual, const Tensor& norm_weight, const Weight& down,
@@ -467,12 +429,6 @@ void hc_mix_fused(const Tensor& residual, const Tensor& norm_weight, const Weigh
     }
     launch<Bf16Codec>(residual, norm_weight, bf16_params(down), bf16_params(up), down.n, rank,
                       streams, eps, x, inject, partials, stream);
-}
-
-std::size_t hc_mix_fused_inv_offset(std::int32_t down_rows, std::int32_t streams,
-                                    std::int32_t columns) noexcept {
-    return (static_cast<std::size_t>(streams) * down_rows * columns * sizeof(float) + 255) / 256 *
-           256;
 }
 
 void hc_mix_down_partials_int8(const Tensor& residual, const Tensor& norm_weight,
@@ -497,7 +453,7 @@ void hc_mix_down_partials_int8(const Tensor& residual, const Tensor& norm_weight
                                          kDownThreads, kDownSharedBytes, stream>>>(
         static_cast<const bf16*>(residual.data), static_cast<const float*>(norm_weight.data),
         params, down.n, columns, eps, static_cast<float*>(partials), inv);
-    check_launch("int8 down partials");
+    check_mix_launch("int8 down partials");
 }
 
 } // namespace ninfer::ops::detail

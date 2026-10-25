@@ -42,9 +42,14 @@ void hc_mix_fused(const Tensor& residual, const Tensor& norm_weight, const Weigh
                                                std::int32_t hidden, std::int32_t streams,
                                                std::int32_t rank, std::int32_t columns) noexcept;
 
-// Where the per-stream inverse RMS [S][T] starts in `partials` (after the split-K partials).
-[[nodiscard]] std::size_t hc_mix_fused_inv_offset(std::int32_t down_rows, std::int32_t streams,
-                                                  std::int32_t columns) noexcept;
+// Where the per-stream inverse RMS [S][T] starts in `partials`: after the FP32 split-K partials
+// [S][down rows][T], 256-byte aligned.
+[[nodiscard]] inline std::size_t hc_mix_fused_inv_offset(std::int32_t down_rows,
+                                                         std::int32_t streams,
+                                                         std::int32_t columns) noexcept {
+    return (static_cast<std::size_t>(streams) * down_rows * columns * sizeof(float) + 255) / 256 *
+           256;
+}
 
 // K1a over the int8 down copy (hyper_connection_mix_fused.cu): the same kernel template as the
 // BF16 route with each 8-weight chunk decoded to q * s, so the partials and inverse RMS are those
@@ -52,10 +57,6 @@ void hc_mix_fused(const Tensor& residual, const Tensor& norm_weight, const Weigh
 void hc_mix_down_partials_int8(const Tensor& residual, const Tensor& norm_weight,
                                const HcInt8Weights& down, std::int32_t streams, float eps,
                                void* partials, cudaStream_t stream);
-
-// The represented values of an int8 copy rounded to BF16, bf16(q * s), as a contiguous [N, K]
-// matrix at `out` (16-byte aligned, N * K * 2 bytes): the int8 form's composed route.
-void hc_int8_dequantize_bf16(const HcInt8Weights& w, void* out, cudaStream_t stream);
 
 // K1a then the int8 K1b (FP16 hi/lo mma.sync over the int8 up copy, then the collapse).
 void hc_mix_int8_fused(const Tensor& residual, const Tensor& norm_weight, const HcInt8Weights& down,

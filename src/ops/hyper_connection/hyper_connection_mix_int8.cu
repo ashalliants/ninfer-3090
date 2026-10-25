@@ -7,7 +7,8 @@
 // one persistent kernel; here each lane loads its own codes and scales straight into the registers
 // the mma reads (ld.global.nc, all before any activation, as the BF16 route does), m is formed in
 // shared memory from the down partials, and the down projection is K1a's int8 instance
-// (hyper_connection_mix_fused.cu). The group rule is ops/hyper_connection/hc_int8_codec.h.
+// (hyper_connection_mix_fused.cu). The group rule is ops/hyper_connection/hc_int8_codec.h. Only the
+// fused route (T <= 16) has an int8 form; wider calls (prefill) use the BF16 weights.
 //
 // K1b int8 hc_up_collapse_int8: a warp per 4 features d (its 16 W_up rows s*H + d, s = 0..3, are
 // one mma tile: tile row 4s + j is row s*H + d0 + j), 8 warps per CTA. Every CTA sums the partials
@@ -21,6 +22,7 @@
 
 #include "ops/hyper_connection/hc_int8_codec.h"
 #include "ops/hyper_connection/hyper_connection_mix_fused.h"
+#include "ops/hyper_connection/hyper_connection_mix_kernels.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -35,45 +37,17 @@ namespace {
 
 using bf16 = __nv_bfloat16;
 
-constexpr int kStreams        = 4;
-constexpr int kHidden         = 2560;
-constexpr int kMaxRank        = 512;
-constexpr int kMaxGroups      = kMaxRank / kHcInt8Group;
-constexpr int kWarpFeatures   = 4; // d per warp: 4 features x 4 streams = one 16-row tile
-constexpr int kUpWarps        = 8;
-constexpr int kUpThreads      = kUpWarps * 32;
-constexpr int kCtaFeatures    = kUpWarps * kWarpFeatures; // 80 CTAs: one wave on 82 SMs
-constexpr int kQuantThreads   = 256;
-constexpr int kDequantThreads = 256;
-
-void check_launch(const char* what) {
-    const cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess) {
-        throw std::runtime_error(std::string("hyper_connection int8 ") + what + ": " +
-                                 cudaGetErrorString(error));
-    }
-}
-
-__device__ __forceinline__ uint2 ld_nc_na_8(const void* ptr) {
-    uint2 value;
-    asm("ld.global.nc.L1::no_allocate.v2.u32 {%0, %1}, [%2];"
-        : "=r"(value.x), "=r"(value.y)
-        : "l"(ptr));
-    return value;
-}
-
-__device__ __forceinline__ float sigmoidf(float x) { return 1.0F / (1.0F + expf(-x)); }
+constexpr int kStreams      = 4;
+constexpr int kHidden       = 2560;
+constexpr int kMaxRank      = 512;
+constexpr int kMaxGroups    = kMaxRank / kHcInt8Group;
+constexpr int kWarpFeatures = 4; // d per warp: 4 features x 4 streams = one 16-row tile
+constexpr int kUpWarps      = 8;
+constexpr int kUpThreads    = kUpWarps * 32;
+constexpr int kCtaFeatures  = kUpWarps * kWarpFeatures; // 80 CTAs: one wave on 82 SMs
+constexpr int kQuantThreads = 256;
 
 __device__ __forceinline__ float h2f(unsigned short h) { return __half2float(__ushort_as_half(h)); }
-
-// Four int8 codes as floats, exactly (Basalt i8x4_f).
-__device__ __forceinline__ float4 i8x4_to_float4(std::uint32_t q) {
-    const std::uint32_t u = q ^ 0x80808080U;
-    return make_float4(__uint_as_float(__byte_perm(u, 0x4B000000U, 0x7650U)) - 8388736.0F,
-                       __uint_as_float(__byte_perm(u, 0x4B000000U, 0x7651U)) - 8388736.0F,
-                       __uint_as_float(__byte_perm(u, 0x4B000000U, 0x7652U)) - 8388736.0F,
-                       __uint_as_float(__byte_perm(u, 0x4B000000U, 0x7653U)) - 8388736.0F);
-}
 
 // Bytes 0, 1 (High: 2, 3) of four int8 codes as an FP16 pair, exactly: 1024 + (q + 128) in the
 // binade where FP16's step is 1, less 1152 (Basalt i8x2_h2).
@@ -126,25 +100,6 @@ __global__ void __launch_bounds__(kQuantThreads)
     destination[0]     = out[0];
     destination[1]     = out[1];
     scales[gi]         = scale;
-}
-
-// One thread per 8 values: bf16(q * s).
-__global__ void __launch_bounds__(kDequantThreads)
-    hc_int8_dequantize_kernel(const std::int8_t* __restrict__ codes,
-                              const unsigned short* __restrict__ scales, int k, std::int64_t chunks,
-                              bf16* __restrict__ out) {
-    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * kDequantThreads + threadIdx.x;
-    if (i >= chunks) { return; }
-    const std::int64_t at  = i * 8;
-    const std::int64_t row = at / k;
-    const int column       = static_cast<int>(at - row * k);
-    const uint2 q          = *reinterpret_cast<const uint2*>(codes + at);
-    const float s          = h2f(scales[row * (k / kHcInt8Group) + column / kHcInt8Group]);
-    const float4 a = i8x4_to_float4(q.x), b = i8x4_to_float4(q.y);
-    const __nv_bfloat162 v[4] = {
-        __floats2bfloat162_rn(a.x * s, a.y * s), __floats2bfloat162_rn(a.z * s, a.w * s),
-        __floats2bfloat162_rn(b.x * s, b.y * s), __floats2bfloat162_rn(b.z * s, b.w * s)};
-    *reinterpret_cast<uint4*>(out + at) = *reinterpret_cast<const uint4*>(v);
 }
 
 template <int Tiles> // 8-column mma tiles: 1 for T <= 8, 2 for T <= 16
@@ -332,19 +287,7 @@ void hc_mix_int8_fused(const Tensor& residual, const Tensor& norm_weight, const 
         static_cast<const float*>(norm_weight.data), up.codes, up.scales, rank, down.n, columns,
         inject != nullptr ? static_cast<float*>(inject->data) : nullptr,
         static_cast<bf16*>(x.data));
-    check_launch("up collapse");
-}
-
-void hc_int8_dequantize_bf16(const HcInt8Weights& w, void* out, cudaStream_t stream) {
-    if (!int8_aligned(w) || out == nullptr || reinterpret_cast<std::uintptr_t>(out) % 16 != 0) {
-        throw std::invalid_argument("hyper_connection_mix: invalid int8 weights to round to BF16");
-    }
-    const std::int64_t chunks = static_cast<std::int64_t>(w.n) * w.k / 8;
-    hc_int8_dequantize_kernel<<<static_cast<unsigned>((chunks + kDequantThreads - 1) /
-                                                      kDequantThreads),
-                                kDequantThreads, 0, stream>>>(w.codes, w.scales, w.k, chunks,
-                                                              static_cast<bf16*>(out));
-    check_launch("BF16 rounding");
+    check_mix_launch("int8 up collapse");
 }
 
 } // namespace detail
@@ -375,7 +318,7 @@ void hc_int8_quantize(const Weight& w, DeviceSpan codes, DeviceSpan scales, Devi
         static_cast<const __nv_bfloat16*>(w.qdata), stride, w.k, groups,
         static_cast<std::int8_t*>(codes.data), static_cast<std::uint16_t*>(scales.data),
         static_cast<unsigned*>(status.data));
-    detail::check_launch("quantize");
+    detail::check_mix_launch("int8 quantize");
 }
 
 } // namespace ninfer::ops
