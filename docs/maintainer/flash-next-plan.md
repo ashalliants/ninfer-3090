@@ -615,6 +615,24 @@ None has been measured on the RTX 3090 yet.
     `--shared-expert-stream` if a format needs more (only the GGML formats are planned for).
   - Designed to work with two lanes, MTP and vision. Basalt estimates 0.25-0.5 ms per token. Not
     measured.
+- **MTP for constrained requests** (`--mtp-constrained`, needs `--spec mtp`). Without it a
+  constrained row (JSON schema, grammar, tool calls) decodes plain rounds. With it the row drafts as
+  any other; once the drafts are on the host the Program asks the Engine's mask provider for one
+  grammar mask per position 0..K (position j follows the committed output and drafts[0:j]) while
+  the verification forward runs, uploads them, and installs them in the round's sampling config.
+  The acceptance Op then takes a masked argmax (greedy) or the masked target distribution
+  (sampled, mask-then-top-k as in `constrained-decoding.md` §7.4) per column, so an illegal draft is
+  rejected and the correction is legal. The drafter itself runs unmasked: drafts are proposals.
+  - Dead-end bits from the provider fail the row when its licensed tokens reach one
+    (`constrained_accept_limit`, `program/constrained_window.h`), committing none of them, as the
+    Qwen3.5 Program does.
+  - The K + 1 masks are the planned term `ProgramDevicePlan::mtp_constrained_masks` (about 31 KB
+    per position at Qwen's vocabulary; zero when off).
+  - Basalt instead checks the grammar after each window and redraws the first refused row with
+    the mask as a bias; that is exact for greedy rows only, so the per-position masks are used.
+  - Checked by `ninfer_qwen4_exp_engine_real_test` (`mtp_constrained_matches_plain`: greedy ids for
+    a JSON-schema request equal plain constrained decoding), not run yet. Basalt's estimate is about
+    81 to 110 tok/s on greedy constrained requests. Not measured.
 
 ## Artifact decisions
 

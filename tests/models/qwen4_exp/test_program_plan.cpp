@@ -5,6 +5,8 @@
 // widest call (a prefill chunk, a round over every lane or an MTP verification). It must cover what
 // the Linear Op itself asks for (ops::linear_workspace_capacity_bytes) for the GGUF's registered
 // shared-expert formats, and weights needing more are refused at startup naming the flag.
+// --mtp-constrained: a verification's per-position grammar masks (one per draft and the bonus) are
+// a named term too, zero when the option or MTP is off.
 
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/program/program.h"
@@ -143,6 +145,26 @@ int main() {
         check(plan.fixed_bytes() == 1000, "a plan without the side stream has no extra term");
         plan.shared_expert_workspace = planned;
         check(plan.fixed_bytes() == 1000 + planned, "fixed_bytes counts the side-stream workspace");
+
+        // --mtp-constrained: K + 1 masks of ceil(V / 32) words for a verification of K drafts.
+        constexpr std::uint32_t kVocab = 248077; // 7753 words, the last one partial
+        q4::ProgramOptions masks;
+        masks.max_context      = 32768;
+        masks.mtp_draft_tokens = 7;
+        check(!masks.mtp_constrained, "MTP for constrained requests is off by default");
+        check(q4::plan_mtp_constrained_masks(masks, kVocab) == 0, "off plans no verification masks");
+        masks.mtp_constrained = true;
+        check(q4::plan_mtp_constrained_masks(masks, kVocab) == 4ULL * 7753 * 8,
+              "on plans one mask per draft and the bonus position");
+        masks.mtp_draft_tokens = 2;
+        check(q4::plan_mtp_constrained_masks(masks, 64) == 4ULL * 2 * 3, "the masks follow --draft-tokens");
+        check(q4::plan_mtp_constrained_masks(masks, 65) == 4ULL * 3 * 3, "a partial word is a whole word");
+        masks.mtp_draft_tokens = 0;
+        check(q4::plan_mtp_constrained_masks(masks, kVocab) == 0, "without MTP there is nothing to mask");
+        q4::ProgramDevicePlan with_masks;
+        with_masks.io = 500;
+        with_masks.mtp_constrained_masks = 4ULL * 7753 * 8;
+        check(with_masks.fixed_bytes() == 500 + 4ULL * 7753 * 8, "fixed_bytes counts the verification masks");
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;
