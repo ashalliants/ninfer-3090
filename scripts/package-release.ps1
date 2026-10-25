@@ -84,6 +84,10 @@ if (-not $Eula -or -not (Test-Path -LiteralPath $Eula)) {
 Copy-Item -LiteralPath $Eula -Destination (Join-Path $ProductRoot 'NVIDIA-CUDA-EULA.txt')
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'VERSION') -Destination $ProductRoot
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'LICENSE') -Destination $ProductRoot
+# Apache-2.0 section 4(d): the conversation projector (lossy prefill's summary strategy) is a port of
+# hermes-vcc-engine, so its NOTICE ships with every binary that contains it. LICENSE above is the
+# Apache-2.0 text it refers to.
+Copy-Item -LiteralPath (Join-Path $RepoRoot 'src\runtime\engine\compaction\NOTICE') -Destination (Join-Path $ProductRoot 'THIRD_PARTY_NOTICES.txt')
 # The archive README must describe the archive. docs\rtx-3090-windows.md is written for a checkout
 # -- it points at scripts\download-model.bat, and the packager copies that script to the archive
 # root -- so a user following it from inside the archive got a missing-file error.

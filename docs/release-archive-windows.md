@@ -69,6 +69,8 @@ API key blank.
 | `run.bat` | serving profiles: `run.bat <model> [profile]`, or double-click it to pick a model |
 | `*.dll` | the FFmpeg and libcurl runtime dependencies, and NVIDIA's cuBLAS (`cublas64_12.dll`, `cublasLt64_12.dll`) |
 | `NVIDIA-CUDA-EULA.txt` | the licence under which the two cuBLAS DLLs are redistributed |
+| `LICENSE` | NInfer's licence (Apache-2.0) |
+| `THIRD_PARTY_NOTICES.txt` | the notice for the ported conversation projector (hermes-vcc-engine, Apache-2.0) |
 | `SHA256SUMS.txt` | checksums for every file in this directory |
 
 ## Overrides
