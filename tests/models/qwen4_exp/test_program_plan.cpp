@@ -431,12 +431,15 @@ int main() {
               "--gdn-async-commit without MTP is refused naming the flag and --spec mtp");
 
         // --hc-fused-read: its share of the static workspace (and the drafter step's) is the read's
-        // second inject, the A8 planes of x and the Op's counters at the widest call it serves (16
-        // columns), each 256-byte aligned; 0 when off. Without --hc-int8 startup refuses naming both.
+        // second inject, the A8 planes of x and the Op's own workspace (the int8 mixer's partials and
+        // inverse RMS, then the routing counters; held for the layer) at the widest call it serves
+        // (16 columns), each 256-byte aligned; 0 when off. Without --hc-int8 startup refuses naming
+        // both.
         check(!q4::ProgramOptions{}.hc_fused_read, "the fused hyper-connection read is off by default");
         {
             q4::TextConfig mixers = flash;
             mixers.hc.streams     = 4;
+            mixers.hc.rank        = 320;
             q4::ProgramOptions read;
             read.max_context = 32768;
             read.hc_int8     = true;
@@ -445,9 +448,12 @@ int main() {
             const auto plane   = [](std::uint64_t n) { return (n + 255) / 256 * 256; };
             for (const std::int32_t t : {1, 8, 16, 17, 1024}) {
                 const std::uint64_t c    = static_cast<std::uint64_t>(std::min(t, 16));
-                const std::uint64_t want = plane(4ULL * c * 4) + plane(2560ULL * c) + plane(320ULL * c) + 256;
+                const std::uint64_t op   = plane(4ULL * 324 * c * 4) + plane(4ULL * c * 4) + 256;
+                const std::uint64_t want = plane(4ULL * c * 4) + plane(2560ULL * c) + plane(320ULL * c) + op;
+                check(ops::hc_fused_read_workspace_capacity_bytes(4, 320, static_cast<std::int32_t>(c)) == op,
+                      "the Op's workspace is the int8 mixer's plus the counters at T = " + std::to_string(t));
                 check(q4::plan_hc_fused_read_workspace(read, mixers, t) == want,
-                      "the fused read plans its inject, A8 planes and counters at T = " + std::to_string(t));
+                      "the fused read plans its inject, A8 planes and own workspace at T = " + std::to_string(t));
                 check(ex::Forward::hc_fused_read_workspace_bytes(mixers, t) == want,
                       "the forward's fused-read term at T = " + std::to_string(t));
             }

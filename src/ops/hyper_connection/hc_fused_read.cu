@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace ninfer::ops {
 namespace {
@@ -295,11 +296,23 @@ __global__ void __launch_bounds__(kRouteThreads)
 
 } // namespace
 
+std::size_t hc_fused_read_workspace_capacity_bytes(std::int32_t streams, std::int32_t rank,
+                                                   std::int32_t max_tokens) {
+    require(max_tokens > 0 && max_tokens <= kHcInt8MaxColumns && streams > 0 && rank > 0,
+            "the workspace query takes 1..16 columns and positive streams and rank");
+    std::size_t bytes = 0;
+    for (std::int32_t T = 1; T <= max_tokens; ++T) {
+        bytes = std::max(bytes, detail::hc_mix_fused_workspace_bytes(rank + streams, streams, T));
+    }
+    return bytes + kCounterBytes;
+}
+
 std::size_t hc_fused_read_workspace_capacity_bytes(const HcInt8Weights& down,
                                                    const HcInt8Weights& up, std::int32_t streams,
                                                    std::int32_t rank, std::int32_t max_tokens) {
     require(max_tokens > 0 && max_tokens <= kHcInt8MaxColumns,
             "the workspace query takes 1..16 columns");
+    require(down.n == rank + streams, "the down copy carries the injection rows");
     return hyper_connection_mix_workspace_capacity_bytes(down, up, streams, rank, max_tokens) +
            kCounterBytes;
 }
@@ -366,11 +379,45 @@ void hc_fused_read(Tensor& residual, const Tensor& y, const Tensor& prev_inject,
                 out.a8_scales.data != nullptr && aligned16(out.a8_scales.data) &&
                 out.a8_scales.bytes >= hc_fused_read_a8_scale_bytes(H, T),
             "the A8 planes are missing, misaligned or too small");
-    require(!overlap(out.inject.data, out.inject.bytes(), prev_inject.data, prev_inject.bytes()) &&
-                !overlap(out.x.data, out.x.bytes(), residual.data, residual.bytes()) &&
-                !overlap(y.data, y.bytes(), residual.data, residual.bytes()) &&
-                !overlap(out.x.data, out.x.bytes(), y.data, y.bytes()),
-            "an output overlaps an input");
+    // No output may overlap an input or another output (the residual is both: it is updated in
+    // place and must overlap nothing else).
+    struct Region {
+        const void* data;
+        std::size_t bytes;
+    };
+    const std::size_t entries = static_cast<std::size_t>(top_k) * static_cast<std::size_t>(T);
+    const Region outputs[]    = {
+        {residual.data, residual.bytes()},
+        {out.x.data, out.x.bytes()},
+        {out.inject.data, out.inject.bytes()},
+        {out.logits.data, out.logits.bytes()},
+        {routing.ids.data, routing.ids.bytes()},
+        {routing.weights.data, routing.weights.bytes()},
+        {routing.shared_gate.data, routing.shared_gate.bytes()},
+        {d.counts, moe_dispatch_bytes(experts, static_cast<std::int32_t>(entries))},
+        {out.route_log, out.route_log != nullptr ? entries * sizeof(std::int32_t) : 0},
+        {out.a8_codes.data, hc_fused_read_a8_code_bytes(H, T)},
+        {out.a8_scales.data, hc_fused_read_a8_scale_bytes(H, T)}};
+    std::vector<Region> inputs = {
+        {y.data, y.bytes()},
+        {prev_inject.data, prev_inject.bytes()},
+        {norm_weight.data, norm_weight.bytes()},
+        {down.codes, hc_int8_code_bytes(down.n, down.k)},
+        {down.scales, hc_int8_scale_bytes(down.n, down.k)},
+        {up.codes, hc_int8_code_bytes(up.n, up.k)},
+        {up.scales, hc_int8_scale_bytes(up.n, up.k)}};
+    for (const Tensor* w : router) { inputs.push_back({w->data, w->bytes()}); }
+    const std::size_t n_outputs = sizeof(outputs) / sizeof(outputs[0]);
+    for (std::size_t i = 0; i < n_outputs; ++i) {
+        for (std::size_t j = i + 1; j < n_outputs; ++j) {
+            require(!overlap(outputs[i].data, outputs[i].bytes, outputs[j].data, outputs[j].bytes),
+                    "two outputs overlap");
+        }
+        for (const Region& input : inputs) {
+            require(!overlap(outputs[i].data, outputs[i].bytes, input.data, input.bytes),
+                    "an output overlaps an input");
+        }
+    }
 
     auto scope                = workspace.scope();
     const DeviceSpan partials =

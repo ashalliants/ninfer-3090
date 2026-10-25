@@ -128,6 +128,13 @@
 // moe_dispatch, then through one hc_fused_read (the verification and decode calls, and the prompt
 // call when it has at most 16 columns; a wider one runs as off). Every logits column must be bitwise
 // equal.
+//
+//   ninfer_qwen4_exp_forward_real_test --hc-fused-read-side-stream TOKENS [--window W] [--decode N]
+//       [--staging SLOTS]
+//
+// The same with the shared expert on its side stream in both runs (ForwardOptions::
+// shared_expert_stream), which forks at the event the fused read records before its routing kernel:
+// the side stream's allocations must not reuse the read's workspace while that kernel runs.
 
 #include "artifact/reader.h"
 #include "core/arena.h"
@@ -1519,7 +1526,8 @@ int identity_mode(int argc, char** argv, const char* artifact_env, const std::st
 
     // --hc-fused-read: the int8 copies both runs read.
     std::unique_ptr<ex::HcInt8Copies> copies;
-    if (flag == "--hc-fused-read") {
+    const bool fused_read_mode = flag == "--hc-fused-read" || flag == "--hc-fused-read-side-stream";
+    if (fused_read_mode) {
         auto mixers = ex::HcInt8Copies::mixers(parameters.layers, parameters.final_mixer,
                                                parameters.mtp ? &*parameters.mtp : nullptr);
         const std::uint64_t bytes = ex::HcInt8Copies::bytes(mixers);
@@ -1530,12 +1538,13 @@ int identity_mode(int argc, char** argv, const char* artifact_env, const std::st
     const auto run = [&](bool on) {
         const bool registers = on && flag == "--moe-gate-up-registers";
         const bool precast   = registers || (on && flag == "--moe-precast-input");
-        const ex::ForwardOptions options{.gdn_head_map          = on && head_map_mode,
+        const ex::ForwardOptions options{.shared_expert_stream  = flag == "--hc-fused-read-side-stream",
+                                         .gdn_head_map          = on && head_map_mode,
                                          .moe_precast_input     = precast,
                                          .moe_gate_up_registers = registers,
                                          .moe_fused_route       = on && flag == "--moe-fused-route",
                                          .hc_int8               = copies.get(),
-                                         .hc_fused_read         = on && flag == "--hc-fused-read"};
+                                         .hc_fused_read         = on && fused_read_mode};
         Harness harness(parameters, device, context, head, staging_slots, options);
         Verifier verifier(harness, window, options.gdn_head_map);
         std::vector<std::vector<float>> rows;
@@ -1606,7 +1615,7 @@ int main(int argc, char** argv) {
         }
         for (const char* flag :
              {"--gdn-head-map", "--moe-precast-input", "--moe-gate-up-registers", "--moe-fused-route",
-              "--hc-fused-read"}) {
+              "--hc-fused-read", "--hc-fused-read-side-stream"}) {
             if (std::any_of(argv + 1, argv + argc, [&](const char* a) { return std::string(a) == flag; })) {
                 return identity_mode(argc, argv, artifact_env, flag);
             }

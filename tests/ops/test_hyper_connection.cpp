@@ -64,6 +64,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -651,6 +652,23 @@ struct ReadCase {
 
     void reset() const { upload(residual->p, r0); }
 
+    // Every output to 0xFF bytes, so an output a call fails to write cannot match.
+    void poison() const {
+        const std::size_t KT = static_cast<std::size_t>(kTopK) * T;
+        const std::pair<void*, std::size_t> outputs[] = {
+            {x->p, static_cast<std::size_t>(kH) * T * 2},
+            {inject->p, static_cast<std::size_t>(kS) * T * 4},
+            {logits->p, static_cast<std::size_t>(kExperts + 1) * T * 4},
+            {ids->p, KT * 4},
+            {weights->p, KT * 4},
+            {shared->p, static_cast<std::size_t>(T) * 4},
+            {dispatch->p, ninfer::ops::moe_dispatch_bytes(kExperts, static_cast<int>(KT))},
+            {log->p, KT * 4},
+            {codes->p, ninfer::ops::hc_fused_read_a8_code_bytes(kH, T)},
+            {scales->p, ninfer::ops::hc_fused_read_a8_scale_bytes(kH, T)}};
+        for (const auto& [p, bytes] : outputs) { t::cuda_check(cudaMemset(p, 0xFF, bytes), "poison"); }
+    }
+
     ninfer::ops::MoeRouting routing() const {
         return {Tensor(ids->p, DType::I32, {kTopK, T}), Tensor(weights->p, DType::FP32, {kTopK, T}),
                 Tensor(shared->p, DType::FP32, {T})};
@@ -778,14 +796,17 @@ void fused_read(cudaStream_t stream) {
     const ReadOps ops{p, down, up, router, ws, stream};
     for (const int T : {1, 2, 5, 8, 9, 16}) {
         const std::string tag = "fused read T=" + std::to_string(T);
-        ReadCase c(T);
-        c.reset();
-        ops.composed(c);
+        // The composition writes its own buffers (the same inputs: a ReadCase's are fixed by T); every
+        // fused output is poisoned before each call and replay.
+        ReadCase ref(T), c(T);
+        ref.reset();
+        ops.composed(ref);
         t::cuda_check(cudaStreamSynchronize(stream), "composed");
-        const ReadResult want = c.result(false);
+        const ReadResult want = ref.result(false);
         // Two eager calls (the second reuses the counters the first left), then a graph replayed twice.
         for (int call = 0; call < 2; ++call) {
             c.reset();
+            c.poison();
             ops.fused(c);
             t::cuda_check(cudaStreamSynchronize(stream), "fused");
             compare_read(c.result(true), want, T, tag + (call == 0 ? "" : " (again)"));
@@ -800,6 +821,7 @@ void fused_read(cudaStream_t stream) {
             t::cuda_check(cudaGraphInstantiate(&exec, g, 0), "instantiate");
             for (int replay = 0; replay < 2; ++replay) {
                 c.reset();
+                c.poison();
                 t::cuda_check(cudaGraphLaunch(exec, stream), "launch");
                 t::cuda_check(cudaStreamSynchronize(stream), "sync");
                 compare_read(c.result(true), want, T, tag + " graph replay " + std::to_string(replay));
@@ -815,25 +837,34 @@ void fused_read(cudaStream_t stream) {
         compare(mixed, oracle(got.residual, p.norm, down.values, p.down_rows, up.values, T), true, true, tag);
     }
     // Refusals.
-    const auto refused = [&](const std::function<void()>& call) {
+    // Refusals, each by the reason it names.
+    const auto refused = [&](const std::function<void()>& call, const std::string& reason) {
         try {
             call();
-        } catch (const std::invalid_argument&) { return true; }
+        } catch (const std::invalid_argument& error) {
+            return std::string(error.what()).find(reason) != std::string::npos;
+        }
         return false;
     };
     {
         ReadCase c(1);
-        check(refused([&] { ops.fused(c, kTopK, c.prev_d.get()); }),
+        check(refused([&] { ops.fused(c, kTopK, c.prev_d.get()); }, "an output overlaps an input"),
               "fused read: an inject output overlapping the previous inject is refused");
-        check(refused([&] { ops.fused(c, 17); }), "fused read: top-17 is refused");
+        check(refused([&] { ops.fused(c, 17); }, "top-1..16"), "fused read: top-17 is refused");
         constexpr int kWide = ninfer::ops::kHcInt8MaxColumns + 1;
         ReadCase wide(kWide);
-        check(refused([&] { ops.fused(wide); }), "fused read: a 17-column call is refused");
-        check(refused([&] {
-                  (void)ninfer::ops::hc_fused_read_workspace_capacity_bytes(down.weights, up.weights, kS, kRank,
-                                                                            kWide);
-              }),
+        check(refused([&] { ops.fused(wide); }, "serves 1..16 columns"),
+              "fused read: a 17-column call is refused");
+        check(refused(
+                  [&] {
+                      (void)ninfer::ops::hc_fused_read_workspace_capacity_bytes(down.weights, up.weights, kS,
+                                                                                kRank, kWide);
+                  },
+                  "1..16 columns"),
               "fused read: the capacity query refuses T past 16");
+        check(ninfer::ops::hc_fused_read_workspace_capacity_bytes(kS, kRank, ninfer::ops::kHcInt8MaxColumns) ==
+                  capacity,
+              "fused read: the geometry capacity equals the copies' capacity");
     }
 }
 

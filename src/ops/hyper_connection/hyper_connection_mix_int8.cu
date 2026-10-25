@@ -25,6 +25,7 @@
 // of x (one A8 group per column) to A8. The other instances are unchanged.
 
 #include "ops/common/canonical_ggml.h"
+#include "ops/linear/ggml/ggml_blocks.cuh"
 #include "ops/hyper_connection/hc_int8_codec.h"
 #include "ops/hyper_connection/hyper_connection_mix_fused.h"
 #include "ops/hyper_connection/hyper_connection_mix_kernels.cuh"
@@ -112,7 +113,7 @@ __global__ void __launch_bounds__(kQuantThreads)
 // Read (hc_fused_read): the residual is read through `read.residual` as R' = bf16(R + g y) (g the
 // previous block's inject read.inject[t][s], y its output read.y[t][d]: hyper_connection_inject's
 // bits) and R' is written back in place, each element by the one thread that reads it; the CTA's
-// 32 features of x are then cast to A8 (canon::a8_quantize_f32, one column per thread) into
+// 32 features of x are then cast to A8 (ggml::quantize_q8_1_group, one column per thread) into
 // read.codes and read.scales, and CTA 0 zeroes the routing kernel's counters. `residual` is unused
 // then. Without Read, `read` is unused.
 template <int Tiles, bool Read> // Tiles: 8-column mma tiles, 1 for T <= 8, 2 for T <= 16
@@ -276,47 +277,21 @@ __global__ __launch_bounds__(kUpThreads, 1) void hc_up_collapse_int8_kernel(
     }
     if constexpr (Read) {
         // 5. The A8 cast of the CTA's group of x per column, from the BF16 values just written (the
-        //    barrier makes the block's global writes visible to the block).
+        //    barrier makes the block's global writes visible to the block), by the cast the MoE
+        //    precast kernel and the GGML Linears run (ggml::quantize_q8_1_group).
         __syncthreads();
         const int t = static_cast<int>(threadIdx.x);
         if (t < columns) {
             const bf16* group =
                 x + static_cast<std::int64_t>(t) * kHidden + blockIdx.x * kCtaFeatures;
-            float v[canon::kA8Values];
-#pragma unroll
-            for (int i = 0; i < canon::kA8Values / 8; ++i) {
-                const uint4 raw = *reinterpret_cast<const uint4*>(group + 8 * i);
-                const std::uint32_t w[4] = {raw.x, raw.y, raw.z, raw.w};
-#pragma unroll
-                for (int k = 0; k < 4; ++k) {
-                    v[8 * i + 2 * k]     = __uint_as_float(w[k] << 16);
-                    v[8 * i + 2 * k + 1] = __uint_as_float(w[k] & 0xFFFF0000U);
-                }
-            }
-            // canon::a8_quantize_f32 step for step (as ggml::quantize_q8_1_group, which the MoE
-            // precast kernel runs), the codes packed four to a word in registers.
-            float amax = 0.0F;
-#pragma unroll
-            for (int j = 0; j < canon::kA8Values; ++j) { amax = canon::a8_amax_step(amax, v[j]); }
-            const float prescale = canon::a8_prescale(amax);
-            const float inverse  = canon::a8_inverse(amax);
-            std::uint32_t words[canon::kA8Values / 4];
-#pragma unroll
-            for (int w = 0; w < canon::kA8Values / 4; ++w) {
-                std::uint32_t word = 0;
-#pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    const int q = canon::a8_code(v[4 * w + j], prescale, inverse);
-                    word |= (static_cast<std::uint32_t>(q) & 0xFFU) << (8 * j);
-                }
-                words[w] = word;
-            }
+            int words[canon::kA8Values / 4];
+            const float d = ggml::quantize_q8_1_group(group, words);
             const std::int64_t g =
                 static_cast<std::int64_t>(t) * (kHidden / canon::kA8Values) + blockIdx.x;
-            auto* out      = reinterpret_cast<uint4*>(read.codes + g * canon::kA8Values);
-            out[0]         = make_uint4(words[0], words[1], words[2], words[3]);
-            out[1]         = make_uint4(words[4], words[5], words[6], words[7]);
-            read.scales[g] = canon::a8_scale(amax);
+            auto* out      = reinterpret_cast<int4*>(read.codes + g * canon::kA8Values);
+            out[0]         = make_int4(words[0], words[1], words[2], words[3]);
+            out[1]         = make_int4(words[4], words[5], words[6], words[7]);
+            read.scales[g] = d;
         }
     }
 }

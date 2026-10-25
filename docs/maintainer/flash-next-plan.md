@@ -988,8 +988,11 @@ None has been measured on the RTX 3090 yet.
     mixer. With `--shared-expert-stream` the side stream forks from an event recorded after K1b, so
     the shared expert still overlaps the routing.
   - Memory: workspace only. `Forward::hc_fused_read_workspace_bytes` (the second inject, the A8
-    planes and the tickets at 16 columns, about 46 KiB) is in `ProgramDevicePlan::workspace` through
-    `plan_hc_fused_read_workspace`. Works with two lanes, MTP (the drafter's MoE block too) and
+    planes and the Op's own workspace at 16 columns, about 127 KiB) is in
+    `ProgramDevicePlan::workspace` through `plan_hc_fused_read_workspace`. The Op's workspace (the
+    mixer's partials and the tickets) is a carve held for the layer, not a scope the Op releases:
+    the routing kernel still uses it after the side stream forks at the event the Op records, and
+    the shared expert's allocations must not reuse it before the join. Works with two lanes, MTP (the drafter's MoE block too) and
     vision; prefill (more than 16 columns) runs as off.
   - GPU-session checks: the identity mode above; nsys of a decode step on vs off (three kernels per
     MLP side, the routing kernel against `projection_fp32`'s 10.2 us at T = 1); tok/s on vs off.

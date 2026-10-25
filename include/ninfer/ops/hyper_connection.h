@@ -204,8 +204,9 @@ struct HcFusedReadOutputs {
  *   planes are 16-byte aligned; every tensor is contiguous. eps > 0.
  *
  * Numeric:
- *   Each step's own contract: steps 1, 3, 4, 5 and 6 are exact given their inputs, and step 2 is
- *   the int8 mixer's arithmetic, so every output is bitwise that of the composition of those Ops
+ *   Each step's own contract: steps 1, 3, 4, 5 and 6 are exact given their inputs (step 1 as one
+ *   fused multiply-add rounded once, which hyper_connection_inject's kernel is by contraction),
+ *   and step 2 is the int8 mixer's arithmetic, so every output is bitwise that of the composition of those Ops
  *   (the fixed dispatch order included). The oracle is that composition; x also meets the int8
  *   mixer's FP64 criterion.
  *
@@ -216,12 +217,15 @@ struct HcFusedReadOutputs {
  *
  * Workspace:
  *   hc_fused_read_workspace_capacity_bytes() for every T in [1, max_tokens]. It must not overlap
- *   any operand.
+ *   any operand. The workspace stays in device use until the call's last kernel (the routing)
+ *   finishes on `stream`, after the call returns and after `mixed` is recorded: work ordered only
+ *   after `mixed` (a side stream forked there) must not be handed that memory, so a caller keeps it
+ *   allocated until such work has joined `stream` again.
  *
  * Execution:
  *   Stream-ordered; graph capturable; no host synchronization. When `mixed` is set it is recorded
  *   on `stream` once residual, x, inject and the A8 planes are written and before the routing
- *   (steps 3 to 5) is enqueued, so a side stream can wait for x alone.
+ *   (steps 3 to 5) is enqueued, so a side stream can wait for x alone (see Workspace).
  */
 void hc_fused_read(Tensor& residual, const Tensor& y, const Tensor& prev_inject,
                    const Tensor& norm_weight, const HcInt8Weights& down, const HcInt8Weights& up,
@@ -235,10 +239,14 @@ inline constexpr std::size_t kHcFusedReadExtraWorkspaceBytes = 256;
 
 /// The workspace hc_fused_read needs for every T in [1, max_tokens] (max_tokens <=
 /// kHcInt8MaxColumns): hyper_connection_mix_workspace_capacity_bytes of the int8 form plus
-/// kHcFusedReadExtraWorkspaceBytes.
+/// kHcFusedReadExtraWorkspaceBytes. The second form takes the geometry alone (down has rank + S
+/// rows), for a caller that plans before the copies exist; both give the same bytes.
 [[nodiscard]] std::size_t hc_fused_read_workspace_capacity_bytes(const HcInt8Weights& down,
                                                                  const HcInt8Weights& up,
                                                                  std::int32_t streams,
+                                                                 std::int32_t rank,
+                                                                 std::int32_t max_tokens);
+[[nodiscard]] std::size_t hc_fused_read_workspace_capacity_bytes(std::int32_t streams,
                                                                  std::int32_t rank,
                                                                  std::int32_t max_tokens);
 

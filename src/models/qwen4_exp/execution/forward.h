@@ -363,8 +363,10 @@ public:
                                                      bool moe_precast_input);
     // With ForwardOptions::hc_fused_read, the workspace a call of up to `columns` columns needs beyond
     // workspace_bytes (and mtp_workspace_bytes): the fused read's second inject [S, T], the A8 planes
-    // of x (ops::hc_fused_read_a8_code_bytes / _scale_bytes) and the Op's counters, each 256-byte
-    // aligned, at T = min(columns, ops::kHcInt8MaxColumns) (wider calls do not take the fused read).
+    // of x (ops::hc_fused_read_a8_code_bytes / _scale_bytes) and the Op's own workspace
+    // (ops::hc_fused_read_workspace_capacity_bytes, held for the layer: it stays in device use past
+    // the side stream's fork), each 256-byte aligned, at T = min(columns, ops::kHcInt8MaxColumns)
+    // (wider calls do not take the fused read).
     [[nodiscard]] static std::size_t hc_fused_read_workspace_bytes(const TextConfig& config, std::int32_t columns);
     // The MoE block's share of workspace_bytes: routing, dispatch, the routed experts' outputs and
     // workspace (with the precast input's planes under moe_precast_input), the shared expert and
