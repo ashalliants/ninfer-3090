@@ -451,6 +451,13 @@ struct FlashNextOptions {
     // A8 cast of the mixer's output in three launches instead of five to seven. Bitwise the outputs
     // of hc_int8 alone. Off: the separate Ops.
     bool hc_fused_read = false;
+    // Run a single-request decode round (and an MTP verification) as one CUDA graph instead of two
+    // around the n-gram row read (--ngram-flag-wait): a one-thread kernel before the PLE layer spins
+    // on a flag in mapped host memory until the host has read the round's rows into the pinned block
+    // and raised it, then the graph copies them in and runs the rest. The same kernels on the same
+    // data, so the same output bit for bit. A host that does not raise the flag within 1 s ends the
+    // request with an error. Two-lane rounds and runs without CUDA graphs keep the two parts.
+    bool ngram_flag_wait = false;
     // The context cache's NVMe tier: a scratch file of up to this many bytes holds the checkpoints,
     // with the Host context budget as its RAM cache (a zero Host budget then reuses prefixes from
     // disk alone); 0: none. The file is created in `context_nvme_dir` (empty: beside the artifact),

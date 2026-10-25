@@ -167,6 +167,19 @@ add_test(NAME ninfer_qwen4_exp_cpu_verify_misses_test
   COMMAND ninfer_tests ninfer_qwen4_exp_engine_real_test --cpu-verify-misses-exact --mtp 3 --expert-cache-mib 4096)
 set_tests_properties(ninfer_qwen4_exp_cpu_verify_misses_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# GPU, real artifact (skips otherwise): ngram_flag_wait_matches_split, the engine test's
+# --ngram-flag-wait-exact mode. Greedy ids with --ngram-flag-wait (each decode round one graph whose
+# wait kernel holds the PLE layer back until the host has read the round's n-gram rows and raised a
+# mapped flag) equal those of the two graphs around the host's read, and at least one round ran as
+# one graph. The first runs plain rounds only; the second (with the MTP drafter, skips without it)
+# adds the verifications and compares their rounds, drafts and acceptances.
+add_test(NAME ninfer_qwen4_exp_ngram_flag_wait_test
+  COMMAND ninfer_tests ninfer_qwen4_exp_engine_real_test --ngram-flag-wait-exact)
+set_tests_properties(ninfer_qwen4_exp_ngram_flag_wait_test PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_qwen4_exp_ngram_flag_wait_mtp_test
+  COMMAND ninfer_tests ninfer_qwen4_exp_engine_real_test --ngram-flag-wait-exact --mtp 3)
+set_tests_properties(ninfer_qwen4_exp_ngram_flag_wait_mtp_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # GPU, real artifact with the MTP drafter (skips otherwise): gdn_async_commit_matches_serial, the
 # engine test's --gdn-async-commit-exact mode. Greedy ids with --gdn-async-commit (a continuing
 # verification commit folds its GDN columns on a side stream; the next round's front waits for it)

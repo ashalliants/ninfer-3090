@@ -17,6 +17,8 @@
 // the side stream; MTP off is refused.
 // --hc-int8: the int8 copies are a named term, the size of the copies of the mixers the Program
 // binds (97, or 100 with the drafter), zero when off.
+// --ngram-flag-wait: the round graphs' wait counter is a named term (the flag and error word a
+// pinned one), zero when off; ngram_rows_in_graph's rule.
 
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/program/program.h"
@@ -461,6 +463,36 @@ int main() {
             read.hc_int8 = false;
             check(refuses(read, "--hc-fused-read") && refuses(read, "--hc-int8"),
                   "--hc-fused-read without --hc-int8 is refused naming both flags");
+        }
+
+        // --ngram-flag-wait: the round graphs' wait counter is a 4-byte term of fixed_bytes and the
+        // mapped flag and error word (a 64-byte line each) are pinned host memory for the RAM ledger,
+        // both zero when off. A round runs as one graph only with the option and CUDA graphs on, and
+        // once its two parts have run eagerly; anything else keeps the two parts. Nothing is refused:
+        // two lanes, MTP, vision and --no-cuda-graph all run (the last two parts only).
+        {
+            q4::ProgramOptions flag;
+            flag.max_context = 32768;
+            check(!flag.ngram_flag_wait, "the in-graph n-gram flag wait is off by default");
+            check(q4::plan_ngram_flag_wait(flag).device == 0 && q4::plan_ngram_flag_wait(flag).pinned == 0,
+                  "off plans no flag");
+            check(!q4::ngram_rows_in_graph(flag, true), "off keeps the round's two parts");
+            flag.ngram_flag_wait = true;
+            check(q4::plan_ngram_flag_wait(flag).device == 4, "on plans the waits' 4-byte counter on the device");
+            check(q4::plan_ngram_flag_wait(flag).pinned == 128, "on pins the flag and the error word, a line each");
+            check(q4::ngram_rows_in_graph(flag, true), "on, a round whose parts ran eagerly runs as one graph");
+            check(!q4::ngram_rows_in_graph(flag, false), "on, a round's first (eager) run keeps the two parts");
+            flag.use_cuda_graph = false;
+            check(!q4::ngram_rows_in_graph(flag, true), "without CUDA graphs the round keeps the two parts");
+            flag.use_cuda_graph   = true;
+            flag.mtp_draft_tokens = 3;
+            flag.max_concurrency  = 2;
+            check(q4::plan_ngram_flag_wait(flag).device == 4 && q4::ngram_rows_in_graph(flag, true),
+                  "MTP and two lanes change neither the plan nor the rule");
+            q4::ProgramDevicePlan with_flag;
+            with_flag.io              = 500;
+            with_flag.ngram_flag_wait = 4;
+            check(with_flag.fixed_bytes() == 504, "fixed_bytes counts the flag waits' counter");
         }
 
         hc_int8_plan_bytes();

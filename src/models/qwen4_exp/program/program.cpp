@@ -68,6 +68,7 @@
 #include "ninfer/ops/qsa.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
+#include "ninfer/ops/wait_flag.h"
 
 #include <cuda_runtime.h>
 
@@ -207,6 +208,8 @@ double seconds(std::uint64_t ns) { return static_cast<double>(ns) * 1e-9; }
 
 // --gdn-async-commit: folds run on fold streams in this process (Program::process_async_gdn_folds).
 std::atomic<std::uint64_t> g_async_gdn_folds{0};
+// --ngram-flag-wait: rounds run as one graph waiting for their rows (Program::process_ngram_flag_rounds).
+std::atomic<std::uint64_t> g_ngram_flag_rounds{0};
 
 // The KV pool's chunk: the VMM allocation granularity of the RTX 3090 (2 MiB).
 constexpr std::size_t kKvChunkBytes = 2ULL << 20;
@@ -616,6 +619,7 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     b.hot_embedding           = plan_hot_embedding(c.vocab_size, c.hidden_size, o.hot_embedding_rows).hot;
     b.cpu_verify_misses       = plan_cpu_verify_misses(o).device;
     b.hc_int8_bytes           = plan_hc_int8(o, c);
+    b.ngram_flag_wait         = plan_ngram_flag_wait(o).device;
     b.staging   = d.staging;
     b.state     = d.state_total;
     // Logits of the widest round (FP32 and BF16; at least one column per lane), then the sampling
@@ -630,7 +634,8 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     b.max_frames           = ExpertResidency::max_frames(c);
     // Each lane's decode forward in two parts (and with MTP its verification forwards in two parts
     // per width, a draft graph per step count, a drafter catch-up per committed count and the
-    // pending cell's), plus the plain round over every lane in two parts.
+    // pending cell's), plus the plain round over every lane in two parts. --ngram-flag-wait's one
+    // graph per round replaces a round's two parts (they then run only eagerly), so the bound holds.
     b.graph_bound = d.lanes * (2 * graph_bound(1, 1, 0) +
                                (d.drafts > 0 ? static_cast<std::uint32_t>(2 * d.drafts + d.drafts + d.max_width + 1) : 0U)) +
                     (d.lanes > 1 ? 2 * graph_bound(1, 1, 0) + (d.drafts > 0 ? 1U : 0U) * d.lanes : 0U);
@@ -828,6 +833,8 @@ public:
 
         if (plan_.bytes.cpu_verify_misses != 0) { start_cpu_verify(); }
         allocated += plan_.bytes.cpu_verify_misses;
+        if (plan_.bytes.ngram_flag_wait != 0) { start_ngram_flag(); }
+        allocated += plan_.bytes.ngram_flag_wait;
         if (plan_.bytes.hc_int8_bytes != 0) {
             // --hc-int8: the int8 copies of every mixer the forward runs, made from the BF16 weights
             // (which stay loaded); the forward's mixers read them.
@@ -1111,6 +1118,81 @@ public:
         }
         cpu_error_device_ = static_cast<std::uint32_t*>(mapped);
         cpu_misses_       = std::make_unique<ops::offloaded_moe::CpuMissService>(std::move(layers), o);
+    }
+
+    // --ngram-flag-wait: the mapped flag (line 0) and error word (line 1), zeroed, their device
+    // addresses, and the waits' device counter (zero: the first replay wants 1, the host's first
+    // raise).
+    void start_ngram_flag() {
+        const NgramFlagPlan p = plan_ngram_flag_wait(options_);
+        ngram_flag_           = PinnedHostBuffer(p.pinned);
+        std::memset(ngram_flag_.data(), 0, p.pinned);
+        void* mapped = nullptr;
+        if (cudaHostGetDevicePointer(&mapped, ngram_flag_.data(), 0) != cudaSuccess || mapped == nullptr) {
+            (void)cudaGetLastError();
+            throw std::runtime_error("--ngram-flag-wait: the round flag has no device address");
+        }
+        ngram_flag_device_  = static_cast<std::uint32_t*>(mapped);
+        ngram_error_device_ = ngram_flag_device_ + 16;
+        ngram_sequence_     = DeviceBuffer(p.device);
+        ngram_sequence_.fill(0);
+        ngram_raised_ = 0;
+    }
+
+    // --ngram-flag-wait: one launch of a round graph that waits for its n-gram rows (the caller ran
+    // its parts eagerly first, so the capture runs no kernel's one-time setup): captured on its first
+    // use, then replayed.
+    void launch_round(DecodeGraphDefinition& graph, DecodeGraphExecutable& exec, const std::function<void()>& body) {
+        if (!exec.ready()) {
+            graph.capture(device_.stream, body);
+            exec.instantiate(graph);
+            exec.upload(device_.stream);
+        }
+        exec.launch(device_.stream);
+        g_ngram_flag_rounds.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // The part of a round graph between the front and the back: the wait for this replay's flag
+    // value, then the rows of `width` columns from the pinned block (where gather_rows reads them).
+    void wait_for_rows(std::int32_t width) {
+        const cudaStream_t s = device_.stream;
+        ops::wait_flag_sequence(ngram_flag_device_, static_cast<std::uint32_t*>(ngram_sequence_.p),
+                                ngram_error_device_, s);
+        const std::size_t rows = static_cast<std::size_t>(width) * hash_.heads() * c_.ple.table.row_bytes;
+        upload_pinned(static_cast<std::byte*>(io_device_.p) + plan_.io.ngram,
+                      static_cast<std::byte*>(io_host_.data()) + plan_.io.ngram, rows, s);
+    }
+
+    // After a round graph's launch: reads its rows into the pinned block, then raises the flag to the
+    // count of launches with a release store, so the device's acquire load sees the rows. The flag
+    // is raised even when the read throws (the device must not spin for the timeout; the round fails
+    // with the exception).
+    void gather_rows(std::int32_t begin, std::int32_t width) {
+        struct Raise {
+            ProgramImpl* self;
+            ~Raise() {
+                std::atomic_ref<std::uint32_t>(*static_cast<std::uint32_t*>(self->ngram_flag_.data()))
+                    .store(++self->ngram_raised_, std::memory_order_release);
+            }
+        } raise{this};
+        (void)read_rows(begin, width);
+    }
+
+    // --ngram-flag-wait, after a round synchronized: a wait that timed out wrote
+    // ops::kWaitFlagErrorTimeout to the error word, and its round read rows the host had not
+    // finished, so the round throws (the caller releases the lane; nothing is committed). The word is
+    // cleared for the next round.
+    void check_ngram_flag() {
+        if (ngram_flag_device_ == nullptr) { return; }
+        auto* word = static_cast<volatile std::uint32_t*>(ngram_flag_.data()) + 16;
+        const std::uint32_t failed = *word;
+        if (failed == 0) { return; }
+        *word = 0;
+        char code[16];
+        std::snprintf(code, sizeof(code), "0x%04X", failed);
+        throw std::runtime_error(std::string("Qwen3.8-Flash-Next: --ngram-flag-wait: the round's n-gram rows were not "
+                                             "ready within 1 s (code ") +
+                                 code + "); the request ends and nothing of this round is committed");
     }
 
     // --cpu-verify-misses, before a verification is drafted: whether its CPU leg can be served. A
@@ -1627,16 +1709,23 @@ public:
             }
             const std::int32_t position = static_cast<std::int32_t>(L().state_tokens);
             // The layers before the PLE layer run while the host reads the round's n-gram rows from
-            // the volume; the rest of the forward follows their upload.
+            // the volume; the rest of the forward follows their upload (--ngram-flag-wait: in the
+            // same graph, behind the flag the host raises once the rows are in the pinned block).
             upload_inputs(position, 1);
             residency_->before_round(device_.stream);
             join_gdn_fold(); // the front reads and writes the recurrent state
-            run_decode(Part::Front);
-            {
+            if (ngram_rows_in_graph(options_, G().front_runs > 0 && G().back_runs > 0)) {
+                run_decode_round();
                 const nvtx::ScopedRange rows(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode);
-                upload_rows(position, 1);
+                gather_rows(position, 1);
+            } else {
+                run_decode(Part::Front);
+                {
+                    const nvtx::ScopedRange rows(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode);
+                    upload_rows(position, 1);
+                }
+                run_decode(Part::Back);
             }
-            run_decode(Part::Back);
             L().state_tokens += 1;
             const bool failed_constraint = sample(position, masks);
             residency_->enqueue_route_download(device_.stream, 1);
@@ -1645,6 +1734,7 @@ public:
                 const nvtx::ScopedRange waiting(nvtx::Name::DecodeOrdinaryWait, nvtx::Category::Decode);
                 device_.synchronize();
             }
+            check_ngram_flag(); // before anything reads the round's outputs
             runtime::ExecutionTiming timing;
             timing.device_wait_ns = elapsed_ns(wait);
             pending_token_        = sampled_token();
@@ -3512,6 +3602,17 @@ private:
             replay(G().back_graph, G().back_exec, G().back_runs, body);
         }
     }
+    // --ngram-flag-wait: the same forward as one graph, the front and the back around the wait for
+    // the round's rows (wait_for_rows); the host reads them after the launch (gather_rows).
+    void run_decode_round() {
+        const std::uint32_t split = forward_->rows_layer();
+        launch_round(G().round_graph, G().round_exec, [this, split] {
+            forward_->run_front(batch(1, true), split);
+            wait_for_rows(1);
+            forward_->run_back(batch(1, true), split, logits32_);
+            ops::cast_fp32_to_bf16(logits32_, logits16_, device_.stream);
+        });
+    }
 
     // Samples the next token from the last call's logits (`logits`, or the shared logits16_) at
     // `position` into sampled_, with the row's grammar mask when constrained. Returns whether the
@@ -3880,6 +3981,8 @@ private:
             g.verify_back.resize(static_cast<std::size_t>(plan_.max_width) + 1);
             g.verify_front_exec.resize(static_cast<std::size_t>(plan_.max_width) + 1);
             g.verify_back_exec.resize(static_cast<std::size_t>(plan_.max_width) + 1);
+            g.verify_round.resize(static_cast<std::size_t>(plan_.max_width) + 1);
+            g.verify_round_exec.resize(static_cast<std::size_t>(plan_.max_width) + 1);
             g.verify_runs.assign(static_cast<std::size_t>(plan_.max_width) + 1, 0);
             g.verify_back_runs.assign(static_cast<std::size_t>(plan_.max_width) + 1, 0);
             g.draft_graphs.resize(static_cast<std::size_t>(plan_.drafts) + 1);
@@ -4199,23 +4302,36 @@ private:
         // --gdn-async-commit: the previous commit's fold lands before the front reads the state and
         // rewrites the records the fold reads.
         join_gdn_fold();
-        replay(G().verify_front.at(w), G().verify_front_exec.at(w), G().verify_runs.at(w), [&] {
-            // The verification pools from copies of the live tails.
-            // (the lane's tails sit one lane stride apart per layer; the copies are packed)
+        // The verification pools from copies of the live tails.
+        // (the lane's tails sit one lane stride apart per layer; the copies are packed)
+        const auto front = [&] {
             CUDA_CHECK(cudaMemcpy2DAsync(spec_base() + sp.tails, align(plan_.tail), tails_base_, tail_layer_stride_,
                                          plan_.tail, c_.attention_layers, cudaMemcpyDeviceToDevice, s));
             forward_->run_front(batch(W, true, &view), split);
-        });
-        {
-            const nvtx::ScopedRange rows(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode);
-            upload_rows(S, W);
-        }
-        L().history.resize(history);
-        replay(G().verify_back.at(w), G().verify_back_exec.at(w), G().verify_back_runs.at(w), [&] {
+        };
+        const auto back = [&] {
             Tensor logits = wide32;
             forward_->run_back(batch(W, true, &view), split, logits);
             ops::cast_fp32_to_bf16(wide32, wide16, s);
-        });
+        };
+        if (ngram_rows_in_graph(options_, G().verify_runs.at(w) > 0 && G().verify_back_runs.at(w) > 0)) {
+            // --ngram-flag-wait: one graph, the rows behind the flag (raised once they are read).
+            launch_round(G().verify_round.at(w), G().verify_round_exec.at(w), [&] {
+                front();
+                wait_for_rows(W);
+                back();
+            });
+            const nvtx::ScopedRange rows(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode);
+            gather_rows(S, W);
+        } else {
+            replay(G().verify_front.at(w), G().verify_front_exec.at(w), G().verify_runs.at(w), front);
+            {
+                const nvtx::ScopedRange rows(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode);
+                upload_rows(S, W);
+            }
+            replay(G().verify_back.at(w), G().verify_back_exec.at(w), G().verify_back_runs.at(w), back);
+        }
+        L().history.resize(history);
         residency_->enqueue_route_download(s, W);
         // A constrained row's masks, filled on the host while the forward runs (the drafts are
         // already here) and uploaded ahead of acceptance.
@@ -4248,6 +4364,7 @@ private:
         runtime::ExecutionTiming timing;
         timing.device_wait_ns = elapsed_ns(wait);
         check_cpu_verify(); // before anything reads the round's outputs
+        check_ngram_flag(); // decode()'s catch releases the lane
         const std::int32_t LC = words[sp.w_counts], A = words[sp.w_accepted];
         if (LC < 1 || LC > W || A != LC - 1) {
             release_lane();
@@ -4873,6 +4990,14 @@ private:
     PinnedHostBuffer cpu_error_{1};
     std::uint32_t* cpu_error_device_ = nullptr;
     bool cpu_verify_off_reported_    = false;
+    // --ngram-flag-wait: the mapped flag and error word (64 bytes apart), their device addresses, the
+    // round graphs' wait counter, and the flag's last raised value (the count of round launches).
+    // Declared before the forward and the graphs, like the CPU miss service's words.
+    PinnedHostBuffer ngram_flag_{1};
+    std::uint32_t* ngram_flag_device_  = nullptr;
+    std::uint32_t* ngram_error_device_ = nullptr;
+    DeviceBuffer ngram_sequence_;
+    std::uint32_t ngram_raised_ = 0;
     std::unique_ptr<ExpertResidency> residency_;
     // --hc-int8: the mixers' int8 copies (declared before the forward, which reads them).
     std::unique_ptr<execution::HcInt8Copies> hc_int8_;
@@ -4899,6 +5024,11 @@ private:
         DecodeGraphDefinition front_graph, back_graph;
         DecodeGraphExecutable front_exec, back_exec;
         std::uint64_t front_runs = 0, back_runs = 0;
+        // --ngram-flag-wait: the plain round and each width's verification as one graph.
+        DecodeGraphDefinition round_graph;
+        DecodeGraphExecutable round_exec;
+        std::vector<DecodeGraphDefinition> verify_round;
+        std::vector<DecodeGraphExecutable> verify_round_exec;
         std::vector<std::optional<ops::GdnReplayFoldPlan>> folds;
         std::vector<DecodeGraphDefinition> verify_front, verify_back, draft_graphs, catch_graphs, row_catch_graphs;
         std::vector<DecodeGraphExecutable> verify_front_exec, verify_back_exec, draft_execs, catch_execs, row_catch_execs;
@@ -5105,6 +5235,17 @@ bool gdn_fold_on_side_stream(const ProgramOptions& options, bool terminal) noexc
     return options.gdn_async_commit && options.mtp_draft_tokens > 0 && !terminal;
 }
 
+bool ngram_rows_in_graph(const ProgramOptions& options, bool eager_done) noexcept {
+    return options.ngram_flag_wait && options.use_cuda_graph && eager_done;
+}
+
+NgramFlagPlan plan_ngram_flag_wait(const ProgramOptions& options) noexcept {
+    if (!options.ngram_flag_wait) { return {}; }
+    // The flag and the error word, each on its own 64-byte line (the host writes one, the device the
+    // other); the waits' sequence counter on the device.
+    return {sizeof(std::uint32_t), 128};
+}
+
 GdnReplayRecordSpec gdn_records_spec(const TextConfig& c, std::int32_t width, bool gdn_head_map) {
     // The copy route tiles q/k to one key head per value head; the map reads the key heads in place.
     const std::uint32_t qk_heads = gdn_head_map ? c.gdn.key_heads : c.gdn.value_heads;
@@ -5145,6 +5286,9 @@ const VramSizing& Program::vram_sizing() const noexcept { return impl_->vram_siz
 Program::ExpertCacheCounters Program::expert_cache_counters() const noexcept { return impl_->cache_counters(); }
 std::uint64_t Program::process_async_gdn_folds() noexcept {
     return detail::g_async_gdn_folds.load(std::memory_order_relaxed);
+}
+std::uint64_t Program::process_ngram_flag_rounds() noexcept {
+    return detail::g_ngram_flag_rounds.load(std::memory_order_relaxed);
 }
 
 RequestBasePlan Program::plan_request(PreparedPrompt&& prompt, const runtime::ResolvedExecutionOptions& options) {

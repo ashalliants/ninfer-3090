@@ -303,6 +303,12 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         cpu.mtp_draft_tokens   = mtp ? options.speculative.draft_tokens : 0;
         demand.later_pinned += models::qwen4_exp::plan_cpu_verify_misses(cpu).pinned;
     }
+    {
+        // --ngram-flag-wait: the round graphs' mapped flag and error word.
+        models::qwen4_exp::ProgramOptions flag;
+        flag.ngram_flag_wait = next.ngram_flag_wait;
+        demand.later_pinned += models::qwen4_exp::plan_ngram_flag_wait(flag).pinned;
+    }
     demand.pageable     = models::qwen4_exp::NgramVolume::cache_bytes(config.ple.table);
     // Decoded media: the frontend's cache up to its budget, and in flight at most one prompt's patches
     // (one prompt per lane; a prompt's vision tokens are bounded by the context).
@@ -386,6 +392,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.gdn_async_commit      = next.gdn_async_commit;
     program_options.hc_int8               = next.hc_int8;
     program_options.hc_fused_read         = next.hc_fused_read;
+    program_options.ngram_flag_wait       = next.ngram_flag_wait;
     program_options.ngram_volume    = next.ngram_volume_path.empty()
                                           ? models::qwen4_exp::default_ngram_volume(options.artifact_path)
                                           : next.ngram_volume_path;

@@ -348,9 +348,11 @@ public:
     void use_workspace(WorkspaceArena& work) noexcept { work_ = &work; }
 
     // The same call in two parts: run_front(batch, end) runs the embedding and layers [0, end), at
-    // most up to rows_layer(), so it reads no batch.ngram_rows (a caller may still be writing them);
-    // run_back(batch, end, logits) runs the remaining layers and the head on the front's residual.
-    // Nothing else may use the workspace in between. run() is run_front(0) then run_back(0).
+    // most up to rows_layer(), so it reads no batch.ngram_rows (a caller may still be writing them,
+    // or enqueue their arrival on the stream between the parts, inside one capture: the Program's
+    // --ngram-flag-wait); run_back(batch, end, logits) runs the remaining layers and the head on the
+    // front's residual. Nothing else may use the workspace in between. run() is run_front(0) then
+    // run_back(0).
     void run_front(const ForwardBatch& batch, std::uint32_t end, const ForwardTap* tap = nullptr);
     void run_back(const ForwardBatch& batch, std::uint32_t begin, Tensor& logits, const ForwardTap* tap = nullptr);
     // The first layer that reads the n-gram rows (the PLE layer); the layer count when none does.

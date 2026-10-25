@@ -347,13 +347,18 @@ struct ProgramDevicePlan {
     // --hc-int8: the int8 copies of every mixer's hyper-connection matrices (plan_hc_int8; 0 when
     // off), beside the BF16 weights, which stay loaded.
     std::uint64_t hc_int8_bytes = 0;
+    // --ngram-flag-wait: the device counter of the round graphs' flag waits
+    // (plan_ngram_flag_wait(...).device; 0 when off). The flag and the error word are pinned host
+    // memory (.pinned), charged to the RAM ledger.
+    std::uint64_t ngram_flag_wait = 0;
     std::uint64_t expert_record_stride = 0; // one expert frame
     std::uint32_t max_frames           = 0; // the most frames the expert cache uses
     std::uint32_t graph_bound          = 0; // CUDA graph executables the Program may instantiate (counts both halves of the split decode)
 
     [[nodiscard]] std::uint64_t fixed_bytes() const noexcept {
         return kv + workspace + staging + state + io + residency + speculation + shared_expert_workspace +
-               mtp_constrained_masks + mtp_draft_probs + hot_embedding + cpu_verify_misses + hc_int8_bytes;
+               mtp_constrained_masks + mtp_draft_probs + hot_embedding + cpu_verify_misses + hc_int8_bytes +
+               ngram_flag_wait;
     }
 };
 
@@ -472,7 +477,29 @@ struct ProgramOptions {
     // mixer, the router, routing, dispatch and the A8 cast of x). Requires hc_int8. Bitwise the
     // outputs of hc_int8 alone; the workspace terms add Forward::hc_fused_read_workspace_bytes.
     bool hc_fused_read = false;
+    // FlashNextOptions::ngram_flag_wait: a single-row plain round and an MTP verification run as one
+    // graph (ngram_rows_in_graph): the front, ops::wait_flag_sequence on the Program's mapped flag,
+    // the rows' copy from the pinned block, the back. The host reads the rows into the pinned block
+    // after launching the graph and raises the flag. Bitwise the two-part round. A wait that times out
+    // (the host did not raise the flag within ops::kWaitFlagTimeoutNs) fails the round: its request
+    // ends with an error and nothing of it is committed. Memory: plan_ngram_flag_wait.
+    bool ngram_flag_wait = false;
 };
+
+// --ngram-flag-wait: whether a round runs as one graph that waits for its n-gram rows (true) or in
+// two parts around the host's row read, as off. Only with the option and CUDA graphs on, and once
+// the round's two parts have run eagerly (`eager_done`: their kernels' one-time setup is done, and
+// a round never spins on the device while the host could still block on it).
+[[nodiscard]] bool ngram_rows_in_graph(const ProgramOptions& options, bool eager_done) noexcept;
+
+// The memory of --ngram-flag-wait: `device` is ProgramDevicePlan::ngram_flag_wait (the waits'
+// 4-byte sequence counter), `pinned` the mapped flag and error word (one 64-byte line each). Both 0
+// without ngram_flag_wait.
+struct NgramFlagPlan {
+    std::uint64_t device = 0;
+    std::uint64_t pinned = 0;
+};
+[[nodiscard]] NgramFlagPlan plan_ngram_flag_wait(const ProgramOptions& options) noexcept;
 
 // --gdn-async-commit: whether a verification commit runs its GDN replay fold on the fold stream
 // (true) or on the device stream as before. Only a commit the row continues from (`terminal`
@@ -556,6 +583,9 @@ public:
     // --gdn-async-commit: the GDN replay folds every Program in this process has run on its fold
     // stream (a test's proof that the option's route ran).
     [[nodiscard]] static std::uint64_t process_async_gdn_folds() noexcept;
+    // --ngram-flag-wait: the rounds every Program in this process has run as one graph waiting for
+    // its n-gram rows (a test's proof that the option's route ran).
+    [[nodiscard]] static std::uint64_t process_ngram_flag_rounds() noexcept;
 
     [[nodiscard]] RequestBasePlan plan_request(PreparedPrompt&& prompt,
                                                const runtime::ResolvedExecutionOptions& options);

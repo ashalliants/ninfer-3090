@@ -178,6 +178,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--vram-headroom-mib N] [--shared-expert-stream] [--mtp-constrained] [--mtp-joint-acceptance] [--ngram-prefetch] "
            "[--hot-embedding-rows N] [--gdn-head-map] [--moe-precast-input [--moe-gate-up-registers]] "
            "[--moe-fused-route] [--cpu-verify-misses [--cpu-verify-workers N]] [--gdn-async-commit] [--hc-int8 [--hc-fused-read]] "
+           "[--ngram-flag-wait] "
            "[--ram-headroom-mib N] [--expert-cache-mib N] [--context-nvme-mib N [--context-nvme-dir DIR]] "
            "[--chat-template FILE] "
            "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
@@ -291,7 +292,9 @@ std::string serve_usage_text(const char* argv0) {
            "default); --hc-fused-read (with --hc-int8) reads each decode MoE block's input in one fused "
            "read: the previous inject, the int8 mixer, the router with its routing and dispatch, and the "
            "experts' A8 input (fewer launches; the same output as --hc-int8 alone, bit for bit; off by "
-           "default); "
+           "default); --ngram-flag-wait runs a decode round (and an MTP verification) as one CUDA graph that "
+           "waits on the GPU for the host to read the round's n-gram rows, instead of two graphs around the "
+           "read (the same output, bit for bit; off by default); "
            "--vision takes "
            "images when "
            "the model was converted with "
@@ -715,6 +718,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.flash_next.hc_int8 = true;
         } else if (arg == "--hc-fused-read") {
             options.flash_next.hc_fused_read = true;
+        } else if (arg == "--ngram-flag-wait") {
+            options.flash_next.ngram_flag_wait = true;
         } else if (arg == "--cpu-verify-workers") {
             const int workers = parse_nonnegative_int(require_value("--cpu-verify-workers"), "cpu-verify-workers");
             if (workers < 1 || workers > 64) { throw std::invalid_argument("--cpu-verify-workers must be in [1, 64]"); }

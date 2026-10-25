@@ -220,6 +220,16 @@ int main() {
         failures += check(serve_usage_text("ninfer-serve").find("--hc-fused-read") != std::string::npos,
                           "the usage text does not name --hc-fused-read");
     }
+    failures += check(!defaults.flash_next.ngram_flag_wait, "the in-graph n-gram flag wait is on by default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--ngram-flag-wait"}))
+                          .flash_next.ngram_flag_wait,
+                      "--ngram-flag-wait does not reach the Engine");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+                                                 "--max-concurrency", "2", "--ngram-flag-wait"}))
+                          .flash_next.ngram_flag_wait,
+                      "--ngram-flag-wait with MTP and two lanes does not reach the Engine");
+    failures += check(serve_usage_text("ninfer-serve").find("--ngram-flag-wait") != std::string::npos,
+                      "the usage text does not name --ngram-flag-wait");
     failures += check(!defaults.flash_next.gdn_async_commit, "the GDN commit on a side stream is on by default");
     failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
                                                  "--gdn-async-commit"}))
