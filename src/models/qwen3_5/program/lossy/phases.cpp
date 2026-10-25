@@ -161,7 +161,7 @@ void ProgramImpl::finish_lossy_scout(std::uint32_t lane, PrefillProgress& progre
     if (scores.size() != span) { throw std::logic_error("scout scored the wrong span"); }
 
     const auto u = std::span<const TokenId>(staged.prompt.token_ids).subspan(begin, span);
-    const std::vector<std::uint8_t> forced = lossy_forced_tokens(u, lossy_special_tokens);
+    const std::vector<std::uint8_t> forced = lossy_forced_tokens(u, lossy_special_tokens, lossy_turn_start);
     const SelectionResult selection = select_tokens({.scores = scores, .forced = forced},
                                                     lossy_options);
     LossyOutcome outcome{.exact_end       = begin,

@@ -110,6 +110,19 @@ void test_forced_tokens() {
     require(lossy_forced_tokens(span, {}) == std::vector<std::uint8_t>(span.size(), 0),
             "no special set: nothing forced");
     require(lossy_forced_tokens({}, specials).empty(), "empty span");
+
+    // With the turn start known, the role name and newline after each <|im_start|> are forced:
+    // "<|im_start|>assistant\n..." and "<|im_start|>user\n<tool_response>..." keep their headers.
+    const TokenId im_start = 151644;
+    const std::vector<TokenId> turns{9, 151644, 77091, 198, 5, 6, 151645, 198, 151644, 872, 198,
+                                     151657, 8, 151644};
+    const auto headers = lossy_forced_tokens(turns, specials, im_start);
+    require((headers == std::vector<std::uint8_t>{0, 1, 1, 1, 0, 0, 1, 0, 1, 1, 1, 1, 0, 1}),
+            "role name and newline after each turn start are forced; a trailing turn start clips");
+    const std::vector<TokenId> short_tail{151644, 77091};
+    require((lossy_forced_tokens(short_tail, specials, im_start) ==
+             std::vector<std::uint8_t>{1, 1}),
+            "a turn start near the end of U forces only what is there");
 }
 
 } // namespace

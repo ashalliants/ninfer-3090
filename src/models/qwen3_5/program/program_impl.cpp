@@ -463,10 +463,13 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         }
         lossy_options        = plan.lossy_prefill;
         // Selection always keeps the chat structure: role markers, tool-call delimiters and every
-        // other added token of the tokenizer, special or not.
+        // other added token of the tokenizer, special or not, and each turn header's role name.
         if (const auto& tokenizer = parameters.model.resources().tokenizer) {
             for (const auto& token : tokenizer->added_tokens()) {
                 lossy_special_tokens.push_back(static_cast<TokenId>(token.id));
+                if (token.content == "<|im_start|>") {
+                    lossy_turn_start = static_cast<TokenId>(token.id);
+                }
             }
             std::sort(lossy_special_tokens.begin(), lossy_special_tokens.end());
             lossy_special_tokens.erase(

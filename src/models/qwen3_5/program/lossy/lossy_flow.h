@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -93,14 +94,25 @@ lossy_planned_exact_end(const PreparedContextCache& context_cache) noexcept {
     return std::max(planned_exact_end, reuse_frontier);
 }
 
+// Tokens after each turn start that name the turn's role ("assistant", "user", "system", with the
+// newline that ends the header): forced too, so a kept turn keeps its header.
+inline constexpr std::size_t kLossyForcedRoleTokens = 2;
+
 // One flag per token of `span`: nonzero where the id is in `special_ids` (the tokenizer's special
 // and added tokens: role markers, tool-call delimiters, im_start/im_end), which selection always
-// keeps. `special_ids` is sorted ascending.
+// keeps, and on the kLossyForcedRoleTokens tokens after each `turn_start` (<|im_start|>), the role
+// name and its newline. `special_ids` is sorted ascending.
 [[nodiscard]] inline std::vector<std::uint8_t>
-lossy_forced_tokens(std::span<const TokenId> span, std::span<const TokenId> special_ids) {
+lossy_forced_tokens(std::span<const TokenId> span, std::span<const TokenId> special_ids,
+                    std::optional<TokenId> turn_start = std::nullopt) {
     std::vector<std::uint8_t> forced(span.size(), 0);
     for (std::size_t i = 0; i < span.size(); ++i) {
-        forced[i] = std::binary_search(special_ids.begin(), special_ids.end(), span[i]) ? 1U : 0U;
+        if (std::binary_search(special_ids.begin(), special_ids.end(), span[i])) { forced[i] = 1U; }
+        if (turn_start && span[i] == *turn_start) {
+            for (std::size_t j = i + 1; j < span.size() && j <= i + kLossyForcedRoleTokens; ++j) {
+                forced[j] = 1U;
+            }
+        }
     }
     return forced;
 }

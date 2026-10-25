@@ -603,6 +603,8 @@ public:
     // by selection) and every gap map some sequence or checkpoint still holds.
     LossyPrefillOptions lossy_options;
     std::vector<TokenId> lossy_special_tokens;
+    // <|im_start|>: the role name after it is forced too (lossy_forced_tokens).
+    std::optional<TokenId> lossy_turn_start;
     std::vector<std::weak_ptr<const GapMap>> gap_map_registry;
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
