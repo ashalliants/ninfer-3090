@@ -7,6 +7,7 @@
 #include "serve/request.h"
 #include "serve/serve_options.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -224,6 +225,8 @@ private:
     void idle_sleep_loop();
 
     ServeOptions options_;
+    // The lossy-prefill warning for a prompt whose product prompt cannot be bounded: once.
+    mutable std::atomic<bool> warned_unbounded_product_prompt_{false};
     std::unique_ptr<ninfer::Engine> engine_;
     std::shared_ptr<RequestCapacity> request_capacity_;
     // --sleep-idle-seconds: the thread that suspends an idle model.

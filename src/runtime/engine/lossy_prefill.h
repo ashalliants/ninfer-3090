@@ -28,16 +28,19 @@ struct LossyTriggerInput {
 
 // M, the end of the exact prefix, when the request takes the lossy path; nullopt otherwise. The
 // path runs only for a conversation that is not cached: the source is nothing or a shared
-// (product-prompt) checkpoint, never a private conversation record, so a large new turn in a warm
-// conversation always prefills in full. The threshold applies to U = [M, prompt end), what is left
-// after the product prompt and the reused prefix.
+// checkpoint no deeper than the product prompt, never a private conversation record, so a large new
+// turn in a warm conversation always prefills in full. A shared checkpoint past the product prompt
+// is the conversation itself (an OpenAI automatic boundary or an Anthropic cache_control on an
+// earlier turn's last message, or a shared progress anchor), so it counts as cached too. The
+// threshold applies to U = [M, prompt end), what is left after the product prompt.
 [[nodiscard]] inline std::optional<std::uint32_t>
 lossy_prefill_trigger(const LossyTriggerInput& input) noexcept {
     if (input.min_tokens == 0 || !input.exact_end || input.has_media) { return std::nullopt; }
     if (input.source_role && *input.source_role != CheckpointRole::SharedPrefix) {
         return std::nullopt;
     }
-    const std::uint32_t exact_end = std::max(*input.exact_end, input.reused_tokens);
+    if (input.source_role && input.reused_tokens > *input.exact_end) { return std::nullopt; }
+    const std::uint32_t exact_end = *input.exact_end;
     if (exact_end >= input.prompt_tokens || input.prompt_tokens - exact_end <= input.min_tokens) {
         return std::nullopt;
     }

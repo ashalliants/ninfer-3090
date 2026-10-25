@@ -1013,10 +1013,16 @@ void test_lossy_trigger_rule() {
     auto exact          = cold;
     exact.prompt_tokens = kMarker + 30000;
     require(!lossy_prefill_trigger(exact), "the threshold is exclusive");
+    // A shared checkpoint past the product prompt is the conversation (an earlier turn's
+    // automatic or cache_control boundary): cached, so no lossy path however long the new turn.
     auto deeper          = shared;
-    deeper.reused_tokens = 5000; // M is the deeper of the marker and the reuse frontier
-    deeper.prompt_tokens = 5000 + 30001;
-    require(lossy_prefill_trigger(deeper) == 5000u, "M did not follow the reuse frontier");
+    deeper.reused_tokens = kMarker + 1;
+    deeper.prompt_tokens = kMarker + 1 + 60000;
+    require(!lossy_prefill_trigger(deeper), "a shared source past the product prompt triggered");
+    auto below_marker          = shared;
+    below_marker.reused_tokens = kMarker / 2; // a shallower shared prefix: still cold
+    require(lossy_prefill_trigger(below_marker) == kMarker,
+            "a shared source inside the product prompt did not trigger at the product end");
     auto off       = cold;
     off.min_tokens = 0;
     require(!lossy_prefill_trigger(off), "min_tokens 0 is not off");
@@ -1061,6 +1067,50 @@ void test_lossy_triggers_only_when_cold() {
     require(finished(plain), "the request with the option off did not finish\n" + off.dump());
     require(off.events_of(4, Event::Kind::EnableLossy).empty(),
             "the path ran with --lossy-prefill-min-tokens 0\n" + off.dump());
+}
+
+// LossySharedSourcePastProductPrompt: turn N published a shared checkpoint at the end of its own
+// last message (OpenAI's automatic boundary, Anthropic cache_control). Turn N+1 binding it is a warm
+// conversation: a large new turn prefills in full. The same prompt bound only at the product end
+// takes the path. The summary strategy's probe answers warm for the deeper shared match.
+void test_lossy_shared_source_past_product_prompt() {
+    constexpr std::uint32_t kTurn = kMarker + 10000; // turn N's shared boundary
+    Rig rig({.chunk = kLossyChunk, .lanes = 1, .lossy_min_tokens = 30000, .context_cache = true,
+             .shared_prefixes = {{7, kMarker}, {8, kTurn}}});
+    fake::PreparedPrompt warm = lossy_prompt(1, kTurn + 31000, 8);
+    warm.shared_tokens        = kTurn;
+    auto warm_result          = rig.run_prompt(std::move(warm), 1);
+    require(finished(warm_result), "the warm request did not finish\n" + rig.dump());
+    require(warm_result.get().reused_prompt_tokens == kTurn,
+            "the request did not bind turn N's shared checkpoint\n" + rig.dump());
+    require(rig.events_of(1, Event::Kind::EnableLossy).empty() &&
+                rig.events_of(1, Event::Kind::Scout).empty() && !warm_result.get().lossy_prefill,
+            "a shared source past the product prompt took the lossy path\n" + rig.dump());
+    require(total_tokens(rig.events_of(1, Event::Kind::Prefill)) == 31000,
+            "the new turn was not prefilled in full\n" + rig.dump());
+
+    auto cold = rig.run_prompt(lossy_prompt(2, kTurn + 31000, 7), 1);
+    require(finished(cold), "the cold request did not finish\n" + rig.dump());
+    const auto enabled = rig.events_of(2, Event::Kind::EnableLossy);
+    require(cold.get().reused_prompt_tokens == kMarker && enabled.size() == 1 &&
+                enabled[0].position == kMarker,
+            "a shared source at the product end did not take the path at M\n" + rig.dump());
+
+    Rig summary({.chunk = kLossyChunk, .lanes = 1, .lossy_min_tokens = 30000,
+                 .lossy_strategy = LossyStrategy::Summary, .context_cache = true,
+                 .shared_prefixes = {{7, kMarker}, {8, kTurn}}});
+    ResolvedExecutionOptions execution;
+    execution.requested_output_tokens = 1;
+    fake::PreparedPrompt deep = lossy_prompt(3, kTurn + 31000, 8);
+    deep.shared_tokens        = kTurn;
+    require(summary.core().has_private_reuse(deep, execution, kMarker,
+                                             std::chrono::milliseconds(250)) ==
+                LossySummaryProbe::Warm,
+            "a shared match past the product prompt was not probed warm");
+    require(summary.core().has_private_reuse(lossy_prompt(4, kTurn + 31000, 7), execution, kMarker,
+                                             std::chrono::milliseconds(250)) ==
+                LossySummaryProbe::Cold,
+            "a shared match at the product end was not probed cold");
 }
 
 // LossyPromptLengthChangeAccepted: the step that ends the scout shrinks the prompt; the Engine
@@ -1631,6 +1681,7 @@ int main() {
     run("LossyCancelDuringScout", test_lossy_cancel_during_scout);
     run("LossyYieldRefusedDuringScout", test_lossy_yield_refused_during_scout);
     run("LossyResumesAfterExactPause", test_lossy_resumes_after_exact_pause);
+    run("LossySharedSourcePastProductPrompt", test_lossy_shared_source_past_product_prompt);
     run("LossyPreemptionDuringScout", test_lossy_preemption_during_scout);
     run("LossyUsageReportsOriginal", test_lossy_usage_reports_original);
     run("LossyCountersAndRequestLog", test_lossy_counters_and_request_log);

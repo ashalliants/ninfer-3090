@@ -1001,6 +1001,10 @@ struct PromptSummary {
     // Vision work the prompt will cost, for predicting its prefill time while it waits.
     std::uint32_t vision_items   = 0;
     std::uint64_t vision_patches = 0;
+    // The prompt declares tools, but neither a leading system message nor the end of the tool
+    // declarations could be located, so the end of the product prompt is unknown. Lossy prefill
+    // does not take such a prompt (it would otherwise expose the tool schemas to selection).
+    bool product_prompt_unbounded = false;
 };
 
 struct PromptPreparationStats {

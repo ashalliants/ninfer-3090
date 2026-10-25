@@ -109,15 +109,20 @@ public:
 
     [[nodiscard]] const ContextMachineCostModel& costs() const noexcept { return costs_; }
 
-    // Whether the index holds a valid private (non-SharedPrefix) checkpoint whose prefix this plan
-    // starts with: a conversation record admission could reuse. Read-only (no pruning, no source
-    // preparation); a shortlist match that exact verification would reject only errs towards true.
-    [[nodiscard]] bool has_private_match(Program& program, const Base& base) const {
+    // Whether the index holds a valid checkpoint whose prefix this plan starts with that makes the
+    // conversation cached: a private (non-SharedPrefix) record, or a SharedPrefix one deeper than
+    // `shared_deeper_than` (past the product prompt: an earlier turn's shared boundary). Read-only
+    // (no pruning, no source preparation); a shortlist match that exact verification would reject
+    // only errs towards true.
+    [[nodiscard]] bool has_conversation_match(Program& program, const Base& base,
+                                              std::uint32_t shared_deeper_than) const {
         if (!enabled_) { return false; }
         for (const auto handle : index_.matches(program, base)) {
             if (!program.valid_checkpoint(handle)) { continue; }
             const auto metadata = program.checkpoint_metadata(handle);
-            if (metadata.role != CheckpointRole::SharedPrefix && metadata.frontier > 0) {
+            if (metadata.frontier == 0) { continue; }
+            if (metadata.role != CheckpointRole::SharedPrefix ||
+                metadata.frontier > shared_deeper_than) {
                 return true;
             }
         }

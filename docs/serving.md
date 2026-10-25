@@ -2410,7 +2410,7 @@ from accepted output token IDs, including a stop token whose decoded text may be
 
 Off by default and **lossy**: when it runs, the model does not see part of the prompt.
 `--lossy-prefill-min-tokens N` turns it on for a cold prompt (no cached conversation; at most a
-shared product-prompt checkpoint) whose part after the product prompt -- the leading
+shared checkpoint no deeper than the product prompt) whose part after the product prompt -- the leading
 system/developer messages and the tool declarations -- has more than N tokens. The product prompt is
 prefilled exactly; a scout pass then runs the layers below `--lossy-prefill-filter-layer` over the
 rest and scores every token by the attention mass of the last query rows at that layer, whole blocks
@@ -2418,7 +2418,9 @@ are kept by score (plus the head, the recent tail, every added token such as rol
 tool-call delimiters, and the role name after each turn start), and only the kept tokens are
 prefilled, at their original RoPE positions. A follow-up turn that starts with the same original
 prompt is rewritten onto the kept lineage, so it reuses that prefill. Text-only Qwen3.5 dense on one
-device; startup refuses MoE and pipeline-split models. When enabled, the scout's scratch is a
+device; startup refuses MoE and pipeline-split models. A prompt that declares tools where neither a
+system message nor the end of the tool declarations can be found in the template's output always
+prefills in full (the server warns once). When enabled, the scout's scratch is a
 permanent VRAM reservation of about 2 KB per token of `--max-context` on the 27B. `--lossy-prefill-strategy
 summary` is the alternative: a deterministic summary replaces the middle of a long conversation.
 Design, acceptance numbers and the deviations of the build are in

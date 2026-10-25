@@ -68,9 +68,10 @@ nlohmann::json added(int id, std::string content, bool special) {
 }
 
 // One token per byte (ids 1000 + byte) and the template's added tokens: enough to count frontiers.
-q::Frontend make_frontend() {
-    const std::string chat_template =
-        read_file(NINFER_SOURCE_DIR "/tools/chat_templates/qwen3_6.jinja");
+q::Frontend make_frontend(std::string chat_template = {}) {
+    if (chat_template.empty()) {
+        chat_template = read_file(NINFER_SOURCE_DIR "/tools/chat_templates/qwen3_6.jinja");
+    }
     const nlohmann::json tokens = nlohmann::json::array(
         {added(6, "<eos>", true), added(kImStart, "<|im_start|>", true),
          added(kImEnd, "<|im_end|>", true), added(248053, "<|vision_start|>", true),
@@ -140,6 +141,7 @@ struct Measured {
     std::uint32_t tokens       = 0;
     std::uint32_t deepest_mark = 0; // the deepest shared opportunity, the old rule's M
     std::vector<ninfer::TokenId> ids;
+    bool unbounded = false;
 };
 
 Measured measure(const q::Frontend& frontend, ninfer::PromptInput input) {
@@ -153,7 +155,8 @@ Measured measure(const q::Frontend& frontend, ninfer::PromptInput input) {
             out.deepest_mark = std::max(out.deepest_mark, opportunity.frontier);
         }
     }
-    out.ids = data.token_ids;
+    out.ids       = data.token_ids;
+    out.unbounded = prompt.summary().product_prompt_unbounded;
     return out;
 }
 
@@ -165,6 +168,7 @@ void require_system_boundary(const Measured& m, const std::string& what) {
     require(std::count(m.ids.begin(), m.ids.begin() + m.exact_end, kImStart) == 1,
             what + ": only the system turn precedes M");
     require(m.tokens - m.exact_end > 4000, what + ": U holds the long user message");
+    require(!m.unbounded, what + ": the product prompt is bounded");
 }
 
 void test_openai_default_policy(const q::Frontend& frontend) {
@@ -218,7 +222,19 @@ void test_no_product_prompt(const q::Frontend& frontend) {
                     {"messages", Json::array({Json{{"role", "user"}, {"content", kLong}}})}};
     const auto request = ninfer::serve::parse_chat_completion_request(body, limits());
     const Measured m   = measure(frontend, prompt_input(request.generation));
-    require(m.exact_end == 0, "no system message or tools: M is 0");
+    require(m.exact_end == 0 && !m.unbounded, "no system message or tools: M is 0, bounded");
+}
+
+// A template that renders no tool declarations the Frontend can find, and no system message: the
+// product prompt's end is unknown, which the summary reports (lossy prefill then refuses it).
+void test_tool_region_not_located() {
+    const q::Frontend frontend = make_frontend("{{ messages[0].content }}");
+    const Json body{{"model", "m"},
+                    {"tools", Json::array({kTool})},
+                    {"messages", Json::array({Json{{"role", "user"}, {"content", kLong}}})}};
+    const auto request = ninfer::serve::parse_chat_completion_request(body, limits());
+    const Measured m   = measure(frontend, prompt_input(request.generation));
+    require(m.unbounded && m.exact_end == 0, "an unlocated tool region is reported unbounded");
 }
 
 } // namespace
@@ -229,6 +245,7 @@ int main() {
         test_openai_default_policy(frontend);
         test_anthropic_cache_control_on_last_message(frontend);
         test_no_product_prompt(frontend);
+        test_tool_region_not_located();
         std::cout << "OK lossy exact end\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

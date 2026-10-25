@@ -598,12 +598,14 @@ prepare_context_cache(ContextCacheHints hints, std::size_t message_count,
             product_end = std::max(product_end, *frontier);
         }
     };
-    if (engine_tool_marker_index && *engine_tool_marker_index < cache_boundaries.size()) {
-        extend_product(cache_boundaries[*engine_tool_marker_index]);
-    }
-    if (leading_boundary && *leading_boundary < message_boundaries.size()) {
-        extend_product(message_boundaries[*leading_boundary]);
-    }
+    const bool tools_located = engine_tool_marker_index &&
+                               *engine_tool_marker_index < cache_boundaries.size() &&
+                               cache_boundaries[*engine_tool_marker_index].has_value();
+    const bool leading_located = leading_boundary && *leading_boundary < message_boundaries.size() &&
+                                 message_boundaries[*leading_boundary].has_value();
+    if (tools_located) { extend_product(cache_boundaries[*engine_tool_marker_index]); }
+    if (leading_located) { extend_product(message_boundaries[*leading_boundary]); }
+    out.product_prompt_unbounded = engine_tool_marker_index && !tools_located && !leading_located;
     for (std::size_t index = 0; index < hints.markers.size(); ++index) {
         const PromptCacheMarker marker = hints.markers[index];
         bool inside                    = false;
@@ -816,6 +818,7 @@ PromptSummary PreparedPrompt::summary() const {
     PromptSummary summary{.starts_in_reasoning = data_->starts_in_reasoning,
                           .prompt_tokens       = checked_token_count(data_->token_ids.size()),
                           .has_media           = data_->has_media()};
+    summary.product_prompt_unbounded = data_->context_cache.product_prompt_unbounded;
     summary.vision_items = static_cast<std::uint32_t>(data_->vision_items.size());
     for (const auto& item : data_->vision_items) { summary.vision_patches += item.patch_count; }
     return summary;

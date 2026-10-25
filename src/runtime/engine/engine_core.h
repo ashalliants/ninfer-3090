@@ -388,7 +388,8 @@ public:
     }
 
     // The summary strategy's reuse probe, from a caller thread (Engine::prepare): Warm when a
-    // private (conversation) record this prompt starts with would be reused, from the cache or from
+    // private (conversation) record, or a shared checkpoint deeper than `exact_end`, this prompt
+    // starts with would be reused, from the cache or from
     // the context store (deeper than `exact_end`, the product prompt), Cold otherwise. `prompt` is
     // a copy the probe plans and drops. The probe is posted to the worker, which answers it between
     // cycles (serve_reuse_probes); an answer not given within `wait` is Timeout, counted in
@@ -4450,7 +4451,10 @@ private:
     // On the worker, under the execution lock: the probe's answer (true: warm).
     [[nodiscard]] bool private_reuse_locked(ReuseProbe& probe) {
         const auto plan = instance_.program->plan_request(std::move(probe.prompt), probe.execution);
-        if (resources_.has_private_match(*instance_.program, plan)) { return true; }
+        // Shared matches past the product prompt are the conversation too (lossy_prefill_trigger).
+        if (resources_.has_conversation_match(*instance_.program, plan, probe.exact_end)) {
+            return true;
+        }
         if (store_.store == nullptr) { return false; }
         bool stored = false;
         for_each_stored_match(plan, [&](const ContextStore::Info&, const ContextStore::CheckpointKey& key) {

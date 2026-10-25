@@ -603,6 +603,14 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         };
         ninfer::PreparedPrompt prompt = engine_->prepare(std::move(input), control);
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
+        if (options_.lossy_prefill.enabled() && prompt.summary().product_prompt_unbounded &&
+            !warned_unbounded_product_prompt_.exchange(true, std::memory_order_relaxed)) {
+            write_console_log(ConsoleLogLevel::Warning,
+                              "lossy prefill: a prompt declares tools but neither a system message "
+                              "nor the end of its tool declarations could be located in the chat "
+                              "template's output, so the product prompt's end is unknown; such "
+                              "prompts prefill in full (shown once)");
+        }
         prepared.enable_thinking = prompt.summary().starts_in_reasoning;
         if (!prepared.enable_thinking) {
             request_options.execution.thinking.budget.reset();

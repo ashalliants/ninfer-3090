@@ -125,7 +125,8 @@ the uncached suffix. The lossy path runs when all hold:
 - the prompt has no Vision items, the model is the Qwen3.5 dense Program, and it is not pipeline-split;
 - no selection gap map (goal 3) already covers the prompt;
 - **the conversation itself is not cached**: the reuse source is nothing or only a shared (product-prompt)
-  checkpoint, never a private conversation record. A large new turn inside a warm conversation (a 40K
+  checkpoint no deeper than the product prompt, never a private conversation record or a shared
+  checkpoint an earlier turn published past it. A large new turn inside a warm conversation (a 40K
   file read, say) always prefills in full. (User's decision, 2026-10-25: such a turn counts as cached, and
   is rare in real use; the case this is for is a cold start or a router overflow to a box without the
   conversation.)
@@ -447,6 +448,17 @@ quality and speed consequences are unmeasured until the GPU sweep runs.
   (`cache_control` on a recent message). A prompt with neither system message nor tools has M = 0.
   Tested on real OpenAI and Anthropic translation (`ninfer_qwen3_5_lossy_exact_end_test`); the sweep
   aborts a point whose preflight request does not log `outcome: "completed"`.
+- **A shared source past the product prompt counts as cached.** With M at the product-prompt end, the
+  shared checkpoints published at message boundaries (OpenAI's automatic boundary at the end of the
+  last message, Anthropic `cache_control` on a recent message, shared progress anchors) are an earlier
+  turn of the same conversation. `lossy_prefill_trigger` refuses a SharedPrefix source whose reused
+  tokens exceed M, and the summary probe answers warm for an in-memory shared match deeper than M (the
+  store branch already did), so a large new turn in a warm conversation prefills in full under both
+  strategies (fake-engine test `LossySharedSourcePastProductPrompt`).
+- **A prompt whose product prompt cannot be bounded is refused**: tools declared, but neither a leading
+  System/Developer message nor the end of the tool declarations found in the template's output. M would
+  be 0 and the tool schemas selectable, so `PromptSummary::product_prompt_unbounded` is set, neither
+  strategy takes the prompt, and `ninfer-serve` warns once when lossy prefill is on.
 - **The scout uses full KV pages** (the v1 fallback in "Scout pass"): peak KV during the scout is a full
   prefill's for the scouted span.
 - **Scout steps are not layer-sliced** and cannot be paused (`start_pause` refuses while a scout runs).

@@ -140,7 +140,7 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
     base->context_cache         = prompt.context_cache;
     base->summary.prompt_tokens = static_cast<std::uint32_t>(prompt.token_ids.size());
     if (scout_buffers && lossy_options.enabled() && base->gap_maps.empty() && !prompt.has_media() &&
-        prompt.external_prefix_tokens == 0) {
+        prompt.external_prefix_tokens == 0 && !prompt.context_cache.product_prompt_unbounded) {
         base->lossy = LossyPlan{.exact_end = lossy_planned_exact_end(prompt.context_cache)};
     }
     if (prompt.has_media()) {

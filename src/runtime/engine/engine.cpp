@@ -367,7 +367,8 @@ public:
         }
         static bool eligible(const Prepared& prompt) {
             const auto& data = models::qwen3_5::PreparedPromptAccess::view(prompt);
-            return !data.has_media() && data.external_prefix_tokens == 0;
+            return !data.has_media() && data.external_prefix_tokens == 0 &&
+                   !data.context_cache.product_prompt_unbounded;
         }
         LossySummaryProbe probe_reuse(const Prepared& prompt) const {
             return impl.has_private_reuse(prompt, exact_end(prompt));
