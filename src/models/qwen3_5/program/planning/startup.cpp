@@ -397,9 +397,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto finish = [](const WorkspaceLayoutBuilder& layout) { return layout.peak_bytes(1); };
 
     const auto text_common_root = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens) {
-        // Text prefill takes one RoPE axis when its positions are explicit (a lossy prompt's gapped
-        // positions) or offset by rope_delta; Vision takes three.
-        (void)workspace::text_prefill_roots(layout, config, tokens, plan.features.vision ? 3 : 1,
+        // Vision takes three RoPE axes. Text prefill takes one only when its positions are explicit
+        // or offset by rope_delta, which without Vision only a compacted lossy prompt (gapped
+        // positions, or a follow-up rewritten onto its gap map) has; text prompts otherwise carry
+        // rope_delta 0. So the axis is planned only where the scout is.
+        const std::int32_t rope_axes = plan.features.vision ? 3 : (scout_planned(plan) ? 1 : 0);
+        (void)workspace::text_prefill_roots(layout, config, tokens, rope_axes,
                                             plan.features.vision ? tokens : 0,
                                             plan.features.overlay_vision());
     };

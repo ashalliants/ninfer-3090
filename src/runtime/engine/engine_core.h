@@ -406,6 +406,7 @@ public:
             std::lock_guard lock(queue_mutex_);
             if (stopping_ || failed_) { return LossySummaryProbe::Warm; }
             probes_.push_back(probe);
+            probes_pending_.store(true, std::memory_order_release);
         }
         queue_cv_.notify_all();
         std::unique_lock lock(probe->mutex);
@@ -4460,6 +4461,10 @@ private:
 
     // Answers the queued probes; `warm_only` (suspended or stopping) answers warm without looking.
     void serve_reuse_probes(bool warm_only) noexcept {
+        // Every worker cycle calls this; without a posted probe (always, unless the summary
+        // strategy is on) it returns without touching the queue lock. A probe posted after the
+        // exchange sets the flag again and is answered on the next cycle.
+        if (!probes_pending_.exchange(false, std::memory_order_acq_rel)) { return; }
         std::deque<std::shared_ptr<ReuseProbe>> probes;
         {
             std::lock_guard lock(queue_mutex_);
@@ -4804,6 +4809,8 @@ private:
     mutable std::mutex execution_mutex_;
     // Summary-strategy reuse probes waiting for the worker (guarded by queue_mutex_).
     std::deque<std::shared_ptr<ReuseProbe>> probes_;
+    // Set (under queue_mutex_) with every posted probe; serve_reuse_probes clears it.
+    std::atomic<bool> probes_pending_{false};
     std::atomic<std::uint64_t> probe_timeouts_{0};
     mutable std::mutex queue_mutex_;
     mutable std::mutex stats_mutex_;
