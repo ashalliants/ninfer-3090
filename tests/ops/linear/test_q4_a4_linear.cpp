@@ -359,7 +359,17 @@ int run_case(const Case& c) {
         ++failures;
     }
 
-    // 5. The scout's routes through the policy-bearing Ops, against this Op's own output.
+    // 5. The scout's routes through the policy-bearing Ops, against this Op's own output. The Ops
+    // take only plain RowSplit (no loader produces RowSplitPanel; it is a q4_a4_linear/kernel
+    // layout), so a panel case drives them with the same weight in RowSplit order, which also checks
+    // the panel GEMM against the row-split one.
+    std::unique_ptr<GuardedDeviceBuffer> route_weight_buffer;
+    Weight route_weight = weight;
+    if (c.panel) {
+        route_weight_buffer = std::make_unique<GuardedDeviceBuffer>(host_weight.payload.size());
+        route_weight_buffer->copy_from_host(host_weight.payload.data(), host_weight.payload.size());
+        route_weight = host_weight.device_weight(route_weight_buffer->data());
+    }
     std::unique_ptr<GuardedDeviceBuffer> route_out;
     std::unique_ptr<WorkspaceArena> route_ws;
     std::function<void(ops::LinearPolicy)> run_route;
@@ -381,15 +391,18 @@ int run_case(const Case& c) {
             route_ws->reset();
             Tensor dst(route_out->data(), DType::BF16, {rows, c.t});
             if (gate_up) {
-                ops::linear_swiglu(tx_bf16, weight, dst, policy, *route_ws, nullptr);
+                ops::linear_swiglu(tx_bf16, route_weight, dst, policy, *route_ws, nullptr);
             } else {
-                ops::linear_add(tx_bf16, weight, dst, policy, *route_ws, nullptr);
+                ops::linear_add(tx_bf16, route_weight, dst, policy, *route_ws, nullptr);
             }
         };
         if (!gate_up) { route_out->fill(0); } // a zero residual
         run_route(ops::LinearPolicy::ScoutA4Int);
         test::cuda_check(cudaDeviceSynchronize(), "synchronize scout a4 route");
         failures += route_out->verify_guards(label + " scout route out");
+        if (route_weight_buffer) {
+            failures += route_weight_buffer->verify_guards(label + " route weight");
+        }
         const double route_cos = cosine(read_output(*route_out, words, DType::BF16), a4_view);
         std::cout << "  " << label << ": ScoutA4Int "
                   << (gate_up ? "linear_swiglu" : "linear_add") << " route vs this Op "
