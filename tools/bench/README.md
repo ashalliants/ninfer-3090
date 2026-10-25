@@ -39,6 +39,37 @@ adds fields to every request. With `--max-concurrency 1` the long prompt queues 
 which is itself the head-of-line case. `python -I tools/bench/test_prefill_stall.py` checks the tool against a
 fake server that stalls its streams on a long request.
 
+## Lossy long-prompt prefill sweep (`run_lossy_prefill_sweep.py`)
+
+Quality and speed of `--lossy-prefill-*` over a grid of settings (`docs/maintainer/lossy-long-prefill.md`). For each
+grid point it starts a fresh `ninfer-serve` with the flags and a request log, runs the workloads, appends one row per
+workload to `results.jsonl`, and writes `summary.md`: every acceptance check marked pass or FAIL against the baseline
+point (the same server with lossy prefill off).
+
+| workload | what it runs | numbers |
+|---|---|---|
+| `needle` | `eval/` evalscope `needle_haystack`, 32K/64K/100K x 5 depths (config generated per run from `--needle-corpus`, `--tokenizer-path`, `--model`) | accuracy per length; gate: >= 0.95x baseline |
+| `agent_replay` | `python -m tools.bench.agent_replay run --min-context 30000 --max-context 120000` | tool-call validity; `Edit` rate (`old_string` occurs verbatim in the file at the corpus commit, over `edit_function` turns); gate: within 2 points of baseline |
+| `greedy_agreement` | 20 long prompts at temperature 0; first-divergence index against the baseline's output (token ids from the request log) | reported, no gate (replaces the spec's teacher-forced KL in v1) |
+| `speed` | `run_prefill_stall.py` with a 108K cold prompt on its own server (`--max-concurrency 2 --prefill-layer-slices 8`) | total, scout and main time (request log `lossy_prefill`), neighbour worst gap; gate: total <= 0.40x baseline |
+
+```bash
+python tools/bench/run_lossy_prefill_sweep.py \
+    --server-cmd "build/apps/ninfer-serve models/qwen3_5_27b.ninfer --kv-dtype rk4v4 --max-context 131072 --prefill-cublas" \
+    --model qwen3.5-27b --tokenizer-path /path/to/hf-tokenizer-dir --needle-corpus /path/to/Needle-in-a-Haystack-Corpus \
+    --grid filter_layer=7,11,15,23,31 keep=0.1,0.2,0.3,0.5 block=32,64,128 strategy=select,summary \
+    --workloads needle,agent_replay,greedy_agreement,speed --out profiles/lossy-sweep
+```
+
+Grid keys: `filter_layer keep block recent head query_rows pool_window skip scout_a4 strategy min_tokens`; a
+knob left out keeps the server default. `strategy=summary` ignores the selection knobs and runs once (it needs the
+`--lossy-prefill-strategy` flag; `select` passes no such flag). Run it in pieces: `--workloads` and `--only REGEX`
+(on point ids) pick a subset, `--resume` skips pairs already ok, `--skip-baseline --baseline-from earlier/results.jsonl`
+reuses a baseline, and `--from-json results.jsonl [more.jsonl]` only re-summarises. A server that fails to start
+is recorded (workload `server`) and the sweep goes on. `python -I tools/bench/test_lossy_prefill_sweep.py` checks the
+summariser (0.96x passes, 0.94x fails, Edit -2.5 points fails, time 0.39x passes), the grid and the commands. It is
+stdlib-only; the needle workload needs the `eval/.venv` of eval/README.md. Hold the GPU lock for a sweep on a shared card.
+
 ## Interleaved A/B between two builds
 
 `run_interleaved_ab.py` compares two executables by alternating them **inside** each repetition.
