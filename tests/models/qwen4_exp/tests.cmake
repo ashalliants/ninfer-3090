@@ -167,6 +167,15 @@ add_test(NAME ninfer_qwen4_exp_cpu_verify_misses_test
   COMMAND ninfer_tests ninfer_qwen4_exp_engine_real_test --cpu-verify-misses-exact --mtp 3 --expert-cache-mib 4096)
 set_tests_properties(ninfer_qwen4_exp_cpu_verify_misses_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# GPU, real artifact (skips otherwise): prefill_cpu_share_matches_plain, the engine test's
+# --prefill-cpu-share-exact mode. Greedy ids with --prefill-cpu-share 0.6 (each layer of the 300-token
+# prompt's static call hands 3 / 5 of its misses, the fewest-column ones of at most 8, to the CPU
+# worker team beside the GPU's staging) equal those of the GPU-only prefill, and the CPU must serve at
+# least one expert. A 4 GiB expert cache keeps prefill misses common.
+add_test(NAME ninfer_qwen4_exp_prefill_cpu_share_test
+  COMMAND ninfer_tests ninfer_qwen4_exp_engine_real_test --prefill-cpu-share-exact --expert-cache-mib 4096)
+set_tests_properties(ninfer_qwen4_exp_prefill_cpu_share_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # GPU, real artifact (skips otherwise): ngram_flag_wait_matches_split, the engine test's
 # --ngram-flag-wait-exact mode. Greedy ids with --ngram-flag-wait (each decode round one graph whose
 # wait kernel holds the PLE layer back until the host has read the round's n-gram rows and raised a

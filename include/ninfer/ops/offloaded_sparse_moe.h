@@ -244,7 +244,10 @@ void moe_route_dispatch(const Tensor& logits, std::int32_t top_k, MoeRouting& ro
 /// fewest-column ones first, are published as a request in mapped host memory with the x columns
 /// they read (compacted: the request's column k is x's k-th column read by a chosen job, in column
 /// order) and computed by the host's expert engine while the GPU computes the other jobs. Of the
-/// call's M misses, M / pcie_divisor stay on the GPU (0: the CPU takes up to max_jobs). The wait
+/// call's M misses, M / pcie_divisor stay on the GPU (0: the CPU takes up to max_jobs); with
+/// share_den > 0 the share rule replaces the divisor: the CPU takes min(max_jobs,
+/// (2 * share_num * M + share_den) / (2 * share_den)) of them (share_num / share_den of the misses,
+/// halves rounded up; offloaded_moe::select_prefill_cpu_jobs states it on the host). The wait
 /// lasts as long as the host's heartbeat word keeps changing; when it stops for
 /// kHeartbeatTimeoutNs the call writes kErrorHostSilent to the source's error word and leaves its
 /// CPU outputs unwritten (without an error word it traps). A call whose error word is already set
@@ -262,6 +265,11 @@ struct MoeCpuChannel {
     std::int32_t max_columns            = 0;
     std::int32_t pcie_divisor           = 3;
     std::int32_t max_job_columns        = offloaded_moe::kMaxColumns; // 1..kMaxColumns
+    // The share rule (prefill calls): 0 <= share_num <= share_den; share_den == 0 keeps the divisor.
+    // Two 16-bit words in the struct's tail padding, so its size and every kernel's parameter
+    // offsets are unchanged.
+    std::int16_t share_num = 0;
+    std::int16_t share_den = 0;
 };
 
 /// The narrow route's gate/up kernel (MoeExpertSource::gate_up_variant). Both compute the canonical
@@ -394,6 +402,10 @@ public:
     CpuMissService(const CpuMissService&)            = delete;
     CpuMissService& operator=(const CpuMissService&) = delete;
 
+    // Layer `layer`'s channel with the service's options. A caller may narrow its max_jobs and
+    // max_columns (never above the options, which size the buffers) and choose its rule
+    // (pcie_divisor, or share_num / share_den); channels of one service share its buffers, so their
+    // calls must not overlap (calls in stream order, each wait before the next call's plan).
     [[nodiscard]] MoeCpuChannel channel(int layer) const;
     [[nodiscard]] std::uint64_t served_requests() const noexcept;
     [[nodiscard]] std::uint64_t served_experts() const noexcept;

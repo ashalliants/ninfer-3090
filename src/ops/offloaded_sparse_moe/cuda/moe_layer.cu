@@ -970,10 +970,16 @@ __device__ __forceinline__ std::uint64_t global_ns() {
 }
 
 static_assert(moe::kMaxCpuJobColumns == moe::kMaxColumns, "select_cpu_jobs mirrors the CPU job width");
+// The share fields sit in the channel's tail padding: every kernel's parameter layout is unchanged.
+static_assert(sizeof(MoeCpuChannel) == 6 * sizeof(void*) + 6 * sizeof(std::int32_t),
+              "MoeCpuChannel grew: the expert kernels' parameter offsets moved");
 
 // One CTA picks the CPU jobs: of the call's M misses, want = min(max_jobs, M - M / pcie_divisor)
-// of those with at most max_job_columns columns, the fewest-column ones first and, within a width,
-// in job order (offloaded_moe::select_cpu_jobs states the same rule on the host). Each thread ranks
+// (with share_den > 0: min(max_jobs, round(M * share_num / share_den)), halves up) of those with at
+// most max_job_columns columns, the fewest-column ones first and, within a width, in job order
+// (offloaded_moe::select_cpu_jobs and, for the share, select_prefill_cpu_jobs state the same rule
+// on the host; jobs are in ascending expert id, so job order is id order). Publishing x is one CTA's
+// copy of the chosen jobs' columns: slow for a call of many columns. Each thread ranks
 // its jobs among their width with warp ballots. The chosen jobs are marked in cpu_flags and listed
 // in that order in call->job and the request. The x columns they read are published compacted, in
 // column order, then the request's sequence after a system-scope fence. With the source's error word
@@ -1020,8 +1026,14 @@ __global__ void __launch_bounds__(kThreads)
         // call's misses stay on the GPU and it does not wait out another heartbeat timeout.
         const bool failed =
             source.error != nullptr && *reinterpret_cast<const volatile std::uint32_t*>(source.error) != 0;
-        const int want =
-            failed ? 0 : min(cap, channel.pcie_divisor > 0 ? misses - misses / channel.pcie_divisor : misses);
+        int want = 0;
+        if (!failed && channel.share_den > 0) {
+            // cpu_share_take's rounding (cpu_share.h), before the width bound applied below.
+            const long long share = (2LL * channel.share_num * misses + channel.share_den) / (2LL * channel.share_den);
+            want                  = static_cast<int>(min(static_cast<long long>(cap), share));
+        } else if (!failed) {
+            want = min(cap, channel.pcie_divisor > 0 ? misses - misses / channel.pcie_divisor : misses);
+        }
         int m          = 0;
         for (int w = 1; w <= kWidths; ++w) {
             first_slot[w] = m;
@@ -1391,7 +1403,8 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
                     source.cpu.done != nullptr && source.cpu.sequence != nullptr &&
                     source.cpu.max_jobs <= moe::kMaxCpuJobs && source.cpu.max_columns <= moe::kMaxCpuCallColumns &&
                     source.cpu.max_job_columns >= 1 && source.cpu.max_job_columns <= moe::kMaxColumns &&
-                    source.cpu.pcie_divisor >= 0 && reinterpret_cast<std::uintptr_t>(x.data) % 16 == 0 &&
+                    source.cpu.pcie_divisor >= 0 && source.cpu.share_den >= 0 && source.cpu.share_num >= 0 &&
+                    source.cpu.share_num <= source.cpu.share_den && reinterpret_cast<std::uintptr_t>(x.data) % 16 == 0 &&
                     reinterpret_cast<std::uintptr_t>(source.cpu.x) % 16 == 0,
                 "CPU channel is incomplete");
         cpu_plan_kernel<<<1, kThreads, 0, stream>>>(dispatch, source, static_cast<const bf16*>(x.data), x.ne[1], top_k,

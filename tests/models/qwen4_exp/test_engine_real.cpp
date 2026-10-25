@@ -81,6 +81,14 @@
 //   ninfer_qwen4_exp_engine_real_test --cpu-verify-misses-exact --mtp K [--expert-cache-mib N]
 //       [--max-context N] [--generate N] [TOKENS...]
 //
+// Prefill CPU share (prefill_cpu_share_matches_plain below, --prefill-cpu-share 0.6): greedy ids
+// (and with --mtp K the MTP rounds, drafts and acceptances) equal those of a GPU-only prefill, and the
+// CPU must serve an expert. The same arguments as --moe-precast-exact; the default 300-token prompt
+// is one static call (shorter than the expert stream's 512), which is what the share applies to.
+//
+//   ninfer_qwen4_exp_engine_real_test --prefill-cpu-share-exact [--mtp K] [--expert-cache-mib N]
+//       [--max-context N] [--generate N] [TOKENS...]
+//
 // GDN commit on a side stream (gdn_async_commit_matches_serial below, --gdn-async-commit): greedy
 // ids, MTP rounds, drafts and acceptances equal those of the commit folded on the device stream, and
 // at least one fold ran on the side stream. The same arguments as --moe-precast-exact; --mtp K is
@@ -851,6 +859,18 @@ int cpu_verify_misses_matches_plain(const std::string& artifact, const std::vect
                                [] { return ops::offloaded_moe::CpuMissService::process_served_experts(); }});
 }
 
+// prefill_cpu_share_matches_plain (--prefill-cpu-share-exact, FlashNextOptions::prefill_cpu_share
+// at Basalt's 0.6): each layer of a prefill call that does not stream its experts hands the CPU miss
+// service 3 / 5 of its misses (those with the fewest columns, at most 8), computed beside the GPU's
+// staging; the greedy ids (and MTP statistics with --mtp) equal those of the GPU-only prefill, and the
+// CPU serves at least one expert. --expert-cache-mib N (both Engines) makes misses common.
+int prefill_cpu_share_matches_plain(const std::string& artifact, const std::vector<std::string>& args) {
+    return option_matches_off(artifact, args,
+                              {"GPU prefill", "prefill CPU share 3/5", "prefill cpu share",
+                               [](EngineOptions& o) { o.flash_next.prefill_cpu_share = {3, 5}; },
+                               [] { return ops::offloaded_moe::CpuMissService::process_served_experts(); }});
+}
+
 // gdn_async_commit_matches_serial (--gdn-async-commit-exact, FlashNextOptions::gdn_async_commit):
 // every MTP verification commit a row continues from folds its GDN columns on the Program's fold
 // stream, beside the drafter's catch-up and the next round's drafts, with the next round's front
@@ -1344,6 +1364,9 @@ int main(int argc, char** argv) {
         }
         if (!args.empty() && args.front() == "--cpu-verify-misses-exact") {
             return cpu_verify_misses_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
+        }
+        if (!args.empty() && args.front() == "--prefill-cpu-share-exact") {
+            return prefill_cpu_share_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
         }
         if (!args.empty() && args.front() == "--gdn-async-commit-exact") {
             return gdn_async_commit_matches_serial(artifact, std::vector<std::string>(args.begin() + 1, args.end()));

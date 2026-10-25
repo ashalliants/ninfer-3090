@@ -115,10 +115,13 @@ GdnQk gdn_qk(const Tensor& q, const Tensor& k, std::int32_t D, std::int32_t Hk, 
     return out;
 }
 
-// ForwardExperts::cpu: none, or one channel per layer with the error word their waits report to.
+// ForwardExperts::cpu and prefill_cpu: each none, or one channel per layer with the error word their
+// waits report to.
 void require_cpu_channels(const ForwardExperts& experts, std::uint32_t layers) {
-    if (!experts.cpu.empty() && (experts.cpu.size() != layers || experts.error == nullptr)) {
-        throw std::invalid_argument("Qwen4Exp forward: CPU miss channels need one per layer and an error word");
+    for (const auto* channels : {&experts.cpu, &experts.prefill_cpu}) {
+        if (!channels->empty() && (channels->size() != layers || experts.error == nullptr)) {
+            throw std::invalid_argument("Qwen4Exp forward: CPU miss channels need one per layer and an error word");
+        }
     }
 }
 
@@ -492,11 +495,11 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
                                       route_log(layer, static_cast<std::size_t>(config_.moe.top_k) * T));
         xm         = read.x;
         mlp_inject = read.inject;
-        ym         = moe(block.moe, xm, layer, route_tap, batch.verify != nullptr, &read);
+        ym         = moe(block.moe, xm, layer, route_tap, cpu_channels(batch), &read);
     } else {
         ops::hyper_connection_inject(y, inject, residual, s);
         xm = mix(block.mlp_hc, residual, &inject);
-        ym = moe(block.moe, xm, layer, route_tap, batch.verify != nullptr);
+        ym = moe(block.moe, xm, layer, route_tap, cpu_channels(batch));
     }
     ops::hyper_connection_inject(ym, mlp_inject, residual, s);
     if (tap != nullptr) {
@@ -752,8 +755,14 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, std::ui
     return y;
 }
 
-Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap, bool verify,
-                    const MoeRead* read) {
+const std::vector<ops::MoeCpuChannel>* Forward::cpu_channels(const ForwardBatch& batch) const noexcept {
+    if (batch.verify != nullptr) { return &experts_.cpu; }
+    const bool streaming = experts_.stream != nullptr && experts_.stream->active();
+    return batch.cpu_share && !streaming ? &experts_.prefill_cpu : nullptr;
+}
+
+Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,
+                    const std::vector<ops::MoeCpuChannel>* cpu_leg, const MoeRead* read) {
     const cudaStream_t s = device_.stream;
     const auto& m        = config_.moe;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size), E = dim(m.experts), K = dim(m.top_k);
@@ -819,11 +828,12 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
                                 .zero_copy_misses = experts_.zero_copy_misses};
     source.precast_input   = moe_precast_input_;
     source.gate_up_variant = gate_up_variant(moe_gate_up_registers_);
-    // A verification call's misses may go to the CPU miss service (ForwardExperts::cpu): the experts
-    // return before placing the CPU's outputs, and the wait below places them once the shared expert
-    // is enqueued, so the host computes them beside the GPU's experts and the shared expert.
-    const bool cpu = verify && !experts_.cpu.empty();
-    if (cpu) { source.cpu = experts_.cpu[layer]; }
+    // A verification call's misses (ForwardExperts::cpu) or a prefill call's CPU share (prefill_cpu)
+    // may go to the CPU miss service: the experts return before placing the CPU's outputs, and the
+    // wait below places them once the shared expert is enqueued, so the host computes them beside the
+    // GPU's experts (and their staging) and the shared expert.
+    const bool cpu = cpu_leg != nullptr && !cpu_leg->empty();
+    if (cpu) { source.cpu = (*cpu_leg)[layer]; }
     ExpertStream* stream = experts_.stream != nullptr && experts_.stream->active() ? experts_.stream : nullptr;
     if (stream != nullptr) {
         source.frames = stream->table(layer);
@@ -947,13 +957,13 @@ void Forward::layer_rows(std::uint32_t layer, const ForwardRowsBatch& batch) {
     if (fused_read(block.mlp_hc, B)) {
         const MoeRead read = read_moe(block.mlp_hc, block.moe.router, block.moe.shared_score, residual_, y, inject,
                                       route_log(layer, static_cast<std::size_t>(config_.moe.top_k) * B));
-        Tensor ym          = moe(block.moe, read.x, layer, nullptr, /*verify=*/false, &read);
+        Tensor ym          = moe(block.moe, read.x, layer, nullptr, /*cpu=*/nullptr, &read);
         ops::hyper_connection_inject(ym, read.inject, residual_, s);
         return;
     }
     ops::hyper_connection_inject(y, inject, residual_, s);
     Tensor xm = mix(block.mlp_hc, residual_, &inject);
-    Tensor ym = moe(block.moe, xm, layer, nullptr, /*verify=*/false);
+    Tensor ym = moe(block.moe, xm, layer, nullptr, /*cpu=*/nullptr);
     ops::hyper_connection_inject(ym, inject, residual_, s);
 }
 
