@@ -315,10 +315,12 @@ PleWeights bind_ple(Bindings& b, const TextConfig& c, const std::string& prefix)
     return out;
 }
 
-TextWeights bind_text(Bindings& b, const TextConfig& c) {
+TextWeights bind_text(Bindings& b, const TextConfig& c, bool hot_embedding) {
     TextWeights out;
     const std::uint64_t h = c.hidden_size, v = c.vocab_size;
-    out.token_embedding = b.parameter("text/token_embedding", {v, h}, {}, QType::GGML_IQ4_XS);
+    // --hot-embedding-rows: the whole table in the pinned block (mapped), first, before the banks.
+    out.token_embedding = b.parameter("text/token_embedding", {v, h}, {}, QType::GGML_IQ4_XS,
+                                      hot_embedding ? Residency::Pinned : Residency::Device);
     out.output_head     = b.parameter("text/output_head", {v, h}, "text/final_hidden", QType::GGML_IQ4_XS);
     out.final_mixer     = bind_hc(b, c, "text/final_mixer/", false);
     for (std::uint32_t i = 0; i < c.num_hidden_layers; ++i) {
@@ -435,7 +437,7 @@ bool has_mtp(const artifact::Reader& reader) { return has_mtp_component(reader.d
 
 bool has_vision(const artifact::Reader& reader) { return has_vision_component(reader.directory()); }
 
-LoadPlan plan_load(const artifact::Reader& reader, bool mtp, bool vision) {
+LoadPlan plan_load(const artifact::Reader& reader, bool mtp, bool vision, bool hot_embedding) {
     auto out    = std::make_unique<LoadPlan::Impl>();
     out->config = parse_config(reader.directory());
     if (mtp && !has_mtp_component(reader.directory())) {
@@ -450,7 +452,7 @@ LoadPlan plan_load(const artifact::Reader& reader, bool mtp, bool vision) {
     artifact::Binder binder(reader);
     out->resources = bind_resources(binder, out->config, out->vision_config);
     Bindings bindings(binder);
-    out->weights         = bind_text(bindings, out->config);
+    out->weights         = bind_text(bindings, out->config, hot_embedding);
     if (mtp) { out->mtp = bind_mtp(bindings, out->config); }
     // After the expert banks: the tower's groups follow them in the pinned block.
     if (vision) { out->vision = bind_vision(bindings, *out->vision_config, out->config); }
@@ -491,8 +493,9 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
                                             std::move(p.info), std::move(backing)));
 }
 
-std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext& device, bool mtp, bool vision) {
-    return materialize_model(plan_load(reader, mtp, vision), device);
+std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext& device, bool mtp, bool vision,
+                                  bool hot_embedding) {
+    return materialize_model(plan_load(reader, mtp, vision, hot_embedding), device);
 }
 
 } // namespace ninfer::models::qwen4_exp

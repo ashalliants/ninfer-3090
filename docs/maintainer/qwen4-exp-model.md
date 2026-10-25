@@ -25,7 +25,10 @@ decoding).
 
 Per call of T consecutive positions of one sequence (`execution/forward.cpp`):
 
-1. `x0 = embed(ids)` (GGML IQ4_XS rows decoded to BF16); `R = expand(x0)` into S streams.
+1. `x0 = embed(ids)` (GGML IQ4_XS rows decoded to BF16); `R = expand(x0)` into S streams. With
+   `--hot-embedding-rows N` the table is in the pinned host block and only rows [0, N) have a device
+   copy; `ops::embedding_split` reads the other rows through the mapped block, with the same values.
+   The MTP drafter's embedding takes the same route.
 2. For each block: the PLE injection (its layer), `xa, inject = mix(attn_hc, R)`,
    `y = GDN(xa)` or `QSA(xa)`, `R += inject * y`, `xm, inject = mix(mlp_hc, R)`, `y = MoE(xm)`,
    `R += inject * y` (each update rounded once to BF16).
@@ -117,8 +120,9 @@ unchanged. Per layer `L` under `text/layers/L/`:
 | `ple/{key,value}` (layer 1) | [S*H, 2560], [H, 2560] | one BF16 parent [12800, 2560] |
 | `ple/{key,query,conv}_norm`, `ple/convolution` | [S*H], [S*H, 4] | FP32 (the convolution is the GGUF's F16 widened, channel-major) |
 
-Globals: `text/token_embedding` and `text/output_head` [248320, H] (GGML IQ4_XS),
-`text/final_mixer/{norm,down,up}`. The n-gram table is the separate volume (`<artifact>.ngram`).
+Globals: `text/token_embedding` and `text/output_head` [248320, H] (GGML IQ4_XS; with
+`--hot-embedding-rows` the token embedding is pinned before the expert banks instead of in device
+memory), `text/final_mixer/{norm,down,up}`. The n-gram table is the separate volume (`<artifact>.ngram`).
 
 The drafter's parameters under `mtp/` mirror the text layer's names (`layers/0/attn_hc/...`,
 `layers/0/attention/...`, `layers/0/indexer/...`, `layers/0/moe/...`, `final_mixer/...`) plus

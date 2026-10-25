@@ -95,7 +95,7 @@ public:
     explicit Parameters(const Model& model);
 
     const Model& model;
-    Weight token_embedding; // GGML IQ4_XS [V, H]
+    Weight token_embedding; // GGML IQ4_XS [V, H] (in the pinned block with --hot-embedding-rows)
     Weight output_head;     // GGML IQ4_XS [V, H], FP32 logits
     HyperConnectionParameters final_mixer;
     std::vector<BlockParameters> layers;

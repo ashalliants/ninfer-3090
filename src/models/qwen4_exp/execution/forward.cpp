@@ -132,7 +132,9 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
                  ForwardKV kv, ForwardExperts experts, std::optional<ForwardMtp> mtp, ForwardOptions options)
     : parameters_(parameters), config_(parameters.model.config()), device_(device), work_(&work),
       state_(std::move(state)), kv_(std::move(kv)), experts_(std::move(experts)), mtp_(std::move(mtp)),
-      side_(options.shared_expert_stream ? std::make_unique<SideStream>() : nullptr) {
+      side_(options.shared_expert_stream ? std::make_unique<SideStream>() : nullptr),
+      hot_embedding_rows_(options.hot_embedding_rows), hot_embedding_(options.hot_embedding),
+      cold_embedding_(options.cold_embedding) {
     if (state_.gdn_conv.size() != config_.gdn_layers || state_.gdn_recurrent.size() != config_.gdn_layers ||
         state_.ple_slot.dtype != DType::I32 || state_.ple_slot.numel() != 1 ||
         state_.qsa_tails.size() != config_.attention_layers || kv_.layers.size() != config_.attention_layers ||
@@ -156,7 +158,9 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
 Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceArena& work, ForwardRowsState state,
                  ForwardRowsKV kv, ForwardExperts experts, std::optional<ForwardRowsMtp> mtp, ForwardOptions options)
     : parameters_(parameters), config_(parameters.model.config()), device_(device), work_(&work),
-      experts_(std::move(experts)), side_(options.shared_expert_stream ? std::make_unique<SideStream>() : nullptr) {
+      experts_(std::move(experts)), side_(options.shared_expert_stream ? std::make_unique<SideStream>() : nullptr),
+      hot_embedding_rows_(options.hot_embedding_rows), hot_embedding_(options.hot_embedding),
+      cold_embedding_(options.cold_embedding) {
     if (mtp.has_value() != parameters_.mtp.has_value()) {
         throw std::invalid_argument("Qwen4Exp forward: the MTP drafter's parameters and state go together");
     }
@@ -333,6 +337,14 @@ void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* t
     run_back(batch, 0, logits, tap);
 }
 
+void Forward::embed(const Tensor& ids, Tensor& x0, cudaStream_t s) const {
+    if (hot_embedding_rows_ == 0) {
+        ops::embedding(ids, parameters_.token_embedding, x0, s);
+    } else {
+        ops::embedding_split(ids, hot_embedding_, cold_embedding_, hot_embedding_rows_, x0, s);
+    }
+}
+
 std::uint32_t Forward::rows_layer() const noexcept {
     for (std::uint32_t l = 0; l < config_.num_hidden_layers; ++l) {
         if (parameters_.layers[l].ple) { return l; }
@@ -352,7 +364,7 @@ void Forward::run_front(const ForwardBatch& batch, std::uint32_t end, const Forw
     {
         auto scope = work_->scope();
         Tensor x0  = work_->alloc(DType::BF16, {H, T});
-        ops::embedding(batch.ids, parameters_.token_embedding, x0, s);
+        embed(batch.ids, x0, s);
         if (batch.vision != nullptr && batch.vision->columns.data != nullptr) {
             ops::scatter(batch.vision->embeddings, batch.vision->columns, x0, s);
         }
@@ -717,7 +729,7 @@ void Forward::run_rows_front(const ForwardRowsBatch& batch) {
     {
         auto scope = work_->scope();
         Tensor x0  = work_->alloc(DType::BF16, {H, B});
-        ops::embedding(batch.ids, parameters_.token_embedding, x0, s);
+        embed(batch.ids, x0, s);
         ops::hyper_connection_expand(x0, dim(config_.hc.streams), residual_, s);
     }
     const std::uint32_t split = rows_layer();
@@ -1071,7 +1083,7 @@ void Forward::mtp_block(const MtpCall& call) {
     try {
         // Input fusion: R = fc_hidden(each stream of RMSNorm_{S*H}(rows)) + fc_embedding(RMSNorm_H(embed(id))).
         Tensor x0 = work_->alloc(DType::BF16, {H, T});
-        ops::embedding(call.ids, parameters_.token_embedding, x0, s);
+        embed(call.ids, x0, s);
         if (call.vision != nullptr && call.vision->columns.data != nullptr) {
             ops::scatter(call.vision->embeddings, call.vision->columns, x0, s);
         }

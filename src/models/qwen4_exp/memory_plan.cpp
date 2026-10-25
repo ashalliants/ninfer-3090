@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::models::qwen4_exp {
 namespace {
@@ -50,6 +51,30 @@ HostMemoryLedger plan_host_memory(const HostMemorySnapshot& snapshot, const Host
         out.fits         = false;
     }
     return out;
+}
+
+HotEmbeddingPlan plan_hot_embedding(std::uint64_t vocab, std::uint64_t hidden, std::uint32_t hot_rows) {
+    if (hot_rows == 0) { return {}; }
+    if (hot_rows > vocab) {
+        throw std::invalid_argument("--hot-embedding-rows " + std::to_string(hot_rows) + " exceeds the model's " +
+                                    std::to_string(vocab) + " embedding rows: use at most " + std::to_string(vocab));
+    }
+    if (hidden == 0 || hidden % 256 != 0) {
+        throw std::invalid_argument("--hot-embedding-rows needs IQ4_XS embedding rows of whole 256-value blocks");
+    }
+    HotEmbeddingPlan out;
+    out.row_bytes = hidden / 256 * 136;
+    out.table     = vocab * out.row_bytes;
+    out.hot       = static_cast<std::uint64_t>(hot_rows) * out.row_bytes;
+    return out;
+}
+
+void plan_pinned_weights(HostMemoryDemand& demand, std::uint64_t pinned_block, const HotEmbeddingPlan& hot) {
+    if (pinned_block < hot.table) {
+        throw std::logic_error("Qwen3.8-Flash-Next: the pinned block is smaller than the embedding it holds");
+    }
+    demand.expert_banks = pinned_block - hot.table;
+    demand.other_pinned = hot.table;
 }
 
 ContextCacheFit fit_context_cache(const HostMemorySnapshot& snapshot, HostMemoryDemand demand, std::uint64_t requested,

@@ -170,15 +170,24 @@ __constant__ std::int8_t kIq4nlValues[16] = {-127, -104, -83, -65, -49, -35, -22
 
 // IQ4_XS: {fp16 d; u16 scales_h; u8 scales_l[4]; u8 qs[128]} per 256 values. One thread per output
 // value, in ggml's operation order: dl = d * (ls - 32), then y = dl * kvalue, both FP32.
+// Split: rows below hot_rows come from `hot`, the rest from `table` (embedding_split); otherwise
+// every row comes from `table`.
 constexpr int kIq4XsBlockBytes = 136;
+template <bool Split>
 __global__ void embed_gather_iq4_xs_kernel(const std::int32_t* __restrict__ ids,
                                            const std::uint8_t* __restrict__ table,
+                                           const std::uint8_t* __restrict__ hot, std::int32_t hot_rows,
                                            std::int64_t row_bytes, int d,
                                            __nv_bfloat16* __restrict__ out) {
     const int v = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
     if (v >= d) { return; }
-    const std::uint8_t* block = table + static_cast<std::int64_t>(ids[t]) * row_bytes +
+    const std::int32_t id      = ids[t];
+    const std::uint8_t* plane = table;
+    if constexpr (Split) {
+        if (id < hot_rows) { plane = hot; }
+    }
+    const std::uint8_t* block = plane + static_cast<std::int64_t>(id) * row_bytes +
                                 static_cast<std::int64_t>(v / 256) * kIq4XsBlockBytes;
     const int ib = (v % 256) / 32, j = v % 32;
     const auto d_bits = static_cast<unsigned short>(block[0] | (static_cast<unsigned>(block[1]) << 8));
@@ -196,9 +205,19 @@ void embed_gather_ggml_iq4_xs_launch(const Tensor& ids, const Weight& table, Ten
                                      cudaStream_t stream) {
     const int d = out.ne[0];
     const std::int64_t row_bytes = static_cast<std::int64_t>(d / 256) * kIq4XsBlockBytes;
-    embed_gather_iq4_xs_kernel<<<dim3((d + 255) / 256, ids.ne[0]), 256, 0, stream>>>(
-        static_cast<const std::int32_t*>(ids.data), static_cast<const std::uint8_t*>(table.qdata),
+    embed_gather_iq4_xs_kernel<false><<<dim3((d + 255) / 256, ids.ne[0]), 256, 0, stream>>>(
+        static_cast<const std::int32_t*>(ids.data), static_cast<const std::uint8_t*>(table.qdata), nullptr, 0,
         row_bytes, d, static_cast<__nv_bfloat16*>(out.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void embed_gather_ggml_iq4_xs_split_launch(const Tensor& ids, const Weight& hot, const Weight& cold,
+                                           std::int32_t hot_rows, Tensor& out, cudaStream_t stream) {
+    const int d = out.ne[0];
+    const std::int64_t row_bytes = static_cast<std::int64_t>(d / 256) * kIq4XsBlockBytes;
+    embed_gather_iq4_xs_kernel<true><<<dim3((d + 255) / 256, ids.ne[0]), 256, 0, stream>>>(
+        static_cast<const std::int32_t*>(ids.data), static_cast<const std::uint8_t*>(cold.qdata),
+        static_cast<const std::uint8_t*>(hot.qdata), hot_rows, row_bytes, d, static_cast<__nv_bfloat16*>(out.data));
     CUDA_CHECK(cudaGetLastError());
 }
 

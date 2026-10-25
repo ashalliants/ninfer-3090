@@ -52,7 +52,8 @@ public:
 
     [[nodiscard]] const TextConfig& config() const;
     [[nodiscard]] const FrontendResources& resources() const;
-    // Device bytes of the dense weights, and the page-locked Host bytes (the expert banks).
+    // Device bytes of the dense weights, and the page-locked Host bytes (the expert banks; with
+    // vision the tower and with hot_embedding the token embedding too).
     [[nodiscard]] std::uint64_t device_bytes() const;
     [[nodiscard]] std::uint64_t pinned_bytes() const;
     // Each layer's expert record stride (the bank's record format).
@@ -63,7 +64,7 @@ public:
 private:
     explicit LoadPlan(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;
-    friend LoadPlan plan_load(const artifact::Reader&, bool, bool);
+    friend LoadPlan plan_load(const artifact::Reader&, bool, bool, bool);
     friend class Model;
     friend std::unique_ptr<class Model> materialize_model(LoadPlan&&, DeviceContext&, const StartupObserver*);
 };
@@ -128,8 +129,11 @@ private:
 // the frontend resources, reading nothing but the resources. With `mtp` it binds the MTP drafter
 // too (the artifact must hold it); without, an artifact's drafter is left unread. With `vision` it
 // binds the vision tower in the pinned block after the expert banks and the frontend's vision
-// resources (the artifact must hold the tower).
-[[nodiscard]] LoadPlan plan_load(const artifact::Reader& reader, bool mtp = false, bool vision = false);
+// resources (the artifact must hold the tower). With `hot_embedding` (--hot-embedding-rows) the token
+// embedding is bound in the pinned block (before the banks) instead of device memory; the Program
+// copies its hot rows to the device and the forward reads the rest through the mapped block.
+[[nodiscard]] LoadPlan plan_load(const artifact::Reader& reader, bool mtp = false, bool vision = false,
+                                 bool hot_embedding = false);
 
 // Materializes a plan. Device memory is allocated before the pinned block.
 [[nodiscard]] std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
@@ -137,6 +141,6 @@ private:
 
 // plan_load then materialize_model.
 [[nodiscard]] std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext& device,
-                                                bool mtp = false, bool vision = false);
+                                                bool mtp = false, bool vision = false, bool hot_embedding = false);
 
 } // namespace ninfer::models::qwen4_exp

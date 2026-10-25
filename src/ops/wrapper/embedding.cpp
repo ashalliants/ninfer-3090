@@ -217,6 +217,20 @@ void require_fp8_metadata(const Weight& table, const Tensor& out) {
     (void)detail::validate_fp8_weight(table, "embedding");
 }
 
+// A ggml_blocks_v1 table: rows of D/256 blocks, codes only (scales live in the blocks).
+void require_ggml_iq4_xs_metadata(const Weight& table, const Tensor& out) {
+    require_weight_2d(table);
+    if (table.layout != QuantLayout::GgmlBlocks || table.shape[1] != out.ne[0] || out.ne[0] % 256 != 0 ||
+        table.qdata == nullptr) {
+        throw std::invalid_argument("embedding: GGML IQ4_XS table must be ggml_blocks_v1 [vocab,d], d % 256 == 0");
+    }
+    const std::uint64_t expected = checked_mul_u64(static_cast<std::uint64_t>(table.shape[0]),
+                                                   static_cast<std::uint64_t>(out.ne[0]) / 256 * 136);
+    if (table.payload_bytes != 0 && table.payload_bytes < expected) {
+        throw std::invalid_argument("embedding: GGML IQ4_XS payload is too small");
+    }
+}
+
 bool is_empty_T(const Tensor& ids, const Tensor& out) { return ids.ne[0] == 0 || out.ne[1] == 0; }
 
 void require_non_empty_tensors(const Tensor& ids, const Tensor& out) {
@@ -268,22 +282,12 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
         require_non_empty_tensors(ids, out);
         detail::embed_gather_q8_launch(ids, table, out, stream);
         break;
-    case QType::GGML_IQ4_XS: {
-        // A ggml_blocks_v1 table: rows of D/256 blocks, codes only (scales live in the blocks).
-        require_weight_2d(table);
-        if (table.layout != QuantLayout::GgmlBlocks || table.shape[1] != out.ne[0] ||
-            out.ne[0] % 256 != 0 || table.qdata == nullptr) {
-            throw std::invalid_argument("embedding: GGML IQ4_XS table must be ggml_blocks_v1 [vocab,d], d % 256 == 0");
-        }
-        const std::uint64_t expected = checked_mul_u64(static_cast<std::uint64_t>(table.shape[0]),
-                                                       static_cast<std::uint64_t>(out.ne[0]) / 256 * 136);
-        if (table.payload_bytes != 0 && table.payload_bytes < expected) {
-            throw std::invalid_argument("embedding: GGML IQ4_XS payload is too small");
-        }
+    case QType::GGML_IQ4_XS:
+        require_ggml_iq4_xs_metadata(table, out);
         if (is_empty_T(ids, out)) { return; }
         require_non_empty_tensors(ids, out);
         detail::embed_gather_ggml_iq4_xs_launch(ids, table, out, stream);
-    } break;
+        break;
     case QType::FP8_E4M3FN_ROW_BF16:
         require_fp8_metadata(table, out);
         if (is_empty_T(ids, out)) { return; }
@@ -293,6 +297,27 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
     default:
         throw std::invalid_argument("embedding: unsupported table qtype");
     }
+}
+
+void embedding_split(const Tensor& ids, const Weight& hot, const Weight& cold, std::int32_t hot_rows, Tensor& out,
+                     cudaStream_t stream) {
+    if (ids.dtype != DType::I32) { throw std::invalid_argument("embedding_split: ids must be I32"); }
+    if (out.dtype != DType::BF16) { throw std::invalid_argument("embedding_split: out must be BF16"); }
+    (void)numel_allow_zero(ids, "ids");
+    (void)numel_allow_zero(out, "out");
+    require_ids_shape(ids);
+    require_out_shape(ids, out);
+    if (hot.qtype != QType::GGML_IQ4_XS || cold.qtype != QType::GGML_IQ4_XS) {
+        throw std::invalid_argument("embedding_split: both planes must be GGML IQ4_XS");
+    }
+    require_ggml_iq4_xs_metadata(hot, out);
+    require_ggml_iq4_xs_metadata(cold, out);
+    if (hot_rows < 1 || hot_rows > cold.shape[0] || hot.shape[0] != hot_rows) {
+        throw std::invalid_argument("embedding_split: hot must hold rows [0,hot_rows), 1 <= hot_rows <= vocab");
+    }
+    if (is_empty_T(ids, out)) { return; }
+    require_non_empty_tensors(ids, out);
+    detail::embed_gather_ggml_iq4_xs_split_launch(ids, hot, cold, hot_rows, out, stream);
 }
 
 } // namespace ninfer::ops

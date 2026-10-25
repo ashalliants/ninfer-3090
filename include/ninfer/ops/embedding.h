@@ -5,6 +5,8 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
+
 namespace ninfer::ops {
 
 /**
@@ -27,5 +29,33 @@ namespace ninfer::ops {
  * There is no workspace or persistent state side effect.
  */
 void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream);
+
+/**
+ * Op: embedding gather from a table held in two planes
+ *
+ * Math / indexing:
+ *   ideal[d,t] = dequantize(row(ids[t]))[d], where row(i) is row i of `hot` when i < hot_rows and
+ *   row i of `cold` otherwise.
+ *
+ * Logical shapes:
+ *   `ids` contiguous I32 [T], every id in [0,vocab); `out` contiguous BF16 [D,T]; `cold` the whole
+ *   table [vocab,D]; `hot` [hot_rows,D], 1 <= hot_rows <= vocab. Both planes hold the same rows
+ *   [0,hot_rows): the Op reads those rows from `hot` and never reads them from `cold`.
+ *
+ * Supported domain:
+ *   GGML_IQ4_XS ggml_blocks_v1 planes (D a multiple of 256), each plane in any memory the device can
+ *   read (device memory, or mapped page-locked host memory through its device pointer).
+ *
+ * Numeric:
+ *   Each value is decoded as `embedding` decodes a GGML_IQ4_XS table (an exact output): the result is
+ *   bitwise `embedding(ids, table, out)` for a table whose rows are the planes' rows as above.
+ *
+ * Effects:
+ *   Writes `out`. `out` must not overlap `ids` or either plane.
+ *
+ * Workspace: none.
+ */
+void embedding_split(const Tensor& ids, const Weight& hot, const Weight& cold, std::int32_t hot_rows, Tensor& out,
+                     cudaStream_t stream);
 
 } // namespace ninfer::ops

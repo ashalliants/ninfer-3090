@@ -418,6 +418,51 @@ void test_kv_growth() {
     }
 }
 
+// --hot-embedding-rows: the token embedding (248,320 IQ4_XS rows of 2,560 values, 1,360 bytes each)
+// leaves the dense device weights for the pinned block, whole, and its first N rows get a device
+// copy. With N = 8192 (Basalt's) the device holds (V - N) rows fewer and the pinned demand grows by
+// the whole table; with N = 0 nothing changes.
+void test_hot_embedding_ledgers() {
+    constexpr std::uint64_t kVocab = 248'320, kHidden = 2'560, kRow = 10 * 136;
+    const HotEmbeddingPlan off = plan_hot_embedding(kVocab, kHidden, 0);
+    require(off.row_bytes == 0 && off.table == 0 && off.hot == 0, "N = 0 plans nothing");
+    const HotEmbeddingPlan on = plan_hot_embedding(kVocab, kHidden, 8192);
+    require(on.row_bytes == kRow, "a row is hidden / 256 IQ4_XS blocks of 136 bytes");
+    require(on.table == kVocab * kRow && on.table == 337'715'200ULL, "the whole table moves to the pinned block");
+    require(on.hot == 8192 * kRow && on.hot == 11'141'120ULL, "the hot copy is the first 8192 rows");
+    // Device: the dense weights lose the table, the Program's fixed allocations gain the hot rows.
+    require(on.table - on.hot == (kVocab - 8192) * kRow && on.table - on.hot == 326'574'080ULL,
+            "the device plan shrinks by (V - N) rows");
+    require(plan_hot_embedding(kVocab, kHidden, static_cast<std::uint32_t>(kVocab)).hot == on.table,
+            "N = V copies every row");
+    bool refused = false;
+    try {
+        (void)plan_hot_embedding(kVocab, kHidden, static_cast<std::uint32_t>(kVocab) + 1);
+    } catch (const std::invalid_argument& error) {
+        refused = std::string(error.what()).find("--hot-embedding-rows") != std::string::npos;
+    }
+    require(refused, "N above the vocabulary is refused naming --hot-embedding-rows");
+
+    // Host: the pinned block holds the banks, and with the option the table too; the ledger plans
+    // the table as other_pinned and the rest as the banks.
+    const HostMemoryDemand base = flash_next();
+    HostMemoryDemand plain      = base;
+    plan_pinned_weights(plain, base.expert_banks, off);
+    require(plain.expert_banks == base.expert_banks && plain.other_pinned == 0, "N = 0 leaves the pinned terms");
+    HostMemoryDemand hot = base;
+    plan_pinned_weights(hot, base.expert_banks + on.table, on);
+    require(hot.expert_banks == base.expert_banks && hot.other_pinned == on.table,
+            "the table is other_pinned and the banks are unchanged");
+    const HostMemorySnapshot s = snapshot(60 * kGiB, 200 * kGiB);
+    const HostMemoryLedger a = plan_host_memory(s, plain), b = plan_host_memory(s, hot);
+    require(b.pinned_total - a.pinned_total == kVocab * kRow, "the pinned total grows by the whole table");
+    // The lock overhead is rounded up over every other pin at once: within a byte of 0.25 % of the table.
+    const std::uint64_t overhead = (on.table * 25) / 10'000;
+    require(b.planned - a.planned >= on.table + overhead && b.planned - a.planned <= on.table + overhead + 1,
+            "the ledger plans the table with its lock overhead");
+    require(b.full_need == a.full_need, "the experts' need is unchanged");
+}
+
 } // namespace
 
 int main() {
@@ -435,6 +480,7 @@ int main() {
         test_spill();
         test_control_law();
         test_kv_growth();
+        test_hot_embedding_ledgers();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

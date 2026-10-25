@@ -7,7 +7,7 @@
 // shared-expert formats, and weights needing more are refused at startup naming the flag.
 // --mtp-constrained: a verification's per-position grammar masks (one per draft and the bonus) are
 // a named term too, zero when the option or MTP is off. So are --mtp-joint-acceptance's draft
-// probabilities.
+// probabilities, and --hot-embedding-rows's device copy of the embedding's first rows.
 
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/program/program.h"
@@ -204,6 +204,30 @@ int main() {
         } catch (const std::exception&) {
         }
         check(refused, "--mtp-joint-acceptance with --mtp-fixed is refused naming both");
+
+        // --hot-embedding-rows: the device copy of the first rows is a term of fixed_bytes (the whole
+        // table moves to the pinned block: test_memory_plan's hot_embedding_ledgers); above the
+        // vocabulary startup refuses naming the flag, before the device is asked anything.
+        q4::ProgramOptions hot;
+        hot.max_context = 32768;
+        check(hot.hot_embedding_rows == 0, "hot embedding rows are on by default");
+        check(q4::plan_hot_embedding(model.vocab_size, model.hidden_size, hot.hot_embedding_rows).hot == 0,
+              "off plans no hot rows");
+        check(q4::plan_hot_embedding(model.vocab_size, model.hidden_size, 8192).hot == 8192ULL * 1360,
+              "8192 hot rows plan 8192 rows of 1360 bytes");
+        q4::ProgramDevicePlan with_hot;
+        with_hot.io            = 500;
+        with_hot.hot_embedding = 8192ULL * 1360;
+        check(with_hot.fixed_bytes() == 500 + 8192ULL * 1360, "fixed_bytes counts the hot embedding rows");
+        hot.hot_embedding_rows = model.vocab_size + 1;
+        refused                = false;
+        try {
+            (void)q4::Program::plan_device(hot, model, 248077, {});
+        } catch (const std::invalid_argument& error) {
+            refused = std::string(error.what()).find("--hot-embedding-rows") != std::string::npos;
+        } catch (const std::exception&) {
+        }
+        check(refused, "--hot-embedding-rows above the vocabulary is refused naming the flag");
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

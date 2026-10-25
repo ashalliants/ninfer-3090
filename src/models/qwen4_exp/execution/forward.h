@@ -252,6 +252,13 @@ struct ForwardOptions {
     // (shared_expert_scratch_bytes per call; the caller plans and checks it, see
     // max_shared_expert_scratch_bytes).
     bool shared_expert_stream = false;
+    // Nonzero: the token embedding is read in two planes (ops::embedding_split) in the text model and
+    // the MTP drafter alike: ids below hot_embedding_rows from `hot_embedding` (device memory, rows
+    // [0, hot_embedding_rows)), the rest from `cold_embedding` (the whole table, through its device
+    // pointer in mapped pinned host memory). Bitwise the values of ops::embedding over the table.
+    std::int32_t hot_embedding_rows = 0;
+    Weight hot_embedding;
+    Weight cold_embedding;
 };
 
 class Forward {
@@ -343,6 +350,8 @@ private:
     Tensor mtp_attention(const MtpParameters& p, const Tensor& x, const MtpCall& call);
     void mtp_block(const MtpCall& call);
     void mtp_cells(const MtpChunk& chunk, const Tensor& residual);
+    // The token embedding of `ids` into `x0` (ForwardOptions::hot_embedding_rows selects the planes).
+    void embed(const Tensor& ids, Tensor& x0, cudaStream_t s) const;
     // ForwardOptions::shared_expert_stream's stream (the greatest priority) and its two events.
     class SideStream {
     public:
@@ -386,6 +395,9 @@ private:
     ForwardExperts experts_;
     std::optional<ForwardMtp> mtp_;
     std::unique_ptr<SideStream> side_; // set with ForwardOptions::shared_expert_stream
+    // ForwardOptions::hot_embedding_rows and its planes (0: parameters_.token_embedding).
+    std::int32_t hot_embedding_rows_ = 0;
+    Weight hot_embedding_, cold_embedding_;
     Tensor mtp_frames_; // I32 [E]: every drafter expert resident at its own index
     DeviceBuffer mtp_frames_backing_;
     Tensor residual_; // the call's residual stream, in the workspace from run_front to run_back
