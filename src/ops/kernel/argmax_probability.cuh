@@ -1,10 +1,14 @@
 #pragma once
 
 // Implements: include/ninfer/ops/argmax_probability.h
-// Match: contiguous finite FP32 [physical_rows,C], valid_rows <= physical_rows, I32 [C], FP32 [C].
+// Match: contiguous FP32 [physical_rows,C] (any values), valid_rows <= physical_rows, I32 [C], FP32 [C].
 // Algorithm assumptions: a first pass reduces each kArgmaxProbabilityTileRows-row tile of a column
 // to its BF16-key winner (value, lower id), its FP32 maximum and its sum of exp(l - tile max); a
-// second pass, one CTA per column, combines the tiles in a fixed order (deterministic, no atomics).
+// second pass, one CTA per column, combines the tiles in a fixed order (deterministic, no atomics)
+// and seeds the winner with row 0 as ops::argmax does, so a NaN key at row 0 selects row 0.
+// Each term's argument l - max is rounded to FP32 before expf; its rounding residual (TwoSum) is
+// added back to first order, so a coherent argument error (many equal rows, |l - max| in [8, 16))
+// does not reach the sum. The terms accumulate in FP64.
 
 #include <cuda_bf16.h>
 #include <math_constants.h>
@@ -77,6 +81,19 @@ __device__ __forceinline__ void argmax_probability_block_winner(float& key, std:
     maximum = warp_maxima[0];
 }
 
+// exp(logit - maximum) for logit <= maximum: expf of the FP32-rounded difference, corrected by the
+// difference's rounding residual (exp(d + r) ~ exp(d) (1 + r)). -inf contributes 0; NaN, and +inf
+// (inf - inf), give NaN.
+__device__ __forceinline__ float argmax_probability_term(float logit, float maximum) {
+    if (logit == -CUDART_INF_F) { return 0.0f; }
+    const float negated  = -maximum;
+    const float d        = logit + negated;
+    const float virtual_ = d - logit;
+    const float residual = (logit - (d - virtual_)) + (negated - virtual_);
+    const float e        = expf(d);
+    return fmaf(e, residual, e);
+}
+
 // Block-wide sum; thread 0 receives the result.
 __device__ __forceinline__ double argmax_probability_block_sum(double value) {
     __shared__ double warp_sums[kArgmaxProbabilityWarps];
@@ -124,7 +141,7 @@ __launch_bounds__(kArgmaxProbabilityBlock) __global__
 #pragma unroll
     for (int item = 0; item < kArgmaxProbabilityItems; ++item) {
         const std::int32_t v = first + item * kArgmaxProbabilityBlock + static_cast<std::int32_t>(threadIdx.x);
-        if (v < valid_rows) { sum += static_cast<double>(expf(values[item] - maximum)); }
+        if (v < valid_rows) { sum += static_cast<double>(argmax_probability_term(values[item], maximum)); }
     }
     sum = argmax_probability_block_sum(sum);
     if (threadIdx.x == 0) {
@@ -156,11 +173,19 @@ __launch_bounds__(kArgmaxProbabilityBlock) __global__
 
     double sum = 0.0;
     for (std::int32_t p = static_cast<std::int32_t>(threadIdx.x); p < tiles; p += kArgmaxProbabilityBlock) {
-        sum += sums[first + p] * exp(static_cast<double>(maxima[first + p]) - static_cast<double>(maximum));
+        // A tile without a finite or +inf maximum (every row -inf or NaN) adds its sum as is: 0, or NaN.
+        const float tile_max = maxima[first + p];
+        sum += tile_max == -CUDART_INF_F
+                   ? sums[first + p]
+                   : sums[first + p] * exp(static_cast<double>(tile_max) - static_cast<double>(maximum));
     }
     sum = argmax_probability_block_sum(sum);
     if (threadIdx.x == 0) {
-        const float winner = logits[static_cast<std::int64_t>(t) * physical_rows + index];
+        const std::int64_t base = static_cast<std::int64_t>(t) * physical_rows;
+        // ops::argmax's winner starts at row 0 and only a strictly better key replaces it: a NaN key at
+        // row 0 is never replaced, and a NaN key elsewhere never wins.
+        if (!argmax_probability_better(key, index, argmax_probability_key(logits[base]), 0)) { index = 0; }
+        const float winner = logits[base + index];
         ids[t]             = index;
         probs[t]           = static_cast<float>(exp(static_cast<double>(winner) - static_cast<double>(maximum)) / sum);
     }

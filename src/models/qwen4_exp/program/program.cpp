@@ -501,6 +501,10 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     if (o.mtp_draft_tokens > 7) {
         throw std::invalid_argument("Qwen3.8-Flash-Next verifies at most 7 MTP drafts per round: use --draft-tokens 1..7");
     }
+    if (o.mtp_joint_acceptance && o.mtp_fixed_drafts) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next: --mtp-joint-acceptance chooses how many drafts each round "
+                                    "verifies and --mtp-fixed always verifies --draft-tokens: use one of them");
+    }
     Layout d;
     d.drafts       = static_cast<std::int32_t>(o.mtp_draft_tokens);
     d.max_width    = 1 + d.drafts;
