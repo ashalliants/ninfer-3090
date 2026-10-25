@@ -36,6 +36,13 @@
 //     artifact (layers of IQ2_S, IQ2_XXS and IQ1_M), GPU = CPU bit for bit and FP64 per expert.
 //   - A CPU miss service whose thread has failed: its heartbeat stops, failure() says why, and a call
 //     that hands it misses ends after the heartbeat timeout with kErrorHostSilent in the error word.
+//   - cpu_verify_leg: the CPU leg as an MTP verification runs it (--cpu-verify-misses): moe_experts
+//     without the wait, other work on the stream (the shared expert's place), then
+//     moe_experts_cpu_wait, at T in {2, 3, 8, 16}, eagerly and replayed twice from a captured graph,
+//     for three selections (the Program's 4 jobs with a third of the misses left on the GPU, every
+//     miss, and 2-column jobs only): every output equals the CPU engine's bit for bit, and each
+//     published MissRequest lists exactly offloaded_moe::select_cpu_jobs of the call's jobs, widths
+//     and residency, with each job's columns compacted in column order.
 //   - malformed inputs: a short shared gate and a non-unit third extent are rejected on the host;
 //     an id outside [0, E) is logged but not dispatched, on both dispatch routes.
 //
@@ -50,6 +57,7 @@
 #include "ninfer/ops/offloaded_sparse_moe.h"
 #include "ninfer/ops/silu_mul.h"
 #include "offloaded_moe_fixtures.h"
+#include "ops/offloaded_sparse_moe/cpu_selection.h"
 #include "ops/offloaded_sparse_moe/dispatch_plan.h"
 
 #include <cuda_runtime.h>
@@ -705,6 +713,158 @@ void test_host_silent() {
                 seconds);
 }
 
+// The CPU leg of a verification call (--cpu-verify-misses), in the Forward's order: moe_experts with
+// wait_for_cpu == false, unrelated work on the stream (the shared expert), then moe_experts_cpu_wait.
+// The outputs equal the CPU engine's, eagerly and from a replayed graph; the request the call
+// publishes is select_cpu_jobs of the call's dispatch and residency.
+void test_cpu_verify_leg() {
+    std::mt19937 rng(606);
+    constexpr int kExperts = 64, kTopK = 10, kStagingSlots = 4;
+    const QType format = QType::GGML_REC_IQ2_S_Q2_0;
+    std::vector<std::vector<std::uint8_t>> records;
+    for (int e = 0; e < kExperts; ++e) { records.push_back(random_record(format, rng)); }
+    const auto bank = make_bank(format, records, align256(om::record_geometry(format).bytes));
+    cudaStream_t stream = nullptr;
+    cuda_ok(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "leg stream");
+    struct Leg {
+        const char* name;
+        int resident_every, cap, divisor, max_job_columns, workers;
+    };
+    int published = 0;
+    for (const Leg& leg : {Leg{"4 jobs, divisor 3", 3, 4, 3, om::kMaxColumns, 6},
+                           Leg{"every miss", 4, 64, 0, om::kMaxColumns, 6}, Leg{"2-column jobs", 3, 3, 3, 2, 1}}) {
+        om::CpuMissService::Options o;
+        o.workers         = leg.workers;
+        o.max_jobs        = leg.cap;
+        o.max_columns     = 16;
+        o.pcie_divisor    = leg.divisor;
+        o.max_job_columns = leg.max_job_columns;
+        om::CpuMissService service({{bank.pinned->host, bank.stride, bank.format}}, o);
+        std::vector<std::int32_t> frames(kExperts, -1);
+        std::vector<std::uint8_t> resident(kExperts, 0);
+        for (int e = 0; e < kExperts; e += leg.resident_every) {
+            frames[e]   = e;
+            resident[e] = 1;
+        }
+        DeviceBuffer d_frames(frames.size() * 4);
+        d_frames.copy_from_host(frames.data(), frames.size() * 4);
+        DeviceBuffer staging(bank.stride * kStagingSlots);
+        Pinned error(64);
+        auto* error_word = reinterpret_cast<volatile std::uint32_t*>(error.host);
+        *error_word      = 0;
+        for (const int columns : g_small ? std::vector<int>{2, 8} : std::vector<int>{2, 3, 8, 16}) {
+            const std::string label = std::string(leg.name) + " T=" + std::to_string(columns);
+            std::vector<float> f32;
+            (void)random_logits(kExperts, columns, rng, f32);
+            DeviceRouting r(f32, kExperts, kTopK, columns);
+            const auto ids  = download<std::int32_t>(r.ids.p, static_cast<std::size_t>(kTopK) * columns);
+            const auto x    = random_x(columns, rng);
+            const auto want = expected_outputs(bank, x, ids, kTopK, columns);
+            const int max_jobs = std::min(kExperts, kTopK * columns);
+            DeviceBuffer x_dev(x.size() * 2), outputs(want.size() * 2), scratch(1 << 20);
+            x_dev.copy_from_host(x.data(), x.size() * 2);
+            DeviceBuffer workspace(ops::moe_experts_workspace_bytes(max_jobs, kTopK * columns, columns));
+            const Tensor xt(x_dev.p, DType::BF16, {om::kHidden, columns});
+            Tensor out(outputs.p, DType::BF16, {om::kHidden, kTopK * columns});
+            ops::MoeExpertSource source;
+            source.format        = bank.format;
+            source.frame_base    = static_cast<const std::uint8_t*>(bank.frames->p);
+            source.frames        = static_cast<const std::int32_t*>(d_frames.p);
+            source.host_records  = bank.pinned->device;
+            source.record_stride = bank.stride;
+            source.error         = reinterpret_cast<std::uint32_t*>(error.device);
+            source.staging_base  = static_cast<std::uint8_t*>(staging.p);
+            source.staging_slots = kStagingSlots;
+            source.cpu           = service.channel(0);
+            const auto call = [&] {
+                ops::moe_experts(xt, r.view, source, kTopK, max_jobs, workspace.p, out, stream, /*wait_for_cpu=*/false);
+                cuda_ok(cudaMemsetAsync(scratch.p, 0x5A, scratch.bytes, stream), "work beside the CPU leg");
+                ops::moe_experts_cpu_wait(xt, r.view, source, max_jobs, workspace.p, out, stream);
+            };
+            // The call's jobs (ascending expert id), widths and compacted columns, from the dispatch.
+            const int jobs     = download<std::int32_t>(r.view.job_count, 1)[0];
+            const auto experts = download<std::int32_t>(r.view.jobs, static_cast<std::size_t>(jobs));
+            const auto offsets = download<std::int32_t>(r.view.offsets, kExperts + 1);
+            const auto entries = download<std::int32_t>(r.view.entries, static_cast<std::size_t>(kTopK) * columns);
+            std::vector<std::int32_t> widths;
+            for (const int e : experts) { widths.push_back(offsets[e + 1] - offsets[e]); }
+            const auto chosen = om::select_cpu_jobs(experts, widths, resident, leg.cap, leg.divisor, leg.max_job_columns);
+            std::vector<int> compact(static_cast<std::size_t>(columns), -1);
+            {
+                std::vector<bool> used(static_cast<std::size_t>(columns), false);
+                for (const int j : chosen) {
+                    const int e = experts[static_cast<std::size_t>(j)];
+                    for (int c = offsets[e]; c < offsets[e + 1]; ++c) { used[static_cast<std::size_t>(entries[c] / kTopK)] = true; }
+                }
+                for (int t = 0, k = 0; t < columns; ++t) {
+                    if (used[static_cast<std::size_t>(t)]) { compact[static_cast<std::size_t>(t)] = k++; }
+                }
+            }
+            const auto check_request = [&](std::uint32_t before, const std::string& at) {
+                const om::MissRequest& q = *source.cpu.request;
+                const std::uint32_t sequence = *reinterpret_cast<const volatile std::uint32_t*>(&q.sequence);
+                if (chosen.empty()) {
+                    check(sequence == before, at + ": a call with nothing for the CPU published a request");
+                    return;
+                }
+                check(sequence != before, at + ": the call published no request");
+                check(q.layer == 0 && q.jobs == static_cast<int>(chosen.size()),
+                      at + ": the request's job count differs from select_cpu_jobs");
+                for (std::size_t i = 0; i < chosen.size() && i < static_cast<std::size_t>(q.jobs); ++i) {
+                    const int e = experts[static_cast<std::size_t>(chosen[i])];
+                    check(q.expert[i] == e && q.ncols[i] == widths[static_cast<std::size_t>(chosen[i])],
+                          at + ": slot " + std::to_string(i) + " differs from select_cpu_jobs");
+                    for (int c = 0; c < q.ncols[i] && c < om::kMaxColumns; ++c) {
+                        check(q.column[i][c] == compact[static_cast<std::size_t>(entries[offsets[e] + c] / kTopK)],
+                              at + ": slot " + std::to_string(i) + " column " + std::to_string(c) + " is not compacted");
+                    }
+                }
+            };
+            const auto compare = [&](const std::string& at) {
+                const auto got         = download<std::uint16_t>(outputs.p, want.size());
+                std::size_t mismatches = 0;
+                for (std::size_t i = 0; i < got.size(); ++i) { mismatches += got[i] != want[i] ? 1 : 0; }
+                check(mismatches == 0, at + ": " + std::to_string(mismatches) + " BF16 outputs differ from the CPU engine");
+                check(*error_word == 0, at + ": the error word is set");
+            };
+            const std::uint64_t served = service.served_experts();
+            // Eagerly (which also configures the kernels outside the capture).
+            std::uint32_t before = *reinterpret_cast<const volatile std::uint32_t*>(&source.cpu.request->sequence);
+            cuda_ok(cudaMemsetAsync(outputs.p, 0xFF, outputs.bytes, stream), "poison the outputs");
+            call();
+            cuda_ok(cudaStreamSynchronize(stream), label.c_str());
+            compare(label + " eager");
+            check_request(before, label + " eager");
+            // Captured once, replayed twice: each replay publishes its own request (the device's sequence).
+            cudaGraph_t graph = nullptr;
+            cuda_ok(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "begin capture");
+            call();
+            cuda_ok(cudaStreamEndCapture(stream, &graph), "end capture");
+            cudaGraphExec_t exec = nullptr;
+            cuda_ok(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+            for (int replay = 0; replay < 2; ++replay) {
+                before = *reinterpret_cast<const volatile std::uint32_t*>(&source.cpu.request->sequence);
+                cuda_ok(cudaMemsetAsync(outputs.p, 0xFF, outputs.bytes, stream), "poison the outputs");
+                cuda_ok(cudaGraphLaunch(exec, stream), "replay");
+                cuda_ok(cudaStreamSynchronize(stream), "replay");
+                compare(label + " replay " + std::to_string(replay));
+                check_request(before, label + " replay " + std::to_string(replay));
+            }
+            cuda_ok(cudaGraphExecDestroy(exec), "destroy exec");
+            cuda_ok(cudaGraphDestroy(graph), "destroy graph");
+            check(service.failure().empty(), label + ": the CPU service failed: " + service.failure());
+            check(service.served_experts() - served == 3 * chosen.size(),
+                  label + ": the service did not serve select_cpu_jobs' experts on each of the three calls");
+            published += chosen.empty() ? 0 : 1;
+            std::printf("cpu_verify_leg %s: %zu of %d jobs on the CPU, outputs bit-identical eagerly and in two "
+                        "replays, request = select_cpu_jobs\n",
+                        label.c_str(), chosen.size(), jobs);
+        }
+    }
+    check(published > 0, "cpu_verify_leg: no call handed the CPU any expert");
+    cuda_ok(cudaStreamDestroy(stream), "leg stream");
+}
+
 // ------------------------------------------------------------------------------ layer against FP64
 
 Weight ggml_weight(QType format, std::int32_t n, std::int32_t k, const DeviceBuffer& storage) {
@@ -1084,6 +1244,7 @@ int main(int argc, char** argv) {
     test_fused_route_dispatch();
     test_layer_fp64();
     test_host_silent();
+    test_cpu_verify_leg();
     test_precast_read_proof();
     if (const char* path = std::getenv("NINFER_TEST_ARTIFACT"); path != nullptr && *path != 0) {
         test_real_banks(path);

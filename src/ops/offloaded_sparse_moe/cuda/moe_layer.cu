@@ -21,6 +21,7 @@
 
 #include "ops/common/canonical_ggml.h"
 #include "ops/offloaded_sparse_moe/coresident.h"
+#include "ops/offloaded_sparse_moe/cpu_selection.h"
 #include "ops/offloaded_sparse_moe/cuda/expert_decode.cuh"
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
 
@@ -1033,11 +1034,14 @@ __device__ __forceinline__ std::uint64_t global_ns() {
     return now;
 }
 
+static_assert(moe::kMaxCpuJobColumns == moe::kMaxColumns, "select_cpu_jobs mirrors the CPU job width");
+
 // One CTA picks the CPU jobs: of the call's M misses, want = min(max_jobs, M - M / pcie_divisor)
 // of those with at most max_job_columns columns, the fewest-column ones first and, within a width,
-// in job order. Each thread ranks its jobs among their width with warp ballots. The chosen jobs are
-// marked in cpu_flags and listed in that order in call->job and the request. The x columns they read
-// are published compacted, in column order, then the request's sequence after a system-scope fence.
+// in job order (offloaded_moe::select_cpu_jobs states the same rule on the host). Each thread ranks
+// its jobs among their width with warp ballots. The chosen jobs are marked in cpu_flags and listed
+// in that order in call->job and the request. The x columns they read are published compacted, in
+// column order, then the request's sequence after a system-scope fence.
 __global__ void __launch_bounds__(kThreads)
     cpu_plan_kernel(MoeDispatch dispatch, MoeExpertSource source, const bf16* __restrict__ x, int columns, int top_k,
                     int max_jobs, std::int32_t* __restrict__ cpu_flags, CpuCall* __restrict__ call) {

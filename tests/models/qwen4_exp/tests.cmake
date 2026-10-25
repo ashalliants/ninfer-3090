@@ -157,3 +157,11 @@ set_tests_properties(ninfer_qwen4_exp_moe_gate_up_registers_test PROPERTIES SKIP
 add_test(NAME ninfer_qwen4_exp_moe_fused_route_test
   COMMAND ninfer_tests ninfer_qwen4_exp_engine_real_test --moe-fused-route-exact --mtp 3)
 set_tests_properties(ninfer_qwen4_exp_moe_fused_route_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# GPU, real artifact with the MTP drafter (skips otherwise): cpu_verify_misses_matches_plain, the
+# engine test's --cpu-verify-misses-exact mode. Greedy ids with --cpu-verify-misses (each
+# verification's misses partly computed on the CPU worker team) equal those of the GPU-only
+# verification, and so do the MTP rounds, drafts and acceptances.
+add_test(NAME ninfer_qwen4_exp_cpu_verify_misses_test
+  COMMAND ninfer_tests ninfer_qwen4_exp_engine_real_test --cpu-verify-misses-exact --mtp 3)
+set_tests_properties(ninfer_qwen4_exp_cpu_verify_misses_test PROPERTIES SKIP_RETURN_CODE 77)

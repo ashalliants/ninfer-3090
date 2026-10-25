@@ -115,6 +115,13 @@ GdnQk gdn_qk(const Tensor& q, const Tensor& k, std::int32_t D, std::int32_t Hk, 
     return out;
 }
 
+// ForwardExperts::cpu: none, or one channel per layer with the error word their waits report to.
+void require_cpu_channels(const ForwardExperts& experts, std::uint32_t layers) {
+    if (!experts.cpu.empty() && (experts.cpu.size() != layers || experts.error == nullptr)) {
+        throw std::invalid_argument("Qwen4Exp forward: CPU miss channels need one per layer and an error word");
+    }
+}
+
 } // namespace
 
 ops::QsaIndexerGeometry qsa_geometry(const TextConfig& c) {
@@ -165,6 +172,7 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
         kv_.pooled.size() != config_.attention_layers || experts_.frames.size() != config_.num_hidden_layers) {
         throw std::invalid_argument("Qwen4Exp forward: state, KV or expert residency is incomplete");
     }
+    require_cpu_channels(experts_, config_.num_hidden_layers);
     if (mtp_.has_value() != parameters_.mtp.has_value()) {
         throw std::invalid_argument("Qwen4Exp forward: the MTP drafter's parameters and state go together");
     }
@@ -218,6 +226,7 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
         valid = shaped(state.qsa_tails[l], DType::BF16, {Di, R - 1, slots});
     }
     if (!valid) { throw std::invalid_argument("Qwen4Exp forward: the slotted state, KV or expert residency is incomplete"); }
+    require_cpu_channels(experts_, c.num_hidden_layers);
     Rows rows{std::move(state), std::move(kv), {}, {}};
     const std::int32_t pages = rows.kv.block_tables.ne[0];
     for (std::int32_t s = 0; s < slots; ++s) {
@@ -452,7 +461,8 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
                    : attention(std::get<AttentionParameters>(block.mixer), xa, compact, batch);
     ops::hyper_connection_inject(y, inject, residual, s);
     Tensor xm = mix(block.mlp_hc, residual, &inject);
-    Tensor ym = moe(block.moe, xm, layer, tap != nullptr && tap->routes != nullptr ? &tap->routes->at(layer) : nullptr);
+    Tensor ym = moe(block.moe, xm, layer, tap != nullptr && tap->routes != nullptr ? &tap->routes->at(layer) : nullptr,
+                    batch.verify != nullptr);
     ops::hyper_connection_inject(ym, inject, residual, s);
     if (tap != nullptr) {
         copy_tap(tap->mixer_inputs, layer, xa, s);
@@ -654,7 +664,7 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, std::ui
     return y;
 }
 
-Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap) {
+Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap, bool verify) {
     const cudaStream_t s = device_.stream;
     const auto& m        = config_.moe;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size), E = dim(m.experts), K = dim(m.top_k);
@@ -716,6 +726,11 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
                                 .zero_copy_misses = experts_.zero_copy_misses};
     source.precast_input   = moe_precast_input_;
     source.gate_up_variant = gate_up_variant(moe_gate_up_registers_);
+    // A verification call's misses may go to the CPU miss service (ForwardExperts::cpu): the experts
+    // return before placing the CPU's outputs, and the wait below places them once the shared expert
+    // is enqueued, so the host computes them beside the GPU's experts and the shared expert.
+    const bool cpu = verify && !experts_.cpu.empty();
+    if (cpu) { source.cpu = experts_.cpu[layer]; }
     ExpertStream* stream = experts_.stream != nullptr && experts_.stream->active() ? experts_.stream : nullptr;
     if (stream != nullptr) {
         source.frames = stream->table(layer);
@@ -727,7 +742,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     const std::int32_t max_jobs = std::min(E, K * T);
     const DeviceSpan expert_ws  =
         work_->alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T, T, moe_precast_input_));
-    ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s);
+    ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/!cpu);
     if (stream != nullptr) { stream->after_experts(layer, s); }
 
     if (fork) {
@@ -735,6 +750,9 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     } else {
         shared = shared_expert(p, x, I, H, *work_, *work_, s);
     }
+    // The CPU's outputs, before the combine reads them (the experts' workspace is still reserved: it
+    // was allocated before the shared expert's tensors and the scope ends with the layer).
+    if (cpu) { ops::moe_experts_cpu_wait(x, dispatch, source, max_jobs, expert_ws.data, outputs, s); }
     Tensor y = work_->alloc(DType::BF16, {H, T});
     ops::moe_combine(outputs, routing, shared, y, s);
     return y;
@@ -834,7 +852,7 @@ void Forward::layer_rows(std::uint32_t layer, const ForwardRowsBatch& batch) {
                    : attention_rows(std::get<AttentionParameters>(block.mixer), xa, compact, batch);
     ops::hyper_connection_inject(y, inject, residual_, s);
     Tensor xm = mix(block.mlp_hc, residual_, &inject);
-    Tensor ym = moe(block.moe, xm, layer, nullptr);
+    Tensor ym = moe(block.moe, xm, layer, nullptr, /*verify=*/false);
     ops::hyper_connection_inject(ym, inject, residual_, s);
 }
 

@@ -74,6 +74,13 @@
 //   ninfer_qwen4_exp_engine_real_test --moe-fused-route-exact [--mtp K] [--max-context N]
 //       [--generate N] [TOKENS...]
 //
+// CPU verification misses (cpu_verify_misses_matches_plain below, --cpu-verify-misses): greedy ids,
+// MTP rounds, drafts and acceptances equal those of the GPU-only verification. The same arguments as
+// --moe-precast-exact; --mtp K is what exercises the option.
+//
+//   ninfer_qwen4_exp_engine_real_test --cpu-verify-misses-exact --mtp K [--max-context N]
+//       [--generate N] [TOKENS...]
+//
 // MTP for constrained requests (mtp_constrained_matches_plain below): a greedy JSON-schema request
 // with --mtp-constrained (K drafts, default 3) gives the ids of plain constrained decoding.
 //
@@ -711,12 +718,15 @@ int option_matches_off(const std::string& artifact, const std::vector<std::strin
     };
     const double ram_before = available_ram_gib();
     std::vector<std::vector<TokenId>> reference;
+    std::vector<SpeculativeStats> reference_speculation;
     try {
         Engine engine(engine_options(false));
         for (std::size_t j = 0; j < prompts.size(); ++j) {
             const Run run = generate(engine, prompts[j], tokens);
             print_run((std::string(option.off) + " " + jobs[j]).c_str(), run, prompts[j].size());
+            if (mtp != 0) { print_speculation((std::string(option.off) + " " + jobs[j]).c_str(), run.speculative); }
             reference.push_back(run.ids);
+            reference_speculation.push_back(run.speculative);
         }
     } catch (const std::exception& error) {
         if (mtp == 0 || std::string(error.what()).find("no MTP drafter") == std::string::npos) { throw; }
@@ -734,6 +744,16 @@ int option_matches_off(const std::string& artifact, const std::vector<std::strin
         ok = same(label.c_str(), reference[j], run.ids) && ok;
         if (mtp != 0 && run.speculative.rounds == 0) {
             std::printf("FAIL: %s ran no MTP round, so the option's MTP route was not exercised\n", label.c_str());
+            ok = false;
+        }
+        // Greedy rounds are deterministic, so a bitwise option leaves the drafter's proposals and
+        // their acceptance unchanged too; equal ids alone would not show a drafter that diverged.
+        const SpeculativeStats& ref = reference_speculation[j];
+        if (mtp != 0 && (run.speculative.rounds != ref.rounds || run.speculative.drafted_tokens != ref.drafted_tokens ||
+                         run.speculative.accepted_tokens != ref.accepted_tokens ||
+                         run.speculative.fallback_steps != ref.fallback_steps ||
+                         run.speculative.accepted_per_position != ref.accepted_per_position)) {
+            std::printf("FAIL: %s: MTP rounds, drafts or acceptances differ from %s\n", label.c_str(), option.off);
             ok = false;
         }
     }
@@ -784,6 +804,15 @@ int moe_fused_route_matches_plain(const std::string& artifact, const std::vector
     return option_matches_off(artifact, args,
                               {"two-launch route", "one-launch route", "moe fused route",
                                [](EngineOptions& o) { o.flash_next.moe_fused_route = true; }});
+}
+
+// cpu_verify_misses_matches_plain (--cpu-verify-misses-exact, FlashNextOptions::cpu_verify_misses):
+// each MTP verification round's CPU-served misses (the CPU miss service's worker team beside the
+// GPU) give the greedy ids, rounds, drafts and acceptances of the GPU-only verification. Needs --mtp.
+int cpu_verify_misses_matches_plain(const std::string& artifact, const std::vector<std::string>& args) {
+    return option_matches_off(artifact, args,
+                              {"GPU misses", "CPU verification misses", "cpu verify misses",
+                               [](EngineOptions& o) { o.flash_next.cpu_verify_misses = true; }});
 }
 
 // mtp_constrained_matches_plain (--mtp-constrained, FlashNextOptions::mtp_constrained): a greedy
@@ -1242,6 +1271,9 @@ int main(int argc, char** argv) {
         }
         if (!args.empty() && args.front() == "--moe-fused-route-exact") {
             return moe_fused_route_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
+        }
+        if (!args.empty() && args.front() == "--cpu-verify-misses-exact") {
+            return cpu_verify_misses_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
         }
         if (!args.empty() && args.front() == "--mtp-constrained") {
             return mtp_constrained_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));

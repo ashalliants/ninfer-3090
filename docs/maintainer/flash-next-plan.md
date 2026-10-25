@@ -806,6 +806,57 @@ None has been measured on the RTX 3090 yet.
   - Off path: every existing kernel of `moe_layer.cu` (49, `route_kernel` and the dispatch kernels
     included) has the same SASS as d262e955, encodings included; `wide_expert.cu`'s six too. No
     memory. Works with two lanes, MTP (the drafter's calls too) and vision.
+- **Verification misses on the CPU** (`--cpu-verify-misses [--cpu-verify-workers N]`, needs
+  `--spec mtp`; F4e of the Basalt learnings). PR 11 left the CPU route of `moe_experts` unwired
+  because a CPU leg cannot win at T = 1 (one cold expert takes 67-146 µs on the worker team, a
+  zero-copy miss adds 30-45 µs to a layer). A verification window (W >= 2 columns) gives the GPU
+  ~130-170 µs of expert work per layer, behind which one or two CPU misses at 67-84 µs can hide. The
+  Program now owns an `ops::offloaded_moe::CpuMissService` over the text model's 48 expert banks
+  (the CPU reads each bank's host address), started before the Forward and stopped after the
+  destructor's synchronization, with its defaults (4 jobs per layer call, a third of the misses
+  left on the GPU, `pcie_divisor` 3) but its column cap set to the widest verification (1 + drafts)
+  and its worker count from `--cpu-verify-workers` (default 6, the op's; PR 11 measured 12-16
+  faster for a single expert, so the flag is there to sweep). `ForwardExperts::cpu` holds a channel
+  per layer, and `Forward::moe` takes `verify` from its caller (a verification call and a two-lane
+  plain round are both T = 2): only a verification's text-model layers set `MoeExpertSource::cpu`;
+  plain decode, prefill and the drafter never do.
+  - Overlap: the experts run with `wait_for_cpu = false`, the shared expert is enqueued next (or
+    joined, with `--shared-expert-stream`, where it already runs on the side stream), then
+    `moe_experts_cpu_wait` places the CPU's outputs before the combine. Both orders read the same
+    outputs, so either is correct; the CPU works while the GPU runs the resident experts, the GPU
+    misses and the shared expert. The device decides everything (`cpu_plan_kernel`, one CTA: which
+    jobs, the compacted x columns, the request's sequence), so the verification graphs capture it
+    and each replay follows its own routing.
+  - Bit-identical by construction: the CPU engine's outputs equal every GPU placement's (PR 7).
+    `offloaded_moe::select_cpu_jobs` (`src/ops/offloaded_sparse_moe/cpu_selection.h`, host-only
+    `ninfer_moe_cpu_selection_test`) states the kernel's selection rule (want = min(cap, M - M /
+    divisor), the fewest-column jobs of at most `max_job_columns` first, ties in job order).
+    `ninfer_offloaded_moe_layer_test` (cpu_verify_leg) runs T in {2, 3, 8, 16} with the CPU leg in
+    the Forward's order (experts without the wait, other work, then the wait), eagerly and replayed
+    from a captured graph, against the CPU engine bit for bit, and checks the published
+    `MissRequest` (jobs, experts, widths, compacted columns) against `select_cpu_jobs`. End to end
+    `ninfer_qwen4_exp_cpu_verify_misses_test` (greedy ids with MTP equal those without the option,
+    and so do the rounds, drafts and acceptances; the option-identity gates now compare those for
+    every option). None has run yet.
+  - Failure: a wait whose host heartbeat stops for 1 s writes `layer << 16 | kErrorHostSilent` to
+    the Program's mapped error word (zero-initialised; the outputs of that call are undefined).
+    Each verification round reads it after its synchronization, before acceptance: a set word fails
+    the round (the lane is released, nothing committed) and is cleared. A service whose thread has
+    failed (`failure()`) never answers again, so the Program then stops speculating (plain rounds,
+    the same output) and says so once.
+  - Memory: the service's 4-byte device counter is `ProgramDevicePlan::cpu_verify_misses`; its
+    mapped channel (request, x for 1 + drafts columns, y for 4 jobs of 8 columns, the done line)
+    and the error word (220 KiB at 7 drafts) are pinned and charged to the RAM ledger
+    (`plan_cpu_verify_misses`). On Windows a pinned allocation is mapped into the GPU's address
+    space too.
+  - GPU-session checks: the GPU spins on a mapped host flag inside the verification graph. With a
+    display attached (WDDM) a kernel that spins past TdrDelay (2 s) resets the driver; a healthy
+    wait is tens of microseconds, but check that a stalled CPU (heartbeat timeout 1 s) does not
+    trip it, and that 6 spinning CPU threads do not slow the rest of the round. The service
+    thread spins while requests arrive and polls every 50 µs after 20 ms without one, which can
+    delay the first layer of a round. Measure tok/s on vs off at 6, 12 and 16 workers, and the
+    share of layers whose wait finds the answer ready. Works with two lanes and vision. Not
+    measured.
 
 ## Artifact decisions
 

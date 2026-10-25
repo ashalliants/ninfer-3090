@@ -11,6 +11,8 @@
 // --gdn-head-map: MTP's GDN replay records (part of the speculation term) hold the 16 key heads.
 // --moe-precast-input: each routed-expert call's workspace, part of the forward's workspace term,
 // holds the call's A8-cast input (codes and scales, T * (2560 + 320) bytes).
+// --cpu-verify-misses: the CPU miss service's device counter is a named term (its mapped channel a
+// pinned one), zero when off or without MTP; MTP off and worker counts outside [1, 64] are refused.
 
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/program/program.h"
@@ -297,6 +299,53 @@ int main() {
         // --moe-fused-route allocates nothing either: the one launch writes the same routing and
         // dispatch arrays the two Ops write, in the same carve.
         check(!q4::ProgramOptions{}.moe_fused_route, "the one-launch MoE route and dispatch is off by default");
+
+        // --cpu-verify-misses: the CPU miss service's device counter is a term of fixed_bytes and its
+        // mapped channel (with the round's error word) is pinned host memory for the RAM ledger, both
+        // zero when off or without MTP. The service serves calls of up to a verification's width and
+        // its default 4 jobs; without MTP, or with a worker count outside [1, 64], startup refuses
+        // naming the flag before the device is asked anything.
+        namespace om = ops::offloaded_moe;
+        q4::ProgramOptions leg;
+        leg.max_context = 32768;
+        check(!leg.cpu_verify_misses && leg.cpu_verify_workers == 6,
+              "the CPU leg is off by default and its team has 6 threads");
+        leg.mtp_draft_tokens = 7;
+        check(q4::plan_cpu_verify_misses(leg).device == 0 && q4::plan_cpu_verify_misses(leg).pinned == 0,
+              "off plans no CPU channel");
+        leg.cpu_verify_misses   = true;
+        leg.cpu_verify_workers  = 12;
+        const q4::CpuVerifyPlan served = q4::plan_cpu_verify_misses(leg);
+        check(served.device == 4, "on plans the service's 4-byte request counter on the device");
+        check(served.pinned == sizeof(om::MissRequest) + 2ULL * 2560 * 8 + 2ULL * 2560 * 4 * 8 + 64 + 64,
+              "on pins the request, x for 8 columns, y for 4 jobs of 8 columns, the done line and the error word");
+        check(served.workers == 12 && served.max_jobs == 4 && served.max_columns == 8 && served.pcie_divisor == 3,
+              "the service takes the worker count, 4 jobs, the verification's 8 columns and divisor 3");
+        leg.mtp_draft_tokens = 3;
+        check(q4::plan_cpu_verify_misses(leg).max_columns == 4 &&
+                  q4::plan_cpu_verify_misses(leg).pinned == served.pinned - 2ULL * 2560 * 4,
+              "the column cap and the x buffer follow --draft-tokens");
+        leg.mtp_draft_tokens = 0;
+        check(q4::plan_cpu_verify_misses(leg).device == 0, "without MTP there is nothing to verify");
+        q4::ProgramDevicePlan with_leg;
+        with_leg.io                = 500;
+        with_leg.cpu_verify_misses = 4;
+        check(with_leg.fixed_bytes() == 504, "fixed_bytes counts the CPU service's counter");
+        const auto refuses = [&](const q4::ProgramOptions& o, const char* flag) {
+            try {
+                (void)q4::Program::plan_device(o, model, 248077, {});
+            } catch (const std::invalid_argument& error) {
+                return std::string(error.what()).find(flag) != std::string::npos;
+            } catch (const std::exception&) {
+            }
+            return false;
+        };
+        check(refuses(leg, "--cpu-verify-misses"), "--cpu-verify-misses without MTP is refused naming the flag");
+        leg.mtp_draft_tokens   = 3;
+        leg.cpu_verify_workers = 0;
+        check(refuses(leg, "--cpu-verify-workers"), "--cpu-verify-workers 0 is refused naming the flag");
+        leg.cpu_verify_workers = 65;
+        check(refuses(leg, "--cpu-verify-workers"), "--cpu-verify-workers 65 is refused naming the flag");
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

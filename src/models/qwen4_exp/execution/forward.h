@@ -4,8 +4,9 @@
 // Modified for NInfer-3090: one sequence per call (M0: teacher-forced chunks and single-sequence
 // decode); NInfer's single-sequence QSA Ops and paged INT8 KV; the PLE rows come from the caller
 // already read; experts are served by the GPU narrow route from device frames, staging slots or the
-// pinned bank, or for a wide prefill call from the expert stream's ring (no CPU miss service,
-// overlap streams, landing frames or prefix-cache events). Image columns take their visual
+// pinned bank, for a wide prefill call from the expert stream's ring, and optionally a verification
+// call's misses by the caller's CPU miss service (no overlap streams, landing frames or
+// prefix-cache events). Image columns take their visual
 // embeddings after the token embedding, in the text model and the drafter (Infernix's VisionInput). Speculative verification and the
 // MTP drafter follow Infernix's ForwardVerify and mtp_block; QSA tails are pooled from scratch
 // copies (this repo's qsa_pool_keys always advances the tail it is given) and committed with
@@ -21,6 +22,7 @@
 #include "core/tensor.h"
 #include "models/qwen4_exp/execution/expert_stream.h"
 #include "models/qwen4_exp/execution/parameters.h"
+#include "ninfer/ops/offloaded_sparse_moe.h"
 #include "ninfer/ops/qsa.h"
 
 #include <cstdint>
@@ -63,6 +65,12 @@ struct ForwardExperts {
     // A staged call with at most this many misses reads them zero-copy instead
     // (ops::MoeExpertSource::zero_copy_misses).
     std::int32_t zero_copy_misses = 0;
+    // Optional, per layer: the CPU miss service's channels (ops::MoeCpuChannel). A verification
+    // call's routed experts (ForwardBatch::verify; the text model's layers only) then hand some of
+    // their misses to the service, which computes them while the GPU runs the other experts and the
+    // shared expert; the outputs are the same bits. Requires `error`: a wait whose host stopped
+    // answering writes it, and the caller must fail the round. Empty: every call stays on the GPU.
+    std::vector<ops::MoeCpuChannel> cpu;
     // Optional prefill expert stream: while it is active the MoE reads its per-layer frame tables
     // (streamed experts resident in the ring) and orders itself with the stream's copies.
     ExpertStream* stream = nullptr;
@@ -372,7 +380,8 @@ private:
     Tensor mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject);
     Tensor gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch);
     Tensor attention(const AttentionParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch);
-    Tensor moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap);
+    // `verify`: a verification call's block, whose misses may go to ForwardExperts::cpu.
+    Tensor moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap, bool verify);
     // A BF16 Linear of a verification call: one column at a time, so each column takes the
     // one-column route a decode call takes (their T > 1 routes sum in other orders).
     void project_verify(const Tensor& x, const LinearParameters& p, Tensor& out, bool columnwise);
