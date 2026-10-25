@@ -448,7 +448,8 @@ struct ProgramOptions {
     // over the expert banks, running for the Program's life; each MTP verification's routed experts
     // hand it some of their misses (execution::ForwardExperts::cpu), computed by its worker team
     // while the GPU runs the other experts and the shared expert. The same outputs, bit for bit. A
-    // round whose CPU leg times out fails; once the service has failed, rounds decode plain.
+    // round whose CPU leg times out throws (its request ends with an error, nothing of the round is
+    // committed); once the service thread has failed, rounds decode plain.
     // Requires MTP (mtp_draft_tokens > 0). cpu_verify_workers: the team's threads, the service thread
     // included (1..64).
     bool cpu_verify_misses           = false;

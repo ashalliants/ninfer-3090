@@ -247,7 +247,9 @@ void moe_route_dispatch(const Tensor& logits, std::int32_t top_k, MoeRouting& ro
 /// call's M misses, M / pcie_divisor stay on the GPU (0: the CPU takes up to max_jobs). The wait
 /// lasts as long as the host's heartbeat word keeps changing; when it stops for
 /// kHeartbeatTimeoutNs the call writes kErrorHostSilent to the source's error word and leaves its
-/// CPU outputs unwritten (without an error word it traps).
+/// CPU outputs unwritten (without an error word it traps). A call whose error word is already set
+/// when it starts hands the host nothing: the GPU computes every job, and the call neither publishes
+/// nor waits, so a host that stopped costs one timeout until the caller clears the word.
 struct MoeCpuChannel {
     offloaded_moe::MissRequest* request = nullptr; // mapped host memory
     std::uint16_t* x                    = nullptr; // mapped BF16 [H, max_columns]
@@ -385,6 +387,9 @@ public:
     [[nodiscard]] MoeCpuChannel channel(int layer) const;
     [[nodiscard]] std::uint64_t served_requests() const noexcept;
     [[nodiscard]] std::uint64_t served_experts() const noexcept;
+    // The experts every service of this process has computed since it started (tests and
+    // diagnostics that cannot reach the service itself).
+    [[nodiscard]] static std::uint64_t process_served_experts() noexcept;
     // Why the service thread stopped serving; empty while it serves.
     [[nodiscard]] std::string failure() const;
 

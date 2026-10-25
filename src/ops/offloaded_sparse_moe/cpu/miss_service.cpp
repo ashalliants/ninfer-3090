@@ -27,6 +27,8 @@
 namespace ninfer::ops::offloaded_moe {
 namespace {
 
+std::atomic<std::uint64_t> g_process_experts{0}; // CpuMissService::process_served_experts
+
 void cuda_require(cudaError_t error, const char* what) {
     if (error != cudaSuccess) {
         throw std::runtime_error(std::string("CPU miss service ") + what + ": " + cudaGetErrorString(error));
@@ -128,6 +130,7 @@ struct CpuMissService::Impl {
                 *volatile_done = current;
                 served.fetch_add(1, std::memory_order_relaxed);
                 experts.fetch_add(static_cast<std::uint64_t>(count), std::memory_order_relaxed);
+                g_process_experts.fetch_add(static_cast<std::uint64_t>(count), std::memory_order_relaxed);
                 last  = std::chrono::steady_clock::now();
                 polls = 0;
             }
@@ -194,6 +197,9 @@ MoeCpuChannel CpuMissService::channel(int layer) const {
 
 std::uint64_t CpuMissService::served_requests() const noexcept { return impl_->served.load(std::memory_order_relaxed); }
 std::uint64_t CpuMissService::served_experts() const noexcept { return impl_->experts.load(std::memory_order_relaxed); }
+std::uint64_t CpuMissService::process_served_experts() noexcept {
+    return g_process_experts.load(std::memory_order_relaxed);
+}
 
 std::string CpuMissService::failure() const {
     const std::lock_guard<std::mutex> lock(impl_->failure_mutex);

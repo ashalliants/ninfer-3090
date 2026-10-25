@@ -113,7 +113,7 @@ set_tests_properties(ninfer_qwen4_exp_lanes_real_test PROPERTIES SKIP_RETURN_COD
 ninfer_add_test(ninfer_qwen4_exp_engine_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_real.cpp"
   NEEDS_SOURCE_DIR
-  LIBRARIES ninfer_engine ninfer_core)
+  LIBRARIES ninfer_engine ninfer_ops ninfer_core)
 set_tests_properties(ninfer_qwen4_exp_engine_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
 # GPU, real artifact with the MTP drafter (skips otherwise): mtp_constrained_matches_plain, the
@@ -161,7 +161,8 @@ set_tests_properties(ninfer_qwen4_exp_moe_fused_route_test PROPERTIES SKIP_RETUR
 # GPU, real artifact with the MTP drafter (skips otherwise): cpu_verify_misses_matches_plain, the
 # engine test's --cpu-verify-misses-exact mode. Greedy ids with --cpu-verify-misses (each
 # verification's misses partly computed on the CPU worker team) equal those of the GPU-only
-# verification, and so do the MTP rounds, drafts and acceptances.
+# verification, and so do the MTP rounds, drafts and acceptances; the CPU must serve at least one
+# expert. A 4 GiB expert cache (about 2,700 of the 24,576 experts) keeps verification misses common.
 add_test(NAME ninfer_qwen4_exp_cpu_verify_misses_test
-  COMMAND ninfer_tests ninfer_qwen4_exp_engine_real_test --cpu-verify-misses-exact --mtp 3)
+  COMMAND ninfer_tests ninfer_qwen4_exp_engine_real_test --cpu-verify-misses-exact --mtp 3 --expert-cache-mib 4096)
 set_tests_properties(ninfer_qwen4_exp_cpu_verify_misses_test PROPERTIES SKIP_RETURN_CODE 77)
