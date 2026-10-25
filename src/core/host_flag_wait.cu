@@ -2,18 +2,13 @@
 // Modified for NInfer-3090: the wrap-aware comparison, the device sequence counter, the timeout
 // and its error word (the pattern of offloaded_sparse_moe's CPU-miss wait).
 
-#include "ninfer/ops/wait_flag.h"
-
-#include "ninfer/ops/offloaded_sparse_moe.h"
+#include "core/host_flag_wait.h"
 
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace ninfer {
 namespace {
-
-static_assert(kWaitFlagTimeoutNs == offloaded_moe::kHeartbeatTimeoutNs,
-              "the n-gram flag wait times out like the CPU-miss wait");
 
 __device__ __forceinline__ std::uint64_t global_ns() {
     std::uint64_t now;
@@ -74,4 +69,4 @@ void wait_flag_sequence(const volatile std::uint32_t* mapped, std::uint32_t* seq
     launch(mapped, 0, sequence, error, stream, "wait_flag_sequence");
 }
 
-} // namespace ninfer::ops
+} // namespace ninfer

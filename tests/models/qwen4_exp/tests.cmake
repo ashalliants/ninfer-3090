@@ -170,9 +170,10 @@ set_tests_properties(ninfer_qwen4_exp_cpu_verify_misses_test PROPERTIES SKIP_RET
 # GPU, real artifact (skips otherwise): ngram_flag_wait_matches_split, the engine test's
 # --ngram-flag-wait-exact mode. Greedy ids with --ngram-flag-wait (each decode round one graph whose
 # wait kernel holds the PLE layer back until the host has read the round's n-gram rows and raised a
-# mapped flag) equal those of the two graphs around the host's read, and at least one round ran as
-# one graph. The first runs plain rounds only; the second (with the MTP drafter, skips without it)
-# adds the verifications and compares their rounds, drafts and acceptances.
+# mapped flag) equal those of the two graphs around the host's read. The first runs plain rounds
+# only (at least one must run as one graph); the second (with the MTP drafter, skips without it) adds
+# the verifications, compares their rounds, drafts and acceptances, and needs at least one
+# verification run as one graph.
 add_test(NAME ninfer_qwen4_exp_ngram_flag_wait_test
   COMMAND ninfer_tests ninfer_qwen4_exp_engine_real_test --ngram-flag-wait-exact)
 set_tests_properties(ninfer_qwen4_exp_ngram_flag_wait_test PROPERTIES SKIP_RETURN_CODE 77)

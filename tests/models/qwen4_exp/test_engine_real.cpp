@@ -91,8 +91,8 @@
 //
 // In-graph n-gram flag wait (ngram_flag_wait_matches_split below, --ngram-flag-wait): greedy ids
 // (and with --mtp K the MTP rounds, drafts and acceptances) equal those of the two-part rounds, and at
-// least one round ran as one graph waiting for its rows. The same arguments as --moe-precast-exact;
-// without --mtp every decode round is a plain one, with it the verifications take the flag wait too.
+// least one plain round (with --mtp K: one verification) ran as one graph waiting for its rows. The
+// same arguments as --moe-precast-exact; without --mtp every decode round is a plain one.
 //
 //   ninfer_qwen4_exp_engine_real_test --ngram-flag-wait-exact [--mtp K] [--max-context N]
 //       [--generate N] [TOKENS...]
@@ -869,12 +869,20 @@ int gdn_async_commit_matches_serial(const std::string& artifact, const std::vect
 // first) runs as one graph whose wait kernel spins until the host has read the round's n-gram rows
 // into the pinned block and raised the flag. The greedy ids, rounds, drafts and acceptances equal
 // those of the two graphs around the host's read (a wait the rows did not stay behind would read the
-// previous round's rows and diverge), and at least one round ran as one graph.
+// previous round's rows and diverge). Without --mtp at least one plain round ran as one graph; with
+// it at least one verification did.
 int ngram_flag_wait_matches_split(const std::string& artifact, const std::vector<std::string>& args) {
+    using ninfer::models::qwen4_exp::Program;
+    const bool mtp = std::find(args.begin(), args.end(), "--mtp") != args.end();
+    const auto set = [](EngineOptions& o) { o.flash_next.ngram_flag_wait = true; };
+    if (mtp) {
+        return option_matches_off(artifact, args,
+                                  {"two-part rounds", "one-graph rounds", "ngram flag wait", set,
+                                   [] { return Program::process_ngram_flag_verifications(); }});
+    }
     return option_matches_off(artifact, args,
-                              {"two-part rounds", "one-graph rounds", "ngram flag wait",
-                               [](EngineOptions& o) { o.flash_next.ngram_flag_wait = true; },
-                               [] { return ninfer::models::qwen4_exp::Program::process_ngram_flag_rounds(); }});
+                              {"two-part rounds", "one-graph rounds", "ngram flag wait", set,
+                               [] { return Program::process_ngram_flag_rounds(); }});
 }
 
 // mtp_constrained_matches_plain (--mtp-constrained, FlashNextOptions::mtp_constrained): a greedy

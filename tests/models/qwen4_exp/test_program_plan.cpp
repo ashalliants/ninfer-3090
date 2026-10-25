@@ -468,7 +468,8 @@ int main() {
         // --ngram-flag-wait: the round graphs' wait counter is a 4-byte term of fixed_bytes and the
         // mapped flag and error word (a 64-byte line each) are pinned host memory for the RAM ledger,
         // both zero when off. A round runs as one graph only with the option and CUDA graphs on, and
-        // once its two parts have run eagerly; anything else keeps the two parts. Nothing is refused:
+        // once its two parts have run eagerly, and not with CUDA_LAUNCH_BLOCKING=1; anything else
+        // keeps the two parts. Nothing is refused:
         // two lanes, MTP, vision and --no-cuda-graph all run (the last two parts only).
         {
             q4::ProgramOptions flag;
@@ -482,6 +483,8 @@ int main() {
             check(q4::plan_ngram_flag_wait(flag).pinned == 128, "on pins the flag and the error word, a line each");
             check(q4::ngram_rows_in_graph(flag, true), "on, a round whose parts ran eagerly runs as one graph");
             check(!q4::ngram_rows_in_graph(flag, false), "on, a round's first (eager) run keeps the two parts");
+            check(!q4::ngram_rows_in_graph(flag, true, true),
+                  "on, with launches serialized (CUDA_LAUNCH_BLOCKING=1) the round keeps the two parts");
             flag.use_cuda_graph = false;
             check(!q4::ngram_rows_in_graph(flag, true), "without CUDA graphs the round keeps the two parts");
             flag.use_cuda_graph   = true;
