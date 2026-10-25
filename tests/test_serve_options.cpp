@@ -138,6 +138,23 @@ int main() {
         }
         failures += check(refused, "--mtp-constrained without --spec mtp was not refused naming both flags");
     }
+    failures += check(!defaults.flash_next.mtp_joint_acceptance, "the joint-acceptance draft length is on by default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "7",
+                                                 "--mtp-joint-acceptance"}))
+                          .flash_next.mtp_joint_acceptance,
+                      "--mtp-joint-acceptance does not reach the Engine");
+    for (const auto& spec : {std::vector<std::string>{}, std::vector<std::string>{"--spec", "dflash"}}) {
+        std::vector<std::string> args{"ninfer-serve", "model.ninfer", "--mtp-joint-acceptance"};
+        args.insert(args.end(), spec.begin(), spec.end());
+        bool refused = false;
+        try {
+            (void)parse(args);
+        } catch (const std::invalid_argument& error) {
+            refused = std::string(error.what()).find("--mtp-joint-acceptance") != std::string::npos &&
+                      std::string(error.what()).find("--spec mtp") != std::string::npos;
+        }
+        failures += check(refused, "--mtp-joint-acceptance without --spec mtp was not refused naming both flags");
+    }
     failures += check(parse({"ninfer-serve", "model.ninfer", "--ngram-keepalive-ms", "25"})
                               .flash_next.ngram_keepalive_ms == 25,
                       "--ngram-keepalive-ms was not parsed");

@@ -332,13 +332,16 @@ struct ProgramDevicePlan {
     // --mtp-constrained: a verification round's grammar masks, one per draft and the bonus position
     // (plan_mtp_constrained_masks; 0 when off or without MTP).
     std::uint64_t mtp_constrained_masks = 0;
+    // --mtp-joint-acceptance: the drafts' probabilities, one FP32 word per draft
+    // (plan_mtp_draft_probs; 0 when off or without MTP).
+    std::uint64_t mtp_draft_probs = 0;
     std::uint64_t expert_record_stride = 0; // one expert frame
     std::uint32_t max_frames           = 0; // the most frames the expert cache uses
     std::uint32_t graph_bound          = 0; // CUDA graph executables the Program may instantiate (counts both halves of the split decode)
 
     [[nodiscard]] std::uint64_t fixed_bytes() const noexcept {
         return kv + workspace + staging + state + io + residency + speculation + shared_expert_workspace +
-               mtp_constrained_masks;
+               mtp_constrained_masks + mtp_draft_probs;
     }
 };
 
@@ -383,6 +386,12 @@ struct ProgramOptions {
     // A constrained row speculates too: the verification takes one grammar mask per position from
     // the round's drafts (FlashNextOptions::mtp_constrained). Off: a constrained row decodes plain.
     bool mtp_constrained = false;
+    // Basalt's joint-acceptance draft length (FlashNextOptions::mtp_joint_acceptance): every round
+    // drafts the ceiling (mtp_draft_tokens, or less near the request's end) with each draft's
+    // probability, then verifies joint_acceptance_window of them (draft_policy.h) under the lane's
+    // JointAcceptanceThreshold. It replaces the acceptance-estimate policy, mtp_fixed_drafts
+    // included. Off: the drafter graphs, the drafts and the window are as before.
+    bool mtp_joint_acceptance = false;
     // Image input: the model loaded its vision tower. Prompts with media encode it into frames lent
     // by the expert cache (its io words are planned only when set).
     bool vision = false;
@@ -415,6 +424,9 @@ void require_shared_expert_workspace(std::uint64_t need, std::uint64_t planned, 
 // ProgramDevicePlan::mtp_constrained_masks of these options over a tokenizer of `public_tokens`:
 // 1 + mtp_draft_tokens masks of ceil(public_tokens / 32) words; 0 without mtp_constrained or MTP.
 [[nodiscard]] std::uint64_t plan_mtp_constrained_masks(const ProgramOptions& options, std::uint32_t public_tokens);
+// ProgramDevicePlan::mtp_draft_probs of these options: one FP32 word per draft (mtp_draft_tokens);
+// 0 without mtp_joint_acceptance or MTP.
+[[nodiscard]] std::uint64_t plan_mtp_draft_probs(const ProgramOptions& options);
 
 class Program {
 public:

@@ -633,6 +633,30 @@ None has been measured on the RTX 3090 yet.
   - Checked by `ninfer_qwen4_exp_engine_real_test` (`mtp_constrained_matches_plain`: greedy ids for
     a JSON-schema request equal plain constrained decoding), not run yet. Basalt's estimate is about
     81 to 110 tok/s on greedy constrained requests. Not measured.
+- **Joint-acceptance draft length** (`--mtp-joint-acceptance`, needs `--spec mtp`), phase A. Without
+  it `choose_draft_length` picks the draft count before drafting from the per-position acceptance
+  estimate (PR 13 found it no better than fixed 2 drafts). With it every round drafts the ceiling
+  (`--draft-tokens`, fewer near the request's end) in the existing per-step-count draft graph, and
+  each drafter step runs `ops::argmax_probability` on the head's FP32 logits in place of the BF16
+  cast and `ops::argmax`. The Op returns the same ids, since its argmax keys are the BF16 roundings,
+  and the winner's softmax probability.
+  - After the drafts are on the host, the round verifies `joint_acceptance_window`
+    (`program/draft_policy.h`) of them: Basalt's rule (keep draft j while the product of the
+    table's acceptance rates for drafts 0..j stays at or above the threshold), but at least the
+    first draft, since the drafts are already made. Basalt can choose no draft (a plain round).
+  - The lane's `JointAcceptanceThreshold` (base 0.35, floor 0.25, reset per request) supplies the
+    threshold and observes the offered probabilities and the accepted count at each committed round.
+  - With `--mtp-constrained` the grammar masks are filled for the verified drafts only (K + 1
+    positions of the trimmed window).
+  - The probabilities are the planned term `ProgramDevicePlan::mtp_draft_probs` (4 bytes per draft;
+    zero when off). Off, the drafter graphs, the drafts and the window are those of master.
+  - Only what is proposed changes, so greedy output is designed to equal plain greedy output:
+    `ninfer_qwen4_exp_engine_real_test --mtp-exact K --mtp-joint-acceptance TOKENS` checks it, not
+    run yet. Basalt estimates +3-8% on Flash-Next. Not measured.
+  - Not done (phase B): stopping the draft chain early on the device once the product falls below
+    the threshold (Basalt's conditional draft graph, `verify_kernels.cu:824-827`,
+    `src/core/mtp.cpp:1390-1453`). Phase A pays for every draft step even when the window keeps one,
+    so it can lose to the acceptance estimate when the rule keeps short windows.
 
 ## Artifact decisions
 

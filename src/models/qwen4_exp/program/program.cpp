@@ -591,6 +591,7 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     b.workspace = d.work;
     b.shared_expert_workspace = plan_shared_expert_workspace(o, c);
     b.mtp_constrained_masks   = plan_mtp_constrained_masks(o, public_tokens);
+    b.mtp_draft_probs         = plan_mtp_draft_probs(o);
     b.staging   = d.staging;
     b.state     = d.state_total;
     // Logits of the widest round (FP32 and BF16; at least one column per lane), then the sampling
@@ -645,6 +646,11 @@ public:
         std::uint64_t mtp_policy_rounds = 0;
         // Per draft position: rounds that drafted it, and rounds that accepted it.
         std::array<std::uint64_t, 8> mtp_offered{}, mtp_taken{};
+        // --mtp-joint-acceptance: the request's threshold, and the probabilities of the drafts the
+        // pending verification offers (joint_offered of them; observed at its commit).
+        JointAcceptanceThreshold joint_threshold;
+        std::array<float, 8> joint_probs{};
+        std::int32_t joint_offered = 0;
         SpeculativeStats speculative;
         // Image input: the lane's RoPE positions; the handoff of its encoded images (lent frames,
         // given back once the prompt's last call ran) and the encode's measurements.
@@ -759,6 +765,11 @@ public:
         if (plan_.bytes.mtp_constrained_masks != 0) {
             verify_masks_ = DeviceBuffer(plan_.bytes.mtp_constrained_masks);
             allocated += plan_.bytes.mtp_constrained_masks;
+        }
+        if (plan_.bytes.mtp_draft_probs != 0) {
+            draft_probs_ = DeviceBuffer(plan_.bytes.mtp_draft_probs);
+            allocated += plan_.bytes.mtp_draft_probs;
+            draft_probs_host_ = PinnedHostBuffer(plan_.bytes.mtp_draft_probs);
         }
 
         // The shared expert's side-stream carve (when on) comes out of the same arena.
@@ -1266,6 +1277,8 @@ public:
                      .prefix_reuse_path    = L().reused != 0 ? PrefixReusePath::Checkpoint : PrefixReusePath::Root};
         install_sampling(base.sampling);
         L().mtp_accept.fill(kAcceptancePrior);
+        L().joint_threshold = JointAcceptanceThreshold{};
+        L().joint_offered   = 0;
         L().mtp_live = plan_.drafts > 0;
         plan_lane_vision(base, L().reused);
         if (base.reuse) {
@@ -3868,7 +3881,8 @@ private:
 
     // `steps` chained drafter steps from the saved residual and the anchor (Infernix mtp_draft):
     // step j writes the cell S - 1 + j and drafts the token at S + 1 + j. The steps pool from a copy
-    // of the drafter's tail. Returns the drafts on the host.
+    // of the drafter's tail. Returns the drafts on the host (with --mtp-joint-acceptance their
+    // probabilities are in draft_probs_host_ too).
     std::span<const TokenId> mtp_draft(std::int32_t steps) {
         const cudaStream_t s = device_.stream;
         const nvtx::ScopedRange range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Decode);
@@ -3892,11 +3906,18 @@ private:
                        call.kv_only      = false;
                        call.residual_out = chain_tensor;
                        call.drafts       = spec_word(plan_.spec.w_drafts + static_cast<std::size_t>(j), 1);
+                       if (options_.mtp_joint_acceptance) {
+                           call.probs = Tensor(static_cast<std::byte*>(draft_probs_.p) + 4 * static_cast<std::size_t>(j),
+                                               DType::FP32, {1});
+                       }
                        forward_->run_mtp(call);
                    }
                });
         CUDA_CHECK(cudaMemcpyAsync(spec_words_host() + plan_.spec.w_drafts, spec_words_device() + plan_.spec.w_drafts,
                                    4ULL * steps, cudaMemcpyDeviceToHost, s));
+        if (options_.mtp_joint_acceptance) {
+            CUDA_CHECK(cudaMemcpyAsync(draft_probs_host_.data(), draft_probs_.p, 4ULL * steps, cudaMemcpyDeviceToHost, s));
+        }
         {
             const nvtx::ScopedRange wait(nvtx::Name::DecodeMtpWait, nvtx::Category::Decode);
             device_.synchronize();
@@ -3931,9 +3952,20 @@ private:
                                                          static_cast<std::int64_t>(L().extent) - L().state_tokens - 1);
         const std::int32_t limit = static_cast<std::int32_t>(std::clamp<std::int64_t>(room, 0, plan_.drafts));
         if (limit <= 0) { return std::nullopt; }
-        const std::int32_t steps = choose_draft_length(limit);
+        // --mtp-joint-acceptance (phase A): draft the ceiling, then verify the prefix the joint rule
+        // keeps under the request's threshold (at least the first draft). A constrained row's masks
+        // are filled for the verified drafts only.
+        const std::int32_t steps = options_.mtp_joint_acceptance ? limit : choose_draft_length(limit);
         if (steps == 0) { return std::nullopt; }
-        const auto drafts = mtp_draft(steps);
+        auto drafts = mtp_draft(steps);
+        if (options_.mtp_joint_acceptance) {
+            const std::span<const float> probs(static_cast<const float*>(draft_probs_host_.data()),
+                                               static_cast<std::size_t>(steps));
+            const int kept = joint_acceptance_window(probs, L().joint_threshold.current());
+            std::copy_n(probs.begin(), kept, L().joint_probs.begin());
+            L().joint_offered = kept;
+            drafts            = drafts.first(static_cast<std::size_t>(kept));
+        }
         return verify(row, drafts, start, masks != nullptr && masks->constrained(0) ? masks : nullptr);
     }
 
@@ -4150,6 +4182,14 @@ private:
         if (k < 1 || k > pending_count_ || (!d.terminal && k != pending_count_)) {
             release_lane();
             throw std::logic_error("Qwen3.8-Flash-Next: commit exceeds the licensed tokens");
+        }
+        // The joint rule's evidence: the offered drafts' probabilities and how many the device
+        // accepted (pending_count_ - 1), whatever the commit keeps of them.
+        if (L().joint_offered > 0) {
+            L().joint_threshold.observe(std::span<const float>(L().joint_probs.data(),
+                                                               static_cast<std::size_t>(L().joint_offered)),
+                                        pending_count_ - 1);
+            L().joint_offered = 0;
         }
         if (L().history.size() == L().prompt_tokens) {
             L().first_token_seconds = std::chrono::duration<double>(Clock::now() - L().admitted).count();
@@ -4596,6 +4636,9 @@ private:
     PinnedHostBuffer io_host_{1};
     PinnedHostBuffer host_token_{1};
     PinnedHostBuffer mask_host_{1};
+    // --mtp-joint-acceptance: the drafts' probabilities on the device and their pinned staging.
+    DeviceBuffer draft_probs_;
+    PinnedHostBuffer draft_probs_host_{1};
     PinnedHostBuffer config_host_{1};
     Tensor logits32_, logits16_, sampled_, sample_position_, token_counts_;
     Tensor lane_logits_; // BF16 [V, lanes]: each lane's last prefill call's logits (checkpoints, exact hits)
@@ -4787,6 +4830,11 @@ std::uint64_t plan_mtp_constrained_masks(const ProgramOptions& options, std::uin
     if (!options.mtp_constrained || options.mtp_draft_tokens == 0) { return 0; }
     const std::uint64_t words = (static_cast<std::uint64_t>(public_tokens) + 31) / 32;
     return 4ULL * words * (1ULL + options.mtp_draft_tokens);
+}
+
+std::uint64_t plan_mtp_draft_probs(const ProgramOptions& options) {
+    if (!options.mtp_joint_acceptance || options.mtp_draft_tokens == 0) { return 0; }
+    return 4ULL * options.mtp_draft_tokens;
 }
 
 void require_shared_expert_workspace(std::uint64_t need, std::uint64_t planned, std::uint32_t columns) {

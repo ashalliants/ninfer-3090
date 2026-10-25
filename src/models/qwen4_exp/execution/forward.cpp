@@ -8,6 +8,7 @@
 #include "models/qwen4_exp/execution/forward.h"
 
 #include "ninfer/ops/argmax.h"
+#include "ninfer/ops/argmax_probability.h"
 #include "ninfer/ops/cast.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "ninfer/ops/embedding.h"
@@ -1062,6 +1063,7 @@ void Forward::mtp_block(const MtpCall& call) {
         call.rope_positions.ne[0] != T || call.rope_positions.ne[1] != 3 || call.block_start_rope.ne[0] != 3 ||
         call.tail.data == nullptr || (!call.kv_only && (T != 1 || call.residual_out.data == nullptr ||
                                                         call.drafts.data == nullptr)) ||
+        (call.probs.data != nullptr && (call.kv_only || call.probs.ne[0] != 1)) ||
         T > mtp_->ones.ne[1]) {
         throw std::invalid_argument("Qwen4Exp forward: MTP call geometry is invalid");
     }
@@ -1171,10 +1173,17 @@ void Forward::mtp_block(const MtpCall& call) {
             tap(call.tap->final_x, final_x);
             tap(call.tap->logits, head);
         }
-        Tensor narrow = work_->alloc(DType::BF16, {dim(config_.vocab_size), T});
-        ops::cast_fp32_to_bf16(head, narrow, s);
-        Tensor drafts = call.drafts;
-        ops::argmax(narrow, drafts, dim(parameters_.model.resources().public_token_count), s);
+        Tensor drafts            = call.drafts;
+        const std::int32_t valid = dim(parameters_.model.resources().public_token_count);
+        if (call.probs.data != nullptr) {
+            // The same ids (its argmax keys are the BF16 roundings) and the draft's probability.
+            Tensor probs = call.probs;
+            ops::argmax_probability(head, drafts, probs, valid, *work_, s);
+        } else {
+            Tensor narrow = work_->alloc(DType::BF16, {dim(config_.vocab_size), T});
+            ops::cast_fp32_to_bf16(head, narrow, s);
+            ops::argmax(narrow, drafts, valid, s);
+        }
     } catch (const std::exception& error) {
         throw std::runtime_error(std::string("qwen4_exp/mtp: ") + error.what());
     }
@@ -1185,10 +1194,13 @@ std::size_t Forward::mtp_workspace_bytes(const TextConfig& c, std::int32_t colum
     const std::size_t t = static_cast<std::size_t>(columns), bf = 2, f = 4;
     const std::size_t h = c.hidden_size, w = c.residual_width(), v = c.vocab_size;
     // A block at `columns` columns (as the text forward sizes one), the fusion's tensors, the
-    // FP32 projection rows and the head's logits of one column.
+    // FP32 projection rows and the head's logits of one column, then their BF16 cast or the
+    // probability Op's scratch in its place.
+    const std::size_t draft = std::max<std::size_t>(
+        v * bf, ops::argmax_probability_workspace_capacity_bytes(static_cast<std::int32_t>(v), 1, 1));
     return workspace_bytes(c, columns, max_visible_keys, execution) + (h * 4 + w * 2) * t * bf +
            (2 * std::size_t(c.attention.query_width()) + 2 * std::size_t(c.attention.key_width()) + 1024) * t * f +
-           v * (f + bf) + (8ULL << 20);
+           v * f + draft + (8ULL << 20);
 }
 
 } // namespace ninfer::models::qwen4_exp::execution

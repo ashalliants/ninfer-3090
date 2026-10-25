@@ -169,6 +169,10 @@ void validate(const EngineOptions& options) {
         refuse("--mtp-constrained keeps MTP speculation on for constrained requests and needs --spec mtp: add "
                "--spec mtp or remove --mtp-constrained");
     }
+    if (next.mtp_joint_acceptance && spec.backend != SpeculativeBackend::Mtp) {
+        refuse("--mtp-joint-acceptance chooses how many MTP drafts a round verifies and needs --spec mtp: add "
+               "--spec mtp or remove --mtp-joint-acceptance");
+    }
     if (next.ram_headroom_bytes > kMaxByteOption ||
         (next.vram_headroom_bytes && *next.vram_headroom_bytes > kMaxByteOption) ||
         (next.expert_cache_bytes && *next.expert_cache_bytes > kMaxByteOption)) {
@@ -325,6 +329,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.mtp_width_cost   = next.mtp_width_cost;
     program_options.mtp_fixed_drafts = next.mtp_fixed_drafts;
     program_options.mtp_constrained  = next.mtp_constrained;
+    program_options.mtp_joint_acceptance = next.mtp_joint_acceptance;
     program_options.vision           = vision;
     program_options.context_cache_bytes  = cache_fit.bytes;
     program_options.context_nvme_bytes   = nvme_bytes;

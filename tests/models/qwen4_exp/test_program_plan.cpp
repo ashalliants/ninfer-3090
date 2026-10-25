@@ -6,7 +6,8 @@
 // the Linear Op itself asks for (ops::linear_workspace_capacity_bytes) for the GGUF's registered
 // shared-expert formats, and weights needing more are refused at startup naming the flag.
 // --mtp-constrained: a verification's per-position grammar masks (one per draft and the bonus) are
-// a named term too, zero when the option or MTP is off.
+// a named term too, zero when the option or MTP is off. So are --mtp-joint-acceptance's draft
+// probabilities.
 
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/program/program.h"
@@ -165,6 +166,23 @@ int main() {
         with_masks.io = 500;
         with_masks.mtp_constrained_masks = 4ULL * 7753 * 8;
         check(with_masks.fixed_bytes() == 500 + 4ULL * 7753 * 8, "fixed_bytes counts the verification masks");
+
+        // --mtp-joint-acceptance: one FP32 probability per draft.
+        q4::ProgramOptions joint;
+        joint.max_context      = 32768;
+        joint.mtp_draft_tokens = 7;
+        check(!joint.mtp_joint_acceptance, "the joint-acceptance draft length is off by default");
+        check(q4::plan_mtp_draft_probs(joint) == 0, "off plans no draft probabilities");
+        joint.mtp_joint_acceptance = true;
+        check(q4::plan_mtp_draft_probs(joint) == 4ULL * 7, "on plans one FP32 word per draft");
+        joint.mtp_draft_tokens = 3;
+        check(q4::plan_mtp_draft_probs(joint) == 4ULL * 3, "the probabilities follow --draft-tokens");
+        joint.mtp_draft_tokens = 0;
+        check(q4::plan_mtp_draft_probs(joint) == 0, "without MTP there is nothing to draft");
+        q4::ProgramDevicePlan with_probs;
+        with_probs.io              = 500;
+        with_probs.mtp_draft_probs = 28;
+        check(with_probs.fixed_bytes() == 528, "fixed_bytes counts the draft probabilities");
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

@@ -21,18 +21,20 @@
 //
 //   ninfer_qwen4_exp_engine_real_test --bench [--max-context N] [--generate N] [--no-graph]
 //       [--expert-cache-mib N] [--no-expert-state] [--split N] [--print-ids] [--vision] [--prefill-chunk N]
-//       [--mtp K [--mtp-fixed] [--width-cost X]] TOKENS...
+//       [--mtp K [--mtp-fixed] [--width-cost X] [--mtp-joint-acceptance]] TOKENS...
 //
 // --vision loads the artifact's vision tower (an Engine started with --vision; the jobs stay text).
 //
 // --mtp K decodes with MTP speculation (the artifact must hold the drafter), verifying up to K
-// drafts per round (--mtp-fixed: always K); each job also prints its acceptance.
+// drafts per round (--mtp-fixed: always K; --mtp-joint-acceptance: Basalt's joint-acceptance window
+// over K drafts); each job also prints its acceptance.
 //
 // MTP exactness mode: greedy output with MTP speculation must equal plain greedy output. One plain
 // Engine decodes every job, then one MTP Engine per depth K; the ids must be identical.
 //
 //   ninfer_qwen4_exp_engine_real_test --mtp-exact K[,K...] [--max-context N] [--generate N]
-//       [--mtp-fixed] TOKENS...
+//       [--mtp-fixed] [--mtp-joint-acceptance] TOKENS...
+//   --mtp-joint-acceptance: the MTP Engines choose their windows by the joint-acceptance rule.
 //
 // MTP for constrained requests (mtp_constrained_matches_plain below): a greedy JSON-schema request
 // with --mtp-constrained (K drafts, default 3) gives the ids of plain constrained decoding.
@@ -408,7 +410,7 @@ bool same(const char* label, const std::vector<TokenId>& reference, const std::v
 
 int bench(const std::string& artifact, const std::vector<std::string>& args) {
     std::uint32_t max_context = 33'792, tokens = 512, split = 0, mtp = 0, prefill_chunk = 1024;
-    bool graph = true, state = true, print_ids = false, mtp_fixed = false, vision = false;
+    bool graph = true, state = true, print_ids = false, mtp_fixed = false, vision = false, joint = false;
     double width_cost = -1.0;
     std::optional<std::uint64_t> cache;
     std::vector<std::string> jobs;
@@ -436,6 +438,8 @@ int bench(const std::string& artifact, const std::vector<std::string>& args) {
             mtp = static_cast<std::uint32_t>(value());
         } else if (a == "--mtp-fixed") {
             mtp_fixed = true;
+        } else if (a == "--mtp-joint-acceptance") {
+            joint = true;
         } else if (a == "--vision") {
             vision = true;
         } else if (a == "--width-cost" && i + 1 < args.size()) {
@@ -457,6 +461,7 @@ int bench(const std::string& artifact, const std::vector<std::string>& args) {
         options.speculative.backend         = SpeculativeBackend::Mtp;
         options.speculative.draft_tokens    = mtp;
         options.flash_next.mtp_fixed_drafts = mtp_fixed;
+        options.flash_next.mtp_joint_acceptance = joint;
         if (width_cost >= 0.0) { options.flash_next.mtp_width_cost = width_cost; }
     }
     const auto load = std::chrono::steady_clock::now();
@@ -481,7 +486,7 @@ int bench(const std::string& artifact, const std::vector<std::string>& args) {
 // verified drafts (so acceptance, rejection and the commit paths all ran).
 int mtp_exact(const std::string& artifact, const std::vector<std::string>& args) {
     std::uint32_t max_context = 33'792, tokens = 256;
-    bool fixed = false;
+    bool fixed = false, joint = false;
     std::vector<std::uint32_t> depths;
     std::vector<std::string> jobs;
     for (std::size_t i = 0; i < args.size(); ++i) {
@@ -492,6 +497,8 @@ int mtp_exact(const std::string& artifact, const std::vector<std::string>& args)
             tokens = static_cast<std::uint32_t>(std::stoul(args[++i]));
         } else if (a == "--mtp-fixed") {
             fixed = true;
+        } else if (a == "--mtp-joint-acceptance") {
+            joint = true;
         } else if (depths.empty() && a.find_first_not_of("0123456789,") == std::string::npos) {
             std::stringstream list(a);
             std::string item;
@@ -522,6 +529,7 @@ int mtp_exact(const std::string& artifact, const std::vector<std::string>& args)
         options.speculative.backend          = SpeculativeBackend::Mtp;
         options.speculative.draft_tokens     = depth;
         options.flash_next.mtp_fixed_drafts  = fixed;
+        options.flash_next.mtp_joint_acceptance = joint;
         Engine engine(options);
         for (std::size_t j = 0; j < jobs.size(); ++j) {
             const auto prompt       = parse_tokens(jobs[j]);

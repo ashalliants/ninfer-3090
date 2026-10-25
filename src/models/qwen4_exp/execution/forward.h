@@ -155,6 +155,9 @@ struct MtpCall {
     bool kv_only = true;
     Tensor residual_out;     // BF16 [S*H, 1]
     Tensor drafts;           // I32 [1]
+    // When set (a full step): FP32 [1] receives the draft's softmax probability under the head's FP32
+    // logits (ops::argmax_probability, whose ids equal the BF16 argmax the step otherwise runs).
+    Tensor probs;
     const VisionInput* vision = nullptr; // when set: cells whose next token is an image token
     // Optional observation of a full step (reference checks): each set tensor receives a copy.
     struct Tap {

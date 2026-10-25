@@ -382,6 +382,11 @@ struct FlashNextOptions {
     // grammar mask per verified position, as the Qwen3.5 path does (--mtp-constrained; needs
     // --spec mtp). Off: a constrained request decodes plain rounds.
     bool mtp_constrained = false;
+    // Basalt's joint-acceptance draft length (--mtp-joint-acceptance; needs --spec mtp): each round
+    // drafts --draft-tokens and verifies the longest prefix whose estimated chance of being accepted
+    // whole, from each draft's probability, stays above a per-request adaptive threshold. Off: the
+    // acceptance-estimate policy picks the count before drafting.
+    bool mtp_joint_acceptance = false;
     // Run each MoE block's shared expert on a high-priority CUDA stream beside the routed experts,
     // joined before they are combined (--shared-expert-stream). The same outputs, bit for bit;
     // the workspace grows by the shared expert's Linear scratch at its widest call.
