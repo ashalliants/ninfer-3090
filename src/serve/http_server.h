@@ -3,6 +3,7 @@
 #include "serve/anthropic_messages.h"
 #include "serve/anthropic_reasoning_store.h"
 #include "serve/generation_service.h"
+#include "serve/http_security.h"
 #include "serve/load_report.h"
 #include "serve/metrics.h"
 #include "serve/openai_common.h"
@@ -49,6 +50,12 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 parse_context_store_flush_body(std::string_view body);
 // Its answer: {"written", "unsaved", "uploaded", "seconds"}.
 [[nodiscard]] std::string context_store_flush_json(const ninfer::ContextStoreFlushReport& report);
+
+// The Host check (always) and the Origin check (without a key and without --cors). A refused
+// request gets a 403 in its endpoint's error shape and the result is true.
+[[nodiscard]] bool reject_untrusted_request(const HostPolicy& policy, const ServeOptions& options,
+                                            const httplib::Request& request,
+                                            httplib::Response& response);
 
 class HttpServer {
 public:
@@ -168,6 +175,9 @@ private:
     std::thread startup_listener_;
     std::atomic<bool> startup_listener_result_{false};
     ServeOptions options_;
+    // The names this server answers to. Rebuilt by bind_any_port() once the port is known, before
+    // any request can arrive.
+    HostPolicy host_policy_;
     std::string public_model_id_;
     // Written by attach() together with service_, before ready_ is published.
     LoadCapacity load_capacity_;

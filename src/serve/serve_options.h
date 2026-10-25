@@ -30,6 +30,8 @@ struct ServeOptions {
     std::string host = "127.0.0.1";
     int port         = 8080;
     std::string api_key;                          // empty => no auth
+    // --allowed-host NAME, repeatable: more names the Host check accepts (see make_host_policy).
+    std::vector<std::string> allowed_hosts;
     std::optional<std::string> model_id_override; // unset => artifact metadata.name
     std::string request_log_jsonl;                // empty => structured request logging disabled
     // --request-log-lossy-detail: request_done records add lossy_prefill.kept_runs (the kept offsets
