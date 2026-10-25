@@ -291,6 +291,9 @@ int main() {
                       cast,
                   "the forward's MoE term plans the precast planes at T = " + std::to_string(t));
         }
+        // --moe-gate-up-registers allocates nothing: the register kernel reads the precast planes in
+        // place and needs no workspace of its own (moe_experts_workspace_bytes does not take it).
+        check(!q4::ProgramOptions{}.moe_gate_up_registers, "the register gate/up kernel is off by default");
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

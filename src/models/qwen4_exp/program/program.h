@@ -433,6 +433,9 @@ struct ProgramOptions {
     // FlashNextOptions::moe_precast_input: each routed-expert call casts its input to A8 once
     // (execution::ForwardOptions::moe_precast_input); the workspace terms include its planes.
     bool moe_precast_input = false;
+    // FlashNextOptions::moe_gate_up_registers: the routed experts' gate/up rows from registers
+    // (execution::ForwardOptions::moe_gate_up_registers); requires moe_precast_input. No memory.
+    bool moe_gate_up_registers = false;
 };
 
 // ProgramDevicePlan::shared_expert_workspace of these options: the side-stream carve

@@ -178,6 +178,10 @@ void validate(const EngineOptions& options) {
         refuse("--mtp-joint-acceptance chooses how many MTP drafts each round verifies and --mtp-fixed "
                "(mtp_fixed_drafts) always verifies --draft-tokens: use one of them");
     }
+    if (next.moe_gate_up_registers && !next.moe_precast_input) {
+        refuse("--moe-gate-up-registers reads the input that --moe-precast-input casts once per call and needs it: "
+               "add --moe-precast-input or remove --moe-gate-up-registers");
+    }
     if (next.ngram_prefetch && spec.backend != SpeculativeBackend::Mtp) {
         refuse("--ngram-prefetch reads the anchor column's n-gram rows while the MTP drafter runs and needs "
                "--spec mtp: add --spec mtp or remove --ngram-prefetch");
@@ -354,6 +358,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.hot_embedding_rows   = next.hot_embedding_rows;
     program_options.gdn_head_map         = next.gdn_head_map;
     program_options.moe_precast_input    = next.moe_precast_input;
+    program_options.moe_gate_up_registers = next.moe_gate_up_registers;
     program_options.ngram_volume    = next.ngram_volume_path.empty()
                                           ? models::qwen4_exp::default_ngram_volume(options.artifact_path)
                                           : next.ngram_volume_path;

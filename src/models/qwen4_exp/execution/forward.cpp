@@ -41,6 +41,11 @@ namespace {
 
 std::int32_t dim(std::uint64_t v) { return static_cast<std::int32_t>(v); }
 
+// ForwardOptions::moe_gate_up_registers as the routed experts' gate/up kernel.
+ops::GateUpVariant gate_up_variant(bool registers) {
+    return registers ? ops::GateUpVariant::Registers : ops::GateUpVariant::Staged;
+}
+
 void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceArena& work, cudaStream_t s) {
     ops::linear(x, p.weight, out, p.policy, work, s);
 }
@@ -152,7 +157,7 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
       side_(options.shared_expert_stream ? std::make_unique<SideStream>() : nullptr),
       hot_embedding_rows_(options.hot_embedding_rows), hot_embedding_(options.hot_embedding),
       cold_embedding_(options.cold_embedding), gdn_head_map_(options.gdn_head_map),
-      moe_precast_input_(options.moe_precast_input) {
+      moe_precast_input_(options.moe_precast_input), moe_gate_up_registers_(options.moe_gate_up_registers) {
     if (state_.gdn_conv.size() != config_.gdn_layers || state_.gdn_recurrent.size() != config_.gdn_layers ||
         state_.ple_slot.dtype != DType::I32 || state_.ple_slot.numel() != 1 ||
         state_.qsa_tails.size() != config_.attention_layers || kv_.layers.size() != config_.attention_layers ||
@@ -179,7 +184,7 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
       experts_(std::move(experts)), side_(options.shared_expert_stream ? std::make_unique<SideStream>() : nullptr),
       hot_embedding_rows_(options.hot_embedding_rows), hot_embedding_(options.hot_embedding),
       cold_embedding_(options.cold_embedding), gdn_head_map_(options.gdn_head_map),
-      moe_precast_input_(options.moe_precast_input) {
+      moe_precast_input_(options.moe_precast_input), moe_gate_up_registers_(options.moe_gate_up_registers) {
     if (mtp.has_value() != parameters_.mtp.has_value()) {
         throw std::invalid_argument("Qwen4Exp forward: the MTP drafter's parameters and state go together");
     }
@@ -695,7 +700,8 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
                                 .staging_base  = experts_.staging_base,
                                 .staging_slots = experts_.staging_slots,
                                 .zero_copy_misses = experts_.zero_copy_misses};
-    source.precast_input = moe_precast_input_;
+    source.precast_input   = moe_precast_input_;
+    source.gate_up_variant = gate_up_variant(moe_gate_up_registers_);
     ExpertStream* stream = experts_.stream != nullptr && experts_.stream->active() ? experts_.stream : nullptr;
     if (stream != nullptr) {
         source.frames = stream->table(layer);
@@ -1179,6 +1185,7 @@ void Forward::mtp_block(const MtpCall& call) {
         ops::moe_dispatch(routing, E, dispatch, nullptr, s);
         const ops::MoeExpertSource source{.format        = p.bank->format,
                                           .precast_input = moe_precast_input_,
+                                          .gate_up_variant = gate_up_variant(moe_gate_up_registers_),
                                           .frame_base    = p.bank->device_records,
                                           .frames        = static_cast<const std::int32_t*>(mtp_frames_.data),
                                           .host_records  = p.bank->device_records,

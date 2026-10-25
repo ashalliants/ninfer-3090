@@ -270,6 +270,10 @@ struct ForwardOptions {
     // bitwise the outputs. The planes are in the call's workspace: workspace_bytes and
     // mtp_workspace_bytes take the same choice.
     bool moe_precast_input = false;
+    // Every routed-expert call computes its narrow gate/up rows from registers
+    // (ops::GateUpVariant::Registers), reading the precast input: requires moe_precast_input. The
+    // same arithmetic, bitwise the outputs; no workspace.
+    bool moe_gate_up_registers = false;
 };
 
 class Forward {
@@ -420,6 +424,7 @@ private:
     Weight hot_embedding_, cold_embedding_;
     bool gdn_head_map_ = false; // ForwardOptions::gdn_head_map
     bool moe_precast_input_ = false; // ForwardOptions::moe_precast_input
+    bool moe_gate_up_registers_ = false; // ForwardOptions::moe_gate_up_registers
     Tensor mtp_frames_; // I32 [E]: every drafter expert resident at its own index
     DeviceBuffer mtp_frames_backing_;
     Tensor residual_; // the call's residual stream, in the workspace from run_front to run_back

@@ -176,7 +176,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--no-cuda-graph] [--no-prefix-reuse] [--devices N,M,...] [--stage-layers A,B,...] "
            "[--ngram-volume FILE] [--ngram-keepalive-ms N] [--expert-state FILE|--no-expert-state] [--default-expert-state FILE] "
            "[--vram-headroom-mib N] [--shared-expert-stream] [--mtp-constrained] [--mtp-joint-acceptance] [--ngram-prefetch] "
-           "[--hot-embedding-rows N] [--gdn-head-map] [--moe-precast-input] "
+           "[--hot-embedding-rows N] [--gdn-head-map] [--moe-precast-input [--moe-gate-up-registers]] "
            "[--ram-headroom-mib N] [--expert-cache-mib N] [--context-nvme-mib N [--context-nvme-dir DIR]] "
            "[--chat-template FILE] "
            "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
@@ -276,7 +276,9 @@ std::string serve_usage_text(const char* argv0) {
            "--gdn-head-map reads the GDN's key heads through the tiled head map instead of copying "
            "them per value head (the same output, bit for bit; off by default); --moe-precast-input "
            "casts each routed-expert call's input to A8 once instead of in every gate/up block (the same "
-           "output, bit for bit; off by default); "
+           "output, bit for bit; off by default); --moe-gate-up-registers computes the routed experts' "
+           "gate/up rows from registers in a grid that stays resident (the same output, bit for bit; off "
+           "by default; needs --moe-precast-input); "
            "--vision takes "
            "images when "
            "the model was converted with "
@@ -687,6 +689,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.flash_next.gdn_head_map = true;
         } else if (arg == "--moe-precast-input") {
             options.flash_next.moe_precast_input = true;
+        } else if (arg == "--moe-gate-up-registers") {
+            options.flash_next.moe_gate_up_registers = true;
         } else if (arg == "--hot-embedding-rows") {
             options.flash_next.hot_embedding_rows = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--hot-embedding-rows"), "hot-embedding-rows"));
@@ -1056,6 +1060,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     product::apply_speculative_defaults(options.speculative);
     product::validate_speculative_cli_options(options.speculative);
+    if (options.flash_next.moe_gate_up_registers && !options.flash_next.moe_precast_input) {
+        throw std::invalid_argument("--moe-gate-up-registers reads the input that --moe-precast-input casts once "
+                                    "per call: add --moe-precast-input");
+    }
     if (options.vision_residency == VisionResidency::Overlay && !options.enable_vision) {
         throw std::invalid_argument("--vision-residency overlay requires --vision");
     }

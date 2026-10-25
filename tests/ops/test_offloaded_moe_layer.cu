@@ -14,6 +14,14 @@
 //     zero-copy (MoeExpertSource::zero_copy_misses), alone, mixed and beside the CPU service.
 //     precast_bitwise: every one of these placements again with MoeExpertSource::precast_input (x
 //     cast to A8 once per call, the gate/up CTAs reading its codes), bit for bit the same outputs.
+//     registers_bitwise: every placement a third time with the precast input and
+//     GateUpVariant::Registers (the co-resident register gate/up grid), bit for bit the same.
+//   - precast_read_proof: a captured narrow call (device frames, T in {1, 8}) with the precast input,
+//     for the staged and the register gate/up kernel, replayed once, then with the precast node
+//     disabled and x overwritten with BF16 NaNs: the outputs stay the expected ones, so the gate/up
+//     kernels read the precast planes and not x. Re-enabling the node, or capturing without the
+//     precast input (the control), makes the NaNs reach the outputs.
+//   - the register gate/up kernel without the precast input is refused on the host.
 //   - The whole layer against FP64: route weights, the routed experts (FP64 over the decoded
 //     records and A8-cast activations), a shared expert composed of GGML linears and silu_mul (its
 //     Op outputs rounded to BF16, their observable boundaries), and moe_combine.
@@ -307,6 +315,7 @@ struct Config {
     bool wide_frames = false;
     int zero_copy_misses = 0; // MoeExpertSource::zero_copy_misses
     bool precast_input   = false; // MoeExpertSource::precast_input
+    bool gate_up_registers = false; // MoeExpertSource::gate_up_variant = Registers (needs precast_input)
 };
 
 std::vector<Config> configs() {
@@ -396,6 +405,7 @@ std::vector<std::uint16_t> run_config(const Bank& bank, const Config& cfg, const
     source.staging_slots = cfg.staging_slots;
     source.zero_copy_misses = cfg.zero_copy_misses;
     source.precast_input    = cfg.precast_input;
+    source.gate_up_variant  = cfg.gate_up_registers ? ops::GateUpVariant::Registers : ops::GateUpVariant::Staged;
     std::unique_ptr<om::CpuMissService> owned;
     om::CpuMissService* service = external;
     if (service == nullptr && cfg.cpu_workers > 0) {
@@ -455,11 +465,14 @@ void check_bank(const Bank& bank, int k, const std::vector<int>& column_counts, 
         DeviceBuffer x_dev(x.size() * 2);
         x_dev.copy_from_host(x.data(), x.size() * 2);
         const auto want = expected_outputs(bank, x, ids, k, columns);
-        // Every placement as it is, then with the input cast once per call (precast_bitwise).
-        for (const bool precast : {false, true}) {
+        // Every placement as it is, then with the input cast once per call (precast_bitwise), then
+        // with that and the register gate/up kernel (registers_bitwise).
+        for (const int mode : {0, 1, 2}) {
             for (Config cfg : configs()) {
-                cfg.precast_input = precast;
-                if (precast) { cfg.name += "+precast"; }
+                cfg.precast_input     = mode >= 1;
+                cfg.gate_up_registers = mode == 2;
+                if (mode >= 1) { cfg.name += "+precast"; }
+                if (mode == 2) { cfg.name += "+registers"; }
                 std::printf("  %s T=%d %s\n", format_name(bank.format), columns, cfg.name.c_str());
                 const auto got = run_config(bank, cfg, r, x_dev, columns);
                 std::size_t mismatches = 0;
@@ -480,11 +493,12 @@ void check_bank(const Bank& bank, int k, const std::vector<int>& column_counts, 
                 worst_point = std::max(worst_point, crit.worst);
                 check(accept(crit), "expert output outside the A8 criterion against FP64");
             }
-            std::printf("%-13s T=%-2d %zu placements, with and without precast_input, bit-identical to the CPU engine; "
-                        "FP64 normwise %.3e, worst %.3e\n",
+            std::printf("%-13s T=%-2d %zu placements, staged, precast and precast+registers, bit-identical to the CPU "
+                        "engine; FP64 normwise %.3e, worst %.3e\n",
                         format_name(bank.format), columns, configs().size(), worst_norm, worst_point);
         } else {
-            std::printf("%-13s T=%-2d %zu placements, with and without precast_input, bit-identical to the CPU engine\n",
+            std::printf("%-13s T=%-2d %zu placements, staged, precast and precast+registers, bit-identical to the CPU "
+                        "engine\n",
                         format_name(bank.format), columns,
                         configs().size());
         }
@@ -726,6 +740,133 @@ bool rejects(F&& f) {
     return false;
 }
 
+// precast_read_proof (see the header). The bitwise matrix cannot tell a gate/up kernel that reads the
+// precast planes from one that casts x itself; this can. A call of device frames only (no staging,
+// no CPU channel, T <= 8) runs the precast kernel (with the precast input), the gate/up kernel and
+// the down kernel, and only the first two read x. It is captured on its own stream, replayed once
+// with x intact, then x is overwritten with 0xFF bytes (BF16 NaN, which casts to zero codes) and the
+// graph is replayed with the precast node disabled: the planes still hold the first replay's codes,
+// so a gate/up kernel that reads them gives the expected outputs and one that reads x does not.
+// Re-enabling the precast node, and the control without the precast input, must change them.
+void test_precast_read_proof() {
+    std::mt19937 rng(505);
+    constexpr int kExperts = 64, kTopK = 10;
+    const QType format = QType::GGML_REC_IQ2_S_Q2_0;
+    std::vector<std::vector<std::uint8_t>> records;
+    for (int e = 0; e < kExperts; ++e) { records.push_back(random_record(format, rng)); }
+    const auto bank = make_bank(format, records, align256(om::record_geometry(format).bytes));
+    std::vector<std::int32_t> frames(kExperts);
+    std::iota(frames.begin(), frames.end(), 0);
+    DeviceBuffer d_frames(frames.size() * 4);
+    d_frames.copy_from_host(frames.data(), frames.size() * 4);
+    cudaStream_t stream = nullptr;
+    cuda_ok(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "proof stream");
+    struct Case {
+        const char* name;
+        bool precast, registers;
+    };
+    for (const int columns : {1, 8}) {
+        std::vector<float> f32;
+        (void)random_logits(kExperts, columns, rng, f32);
+        DeviceRouting r(f32, kExperts, kTopK, columns);
+        const auto ids  = download<std::int32_t>(r.ids.p, static_cast<std::size_t>(kTopK) * columns);
+        const auto x    = random_x(columns, rng);
+        const auto want = expected_outputs(bank, x, ids, kTopK, columns);
+        const int max_jobs = std::min(kExperts, kTopK * columns);
+        DeviceBuffer x_dev(x.size() * 2);
+        DeviceBuffer outputs(want.size() * 2);
+        const Tensor xt(x_dev.p, DType::BF16, {om::kHidden, columns});
+        Tensor out(outputs.p, DType::BF16, {om::kHidden, kTopK * columns});
+        for (const Case& c : {Case{"staged+precast", true, false}, Case{"registers+precast", true, true},
+                              Case{"control: no precast", false, false}}) {
+            x_dev.copy_from_host(x.data(), x.size() * 2);
+            DeviceBuffer workspace(ops::moe_experts_workspace_bytes(max_jobs, kTopK * columns, columns, c.precast));
+            // On the proof's stream (non-blocking: it does not wait for the legacy stream).
+            cuda_ok(cudaMemsetAsync(workspace.p, 0xA5, workspace.bytes, stream), "poison the workspace");
+            ops::MoeExpertSource source;
+            source.format          = bank.format;
+            source.precast_input   = c.precast;
+            source.gate_up_variant = c.registers ? ops::GateUpVariant::Registers : ops::GateUpVariant::Staged;
+            source.frame_base      = static_cast<const std::uint8_t*>(bank.frames->p);
+            source.frames          = static_cast<const std::int32_t*>(d_frames.p);
+            source.host_records    = bank.pinned->device;
+            source.record_stride   = bank.stride;
+            const auto replay = [&](cudaGraphExec_t exec) {
+                cuda_ok(cudaMemsetAsync(outputs.p, 0xFF, outputs.bytes, stream), "poison the outputs");
+                cuda_ok(cudaGraphLaunch(exec, stream), "replay");
+                cuda_ok(cudaStreamSynchronize(stream), "replay");
+                const auto got = download<std::uint16_t>(outputs.p, want.size());
+                std::size_t mismatches = 0;
+                for (std::size_t i = 0; i < got.size(); ++i) { mismatches += got[i] != want[i] ? 1 : 0; }
+                return mismatches;
+            };
+            const std::string label = std::string(c.name) + " T=" + std::to_string(columns);
+            // An eager call first (it also configures the kernels outside the capture).
+            ops::moe_experts(xt, r.view, source, kTopK, max_jobs, workspace.p, out, stream);
+            cuda_ok(cudaStreamSynchronize(stream), "eager call");
+            check(download<std::uint16_t>(outputs.p, want.size()) == want, label + ": the eager call differs");
+            cudaGraph_t graph = nullptr;
+            cuda_ok(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "begin capture");
+            ops::moe_experts(xt, r.view, source, kTopK, max_jobs, workspace.p, out, stream);
+            cuda_ok(cudaStreamEndCapture(stream, &graph), "end capture");
+            std::size_t count = 0;
+            cuda_ok(cudaGraphGetNodes(graph, nullptr, &count), "graph nodes");
+            std::vector<cudaGraphNode_t> nodes(count);
+            cuda_ok(cudaGraphGetNodes(graph, nodes.data(), &count), "graph nodes");
+            int kernels = 0;
+            for (cudaGraphNode_t node : nodes) {
+                cudaGraphNodeType type{};
+                cuda_ok(cudaGraphNodeGetType(node, &type), "node type");
+                kernels += type == cudaGraphNodeTypeKernel ? 1 : 0;
+            }
+            check(kernels == (c.precast ? 3 : 2), label + ": expected precast (when on), gate/up and down kernels");
+            cudaGraphExec_t exec = nullptr;
+            cuda_ok(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+            check(replay(exec) == 0, label + ": the first replay differs from the CPU engine");
+            cuda_ok(cudaMemsetAsync(x_dev.p, 0xFF, x_dev.bytes, stream), "x to BF16 NaN");
+            if (c.precast) {
+                // The precast kernel: the graph's one root, a 1-D grid of ceil(80 T / 256) blocks of 256.
+                std::size_t roots = 0;
+                cuda_ok(cudaGraphGetRootNodes(graph, nullptr, &roots), "root nodes");
+                check(roots == 1, label + ": the precast kernel is not the graph's only root");
+                cudaGraphNode_t precast = nullptr;
+                roots                   = 1;
+                cuda_ok(cudaGraphGetRootNodes(graph, &precast, &roots), "root nodes");
+                cudaKernelNodeParams params{};
+                cuda_ok(cudaGraphKernelNodeGetParams(precast, &params), "precast node");
+                check(params.gridDim.x == static_cast<unsigned>((80 * columns + 255) / 256) && params.gridDim.y == 1 &&
+                          params.blockDim.x == 256,
+                      label + ": the root node is not the precast kernel");
+                cuda_ok(cudaGraphNodeSetEnabled(exec, precast, 0), "disable the precast node");
+                const std::size_t kept = replay(exec);
+                check(kept == 0, label + ": with the precast node disabled and x NaN, " + std::to_string(kept) +
+                                     " outputs changed: the gate/up kernel did not read the precast planes");
+                cuda_ok(cudaGraphNodeSetEnabled(exec, precast, 1), "enable the precast node");
+                check(replay(exec) > 0, label + ": the NaN x did not reach the outputs through the precast node");
+            } else {
+                check(replay(exec) > 0, label + ": the NaN x did not reach the outputs without the precast input");
+            }
+            cuda_ok(cudaGraphExecDestroy(exec), "destroy exec");
+            cuda_ok(cudaGraphDestroy(graph), "destroy graph");
+            std::printf("precast_read_proof %s: %s\n", label.c_str(),
+                        c.precast ? "outputs kept with the precast node off and x NaN; changed with it on"
+                                  : "outputs changed with x NaN (control)");
+        }
+        // The register kernel reads the precast planes: without the precast input it is refused.
+        ops::MoeExpertSource bare;
+        bare.format          = bank.format;
+        bare.gate_up_variant = ops::GateUpVariant::Registers;
+        bare.frame_base      = static_cast<const std::uint8_t*>(bank.frames->p);
+        bare.frames          = static_cast<const std::int32_t*>(d_frames.p);
+        bare.host_records    = bank.pinned->device;
+        bare.record_stride   = bank.stride;
+        DeviceBuffer workspace(ops::moe_experts_workspace_bytes(max_jobs, kTopK * columns, columns));
+        check(rejects([&] { ops::moe_experts(xt, r.view, bare, kTopK, max_jobs, workspace.p, out, stream); }),
+              "the register gate/up kernel ran without the precast input");
+    }
+    cuda_ok(cudaStreamDestroy(stream), "proof stream");
+}
+
 void test_malformed() {
     constexpr int kExperts = 8;
     for (int entries : {6, 1500}) { // the one-CTA route and the three-kernel route
@@ -809,6 +950,7 @@ int main(int argc, char** argv) {
     test_synthetic_banks();
     test_layer_fp64();
     test_host_silent();
+    test_precast_read_proof();
     if (const char* path = std::getenv("NINFER_TEST_ARTIFACT"); path != nullptr && *path != 0) {
         test_real_banks(path);
     } else {

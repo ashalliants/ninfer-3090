@@ -7,11 +7,14 @@
 //     A8-cast activations, for each record format at T in {1, 2, 7, 8};
 //   - AVX2 = scalar, and the worker team at 1, 2, 3, 8 and 16 workers = scalar, bit for bit;
 //   - both entry points reject a job with a null record or a null active x/y column; the team's
-//     optional progress word advances during a round.
+//     optional progress word advances during a round;
+//   - coresident_blocks_values: the register gate/up kernel's co-resident grid leaves an eighth of
+//     the SMs to the side streams (offloaded_moe::coresident_blocks).
 
 #include "ninfer/ops/offloaded_sparse_moe.h"
 #include "offloaded_moe_fixtures.h"
 #include "ops/common/canonical_ggml.h"
+#include "ops/offloaded_sparse_moe/coresident.h"
 #include "ops/offloaded_sparse_moe/cpu/expert_cpu.h"
 
 #include <bit>
@@ -248,6 +251,16 @@ void test_rejects_missing_columns() {
     std::printf("rejects a null record and null active columns; the progress word advances\n");
 }
 
+// The grid of GateUpVariant::Registers: (SMs - SMs / 8) * blocks per SM, an eighth of the SMs (rounded
+// down) left to the side streams.
+void test_coresident_blocks_values() {
+    check(om::coresident_blocks(82, 2) == 144, "82 SMs (RTX 3090) at 2 blocks: 144");
+    check(om::coresident_blocks(1, 2) == 2, "1 SM at 2 blocks: 2");
+    check(om::coresident_blocks(8, 3) == 21, "8 SMs at 3 blocks: 21");
+    check(om::coresident_blocks(7, 1) == 7, "7 SMs keep every SM");
+    std::printf("coresident_blocks_values: 82 SMs x 2 -> 144, 1 x 2 -> 2\n");
+}
+
 } // namespace
 
 int main() {
@@ -256,6 +269,7 @@ int main() {
     test_oracle_and_isa();
     test_team();
     test_rejects_missing_columns();
+    test_coresident_blocks_values();
     std::printf("offloaded_moe_cpu: passed\n");
     return 0;
 }

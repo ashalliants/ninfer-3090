@@ -417,6 +417,12 @@ struct FlashNextOptions {
     // of its gate/up thread blocks (40 per expert): the same codes, so the same output bit for bit;
     // the call's workspace grows by about 2.8 KiB a column.
     bool moe_precast_input = false;
+    // Compute the routed experts' gate/up rows from registers (--moe-gate-up-registers): a grid that
+    // stays resident loops over the rows, a warp loads one gate and one up row straight into
+    // registers and splits their last sub-blocks across its two half-warps. The same arithmetic in
+    // the same order, so the same output bit for bit. Reads the precast input, so it requires
+    // moe_precast_input.
+    bool moe_gate_up_registers = false;
     // The context cache's NVMe tier: a scratch file of up to this many bytes holds the checkpoints,
     // with the Host context budget as its RAM cache (a zero Host budget then reuses prefixes from
     // disk alone); 0: none. The file is created in `context_nvme_dir` (empty: beside the artifact),

@@ -742,6 +742,38 @@ None has been measured on the RTX 3090 yet.
     of the maxima, so the total may not grow). No other device memory.
   - Works with two lanes, MTP (the drafter's and the verification's calls) and vision. Not
     measured.
+- **The routed experts' gate/up rows from registers** (`--moe-gate-up-registers`, with the
+  `--moe-precast-input` it needs; Basalt's `gu2.cuh` / `dm_glue_gu_kernel`). PR 7 and PR 11 found
+  the narrow route bound by per-CTA arithmetic latency at low occupancy (three staged gate/up CTAs
+  per SM, ~12 us of compute each after their slice lands), not by DRAM, and the persistent variants
+  tried there (cp.async slot rings) were no faster. This variant removes the shared-memory staging
+  instead: `ops::GateUpVariant::Registers` launches a grid of (SMs - SMs / 8) x the kernel's
+  measured blocks per SM (`offloaded_moe::coresident_blocks`, the eighth left to the shared
+  expert's side stream; 144 on the RTX 3090 at the two blocks per SM that `launch_bounds` asks for,
+  more for instances that use fewer registers) that loops over (8 intermediates, job) items; a warp
+  decodes one intermediate's gate and up rows straight from the record into registers (no shared
+  memory, no barrier), reads its columns' codes in place from the precast planes and applies SwiGLU
+  itself. A row's 80 sub-blocks leave half a
+  warp idle in the third pass (lanes 16-31 have no sub-block 80-95), so lanes 0-15 take the gate
+  row's sub-blocks 64-79 and lanes 16-31 the up row's, handing each fma's operands (c * d,
+  float(P)) to lane l - 16 by `__shfl_down_sync` before that lane's fma. The down kernel is
+  unchanged. The variant is a separate kernel template; every existing instance's SASS is
+  unchanged (cuobjdump of all 37 kernels of `moe_layer.cu` identical to 25bcd28d, encodings
+  included; `wide_expert.cu` byte-identical).
+  - Each lane partial receives the same fma operands in the same order (s = l, l + 32, then l + 64
+    for l < 16) and the same butterfly, so the outputs are designed to equal the staged kernel's
+    bit for bit (the argument is in the kernel's comment). `ninfer_offloaded_moe_layer_test` runs
+    every placement a third time with the precast input and the register kernel
+    (registers_bitwise), and precast_read_proof checks on a captured call that both gate/up kernels
+    read the precast planes rather than x (the precast node disabled and x set to NaN must leave the
+    outputs as expected; a control without the precast input must change them). End to end
+    `ninfer_qwen4_exp_forward_real_test --moe-gate-up-registers TOKENS` (logits bitwise against
+    the default) and `ninfer_qwen4_exp_moe_gate_up_registers_test` (greedy ids with MTP). None has
+    run yet.
+  - No memory: the kernel uses neither workspace nor shared memory. Records read zero-copy (misses
+    under the zero-copy rule, no staging) are read with the decoders' small loads instead of 16-byte
+    `cp.async` copies, which may cost more over PCIe; unmeasured. Refused without
+    `--moe-precast-input` (parser and startup). Works with two lanes, MTP and vision. Not measured.
 
 ## Artifact decisions
 

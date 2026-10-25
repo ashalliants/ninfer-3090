@@ -138,6 +138,21 @@ int main() {
     failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--moe-precast-input"}))
                           .flash_next.moe_precast_input,
                       "--moe-precast-input does not reach the Engine");
+    failures += check(!defaults.flash_next.moe_gate_up_registers, "the register gate/up kernel is on by default");
+    {
+        const ninfer::EngineOptions both = make_engine_options(
+            parse({"ninfer-serve", "model.ninfer", "--moe-precast-input", "--moe-gate-up-registers"}));
+        failures += check(both.flash_next.moe_gate_up_registers && both.flash_next.moe_precast_input,
+                          "--moe-gate-up-registers does not reach the Engine");
+        bool refused = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--moe-gate-up-registers"});
+        } catch (const std::invalid_argument& error) {
+            refused = std::string(error.what()).find("--moe-gate-up-registers") != std::string::npos &&
+                      std::string(error.what()).find("--moe-precast-input") != std::string::npos;
+        }
+        failures += check(refused, "--moe-gate-up-registers without --moe-precast-input was not refused naming both flags");
+    }
     failures += check(!defaults.flash_next.mtp_constrained, "MTP for constrained requests is on by default");
     failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
                                                  "--mtp-constrained"}))

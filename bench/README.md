@@ -361,14 +361,17 @@ over 1-16 workers, rotating through 96 records so none is cache-resident. Record
 with finite scales; medians of `--reps` (default 30).
 
 Options: `--mode gpu|cpu|all`, `--experts N` (1-16, default 10), `--reps N` (default 30),
-`--misses N` (1-`--experts`, default 1) and `--precast 0|1` (default 0; 1 sets
-`MoeExpertSource::precast_input`, the input cast to A8 once per call, for an A/B of the GPU rows).
+`--misses N` (1-`--experts`, default 1), `--precast 0|1` (default 0; 1 sets
+`MoeExpertSource::precast_input`, the input cast to A8 once per call, for an A/B of the GPU rows) and
+`--registers 0|1` (default 0; 1, which needs `--precast 1`, sets `MoeExpertSource::gate_up_variant`
+to `GateUpVariant::Registers`, the gate/up rows from registers in a co-resident grid).
 
 ```bash
 ./build/bench/ninfer_benches ninfer_offloaded_moe_bench
 ./build/bench/ninfer_benches ninfer_offloaded_moe_bench --mode cpu --reps 50
 ./build/bench/ninfer_benches ninfer_offloaded_moe_bench --mode gpu --misses 3
 ./build/bench/ninfer_benches ninfer_offloaded_moe_bench --mode gpu --precast 1
+./build/bench/ninfer_benches ninfer_offloaded_moe_bench --mode gpu --precast 1 --registers 1
 ```
 
 ## QSA Op benchmark
