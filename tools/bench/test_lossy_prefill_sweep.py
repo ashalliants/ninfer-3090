@@ -481,6 +481,34 @@ def test_preflight():
         sweep.stop_server = real_stop
 
 
+def test_needle_answer_judge():
+    ref = "\nThe best thing to do in San Francisco is eat a sandwich and sit in Dolores Park on a sunny day.\n"
+    q = "\nWhat is the best thing to do in San Francisco?\n"
+    hit = sweep.needle_answer_hit
+    check(hit("Eat a sandwich and sit in Dolores Park on a sunny day.", ref, q), "short correct answer")
+    check(hit("The best thing to do in San Francisco is eat a sandwich and sit in Dolores Park on a sunny day.",
+              ref, q), "full sentence")
+    check(not hit("Visit the Golden Gate Bridge.", ref, q), "wrong answer")
+    check(not hit("Eat a sandwich.", ref, q), "partial answer")
+    check(not hit("", ref, q), "empty answer")
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp)
+        for length in sweep.NEEDLE_LENGTHS:
+            d = run / "backends" / f"needle_{length}" / "reviews" / "m"
+            d.mkdir(parents=True)
+            lines = []
+            for i, pred in enumerate(["Eat a sandwich and sit in Dolores Park on a sunny day.", "No idea."]):
+                lines.append(json.dumps({"target": ref, "messages": [
+                    {"role": "system", "content": "short"},
+                    {"role": "user", "content": f"<text>...</text>\n<question>{q}</question>"}],
+                    "sample_score": {"score": {"prediction": pred, "value": {f"C D{i}": 0}}}}))
+            (d / "needle_haystack_english.jsonl").write_text("\n".join(lines) + "\n")
+        r = sweep.rescore_needle_run(run)
+        check(r["accuracy"] == {"32k": 0.5, "64k": 0.5, "100k": 0.5}, r)
+        check(r["samples"] == {"32k": 2, "64k": 2, "100k": 2} and r["rule_accuracy"]["32k"] == 0.0, r)
+        check(sweep.rescore_needle_run(run / "missing") is None, "no reviews -> None")
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 for t in TESTS:
     t()

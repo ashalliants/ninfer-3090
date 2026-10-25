@@ -392,6 +392,56 @@ def parse_needle_samples(summary: dict[str, Any]) -> dict[str, int]:
             for r in summary.get("results", []) if str(r.get("job_id", "")).startswith("needle_")}
 
 
+_ARTICLES = {"a", "an", "the"}
+
+
+def _answer_tokens(text: str) -> list[str]:
+    """Lower-case word tokens, CJK characters one by one, articles and punctuation dropped."""
+    return [t for t in re.findall(r"[\u3400-\u9fff]|[a-z0-9']+", text.lower()) if t not in _ARTICLES]
+
+
+def needle_answer_hit(prediction: str, reference: str, question: str) -> bool:
+    """The needle judge: every word of the needle that the question does not already contain (the
+    answer words) occurs in the prediction. evalscope's `rule` judge is an exact match of the whole
+    normalised needle sentence, so a correct short answer ("Eat a sandwich and sit in Dolores Park
+    on a sunny day." for "The best thing to do in San Francisco is eat a sandwich ...") scores 0;
+    the system prompt asks for short answers, so it scored 1/22 on a baseline that answered 22/22."""
+    asked = set(_answer_tokens(question))
+    answer = [t for t in _answer_tokens(reference) if t not in asked] or _answer_tokens(reference)
+    said = set(_answer_tokens(prediction))
+    return bool(answer) and all(t in said for t in answer)
+
+
+def rescore_needle_run(run: Path) -> dict[str, Any] | None:
+    """Re-judge a ninfer_eval needle run from evalscope's per-sample reviews with needle_answer_hit:
+    {"accuracy": {length: share}, "samples": {length: n}, "rule_accuracy": {...}}. None when a length
+    has no reviews (the caller keeps evalscope's own numbers)."""
+    accuracy: dict[str, float] = {}
+    samples: dict[str, int] = {}
+    rule: dict[str, float] = {}
+    for length in NEEDLE_LENGTHS:
+        files = sorted((run / "backends" / f"needle_{length}" / "reviews").glob("*/*.jsonl"))
+        hits = rule_hits = n = 0
+        for path in files:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                review = json.loads(line)
+                score = (review.get("sample_score") or {}).get("score") or {}
+                prediction = str(score.get("prediction") or "")
+                users = [m for m in review.get("messages") or [] if m.get("role") == "user"]
+                content = str(users[-1].get("content") or "") if users else ""
+                match = re.search(r"<question>(.*?)</question>", content, re.S)
+                question = match.group(1) if match else content[-500:]
+                n += 1
+                hits += needle_answer_hit(prediction, str(review.get("target") or ""), question)
+                rule_hits += any(bool(v) for v in (score.get("value") or {}).values())
+        if n == 0:
+            return None
+        accuracy[length], samples[length], rule[length] = hits / n, n, rule_hits / n
+    return {"accuracy": accuracy, "samples": samples, "rule_accuracy": rule, "judge": "answer_words"}
+
+
 def edit_metrics(transcripts: Sequence[dict[str, Any]],
                  read_file: Callable[[str], str | None]) -> dict[str, Any]:
     """Tool-call validity and the Edit `old_string`-in-file rate from agent_replay's transcripts.jsonl.
@@ -950,8 +1000,36 @@ class Sweep:
         if not summaries:
             raise RuntimeError(f"ninfer_eval exit {proc.returncode}; no summary (see {directory / 'needle.log'})")
         document = json.loads(summaries[-1].read_text(encoding="utf-8"))
-        return {"accuracy": parse_needle_summary(document), "samples": parse_needle_samples(document),
-                "run": str(summaries[-1].parent)}
+        metrics = {"accuracy": parse_needle_summary(document), "samples": parse_needle_samples(document),
+                   "run": str(summaries[-1].parent)}
+        rescored = rescore_needle_run(summaries[-1].parent)
+        if rescored is None:
+            raise RuntimeError(f"needle run {summaries[-1].parent} has no per-sample reviews to judge")
+        metrics.update(rescored)
+        return metrics
+
+    def rescore_needle(self) -> None:
+        """Append a re-judged needle row (needle_answer_hit) for every point whose latest ok needle
+        row was scored by evalscope's rule judge; the last ok row wins in the summary."""
+        rows = load_rows([self.results]) if self.results.exists() else []
+        for point in dict.fromkeys(r["point"] for r in rows):
+            metrics = _metric(rows, point, "needle")
+            if not metrics or metrics.get("judge") == "answer_words":
+                continue
+            run = Path(metrics.get("run") or "")
+            try:
+                found = run.is_dir()
+            except OSError:  # a path recorded on another machine
+                found = False
+            if not found:
+                run = self.out / point / "needle-runs" / run.name
+            rescored = rescore_needle_run(run) if run.is_dir() else None
+            if rescored is None:
+                print(f"[{point}] needle: no reviews under {run}; not re-judged", file=sys.stderr)
+                continue
+            params = point_params(rows, point)
+            self.record(point, params if params else None, "needle", True,
+                        {**metrics, **rescored, "rejudged": True})
 
     def workload_agent_replay(self, point: str, request_log: Path) -> dict[str, Any]:
         args = self.args
@@ -1156,6 +1234,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--preflight-chars", type=int, default=PREFLIGHT_CHARS,
                         help="size of each lossy server's preflight conversation, characters (~60K tokens); "
                         "it must exceed the point's min_tokens")
+    parser.add_argument("--rescore-needle", action="store_true",
+                        help="re-judge recorded needle runs (needle_answer_hit) and re-summarise; no server")
     parser.add_argument("--speed-tokens", type=int, default=SPEED_LONG_TOKENS)
     parser.add_argument("--words-per-token", type=float, default=None)
     args = parser.parse_args(argv)
@@ -1163,7 +1243,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if any(w not in ALL_WORKLOADS for w in names):
         parser.error(f"--workloads: choose from {', '.join(ALL_WORKLOADS)}")
     args.workload_names = names
-    if args.from_json is None:
+    if args.from_json is None and not args.rescore_needle:
         if not args.server_cmd or not args.model:
             parser.error("--server-cmd and --model are required unless --from-json")
         if "needle" in names and not (args.needle_corpus and args.tokenizer_path):
@@ -1186,6 +1266,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     args.out.mkdir(parents=True, exist_ok=True)
     sweep = Sweep(args)
+    if args.rescore_needle:
+        sweep.rescore_needle()
+        rows = load_rows([sweep.results]) if sweep.results.exists() else []
+        text = render_summary(rows)
+        (args.out / "summary.md").write_text(text, encoding="utf-8")
+        print(text)
+        return 0
     points = expand_grid(args.grid_spec) if args.grid else []
     if args.only:
         points = [p for p in points if re.search(args.only, p["id"])]
