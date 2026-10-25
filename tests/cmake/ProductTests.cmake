@@ -10,13 +10,16 @@ ninfer_add_test(ninfer_pretty_logging_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_pretty_logging.cpp"
   LIBRARIES ninfer_product_logging)
 
+# ninfer-perplexity's evaluation code (host C++), for its own test and the Flash-Next forward
+# harness's KLD gate. One library, because the bundled tests would otherwise each define it.
+add_library(ninfer_perplexity_evaluation STATIC ${PROJECT_SOURCE_DIR}/apps/perplexity/evaluation.cpp)
+ninfer_internal_includes(ninfer_perplexity_evaluation)
+target_include_directories(ninfer_perplexity_evaluation PUBLIC ${PROJECT_SOURCE_DIR}/apps/perplexity)
+target_link_libraries(ninfer_perplexity_evaluation PUBLIC ninfer_core)
+
 ninfer_add_test(ninfer_perplexity_evaluation_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_perplexity_evaluation.cpp"
-          ${PROJECT_SOURCE_DIR}/apps/perplexity/evaluation.cpp
-  LIBRARIES ninfer_core)
-
-target_include_directories(ninfer_perplexity_evaluation_test PRIVATE
-  ${PROJECT_SOURCE_DIR}/apps/perplexity)
+  LIBRARIES ninfer_perplexity_evaluation ninfer_core)
 
 ninfer_add_test(ninfer_cli_options_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_cli_options.cpp" ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp

@@ -244,6 +244,8 @@ check the available memory first. Given a token list it prefills it once, writes
 `--decode N` tokens again and decodes them one call each (timed), and requires the last decode's
 top token to equal the single prefill's. With `--dump-logits OUT.bin [--chunk N]` after each of
 several token lists it scores them teacher-forced in Strata's `--dump-logits` layout instead.
+With `--kld-base FILE [--chunks N] [--window T]` it is the decode-path KLD gate against a llama.cpp
+base (see "Decode-path KLD gate" in `docs/maintainer/flash-next-plan.md`).
 `tests/fixtures/qwen4_exp/` holds the PR 0 token sets (`ppl_tokens`, `infernix_texts`; JSON and
 `strata_compare`'s `.ids`). The FP64 reference that checks it is `tools/flash_next`:
 

@@ -1,6 +1,7 @@
 # Qwen3.8-Flash-Next (qwen4exp). Host only: the n-gram hash against its fixture, and the n-gram
 # volume reader on a synthetic volume. GPU, real artifact (skips without
-# NINFER_TEST_QWEN4EXP_ARTIFACT): the whole forward pass, teacher-forced scoring and block taps.
+# NINFER_TEST_QWEN4EXP_ARTIFACT): the whole forward pass, teacher-forced scoring, block taps and the
+# decode-path KLD gate (--kld-base, scored by ninfer-perplexity's evaluation code).
 ninfer_add_test(ninfer_qwen4_exp_ngram_hash_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_hash.cpp"
   NEEDS_SOURCE_DIR
@@ -13,7 +14,7 @@ ninfer_add_test(ninfer_qwen4_exp_ngram_volume_test
 ninfer_add_test(ninfer_qwen4_exp_forward_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_forward_real.cpp"
   NEEDS_SOURCE_DIR
-  LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_core)
+  LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_ops ninfer_perplexity_evaluation ninfer_core)
 set_tests_properties(ninfer_qwen4_exp_forward_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
 # GPU, real artifact with the MTP drafter (skips otherwise): verification reproduces one-column
