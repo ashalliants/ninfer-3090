@@ -1,12 +1,13 @@
 # Lossy long-prompt prefill: design
 
-Status: built, GPU verification pending (everything compiles; the CPU and fake-engine tests pass;
-no GPU test, quality or speed number has been run yet). What the build changed from this design is in
+Status: built and GPU-verified; the quality and speed sweep ran on 2026-10-25 and set the defaults
+(filter layer 7, keep 0.3, block 64; the feature stays off by default). The measured numbers are in
+["Results"](#results-measured-2026-10-25-rtx-3090-vast). What the build changed from this design is in
 ["As built / deviations"](#as-built--deviations). A temporary plan in the sense of `AGENTS.md`: fold its stable facts into
 `docs/serving.md`, `docs/maintainer/engine-architecture.md` and
 `docs/maintainer/resource-scheduling-and-context-cache.md` when the work lands, then delete it.
 Numbers marked **(predicted)** come from the fitted prefill cost model (`tools/bench/prefill_time_model.py`,
-`docs/performance.md`) and have not been measured.
+`docs/performance.md`) and were made before the sweep; the measured ones are dated.
 
 ## Why
 
@@ -30,7 +31,8 @@ Lossless speedups on one card are nearly exhausted: the prefill GEMMs run at abo
 ## What success looks like
 
 - A 100K-token uncached prompt on the 27B finishes prefill in **about 15-20 s instead of ~55 s**
-  **(predicted)**, and holds **about a fifth of the KV** afterwards.
+  **(predicted)**, and holds **about a fifth of the KV** afterwards. Measured 2026-10-25 at the
+  defaults: a 117K cold prompt in 21.8 s instead of 70.2 s, keeping 30% of its tokens.
 - Answers on long prompts stay close to full-prefill quality on the gates below.
 - The follow-up turns of the same conversation hit the cache like any other conversation does.
 
@@ -359,17 +361,174 @@ and a session log with `[#N]` references to message indices). The output is dete
     `outcome: completed` and a long prompt the probe left whole is `skipped`; `ninfer_lossy_prefill_total` counts the
     same outcomes, and `ninfer_lossy_prefill_summaries_total{kind="new|reused"}` splits the completed ones.
 
-## Expected numbers (predicted, 27B, 100K uncached, chunk 4096)
+## Expected numbers: predicted vs measured (27B, chunk 4096)
 
-Baseline split: GEMM ≈ 33 s, attention ≈ 22 s (55 s measured total, 40% attention measured).
-Scout at `L` = 16 costs ≈ a quarter of a full prefill; main pass on 20% costs ≈ 0.2 × GEMM + 0.04 × attention.
+The predicted columns (unchanged from before the sweep) were made for a 100K uncached prompt with the fitted cost model:
+baseline split GEMM ≈ 33 s, attention ≈ 22 s (55 s measured total, 40% attention measured, on the
+benchmark configuration); scout at `L` = 16 ≈ a quarter of a full prefill; main pass on 20% ≈
+0.2 × GEMM + 0.04 × attention. The measured column is the 2026-10-25 sweep (RTX 3090, Vast,
+`rk4v4`, `--prefill-cublas`, a **117K** cold prompt, so the baseline is longer than the predicted
+100K one); see [Results](#results-measured-2026-10-25-rtx-3090-vast). KV after is derived from the
+measured kept tokens at about 18 KB/token (`rk4v4`), not read from the pool.
 
-| setting | prefill | KV after (int8 / rk4v4) |
-|---|---|---|
-| today | ~55 s | ~3 GB / ~1.8 GB |
-| int8 scout `L`=16, keep 20% | ~19-21 s | ~0.6 GB / ~0.36 GB |
-| int4 scout `L`=16, keep 20% | ~16-18 s | ~0.6 GB / ~0.36 GB |
-| int4 scout `L`=8, keep 20% (if the sweep allows a shallow filter) | ~11-13 s | ~0.6 GB / ~0.36 GB |
+| setting | prefill (predicted, 100K) | prefill (measured 2026-10-25, 117K) | KV after, int8 / rk4v4 (predicted) | kept tokens (measured) |
+|---|---|---|---|---|
+| today | ~55 s | 70.2 s (repeat 77.1 s) | ~3 GB / ~1.8 GB | 116,865 (~2.1 GB rk4v4) |
+| int8 scout `L`=16, keep 20% | ~19-21 s | 24.5 s at `L`=15, keep 0.2 (scout 14.1 s, main 8.4 s; repeat 26.6 s) | ~0.6 GB / ~0.36 GB | 23,424 (~0.42 GB) |
+| int4 scout `L`=16, keep 20% | ~16-18 s | not on the production route: `scout_a4` promotes nothing under `--prefill-cublas`. On the A8 route, `L`=15 keep 0.2: 38.6 s (int8 scout there: 42.8 s) | ~0.6 GB / ~0.36 GB | as int8 |
+| int4 scout `L`=8, keep 20% (if the sweep allows a shallow filter) | ~11-13 s | not run; the int8 scout at `L`=7, keep 0.2 took 16.3 s (scout 5.9 s) | ~0.6 GB / ~0.36 GB | 23,425 (~0.42 GB) |
+| **default since 2026-10-25**: int8 scout `L`=7, keep 0.3 | not predicted | **21.8 s** = 0.31x (scout 5.9 s, main 13.5 s) | not predicted | 35,073 (~0.63 GB, 30%) |
+
+The scout at `L`=15 took 20% of the measured baseline (14.1 of 70.2 s), close to the predicted
+quarter, and more than the main pass at keep 0.2 (8.4 s). Measured scout time is linear in the filter
+layer, about 0.92 s per layer on this prompt, and independent of keep; the main pass is linear in the
+kept tokens (3.9 / 8.4 / 13.4 s at keep 0.1 / 0.2 / 0.3).
+
+## Results (measured 2026-10-25, RTX 3090, Vast)
+
+Every number in this section was measured on 2026-10-25; none is a prediction. The raw data is in
+`profiles/lossy-sweep/` (main sweep, cuBLAS route: `summary.md`, `results.jsonl`),
+`profiles/lossy-sweep-a8/` (int4 scout pair), `profiles/lossy-sweep-rep/` (speed repeat) and
+`profiles/lossy-sweep-box-logs/` (harness logs and box scripts). These directories are local
+artefacts, not checked in.
+
+### Setup
+
+- Qwen3.8-27B (`--model-id qwen3.8-27b`), one RTX 3090 (Vast), server
+  `--kv-dtype rk4v4 --max-context 131072 --prefill-cublas --prefill-chunk 4096` on every point (the
+  production prefill route); lossy points add `--lossy-prefill-min-tokens 30000` and the point's flags.
+  Speed servers add `--max-concurrency 2 --prefill-layer-slices 8` and a neighbour stream.
+- Speed prompt: 116,865 tokens, cold (no cached tokens). The sweep harness is
+  `tools/bench/run_lossy_prefill_sweep.py`; the corpus was pinned to commit 3c4c35fc, the server binary
+  built at 3c4c35fc.
+- Quality per point: needle in a haystack at 32K/64K/100K (22 samples each, English and Chinese
+  haystacks with the same English needle); `agent_edit` (the baseline replay's 26 `edit_function`
+  turns with at least 34K prompt tokens, each sent cold with `--no-prefix-reuse`, judged by whether
+  `old_string` occurs verbatim in the file); greedy agreement (first divergence of 96 greedy tokens
+  from the baseline, 10 prompts of 84.6K-118.0K tokens; reported, not gated).
+
+### GPU tests
+
+All 13 GPU tests for the feature pass (no skips) at 145e814c, and the lossy ones again at 3c4c35fc:
+(short names, as the box run reported them) `key_mass`, `q4_a4_linear`, `input_proj`, `native_transactions` (167 s), `prefix_real`,
+`agent_continuation`, `lossy_prefill_real`, `lossy_summary_real`, `dflash2_after_lossy`,
+`mtp_after_lossy`, `scout_a4_kept_overlap`, `recovery`, `preemption`. Key numbers:
+
+- Follow-up reuse after a select prefill: the follow-up turn of 39,993 tokens reused 39,964 and
+  computed 29 (first prompt 39,971 tokens, 7,936 kept, scout 5,927 ms, main 6,119 ms; filter layer 15,
+  keep 0.2).
+- Follow-up reuse after a summary: 39,332 of 39,360 reused, 28 computed.
+- Speculative decoding after a lossy prefill: DFlash2 matches plain decode over 128 tokens (93/233
+  accepted, FP16 GDN state on both engines); MTP matches over 128 (90/108 accepted).
+- Keep-all identity (`native_transactions`): first token, last-token logits, prompt KV, GDN state and
+  greedy tokens are bit-identical to an ordinary prefill. Scout chunk invariance: two chunk sizes keep
+  the same blocks (kept-set Jaccard 1.0, 4,352 vs 4,352) although per-token scores move by up to 17%
+  (softmax-amplified numerics; the same chunk size twice is bit-identical).
+- `scout_a4_kept_overlap` passes as a test and reports **GATE NOT MET**: score-chosen Jaccard 0.842
+  (32,785 tokens) and 0.835 (100,021 tokens), the pass key kept in both, scout int4 vs int8 1.29x and
+  1.22x.
+
+The GPU tests pin filter layer 15 and keep 0.2, the shape they were measured with, so these numbers
+stay valid after the defaults changed; they check bookkeeping, not the shipped selection.
+
+### Speed (stage 1, block 64)
+
+Baseline 70.2 s, neighbour worst gap 422 ms. Gate: ≤ 0.40x.
+
+| point | total s | x baseline | scout ms | main ms | kept / 116,865 | neighbour worst gap ms | speed gate |
+|---|---|---|---|---|---|---|---|
+| fl7_k0.1 | 11.39 | 0.16 | 5,922 | 3,940 | 11,713 | 288 | pass |
+| fl7_k0.2 | 16.30 | 0.23 | 5,925 | 8,376 | 23,425 | 288 | pass |
+| **fl7_k0.3** | **21.84** | **0.31** | 5,923 | 13,457 | 35,073 | 287 | pass |
+| fl11_k0.1 | 15.47 | 0.22 | 10,016 | 3,937 | 11,712 | 491 | pass |
+| fl11_k0.2 | 20.40 | 0.29 | 10,022 | 8,388 | 23,425 | 493 | pass |
+| fl11_k0.3 | 25.94 | 0.37 | 10,010 | 13,440 | 35,073 | 490 | pass |
+| fl15_k0.1 | 19.54 | 0.28 | 14,087 | 3,941 | 11,712 | 693 | pass |
+| fl15_k0.2 | 24.49 | 0.35 | 14,094 | 8,392 | 23,424 | 695 | pass |
+| fl15_k0.3 | 29.96 | 0.43 | 14,058 | 13,433 | 35,073 | 691 | FAIL |
+| fl23_k0.1 | 27.65 | 0.39 | 22,172 | 3,961 | 11,712 | 1,098 | pass |
+| fl23_k0.2 | 32.59 | 0.46 | 22,200 | 8,385 | 23,424 | 1,097 | FAIL |
+| fl23_k0.3 | 38.04 | 0.54 | 22,139 | 13,416 | 35,072 | 1,095 | FAIL |
+
+Block size at fl15_k0.2 (speed only): block 32 26.75 s (0.38x), block 64 24.49 s (0.35x), block 128
+26.59 s (0.38x); it barely matters. Speed repeat (fresh output directory): baseline 77.14 s,
+fl15_k0.2 26.62 s (0.35x of the repeat baseline), fl11_k0.3 28.30 s (0.37x of the repeat, 0.40x of
+the first baseline).
+
+### Quality
+
+Gates (fixed before the sweep): needle ≥ 0.95x baseline at every length; Edit within 2 points of
+baseline; 100K-class time ≤ 0.40x.
+
+| point | needle 32K / 64K / 100K | Edit, 26 cold turns | greedy first divergence, median (of 96) | time | verdict |
+|---|---|---|---|---|---|
+| baseline | 22/22, 22/22, 22/22 | 25/26 = 0.962 | - | 70.2 s | - |
+| **fl7_k0.3** | 22/22 each (1.00x) | 26/26 = 1.000 (+3.8) | 24 | 0.31x | **pass all three** |
+| fl11_k0.3 | 22/22 each (1.00x) | 26/26 = 1.000 (+3.8) | 26 | 0.37x | pass all three (time within noise of the gate) |
+| fl15_k0.2 (old default) | 22/22 each (1.00x) | 24/26 = 0.923 (−3.8) | 5 | 0.35x | Edit FAIL |
+| fl11_k0.2 | not run | 24/26 = 0.923 (−3.8) | not run | 0.29x | Edit FAIL |
+| summary strategy | 22/22 each, but all 66 skipped | 24/26 = 0.923 (−3.8) | 96 (skipped) | not measured (skipped) | Edit FAIL |
+
+Every lossy quality request of a select point completed on the lossy path (66/66 needle, 26/26
+Edit, 10/10 greedy). Every point misses the baseline's own miss (the 80,581-token turn); the failing
+points miss one more turn each (49,861 at fl15_k0.2, 78,016 at fl11_k0.2, 44,705 for summary).
+Tool-call validity was 1.000 everywhere it was measured. The greedy prompts ask for "the first three
+file names above", whose second and third headers sit in the filtered middle, so early divergence is
+expected for every select point.
+
+### Verdicts
+
+- **Defaults** (`include/ninfer/types.h`, 2026-10-25): filter layer 7, keep 0.3, block 64, the fastest
+  point that passed all three gates (0.31x, with margin to the 0.40x gate that fl11_k0.3 lacks).
+  Recent 4096, head 256, query rows 64, pool window 33 and skip 0.8 are unchanged (not swept). The
+  engine flag stays off by default (`--lossy-prefill-min-tokens 0`), and the production launcher
+  profile is not changed: [docs/serving.md](../serving.md#lossy-long-prompt-prefill-experimental)
+  documents `--lossy-prefill-min-tokens 30000` as the recommended opt-in.
+- keep 0.3 passed Edit at both filter layers tried; keep 0.2 failed by one turn at both (15 and 11).
+- **Int4 scout stays opt-in.** Measured on the integer-A8 route (no `--prefill-cublas`, both arms,
+  fl15_k0.2): score-chosen kept-block Jaccard min 0.865 over 6 prompts (0.882, 0.902, 0.886, 0.893,
+  0.865, 0.906; mean 0.889) < 0.9 FAIL (all-blocks reference min 0.897, mean 0.938); needle unchanged
+  (22/22 each, both arms); scout 23,615 → 19,519 ms = 1.21x end to end (1.19-1.24x on the Jaccard
+  prompts) < 1.4x, although the GEMMs alone are 2.05-2.2x (`ninfer_q4_a4_linear_test`); total 42.76 →
+  38.61 s; neighbour worst gap 1,046 → 896 ms. On the production cuBLAS route the int8 scout already
+  takes 14.1 s at this point, faster than the int4 scout on the A8 route (19.5 s), so `scout_a4` has no
+  production use as built: it would need a cuBLAS-route counterpart.
+- **Summary strategy fails** the Edit gate (24/26, −3.8 points; 26/26 summarised, to 14.4K-28.4K
+  tokens). Its needle and speed numbers do not measure it: the needle prompts and the speed prompt are
+  single user messages, which the summary leaves whole (`skipped`; 77.7 s, baseline-like).
+
+### Caveats
+
+- The Edit gate's resolution is one turn = 3.8 points at 26 turns: "pass" and "fail" above are one or
+  two turns apart. Only 26 turns of the 40 Edit turns in the 12 replayed sessions were long enough
+  (13 were below 30K); 30 or more did not fit the budget.
+- Baseline run-to-run noise: about ±10% in time (70.2 vs 77.1 s) and one Edit turn (the warm replay
+  and the cold `agent_edit` run of the same turns differ by one).
+- Needle saturates at 22/22 on every point measured, baseline included: it does not separate these
+  settings.
+- Agent sessions were cut to 12 (about 95 min of replay per 26 sessions did not fit).
+- Not run (budget): quality at block 32 and 128; needle and greedy at fl11_k0.2; `agent_edit` for the
+  int4 scout.
+
+### Neighbour stall
+
+The scout pass is not layer-sliced (see "As built"), so the neighbour stream's worst gap grows with the
+filter layer: 288 / 491 / 693 / 1,097 ms at `L` = 7 / 11 / 15 / 23 against 422 ms for the baseline
+(with `--prefill-layer-slices 8`). At `L` = 7, the new default, it is below the baseline; at
+`L` ≥ 11 a neighbour stalls longer than during a full prefill.
+
+### Harness bugs found and fixed during the sweep
+
+- 3e69bcef: the needle judge. evalscope's `judge_strategy: rule` exact-matches the whole needle
+  sentence, and the short answers scored 0.045-0.136 although every one was right; each sample is now
+  judged by its answer words (every needle word not in the question must appear), and earlier runs
+  were re-judged (`--rescore-needle`). Re-judged baseline: 22/22 at each length.
+- 328dc34d: `agent_replay` never exercised lossy prefill (every turn after the first reuses the
+  conversation's private record, which lossy prefill never filters). New `agent_edit` workload sends
+  the long Edit turns cold, and the Edit gate reads it.
+- 0e4e03dc: greedy prompts overshot the requested size (whole files appended past the limit; one
+  prompt reached 134,350 tokens > 131,072); the text is now cut at the requested size.
+- e7715825: a missed `agent_edit` turn keeps its reply, so misses can be inspected.
 
 ## Verification
 
@@ -447,7 +606,7 @@ Cancelling during the scout aborts the lane, which drops the scout and its pages
 ## As built / deviations
 
 What the build does differently from the design above, or adds to it. Each item is deliberate; the
-quality and speed consequences are unmeasured until the GPU sweep runs.
+measured quality and speed are in ["Results"](#results-measured-2026-10-25-rtx-3090-vast).
 
 - **M is the end of the product prompt, not the deepest shared marker.** The Frontend records
   `PreparedContextCache::product_prompt_end` (the graft, the leading System/Developer messages, the tool
@@ -500,18 +659,20 @@ quality and speed consequences are unmeasured until the GPU sweep runs.
 - **Request log**: `request_done.lossy_prefill` is omitted (not `null`) for a request that did not take or
   consider the path, so the default schema is unchanged.
 
-## Options (names are proposals; builder may adjust)
+## Options
+
+Defaults set from the 2026-10-25 sweep; the full flag list is in `docs/serving.md`.
 
 | option | default | meaning |
 |---|---|---|
-| `--lossy-prefill-min-tokens N` | `0` (off) | uncached suffix length above which the path runs; production profile sets 30000 |
-| `--lossy-prefill-keep F` | from sweep | fraction of the uncached suffix kept |
-| `--lossy-prefill-filter-layer L` | from sweep | full-attention layer used to score |
-| `--lossy-prefill-block B`, `--lossy-prefill-recent R`, `--lossy-prefill-head S` | from sweep | selection shape |
-| `--lossy-prefill-scout-a4` | off until its gate passes | int4 scout GEMMs |
+| `--lossy-prefill-min-tokens N` | `0` (off) | uncached suffix length above which the path runs; the recommended opt-in is 30000 |
+| `--lossy-prefill-keep F` | `0.3` | fraction of the uncached suffix kept |
+| `--lossy-prefill-filter-layer L` | `7` | full-attention layer used to score |
+| `--lossy-prefill-block B`, `--lossy-prefill-recent R`, `--lossy-prefill-head S` | `64`, `4096`, `256` | selection shape |
+| `--lossy-prefill-scout-a4` | off (its gate failed 2026-10-25) | int4 scout GEMMs |
 
 Startup refuses the option for non-Qwen3.5-dense Programs and pipeline-split models. The production
-launcher profile is updated in the same change that sets defaults.
+launcher profile is not changed (decided 2026-10-25): lossy prefill stays an operator opt-in.
 
 ## Left to the builder
 

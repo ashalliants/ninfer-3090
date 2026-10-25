@@ -2006,8 +2006,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--prefill-decode-share P` | after each prefill step, while another lane decodes, run decode rounds for P percent (0-90) of the step's time before the next step; see [execution behavior](#execution-behavior) | off |
 | `--prefill-layer-slices N` | while another lane decodes, run each text prefill chunk as N slices of layers with that lane's decode round between slices (2-16); see [execution behavior](#execution-behavior) | off |
 | `--lossy-prefill-min-tokens N` | **experimental, opt-in, lossy.** Filter a cold prompt whose part after the product prompt (leading system/developer messages and tools) has more than N tokens: a scout scores it and only the kept blocks are prefilled, so the model never sees the dropped text. Text-only Qwen3.5 dense on one device; never when the conversation itself is cached. See [lossy long-prompt prefill](#lossy-long-prompt-prefill-experimental) | `0` (off) |
-| `--lossy-prefill-keep F` | share of the filtered part kept, (0, 1], at most `--lossy-prefill-skip` | `0.2` |
-| `--lossy-prefill-filter-layer N` | full-attention layer whose attention mass scores the tokens | `15` |
+| `--lossy-prefill-keep F` | share of the filtered part kept, (0, 1], at most `--lossy-prefill-skip` | `0.3` |
+| `--lossy-prefill-filter-layer N` | full-attention layer whose attention mass scores the tokens | `7` |
 | `--lossy-prefill-block N` | selection block, tokens (multiple of 16) | `64` |
 | `--lossy-prefill-recent N`, `--lossy-prefill-head N` | tokens at the end and at the start of the filtered part that are always kept | `4096`, `256` |
 | `--lossy-prefill-query-rows N` | trailing query rows that score the keys (1-256) | `64` |
@@ -2423,9 +2423,32 @@ system message nor the end of the tool declarations can be found in the template
 prefills in full (the server warns once). When enabled, the scout's scratch is a
 permanent VRAM reservation of about 2 KB per token of `--max-context` on the 27B. `--lossy-prefill-strategy
 summary` is the alternative: a deterministic summary replaces the middle of a long conversation.
-Design, acceptance numbers and the deviations of the build are in
-[docs/maintainer/lossy-long-prefill.md](maintainer/lossy-long-prefill.md); quality and speed are
-not yet measured on a GPU.
+
+Recommended opt-in (the production launcher profile does not set it): `--lossy-prefill-min-tokens
+30000` and the default selection, filter layer 7 (`--lossy-prefill-filter-layer`), keep 0.3
+(`--lossy-prefill-keep`), block 64 (`--lossy-prefill-block`), recent 4096 and head 256 tokens,
+64 query rows, pool window 33, skip 0.8. [Server options](#server-options) lists every knob.
+`--lossy-prefill-scout-a4` (int4 scout GEMMs) stays opt-in: it failed its kept-block overlap gate
+and does nothing on the `--prefill-cublas` route.
+
+Measured 2026-10-25 (Qwen3.8-27B, one RTX 3090, `--kv-dtype rk4v4 --max-context 131072
+--prefill-cublas --prefill-chunk 4096`): a 116,865-token cold prompt prefilled in 70.2 s without the
+path and in **21.8 s** (0.31x; scout 5.9 s, main pass 13.5 s) at the defaults, keeping 35,073 tokens,
+so the KV afterwards is about 30% of a full prefill's. Needle in a haystack stayed 22/22 at 32K, 64K
+and 100K, and `Edit` calls replayed cold from long agent sessions found their `old_string` in 26 of
+26 turns against 25 of 26 for the full prefill. The quality checks are small (one `Edit` turn is 3.8
+points; the needle test saturates), and the summary strategy lost one `Edit` turn on the same set.
+While the scout runs it is not layer-sliced: with `--prefill-layer-slices 8` a neighbour stream's
+worst gap was 288 ms at filter layer 7 (422 ms during a full prefill) and grows with the layer
+(1,097 ms at 23).
+
+Watch it with `ninfer_lossy_prefill_total{outcome}`, `ninfer_lossy_prefill_scouted_tokens_total`,
+`ninfer_lossy_prefill_kept_tokens_total` and `ninfer_lossy_prefill_alias_hits_total` (see
+[metrics](#metrics)), and per request with `request_done.lossy_prefill` in the request log
+(outcome, strategy, uncached and kept tokens, filter layer, scout and main milliseconds).
+
+Design, acceptance gates, the full sweep and the deviations of the build are in
+[docs/maintainer/lossy-long-prefill.md](maintainer/lossy-long-prefill.md).
 
 ### Automatic host cache
 
