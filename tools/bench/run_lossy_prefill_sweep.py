@@ -1142,6 +1142,9 @@ class Sweep:
                              "cached_tokens": int((reply.usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0),
                              "outcome": lossy.get("outcome"), "kept_tokens": lossy.get("kept_tokens"),
                              "uncached_tokens": lossy.get("uncached_tokens"), "valid_calls": m["tool_call_validity"]})
+            if not per_turn[-1]["hit"]:  # what the model did instead, for the report
+                per_turn[-1]["reply"] = {"content": reply.content[:500], "tool_calls": [
+                    {"name": c["name"], "arguments": c["arguments"][:1500]} for c in reply.tool_calls]}
         hits = sum(t["hit"] for t in per_turn)
         return {"edit_turns": len(per_turn), "edit_rate": hits / len(per_turn), "turns": per_turn,
                 "lossy_turns": sum(t["outcome"] == "completed" for t in per_turn),
