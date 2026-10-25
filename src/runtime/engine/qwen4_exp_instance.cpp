@@ -165,6 +165,10 @@ void validate(const EngineOptions& options) {
         refuse("has no context fit (its KV grows per request): remove --fit-context");
     }
     const auto& next = options.flash_next;
+    if (next.mtp_constrained && spec.backend != SpeculativeBackend::Mtp) {
+        refuse("--mtp-constrained keeps MTP speculation on for constrained requests and needs --spec mtp: add "
+               "--spec mtp or remove --mtp-constrained");
+    }
     if (next.ram_headroom_bytes > kMaxByteOption ||
         (next.vram_headroom_bytes && *next.vram_headroom_bytes > kMaxByteOption) ||
         (next.expert_cache_bytes && *next.expert_cache_bytes > kMaxByteOption)) {
@@ -320,6 +324,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.mtp_draft_tokens = mtp ? options.speculative.draft_tokens : 0;
     program_options.mtp_width_cost   = next.mtp_width_cost;
     program_options.mtp_fixed_drafts = next.mtp_fixed_drafts;
+    program_options.mtp_constrained  = next.mtp_constrained;
     program_options.vision           = vision;
     program_options.context_cache_bytes  = cache_fit.bytes;
     program_options.context_nvme_bytes   = nvme_bytes;

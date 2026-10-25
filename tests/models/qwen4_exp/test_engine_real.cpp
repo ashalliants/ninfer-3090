@@ -34,6 +34,11 @@
 //   ninfer_qwen4_exp_engine_real_test --mtp-exact K[,K...] [--max-context N] [--generate N]
 //       [--mtp-fixed] TOKENS...
 //
+// MTP for constrained requests (mtp_constrained_matches_plain below): a greedy JSON-schema request
+// with --mtp-constrained (K drafts, default 3) gives the ids of plain constrained decoding.
+//
+//   ninfer_qwen4_exp_engine_real_test --mtp-constrained [K] [--max-context N] [--generate N]
+//
 // --split N streams each request with live timings and also reports decode tok/s over generated
 // tokens 2..N and N+1..end (decode right after a prefill, while the expert cache refills).
 // --print-ids prints each job's generated ids (a needle check decodes them).
@@ -535,6 +540,92 @@ int mtp_exact(const std::string& artifact, const std::vector<std::string>& args)
     return ok ? 0 : 1;
 }
 
+// mtp_constrained_matches_plain (--mtp-constrained, FlashNextOptions::mtp_constrained): a greedy
+// JSON-schema request on an MTP Engine with the option gives the ids of plain constrained decoding.
+// The reference is an MTP Engine without the option, where the constrained row runs plain rounds
+// (checked: no verification round); with the option the row must have verified drafts, each column
+// accepted under its own grammar mask (the Engine's mask provider), so both paths ran.
+int mtp_constrained_matches_plain(const std::string& artifact, const std::vector<std::string>& args) {
+    std::uint32_t max_context = 8192, tokens = 160, depth = 3;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (a == "--max-context" && i + 1 < args.size()) {
+            max_context = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        } else if (a == "--generate" && i + 1 < args.size()) {
+            tokens = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        } else if (a.find_first_not_of("0123456789") == std::string::npos) {
+            depth = static_cast<std::uint32_t>(std::stoul(a));
+        } else {
+            throw std::invalid_argument("unknown option " + a + " in --mtp-constrained mode");
+        }
+    }
+    PromptInput prompt;
+    prompt.options.enable_thinking = false;
+    prompt.messages.push_back(
+        {.role  = ChatRole::User,
+         .parts = {{.kind = MessagePartKind::Text,
+                    .text = "Describe three large cities as JSON: each with its name, its country and "
+                            "its population."}}});
+    RequestOptions request;
+    request.constraint = OutputConstraint::json_schema(R"({
+        "type": "object",
+        "properties": {"cities": {"type": "array", "minItems": 3, "maxItems": 3, "items": {
+            "type": "object",
+            "properties": {"name": {"type": "string", "maxLength": 40},
+                           "country": {"type": "string", "maxLength": 40},
+                           "population": {"type": "integer", "minimum": 0}},
+            "required": ["name", "country", "population"],
+            "additionalProperties": false}}},
+        "required": ["cities"],
+        "additionalProperties": false})");
+    request.execution.requested_output_tokens = tokens;
+    request.execution.allow_prefix_reuse      = false;
+    request.execution.sampling.temperature    = 0.0F;
+    const auto run = [&](bool constrained_mtp) {
+        EngineOptions options                = base_options(artifact, max_context);
+        options.flash_next.save_expert_state = false;
+        options.speculative.backend          = SpeculativeBackend::Mtp;
+        options.speculative.draft_tokens     = depth;
+        options.flash_next.mtp_constrained   = constrained_mtp;
+        Engine engine(options);
+        return engine.generate(engine.prepare(prompt), request);
+    };
+    const double ram_before = available_ram_gib();
+    GenerationResult off;
+    try {
+        off = run(false);
+    } catch (const std::exception& error) {
+        if (std::string(error.what()).find("no MTP drafter") == std::string::npos) { throw; }
+        std::printf("SKIP: the artifact has no MTP drafter (%s)\n", error.what());
+        return 77;
+    }
+    wait_for_ram(ram_before);
+    const GenerationResult on  = run(true);
+    bool ok = true;
+    const auto valid = [&](const char* label, const GenerationResult& r) {
+        const bool closed = r.finish_reason == FinishReason::StopToken && !r.content.empty() &&
+                            r.content.front() == '{' && r.content.back() == '}';
+        std::printf("%s: %zu ids, %s: %s\n", label, r.generated_token_ids.size(),
+                    closed ? "a closed JSON object" : "FAIL: not a complete JSON object", r.content.c_str());
+        print_speculation(label, r.speculative);
+        return closed;
+    };
+    ok = valid("plain constrained (MTP Engine without --mtp-constrained)", off) && ok;
+    ok = valid("--mtp-constrained", on) && ok;
+    if (off.speculative.rounds != 0) {
+        std::printf("FAIL: without --mtp-constrained the constrained request ran %llu verification rounds\n",
+                    static_cast<unsigned long long>(off.speculative.rounds));
+        ok = false;
+    }
+    if (on.speculative.rounds == 0 || on.speculative.drafted_tokens == 0) {
+        std::printf("FAIL: with --mtp-constrained the constrained request verified no drafts\n");
+        ok = false;
+    }
+    ok = same("mtp_constrained_matches_plain", off.generated_token_ids, on.generated_token_ids) && ok;
+    std::printf(ok ? "qwen4_exp mtp constrained checks passed\n" : "FAIL: qwen4_exp mtp constrained checks\n");
+    return ok ? 0 : 1;
+}
+
 // The context cache (docs/maintainer/flash-next-context-cache.md) against cold runs. One Engine with
 // the cache runs a conversation; then one Engine without it runs the same prompts cold. Each cached
 // request's greedy ids are compared with its cold run, and its reused tokens with what the cache
@@ -890,6 +981,9 @@ int main(int argc, char** argv) {
         }
         if (!args.empty() && args.front() == "--mtp-exact") {
             return mtp_exact(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
+        }
+        if (!args.empty() && args.front() == "--mtp-constrained") {
+            return mtp_constrained_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
         }
         std::string tokens_arg = "@" + std::string(NINFER_SOURCE_DIR) + "/tests/fixtures/qwen4_exp/ppl_tokens-chat.ids";
         std::uint32_t generate_tokens = 48, max_context = 8192, prompt_tokens = 300;

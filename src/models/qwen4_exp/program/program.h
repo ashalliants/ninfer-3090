@@ -329,12 +329,16 @@ struct ProgramDevicePlan {
     // --shared-expert-stream: the static workspace's room for the shared expert's side-stream carve
     // at its widest call (plan_shared_expert_workspace; 0 when off), allocated with `workspace`.
     std::uint64_t shared_expert_workspace = 0;
+    // --mtp-constrained: a verification round's grammar masks, one per draft and the bonus position
+    // (plan_mtp_constrained_masks; 0 when off or without MTP).
+    std::uint64_t mtp_constrained_masks = 0;
     std::uint64_t expert_record_stride = 0; // one expert frame
     std::uint32_t max_frames           = 0; // the most frames the expert cache uses
     std::uint32_t graph_bound          = 0; // CUDA graph executables the Program may instantiate (counts both halves of the split decode)
 
     [[nodiscard]] std::uint64_t fixed_bytes() const noexcept {
-        return kv + workspace + staging + state + io + residency + speculation + shared_expert_workspace;
+        return kv + workspace + staging + state + io + residency + speculation + shared_expert_workspace +
+               mtp_constrained_masks;
     }
 };
 
@@ -376,6 +380,9 @@ struct ProgramOptions {
     // (Infernix measured 0.38 on the RTX 5090), and a measurement mode that always drafts the most.
     double mtp_width_cost = 0.38;
     bool mtp_fixed_drafts = false;
+    // A constrained row speculates too: the verification takes one grammar mask per position from
+    // the round's drafts (FlashNextOptions::mtp_constrained). Off: a constrained row decodes plain.
+    bool mtp_constrained = false;
     // Image input: the model loaded its vision tower. Prompts with media encode it into frames lent
     // by the expert cache (its io words are planned only when set).
     bool vision = false;
@@ -405,6 +412,9 @@ struct ProgramOptions {
 // max_shared_expert_scratch_bytes), against the `planned` bytes; refuses (std::invalid_argument
 // naming the flag) when they do not fit.
 void require_shared_expert_workspace(std::uint64_t need, std::uint64_t planned, std::uint32_t columns);
+// ProgramDevicePlan::mtp_constrained_masks of these options over a tokenizer of `public_tokens`:
+// 1 + mtp_draft_tokens masks of ceil(public_tokens / 32) words; 0 without mtp_constrained or MTP.
+[[nodiscard]] std::uint64_t plan_mtp_constrained_masks(const ProgramOptions& options, std::uint32_t public_tokens);
 
 class Program {
 public:

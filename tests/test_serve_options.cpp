@@ -121,6 +121,23 @@ int main() {
     failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--shared-expert-stream"}))
                           .flash_next.shared_expert_stream,
                       "--shared-expert-stream does not reach the Engine");
+    failures += check(!defaults.flash_next.mtp_constrained, "MTP for constrained requests is on by default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+                                                 "--mtp-constrained"}))
+                          .flash_next.mtp_constrained,
+                      "--mtp-constrained does not reach the Engine");
+    for (const auto& spec : {std::vector<std::string>{}, std::vector<std::string>{"--spec", "dflash"}}) {
+        std::vector<std::string> args{"ninfer-serve", "model.ninfer", "--mtp-constrained"};
+        args.insert(args.end(), spec.begin(), spec.end());
+        bool refused = false;
+        try {
+            (void)parse(args);
+        } catch (const std::invalid_argument& error) {
+            refused = std::string(error.what()).find("--mtp-constrained") != std::string::npos &&
+                      std::string(error.what()).find("--spec mtp") != std::string::npos;
+        }
+        failures += check(refused, "--mtp-constrained without --spec mtp was not refused naming both flags");
+    }
     failures += check(parse({"ninfer-serve", "model.ninfer", "--ngram-keepalive-ms", "25"})
                               .flash_next.ngram_keepalive_ms == 25,
                       "--ngram-keepalive-ms was not parsed");

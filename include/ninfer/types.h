@@ -378,6 +378,10 @@ struct FlashNextOptions {
     // relative to a plain round, and a measurement mode that always drafts --draft-tokens.
     double mtp_width_cost = 0.38;
     bool mtp_fixed_drafts = false;
+    // Keep MTP speculation on for constrained requests (JSON schema, grammar, tool calls) with one
+    // grammar mask per verified position, as the Qwen3.5 path does (--mtp-constrained; needs
+    // --spec mtp). Off: a constrained request decodes plain rounds.
+    bool mtp_constrained = false;
     // Run each MoE block's shared expert on a high-priority CUDA stream beside the routed experts,
     // joined before they are combined (--shared-expert-stream). The same outputs, bit for bit;
     // the workspace grows by the shared expert's Linear scratch at its widest call.

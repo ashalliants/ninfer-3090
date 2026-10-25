@@ -51,6 +51,7 @@
 #include "models/qwen4_exp/model.h"
 #include "models/qwen4_exp/program/checkpoint_image.h"
 #include "models/qwen4_exp/program/context_cache.h"
+#include "models/qwen4_exp/program/constrained_window.h"
 #include "models/qwen4_exp/program/draft_policy.h"
 #include "models/qwen4_exp/program/expert_cache/expert_state.h"
 #include "models/qwen4_exp/program/expert_residency.h"
@@ -150,11 +151,12 @@ struct ContractAccess {
         out.constraint_failed_[0] = constraint_failed;
         return out;
     }
-    // A verification round's batch: the row licenses `count` tokens of `tokens` (stride wide).
+    // A verification round's batch: the row licenses `count` tokens of `tokens` (stride wide), or
+    // fails when they run into a grammar dead end.
     static PendingBatch make_speculative(const void* owner, std::uint64_t transaction, SequenceHandle row,
                                          std::span<const TokenId> tokens, std::int32_t count, std::uint32_t stride,
-                                         runtime::ExecutionTiming timing) {
-        PendingBatch out = make_pending(owner, transaction, row, tokens, timing, false);
+                                         runtime::ExecutionTiming timing, bool constraint_failed) {
+        PendingBatch out = make_pending(owner, transaction, row, tokens, timing, constraint_failed);
         out.counts_[0]   = count;
         out.stride_      = stride;
         out.speculative_ = true;
@@ -588,6 +590,7 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     b.kv        = d.vmm ? d.kv.mapped_bytes(d.base_pages) : d.kv.bytes;
     b.workspace = d.work;
     b.shared_expert_workspace = plan_shared_expert_workspace(o, c);
+    b.mtp_constrained_masks   = plan_mtp_constrained_masks(o, public_tokens);
     b.staging   = d.staging;
     b.state     = d.state_total;
     // Logits of the widest round (FP32 and BF16; at least one column per lane), then the sampling
@@ -724,7 +727,10 @@ public:
         allocated += plan_.bytes.io;
         io_host_ = PinnedHostBuffer(plan_.io.bytes);
         host_token_ = PinnedHostBuffer(64);
-        mask_host_  = PinnedHostBuffer(4ULL * plan_.mask_words * plan_.lanes + 64);
+        // A grammar mask per lane, or with --mtp-constrained one per verified position when more.
+        mask_host_  = PinnedHostBuffer(std::max<std::uint64_t>(4ULL * plan_.mask_words * plan_.lanes,
+                                                               plan_.bytes.mtp_constrained_masks) +
+                                       64);
         config_host_ = PinnedHostBuffer(sizeof(ops::SamplingConfig) * plan_.lanes + 64);
         auto* io = static_cast<std::byte*>(io_device_.p);
         std::size_t at = align(plan_.io.bytes);
@@ -750,6 +756,10 @@ public:
         masks_ = reinterpret_cast<std::uint32_t*>(io + at);
         at = align(at + 4ULL * plan_.mask_words * plan_.lanes);
         if (at > io_device_.bytes) { throw std::logic_error("Qwen3.8-Flash-Next: io layout exceeds its plan"); }
+        if (plan_.bytes.mtp_constrained_masks != 0) {
+            verify_masks_ = DeviceBuffer(plan_.bytes.mtp_constrained_masks);
+            allocated += plan_.bytes.mtp_constrained_masks;
+        }
 
         // The shared expert's side-stream carve (when on) comes out of the same arena.
         work_ = std::make_unique<WorkspaceArena>(plan_.work + plan_.bytes.shared_expert_workspace);
@@ -3907,10 +3917,14 @@ private:
     }
 
     // The round's speculative verification, or nullopt for a plain round (no drafter, a
-    // constrained row, too little budget or context, or the policy chose no drafts).
+    // constrained row without --mtp-constrained, too little budget or context, or the policy chose
+    // no drafts).
     std::optional<PendingBatch> try_speculate(SequenceHandle row, const runtime::RoundBudget& budget,
                                               runtime::TokenMaskProvider* masks, Clock::time_point start) {
-        if (plan_.drafts == 0 || !L().mtp_live || (masks != nullptr && masks->constrained(0))) { return std::nullopt; }
+        if (plan_.drafts == 0 || !L().mtp_live ||
+            (masks != nullptr && masks->constrained(0) && !options_.mtp_constrained)) {
+            return std::nullopt;
+        }
         // A row drafts at most one token fewer than it may still emit, and every verified position
         // lies within the request's reserved extent.
         const std::int64_t room = std::min<std::int64_t>(static_cast<std::int64_t>(budget.generated_tokens_remaining) - 1,
@@ -3920,12 +3934,14 @@ private:
         const std::int32_t steps = choose_draft_length(limit);
         if (steps == 0) { return std::nullopt; }
         const auto drafts = mtp_draft(steps);
-        return verify(row, drafts, start);
+        return verify(row, drafts, start, masks != nullptr && masks->constrained(0) ? masks : nullptr);
     }
 
     // One verification round (Infernix verify): the anchor and the drafts as W consecutive
     // columns, one forward that leaves the recurrent state in place, then acceptance on the device.
-    PendingBatch verify(SequenceHandle row, std::span<const TokenId> drafts, Clock::time_point start) {
+    // A constrained row (`masks`, with --mtp-constrained) accepts under one grammar mask per column.
+    PendingBatch verify(SequenceHandle row, std::span<const TokenId> drafts, Clock::time_point start,
+                        runtime::TokenMaskProvider* masks) {
         const cudaStream_t s  = device_.stream;
         const std::int32_t K  = static_cast<std::int32_t>(drafts.size()), W = K + 1;
         const std::int32_t S  = static_cast<std::int32_t>(L().state_tokens);
@@ -3969,10 +3985,15 @@ private:
             ops::cast_fp32_to_bf16(wide32, wide16, s);
         });
         residency_->enqueue_route_download(s, W);
+        // A constrained row's masks, filled on the host while the forward runs (the drafts are
+        // already here) and uploaded ahead of acceptance.
+        ops::SamplingMask mask;
+        std::uint32_t dead = 0;
+        if (masks != nullptr) { dead = stage_verify_masks(*masks, drafts, mask); }
         // Acceptance from BF16 logits, as plain decode samples them.
         Tensor target = spec_word(sp.w_target, W);
         ops::argmax(wide16, target, plan_.token_domain, s);
-        install_round_config();
+        install_round_config(mask);
         {
             auto scope = work_->scope();
             Tensor licensed = spec_word(sp.w_licensed, W).view({W, 1});
@@ -3999,6 +4020,8 @@ private:
             release_lane();
             throw std::logic_error("Qwen3.8-Flash-Next: acceptance returned an invalid extent");
         }
+        // The licensed tokens run into a dead end: the row fails, committing none of them.
+        const bool constraint_failed = masks != nullptr && constrained_accept_limit(dead, LC) < LC;
         for (std::int32_t j = 0; j < LC; ++j) {
             const TokenId token = words[sp.w_licensed + j];
             if (token < 0 || token >= plan_.token_domain) {
@@ -4035,13 +4058,32 @@ private:
         ++decode_rounds_;
         return ContractAccess::make_speculative(this, pending_, row,
                                                 {pending_tokens_.data(), static_cast<std::size_t>(W)}, LC,
-                                                static_cast<std::uint32_t>(W), timing);
+                                                static_cast<std::uint32_t>(W), timing, constraint_failed);
     }
 
-    // The row's sampling config on the device (acceptance reads it), without a grammar mask.
-    void install_round_config() {
+    // A constrained verification's grammar masks: one per position 0..K from the drafts (position j
+    // follows the committed output and drafts[0:j]), written to the pinned staging and uploaded to
+    // the planned device masks. Returns the dead-end position bits; `mask` addresses the masks.
+    std::uint32_t stage_verify_masks(runtime::TokenMaskProvider& masks, std::span<const TokenId> drafts,
+                                     ops::SamplingMask& mask) {
+        const std::size_t bytes = 4ULL * plan_.mask_words * (drafts.size() + 1);
+        if (bytes > plan_.bytes.mtp_constrained_masks) {
+            throw std::logic_error("Qwen3.8-Flash-Next: a constrained verification is wider than its planned masks");
+        }
+        auto* words = static_cast<std::uint32_t*>(mask_host_.data());
+        const std::uint32_t dead = masks.fill(0, drafts, std::span<std::uint32_t>(words, bytes / 4));
+        upload_pinned(verify_masks_.p, words, bytes, device_.stream);
+        masks.uploaded(0, bytes);
+        mask = {static_cast<const std::uint32_t*>(verify_masks_.p), static_cast<std::int32_t>(plan_.mask_words)};
+        return dead;
+    }
+
+    // The row's sampling config on the device (acceptance reads it), with a constrained row's
+    // per-position grammar masks (null: none).
+    void install_round_config(ops::SamplingMask mask) {
         auto* host_config = static_cast<ops::SamplingConfig*>(config_host_.data());
         *host_config      = L().sampling;
+        host_config->mask = mask;
         upload_pinned(configs_, host_config, sizeof(ops::SamplingConfig), device_.stream);
     }
 
@@ -4559,6 +4601,8 @@ private:
     Tensor lane_logits_; // BF16 [V, lanes]: each lane's last prefill call's logits (checkpoints, exact hits)
     ops::SamplingConfig* configs_ = nullptr;
     std::uint32_t* masks_         = nullptr;
+    // --mtp-constrained: a verification's grammar masks, one per position (empty when off).
+    DeviceBuffer verify_masks_;
     std::unique_ptr<WorkspaceArena> work_;
     DeviceBuffer staging_;
     std::unique_ptr<ExpertResidency> residency_;
@@ -4737,6 +4781,12 @@ std::uint64_t plan_shared_expert_workspace(const ProgramOptions& options, const 
     if (!options.shared_expert_stream) { return 0; }
     return execution::Forward::shared_expert_workspace_bytes(config,
                                                              static_cast<std::int32_t>(shared_expert_columns(options)));
+}
+
+std::uint64_t plan_mtp_constrained_masks(const ProgramOptions& options, std::uint32_t public_tokens) {
+    if (!options.mtp_constrained || options.mtp_draft_tokens == 0) { return 0; }
+    const std::uint64_t words = (static_cast<std::uint64_t>(public_tokens) + 31) / 32;
+    return 4ULL * words * (1ULL + options.mtp_draft_tokens);
 }
 
 void require_shared_expert_workspace(std::uint64_t need, std::uint64_t planned, std::uint32_t columns) {

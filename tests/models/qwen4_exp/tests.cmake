@@ -14,6 +14,12 @@ ninfer_add_test(ninfer_qwen4_exp_draft_policy_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_draft_policy.cpp"
   LIBRARIES ninfer_core)
 
+# Host only, header only: a constrained MTP verification's window (--mtp-constrained): the
+# positions before the first dead-end grammar mask.
+ninfer_add_test(ninfer_qwen4_exp_constrained_window_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_constrained_window.cpp"
+  LIBRARIES ninfer_core)
+
 ninfer_add_test(ninfer_qwen4_exp_ngram_volume_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_volume.cpp"
   LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_core)
@@ -70,7 +76,7 @@ ninfer_add_test(ninfer_qwen4_exp_memory_plan_test
 
 # Host only: the Program's planned device terms computed from the options and the configuration
 # and their startup checks (the shared expert's side-stream workspace against the Linear Op's own
-# capacity).
+# capacity; a constrained verification's grammar masks).
 ninfer_add_test(ninfer_qwen4_exp_program_plan_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_program_plan.cpp"
   LIBRARIES ninfer_model_runtime ninfer_ops ninfer_core)
@@ -108,3 +114,10 @@ ninfer_add_test(ninfer_qwen4_exp_engine_real_test
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_engine ninfer_core)
 set_tests_properties(ninfer_qwen4_exp_engine_real_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# GPU, real artifact with the MTP drafter (skips otherwise): mtp_constrained_matches_plain, the
+# engine test's --mtp-constrained mode. A greedy JSON-schema request with --mtp-constrained (MTP
+# rounds, a grammar mask per verified position) gives the ids of plain constrained decoding.
+add_test(NAME ninfer_qwen4_exp_mtp_constrained_test
+  COMMAND ninfer_tests ninfer_qwen4_exp_engine_real_test --mtp-constrained)
+set_tests_properties(ninfer_qwen4_exp_mtp_constrained_test PROPERTIES SKIP_RETURN_CODE 77)
