@@ -157,9 +157,11 @@ set_tests_properties(ninfer_qwen3_5_lossy_prefill_real_test PROPERTIES
 
 # Speculative decoding after a lossy long-prompt prefill (40K prompt, rk4v4, keep 0.2): 128 greedy
 # tokens with MTP or DFlash2 must equal the same lossy prefill decoded without speculation.
-ninfer_add_test(ninfer_qwen3_5_lossy_spec_real_test
+# The program is bundled without a ctest of its own: only the two named tests below run it.
+ninfer_bundle_program(ninfer_tests ninfer_qwen3_5_lossy_spec_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_lossy_spec_real.cpp"
   LIBRARIES ninfer_engine)
+ninfer_test_includes(ninfer_qwen3_5_lossy_spec_real_test)
 ninfer_bundle_command(ninfer_qwen3_5_lossy_spec_real_command ninfer_tests
   ninfer_qwen3_5_lossy_spec_real_test)
 add_test(NAME ninfer_qwen3_5_dflash2_after_lossy_real_test
@@ -178,7 +180,6 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_prefix_real_test
   ninfer_qwen3_5_agent_continuation_real_test
   ninfer_qwen3_5_lossy_prefill_real_test
-  ninfer_qwen3_5_lossy_spec_real_test
   ninfer_qwen3_5_dflash2_after_lossy_real_test
   ninfer_qwen3_5_mtp_after_lossy_real_test
   ninfer_qwen3_5_context_store_real_test
