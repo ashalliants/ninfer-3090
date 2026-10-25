@@ -14,8 +14,10 @@
 // scout_a4_kept_overlap: the int4 scout's gate on its ranking (docs/maintainer/lossy-long-prefill.md,
 // "Int4 scout GEMMs"). The same 32K and 100K haystack prompts, each with a pass key at half depth,
 // are scouted once with the int8 scout (the integer-A8 prefill routes, --prefill-a8) and once with
-// --lossy-prefill-scout-a4. The blocks each keeps must overlap with a Jaccard index of at least
-// 0.9, and both must keep every token of the pass key. rk4v4 KV as in production.
+// --lossy-prefill-scout-a4. The blocks each chose by score (the forced head and recent blocks left
+// out, ruling R11: both scouts keep those identically) must overlap with a Jaccard index of at
+// least 0.9, and both must keep every token of the pass key. The Jaccard over all kept blocks is
+// printed for reference. rk4v4 KV as in production.
 //
 // The prompts are raw tokens (prepare_tokens) built from separately tokenized pieces, so the pass
 // key's offsets are known exactly; with no product prompt the whole prompt is the filtered part.
@@ -195,12 +197,14 @@ int exercise(const char* artifact) {
         const bool key8 = keeps(a, h.key_begin, h.key_end);
         const bool key4 = keeps(b, h.key_begin, h.key_end);
         std::cout << n << ": kept int8=" << a.kept << " int4=" << b.kept << " of " << a.uncached
-                  << "; kept-block Jaccard " << all << " (gated >= " << kJaccardGate
-                  << "), scored blocks only " << scored << " (reported); pass key kept int8="
+                  << "; kept-block Jaccard over score-chosen blocks " << scored << " (gated >= "
+                  << kJaccardGate << "), all kept blocks " << all
+                  << " (reference); pass key kept int8="
                   << key8 << " int4=" << key4 << "; scout int8 " << a.scout_ms << " ms, int4 "
                   << b.scout_ms << " ms (" << a.scout_ms / b.scout_ms << "x)\n";
-        if (!(all >= kJaccardGate)) {
-            std::cerr << n << ": kept-block Jaccard " << all << " < " << kJaccardGate << '\n';
+        if (!(scored >= kJaccardGate)) {
+            std::cerr << n << ": score-chosen kept-block Jaccard " << scored << " < " << kJaccardGate
+                      << '\n';
             ++failures;
         }
         if (!key8 || !key4) {

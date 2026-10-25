@@ -30,7 +30,9 @@ teacher-forced KL in v1 and has no pass/fail threshold; it is reported only.
 Int4 scout gate (`--workloads jaccard`, opt-in, not in the default list): a `scout_a4=1` point and
 its partner (the same knobs with scout_a4 off) each send the same long prompts; the kept-block
 Jaccard between the two runs' `lossy_prefill.kept_runs` (logged under --request-log-lossy-detail,
-which the harness adds for this workload) must be >= 0.9 on every prompt. The rest of that gate --
+which the harness adds for this workload), over the score-chosen blocks only (the forced head and
+recent blocks left out; ruling R11), must be >= 0.9 on every prompt. The all-blocks Jaccard is shown
+for reference. The rest of that gate --
 quality unchanged within noise, scout GEMMs >= 1.4x -- is the a4 point's own quality rows against
 its partner's, and the GPU test ninfer_q4_a4_linear_test's PERF lines.
 """
@@ -252,7 +254,8 @@ def jaccard_metrics(rows: list[dict[str, Any]], point: str) -> dict[str, Any] | 
     return {"partner": partner, "prompts": len(values), "jaccard": values,
             "jaccard_min": min(values) if values else None,
             "jaccard_mean": statistics.fmean(values) if values else None,
-            "scored_min": min(scored) if scored else None, "unmatched": unmatched}
+            "scored": scored, "scored_min": min(scored) if scored else None,
+            "scored_mean": statistics.fmean(scored) if scored else None, "unmatched": unmatched}
 
 
 def server_command(base_cmd: str, port: int, request_log: Path, params: dict[str, str] | None,
@@ -603,11 +606,13 @@ def evaluate_point(rows: list[dict[str, Any]], point: str) -> dict[str, Any]:
             checks.append(check("jaccard", None, None, "not measured (needs the jaccard workload on "
                                 "this point and on its scout_a4=0 partner)"))
         else:
-            ok = overlap["jaccard_min"] >= JACCARD_MIN - 1e-9 and not overlap["unmatched"]
-            checks.append(check("jaccard", overlap["jaccard_min"], ok,
-                                f"min {overlap['jaccard_min']:.3f} over {overlap['prompts']} prompt(s) vs "
-                                f"`{overlap['partner']}` (need >= {JACCARD_MIN:.2f}); scored blocks only "
-                                f"{overlap['scored_min']:.3f}"
+            # Ruling R11: the gate is over the score-chosen blocks only; the forced head and recent
+            # blocks are kept identically by both scouts and would inflate the index.
+            ok = overlap["scored_min"] >= JACCARD_MIN - 1e-9 and not overlap["unmatched"]
+            checks.append(check("jaccard", overlap["scored_min"], ok,
+                                f"score-chosen blocks min {overlap['scored_min']:.3f} over {overlap['prompts']} "
+                                f"prompt(s) vs `{overlap['partner']}` (need >= {JACCARD_MIN:.2f}); all kept "
+                                f"blocks {overlap['jaccard_min']:.3f} (reference)"
                                 + (f"; unmatched prompts {overlap['unmatched']}" if overlap["unmatched"] else "")))
     if point != BASELINE:
         for workload in ALL_WORKLOADS:
@@ -698,9 +703,10 @@ def render_summary(rows: list[dict[str, Any]]) -> str:
     a4_points = [p for p in points_in(rows) if (point_params(rows, p) or {}).get("scout_a4") == "1"]
     if a4_points:
         lines += ["", "## Int4 scout (scout_a4=1 against its int8 partner)", "",
-                  f"Gate: kept-block Jaccard >= {JACCARD_MIN} on every prompt; quality as the table above "
+                  f"Gate: kept-block Jaccard over the score-chosen blocks (forced head and recent blocks "
+                  f"left out) >= {JACCARD_MIN} on every prompt; quality as the table above "
                   "against the partner's row; scout GEMMs >= 1.4x (ninfer_q4_a4_linear_test PERF lines).", "",
-                  "| point | partner | prompts | Jaccard min | Jaccard mean | scored blocks min | scout ms int8 / int4 (speed) | gate |",
+                  "| point | partner | prompts | Jaccard min, score-chosen (gated) | mean, score-chosen | all kept blocks min (reference) | scout ms int8 / int4 (speed) | gate |",
                   "|---|---|---|---|---|---|---|---|"]
         for point in a4_points:
             overlap = jaccard_metrics(rows, point)
@@ -710,8 +716,8 @@ def render_summary(rows: list[dict[str, Any]]) -> str:
             scout = f"{theirs:.0f} / {mine:.0f} ({theirs / mine:.2f}x)" if mine and theirs else "-"
             gate = {c["name"]: c for c in evaluate_point(rows, point)["checks"]}["jaccard"]
             if overlap and overlap["prompts"]:
-                lines.append(f"| {point} | {partner} | {overlap['prompts']} | {overlap['jaccard_min']:.3f} "
-                             f"| {overlap['jaccard_mean']:.3f} | {overlap['scored_min']:.3f} | {scout} "
+                lines.append(f"| {point} | {partner} | {overlap['prompts']} | {overlap['scored_min']:.3f} "
+                             f"| {overlap['scored_mean']:.3f} | {overlap['jaccard_min']:.3f} | {scout} "
                              f"| {_mark(gate, '.3f')} |")
             else:
                 lines.append(f"| {point} | {partner or '-'} | - | - | - | - | {scout} | - |")

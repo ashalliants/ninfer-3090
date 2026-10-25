@@ -268,7 +268,8 @@ Any other Op rejects the policy (`valid_linear_policy` excludes it). Unaligned f
 the int8 scout takes there (A16). The scout's workspace plan adds the int4 planes only when the option is on,
 and startup refuses the option when no Q4 matrix is on the integer route (no `--prefill-a8`). Gate
 evidence: `ninfer_qwen3_5_scout_a4_kept_overlap_real_test` (32K and 100K haystacks: kept-block Jaccard
->= 0.9, pass key kept by both), the `PERF ... scout` lines of `ninfer_q4_a4_linear_test` (the Op under
+over the score-chosen blocks >= 0.9, the forced head and recent blocks left out, which both scouts keep
+identically; the all-blocks Jaccard is printed for reference; pass key kept by both), the `PERF ... scout` lines of `ninfer_q4_a4_linear_test` (the Op under
 `ScoutA4Int` against the same Op under `AllowA8Int`, so gate_up's separate SwiGLU is counted), and the
 sweep's `--workloads jaccard`.
 
@@ -353,7 +354,8 @@ Acceptance targets (agreed with the user 2026-10-25; fixed before the sweep, not
 results; the final go/no-go is the user's, on the PR's measured numbers): needle accuracy ≥ 95% of baseline at every length; agent-replay `Edit` exact-match rate within
 2 points of baseline; prefill time on a 100K prompt ≤ 40% of baseline.
 
-Int4 scout gate: kept-block overlap with the int8 scout (Jaccard) ≥ 0.9 on the sweep prompts, the quality
+Int4 scout gate: kept-block overlap with the int8 scout (Jaccard, over the score-chosen blocks: the forced
+head and recent blocks are left out, 2026-10-25) ≥ 0.9 on the sweep prompts, the quality
 gate above unchanged within run-to-run noise, scout GEMMs ≥ 1.4x faster than int8.
 
 ### Speed

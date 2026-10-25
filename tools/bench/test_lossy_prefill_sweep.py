@@ -308,11 +308,11 @@ def test_kept_blocks_and_jaccard():
     check(sweep.jaccard({1, 2, 3}, {2, 3, 4}) == 0.5 and sweep.jaccard(set(), set()) == 1.0, "jaccard")
 
 
-def jaccard_rows(a4_runs, int8_runs, outcome="completed", uncached=1000):
+def jaccard_rows(a4_runs, int8_runs, outcome="completed", uncached=1000, head="0", recent="0"):
     def kept(runs):
         return [{"prompt": i, "outcome": outcome, "uncached_tokens": uncached, "kept_runs": r}
                 for i, r in enumerate(runs)]
-    common = {"block": "64", "strategy": "select"}
+    common = {"block": "64", "strategy": "select", "head": head, "recent": recent}
     return [
         {"point": "b64_a1", "params": dict(common, scout_a4="1"), "workload": "jaccard", "ok": True,
          "error": None, "metrics": {"kept": kept(a4_runs), "lossy_outcomes": LOSSY}},
@@ -343,6 +343,23 @@ def test_jaccard_gate():
     value = checks(near_rows, "b64_a1")["jaccard"]["value"]
     check(abs(value - 18 / 20) < 1e-9 and checks(near_rows, "b64_a1")["jaccard"]["pass"] is True,
           ("18/20 = 0.9 passes", value))
+    # Ruling R11: the gate is over the score-chosen blocks. Both keep blocks 0..19 (forced head of
+    # 1280 tokens) and differ in one chosen block: all kept blocks 20/22 = 0.909 would pass, but
+    # the score-chosen sets {20} and {21} share nothing, so the gate fails.
+    forced_a4 = [[[0, 1280], [1280, 1344]]]
+    forced_8 = [[[0, 1280], [1344, 1408]]]
+    forced = BASE + jaccard_rows(forced_a4, forced_8, uncached=2000, head="1280")
+    gate = checks(forced, "b64_a1")["jaccard"]
+    check(gate["pass"] is False and gate["value"] == 0.0 and "all kept blocks 0.909" in gate["detail"], gate)
+    overlap = sweep.jaccard_metrics(forced, "b64_a1")
+    check(abs(overlap["jaccard_min"] - 20 / 22) < 1e-9 and overlap["scored_min"] == 0.0, overlap)
+    # With the default head/recent the forced blocks are left out of the gate too.
+    defaults = BASE + jaccard_rows(nine, tenth)
+    for r in defaults:
+        if r["workload"] == "jaccard":
+            r["params"].pop("head"), r["params"].pop("recent")
+    check(sweep.jaccard_metrics(defaults, "b64_a1")["scored_min"] == 1.0,
+          "with recent 4096 > the span, no score-chosen block remains: an empty pair counts 1.0")
     # A prompt that did not complete lossy prefill on one side fails rather than being skipped.
     broken = jaccard_rows(same, same)
     broken[1]["metrics"]["kept"][1]["outcome"] = "skipped"

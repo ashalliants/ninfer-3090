@@ -178,8 +178,8 @@ set_tests_properties(ninfer_qwen3_5_mtp_after_lossy_real_test PROPERTIES
   ENVIRONMENT "NINFER_LOSSY_SPEC_REAL=mtp")
 
 # scout_a4_kept_overlap: the int4 lossy scout (--lossy-prefill-scout-a4) against the int8 one on 32K
-# and 100K haystack prompts (rk4v4, max_context 110592): kept-block Jaccard >= 0.9, and both keep
-# the pass key.
+# and 100K haystack prompts (rk4v4, max_context 110592): kept-block Jaccard over the score-chosen
+# blocks >= 0.9, and both keep the pass key.
 ninfer_add_test(ninfer_qwen3_5_scout_a4_kept_overlap_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_scout_a4_real.cpp"
   LIBRARIES ninfer_engine)
