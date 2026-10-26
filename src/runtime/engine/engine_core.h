@@ -4274,14 +4274,25 @@ private:
     // thread, so a lookup stalled on the network never holds up a read (or the reverse). The
     // waiting request is released at its deadline either way (process_hydrations).
     void hydration_reader_loop(std::deque<HydrationTask>& queue) noexcept {
+        const bool reads = &queue == &hydration_queue_; // the other reader only looks the bucket up
         for (;;) {
             HydrationTask task;
+            std::vector<std::uint8_t> reuse;    // the buffer this read goes into
+            std::vector<std::uint8_t> released; // freed outside the lock
             {
                 std::unique_lock lock(hydration_mutex_);
-                hydration_cv_.wait(lock, [&] { return hydration_stop_ || !queue.empty(); });
+                const auto woken = [&] { return hydration_stop_ || !queue.empty(); };
+                // Idle with a spare read buffer: let it go once no read came for a while.
+                while (reads && !woken() && !hydration_spare_.empty()) {
+                    if (!hydration_cv_.wait_for(lock, kSpareReadBufferIdle, woken)) {
+                        released = std::exchange(hydration_spare_, {});
+                    }
+                }
+                hydration_cv_.wait(lock, woken);
                 if (hydration_stop_) { return; }
                 task = std::move(queue.front());
                 queue.pop_front();
+                if (reads && !task.lookup) { reuse = std::exchange(hydration_spare_, {}); }
             }
             if (const auto started = Clock::now(); started < task.deadline) {
                 try {
@@ -4302,7 +4313,8 @@ private:
                         task.lookup_found =
                             store_.store->lookup_remote(task.lookup_asked, task.deadline, wanted).held;
                     } else {
-                        task.bytes = store_.store->load(task.id, false, &task.fetch, task.deadline);
+                        task.bytes = store_.store->load(task.id, false, &task.fetch, task.deadline,
+                                                        std::move(reuse));
                     }
                 } catch (...) { task.bytes.reset(); }
                 task.read_ns = static_cast<std::uint64_t>(
@@ -4467,6 +4479,26 @@ private:
                 done.swap(hydration_done_);
             }
         }
+        // Whatever became of the reads, the largest buffer goes back to the reader for the next one:
+        // a fresh one of a session's size is mostly page faults on the request's wait.
+        struct Recycle {
+            EngineCore& core;
+            std::deque<HydrationTask>& tasks;
+            ~Recycle() {
+                std::vector<std::uint8_t>* largest = nullptr;
+                for (auto& task : tasks) {
+                    if (task.bytes && task.bytes->capacity() <= kMaximumSpareReadBytes &&
+                        (largest == nullptr || task.bytes->capacity() > largest->capacity())) {
+                        largest = &*task.bytes;
+                    }
+                }
+                if (largest == nullptr) { return; }
+                std::lock_guard lock(core.hydration_mutex_);
+                if (largest->capacity() > core.hydration_spare_.capacity()) {
+                    std::swap(core.hydration_spare_, *largest);
+                }
+            }
+        } const recycle{*this, done};
         for (auto& task : done) {
             const auto& request = task.request;
             // A completed fetch measures the fetch rate whatever then becomes of the request
@@ -5124,6 +5156,11 @@ private:
     std::deque<HydrationTask> hydration_queue_;
     std::deque<HydrationTask> lookup_queue_; // bucket lookups, run on lookup_reader_
     std::deque<HydrationTask> hydration_done_;
+    // The buffer of a read the worker has finished with, for the reader's next read (see
+    // kMaximumSpareReadBytes). Under hydration_mutex_.
+    std::vector<std::uint8_t> hydration_spare_;
+    static constexpr std::size_t kMaximumSpareReadBytes = std::size_t{8} << 30U;
+    static constexpr auto kSpareReadBufferIdle          = std::chrono::seconds(30);
     // Nanoseconds per byte downloaded from the bucket: assumed 100 MB/s until a download says
     // otherwise. Engine worker only.
     double remote_ns_per_byte_ = 10.0;

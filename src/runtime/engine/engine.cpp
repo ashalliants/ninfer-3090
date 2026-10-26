@@ -660,6 +660,7 @@ private:
                 foreign_images = static_cast<std::uint64_t>(
                     std::count_if(images.begin(), images.end(),
                                   [&](const auto& info) { return info.binding != store_binding; }));
+                std::vector<std::uint8_t> spare;
                 for (const runtime::ContextStore::Info& info : images) {
                     if (std::chrono::steady_clock::now() >= deadline) { break; }
                     if (info.binding != store_binding || info.tokens > options.max_context) {
@@ -672,7 +673,10 @@ private:
                     // cannot fit, and reading it would only spend the budget.
                     if (info.image_bytes > generation.free_host_bytes()) { continue; }
                     const auto read_started = std::chrono::steady_clock::now();
-                    std::optional<std::vector<std::uint8_t>> bytes = store->load(info.id, false);
+                    // One buffer serves every image restored: each read reuses the last one's.
+                    std::optional<std::vector<std::uint8_t>> bytes = store->load(
+                        info.id, false, nullptr, std::chrono::steady_clock::time_point::max(),
+                        std::move(spare));
                     if (!bytes) { continue; }
                     const auto read_ns = static_cast<std::uint64_t>(
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -683,6 +687,7 @@ private:
                         ++restored_sessions;
                         restored_bytes += bytes->size();
                     }
+                    spare = std::move(*bytes);
                 }
             });
         } catch (...) {}

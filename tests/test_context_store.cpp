@@ -115,6 +115,22 @@ void test_image_id() {
           "shared prefix image id");
 }
 
+// A load into a reused buffer (larger than the image, full of another image's bytes) gives the
+// same image, in that buffer's memory.
+void test_load_into_a_reused_buffer() {
+    TempDirectory directory;
+    ContextStore store(options_for(directory.path()));
+    const auto image = concat({pseudo_random(300, 11), pseudo_random(6500, 12), pseudo_random(8, 13)});
+    (void)store.put(describe("ab12"), image, std::array{ContextStore::Region{300, 6500}});
+    std::vector<std::uint8_t> reuse(image.size() * 2, 0xa5);
+    reuse.resize(image.size() / 3); // shorter than the image, its capacity larger
+    const std::uint8_t* const memory = reuse.data();
+    const auto loaded = store.load("ab12", true, nullptr, std::chrono::steady_clock::time_point::max(),
+                                   std::move(reuse));
+    check(loaded && *loaded == image, "a load into a reused buffer changed the image");
+    check(loaded && loaded->data() == memory, "the load did not use the buffer it was given");
+}
+
 void test_round_trip() {
     TempDirectory directory;
     ContextStore store(options_for(directory.path()));
@@ -2939,6 +2955,7 @@ int main() {
     test_remote_holds_compressed_objects_and_other_forms_interoperate();
     test_hash();
     test_image_id();
+    test_load_into_a_reused_buffer();
     test_round_trip();
     test_incremental_put_writes_only_new_chunks();
     test_restart_recovers_images();
