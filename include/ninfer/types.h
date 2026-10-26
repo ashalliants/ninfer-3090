@@ -1741,11 +1741,13 @@ struct RuntimeStats {
     std::uint64_t context_store_remote_download_bytes    = 0;
     std::uint64_t context_store_remote_download_failures = 0;
     // Manifests a bucket refresh downloaded (not in remote_downloads), superseded sessions deleted
-    // from the bucket, and queued uploads a newer write of the conversation made unnecessary.
+    // from the bucket, queued uploads a newer write of the conversation made unnecessary, and queued
+    // uploads given up so their chunk files could leave a full directory.
     std::uint64_t context_store_remote_manifest_downloads      = 0;
     std::uint64_t context_store_remote_manifest_download_bytes = 0;
     std::uint64_t context_store_remote_retired                 = 0;
     std::uint64_t context_store_remote_uploads_skipped         = 0;
+    std::uint64_t context_store_remote_uploads_dropped         = 0;
     // With peers: images imported from another engine's directory, the chunk bytes hard-linked
     // (not copied), images skipped, and links that failed.
     std::uint64_t context_store_peer_images        = 0;

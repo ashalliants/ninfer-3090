@@ -47,8 +47,16 @@ public:
     struct Options {
         std::filesystem::path directory;
         // Bytes of chunks and manifests kept; the least recently used images are evicted beyond it.
-        // 0 means no limit.
+        // 0 means no limit. Files queued uploads still need count too: when evicting cannot free
+        // enough, the oldest queued uploads are given up so their files can go.
         std::uint64_t max_bytes = 0;
+        // The volume is shared (another engine, the OS), so the limit above does not keep it from
+        // filling. Before a put writes new chunk files it checks that the volume keeps this much
+        // free after them; if not, the least recently used images go first, and a put that still
+        // does not fit is refused with an error saying the volume is full.
+        std::uint64_t reserve_bytes = std::uint64_t{1} << 30U;
+        // The bytes free on the directory's volume; defaults to std::filesystem::space.
+        std::function<std::uint64_t()> available_bytes;
         // Images not used for this long are removed. Zero means no expiry.
         std::chrono::seconds ttl{0};
         std::uint64_t chunk_bytes = std::uint64_t{32} << 20U;
@@ -173,12 +181,18 @@ public:
         // a newer write of the same conversation made unnecessary.
         std::uint64_t remote_retired          = 0;
         std::uint64_t remote_uploads_skipped  = 0;
+        // Queued uploads given up to keep the files they hold within the limits (the queue's
+        // length and bytes, or max_bytes); their images are uploaded at their next write.
+        std::uint64_t remote_uploads_dropped  = 0;
         // With peers: images imported from them, the chunk bytes linked (not copied), images
         // skipped (damaged, expired, over budget, or gone mid-import) and links that failed.
         std::uint64_t peer_images       = 0;
         std::uint64_t peer_bytes_linked = 0;
         std::uint64_t peer_skipped      = 0;
         std::uint64_t peer_link_failures = 0;
+        // Times a peer's manifests were listed: a poll that finds the peer's directory and this
+        // store unchanged since the last listing skips it.
+        std::uint64_t peer_scans        = 0;
     };
 
     // Creates the directory layout, reads the manifests found there and removes whatever is
@@ -189,13 +203,16 @@ public:
     ContextStore& operator=(const ContextStore&) = delete;
 
     // Stores `image` (its `regions` chunked, the rest inline). Idempotent for an id already held:
-    // the manifest is replaced. Throws std::runtime_error when the files cannot be written; the
-    // store is left consistent and nothing of the failed image remains visible.
+    // the manifest is replaced. Throws std::runtime_error when the files cannot be written or the
+    // volume has no room for them (see reserve_bytes); the store is left consistent and nothing of
+    // the failed image remains visible.
     PutResult put(const Description& description, std::span<const std::uint8_t> image,
                   std::span<const Region> regions);
 
     // Reassembles an image, verifying every chunk. nullopt when it is absent or damaged; a damaged
-    // image is removed so it is not offered again. Counts as a use.
+    // image is removed so it is not offered again (with a remote, a chunk file that is missing
+    // rather than damaged, and cannot be fetched again, is only a miss). Counts as a use. The image
+    // is not evicted while it is loaded.
     // `touch` false reads without refreshing the image's last use; the caller then calls touch()
     // once it has actually used the image.
     // What a load fetched from the bucket first, and how long the fetch took: the missing chunks
@@ -297,7 +314,8 @@ private:
     };
     struct ChunkUse {
         std::uint32_t references = 0;
-        // Queued uploads that still need the file: it outlives its last reference until they finish.
+        // Queued uploads, loads and puts that still need the file: it outlives its last reference
+        // until they finish, and eviction leaves it.
         std::uint32_t pins       = 0;
         std::uint32_t length     = 0; // raw length
         std::uint64_t stored     = 0; // bytes the chunk file takes on disk (raw or compressed)
@@ -375,6 +393,14 @@ private:
     [[nodiscard]] std::uint64_t used_bytes_locked() const;
     void maintain_locked(const std::string* protect);
     bool evict_oldest_locked(const std::string* protect);
+    // Nothing is left to evict, and queued uploads hold the files: gives up the oldest upload whose
+    // files nothing else keeps (not `protect`'s). False when giving one up would free nothing.
+    bool drop_queued_upload_locked(const std::string* protect);
+    // Before a put writes `bytes`: makes the volume keep options_.reserve_bytes free after them,
+    // evicting as needed, or throws. `keep` are the chunks the put reuses, pinned (in `pinned`)
+    // until the put has referenced them.
+    void make_room_on_volume_locked(const std::string& id, std::uint64_t bytes,
+                                    const std::vector<ChunkRef>& keep, std::vector<ChunkRef>& pinned);
     // Gives up the entry's local chunk files (keeping those another image held here still uses, and
     // those a queued upload pins) and keeps the entry, which is then fetched from the bucket when
     // it is loaded. With `apply` false only counts. `holders` is whole_image_holders_locked().
@@ -441,6 +467,12 @@ private:
     std::uint64_t manifest_total_bytes_ = 0;
     std::uint64_t next_generation_      = 0; // guarded by mutex_
     Stats stats_;
+    // Images being loaded, and how many loads each: eviction and expiry pass them by, and their
+    // chunks are pinned, so nothing removes what a load fetched before it reads it.
+    std::unordered_map<std::string, std::uint32_t> loading_;
+    // Counts changes that can let a peer image in that was not before (an image or chunk files
+    // removed here): a peer poll lists the peer again when it moved. Guarded by mutex_.
+    std::uint64_t local_changes_ = 0;
 
     // Remote worker: one thread runs the queued transfers, one at a time.
     std::mutex remote_mutex_;
@@ -480,6 +512,16 @@ private:
     // (peer + id) -> modification time of the peer manifest that was skipped: not tried again until
     // the peer rewrites it. Guarded by mutex_.
     std::unordered_map<std::string, std::int64_t> peer_skipped_;
+    // Per peer: its manifests directory's time and local_changes_ at the last listing. A listing
+    // is trusted to stand for later polls only when the directory's time was well in the past
+    // (a change in the same tick of the file system clock would not move it). sync_peers only.
+    struct PeerScan {
+        std::filesystem::file_time_type manifests_time{};
+        std::uint64_t local_changes = 0;
+        bool trusted                = false;
+    };
+    std::unordered_map<std::string, PeerScan> peer_scans_;
+    std::mutex peer_scan_mutex_; // one sync_peers() at a time
     std::mutex peer_mutex_;
     std::condition_variable peer_cv_;
     bool peer_stopping_ = false;

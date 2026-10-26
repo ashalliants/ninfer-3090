@@ -498,6 +498,8 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
             "Superseded sessions (earlier turns of a conversation) deleted from the bucket.");
     COUNTER(context_store_remote_uploads_skipped, "context_store_remote_uploads_skipped_total",
             "Queued uploads dropped because a newer write of the conversation superseded them.");
+    COUNTER(context_store_remote_uploads_dropped, "context_store_remote_uploads_dropped_total",
+            "Queued uploads given up to keep the chunk files they hold within the store's limits.");
     COUNTER(context_store_peer_images, "context_store_peer_images_total",
             "Sessions imported from another engine's store directory (--context-store-peer).");
     COUNTER(context_store_peer_bytes_linked, "context_store_peer_bytes_linked_total",
