@@ -2571,6 +2571,52 @@ void test_peer_fit_skip_is_counted_once_when_only_the_use_changes() {
     check(b.stats().peer_skipped == 1, "a skip was counted again when only the peer's use changed");
 }
 
+// A peer image evicted to the bucket keeps its manifest and use stamp but none of its own chunk
+// files. It is not linked (that could only fail) and is no failure; once the peer has fetched it
+// back, which stamps its use, it is imported.
+void test_peer_image_evicted_to_the_bucket_is_not_attempted() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    auto remote                   = std::make_shared<MemoryObjectStore>();
+    ContextStore::Options options = remote_options(a_directory.path(), remote);
+    options.max_bytes             = 8000; // room for one image
+    ContextStore a(options);
+    check(drained(a), "the start-up refresh did not finish");
+    const auto image = peer_image(18);
+    (void)a.put(describe("0a"), image, std::array{ContextStore::Region{30, 5000}});
+    check(drained(a), "upload of 0a");
+    remote->clock += 10;
+    (void)a.put(describe("0b"), peer_image(19), std::array{ContextStore::Region{30, 5000}});
+    check(drained(a), "upload of 0b");
+    check(a.find("0a") && !a.find("0a")->local, "the peer did not evict 0a to the bucket");
+    ContextStore b(peer_options(b_directory.path(), a_directory.path()));
+    check(b.sync_peers() == 1 && b.find("0b") && !b.find("0a"), "B did not import exactly 0b");
+    check(b.stats().peer_link_failures == 0 && b.stats().peer_skipped == 0,
+          "an image the peer evicted to the bucket was tried or counted as a failure");
+    check(b.sync_peers() == 0 && b.stats().peer_link_failures == 0, "it was tried on the next poll");
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    check(a.load("0a").value_or(std::vector<std::uint8_t>{}) == image, "the peer could not fetch 0a back");
+    check(b.sync_peers() == 1 && b.load("0a").value_or(std::vector<std::uint8_t>{}) == image,
+          "an image the peer fetched back was not imported");
+}
+
+// An image skipped because it did not fit is imported once this store has made room, though the
+// peer has not rewritten it.
+void test_peer_image_skipped_for_budget_is_imported_after_room_is_made() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    ContextStore a(options_for(a_directory.path()));
+    (void)a.put(describe("0a"), peer_image(20), std::array{ContextStore::Region{30, 5000}});
+    ContextStore::Options options = peer_options(b_directory.path(), a_directory.path());
+    options.max_bytes             = 8000; // room for one image
+    ContextStore b(options);
+    (void)b.put(describe("0c"), peer_image(21), std::array{ContextStore::Region{30, 5000}});
+    check(b.sync_peers() == 0 && b.stats().peer_skipped == 1, "the image that does not fit was not skipped");
+    check(b.sync_peers() == 0 && b.stats().peer_skipped == 1, "the skip was counted again");
+    check(b.erase("0c") && b.sync_peers() == 1 && b.find("0a"),
+          "an image skipped for budget was not imported after the store made room");
+}
+
 void test_non_positive_peer_poll_is_refused() {
     TempDirectory a_directory;
     TempDirectory b_directory;
@@ -2608,6 +2654,8 @@ int main() {
     test_peer_poll_passes_over_images_the_peer_only_registered();
     test_peer_poll_lists_an_unchanged_peer_once();
     test_peer_fit_skip_is_counted_once_when_only_the_use_changes();
+    test_peer_image_evicted_to_the_bucket_is_not_attempted();
+    test_peer_image_skipped_for_budget_is_imported_after_room_is_made();
     test_put_budgets_against_free_disk_space();
     test_write_failure_names_the_cause();
     test_load_keeps_what_it_fetched_until_it_has_read_it();

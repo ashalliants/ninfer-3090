@@ -574,8 +574,9 @@ ninfer-serve model.ninfer --port 8001 --devices 1 --context-store /data/store1 -
   `--context-store-peer-poll-ms` (250) the engine lists the manifests there, and for each session it
   does not hold it **hard-links** the session's chunk files into its own directory (no bytes are
   copied, the data is on disk once) and registers it like any stored session. Only sessions the
-  other engine holds itself are considered: those it only registered from the bucket listing (it
-  has none of their chunks) are passed over until it has fetched them. A poll that finds the other
+  other engine holds the chunks of are considered: those it only registered from the bucket listing
+  or evicted to the bucket are passed over, without counting as failures, until it has fetched them
+  back. A poll that finds the other
   directory and its own unchanged since the last listing does not list it again. A request that would
   resume from it finds it through the same lookup as its own sessions (see above), reads and
   verifies every chunk, and prices the read with the measured read rate. A peer that has not started
@@ -589,7 +590,8 @@ ninfer-serve model.ninfer --port 8001 --devices 1 --context-store /data/store1 -
   start-up scan cannot tell an imported session from its own, so from then on a use puts back what
   the bucket lacks, as for its own sessions. Sessions older than
   `--context-store-ttl-hours`, or that would not fit in `--context-store-max-gib`, are skipped, and a
-  skipped session is not looked at again until its owner rewrites it.
+  skipped session is not looked at again until its owner rewrites it (one that did not fit is also
+  tried again once this engine has removed something to make room).
 - **A session is visible to the other engine only after its owner has written it**, which is
   `--context-store-idle-seconds` (30 by default) after its last use, or when it is evicted, or at
   shutdown, and a background write is skipped while any request is waiting. With the default, the

@@ -2445,7 +2445,10 @@ std::size_t ContextStore::sync_peers() {
         std::unordered_set<std::string> used_ids;
         bool complete = true;
         fs::directory_iterator item(manifests, error);
-        if (error) { continue; }
+        if (error) {
+            last.trusted = false; // listed again next poll
+            continue;
+        }
         for (; item != fs::directory_iterator(); item.increment(error)) {
             if (error) {
                 complete = false;
@@ -2485,13 +2488,34 @@ std::size_t ContextStore::sync_peers() {
             }
             stamped.emplace_back(id, stamp);
         }
+        // Images waiting for the peer's chunks, and the `.used` time each wait was recorded at.
+        std::vector<std::pair<std::string, std::int64_t>> absent;
         {
             std::scoped_lock lock(mutex_);
             stats_.peer_skipped += gone;
             std::erase_if(stamped, [&](const auto& candidate) {
-                const auto skipped = peer_skipped_.find(peer.string() + "|" + candidate.first);
-                return skipped != peer_skipped_.end() && skipped->second == candidate.second;
+                const std::string memo_key = peer.string() + "|" + candidate.first;
+                const auto skipped = peer_skipped_.find(memo_key);
+                if (skipped != peer_skipped_.end() && skipped->second == candidate.second) {
+                    return true;
+                }
+                const auto wait = peer_waits_.find(memo_key);
+                if (wait == peer_waits_.end() || wait->second.stamp != candidate.second) { return false; }
+                if (wait->second.absent) {
+                    absent.emplace_back(candidate.first, wait->second.used_stamp);
+                    return true; // checked against the peer's `.used` below
+                }
+                // Over budget: tried again once this store has removed something.
+                return wait->second.local_changes == local_changes_;
             });
+        }
+        for (const auto& [id, used_stamp] : absent) {
+            const auto stamp = peer_used_stamp(peer, id);
+            if (stamp && *stamp == used_stamp) { continue; } // the peer still lacks the chunks
+            std::error_code time_error;
+            const std::int64_t manifest_stamp = static_cast<std::int64_t>(
+                fs::last_write_time(manifests / (id + ".manifest"), time_error).time_since_epoch().count());
+            if (!time_error) { stamped.emplace_back(id, manifest_stamp); }
         }
         for (const auto& [id, stamp] : stamped) {
             if (import_peer_image(peer, id, stamp)) { ++imported; }
@@ -2501,10 +2525,12 @@ std::size_t ContextStore::sync_peers() {
         if (complete) {
             const std::string prefix = peer.string() + "|";
             std::scoped_lock lock(mutex_);
-            std::erase_if(peer_skipped_, [&](const auto& skipped) {
+            const auto unlisted = [&](const auto& skipped) {
                 return skipped.first.compare(0, prefix.size(), prefix) == 0 &&
                        manifest_ids.count(skipped.first.substr(prefix.size())) == 0;
-            });
+            };
+            std::erase_if(peer_skipped_, unlisted);
+            std::erase_if(peer_waits_, unlisted);
         }
         // A directory time well in the past is one a later change must move; one this recent
         // could share its file system tick with a change made just after the listing.
@@ -2512,6 +2538,14 @@ std::size_t ContextStore::sync_peers() {
                 complete && manifests_time + std::chrono::seconds(1) < listed_at};
     }
     return imported;
+}
+
+std::optional<std::int64_t> ContextStore::peer_used_stamp(const fs::path& peer,
+                                                          const std::string& id) {
+    std::error_code error;
+    const auto time = fs::last_write_time(peer / "manifests" / (id + ".used"), error);
+    if (error) { return std::nullopt; }
+    return static_cast<std::int64_t>(time.time_since_epoch().count());
 }
 
 bool ContextStore::import_peer_image(const fs::path& peer, const std::string& id,
@@ -2573,6 +2607,7 @@ bool ContextStore::import_peer_image(const fs::path& peer, const std::string& id
     std::vector<Source> needed;
     std::unordered_set<std::string> seen;
     std::uint64_t new_bytes = held != nullptr ? 0 : entry.manifest_bytes; // a held manifest is counted
+    bool lacking            = false; // a chunk this store needs that the peer does not hold intact
     for (const ChunkRef& chunk : wanted) {
         const std::string key = hex_key(chunk.hash);
         if (!seen.insert(key).second) { continue; }
@@ -2589,17 +2624,34 @@ bool ContextStore::import_peer_image(const fs::path& peer, const std::string& id
             size = fs::file_size(packed_source, error);
             const auto content = error ? std::nullopt : compressed_content_size(packed_source);
             if (error || !content || *content != chunk.length) {
-                ++stats_.peer_link_failures;
-                return skip_locked(); // the peer evicted it meanwhile, or it is damaged
+                lacking = true;
+                continue;
             }
             needed.push_back({&chunk, packed_source, true, size});
         }
         new_bytes += size;
     }
+    if (lacking) {
+        if (needed.empty()) {
+            // The peer holds none of what this store lacks: its copy is only an entry for the
+            // bucket's (registered from a listing, or evicted to the bucket). Not a failure;
+            // looked at again when the peer uses the image, as a fetch back to its disk does.
+            PeerWait& wait = peer_waits_[memo_key];
+            wait           = {stamp, peer_used_stamp(peer, id).value_or(0), 0, true};
+            return false;
+        }
+        ++stats_.peer_link_failures;
+        return skip_locked(); // the peer evicted part of it meanwhile, or it is damaged
+    }
     // Nothing is imported that would be evicted at once, or the store would link, evict and link
     // the same image again at every poll.
+    // The skip stands until the peer rewrites the image or this store removes something, and the
+    // same skip is counted once.
     if (options_.max_bytes != 0 && used_bytes_locked() + new_bytes > options_.max_bytes) {
-        return skip_locked();
+        PeerWait& wait = peer_waits_[memo_key];
+        if (wait.absent || wait.stamp != stamp) { ++stats_.peer_skipped; }
+        wait = {stamp, 0, local_changes_, false};
+        return false;
     }
 
     // Hard-link each chunk. A link is independent of the peer's file from then on: the peer
@@ -2645,6 +2697,7 @@ bool ContextStore::import_peer_image(const fs::path& peer, const std::string& id
         }
     }
     peer_skipped_.erase(memo_key);
+    peer_waits_.erase(memo_key);
     ++stats_.peer_images;
     stats_.peer_bytes_linked += linked_bytes;
     // Only the chunks linked here are the peer's: one this store already held is not.

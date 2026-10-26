@@ -512,6 +512,19 @@ private:
     // (peer + id) -> modification time of the peer manifest that was skipped: not tried again until
     // the peer rewrites it. Guarded by mutex_.
     std::unordered_map<std::string, std::int64_t> peer_skipped_;
+    // (peer + id) -> an image not imported for a reason that can pass without the peer rewriting
+    // the manifest (`stamp`, its time): it did not fit here (tried again once `local_changes` has
+    // moved), or the peer holds none of the chunks this store lacks (`absent`: tried again once the
+    // peer's `.used` time, `used_stamp`, moves). Guarded by mutex_.
+    struct PeerWait {
+        std::int64_t stamp           = 0;
+        std::int64_t used_stamp      = 0;
+        std::uint64_t local_changes  = 0;
+        bool absent                  = false;
+    };
+    std::unordered_map<std::string, PeerWait> peer_waits_;
+    [[nodiscard]] static std::optional<std::int64_t> peer_used_stamp(const std::filesystem::path& peer,
+                                                                     const std::string& id);
     // Per peer: its manifests directory's time and local_changes_ at the last listing. A listing
     // is trusted to stand for later polls only when the directory's time was well in the past
     // (a change in the same tick of the file system clock would not move it). sync_peers only.
