@@ -838,7 +838,11 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             options.flash_next.ngram_volume_path = require_value("--ngram-volume");
         } else if (arg == "--ngram-keepalive-ms") {
             const int ms = parse_nonnegative_int(require_value("--ngram-keepalive-ms"), "ngram-keepalive-ms");
-            if (ms > 60000) { throw std::invalid_argument("--ngram-keepalive-ms must be in [0, 60000]"); }
+            if (static_cast<std::uint32_t>(ms) > kNgramKeepaliveWindowMs) {
+                throw std::invalid_argument("--ngram-keepalive-ms must be in [0, " +
+                                            std::to_string(kNgramKeepaliveWindowMs) +
+                                            "]: keep-alive reads run only for a minute after a request");
+            }
             options.flash_next.ngram_keepalive_ms = static_cast<std::uint32_t>(ms);
         } else if (arg == "--shared-expert-stream") {
             options.flash_next.shared_expert_stream = true;

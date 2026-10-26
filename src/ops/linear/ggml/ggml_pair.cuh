@@ -13,10 +13,6 @@
 
 namespace ninfer::ops::detail {
 
-inline constexpr int kGgmlPairK = 2560;
-static_assert(kGgmlPairShapes[0].k == kGgmlPairK && kGgmlPairShapes[1].k == kGgmlPairK,
-              "the pair instances are compiled for K = 2560");
-
 template <QType F1, QType F2>
 void ggml_pair_launch_t(const std::uint8_t* w1, const std::uint8_t* w2, const __nv_bfloat16* x, __nv_bfloat16* out1,
                         __nv_bfloat16* out2, std::int32_t n, std::int32_t t, cudaStream_t stream) {

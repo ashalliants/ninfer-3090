@@ -107,6 +107,10 @@ public:
     // Makes a resident key non-resident (its frame is lent); its count is kept.
     void evict(std::uint32_t key);
 
+    // Work counters of the gated victim search (tests bound them): candidate heaps built, gate calls.
+    [[nodiscard]] std::uint64_t gate_heaps() const noexcept { return gate_heaps_; }
+    [[nodiscard]] std::uint64_t gate_calls() const noexcept { return gate_calls_; }
+
 private:
     static constexpr std::uint32_t kNone = 0xFFFFFFFFU;
     void insert(std::uint32_t key);
@@ -117,13 +121,6 @@ private:
     // outranks, from the step's candidate heap (built on first use); refused ones leave the heap.
     std::optional<std::uint32_t> evictable_victim(std::span<const std::uint32_t> protect, std::uint32_t newcomer,
                                                   const Admissible& gate);
-
-public:
-    // Work counters of the gated victim search (tests bound them): candidate heaps built, gate calls.
-    [[nodiscard]] std::uint64_t gate_heaps() const noexcept { return gate_heaps_; }
-    [[nodiscard]] std::uint64_t gate_calls() const noexcept { return gate_calls_; }
-
-private:
 
     std::uint32_t capacity_;
     std::uint32_t halving_period_;

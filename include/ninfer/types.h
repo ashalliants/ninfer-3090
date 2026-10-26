@@ -87,6 +87,9 @@ inline constexpr std::uint32_t kMaximumPrefillYieldRemainingMs = 3'600'000;
 inline constexpr std::uint32_t kMaximumPrefillDecodeSharePercent = 90;
 // PrefillScheduleOptions::layer_slices: more slices than this leaves a few layers per slice.
 inline constexpr std::uint32_t kMaximumPrefillLayerSlices = 16;
+// FlashNextOptions::ngram_keepalive_ms: keep-alive reads run for this long after the last request,
+// and the period between them is at most this (a longer one would never fire).
+inline constexpr std::uint32_t kNgramKeepaliveWindowMs = 60'000;
 
 struct KvCapacityPolicy {
     KvCapacityMode mode                  = KvCapacityMode::Explicit;
@@ -464,10 +467,11 @@ struct FlashNextOptions {
     // A commit that ends the request folds before the round is reported. The same state, bit for bit.
     bool gdn_async_commit = false;
     // Int8 copies of every hyper-connection mixer's matrices (--hc-int8), made at startup from the
-    // BF16 weights with one binary16 scale per 32 values; decode-width mixer calls (up to 16
-    // columns: decode, MTP drafts and verification) read them, about 0.53x the bytes per call, and
-    // prefill keeps the BF16 weights. CHANGES THE NUMERICS (the weights are rounded); the BF16
-    // weights stay loaded, so it costs about 0.68 GB of VRAM (fewer expert frames). Off: BF16.
+    // BF16 weights with one binary16 scale per 32 values; mixer calls of up to 16 columns (decode,
+    // MTP drafts and verification, and prefill calls that short) read them, about 0.53x the bytes
+    // per call; calls of more than 16 columns keep the BF16 weights, bit for bit. CHANGES THE
+    // NUMERICS (the weights are rounded); the BF16 weights stay loaded, so it costs about 0.68 GB
+    // of VRAM (fewer expert frames). Off: BF16.
     bool hc_int8 = false;
     // One fused read per decode-width routed-expert block input (--hc-fused-read; requires hc_int8):
     // the attention block's inject, the int8 mixer, the router with its top-10 and dispatch, and the

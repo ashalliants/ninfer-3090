@@ -14,7 +14,9 @@
 //    within the suite's criterion, and the FP32 accumulator within the documented accumulation
 //    bound. A row's arithmetic depends only on the format and K, so each problem checks its first
 //    1024 rows. LinearAdd problems add a BF16 residual.
-// 3. Rows built to cancel (d sc q close to dmin m for every value) stay within the FP32 bound.
+// 3. Rows built to cancel (d sc q close to dmin m for every value) stay within the FP32 bound and
+//    the suite's criterion, with zero-mean activations and with biased all-positive ones (every
+//    group's min term dmin m sum(xq) then is large and cancels against the code term).
 
 #include "core/weight.h"
 #include "ops/ggml_blocks_decode.h"
@@ -112,11 +114,13 @@ void decomposition(QType format) {
 }
 
 // BF16 [K,T] whose 32-value groups each get their own magnitude; the first group of every column
-// is zero (the cast's amax = 0 rule).
-std::vector<std::uint16_t> make_activation(std::int32_t k, std::int32_t t, std::uint32_t seed) {
+// is zero (the cast's amax = 0 rule). `positive`: every other value in (0.5, 1.5) times its
+// group's magnitude (a biased all-positive input), else in [-0.5, 0.5).
+std::vector<std::uint16_t> make_activation(std::int32_t k, std::int32_t t, std::uint32_t seed,
+                                           bool positive = false) {
     std::vector<std::uint16_t> x(static_cast<std::size_t>(k) * t);
     std::mt19937 rng(seed);
-    std::uniform_real_distribution<float> unit(-0.5F, 0.5F);
+    std::uniform_real_distribution<float> unit(positive ? 0.5F : -0.5F, positive ? 1.5F : 0.5F);
     for (std::int32_t col = 0; col < t; ++col) {
         for (std::int32_t g = 0; g < k / 32; ++g) {
             const float scale = std::ldexp(1.0F, static_cast<int>(rng() % 9) - 6);
@@ -142,10 +146,11 @@ void parallel_rows(std::int32_t rows, F&& body) {
 
 // Rows of `blocks` against the oracle, both route orders, T = 1..8 (`residual`: LinearAdd).
 void problem(const std::string& label, QType format, std::int32_t rows, std::int32_t k,
-             const std::vector<std::uint8_t>& blocks, bool residual, std::uint32_t seed, bool report_bf16) {
+             const std::vector<std::uint8_t>& blocks, bool residual, std::uint32_t seed, bool report_bf16,
+             bool positive = false) {
     constexpr std::int32_t kColumns = ops::detail::kGgmlDecodeMaxTokens;
     const std::size_t row_bytes     = static_cast<std::size_t>(k) / 256 * ggml_block(format).bytes;
-    const auto x_bits               = make_activation(k, kColumns, seed);
+    const auto x_bits               = make_activation(k, kColumns, seed, positive);
     const em::Q81 x                 = em::cast_q81(x_bits, k, kColumns);
     const auto xm                   = em::activation_sums(x);
     std::vector<std::uint16_t> old(static_cast<std::size_t>(rows) * kColumns);
@@ -236,7 +241,11 @@ void cancelling(QType format) {
             b[(q5 ? 48 : 16) + l] = static_cast<std::uint8_t>(lo | (hi << 4));
         }
     }
-    problem(std::string("cancelling ") + name_of(format) + " [64,2560]", format, rows, k, blocks, false, 0xC0DE, false);
+    for (const bool positive : {false, true}) {
+        problem(std::string("cancelling ") + name_of(format) + " [64,2560]" +
+                    (positive ? " biased all-positive x" : " zero-mean x"),
+                format, rows, k, blocks, false, 0xC0DE, true, positive);
+    }
 }
 
 } // namespace

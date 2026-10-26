@@ -5,6 +5,7 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -84,6 +85,13 @@ void joint_table_bins() {
     for (const Case& c : cases) {
         require(joint_acceptance_table(c.p) == c.expect, "bin of p=" + std::to_string(c.p));
     }
+    // A NaN probability (an overflowed draft softmax) and negative ones map to the floor, never
+    // to the top bin, so a damaged probability cannot lengthen the window.
+    require(joint_acceptance_table(std::numeric_limits<float>::quiet_NaN()) == 0.12f, "NaN maps to the floor");
+    require(joint_acceptance_table(-std::numeric_limits<float>::infinity()) == 0.12f, "-inf maps to the floor");
+    require(joint_acceptance_table(-0.5f) == 0.12f, "negative maps to the floor");
+    const std::array<float, 2> damaged{std::numeric_limits<float>::quiet_NaN(), 0.99f};
+    require(joint_acceptance_length(damaged, 0.35f) == 0, "a NaN first draft keeps no drafts");
 }
 
 void joint_length_stops() {
@@ -122,6 +130,10 @@ void joint_window_verifies_one() {
 void joint_threshold_adapts() {
     JointAcceptanceThreshold t;
     require(t.current() == 0.35f, "starts at base");
+    // Moving base after construction does not move current() until an observe with evidence.
+    JointAcceptanceThreshold moved;
+    moved.base = 0.5f;
+    require(moved.current() == 0.35f, "a later base leaves current() at the default");
 
     // Little evidence (expected < 0.5) leaves the threshold at base: p=0.3 twice expects .3276.
     const std::array<float, 2> weak{0.3f, 0.3f};

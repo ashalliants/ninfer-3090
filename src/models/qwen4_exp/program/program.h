@@ -485,8 +485,8 @@ struct ProgramOptions {
     bool gdn_async_commit = false;
     // FlashNextOptions::hc_int8: the Program makes int8 copies of every mixer's hyper-connection
     // matrices at construction (execution::HcInt8Copies, ProgramDevicePlan::hc_int8_bytes) and the
-    // forward's decode-width mixer calls read them (execution::ForwardOptions::hc_int8; prefill
-    // keeps the BF16 weights). Changes the numerics; no workspace.
+    // forward's mixer calls of up to 16 columns read them (execution::ForwardOptions::hc_int8;
+    // calls of more than 16 columns keep the BF16 weights). Changes the numerics; no workspace.
     bool hc_int8 = false;
     // FlashNextOptions::hc_fused_read: every decode-width routed-expert block's input is read by one
     // ops::hc_fused_read (execution::ForwardOptions::hc_fused_read: the previous inject, the int8

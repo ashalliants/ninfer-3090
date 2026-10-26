@@ -775,7 +775,8 @@ public:
         }
         // A read after ngram_keepalive_ms of idleness within a minute of a request keeps the volume's
         // drive awake (a zero period leaves the keep-alive off).
-        volume_.set_keepalive(std::chrono::milliseconds(options_.ngram_keepalive_ms), std::chrono::milliseconds(60000));
+        volume_.set_keepalive(std::chrono::milliseconds(options_.ngram_keepalive_ms),
+                              std::chrono::milliseconds(kNgramKeepaliveWindowMs));
         vocab_ = dim(c_.vocab_size);
 
         // Every fixed allocation is checked against the plan and against device free memory (an
@@ -3226,7 +3227,8 @@ private:
         const auto& io = plan_.io;
         auto* host     = static_cast<std::byte*>(io_host_.data());
         // n-gram rows: the window of ngram_size - 1 earlier tokens, EOS-padded at the start.
-        row_ids_ = ngram_window_rows(hash_, L().history, {}, begin, width);
+        row_ids_.resize(static_cast<std::size_t>(width) * hash_.heads());
+        ngram_window_rows(hash_, L().history, {}, begin, width, ngram_window_, row_ids_);
         const std::size_t row_bytes = c_.ple.table.row_bytes;
         const std::size_t rows      = static_cast<std::size_t>(width) * hash_.heads() * row_bytes;
         if (next_begin_ == begin && next_width_ == width && next_lane_ == cur_) {
@@ -3248,8 +3250,8 @@ private:
         row_ids_.resize(rows_lanes.size() * heads);
         for (std::size_t b = 0; b < rows_lanes.size(); ++b) {
             const Lane& lane = lanes_[rows_lanes[b]];
-            const auto ids   = ngram_window_rows(hash_, lane.history, {}, static_cast<std::int64_t>(lane.state_tokens), 1);
-            std::copy(ids.begin(), ids.end(), row_ids_.begin() + static_cast<std::ptrdiff_t>(b * heads));
+            ngram_window_rows(hash_, lane.history, {}, static_cast<std::int64_t>(lane.state_tokens), 1,
+                              ngram_window_, std::span<std::uint32_t>(row_ids_).subspan(b * heads, heads));
         }
         const std::size_t row_bytes = c_.ple.table.row_bytes;
         volume_.read_rows(row_ids_, std::span<std::byte>(host + io.ngram, row_ids_.size() * row_bytes));
@@ -3259,7 +3261,8 @@ private:
     // Reads the n-gram rows of positions [begin, begin + width) into ngram_next_ (the next call's
     // stage takes them from there).
     void prefetch_rows(std::int32_t begin, std::int32_t width) {
-        row_ids_ = ngram_window_rows(hash_, L().history, {}, begin, width);
+        row_ids_.resize(static_cast<std::size_t>(width) * hash_.heads());
+        ngram_window_rows(hash_, L().history, {}, begin, width, ngram_window_, row_ids_);
         volume_.read_rows(row_ids_, std::span<std::byte>(static_cast<std::byte*>(ngram_next_.data()),
                                                          row_ids_.size() * c_.ple.table.row_bytes));
         next_begin_ = begin;
@@ -4924,9 +4927,12 @@ private:
         const std::uint32_t loaded = residency_->warm_start(*load.state, kSeedCountCap, max_keys, device_.stream);
         device_.synchronize();
         char line[200];
-        std::snprintf(line, sizeof(line), "expert cache: restored the %u most-used experts from %s (%.1f GiB in %.2f s)",
-                      loaded, warm.from_fallback ? "the default state shipped with the model" : "the last session", static_cast<double>(loaded) * static_cast<double>(residency_->frame_stride()) / (1ULL << 30),
-                      std::chrono::duration<double>(Clock::now() - start).count());
+        const char* source = warm.from_fallback ? "the default state shipped with the model" : "the last session";
+        const double gib   = static_cast<double>(loaded) * static_cast<double>(residency_->frame_stride()) /
+                           (1ULL << 30);
+        std::snprintf(line, sizeof(line),
+                      "expert cache: restored the %u most-used experts from %s (%.1f GiB in %.2f s)", loaded,
+                      source, gib, std::chrono::duration<double>(Clock::now() - start).count());
         diagnostic(line);
         expert_state_routed_ = residency_->stats().routed;
     }
@@ -5365,6 +5371,7 @@ private:
     std::uint64_t decode_rounds_ = 0, rows_rounds_ = 0;
     std::uint64_t budget_tokens_ = 0;
     std::vector<std::uint32_t> row_ids_;
+    std::vector<std::int32_t> ngram_window_; // ngram_window_rows' token window, kept between calls
     std::vector<std::byte> prefetch_sink_; // the anchor prefetch's rows, read only to fill the volume's cache
     Clock::time_point expert_state_saved_{};
     std::uint64_t expert_state_routed_ = 0;

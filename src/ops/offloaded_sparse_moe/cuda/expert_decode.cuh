@@ -53,6 +53,8 @@ struct ExpertFormat<QType::GGML_IQ2_XXS> {
         for (int l = 0; l < 4; ++l) {
             const auto index = static_cast<std::uint32_t>(q2 >> (8 * l)) & 0xFFU;
             const uint2 grid = grid_table[index];
+            // ggml::signed_grid's arithmetic written out: calling it compiles these kernels with
+            // commuted LOP3 operands, so their SASS would no longer match the shipped build's.
             const std::uint32_t signs = ggml::ksigns_word(aux32 >> (7 * l));
             const int s0 = static_cast<int>(__vcmpne4(signs & 0x08040201U, 0));
             const int s1 = static_cast<int>(__vcmpne4(signs & 0x80402010U, 0));

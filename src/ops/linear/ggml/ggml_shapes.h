@@ -91,6 +91,10 @@ struct GgmlPairShape {
     std::int32_t k;
 };
 inline constexpr GgmlPairShape kGgmlPairShapes[] = {{640, 2560}, {512, 2560}};
+// The one K the pair instances are compiled for (ggml_pair.cuh); every pair shape has it.
+inline constexpr std::int32_t kGgmlPairK = 2560;
+static_assert(kGgmlPairShapes[0].k == kGgmlPairK && kGgmlPairShapes[1].k == kGgmlPairK,
+              "the pair instances are compiled for K = 2560");
 inline constexpr QType kGgmlPairFormats[] = {QType::GGML_IQ4_XS, QType::GGML_IQ3_S, QType::GGML_Q6_K,
                                              QType::GGML_Q5_K, QType::GGML_Q4_K};
 
@@ -118,6 +122,17 @@ inline constexpr QType kGgmlHeadFormats[] = {QType::GGML_IQ4_XS, QType::GGML_Q6_
 
 [[nodiscard]] constexpr bool ggml_head_registered(QType format) {
     for (const QType f : kGgmlHeadFormats) {
+        if (f == format) { return true; }
+    }
+    return false;
+}
+
+// ops::embedding's GGML table formats (src/ops/wrapper/embedding.cpp, its GGML cases): the packs'
+// token embeddings.
+inline constexpr QType kGgmlEmbeddingFormats[] = {QType::GGML_IQ4_XS, QType::GGML_IQ3_S};
+
+[[nodiscard]] constexpr bool ggml_embedding_registered(QType format) {
+    for (const QType f : kGgmlEmbeddingFormats) {
         if (f == format) { return true; }
     }
     return false;

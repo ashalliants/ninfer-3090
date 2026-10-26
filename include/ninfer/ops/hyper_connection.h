@@ -206,9 +206,9 @@ struct HcFusedReadOutputs {
  * Numeric:
  *   Each step's own contract: steps 1, 3, 4, 5 and 6 are exact given their inputs (step 1 as one
  *   fused multiply-add rounded once, which hyper_connection_inject's kernel is by contraction),
- *   and step 2 is the int8 mixer's arithmetic, so every output is bitwise that of the composition of those Ops
- *   (the fixed dispatch order included). The oracle is that composition; x also meets the int8
- *   mixer's FP64 criterion.
+ *   and step 2 is the int8 mixer's arithmetic, so every output is bitwise that of the composition
+ *   of those Ops (the fixed dispatch order included). The oracle is that composition; x also meets
+ *   the int8 mixer's FP64 criterion.
  *
  * Effects:
  *   Updates residual in place (step 1); writes every output. y, prev_inject, norm_weight, the
