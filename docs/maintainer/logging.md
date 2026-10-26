@@ -169,15 +169,15 @@ explicit emergency cases above remain direct outputs because they are different 
 Code under `src/` reaches stderr through the product logger, except for the emergency diagnostics of
 section 1 and the logging runtime's own sink. `tools/check_stderr_logging.py` keeps that list from
 growing: `tools/stderr_logging.allow` records, per file, how many times the code names stderr today,
-and the check fails when a file's count rises or a file that is not listed names stderr. A lower count
-passes with a note.
+and the check fails when a file's count rises or a file that is not listed names stderr, naming the
+lines of its uses. A lower count passes with a note. A missing or malformed allowlist exits 2.
 
 A use is one match of `std::cerr`, `std::clog`, `cerr`, `clog`, `stderr` or `perror(` as a whole word,
 after comments and string and character literals are blanked out. So `fprintf(stderr, ...)`,
 `fflush(stderr)`, `fputs(..., stderr)` and `std::cerr <<` each count once, while a comment or a log
 message that merely says "stderr", `STDERR_FILENO` and spdlog's `stderr_color_sink_st` do not. The
-files are those git tracks under `src/` (`apps/`, `tests/` and `bench/` print results to stderr by
-design and are not checked). It runs as the host-only test `ninfer_stderr_logging_ratchet_test`, so CI
+files are those git tracks under `src/`, or every file under it when git cannot list them (with a
+note; `apps/`, `tests/` and `bench/` print results to stderr by design and are not checked). It runs as the host-only test `ninfer_stderr_logging_ratchet_test`, so CI
 enforces it, and by hand:
 
 ```bash

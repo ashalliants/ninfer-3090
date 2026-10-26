@@ -163,9 +163,10 @@ What a row measures, exactly:
   for any one phase; use the ordinary benchmark (`-p`, `-n`, `-r`, `--warmup`) for that.
 
 The preset is defined on the 27B dense models: the corpus holds Qwen3.6 token ids, and the
-architecture must be `Qwen3_5ForCausalLM`, which the project ships only as Qwen3.6-27B and
-Qwen3.8-27B. Any other artifact (the 35B-A3B MoE, Flash-Next) is refused after it loads, because
-its architecture is not known before then. Rows compare only within one model, which each row
+architecture must be `Qwen3_5ForCausalLM`, the architecture of the shipped Qwen3.6-27B and
+Qwen3.8-27B artifacts (and of other 27B conversions such as Bonsai-2-27B, which the preset accepts
+too; their rows compare only with their own). Any other artifact (the 35B-A3B MoE, Flash-Next) is
+refused after it loads, because its architecture is not known before then. Rows compare only within one model, which each row
 names.
 
 The preset takes no other flag, and the error names the one given: `-p`, `-n`, `-pg`, `-r`,

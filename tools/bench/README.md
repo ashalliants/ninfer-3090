@@ -95,8 +95,8 @@ Its self-test, `ninfer_interleaved_ab_test`, uses a fake executable and needs no
 Do two builds produce the same tokens? The tool runs each `ninfer` CLI on every prompt of a JSONL file
 (default `bench/fixtures/chat_prompts.jsonl`, 24 prompts) with `--greedy --print-token-ids --max-new N`,
 reads the generated ids the CLI prints on stderr, and prints `GREEDY IDENTICAL`, or `GREEDY DIFFERS`
-with the first differing prompt and token index (exit 1) and the ids around it. Exit 2 means a build
-crashed or printed no ids line, so nothing was compared.
+with the first differing prompt and token index (exit 1) and the ids around it. Exit 2 means nothing
+was compared: a build crashed, printed no ids line, or neither build generated a token for a prompt.
 
 ```bash
 python3 tools/bench/greedy_identity.py \
@@ -121,12 +121,18 @@ python3 tools/bench/greedy_identity.py --a build-ninja/apps/ninfer.exe \
     --model models/qwen3_8_27b.ninfer --b-args="--no-cuda-graph"
 ```
 
-It runs the builds one after the other on the card, a process per prompt and build, so **hold the GPU
-lock around the whole run** (CLAUDE.md, "GPU lock"):
+It runs the builds one after the other on the card, a process per prompt and build, and does not take
+the GPU lock itself. **Hold the lock per prompt**, not around the whole set (CLAUDE.md, "GPU lock": a
+hold over 48 model loads keeps every other session waiting). Give the tool a one-line prompts file
+and wrap each invocation, as `basalt_gpu_verify.py` does:
 
 ```powershell
 . tools/gpu-lock.ps1
-Invoke-WithGpuLock { python tools/bench/greedy_identity.py --a ... --b ... --model ... }
+foreach ($line in Get-Content bench/fixtures/chat_prompts.jsonl | Where-Object { $_.Trim() }) {
+    Set-Content -Encoding utf8 prompt.jsonl $line
+    Invoke-WithGpuLock { python tools/bench/greedy_identity.py --a ... --b ... --model ... `
+        --prompts prompt.jsonl }
+}
 ```
 
 Its self-test, `ninfer_greedy_identity_test`, uses fake CLIs and needs no GPU.

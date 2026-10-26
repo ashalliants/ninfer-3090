@@ -7,8 +7,9 @@ For every prompt in a prompts file, run each build as
 
 and compare the generated token ids the CLI prints on stderr (the `tokens  generated ids ...` line).
 Prints `GREEDY IDENTICAL` (exit 0), or `GREEDY DIFFERS` with the first differing prompt and token
-index (exit 1), stopping at that prompt. Exit 2 means a build failed, printed no ids line, or the
-inputs were wrong, so nothing was compared.
+index (exit 1), stopping at that prompt. Exit 2 means nothing was compared: a build failed, printed
+no ids line, or generated no tokens on both sides for a prompt (equal empty lists prove nothing),
+or the inputs were wrong.
 
 Use it for a change that must not move the output: an option that is off by default, a refactor, a
 kernel swapped for an equivalent one. Equal ids over 24 prompts is evidence the two builds take the
@@ -41,11 +42,17 @@ Both builds must sit in the same directory, under different names: the preflight
 run_interleaved_ab.py uses (an executable copied away from its build fails DLL resolution, exits 127
 and reads like a model-loading failure).
 
-GPU: this tool runs the two builds one after the other, on the card, for as long as the prompts
-take. Take the GPU lock around the whole invocation (CLAUDE.md, "GPU lock"):
+GPU: every prompt runs two CLI processes on the card, one after the other. The tool does not take
+the GPU lock itself. Hold it per prompt, not around the whole set (CLAUDE.md, "GPU lock": a hold
+over 48 model loads keeps every other session waiting): give the tool a one-line prompts file and
+wrap each invocation, as tools/bench/basalt_gpu_verify.py does (pwsh, so the file has no BOM):
 
     . tools/gpu-lock.ps1
-    Invoke-WithGpuLock { python tools/bench/greedy_identity.py --a ... --b ... --model ... }
+    foreach ($line in Get-Content bench/fixtures/chat_prompts.jsonl | Where-Object { $_.Trim() }) {
+        Set-Content -Encoding utf8 prompt.jsonl $line
+        Invoke-WithGpuLock { python tools/bench/greedy_identity.py --a ... --b ... --model ... `
+            --prompts prompt.jsonl }
+    }
 """
 
 from __future__ import annotations
@@ -76,7 +83,8 @@ def load_prompts(path: Path, limit: int | None) -> list[str]:
     if not path.is_file():
         raise Failure(f"missing prompts file: {path}")
     prompts: list[str] = []
-    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    # utf-8-sig: a prompts file written by Windows PowerShell 5 starts with a BOM.
+    for number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
         if not line.strip():
             continue
         try:
@@ -150,6 +158,9 @@ def compare_builds(args: argparse.Namespace, extra_a: list[str], extra_b: list[s
         total += len(ids_a)
         index = first_difference(ids_a, ids_b)
         label = prompt if len(prompt) <= 60 else prompt[:57] + "..."
+        if index is None and not ids_a:
+            raise Failure(f"prompt {number}/{len(prompts)} ({label!r}): neither build generated a token, "
+                          "so nothing was compared")
         if index is not None:
             print(f"GREEDY DIFFERS: prompt {number}/{len(prompts)} ({label!r}), token index {index} "
                   f"(0-based; A made {len(ids_a)} tokens, B made {len(ids_b)})")
