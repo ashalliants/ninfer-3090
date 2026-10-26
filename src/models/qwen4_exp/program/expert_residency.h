@@ -252,9 +252,11 @@ private:
     // Partial RAM residency (null/empty otherwise).
     std::unique_ptr<partial::Residency> homes_;
     std::function<void(std::uint32_t, std::uint32_t, std::uint32_t, std::span<std::byte>)> read_;
-    PinnedHostBuffer ram_pool_{1};
+    // The pinned slot pool and the slot table's upload block exist only in partial mode, so the
+    // default (full) mode pins nothing for them.
+    std::optional<PinnedHostBuffer> ram_pool_;
     const std::uint8_t* ram_device_ = nullptr; // the pool's device address
-    PinnedHostBuffer slots_upload_{1};         // device addresses [keys], uploaded to slots_device_
+    std::optional<PinnedHostBuffer> slots_upload_; // device addresses [keys], uploaded to slots_device_
     DeviceBuffer slots_device_;
     std::vector<const std::uint8_t*> slots_cpu_; // host addresses [keys]
     std::vector<std::uint8_t> written_back_;     // per key: its slot was filled by a write-back
