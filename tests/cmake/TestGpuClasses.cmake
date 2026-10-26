@@ -16,6 +16,7 @@
 set(NINFER_CPU_ONLY_TESTS
   ninfer_anthropic_schema_test
   ninfer_artifact_reader_test
+  ninfer_bench_rows_check_test
   ninfer_bench_support_test
   ninfer_chat_templates_test
   ninfer_chunked_reservation_test

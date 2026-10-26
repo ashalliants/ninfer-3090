@@ -264,6 +264,7 @@ int main() {
         gpu.memory_total_bytes     = 25769803776ULL;
         gpu.temperature_celsius    = 71;
         gpu.power_watts            = 312.5;
+        gpu.power_limit_watts      = 287.5;
         return gpu;
     });
     const auto gpu_body = metrics.render(running, true, 0);
@@ -271,7 +272,8 @@ int main() {
               has_line(gpu_body, "ninfer_gpu_memory_used_bytes 21474836480") &&
               has_line(gpu_body, "ninfer_gpu_memory_total_bytes 25769803776") &&
               has_line(gpu_body, "ninfer_gpu_temperature_celsius 71") &&
-              has_line(gpu_body, "ninfer_gpu_power_watts 312.5"),
+              has_line(gpu_body, "ninfer_gpu_power_watts 312.5") &&
+              has_line(gpu_body, "ninfer_gpu_power_limit_watts 287.5"),
           "GPU gauges must be reported from the sampler");
     check(gpu_body.find("ninfer_gpu_memory_utilization_percent") == std::string::npos,
           "an unknown GPU reading must be omitted, not reported as zero");

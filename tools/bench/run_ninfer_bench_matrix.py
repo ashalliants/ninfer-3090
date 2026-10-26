@@ -40,7 +40,7 @@ CONTEXT_CORE = ((512, 512), (2048, 512), (8192, 512))
 CONTEXT_FULL_EXTRA = ((32768, 256), (65536, 128))
 PRIMARY_KS = (0, 3, 5)
 SWEEP_KS = (0, 1, 2, 3, 4, 5)
-REPORT_SCHEMA_VERSION = 19
+REPORT_SCHEMA_VERSION = 20
 REPORT_ARTIFACT_TYPE = "ninfer_bench_report"
 REPORT_TOOL = "ninfer_bench"
 
@@ -342,6 +342,8 @@ def report_rows(report_path: Path, case: BenchCase) -> list[dict[str, Any]]:
                 speculative.get("accepted_per_position", []), separators=(",", ":")
             ),
             "gpu_name": report.get("environment", {}).get("gpu_name"),
+            "power_limit_watts_start": report.get("environment", {}).get("power_limit_watts_start"),
+            "power_limit_watts_end": report.get("environment", {}).get("power_limit_watts_end"),
         }
         rows.append(row)
     return rows

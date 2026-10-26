@@ -247,6 +247,8 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
                        "Device memory installed.");
         optional_gauge("gpu_temperature_celsius", gpu.temperature_celsius, "GPU core temperature.");
         optional_gauge("gpu_power_watts", gpu.power_watts, "Board power draw.");
+        optional_gauge("gpu_power_limit_watts", gpu.power_limit_watts,
+                       "Board power limit the driver enforces now.");
         // Needs a starting reading: NVML counts from driver load, so a reading first seen later
         // would otherwise report the whole uptime of the machine.
         if (gpu.energy_joules && gpu_energy_last_) {
