@@ -204,6 +204,8 @@ void test_corruption_is_a_miss_and_removed() {
         ContextStore reopened(options_for(directory.path()));
         check(reopened.list().empty() && chunk_files(directory.path()).empty(),
               "a truncated manifest was kept or left chunks behind");
+        check(reopened.stats().corrupt_removed == 1 && reopened.stats().corrupt_manifest == 1,
+              "a truncated manifest removed at start-up was not counted as damaged");
         (void)reopened.put(describe("cafe"), image, std::array{ContextStore::Region{64, 3000}});
     }
     // A chunk lost while the store was closed: without a bucket the image can never be read.
@@ -729,6 +731,76 @@ void test_a_lookup_shares_a_listing_in_progress() {
     refresh.join();
     check(remote->lists == lists + 1 && found.held == 1 && other.find("0a"),
           "the lookup did not take the refresh's listing");
+
+    // Lookups asked after a listing started cannot use it (it may miss what was uploaded just
+    // before they asked): they wait for it to end and share one listing after it, instead of
+    // listing the bucket each.
+    const int before = remote->lists;
+    remote->set_hold(true);
+    std::thread late_refresh([&] { (void)other.refresh_remote(); });
+    check(waited_for(1), "the refresh did not start its listing");
+    std::vector<std::thread> lookups;
+    std::atomic<int> held{0};
+    for (int i = 0; i < 4; ++i) {
+        lookups.emplace_back([&] {
+            const auto result = other.lookup_remote(
+                std::chrono::steady_clock::now(),
+                std::chrono::steady_clock::now() + std::chrono::seconds(10),
+                [](const std::string& id) { return id == "0a"; });
+            held += static_cast<int>(result.held);
+        });
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    check(remote->waiting == 1, "a lookup listed the bucket beside the listing in progress");
+    remote->set_hold(false);
+    for (auto& thread : lookups) { thread.join(); }
+    late_refresh.join();
+    check(remote->lists == before + 2 && held == 4,
+          "lookups arriving during a listing did not share one listing after it");
+}
+
+// A manifest the listing shows that is gone by the time it is read, or does not parse, is a failed
+// download (missing, damaged), for a lookup and for a refresh alike.
+void test_listed_manifests_that_cannot_be_read_are_counted() {
+    TempDirectory directory;
+    TempDirectory other_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore other(remote_options(other_directory.path(), remote));
+    check(drained(other), "the start-up refresh did not finish");
+    {
+        ContextStore store(remote_options(directory.path(), remote));
+        for (const char* id : {"0a", "0b", "0c"}) {
+            (void)store.put(describe(id), concat({pseudo_random(30, 1), pseudo_random(3000, 2)}),
+                            std::array{ContextStore::Region{30, 3000}});
+        }
+        check(drained(store), "upload");
+    }
+    const auto manifest = [&](const std::string& id) {
+        for (auto& [key, value] : remote->objects) {
+            if (key.find("manifests/" + id + ".manifest") != std::string::npos) { return &value; }
+        }
+        return static_cast<std::pair<std::vector<std::uint8_t>, std::int64_t>*>(nullptr);
+    };
+    const auto asked    = std::chrono::steady_clock::now();
+    const auto deadline = asked + std::chrono::seconds(10);
+    (void)other.lookup_remote(asked, deadline, [](const std::string& id) { return id == "0a"; });
+    // Gone after the listing the next lookup reuses was taken.
+    {
+        std::scoped_lock lock(remote->mutex);
+        for (auto it = remote->objects.begin(); it != remote->objects.end();) {
+            it = it->first.find("0b.manifest") != std::string::npos ? remote->objects.erase(it)
+                                                                    : std::next(it);
+        }
+    }
+    const auto gone = other.lookup_remote(asked, deadline, [](const std::string& id) { return id == "0b"; });
+    check(gone.registered == 0 && other.stats().remote_download_failures == 1 &&
+              other.stats().remote_download_failures_missing == 1,
+          "a listed manifest that was gone was not counted as missing");
+    manifest("0c")->first[5] ^= 0xff;
+    (void)other.refresh_remote();
+    check(!other.find("0c") && other.stats().remote_download_failures == 2 &&
+              other.stats().remote_download_failures_damaged == 1,
+          "a listed manifest that does not parse was not counted as damaged");
 }
 
 // A fetch that cannot finish by its deadline stops there: a miss, not damage. The image stays
@@ -2515,6 +2587,7 @@ int main() {
     test_fetch_bytes_and_lookup_on_demand();
     test_a_lookup_shares_a_listing_in_progress();
     test_a_fetch_stops_at_its_deadline();
+    test_listed_manifests_that_cannot_be_read_are_counted();
     test_checkpoint_visitor_matches_list();
     test_shared_prefix_outlives_the_conversations_on_it();
     test_conversation_moves_between_engines_on_a_shared_prefix();

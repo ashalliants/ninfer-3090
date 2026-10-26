@@ -261,8 +261,9 @@ public:
     // or later, whose ids `wanted` accepts, and leaves every other new image to the background
     // refresh, so a lookup costs a listing and the manifests it is after, not every manifest
     // uploaded since the last refresh. The listing is shared: one taken (or started) at or after
-    // `asked` serves it, so requests arriving together, and a refresh running meanwhile, list the
-    // bucket once. Gives up at `deadline`. Never removes anything from the index.
+    // `asked` serves it, and lookups arriving while an older one runs wait for it and then share
+    // the one next listing, so the bucket is listed once at a time however many ask. Gives up at
+    // `deadline`. Never removes anything from the index.
     struct LookupResult {
         std::size_t registered = 0; // wanted images this lookup added to the index
         std::size_t held       = 0; // wanted images listed that the index holds now
@@ -512,15 +513,15 @@ private:
         std::vector<ObjectInfo> objects;
     };
     // A listing asked for at or after `asked`: the newest one taken, one in progress that started
-    // after `asked` (waited for), or a new one. Nullptr when none is ready by `deadline`; throws
-    // what the bucket throws.
+    // after `asked` (waited for), or a new one once the one in progress ends (listings never run
+    // two at a time). Nullptr when none is ready by `deadline`; throws what the bucket throws.
     [[nodiscard]] std::shared_ptr<const Listing>
     listing_since(std::chrono::steady_clock::time_point asked,
                   std::chrono::steady_clock::time_point deadline);
     std::mutex listing_mutex_;
     std::condition_variable listing_cv_;
     std::shared_ptr<const Listing> latest_listing_;
-    // When the newest listing in progress was asked for (nullopt: none is).
+    // When the listing in progress was asked for (nullopt: none is).
     std::optional<std::chrono::steady_clock::time_point> listing_started_;
     // The image id a listed manifest key names (empty when it names none).
     [[nodiscard]] std::string listed_id(const std::string& key) const;

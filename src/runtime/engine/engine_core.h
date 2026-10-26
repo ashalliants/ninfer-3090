@@ -4336,6 +4336,13 @@ private:
                 finish_store_lookup(request, task.lookup_found > 0);
                 continue;
             }
+            // A read that finished after the request's wait ended (the worker was busy when the
+            // deadline passed, so the expiry scan below has not run yet) is not imported: the
+            // import would spend worker time past the budget the request was given.
+            if (Clock::now() >= request->hydration_deadline) {
+                finish_hydration(request, ContextStoreHydrationFailure::Deadline);
+                continue;
+            }
             if (task.bytes && cache_covers_hydration(request)) {
                 // Another waiter's read-back of the same image (or anything else) has already
                 // brought this prefix in: importing it again would catalogue a second copy.

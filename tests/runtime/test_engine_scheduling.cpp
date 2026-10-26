@@ -730,6 +730,7 @@ public:
     std::optional<std::vector<std::uint8_t>> get(const std::string& key) override {
         gate();
         if (key.find("/chunks/") != std::string::npos) {
+            ++chunk_gets;
             std::this_thread::sleep_for(chunk_delay.load());
         } else if (key.find("/manifests/") != std::string::npos) {
             ++manifest_gets;
@@ -775,6 +776,7 @@ public:
 
     std::atomic<int> lists{0};
     std::atomic<int> manifest_gets{0};
+    std::atomic<int> chunk_gets{0};
     // How long each chunk download takes, as on a slow link.
     std::atomic<std::chrono::milliseconds> chunk_delay{std::chrono::milliseconds(0)};
 
@@ -1058,6 +1060,41 @@ void test_a_slow_download_stops_at_the_requests_deadline() {
         const auto info = store.find(session_id(14, 30'000));
         require(info && !info->local && store.stats().corrupt_removed == 0,
                 "a download stopped at its deadline was treated as damage");
+    }
+}
+
+// A read that completes after the request's wait ended, while the worker was busy past the deadline,
+// is not imported when the worker gets to it: the request was given that long, no more.
+void test_a_read_finished_after_the_deadline_is_not_imported() {
+    auto bucket = std::make_shared<MemoryBucket>();
+    StoreDirectory directory;
+    ContextStore store(bucket_store_options(directory.path(), bucket));
+    require(store_drained(store), "the start-up refresh did not finish");
+    // One chunk, which starts inside the 200 ms wait and arrives at 300 ms.
+    store_session_elsewhere(bucket, 16, 30'000, 4096);
+    (void)store.refresh_remote();
+    bucket->chunk_delay = std::chrono::milliseconds(300);
+    {
+        Rig rig({.chunk = 1024, .lanes = 2});
+        rig.attach_store(store, std::chrono::milliseconds(200));
+        // The worker stalls in one unit from when the download starts until well after it ends,
+        // as behind a long prefill step.
+        std::atomic<bool> stalled{false};
+        rig.program().before_unit = [&](const Event&) {
+            if (bucket->chunk_gets > 0 && !stalled.exchange(true)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(600));
+            }
+        };
+        auto busy   = rig.run(1, 4000, 2000); // keeps the worker running units
+        auto result = rig.run(16, kLongPrompt, 1);
+        require(finished(result), "the request did not finish\n" + rig.dump());
+        require(stalled, "the worker never stalled during the download");
+        const auto failed = rig.core().runtime_stats().context_store_hydration_failures_by_reason;
+        require(failed[static_cast<std::size_t>(ContextStoreHydrationFailure::Deadline)] == 1 &&
+                    failed[static_cast<std::size_t>(ContextStoreHydrationFailure::HostGeometry)] == 0,
+                "a read that finished after its deadline was imported");
+        drain(busy, std::chrono::seconds(30));
+        rig.program().before_unit = nullptr;
     }
 }
 
@@ -1823,6 +1860,8 @@ int main() {
         test_a_lookup_reads_only_the_requests_own_manifests);
     run("a slow download stops at the request's deadline",
         test_a_slow_download_stops_at_the_requests_deadline);
+    run("a read finished after the deadline is not imported",
+        test_a_read_finished_after_the_deadline_is_not_imported);
     run("an import that throws fails only the hydration",
         test_an_import_that_throws_fails_only_the_hydration);
     run("LossyTriggersOnlyWhenCold", test_lossy_triggers_only_when_cold);

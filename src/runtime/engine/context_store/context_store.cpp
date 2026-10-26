@@ -790,6 +790,12 @@ void ContextStore::scan() {
         Entry entry;
         const std::string id = path.stem().string();
         if (!valid_id(id) || !read_manifest(path, entry, nullptr) || entry.info.id != id) {
+            // A manifest of this store's own naming that does not describe its image is a damaged
+            // session; a file under another name was never one.
+            if (valid_id(id)) {
+                ++stats_.corrupt_removed;
+                ++stats_.corrupt_manifest;
+            }
             remove_quietly(path);
             remove_quietly(used_path(id));
             remove_quietly(published_path(id));
@@ -2145,8 +2151,12 @@ ContextStore::listing_since(std::chrono::steady_clock::time_point asked,
         // A listing asked for at or after `asked` shows everything this caller needs to see; one
         // asked for before it may miss what was uploaded since, however recently it finished.
         if (latest_listing_ && latest_listing_->listed_at >= asked) { return latest_listing_; }
-        if (!listing_started_ || *listing_started_ < asked) { break; }
-        // One that will do is in progress: wait for it rather than list the bucket twice.
+        if (!listing_started_) { break; }
+        // One listing runs at a time. One in progress that started after `asked` serves this
+        // caller; one that started before it may miss what was uploaded just before this caller
+        // asked, so the caller waits for it to end and then shares the next one: the first to
+        // wake takes it, and the others find a listing started after they asked and wait for it.
+        // However many callers arrive during a listing, one more listing follows it.
         if (listing_cv_.wait_until(lock, deadline) == std::cv_status::timeout &&
             !(latest_listing_ && latest_listing_->listed_at >= asked)) {
             return nullptr;
@@ -2172,7 +2182,7 @@ ContextStore::listing_since(std::chrono::steady_clock::time_point asked,
     listing->listed_at = started;
     listing->objects   = options_.remote->list(options_.remote_prefix + "manifests/");
     std::scoped_lock published(listing_mutex_);
-    if (!latest_listing_ || latest_listing_->listed_at < started) { latest_listing_ = listing; }
+    latest_listing_ = listing; // one listing at a time: this is the newest
     return listing;
 }
 
@@ -2204,7 +2214,13 @@ bool ContextStore::register_remote_image(const ObjectInfo& object, const std::st
         }
     }
     const std::optional<std::vector<std::uint8_t>> data = options_.remote->get(object.key);
-    if (!data) { return false; }
+    if (!data) {
+        // Listed but gone by the time it was read (deleted, or expired, since the listing).
+        std::scoped_lock lock(mutex_);
+        ++stats_.remote_download_failures;
+        ++stats_.remote_download_failures_missing;
+        return false;
+    }
     {
         std::scoped_lock lock(mutex_);
         ++stats_.remote_manifest_downloads;
@@ -2212,6 +2228,11 @@ bool ContextStore::register_remote_image(const ObjectInfo& object, const std::st
     }
     Entry entry;
     if (!parse_manifest(*data, entry, nullptr) || entry.info.id != id) {
+        {
+            std::scoped_lock lock(mutex_);
+            ++stats_.remote_download_failures;
+            ++stats_.remote_download_failures_damaged;
+        }
         std::scoped_lock lock(remote_mutex_);
         remote_failed_[id] = {object.modified_ms, now_ms()};
         return false;

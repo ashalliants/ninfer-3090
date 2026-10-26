@@ -628,9 +628,10 @@ The local directory becomes a cache of the bucket.
   A session's name in the bucket is its endpoint key, so the lookup lists the manifests and reads
   only those of sessions ending on this request's own prompt; it registers nothing else (the
   minute's background listing does) and releases the request as soon as the listing shows nothing
-  of its own. One listing serves every lookup asked for before it was taken, and a lookup that
-  arrives while one is in progress (a request's or the background listing's) waits for it rather
-  than listing again. A lookup finds only a session whose last state is on this prompt; a session
+  of its own. The bucket is listed once at a time: one listing serves every lookup asked for before
+  it was taken, and lookups that arrive while one is in progress (a request's or the background
+  listing's) wait for it to end and then share the one listing taken after it, which shows what
+  was uploaded just before they asked. A lookup finds only a session whose last state is on this prompt; a session
   that continues past it (a regenerated turn) is found by the next background listing.
   `ninfer_context_store_lookup_hits_total` counts the lookups that found something.
 - A request that would resume from a session only the bucket holds waits for it like any stored
