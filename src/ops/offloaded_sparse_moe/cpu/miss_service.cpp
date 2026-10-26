@@ -117,7 +117,10 @@ struct CpuMissService::Impl {
                 if (count < 0 || count > options.max_jobs) { throw std::runtime_error("CPU miss request has too many jobs"); }
                 for (int j = 0; j < count; ++j) {
                     CpuExpertJob& job = jobs[static_cast<std::size_t>(j)];
-                    job.record = layer.records + static_cast<std::uint64_t>(r.expert[j]) * layer.record_stride;
+                    job.record = layer.slots != nullptr
+                                     ? layer.slots[r.expert[j]]
+                                     : layer.records + static_cast<std::uint64_t>(r.expert[j]) * layer.record_stride;
+                    if (job.record == nullptr) { throw std::runtime_error("CPU miss request names an expert with no RAM copy"); }
                     job.format = layer.format;
                     job.ncols  = r.ncols[j];
                     for (int c = 0; c < job.ncols; ++c) {
@@ -155,7 +158,7 @@ CpuMissService::CpuMissService(std::vector<Layer> layers, Options options) : imp
         throw std::invalid_argument("CPU miss service options are out of range");
     }
     for (const auto& layer : s.layers) {
-        if (layer.records == nullptr || layer.record_stride < record_geometry(layer.format).bytes) {
+        if ((layer.records == nullptr && layer.slots == nullptr) || layer.record_stride < record_geometry(layer.format).bytes) {
             throw std::invalid_argument("CPU miss service layer is incomplete");
         }
     }

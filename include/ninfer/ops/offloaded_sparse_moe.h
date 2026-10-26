@@ -67,8 +67,9 @@ namespace ninfer::ops {
  *   (record_geometry refuses any other format; a call takes one format). One record per expert,
  *   gate, up and down at the layout's part offsets. Expert e's record is read from the device frame
  *   frame_base + frames[e] * frame_stride (record_stride when frame_stride is zero) when
- *   frames[e] >= 0, else from the pinned, mapped host bank host_records + e * record_stride
- *   (zero-copy, or first copied to a staging slot), or it is computed by the host
+ *   frames[e] >= 0, else from the pinned, mapped host bank host_records + e * record_stride (or,
+ *   with MoeExpertSource::host_slots, the host address the expert's entry in that table names),
+ *   zero-copy or first copied to a staging slot, or it is computed by the host
  *   (MoeCpuChannel). Every positive T; an expert with any number of columns.
  *   GGML_REC_Q2_0_Q2_0 (the MTP drafter's Q2_0 gate/up and down) is supported on the narrow route
  *   only: an expert of such a call takes at most offloaded_moe::kMaxColumns columns.
@@ -297,6 +298,13 @@ struct MoeExpertSource {
     // The narrow route's gate/up kernel (GateUpVariant); Registers requires precast_input. Also in
     // `format`'s padding.
     GateUpVariant gate_up_variant    = GateUpVariant::Staged;
+    // Partial RAM residency (NInfer-3090, --partial-ram-residency): host_records is a device table of
+    // E device-readable host addresses (const std::uint8_t* const*, set_host_slots), expert e's
+    // record at entry e, instead of a bank of records record_stride apart. An entry is read only
+    // for an expert whose frames[e] is -1 (it may be null otherwise); each address is 16-byte
+    // aligned. Requires staging_slots > 0: the stage pass resolves every record, so the expert
+    // kernels never read the table. Also in `format`'s padding.
+    bool host_slots                  = false;
     const std::uint8_t* frame_base   = nullptr;
     const std::int32_t* frames       = nullptr; // device [E]: frame of a resident expert, else -1
     const std::uint8_t* host_records = nullptr; // pinned host bank, device-readable (mapped)
@@ -317,6 +325,13 @@ struct MoeExpertSource {
     std::int32_t zero_copy_misses = 0;
     MoeCpuChannel cpu;
 };
+
+/// Points `source` at a per-expert host address table (MoeExpertSource::host_slots): device memory
+/// [E] of mapped host addresses.
+inline void set_host_slots(MoeExpertSource& source, const std::uint8_t* const* table) noexcept {
+    source.host_slots   = true;
+    source.host_records = reinterpret_cast<const std::uint8_t*>(table);
+}
 
 /// Workspace of one moe_experts call of `columns` (T) columns and `entries` (k*T) routed entries.
 /// With `precast_input` (MoeExpertSource::precast_input) it holds the call's A8 input too: T * 2560
@@ -391,6 +406,10 @@ public:
         const std::uint8_t* records = nullptr; // pinned host bank, record_stride apart
         std::uint64_t record_stride = 0;
         QType format                = QType::BF16;
+        // Partial RAM residency: host [E] addresses of each expert's record (null for one in VRAM,
+        // which the GPU never hands the CPU), read in place of `records`; owned by the caller, who
+        // changes entries only while no call is pending. Null: the bank.
+        const std::uint8_t* const* slots = nullptr;
     };
     struct Options {
         int workers         = 6;  // including the service thread

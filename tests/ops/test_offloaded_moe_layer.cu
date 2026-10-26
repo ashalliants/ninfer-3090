@@ -19,6 +19,9 @@
 //     1, 3 or 64 slots, mixed, and served by the CPU
 //     miss service at 1 and 6 workers; and staged calls whose passes with few misses read them
 //     zero-copy (MoeExpertSource::zero_copy_misses), alone, mixed and beside the CPU service.
+//     host_slots: three staged placements again with the non-resident records read through a host
+//     slot table (MoeExpertSource::host_slots, partial RAM residency) from a reordered, poisoned
+//     pool, the CPU service through its host table; without staging slots the table is refused.
 //     precast_bitwise: every one of these placements again with MoeExpertSource::precast_input (x
 //     cast to A8 once per call, the gate/up CTAs reading its codes), bit for bit the same outputs.
 //     registers_bitwise: every placement a third time with the precast input and
@@ -347,6 +350,10 @@ struct Config {
     int zero_copy_misses = 0; // MoeExpertSource::zero_copy_misses
     bool precast_input   = false; // MoeExpertSource::precast_input
     bool gate_up_registers = false; // MoeExpertSource::gate_up_variant = Registers (needs precast_input)
+    // MoeExpertSource::host_slots (partial RAM residency): the non-resident records in a separate
+    // pinned pool in reverse expert order, read through a device table of their addresses (the CPU
+    // service through the host table); needs staging slots.
+    bool host_slots = false;
 };
 
 std::vector<Config> configs() {
@@ -366,6 +373,20 @@ std::vector<Config> configs() {
         {"cpu-6w-zc-1", 3, 4, 6, 4, 3, 2, false, 1},
     };
     if (g_small) { c = {c[0], c[1], c[2], c[4], c[7], c[10], c[11]}; }
+    // The host slot table on the staged placements: all staged, mixed with zero-copy misses, and
+    // with the CPU service reading its records through the host table.
+    for (const std::size_t i : {std::size_t{3}, std::size_t{11}, std::size_t{12}}) {
+        if (i >= (g_small ? std::size_t{0} : c.size())) { continue; }
+        Config slots     = c[i];
+        slots.name       = "slots-" + slots.name;
+        slots.host_slots = true;
+        c.push_back(slots);
+    }
+    if (g_small) {
+        Config slots{"slots-mixed-staged-4-zc-2", 3, 4, 6, 4, 3, 2, false, 2};
+        slots.host_slots = true;
+        c.push_back(slots);
+    }
     return c;
 }
 
@@ -425,6 +446,26 @@ std::vector<std::uint16_t> run_config(const Bank& bank, const Config& cfg, const
     Pinned error(64);
     *reinterpret_cast<std::uint32_t*>(error.host) = initial_error;
 
+    // Host slots: the non-resident records copied into another, poisoned pool, expert e at slot
+    // E - 1 - e; the source names only the table, so a record read anywhere else is caught.
+    std::unique_ptr<Pinned> pool;
+    std::unique_ptr<DeviceBuffer> slot_table;
+    std::vector<const std::uint8_t*> host_slots(bank.experts, nullptr);
+    if (cfg.host_slots) {
+        pool = std::make_unique<Pinned>(static_cast<std::size_t>(bank.experts) * bank.stride);
+        std::memset(pool->host, 0xA5, static_cast<std::size_t>(bank.experts) * bank.stride);
+        std::vector<const std::uint8_t*> device_slots(bank.experts, nullptr);
+        for (int e = 0; e < bank.experts; ++e) {
+            if (frames[e] >= 0) { continue; }
+            const std::size_t at = static_cast<std::size_t>(bank.experts - 1 - e) * bank.stride;
+            std::memcpy(pool->host + at, bank.record(e), bank.stride);
+            host_slots[e]   = pool->host + at;
+            device_slots[e] = pool->device + at;
+        }
+        slot_table = std::make_unique<DeviceBuffer>(device_slots.size() * sizeof(void*));
+        slot_table->copy_from_host(device_slots.data(), device_slots.size() * sizeof(void*));
+    }
+
     ops::MoeExpertSource source;
     source.format        = bank.format;
     source.frame_base    = static_cast<const std::uint8_t*>(wide ? wide->p : bank.frames->p);
@@ -438,6 +479,7 @@ std::vector<std::uint16_t> run_config(const Bank& bank, const Config& cfg, const
     source.zero_copy_misses = cfg.zero_copy_misses;
     source.precast_input    = cfg.precast_input;
     source.gate_up_variant  = cfg.gate_up_registers ? ops::GateUpVariant::Registers : ops::GateUpVariant::Staged;
+    if (cfg.host_slots) { ops::set_host_slots(source, static_cast<const std::uint8_t* const*>(slot_table->p)); }
     std::unique_ptr<om::CpuMissService> owned;
     om::CpuMissService* service = external;
     if (service == nullptr && cfg.cpu_workers > 0) {
@@ -447,8 +489,12 @@ std::vector<std::uint16_t> run_config(const Bank& bank, const Config& cfg, const
         o.max_columns     = 64;
         o.pcie_divisor    = cfg.cpu_divisor;
         o.max_job_columns = cfg.cpu_job_columns;
-        owned = std::make_unique<om::CpuMissService>(
-            std::vector<om::CpuMissService::Layer>{{bank.pinned->host, bank.stride, bank.format}}, o);
+        om::CpuMissService::Layer layer{bank.pinned->host, bank.stride, bank.format};
+        if (cfg.host_slots) {
+            layer.records = nullptr;
+            layer.slots   = host_slots.data();
+        }
+        owned = std::make_unique<om::CpuMissService>(std::vector<om::CpuMissService::Layer>{layer}, o);
         service = owned.get();
     }
     if (service != nullptr) { source.cpu = service->channel(0); }
@@ -1178,6 +1224,12 @@ void test_precast_read_proof() {
         DeviceBuffer workspace(ops::moe_experts_workspace_bytes(max_jobs, kTopK * columns, columns));
         check(rejects([&] { ops::moe_experts(xt, r.view, bare, kTopK, max_jobs, workspace.p, out, stream); }),
               "the register gate/up kernel ran without the precast input");
+        // A host slot table is read by the stage pass only: without staging slots it is refused.
+        ops::MoeExpertSource unstaged = bare;
+        unstaged.gate_up_variant      = ops::GateUpVariant::Staged;
+        ops::set_host_slots(unstaged, static_cast<const std::uint8_t* const*>(d_frames.p));
+        check(rejects([&] { ops::moe_experts(xt, r.view, unstaged, kTopK, max_jobs, workspace.p, out, stream); }),
+              "a host slot table without staging slots ran");
     }
     cuda_ok(cudaStreamDestroy(stream), "proof stream");
 }
