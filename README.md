@@ -18,7 +18,12 @@ different machine and prompt set, so read the ratio as indicative. The measureme
 
 ![NInfer-3090 throughput on one RTX 3090](docs/assets/perf-banner.svg)
 
-NInfer-3090 is a specialized C++20/CUDA inference engine for **Qwen3.8-27B**, Qwen3.6 and, as a
+**Run a 27B model at about 140 tokens per second on one gaming GPU.** NInfer-3090 is a local LLM
+server with a drop-in OpenAI and Anthropic API, so Claude Code, Codex, Cursor, Cline and other
+tools can point at your own RTX 3090 instead of a paid service. On the same card it decodes up to
+2.1x faster than llama.cpp ([how that was measured](model-cards/Qwen3.8-27B-NInfer-3090/README.md)).
+
+Under the hood it is a specialized C++20/CUDA inference engine for **Qwen3.8-27B**, Qwen3.6 and, as a
 Windows preview, the 512-expert **Qwen3.8-Flash-Next** on one
 24 GB NVIDIA GeForce RTX 3090, or split as a pipeline across several GPUs on Linux. The native SM86
 runtime loads the official groupwise `.ninfer` artifacts, serves OpenAI- and Anthropic-compatible
