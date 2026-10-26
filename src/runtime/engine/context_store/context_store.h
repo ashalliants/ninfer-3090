@@ -248,6 +248,12 @@ public:
     // 128-bit content hash used for chunk names.
     [[nodiscard]] static std::array<std::uint64_t, 2> hash(std::span<const std::uint8_t> bytes);
 
+    // The id an Engine stores an image under: lowercase hex of its endpoint key, so an image of the
+    // same endpoint replaces it. A shared prefix's id ends in an extra digit, so it never replaces a
+    // conversation image whose endpoint happens to fall at the same position.
+    [[nodiscard]] static std::string image_id(const std::array<std::uint64_t, 2>& digests,
+                                              std::uint32_t frontier, bool shared);
+
 private:
     struct ChunkRef {
         std::array<std::uint64_t, 2> hash{};

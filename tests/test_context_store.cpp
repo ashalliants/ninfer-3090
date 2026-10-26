@@ -103,6 +103,15 @@ void test_hash() {
     check(ContextStore::hash(short_input) != ContextStore::hash({}), "short input hashes alike");
 }
 
+// Stores on disk and in buckets are keyed by these ids: the format must not change.
+void test_image_id() {
+    check(ContextStore::image_id({0x0123456789abcdefULL, 0xfedcba9876543210ULL}, 0x1ad2d, false) ==
+              "0123456789abcdeffedcba98765432100001ad2d",
+          "conversation image id");
+    check(ContextStore::image_id({1, 2}, 16384, true) == "0000000000000001000000000000000200004000" "5",
+          "shared prefix image id");
+}
+
 void test_round_trip() {
     TempDirectory directory;
     ContextStore store(options_for(directory.path()));
@@ -2339,6 +2348,7 @@ int main() {
     test_chunks_of_both_forms_share_a_store();
     test_remote_holds_compressed_objects_and_other_forms_interoperate();
     test_hash();
+    test_image_id();
     test_round_trip();
     test_incremental_put_writes_only_new_chunks();
     test_restart_recovers_images();

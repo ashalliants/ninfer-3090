@@ -365,6 +365,16 @@ std::array<std::uint64_t, 2> ContextStore::hash(std::span<const std::uint8_t> by
     return {xxh64(bytes.data(), bytes.size(), 0), xxh64(bytes.data(), bytes.size(), 0x9e3779b97f4a7c15ULL)};
 }
 
+std::string ContextStore::image_id(const std::array<std::uint64_t, 2>& digests,
+                                   std::uint32_t frontier, bool shared) {
+    char text[42];
+    std::snprintf(text, sizeof(text), "%016llx%016llx%08x%s",
+                  static_cast<unsigned long long>(digests[0]),
+                  static_cast<unsigned long long>(digests[1]), static_cast<unsigned>(frontier),
+                  shared ? "5" : "");
+    return text;
+}
+
 // An exclusive lock on one file of the directory, held for the store's life. The directory's logic
 // (refcounts, scan, garbage collection) is only sound with one process in it, so a second owner
 // must fail at start-up rather than corrupt it. The OS releases the lock when the process dies.
