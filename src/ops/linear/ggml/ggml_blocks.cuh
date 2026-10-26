@@ -214,11 +214,15 @@ struct Format<QType::GGML_IQ3_S> {
     }
 };
 
-// ksigns_iq2xs[v] for a 7-bit selector v, in each byte of a word: v with bit 7 set to the parity of
-// v (ggml's unpack_ksigns). Bit j of a byte negates value j of its eight.
+// ksigns_iq2xs[v & 127] in each byte of a word: the 7-bit selector with bit 7 set to its parity
+// (ggml's unpack_ksigns). Bit 7 of the given byte may hold another selector's bit: the parity of all
+// eight bits, xored into bit 7, cancels it. Bit j of a byte negates value j of its eight. The one
+// copy of the GGML linears and offloaded_sparse_moe's expert decoders (expert_decode.cuh).
 __device__ __forceinline__ std::uint32_t ksigns_word(std::uint32_t v) {
-    v &= 0x7FU;
-    return (v | ((__popc(v) & 1U) << 7)) * 0x01010101U;
+    v &= 0xFFU;
+    const std::uint32_t p = __popc(v) & 1U;
+    const std::uint32_t s = v ^ (p << 7);
+    return s * 0x01010101U;
 }
 
 // Eight grid magnitudes (two words of four bytes) with the signs of `signs` applied.

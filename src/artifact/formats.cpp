@@ -33,6 +33,15 @@ constexpr std::array kFormats = {
     std::pair{QType::GGML_REC_IQ2_XXS_Q2_0, std::string_view{"ggml_rec_iq2_xxs_q2_0"}},
     std::pair{QType::GGML_REC_IQ1_M_Q2_0, std::string_view{"ggml_rec_iq1_m_q2_0"}},
     std::pair{QType::GGML_REC_Q2_0_Q2_0, std::string_view{"ggml_rec_q2_0_q2_0"}},
+    std::pair{QType::GGML_REC_IQ2_XS_Q2_0, std::string_view{"ggml_rec_iq2_xs_q2_0"}},
+    std::pair{QType::GGML_REC_IQ2_XS_IQ4_NL, std::string_view{"ggml_rec_iq2_xs_iq4_nl"}},
+    std::pair{QType::GGML_REC_IQ2_XXS_IQ4_NL, std::string_view{"ggml_rec_iq2_xxs_iq4_nl"}},
+    std::pair{QType::GGML_REC_IQ2_S_IQ4_NL, std::string_view{"ggml_rec_iq2_s_iq4_nl"}},
+    std::pair{QType::GGML_REC_IQ3_XXS_Q2_0, std::string_view{"ggml_rec_iq3_xxs_q2_0"}},
+    std::pair{QType::GGML_REC_IQ3_XXS_IQ4_NL, std::string_view{"ggml_rec_iq3_xxs_iq4_nl"}},
+    std::pair{QType::GGML_REC_IQ3_S_Q2_0, std::string_view{"ggml_rec_iq3_s_q2_0"}},
+    std::pair{QType::GGML_REC_IQ3_S_IQ4_NL, std::string_view{"ggml_rec_iq3_s_iq4_nl"}},
+    std::pair{QType::GGML_REC_IQ4_XS_IQ4_NL, std::string_view{"ggml_rec_iq4_xs_iq4_nl"}},
 };
 constexpr std::array kLayouts = {
     std::pair{QuantLayout::Contiguous, std::string_view{"contiguous_le_v1"}},

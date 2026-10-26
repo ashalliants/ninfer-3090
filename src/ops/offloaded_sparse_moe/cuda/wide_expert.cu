@@ -6,13 +6,15 @@
 // The wide route of offloaded_sparse_moe (wide_expert.h). Gate/up: a CTA owns one unit (32
 // intermediates: 32 gate and 32 up rows) of one wide job. It stages the unit's slice of the record
 // into shared memory with cp.async (from a device frame, a staging slot or the pinned host bank)
-// once, then for each 64-column tile of the job walks the 32 leaves of the canonical tree: the
+// once when the slice fits beside the tiles (IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S; kStagedSlice), else its
+// decodes read the record where it lives, then for each 64-column tile of the job walks the 32
+// leaves of the canonical tree: the
 // leaf's sub-blocks of its rows are decoded into int8 tiles two leaves ahead, the columns' A8 codes
 // arrive through a cp.async ring two leaves ahead, and each sub-block is one m16n8k32 or two
 // m16n8k16 per tile, its exact sums scaled in canonical order and folded into the tree's stack. It
 // ends with SwiGLU and the A8 cast of h (the unit is one 32-value group), so down reads A8 codes
-// directly. Down: a CTA owns 64 output rows of one job, decodes their whole K = 640 slice once and
-// keeps it while each column tile's h codes arrive in one piece.
+// directly. Down: a CTA owns 64 output rows of one job, decodes their whole K = 640 slice (Q2_0 or
+// IQ4_NL) once and keeps it while each column tile's h codes arrive in one piece.
 
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
 
@@ -35,7 +37,7 @@ constexpr int kLeaves       = 32; // partials of the canonical row sum
 constexpr int kMaxLeafSubs  = 3;  // sub-blocks of one leaf (K = 2560: sub-blocks l, l + 32, l + 64)
 constexpr int kGateUpUnits  = kIntermediate / 32; // 20: 32 intermediates each (one A8 group of h)
 constexpr int kDownUnits    = kHidden / kRows;    // 40: 64 output rows each
-constexpr int kDownSubs     = kIntermediate / 32; // 20 Q2_0 sub-blocks of a down row
+constexpr int kDownSubs     = kIntermediate / 32; // 20 sub-blocks of a down row
 constexpr int kWStages      = 3; // decoded weight stages (two leaves ahead)
 constexpr int kXStages      = 3; // activation stages (two leaves ahead)
 constexpr int kXGroups      = kHidden / canon::kA8Values;
@@ -148,6 +150,18 @@ struct alignas(16) Tiles {
 // The gate/up epilogue's h tile [columns][32 intermediates] reuses the activation stages.
 static_assert(sizeof(float) * kTileColumns * 32 <= sizeof(Tiles::x));
 
+// A gate/up row's bytes in format F (K = kHidden).
+template <QType F>
+inline constexpr int kGateUpRowBytes = static_cast<int>(kHidden / ggml_block(F).values * ggml_block(F).bytes);
+
+// Whether a unit's 64-row slice fits in shared memory beside the tiles (1 CTA per SM): IQ1_M,
+// IQ2_XXS, IQ2_XS and IQ2_S (at most 52,480 bytes); IQ3_XXS, IQ3_S and IQ4_XS (62,720 to 87,040
+// bytes) do not, and decode from the record where it lives (L2 serves the re-reads of a job's later
+// column tiles when the record is in device memory).
+template <QType F>
+inline constexpr bool kStagedSlice =
+    static_cast<int>(sizeof(Tiles)) + kRows * kGateUpRowBytes<F> <= kMaxDynamicSmem;
+
 __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool valid) {
     const auto s = static_cast<unsigned>(__cvta_generic_to_shared(dst));
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(src), "r"(valid ? 16 : 0) : "memory");
@@ -194,11 +208,13 @@ __device__ __forceinline__ void load_columns(Tiles& sm, int st, int n) {
     }
 }
 
-// Leaf n's sub-blocks of the unit's rows decoded from the staged slice into weight stage `st`, one
-// (row, sub-block) per thread.
+// Leaf n's sub-blocks of the unit's rows decoded into weight stage `st`, one (row, sub-block) per
+// thread. Row r is raw + r * row_bytes in the staged slice (gate rows 0..31, then up rows), or, when
+// the slice is not staged (kStagedSlice), gate row r is raw + r * row_bytes and up row r - 32 is
+// up + (r - 32) * row_bytes in the record itself.
 template <QType F, int kSubs>
-__device__ __forceinline__ void decode_rows(Tiles& sm, int st, int n, const std::uint8_t* raw, int row_bytes,
-                                            const uint2* grid) {
+__device__ __forceinline__ void decode_rows(Tiles& sm, int st, int n, const std::uint8_t* raw, const std::uint8_t* up,
+                                            int row_bytes, const typename device::ExpertFormat<F>::Table& grid) {
     if (n >= kLeaves) { return; }
     const int leaf = leaf_of(n);
     // One (row, sub-block) per thread, the first 64 x subs threads (spreading the tasks over every
@@ -207,7 +223,13 @@ __device__ __forceinline__ void decode_rows(Tiles& sm, int st, int n, const std:
     if (task < kRows * leaf_subs<kSubs>(leaf)) {
         const int r = task % kRows, k = task / kRows;
         const int s = leaf + kLeaves * k;
-        const device::Sub sub = device::ExpertFormat<F>::decode(raw + r * row_bytes, s, grid);
+        const std::uint8_t* row;
+        if constexpr (kStagedSlice<F>) {
+            row = raw + r * row_bytes;
+        } else {
+            row = r < kRows / 2 ? raw + r * row_bytes : up + (r - kRows / 2) * row_bytes;
+        }
+        const device::Sub sub = device::ExpertFormat<F>::decode(row, s, grid);
         auto* out = &sm.w[st][k][0][0];
         *reinterpret_cast<int4*>(out + tile_offset(r, 0)) = make_int4(sub.v[0], sub.v[1], sub.v[2], sub.v[3]);
         *reinterpret_cast<int4*>(out + tile_offset(r, 1)) = make_int4(sub.v[4], sub.v[5], sub.v[6], sub.v[7]);
@@ -291,7 +313,9 @@ __device__ __forceinline__ void fold_all(int n, const float (&v)[kOutputs], floa
 
 // Whether a format's sub-blocks share one multiplier between their halves (one k32 MMA suffices).
 template <QType F>
-inline constexpr bool kOneMultiplier = F == QType::GGML_IQ2_XXS || F == QType::GGML_Q2_0;
+inline constexpr bool kOneMultiplier = F == QType::GGML_IQ2_XXS || F == QType::GGML_Q2_0 ||
+                                       F == QType::GGML_IQ3_XXS || F == QType::GGML_IQ3_S ||
+                                       F == QType::GGML_IQ4_XS;
 
 // A job's record: resolved by the stage kernel when the call stages its misses, else read where it
 // lives (a device frame or the mapped host bank).
@@ -304,26 +328,35 @@ __device__ __forceinline__ const std::uint8_t* resolve_record(const MoeExpertSou
                       : source.host_records + static_cast<std::uint64_t>(expert) * source.record_stride;
 }
 
-// The down unit of a wide job: 64 output rows of the expert's down projection (K = 640, 20 Q2_0
-// sub-blocks) for every column of the job. The unit's weights are decoded once into shared memory
-// (64 rows x 640 int8 codes and their scales) and stay there while each 64-column tile's A8 codes of
-// h arrive in one piece; a tile's 20 sub-blocks then run without a barrier, in the canonical leaf
-// order (sub-block l is leaf l's only one; leaves 20..31 are empty: +0, an exact identity here).
+// The down unit of a wide job: 64 output rows of the expert's down projection (K = 640, 20
+// sub-blocks of format D, Q2_0 or IQ4_NL) for every column of the job. The unit's weights are
+// decoded once into shared memory (64 rows x 640 int8 codes and their scales) and stay there while
+// each 64-column tile's A8 codes of h arrive in one piece; a tile's 20 sub-blocks then run without a
+// barrier, in the canonical leaf order (sub-block l is leaf l's only one; leaves 20..31 are empty:
+// +0, an exact identity here).
 struct alignas(16) DownTiles {
     std::uint8_t w[kDownSubs][kRows][32];           // decoded weights
     std::uint8_t x[kDownSubs][kTileColumns][32];    // the tile's A8 codes of h (the raw slice first)
     float wc[kDownSubs][kRows];                      // sub-block scale
     float xd[kDownSubs][kTileColumns];               // the tile's A8 scales
 };
-static_assert(sizeof(DownTiles::x) >= kRows * 180, "the staged Q2_0 slice fits the activation tile");
+// The down formats: both have m0 = m1 = 1 (the kernel's P is the MMA sum itself) and their 64-row
+// slices (Q2_0 11,520 bytes, IQ4_NL 23,040) fit the activation tile they are staged through.
+template <QType D>
+inline constexpr bool kDownFormat = D == QType::GGML_Q2_0 || D == QType::GGML_IQ4_NL;
+static_assert(sizeof(DownTiles::x) >= kRows * (kIntermediate / 32) * 18,
+              "the staged IQ4_NL slice fits the activation tile");
 
+template <QType D>
 __global__ void __launch_bounds__(kThreads, 1)
     wide_down_kernel(MoeDispatch dispatch, MoeExpertSource source, Geometry g, const std::uint8_t* const* __restrict__ job_records,
                 const std::int32_t* __restrict__ tiles, const std::int32_t* __restrict__ pass_tiles, int pass,
                 const float* __restrict__ h_rows, std::uint16_t* __restrict__ outputs) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
+    static_assert(kDownFormat<D>, "a wide down unit reads Q2_0 or IQ4_NL rows");
     DownTiles& sm         = *reinterpret_cast<DownTiles*>(smem_raw);
     std::uint8_t* raw     = &sm.x[0][0][0];
+    const auto table      = device::ExpertFormat<D>::table();
     const int row_bytes   = static_cast<int>(g.down_row_bytes);
     const int unit        = static_cast<int>(blockIdx.x);
     const int first_tile  = pass_tiles[pass], end_tile = pass_tiles[pass + 1];
@@ -344,7 +377,7 @@ __global__ void __launch_bounds__(kThreads, 1)
         __syncthreads();
         for (int task = static_cast<int>(threadIdx.x); task < kRows * kDownSubs; task += kThreads) {
             const int r = task % kRows, s = task / kRows;
-            const device::Sub sub = device::ExpertFormat<QType::GGML_Q2_0>::decode(raw + r * row_bytes, s, nullptr);
+            const device::Sub sub = device::ExpertFormat<D>::decode(raw + r * row_bytes, s, table);
             *reinterpret_cast<int4*>(&sm.w[s][0][0] + tile_offset(r, 0)) = make_int4(sub.v[0], sub.v[1], sub.v[2], sub.v[3]);
             *reinterpret_cast<int4*>(&sm.w[s][0][0] + tile_offset(r, 1)) = make_int4(sub.v[4], sub.v[5], sub.v[6], sub.v[7]);
             sm.wc[s][r] = sub.c;
@@ -465,7 +498,7 @@ __global__ void __launch_bounds__(kThreads, 1)
     const int row_bytes  = static_cast<int>(g.gate_up_row_bytes);
     const int unit       = static_cast<int>(blockIdx.x);
     const int first_tile = pass_tiles[pass], end_tile = pass_tiles[pass + 1];
-    const uint2* grid    = device::ExpertFormat<F>::global_grid();
+    const auto grid      = device::ExpertFormat<F>::table();
     const int lane = static_cast<int>(threadIdx.x) % 32, warp = static_cast<int>(threadIdx.x) / 32;
     const int gq = lane / 4, tig = lane % 4;
     const int pair = warp % 2, cgroup = 16 * (warp / 2);
@@ -478,10 +511,16 @@ __global__ void __launch_bounds__(kThreads, 1)
         const int begin = dispatch.offsets[expert], end = dispatch.offsets[expert + 1];
         const std::uint8_t* record = resolve_record(source, job_records, job, expert);
         __syncthreads(); // the previous job has finished with shared memory
-        {
-            const std::size_t slice = static_cast<std::size_t>(unit) * (kRows / 2) * row_bytes;
+        // The unit's gate and up rows: the staged slice, or the record itself (kStagedSlice).
+        const std::size_t slice = static_cast<std::size_t>(unit) * (kRows / 2) * row_bytes;
+        const std::uint8_t* rows = raw;
+        const std::uint8_t* up   = nullptr;
+        if constexpr (kStagedSlice<F>) {
             stage_slice(record + slice, raw, (kRows / 2) * row_bytes);
             stage_slice(record + g.up_offset + slice, raw + (kRows / 2) * row_bytes, (kRows / 2) * row_bytes);
+        } else {
+            rows = record + slice;
+            up   = record + g.up_offset + slice;
         }
         cp_commit();
         for (int first = begin; first < end; first += kTileColumns) {
@@ -502,8 +541,8 @@ __global__ void __launch_bounds__(kThreads, 1)
             }
             cp_wait_ahead();
             __syncthreads();
-            decode_rows<F, kSubs>(sm, 0, 0, raw, row_bytes, grid);
-            decode_rows<F, kSubs>(sm, 1, 1, raw, row_bytes, grid);
+            decode_rows<F, kSubs>(sm, 0, 0, rows, up, row_bytes, grid);
+            decode_rows<F, kSubs>(sm, 1, 1, rows, up, row_bytes, grid);
             __syncthreads();
 
             float stack[16][5];
@@ -592,7 +631,7 @@ __global__ void __launch_bounds__(kThreads, 1)
                 }
                 fold_all(n, v, stack, root);
                 // Two leaves ahead, after this leaf's tensor work in program order.
-                decode_rows<F, kSubs>(sm, (n + 2) % kWStages, n + 2, raw, row_bytes, grid);
+                decode_rows<F, kSubs>(sm, (n + 2) % kWStages, n + 2, rows, up, row_bytes, grid);
                 cp_wait_ahead();
                 __syncthreads();
             }
@@ -637,10 +676,28 @@ void launch_gate_up(const MoeDispatch& dispatch, const MoeExpertSource& source, 
         }
         return e;
     });
-    const int smem = static_cast<int>(sizeof(Tiles)) + kRows * static_cast<int>(g.gate_up_row_bytes);
+    const int slice = kStagedSlice<F> ? kRows * static_cast<int>(g.gate_up_row_bytes) : 0;
+    const int smem  = static_cast<int>(sizeof(Tiles)) + slice;
     wide_gate_up_kernel<F><<<dim3(kGateUpUnits, grid_y), kThreads, smem, stream>>>(
         dispatch, source, g, top_k, job_records, w.tiles, w.pass_tiles, pass, w.xq, h_rows);
     check_launch("gate/up");
+}
+
+template <QType D>
+void launch_down(dim3 grid, const MoeDispatch& dispatch, const MoeExpertSource& source, const Geometry& g,
+                 const std::uint8_t* const* job_records, const Workspace& w, int pass, const float* h_rows,
+                 std::uint16_t* outputs, cudaStream_t stream) {
+    configure_cuda_device_once([] {
+        const void* kernel = reinterpret_cast<const void*>(wide_down_kernel<D>);
+        cudaError_t e      = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSmem);
+        if (e == cudaSuccess) {
+            e = cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+        }
+        return e;
+    });
+    wide_down_kernel<D><<<grid, kThreads, sizeof(DownTiles), stream>>>(dispatch, source, g, job_records, w.tiles,
+                                                                       w.pass_tiles, pass, h_rows, outputs);
+    check_launch("down");
 }
 
 } // namespace
@@ -702,8 +759,8 @@ void prepare(const std::uint16_t* x, std::int32_t columns, const MoeDispatch& di
     check_launch("quantize x");
 }
 
-void run_pass(QType gate_up_format, const MoeDispatch& dispatch, const MoeExpertSource& source, const Geometry& g,
-              std::int32_t top_k, std::int32_t max_jobs, std::int32_t pass_jobs, std::int32_t pass,
+void run_pass(QType gate_up_format, QType down_format, const MoeDispatch& dispatch, const MoeExpertSource& source,
+              const Geometry& g, std::int32_t top_k, std::int32_t max_jobs, std::int32_t pass_jobs, std::int32_t pass,
               const std::uint8_t* const* job_records, const Workspace& workspace, float* h_rows, std::uint16_t* outputs,
               cudaStream_t stream) {
     // Tiles of the pass: at most one per job plus one per 64 of its entries; the grid's second
@@ -711,6 +768,10 @@ void run_pass(QType gate_up_format, const MoeDispatch& dispatch, const MoeExpert
     const int jobs   = std::min(pass_jobs, max_jobs - pass * pass_jobs);
     const int bound  = jobs + jobs * top_k; // generous: a call's entries per job are not known here
     const int grid_y = std::max(1, std::min(bound, 16));
+    // Refused before any launch: a record whose down format the wide route does not read.
+    if (down_format != QType::GGML_Q2_0 && down_format != QType::GGML_IQ4_NL) {
+        throw std::invalid_argument("offloaded_sparse_moe wide: unsupported down format");
+    }
     switch (gate_up_format) {
     case QType::GGML_IQ2_S:
         launch_gate_up<QType::GGML_IQ2_S>(dispatch, source, g, top_k, job_records, workspace, pass, grid_y, h_rows, stream);
@@ -721,19 +782,27 @@ void run_pass(QType gate_up_format, const MoeDispatch& dispatch, const MoeExpert
     case QType::GGML_IQ1_M:
         launch_gate_up<QType::GGML_IQ1_M>(dispatch, source, g, top_k, job_records, workspace, pass, grid_y, h_rows, stream);
         break;
+    case QType::GGML_IQ2_XS:
+        launch_gate_up<QType::GGML_IQ2_XS>(dispatch, source, g, top_k, job_records, workspace, pass, grid_y, h_rows, stream);
+        break;
+    case QType::GGML_IQ3_XXS:
+        launch_gate_up<QType::GGML_IQ3_XXS>(dispatch, source, g, top_k, job_records, workspace, pass, grid_y, h_rows, stream);
+        break;
+    case QType::GGML_IQ3_S:
+        launch_gate_up<QType::GGML_IQ3_S>(dispatch, source, g, top_k, job_records, workspace, pass, grid_y, h_rows, stream);
+        break;
+    case QType::GGML_IQ4_XS:
+        launch_gate_up<QType::GGML_IQ4_XS>(dispatch, source, g, top_k, job_records, workspace, pass, grid_y, h_rows, stream);
+        break;
     default: throw std::invalid_argument("offloaded_sparse_moe wide: unsupported gate/up format");
     }
-    configure_cuda_device_once([] {
-        const void* kernel = reinterpret_cast<const void*>(wide_down_kernel);
-        cudaError_t e      = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSmem);
-        if (e == cudaSuccess) {
-            e = cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
-        }
-        return e;
-    });
-    wide_down_kernel<<<dim3(kDownUnits, std::max(1, std::min(jobs, 8))), kThreads, sizeof(DownTiles), stream>>>(
-        dispatch, source, g, job_records, workspace.tiles, workspace.pass_tiles, pass, h_rows, outputs);
-    check_launch("down");
+    const dim3 down_grid(kDownUnits, std::max(1, std::min(jobs, 8)));
+    if (down_format == QType::GGML_Q2_0) {
+        launch_down<QType::GGML_Q2_0>(down_grid, dispatch, source, g, job_records, workspace, pass, h_rows, outputs, stream);
+    } else {
+        launch_down<QType::GGML_IQ4_NL>(down_grid, dispatch, source, g, job_records, workspace, pass, h_rows, outputs,
+                                        stream);
+    }
 }
 
 } // namespace ninfer::ops::offloaded_moe::wide

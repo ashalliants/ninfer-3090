@@ -22,8 +22,8 @@
 //     at most 8 rows to the CPU) at T in {1024, 2048}, 512 experts, the cold half routed few rows: the
 //     same checks.
 //
-// --small: one format at T in {9, 65} with two placements, the share at T in {16, 65} (for
-// compute-sanitizer).
+// --small: two formats (IQ1_M+Q2_0, IQ4_XS+IQ4_NL) at T in {9, 65} with two placements, the share
+// at T in {16, 65} (for compute-sanitizer).
 // --bench: 512 resident experts, near-uniform routing, T in {256, 1024, 2048, 4096}: moe_experts
 //          time (CUDA events, median of 10) and its integer TOPS (the routed experts' multiply-adds).
 
@@ -302,7 +302,7 @@ void check_bank(const Bank& bank, int k, const std::vector<int>& column_counts, 
             worst_point = std::max(worst_point, crit.worst);
             check(accept(crit), "expert output outside the A8 criterion against FP64");
         }
-        std::printf("%-13s T=%-4d %3d wide + %3d narrow jobs: %zu placements bit-identical to the CPU engine; "
+        std::printf("%-14s T=%-4d %3d wide + %3d narrow jobs: %zu placements bit-identical to the CPU engine; "
                     "FP64 (%d entries) normwise %.3e, worst %.3e\n",
                     format_name(bank.format), columns, wide, narrow, placements(columns).size(), samples, worst_norm,
                     worst_point);
@@ -313,7 +313,9 @@ void test_synthetic_banks() {
     std::mt19937 rng(505);
     constexpr int kExperts = 64, kTopK = 10, kHot = 4;
     for (QType format : kRecordFormats) {
-        if (g_small && format != QType::GGML_REC_IQ1_M_Q2_0) { continue; }
+        // --small: IQ1_M (two multipliers, a staged slice) and IQ4_XS+IQ4_NL (one signed multiplier,
+        // decoded from the record in place, IQ4_NL down).
+        if (g_small && format != QType::GGML_REC_IQ1_M_Q2_0 && format != QType::GGML_REC_IQ4_XS_IQ4_NL) { continue; }
         std::vector<std::vector<std::uint8_t>> records;
         for (int e = 0; e < kExperts; ++e) { records.push_back(random_record(format, rng)); }
         const auto bank = make_bank(format, records, align256(om::record_geometry(format).bytes));
@@ -348,7 +350,7 @@ void test_all_wide_threshold() {
             check(mismatches == 0, "T=" + std::to_string(columns) + " " + placement.name + ": " + std::to_string(mismatches) +
                                        " BF16 outputs differ from the CPU engine");
         }
-        std::printf("%-13s T=%-4d 512 experts, %3d with more than 8 columns + %3d with at most 8: bit-identical to the "
+        std::printf("%-14s T=%-4d 512 experts, %3d with more than 8 columns + %3d with at most 8: bit-identical to the "
                     "CPU engine (device, staged-64)\n",
                     format_name(format), columns, wide, narrow);
     }
@@ -430,7 +432,7 @@ void bench() {
             (void)run_experts(bank, {"device", 1, 0}, r, x_dev, columns, 2);
             const auto run    = run_experts(bank, {"device", 1, 0}, r, x_dev, columns, 10);
             const double macs = 3.0 * om::kHidden * om::kIntermediate * kTopK * columns;
-            std::printf("bench %-13s T=%-4d %3d wide + %3d narrow jobs: %8.3f ms, %6.1f TOPS (resident)\n",
+            std::printf("bench %-14s T=%-4d %3d wide + %3d narrow jobs: %8.3f ms, %6.1f TOPS (resident)\n",
                         format_name(format), columns, wide, narrow, run.ms, 2.0 * macs / (run.ms * 1e-3) / 1e12);
         }
     }

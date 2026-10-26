@@ -197,19 +197,39 @@ void ggml_geometry() {
         const char* name;
         QType format;
         QType gate_up;
+        QType down;
         std::uint64_t gate_bytes;
         std::uint64_t record_bytes;
     };
+    // The IQ2_XS pack's three, the MTP drafter's bank (not one of the 48 text layers), then the
+    // further pairs of the GSQ-RCO IQ3_XXS and IQ3_S packs (IQ4_NL down rows are 360 B).
     constexpr std::array records = {
-        RecordCase{"ggml_rec_iq2_s_q2_0", QType::GGML_REC_IQ2_S_Q2_0, QType::GGML_IQ2_S, 524800,
-                   1510400},
+        RecordCase{"ggml_rec_iq2_s_q2_0", QType::GGML_REC_IQ2_S_Q2_0, QType::GGML_IQ2_S,
+                   QType::GGML_Q2_0, 524800, 1510400},
         RecordCase{"ggml_rec_iq2_xxs_q2_0", QType::GGML_REC_IQ2_XXS_Q2_0, QType::GGML_IQ2_XXS,
-                   422400, 1305600},
-        RecordCase{"ggml_rec_iq1_m_q2_0", QType::GGML_REC_IQ1_M_Q2_0, QType::GGML_IQ1_M, 358400,
-                   1177600},
-        // The MTP drafter's bank (not one of the 48 text layers).
-        RecordCase{"ggml_rec_q2_0_q2_0", QType::GGML_REC_Q2_0_Q2_0, QType::GGML_Q2_0, 460800,
-                   1382400},
+                   QType::GGML_Q2_0, 422400, 1305600},
+        RecordCase{"ggml_rec_iq1_m_q2_0", QType::GGML_REC_IQ1_M_Q2_0, QType::GGML_IQ1_M,
+                   QType::GGML_Q2_0, 358400, 1177600},
+        RecordCase{"ggml_rec_q2_0_q2_0", QType::GGML_REC_Q2_0_Q2_0, QType::GGML_Q2_0,
+                   QType::GGML_Q2_0, 460800, 1382400},
+        RecordCase{"ggml_rec_iq2_xs_q2_0", QType::GGML_REC_IQ2_XS_Q2_0, QType::GGML_IQ2_XS,
+                   QType::GGML_Q2_0, 473600, 1408000},
+        RecordCase{"ggml_rec_iq2_xs_iq4_nl", QType::GGML_REC_IQ2_XS_IQ4_NL, QType::GGML_IQ2_XS,
+                   QType::GGML_IQ4_NL, 473600, 1868800},
+        RecordCase{"ggml_rec_iq2_xxs_iq4_nl", QType::GGML_REC_IQ2_XXS_IQ4_NL, QType::GGML_IQ2_XXS,
+                   QType::GGML_IQ4_NL, 422400, 1766400},
+        RecordCase{"ggml_rec_iq2_s_iq4_nl", QType::GGML_REC_IQ2_S_IQ4_NL, QType::GGML_IQ2_S,
+                   QType::GGML_IQ4_NL, 524800, 1971200},
+        RecordCase{"ggml_rec_iq3_xxs_q2_0", QType::GGML_REC_IQ3_XXS_Q2_0, QType::GGML_IQ3_XXS,
+                   QType::GGML_Q2_0, 627200, 1715200},
+        RecordCase{"ggml_rec_iq3_xxs_iq4_nl", QType::GGML_REC_IQ3_XXS_IQ4_NL, QType::GGML_IQ3_XXS,
+                   QType::GGML_IQ4_NL, 627200, 2176000},
+        RecordCase{"ggml_rec_iq3_s_q2_0", QType::GGML_REC_IQ3_S_Q2_0, QType::GGML_IQ3_S,
+                   QType::GGML_Q2_0, 704000, 1868800},
+        RecordCase{"ggml_rec_iq3_s_iq4_nl", QType::GGML_REC_IQ3_S_IQ4_NL, QType::GGML_IQ3_S,
+                   QType::GGML_IQ4_NL, 704000, 2329600},
+        RecordCase{"ggml_rec_iq4_xs_iq4_nl", QType::GGML_REC_IQ4_XS_IQ4_NL, QType::GGML_IQ4_XS,
+                   QType::GGML_IQ4_NL, 870400, 2662400},
     };
     require(parse_layout("ggml_expert_record_v1") == QuantLayout::GgmlExpertRecord &&
                 layout_name(QuantLayout::GgmlExpertRecord) == "ggml_expert_record_v1",
@@ -220,7 +240,7 @@ void ggml_geometry() {
         require(parse_format(item.name) == item.format && format_name(item.format) == item.name &&
                     is_ggml_record(item.format) && !is_ggml_block(item.format) &&
                     ggml_record_parts(item.format).gate_up == item.gate_up &&
-                    ggml_record_parts(item.format).down == QType::GGML_Q2_0,
+                    ggml_record_parts(item.format).down == item.down,
                 "expert record format does not round-trip");
         const auto g = weight_geometry(item.format, QuantLayout::GgmlExpertRecord, layer);
         require(g.record_up_offset == item.gate_bytes &&
@@ -230,8 +250,8 @@ void ggml_geometry() {
                     g.elements == 512ULL * 2560 * 640,
                 (std::string(item.name) + ": record geometry differs from the GGUF").c_str());
         const auto down = ggml_record_part(g, 511, ExpertPart::Down);
-        require(down.format == QType::GGML_Q2_0 && down.rows == 2560 && down.k == 640 &&
-                    down.row_bytes == 180 &&
+        require(down.format == item.down && down.rows == 2560 && down.k == 640 &&
+                    down.row_bytes == (item.down == QType::GGML_Q2_0 ? 180U : 360U) &&
                     down.offset == 511 * item.record_bytes + 2 * item.gate_bytes &&
                     down.offset + down.rows * down.row_bytes == g.bytes,
                 "the last expert's down part is not the end of the bank");
