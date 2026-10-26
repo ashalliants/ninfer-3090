@@ -238,6 +238,9 @@ Numerics options under the gate, each a harness flag:
 - `--hc-int8`: the mixers read their int8 copies (Basalt items, below). The harness makes the
   copies once and every chunk's decode and verification calls read them; the prompt half (one
   call of more than 16 columns) reads the BF16 weights, as the Program's prefill does.
+- `--ggml-decode-mma`: the dense GGML linears of the decode and verification calls (at most 8
+  columns) take the int8 tensor-core route (Basalt items, below); the prompt half keeps the wide
+  route either way.
 
 ## PR 9 (M1) measurements
 
@@ -1272,10 +1275,69 @@ None has been measured on the RTX 3090 yet.
     the policy's admission).
   - Memory: none (no workspace; up to about 74 KiB of shared memory per CTA, Q5_K at K = 6144 and
     T = 8).
-  - GPU-session checks: `ninfer_linear_ggml_test`; the KLD gate on vs off; each dense shape's time at
-    T = 1, 2, 4, 8 against the dp4a route (IQ3_S above all); tok/s on vs off with and without MTP.
+  - GPU-session checks: `ninfer_linear_ggml_test`; the KLD gate on vs off (the harness flag
+    `--ggml-decode-mma`); each dense shape's time at T = 1, 2, 4, 8 against the dp4a route
+    (`ninfer_linear_ggml_test --time`, IQ3_S above all); that the served decode runs
+    `ggml_mma_decode_kernel` (nsys); tok/s on vs off with and without MTP.
     Basalt estimates 0.3-0.5 ms per token plus a flatter verify. Designed to work with two lanes,
     MTP and `--partial-ram-residency`. Not measured.
+
+### Verification status
+
+Every item below is compiled for sm_86 and covered by the CPU tests, and none has run on a GPU:
+each is **compiled, CPU-tested, GPU-unverified**. `tools/bench/basalt_gpu_verify.ps1` (Windows,
+under the GPU lock) or `.sh` (the Linux box) runs every GPU check in one go from
+`tools/bench/basalt_options.json`; [tools/bench/README.md](../../tools/bench/README.md#verifying-the-basalt-options-on-a-gpu)
+says how. Kinds: identity = designed bit for bit unchanged, quality = numerics or the output
+distribution change, speed = timing or scheduling only, serving = a server feature. The checks
+named are the script's step ids; every option also has its targeted GPU tests (`tests:<model>`)
+and, where it has a workload, an ABBA A/B at n = 12 (`ab:<flag>`).
+
+Flash-Next options (Qwen3.8-Flash-Next):
+
+| Option | Task | Kind | Checks besides its GPU tests and A/B |
+|---|---|---|---|
+| `--ngram-keepalive-ms N` (default 40, was a fixed 100) | 5 | speed | none scripted: TTFT after an idle pause |
+| `--shared-expert-stream` | 7 | identity | `identity:` forward harness, eager and in graphs |
+| `--mtp-constrained` | 8 | identity | `ninfer_qwen4_exp_mtp_constrained_test`; no speed workload |
+| `--mtp-joint-acceptance` | 9 | identity | `identity:` engine `--mtp-exact 3 --mtp-joint-acceptance` |
+| `--ngram-prefetch` | 10 | identity | the A/B's greedy ids, equal across arms |
+| `--default-expert-state FILE` | 11 | speed | `default-expert-state`: export, then a fresh start from it |
+| `--hot-embedding-rows N` | 12 | identity | `ninfer_qwen4_exp_hot_embedding_test` |
+| `--gdn-head-map` | 13 | identity | `identity:` forward harness; `ninfer_qwen4_exp_gdn_head_map_test` |
+| `--moe-precast-input` | 14 | identity | `identity:` forward harness; `ninfer_qwen4_exp_moe_precast_test` |
+| `--moe-gate-up-registers` | 15 | identity | `identity:` forward harness; its engine test (capture-safe occupancy query) |
+| `--moe-fused-route` | 16 | identity | `identity:` forward harness; `ninfer_qwen4_exp_moe_fused_route_test` |
+| `--cpu-verify-misses` | 17 | identity | `ninfer_qwen4_exp_cpu_verify_misses_test` |
+| `--cpu-verify-workers N` | 17 | speed | A/B 6 against 12 workers |
+| `--prefill-cpu-share F` | 22 | identity | `ninfer_qwen4_exp_prefill_cpu_share_test`; A/B sweep F = 0.2, 0.4, 0.6 on a 2K prompt |
+| `--gdn-async-commit` | 18 | identity | `ninfer_qwen4_exp_gdn_async_commit_test` |
+| `--hc-int8` | 19 | quality | `kld:hc-int8-20`, `-100` against `kld:off-*`; `identity:` prefill bit-exact |
+| `--hc-fused-read` | 20 | identity | `identity:` forward harness, plain and side stream (against `--hc-int8`) |
+| `--ngram-flag-wait` | 21 | identity | `ninfer_qwen4_exp_ngram_flag_wait_test` and `_mtp_test` |
+| `--partial-ram-residency` | 36 | identity | both engine gates; `partial-start` (Windows page-lock warning, pinning) |
+| `--ggml-decode-mma` | 37 | quality | `kld:ggml-decode-mma-*`; `ggml-mma:timing` per shape; `ggml-mma:policy` (nsys) |
+
+Qwen3.8-27B (and Qwen3.6-35B-A3B) and cross-model options:
+
+| Option | Task | Kind | Checks besides its GPU tests and A/B |
+|---|---|---|---|
+| `--relaxed-drafting [P]` (and the `relaxed_drafting` request key) | 23 | quality | `relaxed-startup:` every model (added ids contiguous); A/B at temperature 0.7 reports acceptance; `greedy-master:` for the 64-byte `SamplingConfig` |
+| `--draft-context-rows N` | 24 | identity | `ninfer_qwen3_5_context_rows_real_test` on the 27B (MTP, DFlash2) and the 35B (MTP); the A/B's greedy answers equal |
+| `--admission-affinity` | 30 | speed | `serve-soak`: overtakes under 4 requests on one lane |
+| `--allowed-host NAME` (Host, Origin and Sec-Fetch-Site checks) | 25 | serving | `serve-smoke` |
+| `--config FILE` | 28 | serving | `serve-smoke`; `launchers:` (the profiles are config files, Task 29) |
+
+Other branch items: the decode-path KLD gate (`ninfer-perplexity --kld-base`, Task 2:
+`kld-qwen35:w1`/`w3`; the forward harness's, Task 3: `kld:off-20-w1` must equal window 3's rows);
+unpinned CPU expert workers (Task 6: no option, covered by the Flash-Next tests and A/Bs);
+`GET /slots` and `GET /dashboard` (Tasks 26, 27: `serve-smoke`, and the dashboard still needs a
+look in a browser at desktop and phone width); the GPU power limit in bench rows and the
+community preset (Task 31: `community-preset`); the soak harness (Task 32: `serve-soak`, its first
+real run); the stderr ratchet and the greedy-identity tool (Task 33: CPU-only, run by ctest; the
+tool's two-build mode is `greedy-master:`); the IQ2_XS/IQ3_XXS/IQ3_S formats and the IQ3 packs
+(Tasks 34, 35: `iq3:`, and `converter-pytests`, which needs torch). The two-stage head (Task 38)
+was tried and dropped; it is not on the branch.
 
 ## Artifact decisions
 

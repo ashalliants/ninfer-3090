@@ -217,7 +217,10 @@ GPU suite's FP64 criterion and the FP32 accumulation bound, the kernel's tile or
 canonical row order bit for bit at T = 1..8 wherever a column sits, and the MMA's int32 sums stay
 below 2^22 (their scaled products below 2^24) on extreme blocks. `ninfer_linear_ggml_test` then
 requires the device route bit for bit equal to that emulation at T = 1..8 and T = 9 equal to the
-AllowA8 wide route.
+AllowA8 wide route. `ninfer_linear_ggml_test --time [--format NAME] [--shape N K]` checks nothing and
+instead times each registered problem's dp4a decode route against the tensor-core route at T = 1,
+2, 4 and 8 (weights cycled through copies larger than L2, so every launch reads VRAM), for
+`--ggml-decode-mma`'s per-shape on/off table.
 
 `ninfer_offloaded_moe_cpu_test` (host only) and `ninfer_offloaded_moe_layer_test` qualify
 offloaded_sparse_moe over the twelve GGML text expert record formats (the IQ2_XS pack's three and
@@ -274,7 +277,8 @@ check the available memory first. Given a token list it prefills it once, writes
 top token to equal the single prefill's. With `--dump-logits OUT.bin [--chunk N]` after each of
 several token lists it scores them teacher-forced in Strata's `--dump-logits` layout instead.
 With `--kld-base FILE [--chunks N] [--window T]` it is the decode-path KLD gate against a llama.cpp
-base (see "Decode-path KLD gate" in `docs/maintainer/flash-next-plan.md`).
+base (see "Decode-path KLD gate" in `docs/maintainer/flash-next-plan.md`); `--hc-int8` and
+`--ggml-decode-mma` run it with those numerics options on.
 `tests/fixtures/qwen4_exp/` holds the PR 0 token sets (`ppl_tokens`, `infernix_texts`; JSON and
 `strata_compare`'s `.ids`). The FP64 reference that checks it is `tools/flash_next`:
 
@@ -303,7 +307,10 @@ capped at 1 GiB (evicting every round) with a 64-token KV base and no CUDA graph
 prompt (every fixture text: past QSA's 2,048-token selection budget, and past the small Engine's KV
 base, which grows) must give the same ids in the default and the small-cache Engine. It loads the model three times (about five minutes). With `--bench` it loads once and
 runs each `@FILE` prompt in order with greedy output and model stops off (`--generate N`, default
-512), printing prefill and decode rates; the Program logs each request's expert hit rate:
+512), printing prefill and decode rates; the Program logs each request's expert hit rate. The
+bench also takes the Flash-Next options in their ninfer-serve spelling (`--moe-fused-route`,
+`--prefill-cpu-share 0.6`, ...; the file's header lists them), so one build can be timed with an
+option off and on (`tools/bench/basalt_gpu_verify.py` does):
 
 ```powershell
 build-ninja\tests\ninfer_tests.exe ninfer_qwen4_exp_engine_real_test --bench --max-context 33792 `

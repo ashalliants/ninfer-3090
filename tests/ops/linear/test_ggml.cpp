@@ -29,7 +29,9 @@
 // Q6_K, Q5_K and Q4_K at both registered pair shapes, each output against the same FP64 oracle and bit for
 // bit against linear() on its own weight; and its admission.
 //
-// Usage: ninfer_linear_ggml_test [--format NAME] [--shape N K]
+// Usage: ninfer_linear_ggml_test [--time] [--format NAME] [--shape N K]
+//   --time: per-problem timing of the decode route against the tensor-core route (time_problem);
+//   no checks.
 
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
@@ -52,8 +54,10 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <random>
 #include <span>
 #include <stdexcept>
@@ -651,6 +655,73 @@ int pair_admission() {
     return failures;
 }
 
+// --time: the decode route (AllowA8, dp4a) against the int8 tensor-core route (AllowA8GgmlDecodeMma)
+// on one registered problem at T = 1, 2, 4 and 8, for --ggml-decode-mma's per-shape on/off timing.
+// The weight is copied until the copies exceed the L2 cache several times over and the launches
+// cycle through them, so every launch reads its weight from VRAM as a decode step does. Five rounds
+// per policy, alternating which policy goes first; each round is 100 launches between two CUDA
+// events. Prints one tab-separated line per T: label, T, median microseconds per launch of each
+// route and their ratio. Measures only; it checks no outputs (the default mode does).
+void time_problem(QType format, std::int32_t n, std::int32_t k, bool add) {
+    constexpr int kLaunches = 100, kRounds = 5;
+    const auto blocks       = make_blocks(format, n, k, static_cast<std::uint32_t>(n * 131 + k * 7));
+    const auto x_bits       = make_activation(k, ops::detail::kGgmlDecodeMaxTokens, 0x5bd1e995U);
+    const std::size_t copies =
+        std::clamp<std::size_t>((std::size_t{96} << 20) / std::max<std::size_t>(blocks.size(), 1) + 1, 1, 64);
+    std::vector<std::unique_ptr<DeviceBuffer>> storage;
+    std::vector<Weight> weights;
+    for (std::size_t c = 0; c < copies; ++c) {
+        storage.push_back(std::make_unique<DeviceBuffer>(blocks.size()));
+        storage.back()->copy_from_host(blocks.data(), blocks.size());
+        weights.push_back(device_weight(format, n, k, *storage.back()));
+    }
+    DeviceBuffer d_x(x_bits.size() * 2);
+    d_x.copy_from_host(x_bits.data(), x_bits.size() * 2);
+    DeviceBuffer d_out(static_cast<std::size_t>(n) * ops::detail::kGgmlDecodeMaxTokens * 2);
+    cuda_check(cudaMemset(d_out.p, 0, static_cast<std::size_t>(n) * ops::detail::kGgmlDecodeMaxTokens * 2), "zero");
+    cudaEvent_t start = nullptr, stop = nullptr;
+    cuda_check(cudaEventCreate(&start), "event");
+    cuda_check(cudaEventCreate(&stop), "event");
+    const std::string label = std::string(add ? "linear_add " : "linear ") + format_name(format) + " [" +
+                              std::to_string(n) + "," + std::to_string(k) + "]";
+    for (const std::int32_t t : {1, 2, 4, 8}) {
+        const LinearPolicy policies[2] = {LinearPolicy::AllowA8, LinearPolicy::AllowA8GgmlDecodeMma};
+        std::vector<double> us[2];
+        for (int round = 0; round < kRounds; ++round) {
+            for (int order = 0; order < 2; ++order) {
+                const int p              = (round + order) % 2;
+                const std::size_t needed = add ? ops::linear_add_workspace_capacity_bytes(format, n, k, policies[p], t, t)
+                                               : ops::linear_workspace_capacity_bytes(format, n, k, policies[p], t, t);
+                DeviceArena workspace(std::max<std::size_t>(needed, 256));
+                Tensor x(d_x.p, DType::BF16, {k, t});
+                Tensor out(d_out.p, DType::BF16, {n, t});
+                const auto launch = [&](int i) {
+                    const Weight& w = weights[static_cast<std::size_t>(i) % copies];
+                    if (add) {
+                        ops::linear_add(x, w, out, policies[p], workspace, nullptr);
+                    } else {
+                        ops::linear(x, w, out, policies[p], workspace, nullptr);
+                    }
+                };
+                for (int i = 0; i < 5; ++i) launch(i); // warm-up
+                cuda_check(cudaEventRecord(start, nullptr), "record");
+                for (int i = 0; i < kLaunches; ++i) launch(i);
+                cuda_check(cudaEventRecord(stop, nullptr), "record");
+                cuda_check(cudaEventSynchronize(stop), "sync");
+                float ms = 0.0F;
+                cuda_check(cudaEventElapsedTime(&ms, start, stop), "elapsed");
+                us[p].push_back(1000.0 * ms / kLaunches);
+            }
+        }
+        for (auto& v : us) std::sort(v.begin(), v.end());
+        const double dp4a = us[0][kRounds / 2], mma = us[1][kRounds / 2];
+        std::printf("time\t%s\tT=%d\tdp4a %.2f us\tmma %.2f us\tmma/dp4a %.3f\n", label.c_str(), t, dp4a, mma,
+                    mma / dp4a);
+    }
+    cuda_check(cudaEventDestroy(start), "event");
+    cuda_check(cudaEventDestroy(stop), "event");
+}
+
 QType parse_format(std::string_view name) {
     for (const QType f : {QType::GGML_IQ4_XS, QType::GGML_IQ3_S, QType::GGML_Q6_K, QType::GGML_Q5_K,
                           QType::GGML_Q4_K, QType::GGML_IQ4_NL, QType::GGML_Q8_0, QType::GGML_Q2_0}) {
@@ -667,12 +738,14 @@ int main(int argc, char** argv) {
         return 77;
     }
     try {
-        bool have_format = false;
+        bool have_format = false, timing = false;
         QType format     = QType::GGML_IQ4_XS;
         std::int32_t n = 0, k = 0;
         for (int i = 1; i < argc; ++i) {
             const std::string_view arg(argv[i]);
-            if (arg == "--format" && i + 1 < argc) {
+            if (arg == "--time") {
+                timing = true;
+            } else if (arg == "--format" && i + 1 < argc) {
                 format      = parse_format(argv[++i]);
                 have_format = true;
             } else if (arg == "--shape" && i + 2 < argc) {
@@ -680,8 +753,17 @@ int main(int argc, char** argv) {
                 k = std::stoi(argv[++i]);
             } else {
                 throw std::invalid_argument(
-                    "usage: ninfer_linear_ggml_test [--format NAME] [--shape N K]");
+                    "usage: ninfer_linear_ggml_test [--time] [--format NAME] [--shape N K]");
             }
+        }
+        if (timing) {
+            for (const auto& shape : ops::detail::kGgmlLinearShapes) {
+                if (have_format && shape.format != format) continue;
+                if (n != 0 && (shape.n != n || shape.k != k)) continue;
+                time_problem(shape.format, shape.n, shape.k, false);
+                if (shape.linear_add) time_problem(shape.format, shape.n, shape.k, true);
+            }
+            return 0;
         }
         int failures = 0;
         if (!have_format && n == 0) {

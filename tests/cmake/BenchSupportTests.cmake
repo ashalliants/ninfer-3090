@@ -64,3 +64,15 @@ add_test(NAME ninfer_stderr_logging_ratchet_test
 # diverge at a chosen token, stop early, crash or print no ids. Pure Python, no GPU.
 add_test(NAME ninfer_greedy_identity_test
   COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/bench/test_greedy_identity.py)
+
+# The interleaved A/B tool's self-test (tools/bench/run_interleaved_ab.py), against a fake executable:
+# same-build mode (--a-args / --b-args on one build), the per-run logs and the JSON result. Pure
+# Python, no GPU.
+add_test(NAME ninfer_interleaved_ab_test
+  COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/bench/test_run_interleaved_ab.py)
+
+# The Basalt options' GPU verification plan (tools/bench/basalt_gpu_verify.py, basalt_options.json):
+# the options file against the flags ninfer-serve parses, the plan's regex check on a fake ctest
+# listing, and the parsers its steps read results with. Pure Python, no GPU.
+add_test(NAME ninfer_basalt_gpu_verify_test
+  COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/bench/test_basalt_gpu_verify.py)

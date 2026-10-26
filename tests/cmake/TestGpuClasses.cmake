@@ -16,6 +16,7 @@
 set(NINFER_CPU_ONLY_TESTS
   ninfer_anthropic_schema_test
   ninfer_artifact_reader_test
+  ninfer_basalt_gpu_verify_test
   ninfer_bench_rows_check_test
   ninfer_bench_support_test
   ninfer_chat_templates_test
@@ -44,6 +45,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_host_timing_test
   ninfer_http_error_handler_test
   ninfer_http_security_test
+  ninfer_interleaved_ab_test
   ninfer_http_transport_test
   ninfer_jinja_test
   ninfer_json_schema_oracle_test

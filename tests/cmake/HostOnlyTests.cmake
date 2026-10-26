@@ -10,6 +10,7 @@
 # -CpuOnly runs all of them).
 set(NINFER_HOST_ONLY_TESTS
   ninfer_artifact_reader_test
+  ninfer_basalt_gpu_verify_test
   ninfer_bench_rows_check_test
   ninfer_chat_templates_test
   ninfer_chunked_reservation_test
@@ -32,6 +33,7 @@ set(NINFER_HOST_ONLY_TESTS
   ninfer_host_arena_replay_test
   ninfer_host_timing_test
   ninfer_http_security_test
+  ninfer_interleaved_ab_test
   ninfer_jinja_test
   ninfer_json_schema_oracle_test
   ninfer_json_schema_test

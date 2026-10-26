@@ -76,6 +76,20 @@ Two things it refuses rather than lets you get wrong:
 line and needs changing for `ninfer_bench`, which prints CSV. A run where any sample produced no
 number exits 1, because a comparison with a hole in it is not a comparison.
 
+**One build, an option off and on.** Leave out `--arm-b` and give `--a-args` and `--b-args`
+(they must differ): the one executable runs both arms, each command with its arm's arguments
+appended. The interleaving and the statistics are the same. `--log-dir DIR` keeps every run's
+output, and `--json FILE` writes the result for a script:
+
+```bash
+python tools/bench/run_interleaved_ab.py --arm-a build-ninja/tests/ninfer_tests.exe --reps 12 \
+    --b-args="--moe-fused-route" \
+    --config 'decode:{exe} ninfer_qwen4_exp_engine_real_test --bench --generate 256 --mtp 3 @prompt.ids' \
+    --metric-regex 'decode [0-9.]+ s \(([0-9.]+) tok/s\)' --log-dir ab-logs --json ab.json
+```
+
+Its self-test, `ninfer_interleaved_ab_test`, uses a fake executable and needs no GPU.
+
 ## Greedy identity between two builds (`greedy_identity.py`)
 
 Do two builds produce the same tokens? The tool runs each `ninfer` CLI on every prompt of a JSONL file
@@ -116,6 +130,76 @@ Invoke-WithGpuLock { python tools/bench/greedy_identity.py --a ... --b ... --mod
 ```
 
 Its self-test, `ninfer_greedy_identity_test`, uses fake CLIs and needs no GPU.
+
+## Verifying the Basalt options on a GPU
+
+The Basalt-learnings branch (issue #383) adds about 25 options, each compiled and CPU-tested but
+never run on a GPU. `basalt_gpu_verify.ps1` (Windows) and `basalt_gpu_verify.sh` (Linux) run every
+GPU check they need in one go, from `basalt_options.json`: each option's kind (identity, quality,
+speed or serving), its GPU-test regex, its identity harness runs, its KLD-gate flag and its A/B
+workload. The status of each is in
+[docs/maintainer/flash-next-plan.md](../../docs/maintainer/flash-next-plan.md#verification-status).
+
+1. Build the branch (`build-ninja`, Release, sm_86, tests and apps; `-DNINFER_BUILD_BENCHMARKS=ON`
+   too for the community preset). For the "every option off equals master" check, build
+   origin/master's `ninfer` CLI and copy it into the same `apps` directory under another name, such
+   as `ninfer-master.exe`.
+2. Gather the inputs. Each step that lacks one is skipped and says which:
+   - `--flash-next`: the Flash-Next artifact with the MTP drafter (`qwen4exp-iq2xs-mtp.ninfer`), its
+     n-gram volume beside it; `--qwen27b`: the 27B DFlash2 bundle; `--qwen35b`: the 35B-A3B
+     (optional);
+   - `--kld-base-flash-next` and `--kld-base-27b`: llama.cpp KL-divergence bases
+     ([flash-next-plan.md](../../docs/maintainer/flash-next-plan.md#decode-path-kld-gate),
+     [perplexity.md](../../docs/perplexity.md)); `--master-cli`: the master CLI from step 1;
+   - `--iq3-pack` (repeatable): the converted IQ3_XXS and IQ3_S packs; `--gguf`: the Flash-Next
+     GGUF for the converter's real-file test; torch, pytest and numpy for the converter suites;
+     `nsys` on the PATH for the `--ggml-decode-mma` policy check.
+3. Look at the plan. The dry run prints every step with its commands and checks that every test
+   regex matches a name `ctest -N` lists; it exits 1 if one does not:
+
+   ```powershell
+   pwsh tools/bench/basalt_gpu_verify.ps1 --build-dir build-ninja --dry-run --flash-next <...> --qwen27b <...>
+   ```
+
+4. Run it, in the background (it takes many hours, mostly model loads: every A/B is 24 processes):
+
+   ```powershell
+   pwsh tools/bench/basalt_gpu_verify.ps1 --build-dir build-ninja --flash-next <...> --qwen27b <...> `
+       --kld-base-flash-next <...> --master-cli build-ninja\apps\ninfer-master.exe
+   ```
+
+   `--only ab:,kld:` or `--skip launchers:,full-suite` picks steps by id prefix; `--reps N` changes
+   the A/B pairs (12 by default); a step can be rerun alone with
+   `python tools/bench/basalt_gpu_verify.py <the same arguments> --action run --step <id>`.
+
+Order: the GPU tests of every touched area (`tools/run-tests.ps1 -GpuOnly -Regex`, grouped by the
+artifact their real tests read), the identity harness runs, the KLD gate (one option-off run at 20
+and at 100 chunks serves every option; the window check compares window 1 with window 3), the
+`--ggml-decode-mma` per-shape timing and nsys policy check, one ABBA A/B per option and variant
+(n = 12, the Engine bench through `run_interleaved_ab.py` in its same-build mode, the 27B options
+through `run_chat_decode.py`), two combined rows with every winning option on, the ledger's checks
+(every option off against master with `greedy_identity.py`, `--relaxed-drafting` starts, a
+`--partial-ram-residency` start, the default expert state, a real-server smoke and soak, the
+community preset, the converter suites, the IQ3 packs, the launchers from a path with spaces and
+`(x86)`, with `package-release.ps1` on Windows), and last the rest of the GPU suite without the slow
+tests (`softmax_attention|kv_materialize`, AGENTS.md).
+
+**The GPU lock.** On Windows the script holds the shared lock (`tools/gpu-lock.ps1`) for each step
+marked `hold` (one ABBA set, one KLD run, one server start and its probes), releasing it between
+steps; test steps go through `tools/run-tests.ps1`, which takes it per test. The Linux script takes
+no lock: no Linux script here does, because the Linux box is a rented machine used by one session at
+a time. Do not run it on a shared Linux machine without one.
+
+**Results** go to `profiles/bench/basalt-<date>/` (`--out` to change): `results/<step>.json`,
+`logs/<step>/`, the KLD rows, the generated inputs, and `summary.md`, a table of every option (its
+GPU tests, identity run, KLD numbers and A/B) and every check, ready to paste into the pull request.
+A speed variant is marked a win at a paired median of at least +1% with three quarters of the pairs
+positive; that only decides what the combined rows turn on, not what ships. Two things stay manual:
+the dashboard (open `/dashboard` in a browser at desktop and phone width) and `--mtp-constrained`'s
+speed (it needs constrained requests through ninfer-serve).
+
+Its self-test, `ninfer_basalt_gpu_verify_test`, checks `basalt_options.json` against the flags
+ninfer-serve parses and the plan against a fake `ctest -N` listing; it needs no GPU.
 
 ## External Serve TTFT
 
