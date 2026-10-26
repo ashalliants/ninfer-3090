@@ -6,6 +6,7 @@
 #include "models/qwen3_5/frontend/graft.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/load.h"
+#include "models/qwen3_5/lossy_options.h"
 #include "models/qwen3_5/measurement.h"
 #include "runtime/engine/host_cache.h"
 #include "runtime/engine/validate_options.h"
@@ -260,6 +261,8 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     if (options.prefill_schedule.layer_slices > kMaximumPrefillLayerSlices) {
         throw std::invalid_argument("prefill_schedule.layer_slices must be at most 16");
     }
+    // The CLI checks these too, but a caller building EngineOptions directly does not go through it.
+    models::qwen3_5::validate_lossy_prefill_options(options.lossy_prefill);
     ContextCacheOptions& cache      = options.context_cache;
     const std::uint32_t concurrency = options.max_concurrency;
     // Each direct graft is installed as a pinned context-cache checkpoint that holds one StateImage

@@ -1,6 +1,7 @@
 #include "serve/serve_options.h"
 
 #include <algorithm>
+#include "models/qwen3_5/lossy_options.h"
 #include "product/reasoning_loop_options.h"
 #include "product/speculative_options.h"
 
@@ -1064,33 +1065,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.prefill_schedule.layer_slices > kMaximumPrefillLayerSlices) {
         throw std::invalid_argument("--prefill-layer-slices must be at most 16");
     }
-    {
-        const LossyPrefillOptions& lossy = options.lossy_prefill;
-        if (!(lossy.keep_fraction > 0.0F && lossy.keep_fraction <= 1.0F)) {
-            throw std::invalid_argument("--lossy-prefill-keep must be in (0, 1]");
-        }
-        if (!(lossy.skip_fraction > 0.0F && lossy.skip_fraction <= 1.0F)) {
-            throw std::invalid_argument("--lossy-prefill-skip must be in (0, 1]");
-        }
-        // A keep share above the skip share would skip every prompt after its scout.
-        if (lossy.keep_fraction > lossy.skip_fraction) {
-            throw std::invalid_argument(
-                "--lossy-prefill-keep must not exceed --lossy-prefill-skip (every prompt would be "
-                "skipped)");
-        }
-        if (lossy.block_tokens < 16 || lossy.block_tokens % 16 != 0) {
-            throw std::invalid_argument("--lossy-prefill-block must be a multiple of 16, at least 16");
-        }
-        if (lossy.query_rows < 1 || lossy.query_rows > 256) {
-            throw std::invalid_argument("--lossy-prefill-query-rows must be 1 to 256");
-        }
-        if (lossy.pool_window % 2 == 0) {
-            throw std::invalid_argument("--lossy-prefill-pool-window must be odd");
-        }
-        if (lossy.summary_max_tokens == 0) {
-            throw std::invalid_argument("--lossy-prefill-summary-max-tokens must be positive");
-        }
-    }
+    models::qwen3_5::validate_lossy_prefill_options(options.lossy_prefill);
     product::apply_speculative_defaults(options.speculative);
     product::validate_speculative_cli_options(options.speculative);
     if (options.vision_residency == VisionResidency::Overlay && !options.enable_vision) {

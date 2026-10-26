@@ -1,11 +1,14 @@
 // Lossy long-prefill token selection (CPU only).
+#include "models/qwen3_5/lossy_options.h"
 #include "models/qwen3_5/program/lossy/selection.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -208,6 +211,41 @@ void test_kept_runs() {
     require(total == r.kept.size(), "runs cover the kept offsets");
 }
 
+void test_validate_options() {
+    // The shared contract every entry point applies, the CLI's included: a caller building
+    // EngineOptions directly must not reach selection's ceil() with a NaN or out-of-range share.
+    using ninfer::models::qwen3_5::validate_lossy_prefill_options;
+    validate_lossy_prefill_options(LossyPrefillOptions{});
+    const auto rejected = [](const std::function<void(LossyPrefillOptions&)>& edit) {
+        LossyPrefillOptions o;
+        edit(o);
+        try {
+            validate_lossy_prefill_options(o);
+        } catch (const std::invalid_argument&) { return true; }
+        return false;
+    };
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    require(rejected([&](auto& o) { o.keep_fraction = nan; }), "NaN keep share rejected");
+    require(rejected([&](auto& o) { o.skip_fraction = nan; }), "NaN skip share rejected");
+    require(rejected([](auto& o) { o.keep_fraction = -0.1F; }), "negative keep share rejected");
+    require(rejected([](auto& o) { o.keep_fraction = 0.0F; }), "zero keep share rejected");
+    require(rejected([&](auto& o) { o.keep_fraction = 1.5F; o.skip_fraction = inf; }),
+            "keep share above 1 rejected");
+    require(rejected([](auto& o) { o.keep_fraction = 0.9F; o.skip_fraction = 0.8F; }),
+            "keep share above the skip share rejected");
+    require(rejected([](auto& o) { o.block_tokens = 1; }), "block of 1 rejected");
+    require(rejected([](auto& o) { o.block_tokens = 24; }), "block not a multiple of 16 rejected");
+    require(rejected([](auto& o) { o.query_rows = 0; }), "zero query rows rejected");
+    require(rejected([](auto& o) { o.query_rows = 257; }), "query rows above 256 rejected");
+    require(rejected([](auto& o) { o.pool_window = 32; }), "even pool window rejected");
+    require(rejected([](auto& o) { o.summary_max_tokens = 0; }), "zero summary budget rejected");
+    require(rejected([](auto& o) { o.strategy = static_cast<ninfer::LossyStrategy>(7); }),
+            "unknown strategy rejected");
+    require(!rejected([](auto& o) { o.keep_fraction = 0.5F; o.skip_fraction = 0.5F; }),
+            "equal keep and skip shares accepted");
+}
+
 } // namespace
 
 int main() {
@@ -222,6 +260,7 @@ int main() {
         test_skip_rule_counts_the_budget();
         test_pool_window_spreads_across_blocks();
         test_kept_runs();
+        test_validate_options();
         std::cout << "lossy selection tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

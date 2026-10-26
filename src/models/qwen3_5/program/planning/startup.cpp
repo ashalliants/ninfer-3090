@@ -8,6 +8,7 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/lossy/scout_plan.h"
+#include "models/qwen3_5/lossy_options.h"
 #include "ninfer/ops/attention_key_mass.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/execution/workspace.h"
@@ -966,20 +967,9 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         // Throws unless the filter layer is one of the model's full-attention layers.
         (void)scout_gdn_layers(parameters.model.config().text.layer_types,
                                options.lossy_prefill.filter_layer);
-        if (options.lossy_prefill.query_rows == 0 || options.lossy_prefill.query_rows > 256) {
-            throw std::invalid_argument("lossy prefill query rows must be in [1,256]");
-        }
-        // Selection's own contract (selection.h), checked here so a bad option fails at startup
-        // rather than at the end of a request's scout.
-        if (options.lossy_prefill.pool_window % 2 == 0) {
-            throw std::invalid_argument("lossy prefill pool window must be odd");
-        }
-        if (options.lossy_prefill.block_tokens == 0) {
-            throw std::invalid_argument("lossy prefill block must be positive");
-        }
-        if (options.lossy_prefill.keep_fraction > options.lossy_prefill.skip_fraction) {
-            throw std::invalid_argument("lossy prefill keep share must not exceed the skip share");
-        }
+        // The model-independent contract, also checked by the CLI and Engine normalization; here
+        // too so a bad option fails at startup rather than at the end of a request's scout.
+        models::qwen3_5::validate_lossy_prefill_options(options.lossy_prefill);
         // The int4 scout replaces the integer-A8 prefill route of the Q4 matrices; with none on
         // that route (no --prefill-a8, or a build without the sm86 integer routes) it would
         // silently be the int8 scout.
