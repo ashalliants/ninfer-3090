@@ -31,6 +31,10 @@ class State:
         self.mode = mode
         self.vision = vision
         self.lock = threading.Lock()
+        self.lane = threading.Lock()   # the one lane of mode "lane": streams run one at a time
+        self.waiting = []              # when each queued request arrived
+        self.busy = False
+        self.first_post: float | None = None
         self.seen = []            # (method, path, headers dict)
         self.posts = {"chat": 0, "messages": 0, "over": 0, "oversize": 0, "image": 0}
 
@@ -39,7 +43,7 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "fake-ninfer"
     state = State()
 
-    def log_message(self, *args):
+    def log_message(self, format, *args):
         pass
 
     def _json(self, status, payload):
@@ -59,9 +63,20 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/models":
             return self._json(200, {"object": "list", "data": [{"id": "fake-model"}]})
         if self.path == "/slots":
-            return self._json(200, [{"id": 0, "n_ctx": CONTEXT, "n_ctx_used": 10, "is_processing": True}])
+            busy = self.state.busy if self.state.mode in ("lane", "idle_queue", "idle_queue_head") else True
+            return self._json(200, [{"id": 0, "n_ctx": CONTEXT, "n_ctx_used": 10, "is_processing": busy}])
         if self.path == "/v1/load":
-            return self._json(200, {"requests": {"queue": [], "queue_total": 0}})
+            now = time.monotonic()
+            with self.state.lock:
+                if self.state.mode == "lane":
+                    queue = [{"id": "r", "waited_s": now - t} for t in self.state.waiting]
+                elif self.state.mode.startswith("idle_queue") and self.state.first_post is not None:
+                    # Two requests "queued" behind a lane that is idle and never takes them.
+                    head = 100.0 if self.state.mode == "idle_queue_head" else now - self.state.first_post
+                    queue = [{"id": "a", "waited_s": head}, {"id": "b", "waited_s": head}]
+                else:
+                    queue = []
+            return self._json(200, {"requests": {"queue": queue, "queue_total": len(queue)}})
         if self.path == "/metrics":
             body = b"# TYPE ninfer_requests_total counter\nninfer_requests_total 3\nninfer_x{a=\"b\"} 1\n"
             self.send_response(200)
@@ -103,10 +118,32 @@ class Handler(BaseHTTPRequestHandler):
                     "type": "invalid_request_error", "message": "prompt is too long"}})
             return self._json(400, {"error": {"code": "context_length_exceeded", "message": "too long"}})
         mode = self.state.mode
+        if mode.startswith("idle_queue"):
+            with self.state.lock:
+                self.state.first_post = self.state.first_post or time.monotonic()
+            time.sleep(8)           # never admitted; the soak ends the request
+            return
+        if mode == "lane":
+            with self.state.lock:
+                self.state.waiting.append(time.monotonic())
+            self.state.lane.acquire()
+            with self.state.lock:
+                self.state.waiting.pop(0)
+                self.state.busy = True
+            try:
+                return self._stream(body, anthropic, mode)
+            finally:
+                with self.state.lock:
+                    self.state.busy = False
+                self.state.lane.release()
         if mode == "bad400":
             return self._json(400, {"error": {"code": "invalid_request", "message": "nope"}})
         if mode == "boom500":
             return self._json(500, {"error": {"code": "internal_error", "message": "boom"}})
+        self._stream(body, anthropic, mode)
+
+    def _stream(self, body, anthropic, mode):
+        delay = 0.03 if mode == "lane" else 0.01
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Connection", "close")
@@ -122,7 +159,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
                 if mode == "stall" and i == 1:
                     time.sleep(6)         # far beyond --stall-seconds; the soak cancels it
-                time.sleep(0.01)
+                time.sleep(delay)
             if anthropic:
                 self.wfile.write(b'event: message_stop\ndata: {"type":"message_stop"}\n\n')
             else:
@@ -148,7 +185,7 @@ def png():
             + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
 
 
-def run_soak(server, extra=(), rss_reader=None, minutes="0.015"):
+def run_soak(server, extra=(), rss_reader=None, minutes="0.01"):
     with tempfile.TemporaryDirectory() as tmp:
         out = os.path.join(tmp, "report.json")
         argv = ["--url", f"http://127.0.0.1:{server.server_port}", "--minutes", minutes, "--out", out,
@@ -174,7 +211,7 @@ def test_a_clean_server_passes_and_every_kind_runs():
         with tempfile.TemporaryDirectory() as images:
             with open(os.path.join(images, "a.png"), "wb") as handle:
                 handle.write(png())
-            code, report, output = run_soak(server, ["--images", images, "--api-key", "sekrit"])
+            code, report, output = run_soak(server, ["--images", images, "--api-key", "sekrit", "--max-concurrency", "3"])
     finally:
         server.shutdown()
     check(code == 0, f"a clean server exited {code}: {report['findings']} {report['failures']}\n{output}")
@@ -206,7 +243,7 @@ def test_images_are_skipped_when_the_server_has_no_vision():
         with tempfile.TemporaryDirectory() as images:
             with open(os.path.join(images, "a.png"), "wb") as handle:
                 handle.write(png())
-            code, report, output = run_soak(server, ["--images", images, "--kinds", "chat,image"])
+            code, report, output = run_soak(server, ["--images", images, "--kinds", "chat,image", "--max-requests", "2"])
     finally:
         server.shutdown()
     check(code == 0, f"vision_disabled must not fail the run: {report['failures']}\n{output}")
@@ -230,10 +267,47 @@ def test_a_stalled_stream_is_flagged():
     check(elapsed < 6, f"the soak waited out the stalled stream ({elapsed:.1f} s) instead of cancelling it")
 
 
+def test_queued_requests_on_one_lane_are_not_stalls():
+    # One lane, four clients: each waits behind the others for longer than --stall-seconds, which is
+    # queueing and not silence. The server reports the queue, so none of it counts.
+    server, state = fake_server("lane")
+    try:
+        code, report, output = run_soak(server, ["--kinds", "chat", "--stall-seconds", "0.3",
+                                                  "--max-concurrency", "4"], minutes="0.02")
+    finally:
+        server.shutdown()
+    check(code == 0, f"queued requests were flagged: {report['stalls']} {report['failures'][:2]}\n{output}")
+    check(report["settings"]["lanes"] == 1 and report["requests"]["total"] >= 4, f"{report['requests']}")
+    check(any(s.get("queue_total") for s in report["samples"]), "the queue was never sampled")
+    check(report["duration_seconds"] > 0.6, "run too short to prove anything")
+
+
+def test_the_default_concurrency_is_the_lane_count():
+    server, _ = fake_server("clean")
+    try:
+        code, report, output = run_soak(server, ["--kinds", "chat", "--max-requests", "1"], minutes="1")
+    finally:
+        server.shutdown()
+    check(report["settings"]["lanes"] == 1 and report["settings"]["max_concurrency"] == 1,
+          f"settings {report['settings']}")
+
+
+def test_a_queue_behind_an_idle_lane_is_flagged():
+    for mode in ("idle_queue", "idle_queue_head"):
+        server, _ = fake_server(mode)
+        try:
+            code, report, output = run_soak(server, ["--kinds", "chat", "--stall-seconds", "0.5",
+                                                      "--max-concurrency", "2"])
+        finally:
+            server.shutdown()
+        check(code == 1 and any(s["kind"] == "queue" for s in report["stalls"]),
+              f"{mode}: an idle lane with a queue was not flagged: {code} {report['stalls']}\n{output}")
+
+
 def test_an_unexpected_400_is_flagged():
     server, _ = fake_server("bad400")
     try:
-        code, report, output = run_soak(server, ["--kinds", "chat"])
+        code, report, output = run_soak(server, ["--kinds", "chat", "--max-requests", "2"], minutes="1")
     finally:
         server.shutdown()
     check(code == 1, f"unexpected 400 exit code {code}\n{output}")
@@ -244,7 +318,7 @@ def test_an_unexpected_400_is_flagged():
 def test_an_unexpected_500_is_flagged():
     server, _ = fake_server("boom500")
     try:
-        code, report, output = run_soak(server, ["--kinds", "chat,cancel"])
+        code, report, output = run_soak(server, ["--kinds", "chat,cancel", "--max-requests", "3"], minutes="1")
     finally:
         server.shutdown()
     check(code == 1, f"500 exit code {code}\n{output}")
@@ -255,7 +329,7 @@ def test_a_wrong_status_for_an_expected_error_is_flagged():
     # The over-long prompt must be a 400 context_length_exceeded; a server that streams it is wrong.
     server, _ = fake_server("accept_over")
     try:
-        code, report, output = run_soak(server, ["--kinds", "over"])
+        code, report, output = run_soak(server, ["--kinds", "over", "--max-requests", "2"], minutes="1")
     finally:
         server.shutdown()
     check(code == 1 and any("expected HTTP 400 context_length_exceeded" in f["reason"]
@@ -309,6 +383,7 @@ def test_a_gone_server_is_a_usage_error_and_a_dying_one_a_finding():
                               "--out", os.path.join(tmp, "r.json")])
         check(code == 2 and "cannot reach" in sink.getvalue(), f"unreachable server: {code} {sink.getvalue()}")
     server, _ = fake_server("clean")
+    killer = threading.Timer(0.6, lambda: None)
     try:
         killer = threading.Timer(0.6, lambda: (server.shutdown(), server.server_close()))
         killer.start()
@@ -316,6 +391,65 @@ def test_a_gone_server_is_a_usage_error_and_a_dying_one_a_finding():
     finally:
         killer.cancel()
     check(code == 1 and "the server stopped answering" in report["findings"], f"dying server: {code} {output}")
+
+
+def test_the_oversize_body_is_streamed_in_small_chunks():
+    args = soak.parse_args(["--url", "http://x", "--minutes", "1", "--out", "o", "--max-request-mib", "3"])
+    chunks, length = soak.Soak(args, None, "").oversize_body()
+    sizes = [len(chunk) for chunk in chunks]
+    check(sum(sizes) == length and length > 4 << 20, f"declared {length}, produced {sum(sizes)}")
+    check(max(sizes) <= 1 << 20, "a chunk larger than 1 MiB: the body is being held whole")
+
+
+def test_exit_two_for_a_bad_out_path_and_for_a_harness_bug():
+    sink = StringIO()
+    with redirect_stdout(sink), redirect_stderr(sink):
+        code = soak.main(["--url", "http://127.0.0.1:1", "--minutes", "0.01", "--out", "/nonexistent-dir/r.json"])
+    check(code == 2 and "not writable" in sink.getvalue(), f"bad --out: {code} {sink.getvalue()}")
+    server, _ = fake_server("clean")
+    original = soak.Soak.preflight
+    try:
+        def explode(self):
+            raise ZeroDivisionError("harness bug")
+        soak.Soak.preflight = explode
+        with tempfile.TemporaryDirectory() as tmp, redirect_stdout(sink), redirect_stderr(sink):
+            code = soak.main(["--url", f"http://127.0.0.1:{server.server_port}", "--minutes", "0.01",
+                              "--out", os.path.join(tmp, "r.json")])
+    finally:
+        soak.Soak.preflight = original
+        server.shutdown()
+    check(code == 2 and "harness itself failed" in sink.getvalue(), f"harness bug: {code}")
+
+
+def test_an_interrupt_writes_a_partial_report():
+    server, _ = fake_server("stall")
+    original = soak.Soak.traffic
+    try:
+        def interrupted(self):
+            original(self)
+            raise KeyboardInterrupt
+        soak.Soak.traffic = interrupted
+        code, report, output = run_soak(server, ["--kinds", "chat", "--stall-seconds", "30"], minutes="0.005")
+    finally:
+        soak.Soak.traffic = original
+        server.shutdown()
+    check(report["interrupted"] and code == 2 and report["failures"] == [] and report["stalls"] == [],
+          f"interrupt: {code} {report['failures']} {report['stalls']}")
+
+
+def test_a_sampler_bug_is_recorded_and_fails_the_run():
+    server, _ = fake_server("clean")
+    original = soak.Soak.check_queue
+    try:
+        def broken(self, sample):
+            raise RuntimeError("boom")
+        soak.Soak.check_queue = broken
+        code, report, output = run_soak(server, ["--kinds", "chat"])
+    finally:
+        soak.Soak.check_queue = original
+        server.shutdown()
+    check(code == 1 and report["harness_errors"] and len(report["samples"]) >= 3,
+          f"sampler bug: {code} {report['harness_errors'][:1]} samples={len(report['samples'])}")
 
 
 def test_argument_checks():
