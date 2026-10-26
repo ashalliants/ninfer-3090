@@ -4292,7 +4292,6 @@ private:
                 if (hydration_stop_) { return; }
                 task = std::move(queue.front());
                 queue.pop_front();
-                if (reads && !task.lookup) { reuse = std::exchange(hydration_spare_, {}); }
             }
             if (const auto started = Clock::now(); started < task.deadline) {
                 try {
@@ -4313,6 +4312,12 @@ private:
                         task.lookup_found =
                             store_.store->lookup_remote(task.lookup_asked, task.deadline, wanted).held;
                     } else {
+                        // The spare is taken only for a read that runs: one queued past its
+                        // deadline leaves it for the next.
+                        {
+                            std::lock_guard lock(hydration_mutex_);
+                            reuse = std::exchange(hydration_spare_, {});
+                        }
                         task.bytes = store_.store->load(task.id, false, &task.fetch, task.deadline,
                                                         std::move(reuse));
                     }
@@ -4470,6 +4475,11 @@ private:
                 // Settle only the reads nobody waits for any longer.
                 for (auto it = hydration_done_.begin(); it != hydration_done_.end();) {
                     if (!it->request->hydrating) {
+                        // Its buffer is kept for the next read, as after any other read.
+                        if (it->bytes && it->bytes->capacity() <= kMaximumSpareReadBytes &&
+                            it->bytes->capacity() > hydration_spare_.capacity()) {
+                            std::swap(hydration_spare_, *it->bytes);
+                        }
                         it = hydration_done_.erase(it);
                     } else {
                         ++it;
