@@ -27,6 +27,8 @@ constexpr std::array kFormats = {
     std::pair{QType::GGML_IQ4_XS, std::string_view{"ggml_iq4_xs"}},
     std::pair{QType::GGML_IQ1_M, std::string_view{"ggml_iq1_m"}},
     std::pair{QType::GGML_Q2_0, std::string_view{"ggml_q2_0"}},
+    std::pair{QType::GGML_IQ2_XS, std::string_view{"ggml_iq2_xs"}},
+    std::pair{QType::GGML_IQ3_XXS, std::string_view{"ggml_iq3_xxs"}},
     std::pair{QType::GGML_REC_IQ2_S_Q2_0, std::string_view{"ggml_rec_iq2_s_q2_0"}},
     std::pair{QType::GGML_REC_IQ2_XXS_Q2_0, std::string_view{"ggml_rec_iq2_xxs_q2_0"}},
     std::pair{QType::GGML_REC_IQ1_M_Q2_0, std::string_view{"ggml_rec_iq1_m_q2_0"}},

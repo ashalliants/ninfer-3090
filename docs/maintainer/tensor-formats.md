@@ -47,6 +47,8 @@ The GGML block formats store blocks of ggml's quantization types unchanged (Sect
 | `ggml_q8_0` | `Q8_0` (8) | 32 | 34 | 8.5 |
 | `ggml_q6_k` | `Q6_K` (14) | 256 | 210 | 6.5625 |
 | `ggml_iq2_xxs` | `IQ2_XXS` (16) | 256 | 66 | 2.0625 |
+| `ggml_iq2_xs` | `IQ2_XS` (17) | 256 | 74 | 2.3125 |
+| `ggml_iq3_xxs` | `IQ3_XXS` (18) | 256 | 98 | 3.0625 |
 | `ggml_iq4_nl` | `IQ4_NL` (20) | 32 | 18 | 4.5 |
 | `ggml_iq3_s` | `IQ3_S` (21) | 256 | 110 | 3.4375 |
 | `ggml_iq2_s` | `IQ2_S` (22) | 256 | 82 | 2.5625 |
@@ -73,6 +75,8 @@ Host or Pinned memory unchanged. Linear and LinearAdd consume `ggml_iq4_xs`, `gg
 `ggml_iq4_nl`, `ggml_q8_0` and `ggml_q2_0` at the registered problems in
 [`linear.h`](../../include/ninfer/ops/linear.h) and
 [`linear_add.h`](../../include/ninfer/ops/linear_add.h), through their Q8_1 activation profile.
+`ggml_iq2_xs` and `ggml_iq3_xxs` have a device sub-block decoder in the GGML linears
+(`src/ops/linear/ggml/ggml_blocks.cuh`) but no registered problem, so no Op consumes them yet.
 offloaded_sparse_moe consumes the three text expert record formats through its canonical A8
 arithmetic, and `ggml_rec_q2_0_q2_0` on its narrow route only
 ([`offloaded_sparse_moe.h`](../../include/ninfer/ops/offloaded_sparse_moe.h)). An Op that consumes
@@ -352,14 +356,14 @@ consecutive blocks. Each block holds its own scales; no field lies outside the b
 string of the block size is a valid block: the binary16 scales may be zero, subnormal, infinite or
 NaN, and the format represents whatever they reconstruct to.
 
-The represented FP32 values of a block are exactly those of ggml's reference
-`dequantize_row_<type>` in `ggml-quants.c` of llama.cpp release b11316, with the block structs of
-`ggml-common.h` and its lookup tables (`iq2xxs_grid`, `iq2s_grid`, `iq3s_grid`, `iq1s_grid`,
+The represented FP32 values of a block are exactly those of ggml's reference `dequantize_row_<type>`
+in `ggml-quants.c` of llama.cpp release b11316, with the block structs of `ggml-common.h` and its
+lookup tables (`iq2xxs_grid`, `iq2xs_grid`, `iq2s_grid`, `iq3xxs_grid`, `iq3s_grid`, `iq1s_grid`,
 `ksigns_iq2xs`, `kmask_iq2xs`, `kvalues_iq4nl`). Each output is formed by that source's sequence of
 single FP32 operations, so the result is one FP32 bit pattern. One case is fixed beyond the C
-source: the sign factor `(bit ? -1.f : 1.f)` of IQ2_XXS, IQ2_S and IQ3_S negates its operand (flips
-the sign bit), which equals the product for every non-NaN value and is what the reference build
-does for NaN.
+source: the sign factor `(bit ? -1.f : 1.f)` of IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS and IQ3_S negates
+its operand (flips the sign bit), which equals the product for every non-NaN value and is what the
+reference build does for NaN.
 
 `ggml_q2_0` is the newest of these types: one binary16 `d` followed by 16 bytes of 2-bit codes per
 64 values. Value `j` uses code `q = (qs[j / 4] >> (2 * (j % 4))) & 3`, least significant pair

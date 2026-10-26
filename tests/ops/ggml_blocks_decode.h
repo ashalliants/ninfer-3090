@@ -5,8 +5,9 @@
 // This is the test-owned oracle that GGML Ops are qualified against. Each value is formed by the
 // same sequence of single FP32 operations as ggml's reference `dequantize_row_*` (ggml-quants.c,
 // llama.cpp b11316), so the output is one FP32 bit pattern; tests compare bit patterns, never with
-// a tolerance. The sign factor `(bit ? -1.f : 1.f)` of IQ2_XXS, IQ2_S and IQ3_S is applied as a
-// sign-bit flip, which is what the reference build does and differs from a product only on NaN.
+// a tolerance. The sign factor `(bit ? -1.f : 1.f)` of IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS and IQ3_S is
+// applied as a sign-bit flip, which is what the reference build does and differs from a product
+// only on NaN.
 // Build the including translation unit without FP contraction (ninfer_op_oracle_options).
 
 #include "core/weight.h"
@@ -144,6 +145,46 @@ inline void iq2_xxs(const std::byte* b, float* y) {
     }
 }
 
+inline void iq2_xs(const std::byte* b, float* y) {
+    const float d = fp16(u16(b, 0));
+    for (int ib32 = 0; ib32 < 8; ++ib32) {
+        const auto scale = u8(b, 66 + ib32);
+        const float db[2] = {d * (0.5F + static_cast<float>(scale & 0xF)) * 0.25F,
+                             d * (0.5F + static_cast<float>(scale >> 4)) * 0.25F};
+        for (int l = 0; l < 4; ++l) {
+            // A 9-bit grid index and a 7-bit sign selector per eight values.
+            const auto code  = u16(b, 2 + 2 * static_cast<std::size_t>(4 * ib32 + l));
+            const auto grid  = iq2xs_grid[code & 511];
+            const auto signs = ksigns_iq2xs[code >> 9];
+            for (int j = 0; j < 8; ++j) {
+                const float value = db[l / 2] * static_cast<float>(byte_of(grid, j));
+                y[8 * (4 * ib32 + l) + j] = negate_if(value, (signs & kmask_iq2xs[j]) != 0);
+            }
+        }
+    }
+}
+
+inline void iq3_xxs(const std::byte* b, float* y) {
+    const float d = fp16(u16(b, 0));
+    // qs[64] then one u32 per 32 values: four 7-bit sign selectors and a 4-bit scale on top.
+    for (int ib32 = 0; ib32 < 8; ++ib32) {
+        const std::uint32_t aux32 = u32(b, 66 + 4 * static_cast<std::size_t>(ib32));
+        const float db = d * (0.5F + static_cast<float>(aux32 >> 28)) * 0.5F;
+        for (int l = 0; l < 4; ++l) {
+            const std::uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+            const auto grid1 = iq3xxs_grid[u8(b, 2 + 8 * ib32 + 2 * l + 0)];
+            const auto grid2 = iq3xxs_grid[u8(b, 2 + 8 * ib32 + 2 * l + 1)];
+            float* out       = y + 32 * ib32 + 8 * l;
+            for (int j = 0; j < 4; ++j) {
+                out[j + 0] = negate_if(db * static_cast<float>(byte_of(grid1, j)),
+                                       (signs & kmask_iq2xs[j + 0]) != 0);
+                out[j + 4] = negate_if(db * static_cast<float>(byte_of(grid2, j)),
+                                       (signs & kmask_iq2xs[j + 4]) != 0);
+            }
+        }
+    }
+}
+
 inline void iq2_s(const std::byte* b, float* y) {
     const float d = fp16(u16(b, 0));
     for (int ib32 = 0; ib32 < 8; ++ib32) {
@@ -235,6 +276,10 @@ inline void decode_blocks(QType format, std::span<const std::byte> blocks, std::
             return detail::q6_k;
         case QType::GGML_IQ2_XXS:
             return detail::iq2_xxs;
+        case QType::GGML_IQ2_XS:
+            return detail::iq2_xs;
+        case QType::GGML_IQ3_XXS:
+            return detail::iq3_xxs;
         case QType::GGML_IQ4_NL:
             return detail::iq4_nl;
         case QType::GGML_IQ3_S:

@@ -96,6 +96,8 @@ FP8_E4M3FN_ROW_BF16 = Fp8RowFormat("fp8_e4m3fn_row_bf16")
 GGML_Q8_0 = GgmlBlockFormat("ggml_q8_0", 8, 32, 34)
 GGML_Q6_K = GgmlBlockFormat("ggml_q6_k", 14, 256, 210)
 GGML_IQ2_XXS = GgmlBlockFormat("ggml_iq2_xxs", 16, 256, 66)
+GGML_IQ2_XS = GgmlBlockFormat("ggml_iq2_xs", 17, 256, 74)
+GGML_IQ3_XXS = GgmlBlockFormat("ggml_iq3_xxs", 18, 256, 98)
 GGML_IQ4_NL = GgmlBlockFormat("ggml_iq4_nl", 20, 32, 18)
 GGML_IQ3_S = GgmlBlockFormat("ggml_iq3_s", 21, 256, 110)
 GGML_IQ2_S = GgmlBlockFormat("ggml_iq2_s", 22, 256, 82)
@@ -129,6 +131,8 @@ GGML_BLOCK_FORMATS = MappingProxyType(
             GGML_Q8_0,
             GGML_Q6_K,
             GGML_IQ2_XXS,
+            GGML_IQ2_XS,
+            GGML_IQ3_XXS,
             GGML_IQ4_NL,
             GGML_IQ3_S,
             GGML_IQ2_S,
@@ -248,6 +252,8 @@ __all__ = [
     "GGML_Q8_0",
     "GGML_Q6_K",
     "GGML_IQ2_XXS",
+    "GGML_IQ2_XS",
+    "GGML_IQ3_XXS",
     "GGML_IQ4_NL",
     "GGML_IQ3_S",
     "GGML_IQ2_S",

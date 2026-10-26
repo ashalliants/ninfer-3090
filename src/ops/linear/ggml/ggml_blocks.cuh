@@ -45,7 +45,7 @@
 
 #include <cstdint>
 
-// The device copy of ggml's IQ3_S grid (third_party/ggml/ggml-common-tables.h is the one table
+// The device copy of ggml's lookup tables (third_party/ggml/ggml-common-tables.h is the one table
 // set; tests read the same header as host arrays). Static per translation unit.
 #define NINFER_GGML_TABLE_BEGIN(type, name, size) static __device__ const type name[size] = {
 #define NINFER_GGML_TABLE_END() };
@@ -56,7 +56,8 @@ namespace ninfer::ops::ggml {
 inline constexpr int kSubValues = 32;
 
 // One decoded 32-value sub-block: v[w] packs values 4w..4w+3 as signed bytes (little endian).
-// scale[0] multiplies values 0..15 and scale[1] values 16..31; they differ only for Q6_K.
+// scale[0] multiplies values 0..15 and scale[1] values 16..31; they differ only for Q6_K and
+// IQ2_XS.
 struct SubBlock {
     int v[8];
     float scale[2];
@@ -209,6 +210,75 @@ struct Format<QType::GGML_IQ3_S> {
             const int m2 = static_cast<int>(__vcmpne4(((sg & 0x30) << 3) | ((sg & 0xC0) << 17), 0));
             out.v[2 * l]     = static_cast<int>(__vsub4(g1 ^ m1, m1));
             out.v[2 * l + 1] = static_cast<int>(__vsub4(g2 ^ m2, m2));
+        }
+    }
+};
+
+// ksigns_iq2xs[v] for a 7-bit selector v, in each byte of a word: v with bit 7 set to the parity of
+// v (ggml's unpack_ksigns). Bit j of a byte negates value j of its eight.
+__device__ __forceinline__ std::uint32_t ksigns_word(std::uint32_t v) {
+    v &= 0x7FU;
+    return (v | ((__popc(v) & 1U) << 7)) * 0x01010101U;
+}
+
+// Eight grid magnitudes (two words of four bytes) with the signs of `signs` applied.
+__device__ __forceinline__ void signed_grid(std::uint32_t g0, std::uint32_t g1, std::uint32_t signs,
+                                            int& v0, int& v1) {
+    const int m0 = static_cast<int>(__vcmpne4(signs & 0x08040201U, 0));
+    const int m1 = static_cast<int>(__vcmpne4(signs & 0x80402010U, 0));
+    v0           = static_cast<int>(__vsub4(static_cast<int>(g0) ^ m0, m0));
+    v1           = static_cast<int>(__vsub4(static_cast<int>(g1) ^ m1, m1));
+}
+
+// IQ2_XS: {fp16 d; u16 qs[32]; u8 scales[8]} per 256 values. Code qs[4 ib + l] holds a 9-bit
+// iq2xs_grid index and a 7-bit sign selector for values 8 l..8 l + 7 of sub-block ib; values 0..15
+// have scale d (0.5 + (scales[ib] & 15)) / 4 and values 16..31 d (0.5 + (scales[ib] >> 4)) / 4,
+// formed as ggml's dequantize_row_iq2_xs forms db. No GGML linear instance takes it yet (no
+// registered problem is IQ2_XS); the grid is read from global memory.
+template <>
+struct Format<QType::GGML_IQ2_XS> {
+    static constexpr int kBlockValues = 256, kBlockBytes = 74;
+    static constexpr bool kSplitScale = true;
+    __device__ static void decode(const std::uint8_t* row, int s, const Tables&, SubBlock& out) {
+        const std::uint8_t* b = row + (s >> 3) * kBlockBytes;
+        const int ib          = s & 7;
+        const float d         = load_half(b);
+        const int sc          = b[66 + ib];
+        out.scale[0]          = d * (0.5F + static_cast<float>(sc & 0x0F)) * 0.25F;
+        out.scale[1]          = d * (0.5F + static_cast<float>(sc >> 4)) * 0.25F;
+        const std::uint32_t codes[2] = {static_cast<std::uint32_t>(load_i32_b2(b + 2 + 8 * ib)),
+                                        static_cast<std::uint32_t>(load_i32_b2(b + 6 + 8 * ib))};
+        const auto* grid_table = reinterpret_cast<const uint2*>(ggml_tables::iq2xs_grid);
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const std::uint32_t code = (codes[l >> 1] >> (16 * (l & 1))) & 0xFFFFU;
+            const uint2 grid         = grid_table[code & 511U];
+            signed_grid(grid.x, grid.y, ksigns_word(code >> 9), out.v[2 * l], out.v[2 * l + 1]);
+        }
+    }
+};
+
+// IQ3_XXS: {fp16 d; u8 qs[64]; u32 scales_and_signs[8]} per 256 values. Sub-block ib reads
+// qs[8 ib..8 ib + 7] (one iq3xxs_grid index per four values) and word ib: four 7-bit sign selectors
+// (one per eight values) and a 4-bit scale ls in bits 28..31; its scale is d (0.5 + ls) / 2, formed
+// as ggml's dequantize_row_iq3_xxs forms db. No GGML linear instance takes it yet (no registered
+// problem is IQ3_XXS); the grid is read from global memory.
+template <>
+struct Format<QType::GGML_IQ3_XXS> {
+    static constexpr int kBlockValues = 256, kBlockBytes = 98;
+    static constexpr bool kSplitScale = false;
+    __device__ static void decode(const std::uint8_t* row, int s, const Tables&, SubBlock& out) {
+        const std::uint8_t* b     = row + (s >> 3) * kBlockBytes;
+        const int ib              = s & 7;
+        const std::uint32_t aux32 = static_cast<std::uint32_t>(load_i32_b2(b + 66 + 4 * ib));
+        const float db            = load_half(b) * (0.5F + static_cast<float>(aux32 >> 28)) * 0.5F;
+        out.scale[0] = out.scale[1] = db;
+        const std::uint8_t* qs = b + 2 + 8 * ib;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            signed_grid(ggml_tables::iq3xxs_grid[qs[2 * l + 0]],
+                        ggml_tables::iq3xxs_grid[qs[2 * l + 1]], ksigns_word(aux32 >> (7 * l)),
+                        out.v[2 * l], out.v[2 * l + 1]);
         }
     }
 };
