@@ -44,3 +44,8 @@ add_test(NAME ninfer_host_arena_replay_test
 # passes. Pure Python, no GPU.
 add_test(NAME ninfer_bench_rows_check_test
   COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/bench/check_bench_rows.py --self-test)
+
+# The randomised soak harness's self-test (tools/bench/serve_soak.py), against a fake server that stalls,
+# answers 400/500, grows its resident memory and goes away. Pure Python, no GPU, about 12 s.
+add_test(NAME ninfer_serve_soak_test
+  COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/bench/test_serve_soak.py)

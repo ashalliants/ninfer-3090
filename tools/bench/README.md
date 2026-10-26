@@ -514,3 +514,71 @@ have placed it right now?) and the live set stays the real run's, so the engine'
 placement, which would change every later event, is not modelled. A live A/B of plain two-ended placement did
 not show what the replay predicted for it. `python -I tools/bench/test_replay_host_arena.py` checks the tool
 itself and runs as `ninfer_host_arena_replay_test`.
+
+## Randomised serving soak (`serve_soak.py`)
+
+`serve_soak.py` sends a seeded random mix of requests to a running `ninfer-serve` for a fixed time and
+reports what went wrong. It is the long-run check the single-purpose probes above are not: leaks, a lane
+that stops answering, and error paths that only break after hours. It is adapted in shape from Basalt's
+`tools/serve_soak.py` and built on `tools/streaming_http`, so stalls are timed from SSE event arrivals.
+
+| Kind | What it sends | A pass is |
+|---|---|---|
+| `chat` | OpenAI `/v1/chat/completions` and Anthropic `/v1/messages` streams, 32 to 1200 tokens; half carry a unique prefix, so the prompt cache sees both hits and misses | 200 and the stream's terminator (`[DONE]`, `message_stop`) |
+| `cancel` | a stream dropped after 1 to 40 events, or 50 ms to 1.5 s after the send (often mid-prefill) | no error status; nothing else is asserted |
+| `near` | a prompt of context minus the reply and 256 tokens, sized with `/v1/messages/count_tokens` | 200 |
+| `over` | a prompt 2000 tokens beyond the context | 400 `context_length_exceeded` (Anthropic: 400 `invalid_request_error`) |
+| `oversize` | a body one MiB above `--max-request-mib` | 413; a reset while uploading is also accepted and counted as `ok_reset`, since the server answers before it reads the body |
+| `image` | base64 data-URL images from `--images DIR` in OpenAI `image_url` / Anthropic `image` parts | 200, or 400 `vision_disabled` from a server without `--vision`, which skips images for the rest of the run |
+
+The first requests are one of every enabled kind, then random picks with 1 to `--max-concurrency` (4) in
+flight. `near`, `over` and `oversize` are rationed (a few per ten minutes) because each costs a context-sized
+prefill or a body of hundreds of MiB (an `oversize` request holds about twice the limit in client memory
+for a moment). `--kinds chat,cancel` narrows the mix. The context is read from `/slots` (`n_ctx`); pass
+`--context` to override it.
+
+Every `--sample-seconds` (2) it reads `/v1/load` (queue depth), `/metrics` (the unlabelled `ninfer_*`
+series), `/slots` (busy lanes, context in use) and the server's resident memory, and keeps them in the
+report's `samples`. It sends a normal `Host`, no `Origin` or `Sec-Fetch-*`, and `--api-key` as
+`Authorization: Bearer`, so it passes the server's Host and Origin checks.
+
+**Run it against a live server under the GPU lock.** The server holds the card for the whole soak, so
+take the lock for the server's lifetime (`CLAUDE.md`, "GPU lock"), then run the soak from a second shell:
+
+```powershell
+. tools/gpu-lock.ps1
+Invoke-WithGpuLock {
+    $server = Start-Process ninfer-serve -ArgumentList 'model.ninfer','--max-context','32768','--vision' -PassThru
+    Start-Sleep 60      # or poll /health
+    python tools/bench/serve_soak.py --url http://127.0.0.1:8080 --minutes 30 --pid $server.Id `
+        --images C:\soak-images --out soak.json
+    $code = $LASTEXITCODE
+    Stop-Process $server
+}
+exit $code
+```
+
+On Linux the memory is read from `/proc/<pid>/status` (`VmRSS`). On Windows it needs `psutil`; when that
+is not installed the run prints a note and leaves memory out (nothing is installed for it). Without
+`--pid` memory is not sampled either. Pass `--seed` to repeat a mix.
+
+**What it flags, and the exit code.** 0 is a clean run; 1 is any of the findings below; 2 is a run that
+could not start (unreachable server, `/v1/models` refused, `--images` with no usable file). The report's
+`findings`, `failures`, `stalls` and `rss` say which.
+
+- **Unexpected result:** a status or error code other than the table's, a stream that ends without its
+  terminator, an error event inside a stream, or a transport error.
+- **Stall:** no SSE event for `--stall-seconds` (60), counted from the send until the first event and
+  after that from the previous one (a keep-alive comment does not count). The report gives the phase
+  (before the first event or mid-stream); the stalled request is cancelled so the run can end. A request
+  that is still running when the `--drain-seconds` grace period (stall plus 30 s) after the last launch
+  ends is reported the same way. A server with more concurrent long prefills than lanes can queue a
+  request past 60 s, so raise `--stall-seconds` or lower `--max-concurrency` rather than ignoring it.
+- **Memory growth:** the median of the last fifth of the second half of the run minus the median of its
+  first fifth is above `--rss-growth-mib` (512). Fewer than 4 samples gives no verdict (the report says so).
+- **Server gone:** `/v1/load`, `/metrics` and `/slots` all fail 3 sampling rounds in a row.
+
+`python -I tools/bench/test_serve_soak.py` checks the tool against a fake server (a clean run, a stall, an
+unexpected 400 and 500, growing and flat memory, a vanished server) and runs as `ninfer_serve_soak_test`
+without a GPU. It says nothing about the real server: the first run against one is the check that the
+expected statuses above match what that build returns.
