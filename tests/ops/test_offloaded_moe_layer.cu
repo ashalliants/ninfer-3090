@@ -48,7 +48,8 @@
 //   - malformed inputs: a short shared gate and a non-unit third extent are rejected on the host;
 //     an id outside [0, E) is logged but not dispatched, on both dispatch routes.
 //
-// --small runs one format at T in {1, 8} with few configurations (for compute-sanitizer).
+// --small runs two formats (IQ2_S+Q2_0, IQ4_XS+IQ4_NL) at T in {1, 8} with few configurations (for
+// compute-sanitizer).
 
 #include "artifact/reader.h"
 #include "core/arena.h"
@@ -524,11 +525,11 @@ void check_bank(const Bank& bank, int k, const std::vector<int>& column_counts, 
                 worst_point = std::max(worst_point, crit.worst);
                 check(accept(crit), "expert output outside the A8 criterion against FP64");
             }
-            std::printf("%-13s T=%-2d %zu placements, staged, precast and precast+registers, bit-identical to the CPU "
+            std::printf("%-14s T=%-2d %zu placements, staged, precast and precast+registers, bit-identical to the CPU "
                         "engine; FP64 normwise %.3e, worst %.3e\n",
                         format_name(bank.format), columns, configs().size(), worst_norm, worst_point);
         } else {
-            std::printf("%-13s T=%-2d %zu placements, staged, precast and precast+registers, bit-identical to the CPU "
+            std::printf("%-14s T=%-2d %zu placements, staged, precast and precast+registers, bit-identical to the CPU "
                         "engine\n",
                         format_name(bank.format), columns,
                         configs().size());
@@ -540,7 +541,8 @@ void test_synthetic_banks() {
     std::mt19937 rng(202);
     constexpr int kExperts = 64, kTopK = 10;
     for (QType format : kRecordFormats) {
-        if (g_small && format != QType::GGML_REC_IQ2_S_Q2_0) { continue; }
+        // --small: one Q2_0-down format and the IQ4_XS+IQ4_NL record (signed multipliers, IQ4_NL down).
+        if (g_small && format != QType::GGML_REC_IQ2_S_Q2_0 && format != QType::GGML_REC_IQ4_XS_IQ4_NL) { continue; }
         std::vector<std::vector<std::uint8_t>> records;
         for (int e = 0; e < kExperts; ++e) { records.push_back(random_record(format, rng)); }
         const auto bank = make_bank(format, records, align256(om::record_geometry(format).bytes));

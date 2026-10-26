@@ -203,7 +203,7 @@ The converter currently writes these formats:
 | `fp8_e4m3fn_row_bf16` | `fp8_row_maxabs` | `import_encoded` |
 | `nvfp4` | Supply a custom quantizer | `import_encoded` |
 | `ggml_q8_0`, `ggml_q6_k`, `ggml_iq2_xxs`, `ggml_iq2_xs`, `ggml_iq3_xxs`, `ggml_iq4_nl`, `ggml_iq3_s`, `ggml_iq2_s`, `ggml_iq4_xs`, `ggml_iq1_m`, `ggml_q2_0` | None | `import_encoded` from a GGUF |
-| `ggml_rec_iq2_s_q2_0`, `ggml_rec_iq2_xxs_q2_0`, `ggml_rec_iq1_m_q2_0`, `ggml_rec_q2_0_q2_0` | None | `import_expert_records` from a GGUF expert layer (the last: the MTP drafter's fused gate/up) |
+| `ggml_rec_iq2_s_q2_0`, `ggml_rec_iq2_xxs_q2_0`, `ggml_rec_iq1_m_q2_0`, `ggml_rec_q2_0_q2_0`, and the IQ3 packs' `ggml_rec_iq2_xs_q2_0`, `ggml_rec_iq2_xs_iq4_nl`, `ggml_rec_iq2_xxs_iq4_nl`, `ggml_rec_iq2_s_iq4_nl`, `ggml_rec_iq3_xxs_q2_0`, `ggml_rec_iq3_xxs_iq4_nl`, `ggml_rec_iq3_s_q2_0`, `ggml_rec_iq3_s_iq4_nl`, `ggml_rec_iq4_xs_iq4_nl` | None | `import_expert_records` from a GGUF expert layer, whose gate/up and down types pick the format (`ggml_rec_q2_0_q2_0`: the MTP drafter's fused gate/up) |
 
 `grouped_absmax` stores one FP16 scale per group and signed integer codes. `grouped_search` stores
 the same words but chooses each group's scale by minimizing rounding error weighted by an activation

@@ -1,8 +1,8 @@
 #pragma once
 
 // Adapted from Infernix a3edb450 include/infernix/ops/offloaded_sparse_moe.h (Apache-2.0).
-// Modified for NInfer-3090: GGML expert records (three record formats, canonical A8 arithmetic)
-// instead of NVFP4 records with per-expert scales; an exact wide route (Infernix's W4A16 contract,
+// Modified for NInfer-3090: GGML expert records (twelve text record formats and the MTP drafter's,
+// canonical A8 arithmetic) instead of NVFP4 records with per-expert scales; an exact wide route (Infernix's W4A16 contract,
 // not its W4A4 one, which only met an FP64 bound); the SSD tier, fetch channel, landing, streamed
 // records, overlap/fork streams and L2 warming are not part of this contract (prefill streaming lives
 // in the model, which publishes streamed records as resident frames).
@@ -59,8 +59,12 @@ namespace ninfer::ops {
  *   T >= 1 columns. Expert outputs are BF16 [H, top_k * T]: column t * top_k + i holds y_i[:, t].
  *
  * Supported domain:
- *   Records of format GGML_REC_IQ2_S_Q2_0, GGML_REC_IQ2_XXS_Q2_0 or GGML_REC_IQ1_M_Q2_0 in layout
- *   ggml_expert_record_v1 at [E, 2560, 640] (storage-layouts.md Section 7): one record per expert,
+ *   Records in layout ggml_expert_record_v1 at [E, 2560, 640] (storage-layouts.md Section 7) of one
+ *   of the twelve text formats: gate/up IQ2_S, IQ2_XXS or IQ1_M with Q2_0 down (the IQ2_XS pack),
+ *   and the further pairs of the GSQ-RCO IQ3_XXS and IQ3_S packs: GGML_REC_IQ2_XS_Q2_0,
+ *   GGML_REC_IQ2_XS_IQ4_NL, GGML_REC_IQ2_XXS_IQ4_NL, GGML_REC_IQ2_S_IQ4_NL, GGML_REC_IQ3_XXS_Q2_0,
+ *   GGML_REC_IQ3_XXS_IQ4_NL, GGML_REC_IQ3_S_Q2_0, GGML_REC_IQ3_S_IQ4_NL, GGML_REC_IQ4_XS_IQ4_NL
+ *   (record_geometry refuses any other format; a call takes one format). One record per expert,
  *   gate, up and down at the layout's part offsets. Expert e's record is read from the device frame
  *   frame_base + frames[e] * frame_stride (record_stride when frame_stride is zero) when
  *   frames[e] >= 0, else from the pinned, mapped host bank host_records + e * record_stride

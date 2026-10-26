@@ -6,8 +6,9 @@
 // arch/x86/quants.c, MIT, Copyright (c) 2023-2026 The ggml authors; third_party/ggml/LICENSE).
 //
 // Modified for NInfer: each 32-value sub-block is decoded once into unsigned magnitudes, a sign
-// vector and its two integer half multipliers (Strata's split, with IQ1_M added as 8 grid +- 1 and
-// Q2_0 as code - 1); every column then forms the exact int32 sum P_s of the sub-block, and eight
+// vector and its two integer half multipliers (Strata's split, with IQ1_M added as 8 grid +- 1,
+// Q2_0 as code - 1, and IQ2_XS, IQ3_XXS, IQ3_S, IQ4_XS and IQ4_NL as ggml's AVX2 decodes of their
+// grids and codebook, ls - 32 being IQ4_XS's signed multiplier); every column then forms the exact int32 sum P_s of the sub-block, and eight
 // sub-blocks' P_s are gathered into one vector so that the canonical A8 step (one FP32 product and
 // one fma per sub-block into lane s % 32, then the fixed butterfly) runs eight lanes at a time
 // (ops/common/canonical_ggml.h). Strata's per-super-block integer accumulation and float order are
@@ -186,6 +187,114 @@ struct Fmt<QType::GGML_Q2_0> {
     }
 };
 
+template <>
+struct Fmt<QType::GGML_IQ2_XS> {
+    NINFER_AVX2 static void decode(const std::uint8_t* row, int ch, int, Sub* subs, float* cs) {
+        const std::uint8_t* b = row + static_cast<std::size_t>(ch) * 74;
+        const float c         = canon::mul_rn(fp16_to_f32(load_u16(b)), 0.125F);
+        for (int ib = 0; ib < 8; ++ib) {
+            const std::uint8_t* q = b + 2 + 8 * ib;
+            const int code[4]     = {load_u16(q), load_u16(q + 2), load_u16(q + 4), load_u16(q + 6)};
+            subs[ib].aw = grid4(iq2xs_grid, code[0] & 511, code[1] & 511, code[2] & 511, code[3] & 511);
+            subs[ib].sg = _mm256_set_epi64x(static_cast<long long>(even_signs.v[code[3] >> 9]),
+                                            static_cast<long long>(even_signs.v[code[2] >> 9]),
+                                            static_cast<long long>(even_signs.v[code[1] >> 9]),
+                                            static_cast<long long>(even_signs.v[code[0] >> 9]));
+            const int scale = b[66 + ib];
+            subs[ib].m      = half_multipliers(2 * (scale & 0xF) + 1, 2 * (scale >> 4) + 1);
+            cs[ib]          = c;
+        }
+    }
+};
+
+template <>
+struct Fmt<QType::GGML_IQ3_XXS> {
+    NINFER_AVX2 static void decode(const std::uint8_t* row, int ch, int, Sub* subs, float* cs) {
+        const std::uint8_t* b = row + static_cast<std::size_t>(ch) * 98;
+        const float c         = canon::mul_rn(fp16_to_f32(load_u16(b)), 0.25F);
+        for (int ib = 0; ib < 8; ++ib) {
+            const std::uint8_t* q  = b + 2 + 8 * ib;
+            const std::uint32_t w1 = load_u32(b + 66 + 4 * ib);
+            subs[ib].aw = _mm256_setr_epi32(static_cast<int>(iq3xxs_grid[q[0]]), static_cast<int>(iq3xxs_grid[q[1]]),
+                                            static_cast<int>(iq3xxs_grid[q[2]]), static_cast<int>(iq3xxs_grid[q[3]]),
+                                            static_cast<int>(iq3xxs_grid[q[4]]), static_cast<int>(iq3xxs_grid[q[5]]),
+                                            static_cast<int>(iq3xxs_grid[q[6]]), static_cast<int>(iq3xxs_grid[q[7]]));
+            subs[ib].sg = _mm256_set_epi64x(static_cast<long long>(even_signs.v[(w1 >> 21) & 127]),
+                                            static_cast<long long>(even_signs.v[(w1 >> 14) & 127]),
+                                            static_cast<long long>(even_signs.v[(w1 >> 7) & 127]),
+                                            static_cast<long long>(even_signs.v[w1 & 127]));
+            subs[ib].m  = _mm256_set1_epi16(static_cast<short>(2 * static_cast<int>(w1 >> 28) + 1));
+            cs[ib]      = c;
+        }
+    }
+};
+
+template <>
+struct Fmt<QType::GGML_IQ3_S> {
+    NINFER_AVX2 static void decode(const std::uint8_t* row, int ch, int, Sub* subs, float* cs) {
+        const std::uint8_t* b = row + static_cast<std::size_t>(ch) * 110;
+        const float c         = fp16_to_f32(load_u16(b));
+        for (int ib = 0; ib < 8; ++ib) {
+            const std::uint8_t* qs = b + 2 + 8 * ib;
+            const int qh           = b[66 + ib];
+            int grid[8];
+            for (int l = 0; l < 4; ++l) {
+                grid[2 * l]     = static_cast<int>(iq3s_grid[qs[2 * l] | ((qh << (8 - 2 * l)) & 256)]);
+                grid[2 * l + 1] = static_cast<int>(iq3s_grid[qs[2 * l + 1] | ((qh << (7 - 2 * l)) & 256)]);
+            }
+            subs[ib].aw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(grid));
+            subs[ib].sg = sign_vector(load_u32(b + 74 + 4 * ib));
+            const int nibble = (b[106 + ib / 2] >> (4 * (ib % 2))) & 0xF;
+            subs[ib].m       = _mm256_set1_epi16(static_cast<short>(1 + 2 * nibble));
+            cs[ib]           = c;
+        }
+    }
+};
+
+// 16 bytes of 4-bit codes (code j in the low nibble of byte j, code j + 16 in its high nibble) ->
+// the 32 kvalues_iq4nl values in value order, signed.
+NINFER_AVX2 inline __m256i iq4_values(const std::uint8_t* codes) {
+    const __m128i table = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_iq4nl));
+    const __m128i m4    = _mm_set1_epi8(0x0F);
+    const __m128i q     = _mm_loadu_si128(reinterpret_cast<const __m128i*>(codes));
+    const __m128i lo    = _mm_shuffle_epi8(table, _mm_and_si128(q, m4));
+    const __m128i hi    = _mm_shuffle_epi8(table, _mm_and_si128(_mm_srli_epi16(q, 4), m4));
+    return _mm256_set_m128i(hi, lo);
+}
+
+template <>
+struct Fmt<QType::GGML_IQ4_XS> {
+    NINFER_AVX2 static void decode(const std::uint8_t* row, int ch, int, Sub* subs, float* cs) {
+        const std::uint8_t* b      = row + static_cast<std::size_t>(ch) * 136;
+        const float c              = fp16_to_f32(load_u16(b));
+        const std::uint16_t high   = load_u16(b + 2);
+        for (int ib = 0; ib < 8; ++ib) {
+            const __m256i w = iq4_values(b + 8 + 16 * ib);
+            const int ls    = ((b[4 + ib / 2] >> (4 * (ib % 2))) & 0xF) | (((high >> (2 * ib)) & 3) << 4);
+            subs[ib].aw     = _mm256_abs_epi8(w);
+            subs[ib].sg     = w;
+            subs[ib].m      = _mm256_set1_epi16(static_cast<short>(ls - 32));
+            cs[ib]          = c;
+        }
+    }
+};
+
+// IQ4_NL: one 32-value block per sub-block, so a chunk is n blocks.
+template <>
+struct Fmt<QType::GGML_IQ4_NL> {
+    NINFER_AVX2 static void decode(const std::uint8_t* row, int ch, int n, Sub* subs, float* cs) {
+        const __m256i m = _mm256_set1_epi16(1);
+        for (int i = 0; i < n; ++i) {
+            const std::uint8_t* b = row + static_cast<std::size_t>(8 * ch + i) * 18;
+            const __m256i w       = iq4_values(b + 2);
+            subs[i].aw            = _mm256_abs_epi8(w);
+            subs[i].sg            = w;
+            subs[i].m             = m;
+            cs[i]                 = fp16_to_f32(load_u16(b));
+        }
+    }
+};
+
 // Lane j of the result = the sum of the eight int32 lanes of v[j].
 NINFER_AVX2 inline __m256i gather_sums(const __m256i* v) {
     const __m256i h01 = _mm256_hadd_epi32(v[0], v[1]);
@@ -280,6 +389,11 @@ void row_values_avx2(QType format, const std::uint8_t* matrix, std::size_t row_b
     case QType::GGML_IQ2_S: rows_any<QType::GGML_IQ2_S>(ncols, matrix, row_bytes, k, r0, r1, acts, out); return;
     case QType::GGML_IQ1_M: rows_any<QType::GGML_IQ1_M>(ncols, matrix, row_bytes, k, r0, r1, acts, out); return;
     case QType::GGML_Q2_0: rows_any<QType::GGML_Q2_0>(ncols, matrix, row_bytes, k, r0, r1, acts, out); return;
+    case QType::GGML_IQ2_XS: rows_any<QType::GGML_IQ2_XS>(ncols, matrix, row_bytes, k, r0, r1, acts, out); return;
+    case QType::GGML_IQ3_XXS: rows_any<QType::GGML_IQ3_XXS>(ncols, matrix, row_bytes, k, r0, r1, acts, out); return;
+    case QType::GGML_IQ3_S: rows_any<QType::GGML_IQ3_S>(ncols, matrix, row_bytes, k, r0, r1, acts, out); return;
+    case QType::GGML_IQ4_XS: rows_any<QType::GGML_IQ4_XS>(ncols, matrix, row_bytes, k, r0, r1, acts, out); return;
+    case QType::GGML_IQ4_NL: rows_any<QType::GGML_IQ4_NL>(ncols, matrix, row_bytes, k, r0, r1, acts, out); return;
     default: throw std::invalid_argument("offloaded_sparse_moe: not an expert block format");
     }
 }

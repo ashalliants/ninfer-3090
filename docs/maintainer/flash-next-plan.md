@@ -30,7 +30,8 @@ references, `engine-architecture.md`).
 | 16 | Two lanes (`--max-concurrency 2`): slotted state and KV, a batched plain round for two decoding lanes (MTP stays at one), per-lane context cache, graphs and leases ([measurements](#pr-16-two-lanes), spike [#284](https://github.com/ashalliants/ninfer-3090/pull/284)) | done, opt-in (aggregate gate missed, below) |
 
 The C++ loader reads and places every `ggml_*` and `ggml_rec_*` object. Linear and LinearAdd execute
-the six dense formats (PR 3); offloaded_sparse_moe executes the three expert record formats (PR 7).
+the six dense formats (PR 3); offloaded_sparse_moe executes the three expert record formats (PR 7)
+and the nine further pairs of the GSQ-RCO IQ3 packs (Basalt items below).
 
 ## PR 3 measurements
 
@@ -1132,6 +1133,36 @@ None has been measured on the RTX 3090 yet.
   instance runs and the round is as before. Off, the default instances' SASS is the base kernels'
   with the 64-byte `SamplingConfig`. Basalt's own measurements (RTX 5090, its models) are in
   serving.md; nothing has been measured here.
+- **Expert records of the GSQ-RCO IQ3_XXS and IQ3_S packs** (F8 of the Basalt learnings, part 2;
+  no option: new formats only). The packs' published tensor allocations choose a (gate/up, down)
+  pair per layer, gate/up from IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S or IQ4_XS and down Q2_0 or
+  IQ4_NL, mixed across layers. Nine pairs are new record formats (`ggml_rec_iq2_xs_q2_0` ...
+  `ggml_rec_iq4_xs_iq4_nl`, [tensor formats](tensor-formats.md) Section 3.6); the converter picks
+  each layer's from its GGUF types, and offloaded_sparse_moe runs them on the CPU engine (scalar
+  and AVX2), the narrow route (dp4a; `down_kernel` is templated on the down format) and the wide
+  route (int8 MMA).
+  - Numerics: the canonical A8 arithmetic, unchanged; every new decoder gives ggml's reference
+    value exactly as c * m * w. IQ4_XS brings a signed multiplier ls - 32 and |w| up to 127, so
+    the bound of `canonical_ggml.h` is now |P_s| <= 32 * 32 * 127^2 = 16,516,096 < 2^24 (tight,
+    pinned by `extreme_magnitude_records` in `ninfer_offloaded_moe_cpu_test` on both ISAs); MMA and
+    dp4a sums stay below 2^22 and AVX2's byte pairs below 2^15. The existing formats' kernels
+    compile to the base commit's SASS (all 50 narrow kernels and the 5 wide kernels).
+  - Memory: frames are sized by the largest record stride of the artifact (`frame_stride`), so the
+    same frame budget holds fewer frames: 2,662,400 bytes for the IQ3_S pack (its one IQ4_XS layer)
+    and 2,329,600 for the IQ3_XXS pack, against 1,510,400 for the IQ2_XS pack.
+  - The wide route's gate/up units of IQ3_XXS, IQ3_S and IQ4_XS do not stage their 64-row slice in
+    shared memory (62,720-87,040 bytes beside the tiles' 47,360 exceed the 101,376-byte limit):
+    their decodes read the record where it lives, so a job's later 64-column tiles re-read it (from
+    L2 for a device frame or staging slot, over PCIe for a zero-copy host record). The narrow
+    route stages them as before (IQ4_XS gate/up: 67,584 bytes of shared memory at 8 columns, one
+    CTA per SM).
+  - Not yet loadable: an IQ3 pack also needs dense Q4_K and Q5_K linears, the new (format, shape)
+    combinations of its dense tensors, a Q5_K or Q6_K output head and an IQ3_S token embedding
+    (Task 35b), and its larger expert banks need partial residency to fit host RAM (Task 36).
+  - GPU-session checks: `ninfer_offloaded_moe_layer_test` and `ninfer_offloaded_moe_wide_test`
+    (every record format bitwise against the CPU engine; compiled, not run), the bench rows of the
+    new formats (`ninfer_offloaded_moe_bench`), and whether the wide route's unstaged IQ3/IQ4 slices
+    want a split staging scheme.
 
 ## Artifact decisions
 
@@ -1147,7 +1178,8 @@ expert cache are lifted from it in PRs 7-9).
 - **Expert banks (PR 2b).** Each layer's routed experts are one parameter
   `text/layers/L/moe/experts` of shape `[512, 2560, 640]` in `ggml_expert_record_v1`: one record
   per expert holding its gate, up and down blocks, in one of three record formats
-  (`ggml_rec_iq2_s_q2_0`, `ggml_rec_iq2_xxs_q2_0`, `ggml_rec_iq1_m_q2_0`). Infernix's frame pool,
+  (`ggml_rec_iq2_s_q2_0`, `ggml_rec_iq2_xxs_q2_0`, `ggml_rec_iq1_m_q2_0`; the IQ3 packs use nine
+  more, [tensor formats](tensor-formats.md) Section 3.6). Infernix's frame pool,
   residency table, staging and CPU jobs treat an expert as one opaque record with one
   `record_stride`; packing records on the host at load would be runtime repacking, so the converter
   writes them. Records are 1,510,400 / 1,305,600 / 1,177,600 bytes, back to back: the stride is

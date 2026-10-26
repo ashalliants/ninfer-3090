@@ -48,10 +48,30 @@ void cuda_ok(cudaError_t e, const char* what) {
     }
 }
 
-constexpr QType kFormats[] = {QType::GGML_REC_IQ2_S_Q2_0, QType::GGML_REC_IQ2_XXS_Q2_0, QType::GGML_REC_IQ1_M_Q2_0};
+// The IQ2_XS pack's three record formats, then the further pairs of the GSQ-RCO IQ3_XXS and IQ3_S
+// packs.
+constexpr QType kFormats[] = {
+    QType::GGML_REC_IQ2_S_Q2_0,    QType::GGML_REC_IQ2_XXS_Q2_0,   QType::GGML_REC_IQ1_M_Q2_0,
+    QType::GGML_REC_IQ2_XS_Q2_0,   QType::GGML_REC_IQ2_XS_IQ4_NL,  QType::GGML_REC_IQ2_XXS_IQ4_NL,
+    QType::GGML_REC_IQ2_S_IQ4_NL,  QType::GGML_REC_IQ3_XXS_Q2_0,   QType::GGML_REC_IQ3_XXS_IQ4_NL,
+    QType::GGML_REC_IQ3_S_Q2_0,    QType::GGML_REC_IQ3_S_IQ4_NL,   QType::GGML_REC_IQ4_XS_IQ4_NL};
 
 const char* name(QType f) {
-    return f == QType::GGML_REC_IQ2_S_Q2_0 ? "iq2_s" : f == QType::GGML_REC_IQ2_XXS_Q2_0 ? "iq2_xxs" : "iq1_m";
+    switch (f) {
+    case QType::GGML_REC_IQ2_S_Q2_0: return "iq2_s";
+    case QType::GGML_REC_IQ2_XXS_Q2_0: return "iq2_xxs";
+    case QType::GGML_REC_IQ1_M_Q2_0: return "iq1_m";
+    case QType::GGML_REC_IQ2_XS_Q2_0: return "iq2_xs";
+    case QType::GGML_REC_IQ2_XS_IQ4_NL: return "iq2_xs+iq4_nl";
+    case QType::GGML_REC_IQ2_XXS_IQ4_NL: return "iq2_xxs+iq4_nl";
+    case QType::GGML_REC_IQ2_S_IQ4_NL: return "iq2_s+iq4_nl";
+    case QType::GGML_REC_IQ3_XXS_Q2_0: return "iq3_xxs";
+    case QType::GGML_REC_IQ3_XXS_IQ4_NL: return "iq3_xxs+iq4_nl";
+    case QType::GGML_REC_IQ3_S_Q2_0: return "iq3_s";
+    case QType::GGML_REC_IQ3_S_IQ4_NL: return "iq3_s+iq4_nl";
+    case QType::GGML_REC_IQ4_XS_IQ4_NL: return "iq4_xs+iq4_nl";
+    default: return "?";
+    }
 }
 
 std::uint16_t fp16_of(float v) {
@@ -130,7 +150,7 @@ void bench_gpu(int experts, int reps, int misses, bool precast, bool registers) 
     std::printf("GPU narrow route, %d experts each routed every column (top_k = %d), cold L2, median of %d%s%s\n",
                 experts, experts, reps, precast ? ", input cast once per call" : "",
                 registers ? ", gate/up from registers" : "");
-    std::printf("%-8s %-10s %3s %8s %9s %8s %9s %6s\n", "format", "placement", "T", "MB", "graph us", "eager us",
+    std::printf("%-14s %-10s %3s %8s %9s %8s %9s %6s\n", "format", "placement", "T", "MB", "graph us", "eager us",
                 "GB/s", "of 936");
     for (QType format : kFormats) {
         const std::uint64_t stride = stride_of(format);
@@ -219,7 +239,7 @@ void bench_gpu(int experts, int reps, int misses, bool precast, bool registers) 
                 cuda_ok(cudaGraphExecDestroy(exec), "destroy");
                 cuda_ok(cudaGraphDestroy(graph), "destroy");
                 static const char* kPlacement[] = {"resident", "staged", "zero-copy", "m-staged", "m-zc-rule", "m-zerocopy"};
-                std::printf("%-8s %-10s %3d %8.2f %9.1f %8.1f %9.1f %5.0f%%\n", name(format), kPlacement[placement], t,
+                std::printf("%-14s %-10s %3d %8.2f %9.1f %8.1f %9.1f %5.0f%%\n", name(format), kPlacement[placement], t,
                             record_mb, g, e, record_mb * 1e3 / g, 100.0 * record_mb * 1e3 / g / 936.0);
             }
         }
@@ -232,7 +252,7 @@ void bench_cpu(int reps) {
     const int records = 96; // > the last-level cache at every format
     std::printf("CPU worker team, one cold expert at T = 1, median of %d (ISA %s)\n", reps,
                 om::cpu_isa_name(om::best_cpu_isa()));
-    std::printf("%-8s %7s %10s %9s\n", "format", "workers", "us", "GB/s");
+    std::printf("%-14s %7s %10s %9s\n", "format", "workers", "us", "GB/s");
     std::vector<std::uint16_t> x(om::kHidden), y(om::kHidden);
     std::normal_distribution<float> n(0.0F, 1.0F);
     for (auto& v : x) {
@@ -261,7 +281,7 @@ void bench_cpu(int reps) {
                 if (r >= 3) { us.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count()); }
             }
             const double m = median(us);
-            std::printf("%-8s %7d %10.1f %9.2f\n", name(format), workers, m, mb * 1e6 / (m * 1e-6) / 1e9);
+            std::printf("%-14s %7d %10.1f %9.2f\n", name(format), workers, m, mb * 1e6 / (m * 1e-6) / 1e9);
         }
     }
 }

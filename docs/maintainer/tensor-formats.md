@@ -8,7 +8,7 @@ separately.
 
 ## 1. Registered formats
 
-NInfer has exactly twenty-one persistent numeric tensor formats in six categories.
+NInfer has exactly thirty-four persistent numeric tensor formats in six categories.
 
 Direct scalar formats preserve one logical scalar word per tensor element:
 
@@ -65,6 +65,15 @@ formats (Section 3.6):
 | `ggml_rec_iq2_xxs_q2_0` | `ggml_iq2_xxs` | `ggml_q2_0` |
 | `ggml_rec_iq1_m_q2_0` | `ggml_iq1_m` | `ggml_q2_0` |
 | `ggml_rec_q2_0_q2_0` | `ggml_q2_0` | `ggml_q2_0` |
+| `ggml_rec_iq2_xs_q2_0` | `ggml_iq2_xs` | `ggml_q2_0` |
+| `ggml_rec_iq2_xs_iq4_nl` | `ggml_iq2_xs` | `ggml_iq4_nl` |
+| `ggml_rec_iq2_xxs_iq4_nl` | `ggml_iq2_xxs` | `ggml_iq4_nl` |
+| `ggml_rec_iq2_s_iq4_nl` | `ggml_iq2_s` | `ggml_iq4_nl` |
+| `ggml_rec_iq3_xxs_q2_0` | `ggml_iq3_xxs` | `ggml_q2_0` |
+| `ggml_rec_iq3_xxs_iq4_nl` | `ggml_iq3_xxs` | `ggml_iq4_nl` |
+| `ggml_rec_iq3_s_q2_0` | `ggml_iq3_s` | `ggml_q2_0` |
+| `ggml_rec_iq3_s_iq4_nl` | `ggml_iq3_s` | `ggml_iq4_nl` |
+| `ggml_rec_iq4_xs_iq4_nl` | `ggml_iq4_xs` | `ggml_iq4_nl` |
 
 `ggml_rec_q2_0_q2_0` holds the Qwen3.8-Flash-Next MTP drafter's experts (Strata's
 `mtp-q2_0.gguf`, whose fused `gate_up_proj` the converter splits into each record's gate and up
@@ -77,7 +86,7 @@ Host or Pinned memory unchanged. Linear and LinearAdd consume `ggml_iq4_xs`, `gg
 [`linear_add.h`](../../include/ninfer/ops/linear_add.h), through their Q8_1 activation profile.
 `ggml_iq2_xs` and `ggml_iq3_xxs` have a device sub-block decoder in the GGML linears
 (`src/ops/linear/ggml/ggml_blocks.cuh`) but no registered problem, so no Op consumes them yet.
-offloaded_sparse_moe consumes the three text expert record formats through its canonical A8
+offloaded_sparse_moe consumes the twelve text expert record formats through its canonical A8
 arithmetic, and `ggml_rec_q2_0_q2_0` on its narrow route only
 ([`offloaded_sparse_moe.h`](../../include/ninfer/ops/offloaded_sparse_moe.h)). An Op that consumes
 a format declares its own support.
@@ -391,9 +400,19 @@ holds. A record contains the expert's three matrices, each in a GGML block forma
 - down `[H, I]` in its down block format, K = I.
 
 The represented values of each matrix are those of its blocks under Section 3.5; the record adds
-no scale, offset or field of its own. The three registered formats are exactly the gate/up and down
-type pairs of the Qwen3.8-Flash-Next GGUF. Their only layout is `ggml_expert_record_v1`
-([storage layouts](storage-layouts.md) Section 7), which fixes where each part lies in a record.
+no scale, offset or field of its own. The twelve text formats are exactly the gate/up and down type
+pairs of the routed experts of three Qwen3.8-Flash-Next GGUFs; gate and up always share a type:
+
+- the IQ2_XS pack: IQ2_S, IQ2_XXS and IQ1_M gate/up, all with Q2_0 down;
+- ISTA-DASLab's GSQ-RCO IQ3_XXS and IQ3_S packs, which choose a pair per layer from IQ2_XXS,
+  IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S or IQ4_XS gate/up with Q2_0 or IQ4_NL down. Their published tensor
+  allocations add the nine pairs after `ggml_rec_q2_0_q2_0` in the table of Section 1.
+
+A record's bytes follow from its pair (at `[E, 2560, 640]`, 256-byte aligned parts): from 1.18 MB
+(`ggml_rec_iq1_m_q2_0`) to 2.66 MB (`ggml_rec_iq4_xs_iq4_nl`); IQ4_NL down rows are 360 bytes
+against Q2_0's 180. The fourth format, `ggml_rec_q2_0_q2_0`, is the MTP drafter's. Their only
+layout is `ggml_expert_record_v1` ([storage layouts](storage-layouts.md) Section 7), which fixes
+where each part lies in a record.
 
 ## 4. Grouped signed-integer tensor model
 

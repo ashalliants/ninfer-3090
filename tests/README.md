@@ -197,14 +197,18 @@ the wide route's cast kernel and through the public Op on both routes, and the a
 `--format NAME` and `--shape N K` select problems; the full run takes about a minute, most of it the
 host oracle. `ninfer_linear_ggml_device_decode_test` checks the linears' device sub-block decoders on
 their own, each value (the int8 code times its FP32 scale) bit for bit against the golden fixtures;
-it is the only device check of IQ2_XS and IQ3_XXS, which have a decoder but no registered problem.
+it is the only device check of IQ2_XS and IQ3_XXS in the linears, which have a decoder but no
+registered problem (the expert routes check them through their records, below).
 
 `ninfer_offloaded_moe_cpu_test` (host only) and `ninfer_offloaded_moe_layer_test` qualify
-offloaded_sparse_moe over the three GGML expert record formats. The CPU test checks the canonical A8
-cast bit for bit against an independent FP64 formulation, the exact sub-block decode of IQ2_S,
-IQ2_XXS, IQ1_M and Q2_0 against the host decoder above, the CPU expert engine against the FP64
-expert oracle at T in {1, 2, 7, 8}, and AVX2, scalar and the worker team at 1-16 workers for equal
-bits. The layer test checks routing (exact top-10 with ties to the lower id) and dispatch exactly,
+offloaded_sparse_moe over the twelve GGML text expert record formats (the IQ2_XS pack's three and
+the further nine of the GSQ-RCO IQ3 packs). The CPU test checks the canonical A8 cast bit for bit
+against an independent FP64 formulation, the exact sub-block decode of every expert block format
+(IQ2_S, IQ2_XXS, IQ2_XS, IQ1_M, IQ3_XXS, IQ3_S, IQ4_XS, Q2_0 and IQ4_NL) against the host decoder
+above, the CPU expert engine against the FP64 expert oracle at T in {1, 2, 7, 8}, AVX2, scalar and
+the worker team at 1-16 workers for equal bits, and rows at the largest |P_s| of the arithmetic
+(IQ4_XS with multiplier -32 and |w| = 127, IQ3_XXS's largest grid entries, IQ4_NL) against exact
+int64 sums on both ISAs. The layer test checks routing (exact top-10 with ties to the lower id) and dispatch exactly,
 then requires every routed output of the GPU narrow route to equal the CPU engine's bits for records
 in device frames, read zero-copy, staged through 1, 3 or 64 slots, and served by the CPU miss service
 at 1 and 6 workers (T in {1, 2, 7, 8, 16}), and the whole layer, with a shared expert composed of

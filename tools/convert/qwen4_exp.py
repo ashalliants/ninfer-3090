@@ -461,8 +461,10 @@ class Subset:
 
 SUBSETS = {
     # One real tensor of every stored GGML type, the direct tensors of a GDN layer, the PLE
-    # layer and a QSA layer, the three expert record formats (IQ2_S, IQ2_XXS and IQ1_M gate/up
-    # with Q2_0 down) and the first 100 volume blocks of the n-gram table.
+    # layer and a QSA layer, the expert banks of layers 0, 1 and 8 and the first 100 volume blocks
+    # of the n-gram table. In the IQ2_XS pack those banks are its three expert record formats
+    # (IQ2_S, IQ2_XXS and IQ1_M gate/up with Q2_0 down); the GSQ-RCO IQ3_XXS and IQ3_S packs choose
+    # another (gate/up, down) pair per layer, and each bank takes its layer's record format.
     "dev": Subset(
         tensors=frozenset(
             {
