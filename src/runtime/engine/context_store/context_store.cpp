@@ -1,4 +1,5 @@
 #include "runtime/engine/context_store/context_store.h"
+#include "runtime/engine/context_store/image_id.h"
 
 #include <algorithm>
 #include <atomic>
@@ -372,6 +373,11 @@ std::optional<std::uint64_t> compressed_content_size(const fs::path& path) {
 
 std::array<std::uint64_t, 2> ContextStore::hash(std::span<const std::uint8_t> bytes) {
     return {xxh64(bytes.data(), bytes.size(), 0), xxh64(bytes.data(), bytes.size(), 0x9e3779b97f4a7c15ULL)};
+}
+
+std::string ContextStore::image_id(const std::array<std::uint64_t, 2>& digests,
+                                   std::uint32_t frontier, bool shared) {
+    return context_store_image_id(digests, frontier, shared);
 }
 
 // An exclusive lock on one file of the directory, held for the store's life. The directory's logic
@@ -870,6 +876,12 @@ void ContextStore::scan() {
         Entry entry;
         const std::string id = path.stem().string();
         if (!valid_id(id) || !read_manifest(path, entry, nullptr) || entry.info.id != id) {
+            // A manifest of this store's own naming that does not describe its image is a damaged
+            // session; a file under another name was never one.
+            if (valid_id(id)) {
+                ++stats_.corrupt_removed;
+                ++stats_.corrupt_manifest;
+            }
             remove_quietly(path);
             remove_quietly(used_path(id));
             remove_quietly(published_path(id));
@@ -934,6 +946,7 @@ void ContextStore::scan() {
             }
         }
     }
+    stats_.corrupt_startup += broken.size();
     for (const std::string& id : broken) { remove_entry_locked(id, true); }
 }
 
@@ -1446,8 +1459,9 @@ void ContextStore::make_room_on_volume_locked(const std::string& id, std::uint64
     }
 }
 
-std::optional<std::vector<std::uint8_t>> ContextStore::load(const std::string& id, bool touch,
-                                                            LoadReport* report) {
+std::optional<std::vector<std::uint8_t>> ContextStore::load(
+    const std::string& id, bool touch, LoadReport* report,
+    std::chrono::steady_clock::time_point deadline) {
     if (!valid_id(id)) { return std::nullopt; }
     // From here until it returns, the image is not evicted or expired and its chunk files are
     // pinned: a put meanwhile (no lock is held while chunks download) would otherwise remove what
@@ -1485,8 +1499,9 @@ std::optional<std::vector<std::uint8_t>> ContextStore::load(const std::string& i
     const auto fetch = [&](std::uint64_t& generation) {
         const auto started  = std::chrono::steady_clock::now();
         std::uint64_t bytes = 0;
-        const FetchStatus status = fetch_image_chunks(id, generation, &bytes);
+        const FetchStatus status = fetch_image_chunks(id, generation, &bytes, deadline);
         if (report != nullptr) {
+            report->expired = report->expired || status == FetchStatus::Expired;
             report->fetched_bytes += bytes;
             report->fetch_ns += static_cast<std::uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1541,7 +1556,10 @@ std::optional<std::vector<std::uint8_t>> ContextStore::load(const std::string& i
                                       nullptr) -> std::optional<std::vector<std::uint8_t>> {
                 std::scoped_lock lock(mutex_);
                 const auto found = entries_.find(id);
-                if (found != entries_.end()) { quarantine_peers_locked(found->second, bad_chunks); }
+                if (found != entries_.end()) {
+                    quarantine_peers_locked(found->second, bad_chunks);
+                    ++(bad_chunks == nullptr ? stats_.corrupt_manifest : stats_.corrupt_chunk);
+                }
                 remove_entry_locked(id, true);
                 ++stats_.load_misses;
                 return std::nullopt;
@@ -1704,6 +1722,23 @@ std::optional<ContextStore::Info> ContextStore::find(const std::string& id) cons
     info.fetch_bytes = fetch_bytes_locked(found->second);
     info.local       = info.fetch_bytes == 0 && entry_local_locked(found->second);
     return info;
+}
+
+void ContextStore::for_each_checkpoint(const CheckpointMatch& match,
+                                       const CheckpointVisit& visit) const {
+    std::scoped_lock lock(mutex_);
+    for (const auto& [id, entry] : entries_) {
+        std::optional<Info> info; // as list() reports it, once a key matches
+        for (const CheckpointKey& key : entry.info.checkpoints) {
+            if (!match(entry.info, key)) { continue; }
+            if (!info) {
+                info.emplace(entry.info);
+                info->fetch_bytes = fetch_bytes_locked(entry);
+                info->local       = info->fetch_bytes == 0 && entry_local_locked(entry);
+            }
+            visit(*info, key);
+        }
+    }
 }
 
 std::uint64_t ContextStore::fetch_bytes_locked(const Entry& entry) const {
@@ -2203,9 +2238,9 @@ void ContextStore::touch_remote_image(const std::string& id) {
     } catch (const std::exception&) {}
 }
 
-ContextStore::FetchStatus ContextStore::fetch_image_chunks(const std::string& id,
-                                                           std::uint64_t& generation,
-                                                           std::uint64_t* fetched) {
+ContextStore::FetchStatus ContextStore::fetch_image_chunks(
+    const std::string& id, std::uint64_t& generation, std::uint64_t* fetched,
+    std::chrono::steady_clock::time_point deadline) {
     std::vector<ChunkRef> chunks;
     generation = 0;
     std::atomic<std::uint64_t> fetched_bytes{0};
@@ -2238,9 +2273,16 @@ ContextStore::FetchStatus ContextStore::fetch_image_chunks(const std::string& id
     std::atomic<std::size_t> next{0};
     std::atomic<bool> transient{false};
     std::atomic<bool> corrupt{false};
+    // A request waits on this until its deadline only: past it, no chunk is started (one in flight
+    // ends within the transfer's own timeouts), so the reader is free for the next request.
+    std::atomic<bool> expired{false};
     const auto fetch_chunk_range = [&] {
-        for (std::size_t index = next++; index < chunks.size() && !transient && !corrupt;
+        for (std::size_t index = next++; index < chunks.size() && !transient && !corrupt && !expired;
              index = next++) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                expired = true;
+                return;
+            }
             const ChunkRef& chunk = chunks[index];
             std::optional<std::vector<std::uint8_t>> data;
             bool compressed = false;
@@ -2256,6 +2298,7 @@ ContextStore::FetchStatus ContextStore::fetch_image_chunks(const std::string& id
             } catch (const std::exception&) {
                 std::scoped_lock lock(mutex_);
                 ++stats_.remote_download_failures;
+                ++stats_.remote_download_failures_transfer;
                 transient = true;
                 return;
             }
@@ -2271,6 +2314,7 @@ ContextStore::FetchStatus ContextStore::fetch_image_chunks(const std::string& id
             if (!intact) {
                 std::scoped_lock lock(mutex_);
                 ++stats_.remote_download_failures;
+                ++(data ? stats_.remote_download_failures_damaged : stats_.remote_download_failures_missing);
                 corrupt = true;
                 return;
             }
@@ -2296,6 +2340,7 @@ ContextStore::FetchStatus ContextStore::fetch_image_chunks(const std::string& id
             transient = true;
             std::scoped_lock lock(mutex_);
             ++stats_.remote_download_failures;
+            ++stats_.remote_download_failures_install;
         }
     };
     const std::size_t threads = std::min(chunks.size(), kFetchThreads);
@@ -2307,6 +2352,7 @@ ContextStore::FetchStatus ContextStore::fetch_image_chunks(const std::string& id
     for (auto& fetcher : fetchers) { fetcher.join(); }
     if (corrupt) { return FetchStatus::Corrupt; }
     if (transient) { return FetchStatus::Transient; }
+    if (expired) { return FetchStatus::Expired; }
     std::scoped_lock lock(mutex_);
     const auto found = entries_.find(id);
     // Whole again: it is evicted like any image the directory holds.
@@ -2342,95 +2388,184 @@ void ContextStore::settle_failed_fetch(const std::string& id, std::uint64_t gene
     const std::int64_t remote_modified = found->second.remote_modified_ms != 0
                                              ? found->second.remote_modified_ms
                                              : std::numeric_limits<std::int64_t>::max();
+    ++stats_.corrupt_remote;
     remove_entry_locked(id, true);
     std::scoped_lock remote_lock(remote_mutex_);
     remote_failed_[id] = {remote_modified, now_ms()};
 }
 
 std::size_t ContextStore::refresh_remote(std::chrono::steady_clock::time_point deadline) {
-    return refresh_remote_since(std::chrono::steady_clock::now(), deadline);
-}
-
-std::size_t ContextStore::refresh_remote_since(std::chrono::steady_clock::time_point asked,
-                                               std::chrono::steady_clock::time_point deadline) {
     if (!options_.remote) { return 0; }
     // The wait for another refresh counts against the deadline too.
     std::unique_lock refreshing(refresh_mutex_, std::defer_lock);
     if (!refreshing.try_lock_until(deadline)) { return 0; }
-    // A complete listing taken after `asked` (one that ran while this waited) already shows
-    // everything this one would; one taken before it may not, however recently it finished.
-    if (last_refresh_ >= asked) { return 0; }
     return refresh_remote_locked(deadline);
+}
+
+std::shared_ptr<const ContextStore::Listing>
+ContextStore::listing_since(std::chrono::steady_clock::time_point asked,
+                            std::chrono::steady_clock::time_point deadline) {
+    std::unique_lock lock(listing_mutex_);
+    for (;;) {
+        // A listing asked for at or after `asked` shows everything this caller needs to see; one
+        // asked for before it may miss what was uploaded since, however recently it finished.
+        if (latest_listing_ && latest_listing_->listed_at >= asked) { return latest_listing_; }
+        if (!listing_started_) { break; }
+        // One listing runs at a time. One in progress that started after `asked` serves this
+        // caller; one that started before it may miss what was uploaded just before this caller
+        // asked, so the caller waits for it to end and then shares the next one: the first to
+        // wake takes it, and the others find a listing started after they asked and wait for it.
+        // However many callers arrive during a listing, one more listing follows it.
+        if (listing_cv_.wait_until(lock, deadline) == std::cv_status::timeout &&
+            !(latest_listing_ && latest_listing_->listed_at >= asked)) {
+            return nullptr;
+        }
+    }
+    if (std::chrono::steady_clock::now() >= deadline) { return nullptr; }
+    const auto started = std::chrono::steady_clock::now();
+    listing_started_   = started;
+    lock.unlock();
+    // However this ends, the waiters are told: they take the listing, or list for themselves.
+    struct Finish {
+        ContextStore& store;
+        std::chrono::steady_clock::time_point started;
+        ~Finish() {
+            {
+                std::scoped_lock lock(store.listing_mutex_);
+                if (store.listing_started_ == started) { store.listing_started_.reset(); }
+            }
+            store.listing_cv_.notify_all();
+        }
+    } finish{*this, started};
+    auto listing       = std::make_shared<Listing>();
+    listing->listed_at = started;
+    listing->objects   = options_.remote->list(options_.remote_prefix + "manifests/");
+    std::scoped_lock published(listing_mutex_);
+    latest_listing_ = listing; // one listing at a time: this is the newest
+    return listing;
+}
+
+std::string ContextStore::listed_id(const std::string& key) const {
+    const std::string manifests        = options_.remote_prefix + "manifests/";
+    constexpr std::string_view kSuffix = ".manifest";
+    if (key.size() <= manifests.size() + kSuffix.size() || key.compare(0, manifests.size(), manifests) != 0 ||
+        key.compare(key.size() - kSuffix.size(), kSuffix.size(), kSuffix) != 0) {
+        return {};
+    }
+    std::string id = key.substr(manifests.size(), key.size() - manifests.size() - kSuffix.size());
+    return valid_id(id) ? id : std::string();
+}
+
+bool ContextStore::register_remote_image(const ObjectInfo& object, const std::string& id,
+                                         std::chrono::steady_clock::time_point listed_at) {
+    {
+        std::scoped_lock lock(mutex_);
+        if (entries_.find(id) != entries_.end()) { return false; }
+    }
+    {
+        std::scoped_lock lock(remote_mutex_);
+        const auto failed = remote_failed_.find(id);
+        if (failed != remote_failed_.end()) {
+            // Given up on: skipped until the bucket lists the manifest as written since, which
+            // means another engine has replaced the image that failed.
+            if (object.modified_ms <= failed->second.remote_modified_ms) { return false; }
+            remote_failed_.erase(failed);
+        }
+    }
+    const std::optional<std::vector<std::uint8_t>> data = options_.remote->get(object.key);
+    if (!data) {
+        // Listed but gone by the time it was read (deleted, or expired, since the listing).
+        std::scoped_lock lock(mutex_);
+        ++stats_.remote_download_failures;
+        ++stats_.remote_download_failures_missing;
+        return false;
+    }
+    {
+        std::scoped_lock lock(mutex_);
+        ++stats_.remote_manifest_downloads;
+        stats_.remote_manifest_download_bytes += data->size();
+    }
+    Entry entry;
+    if (!parse_manifest(*data, entry, nullptr) || entry.info.id != id) {
+        {
+            std::scoped_lock lock(mutex_);
+            ++stats_.remote_download_failures;
+            ++stats_.remote_download_failures_damaged;
+        }
+        std::scoped_lock lock(remote_mutex_);
+        remote_failed_[id] = {object.modified_ms, now_ms()};
+        return false;
+    }
+    entry.info.last_used_ms = std::max(entry.info.created_ms, object.modified_ms);
+    entry.published         = true; // listed, so the bucket holds its manifest
+    // A listing a refresh asked for before this one was taken may not show the image: it does not
+    // prove the image gone (a lookup registers images while a refresh runs).
+    entry.published_at      = listed_at;
+    std::scoped_lock io(io_mutex_);
+    std::scoped_lock lock(mutex_);
+    // A refresh and a lookup may register the same image at once: the first one wins.
+    if (entries_.find(id) != entries_.end()) { return false; }
+    write_atomically(manifest_path(id), *data);
+    write_published_locked(id, *data);
+    manifest_total_bytes_ += entry.manifest_bytes;
+    add_references(entry);
+    // The listing shows the manifest, not its chunks (a lifecycle rule or a person may have
+    // removed one): their bucket presence stays unknown, so a write that shares them checks
+    // before it skips the upload.
+    entry.generation         = ++next_generation_;
+    entry.remote_modified_ms = object.modified_ms;
+    entries_.emplace(id, std::move(entry));
+    return true;
+}
+
+ContextStore::LookupResult
+ContextStore::lookup_remote(std::chrono::steady_clock::time_point asked,
+                            std::chrono::steady_clock::time_point deadline,
+                            const std::function<bool(const std::string& id)>& wanted) {
+    LookupResult result;
+    if (!options_.remote) { return result; }
+    try {
+        const std::shared_ptr<const Listing> listing = listing_since(asked, deadline);
+        if (!listing) { return result; }
+        for (const ObjectInfo& object : listing->objects) {
+            const std::string id = listed_id(object.key);
+            if (id.empty() || !wanted(id)) { continue; }
+            if (std::chrono::steady_clock::now() < deadline &&
+                register_remote_image(object, id, listing->listed_at)) {
+                ++result.registered;
+            }
+            std::scoped_lock lock(mutex_);
+            if (entries_.find(id) != entries_.end()) { ++result.held; }
+        }
+    } catch (const std::exception&) {
+        std::scoped_lock lock(mutex_);
+        ++stats_.remote_download_failures;
+        ++stats_.remote_download_failures_listing;
+    }
+    return result;
 }
 
 std::size_t ContextStore::refresh_remote_locked(std::chrono::steady_clock::time_point deadline) {
     std::size_t added = 0;
     bool truncated    = false;
-    // The listing shows the bucket as it was when it was asked for, not when it ends.
-    const auto listed_at = std::chrono::steady_clock::now();
     try {
-        const std::string manifests = options_.remote_prefix + "manifests/";
-        const std::vector<ObjectInfo> objects = options_.remote->list(manifests);
+        // Taken now: a refresh is what lookups fall back on for every image they leave, so it
+        // never reuses an older listing (a lookup may reuse this one).
+        const std::shared_ptr<const Listing> listing =
+            listing_since(std::chrono::steady_clock::now(), deadline);
+        if (!listing) { return 0; }
         std::unordered_set<std::string> listed;
-        for (const ObjectInfo& object : objects) {
+        for (const ObjectInfo& object : listing->objects) {
             if (std::chrono::steady_clock::now() >= deadline) {
                 truncated = true;
                 break;
             }
-            constexpr std::string_view kSuffix = ".manifest";
-            if (object.key.size() <= manifests.size() + kSuffix.size() ||
-                object.key.compare(object.key.size() - kSuffix.size(), kSuffix.size(), kSuffix) != 0) {
-                continue;
-            }
-            const std::string id = object.key.substr(
-                manifests.size(), object.key.size() - manifests.size() - kSuffix.size());
             // The bucket's lifecycle rule is what expires an image there; this directory's TTL
             // governs only the files it holds.
-            if (!valid_id(id)) { continue; }
+            const std::string id = listed_id(object.key);
+            if (id.empty()) { continue; }
             listed.insert(id);
-            {
-                std::scoped_lock lock(mutex_);
-                if (entries_.find(id) != entries_.end()) { continue; }
-            }
-            {
-                std::scoped_lock lock(remote_mutex_);
-                const auto failed = remote_failed_.find(id);
-                if (failed != remote_failed_.end()) {
-                    // Given up on: skipped until the bucket lists the manifest as written since, which
-                    // means another engine has replaced the image that failed.
-                    if (object.modified_ms <= failed->second.remote_modified_ms) { continue; }
-                    remote_failed_.erase(failed);
-                }
-            }
-            const std::optional<std::vector<std::uint8_t>> data = options_.remote->get(object.key);
-            if (!data) { continue; }
-            {
-                std::scoped_lock lock(mutex_);
-                ++stats_.remote_manifest_downloads;
-                stats_.remote_manifest_download_bytes += data->size();
-            }
-            Entry entry;
-            if (!parse_manifest(*data, entry, nullptr) || entry.info.id != id) {
-                std::scoped_lock lock(remote_mutex_);
-                remote_failed_[id] = {object.modified_ms, now_ms()};
-                continue;
-            }
-            entry.info.last_used_ms = std::max(entry.info.created_ms, object.modified_ms);
-            entry.published         = true; // listed, so the bucket holds its manifest
-            std::scoped_lock io(io_mutex_);
-            std::scoped_lock lock(mutex_);
-            if (entries_.find(id) != entries_.end()) { continue; }
-            write_atomically(manifest_path(id), *data);
-            write_published_locked(id, *data);
-            manifest_total_bytes_ += entry.manifest_bytes;
-            add_references(entry);
-            // The listing shows the manifest, not its chunks (a lifecycle rule or a person may have
-            // removed one): their bucket presence stays unknown, so a write that shares them
-            // checks before it skips the upload.
-            entry.generation         = ++next_generation_;
-            entry.remote_modified_ms = object.modified_ms;
-            entries_.emplace(id, std::move(entry));
-            ++added;
+            if (register_remote_image(object, id, listing->listed_at)) { ++added; }
         }
         // An image the bucket no longer lists (expired, or removed by someone) is not offered
         // from the index any more, unless the directory still holds some of it.
@@ -2442,8 +2577,10 @@ std::size_t ContextStore::refresh_remote_locked(std::chrono::steady_clock::time_
             for (auto& [id, entry] : entries_) {
                 if (listed.count(id) != 0) { continue; }
                 if (!entry_has_local_bytes_locked(entry)) {
+                    // Registered (or published) from a listing taken after this one: not gone.
+                    if (entry.published_at >= listing->listed_at) { continue; }
                     gone.push_back(id);
-                } else if (entry.published && entry.published_at < listed_at) {
+                } else if (entry.published && entry.published_at < listing->listed_at) {
                     // Kept for its local bytes, but no longer in the bucket: eviction must remove
                     // it whole, not keep an entry whose chunks would exist nowhere. (A manifest
                     // published after the listing began may be missing from it, so that one
@@ -2456,10 +2593,10 @@ std::size_t ContextStore::refresh_remote_locked(std::chrono::steady_clock::time_
         for (const std::string& id : gone) { remove_entry_locked(id, false); }
         stats_.remote_removed += gone.size();
         ++stats_.remote_refreshes;
-        if (!truncated) { last_refresh_ = listed_at; }
     } catch (const std::exception&) {
         std::scoped_lock lock(mutex_);
         ++stats_.remote_download_failures;
+        ++stats_.remote_download_failures_listing;
     }
     return added;
 }

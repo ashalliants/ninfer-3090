@@ -405,7 +405,8 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
 GenerationService::GenerationService(
     ServeOptions options, StartupObserver startup_observer,
     std::function<void(const ninfer::ContextStoreWriteEvent&)> store_listener,
-    std::function<void(const ninfer::EngineFaultEvent&)> fault_listener)
+    std::function<void(const ninfer::EngineFaultEvent&)> fault_listener,
+    std::function<void(const ninfer::ContextStoreHydrationEvent&)> hydration_listener)
     : options_(std::move(options)) {
     // Inline ECC on GDDR6X GeForce cards reserves ~6.25% of VRAM for checksums and taxes
     // memory bandwidth on every access. Decode is bandwidth-bound, so an ECC-enabled card
@@ -429,6 +430,7 @@ GenerationService::GenerationService(
     ninfer::EngineOptions engine_options = make_engine_options(options_);
     engine_options.startup_observer      = std::move(startup_observer);
     engine_options.context_store.listener = std::move(store_listener);
+    engine_options.context_store.hydration_listener = std::move(hydration_listener);
     engine_options.fault_listener         = std::move(fault_listener);
     engine_           = std::make_unique<ninfer::Engine>(std::move(engine_options));
     // A context fit may have lowered the context; every request limit follows what was resolved.

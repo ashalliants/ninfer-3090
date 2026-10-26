@@ -169,6 +169,18 @@ int main() {
     fork.context_store_remote_uploads     = 7;
     fork.context_store_remote_images      = 1;
     fork.context_store_read_bytes_per_second = 2.5e9;
+    fork.context_store_lookups            = 4;
+    fork.context_store_lookup_hits        = 1;
+    fork.context_store_hydration_failures = baseline.context_store_hydration_failures + 3;
+    fork.context_store_hydration_failures_by_reason[static_cast<std::size_t>(
+        ContextStoreHydrationFailure::Deadline)] += 2;
+    fork.context_store_hydration_failures_by_reason[static_cast<std::size_t>(
+        ContextStoreHydrationFailure::UnusedAtAdmission)] += 1;
+    fork.context_store_corrupt                         = 2;
+    fork.context_store_corrupt_remote                  = 2;
+    fork.context_store_remote_download_failures        = 5;
+    fork.context_store_remote_download_failures_damaged = 2;
+    fork.context_store_remote_download_failures_listing = 3;
     fork.main_kv_h2d_bytes                = 123456;
     fork.root_selections                  = 7;
     fork.checkpoint_selections            = 31;
@@ -207,11 +219,28 @@ int main() {
               has_line(series, "ninfer_context_store_restored_sessions 3") &&
               has_line(series, "ninfer_context_store_hydrations_total 2") &&
               has_line(series, "ninfer_context_store_hydrated_tokens_total 70000") &&
-              has_line(series, "ninfer_context_store_hydration_failures_total 0") &&
+              has_line(series, "ninfer_context_store_hydration_failures_total 3") &&
               has_line(series, "ninfer_context_store_remote_uploads_total 7") &&
               has_line(series, "ninfer_context_store_remote_images 1") &&
               has_line(series, "ninfer_context_store_read_bytes_per_second 2500000000"),
           "context store series must be reported");
+    check(has_line(series, "ninfer_context_store_lookups_total 4") &&
+              has_line(series, "ninfer_context_store_lookup_hits_total 1") &&
+              has_line(series,
+                       "ninfer_context_store_hydration_failures_by_reason_total{reason=\"deadline\"} 2") &&
+              has_line(series, "ninfer_context_store_hydration_failures_by_reason_total"
+                               "{reason=\"unused_at_admission\"} 1") &&
+              has_line(series,
+                       "ninfer_context_store_hydration_failures_by_reason_total{reason=\"load_miss\"} 0") &&
+              has_line(series, "ninfer_context_store_corrupt_total 2") &&
+              has_line(series, "ninfer_context_store_corrupt_by_reason_total{reason=\"remote\"} 2") &&
+              has_line(series, "ninfer_context_store_corrupt_by_reason_total{reason=\"startup\"} 0") &&
+              has_line(series, "ninfer_context_store_remote_download_failures_total 5") &&
+              has_line(series, "ninfer_context_store_remote_download_failures_by_reason_total"
+                               "{reason=\"damaged\"} 2") &&
+              has_line(series, "ninfer_context_store_remote_download_failures_by_reason_total"
+                               "{reason=\"listing\"} 3"),
+          "context store lookup hits and failure reasons must be reported");
     check(has_line(series,
                    "ninfer_context_transfer_bytes_total{resource=\"main_kv\",direction=\"h2d\"} "
                    "123456") &&

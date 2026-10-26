@@ -474,7 +474,8 @@ public:
     void reset_memory_peaks() noexcept;
     [[nodiscard]] CheckpointImage export_checkpoints(std::span<const CheckpointHandle>,
                                                      const std::optional<PreparedSessionKey>&,
-                                                     std::string_view binding) const;
+                                                     std::string_view binding,
+                                                     std::vector<std::uint8_t> buffer = {}) const;
     [[nodiscard]] std::size_t checkpoint_image_host_bytes(std::span<const std::uint8_t>,
                                                           std::string_view binding) const;
     [[nodiscard]] std::optional<ImportedCheckpoints>

@@ -441,6 +441,23 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
             "Sessions removed for space, age or because a newer state replaced them.");
     COUNTER(context_store_corrupt, "context_store_corrupt_total",
             "Sessions removed because they could not be read back intact.");
+    header("context_store_corrupt_by_reason_total", "counter",
+           "context_store_corrupt_total by what was found: a chunk missing at start-up (startup), a "
+           "manifest that does not describe its session (manifest), a chunk whose bytes do not "
+           "match with no bucket to repair it (chunk), or the bucket's copy missing or damaged "
+           "too (remote).");
+    for (const auto& [reason, current, baseline] :
+         std::array{std::tuple{"startup", stats.context_store_corrupt_startup,
+                               baseline_.context_store_corrupt_startup},
+                    std::tuple{"manifest", stats.context_store_corrupt_manifest,
+                               baseline_.context_store_corrupt_manifest},
+                    std::tuple{"chunk", stats.context_store_corrupt_chunk,
+                               baseline_.context_store_corrupt_chunk},
+                    std::tuple{"remote", stats.context_store_corrupt_remote,
+                               baseline_.context_store_corrupt_remote}}) {
+        out << "ninfer_context_store_corrupt_by_reason_total{reason=\"" << reason << "\"} "
+            << current - baseline << '\n';
+    }
     GAUGE(context_store_restored, "context_store_restored_sessions",
           "Sessions restored into the cache at start-up.");
     GAUGE(context_store_restored_bytes, "context_store_restored_bytes",
@@ -453,16 +470,37 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
             "Prompt tokens requests resumed from a hydrated session instead of prefilling.");
     COUNTER(context_store_hydration_failures, "context_store_hydration_failures_total",
             "Hydrations that failed; the request was prefilled normally.");
+    header("context_store_hydration_failures_by_reason_total", "counter",
+           "context_store_hydration_failures_total by reason: the store could not read the session "
+           "(load_miss), the read did not finish in the wait (deadline), the Host tier had no room "
+           "(host_capacity) or no contiguous extents for it (host_geometry), the cache could not "
+           "adopt it (adopt) or did not offer it (not_candidate), the request was admitted from "
+           "something shallower (unused_at_admission), the session belongs to another model or "
+           "configuration (invalid_image), or the import failed otherwise (exception).");
+    for (std::size_t reason = 0; reason < kContextStoreHydrationFailureReasons; ++reason) {
+        out << "ninfer_context_store_hydration_failures_by_reason_total{reason=\""
+            << context_store_hydration_failure_name(static_cast<ContextStoreHydrationFailure>(reason))
+            << "\"} "
+            << stats.context_store_hydration_failures_by_reason[reason] -
+                   baseline_.context_store_hydration_failures_by_reason[reason]
+            << '\n';
+    }
     COUNTER(context_store_hydration_seconds, "context_store_hydration_seconds_total",
             "Time requests waited for stored sessions to be read back, failed reads included.");
     COUNTER(context_store_lookups, "context_store_lookups_total",
-            "Bucket listings refreshed for a request that found nothing stored.");
+            "Bucket lookups for a request that found nothing stored.");
+    COUNTER(context_store_lookup_hits, "context_store_lookup_hits_total",
+            "Lookups after which the store held a session ending on the request's prompt.");
     COUNTER(context_store_lookup_seconds, "context_store_lookup_seconds_total",
             "Time requests waited for those listings.");
     GAUGE(context_store_remote_fetch_bytes_per_second, "context_store_remote_fetch_bytes_per_second",
           "Rate at which missing chunks are fetched from the bucket and installed in the store "
           "directory (download, verification and write together, the time a request waits), "
           "learned from fetches.");
+    COUNTER(context_store_idle_writes, "context_store_idle_writes_total",
+            "Conversations written to the store once idle (--context-store-idle-seconds).");
+    COUNTER(context_store_idle_export_seconds, "context_store_idle_export_seconds_total",
+            "Engine worker time spent copying idle conversations out for the store.");
     COUNTER(context_store_eviction_writes, "context_store_eviction_writes_total",
             "Conversations written to the store as the cache evicted them (write-on-evict).");
     COUNTER(context_store_eviction_export_seconds, "context_store_eviction_export_seconds_total",
@@ -488,6 +526,25 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
     COUNTER(context_store_remote_download_failures,
             "context_store_remote_download_failures_total",
             "Remote listings or fetches that failed or returned damaged data.");
+    header("context_store_remote_download_failures_by_reason_total", "counter",
+           "context_store_remote_download_failures_total by cause: a transfer that failed "
+           "(transfer), an object the bucket did not have (missing), one whose bytes did not match "
+           "(damaged), a chunk that could not be written to the store directory (install), or a "
+           "listing or its manifest reads (listing).");
+    for (const auto& [reason, current, baseline] :
+         std::array{std::tuple{"transfer", stats.context_store_remote_download_failures_transfer,
+                               baseline_.context_store_remote_download_failures_transfer},
+                    std::tuple{"missing", stats.context_store_remote_download_failures_missing,
+                               baseline_.context_store_remote_download_failures_missing},
+                    std::tuple{"damaged", stats.context_store_remote_download_failures_damaged,
+                               baseline_.context_store_remote_download_failures_damaged},
+                    std::tuple{"install", stats.context_store_remote_download_failures_install,
+                               baseline_.context_store_remote_download_failures_install},
+                    std::tuple{"listing", stats.context_store_remote_download_failures_listing,
+                               baseline_.context_store_remote_download_failures_listing}}) {
+        out << "ninfer_context_store_remote_download_failures_by_reason_total{reason=\"" << reason
+            << "\"} " << current - baseline << '\n';
+    }
     COUNTER(context_store_remote_manifest_downloads,
             "context_store_remote_manifest_downloads_total",
             "Session manifests a bucket refresh downloaded to register sessions other engines wrote.");

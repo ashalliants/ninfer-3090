@@ -145,12 +145,37 @@ public:
         return result;
     }
 
-    // Gives the Engine a context store backed by a bucket. The store must outlive the Rig.
+    // Gives the Engine a context store backed by a bucket. The store must outlive the Rig. Each
+    // failed hydration is recorded in hydration_events().
     void attach_store(ContextStore& store, std::chrono::milliseconds hydration_budget) {
-        core_->set_context_store({.store            = &store,
-                                  .binding          = "fake-binding",
-                                  .hydration_budget = hydration_budget,
-                                  .remote           = true});
+        core_->set_context_store({.store              = &store,
+                                  .binding            = "fake-binding",
+                                  .hydration_budget   = hydration_budget,
+                                  .remote             = true,
+                                  .hydration_listener = [this](const ContextStoreHydrationEvent& event) {
+                                      std::lock_guard lock(events_mutex_);
+                                      hydration_events_.push_back(event);
+                                  }});
+    }
+    [[nodiscard]] std::vector<ContextStoreHydrationEvent> hydration_events() const {
+        std::lock_guard lock(events_mutex_);
+        return hydration_events_;
+    }
+
+    // Gives the Engine a context store it writes idle conversations to, through `write` (which
+    // stores the image and returns whether it took it). The store must outlive the Rig.
+    // `failures` and `failed_writes`, when given, stand for the writer's failure count and its
+    // reports of the writes that failed.
+    void attach_store_writer(ContextStore& store, std::function<bool(fake::CheckpointImage&&)> write,
+                             std::chrono::milliseconds idle,
+                             std::function<std::uint64_t()> failures             = {},
+                             std::function<EngineCore<fake::Instance>::FailedStoreWrites()> failed_writes = {}) {
+        core_->set_context_store({.store        = &store,
+                                  .binding      = "fake-binding",
+                                  .sink         = std::move(write),
+                                  .failures     = std::move(failures),
+                                  .failed_writes = std::move(failed_writes),
+                                  .idle_persist = idle});
     }
 
     fake::Program& program() { return *instance_.program; }
@@ -231,6 +256,8 @@ private:
     };
 
     Settings settings_;
+    mutable std::mutex events_mutex_;
+    std::vector<ContextStoreHydrationEvent> hydration_events_;
     std::vector<std::thread> waiters_;
     fake::Instance instance_;
     fake::Device device_;
@@ -718,6 +745,12 @@ public:
     }
     std::optional<std::vector<std::uint8_t>> get(const std::string& key) override {
         gate();
+        if (key.find("/chunks/") != std::string::npos) {
+            ++chunk_gets;
+            std::this_thread::sleep_for(chunk_delay.load());
+        } else if (key.find("/manifests/") != std::string::npos) {
+            ++manifest_gets;
+        }
         std::scoped_lock lock(mutex_);
         const auto found = objects_.find(key);
         if (found == objects_.end()) { return std::nullopt; }
@@ -758,6 +791,10 @@ public:
     [[nodiscard]] std::int64_t clock() const noexcept { return clock_; }
 
     std::atomic<int> lists{0};
+    std::atomic<int> manifest_gets{0};
+    std::atomic<int> chunk_gets{0};
+    // How long each chunk download takes, as on a slow link.
+    std::atomic<std::chrono::milliseconds> chunk_delay{std::chrono::milliseconds(0)};
 
 private:
     void gate() {
@@ -807,14 +844,20 @@ bool store_drained(ContextStore& store) {
     return store.flush_remote(Clock::now() + std::chrono::seconds(10));
 }
 
-// Another engine stores a session of prompt `id` (the fake's shortlist key is {id, 0} at every
-// frontier) up to `frontier`, with `bytes` of state, and uploads it.
+// The id the Engine stores a session of prompt `id` up to `frontier` under (the fake's shortlist key
+// is {id, 0} at every frontier).
+std::string session_id(std::uint64_t id, std::uint32_t frontier) {
+    return context_store_image_id({id, 0}, frontier, false);
+}
+
+// Another engine stores a session of prompt `id` up to `frontier`, with `bytes` of state, and
+// uploads it.
 void store_session_elsewhere(const std::shared_ptr<MemoryBucket>& bucket, std::uint64_t id,
                              std::uint32_t frontier, std::size_t bytes) {
     StoreDirectory directory;
     ContextStore other(bucket_store_options(directory.path(), bucket));
     ContextStore::Description description;
-    description.id      = "5e55" + std::to_string(id);
+    description.id      = session_id(id, frontier);
     description.binding = "fake-binding";
     description.tokens  = frontier;
     description.checkpoints.push_back({.frontier = frontier, .digests = {id, 0}, .identity_tag = 0});
@@ -857,9 +900,20 @@ void test_a_request_that_finds_nothing_lists_the_bucket_once_and_fetches() {
                     return rig.core().runtime_stats().context_store_remote_fetch_bytes_per_second > 0;
                 }),
                 "the fetch did not teach the fetch rate");
+        require(stats.context_store_lookup_hits == 1, "the lookup that found the session was not a hit");
         // The fake imports nothing: the fetched session is a failed hydration, and it prefilled.
         require(rig.core().runtime_stats().context_store_hydration_failures == 1,
                 "the fetched session was not offered for import");
+        // Said why, once, with the session it was.
+        const auto failed = rig.core().runtime_stats().context_store_hydration_failures_by_reason;
+        require(failed[static_cast<std::size_t>(ContextStoreHydrationFailure::HostGeometry)] == 1,
+                "the failed import was not counted under its reason");
+        const auto events = rig.hydration_events();
+        require(events.size() == 1 && events[0].id == session_id(7, 30'000) &&
+                    events[0].reason == ContextStoreHydrationFailure::HostGeometry &&
+                    events[0].bytes == 64 + 64 * 1024 && events[0].fetch_bytes == 64 * 1024 &&
+                    events[0].frontier == 30'000,
+                "the failed hydration was not reported with its session");
         // A second request for the same prompt finds the session without a listing.
         auto again = rig.run(7, kLongPrompt, 1);
         require(finished(again), "the second request did not finish\n" + rig.dump());
@@ -897,7 +951,7 @@ void test_a_fetch_that_cannot_fit_the_wait_is_not_started() {
         auto result = rig.run(9, kLongPrompt, 1);
         require(finished(result), "the request did not finish\n" + rig.dump());
         require(rig.core().runtime_stats().context_store_lookups == 1, "the request did not look");
-        const auto info = store.find("5e559");
+        const auto info = store.find(session_id(9, 30'000));
         require(info && !info->local, "the lookup did not register the session");
         require(store.stats().remote_downloads == 0,
                 "a fetch that could not fit the request's wait was started");
@@ -945,9 +999,448 @@ void test_a_stalled_listing_releases_the_request_at_its_budget() {
                     std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(waited).count()) +
                     " ms");
         require(rig.core().runtime_stats().context_store_lookups == 1, "the lookup was not counted");
+        require(rig.core().runtime_stats().context_store_lookup_hits == 0,
+                "a lookup that found nothing was counted as a hit");
     }
 }
 
+// A lookup reads only the manifests of sessions ending on the request's own prompt: sessions other
+// engines uploaded for other conversations are left to the background refresh, and a request whose
+// session is not there is released as soon as the listing shows it.
+void test_a_lookup_reads_only_the_requests_own_manifests() {
+    auto bucket = std::make_shared<MemoryBucket>();
+    StoreDirectory directory;
+    ContextStore store(bucket_store_options(directory.path(), bucket));
+    require(store_drained(store), "the start-up refresh did not finish");
+    store_session_elsewhere(bucket, 12, 30'000, 4096);
+    for (std::uint64_t other = 20; other < 26; ++other) {
+        store_session_elsewhere(bucket, other, 30'000, 4096);
+    }
+    // Another conversation's session on a frontier this prompt also reaches.
+    store_session_elsewhere(bucket, 26, 1'000, 4096);
+    const int manifests = bucket->manifest_gets;
+    {
+        Rig rig({.chunk = 1024, .lanes = 1});
+        rig.attach_store(store, std::chrono::seconds(2));
+        auto result = rig.run(12, kLongPrompt, 1);
+        require(finished(result), "the request did not finish\n" + rig.dump());
+        const auto stats = rig.core().runtime_stats();
+        require(stats.context_store_lookups == 1 && stats.context_store_lookup_hits == 1,
+                "the lookup did not find the request's session");
+        require(bucket->manifest_gets == manifests + 1 && store.find(session_id(12, 30'000)),
+                "the lookup read manifests of other conversations: " +
+                    std::to_string(bucket->manifest_gets - manifests));
+        require(!store.find(session_id(20, 30'000)) && !store.find(session_id(26, 1'000)),
+                "the lookup registered sessions of other conversations");
+
+        // Nothing of this prompt is in the bucket: no manifest is read.
+        auto missing = rig.run(13, kLongPrompt, 1);
+        require(finished(missing), "the second request did not finish\n" + rig.dump());
+        const auto after = rig.core().runtime_stats();
+        require(after.context_store_lookups == 2 && after.context_store_lookup_hits == 1 &&
+                    bucket->manifest_gets == manifests + 1,
+                "a lookup that matched nothing read manifests or counted a hit");
+    }
+    // The background refresh still registers everything else.
+    require(store.refresh_remote() == 7, "the refresh did not register what the lookups left");
+}
+
+// A download that cannot finish in the request's wait stops at its deadline (a miss, not damage):
+// the request prefills, and the reader is free for the next request instead of downloading the
+// rest of a session nobody waits for.
+void test_a_slow_download_stops_at_the_requests_deadline() {
+    auto bucket = std::make_shared<MemoryBucket>();
+    StoreDirectory directory;
+    ContextStore store(bucket_store_options(directory.path(), bucket));
+    require(store_drained(store), "the start-up refresh did not finish");
+    // 64 chunks of 4 KiB; each takes 100 ms, eight at a time: 0.8 s, past a 200 ms wait (the
+    // assumed rate prices it at a few ms, so the read is started).
+    store_session_elsewhere(bucket, 14, 30'000, 64 * 4096);
+    (void)store.refresh_remote(); // registered: no lookup
+    bucket->chunk_delay = std::chrono::milliseconds(100);
+    {
+        Rig rig({.chunk = 1024, .lanes = 1});
+        rig.attach_store(store, std::chrono::milliseconds(200));
+        auto result = rig.run(14, kLongPrompt, 1);
+        require(finished(result), "the request did not finish\n" + rig.dump());
+        const auto stats = rig.core().runtime_stats();
+        require(stats.context_store_hydration_failures == 1 &&
+                    stats.context_store_hydration_failures_by_reason[static_cast<std::size_t>(
+                        ContextStoreHydrationFailure::Deadline)] == 1,
+                "the expired read was not a deadline failure");
+        // Long enough for the whole download, had it gone on.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        require(store.stats().remote_downloads < 64,
+                "the download went on past the request's deadline: " +
+                    std::to_string(store.stats().remote_downloads) + " chunks");
+        const auto info = store.find(session_id(14, 30'000));
+        require(info && !info->local && store.stats().corrupt_removed == 0,
+                "a download stopped at its deadline was treated as damage");
+    }
+}
+
+// A read that completes after the request's wait ended, while the worker was busy past the deadline,
+// is not imported when the worker gets to it: the request was given that long, no more.
+void test_a_read_finished_after_the_deadline_is_not_imported() {
+    auto bucket = std::make_shared<MemoryBucket>();
+    StoreDirectory directory;
+    ContextStore store(bucket_store_options(directory.path(), bucket));
+    require(store_drained(store), "the start-up refresh did not finish");
+    // One chunk, which starts inside the 200 ms wait and arrives at 300 ms.
+    store_session_elsewhere(bucket, 16, 30'000, 4096);
+    (void)store.refresh_remote();
+    bucket->chunk_delay = std::chrono::milliseconds(300);
+    {
+        Rig rig({.chunk = 1024, .lanes = 2});
+        rig.attach_store(store, std::chrono::milliseconds(200));
+        // The worker stalls in one unit from when the download starts until well after it ends,
+        // as behind a long prefill step.
+        std::atomic<bool> stalled{false};
+        rig.program().before_unit = [&](const Event&) {
+            if (bucket->chunk_gets > 0 && !stalled.exchange(true)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(600));
+            }
+        };
+        auto busy   = rig.run(1, 4000, 2000); // keeps the worker running units
+        auto result = rig.run(16, kLongPrompt, 1);
+        require(finished(result), "the request did not finish\n" + rig.dump());
+        require(stalled, "the worker never stalled during the download");
+        const auto failed = rig.core().runtime_stats().context_store_hydration_failures_by_reason;
+        require(failed[static_cast<std::size_t>(ContextStoreHydrationFailure::Deadline)] == 1 &&
+                    failed[static_cast<std::size_t>(ContextStoreHydrationFailure::HostGeometry)] == 0,
+                "a read that finished after its deadline was imported");
+        drain(busy, std::chrono::seconds(30));
+        rig.program().before_unit = nullptr;
+    }
+}
+
+// A failure the import did not foresee fails only the hydration: the request prefills, and the
+// Engine does not treat it as a worker fault.
+void test_an_import_that_throws_fails_only_the_hydration() {
+    auto bucket = std::make_shared<MemoryBucket>();
+    StoreDirectory directory;
+    ContextStore store(bucket_store_options(directory.path(), bucket));
+    require(store_drained(store), "the start-up refresh did not finish");
+    store_session_elsewhere(bucket, 15, 30'000, 4096);
+    (void)store.refresh_remote();
+    {
+        Rig rig({.chunk = 1024, .lanes = 1});
+        rig.attach_store(store, std::chrono::seconds(2));
+        rig.program().import_throws = true;
+        auto result = rig.run(15, kLongPrompt, 1);
+        require(finished(result), "the request did not finish\n" + rig.dump());
+        const auto stats = rig.core().runtime_stats();
+        require(stats.engine_recoveries == 0, "a failed import was handled as a worker fault");
+        require(stats.context_store_hydration_failures == 1 &&
+                    stats.context_store_hydration_failures_by_reason[static_cast<std::size_t>(
+                        ContextStoreHydrationFailure::Exception)] == 1,
+                "the failed import was not counted as an exception");
+        const auto events = rig.hydration_events();
+        require(events.size() == 1 && events[0].reason == ContextStoreHydrationFailure::Exception,
+                "the failed import was not reported");
+    }
+}
+
+
+// ---- idle writes ---------------------------------------------------------------------------
+
+// Stores a fake image as the Engine's writer does, under the id the Engine expects.
+void put_image(ContextStore& store, const fake::CheckpointImage& image) {
+    ContextStore::Description description;
+    const auto& key     = image.keys.front();
+    description.id      = ContextStore::image_id(key.digests, key.frontier, false);
+    description.binding = "fake-binding";
+    description.tokens  = image.tokens;
+    description.checkpoints.push_back(
+        {.frontier = key.frontier, .digests = key.digests, .identity_tag = key.identity_tag});
+    std::vector<ContextStore::Region> regions;
+    for (const auto& region : image.regions) { regions.push_back({region.offset, region.length}); }
+    (void)store.put(description, image.bytes, regions);
+}
+
+// Another conversation's second turn, whose image supersedes its first: a removal from the store
+// that has nothing to do with the sessions the Engine holds.
+void supersede_elsewhere(ContextStore& store) {
+    ContextStore::Description first;
+    first.id      = "e1";
+    first.binding = "fake-binding";
+    first.tokens  = 100;
+    first.checkpoints.push_back({.frontier = 100, .digests = {77, 7}, .identity_tag = 0});
+    const std::vector<std::uint8_t> image(64 + 4096, 1);
+    (void)store.put(first, image, std::array{ContextStore::Region{64, 4096}});
+    std::vector<std::array<std::uint64_t, 2>> digests(201, {77, 0});
+    digests[100] = {77, 7};
+    ContextStore::Description second = first;
+    second.id                         = "e2";
+    second.tokens                     = 200;
+    second.checkpoints                = {{.frontier = 200, .digests = {77, 8}, .identity_tag = 0}};
+    second.prefix_digests             = digests;
+    (void)store.put(second, image, std::array{ContextStore::Region{64, 4096}});
+    require(!store.find("e1") && store.stats().superseded == 1, "the second turn did not supersede");
+}
+
+// Restores the image of conversation `group` from the store into the Engine's cache, where it is a
+// retained continuation the store holds as it is.
+void restore_stored(Rig& rig, ContextStore& store, std::uint64_t group) {
+    const auto image = rig.program().image_of(group, 4096);
+    const auto id    = ContextStore::image_id(image.keys.front().digests, 4096, false);
+    const auto bytes = store.load(id);
+    require(bytes.has_value(), "the stored session could not be read");
+    require(rig.core().restore_image(*bytes), "the stored session was not restored");
+}
+
+// The store removing an image of another conversation (here superseded by its next turn, which
+// happens on every turn of every conversation) does not make the Engine write the sessions it
+// holds again: they are unchanged, and the store still holds them.
+void test_an_unrelated_removal_does_not_rewrite_stored_sessions() {
+    StoreDirectory directory;
+    ContextStore::Options options;
+    options.directory   = directory.path();
+    options.chunk_bytes = 4096;
+    ContextStore store(options);
+    Rig rig({.chunk = 1024, .lanes = 1, .context_cache = true});
+    std::atomic<int> writes{0};
+    rig.attach_store_writer(
+        store,
+        [&](fake::CheckpointImage&& image) {
+            put_image(store, image);
+            ++writes;
+            return true;
+        },
+        std::chrono::milliseconds(50));
+    for (const std::uint64_t group : {1, 2}) {
+        put_image(store, rig.program().image_of(group, 4096));
+        restore_stored(rig, store, group);
+    }
+    auto busy = rig.run(9, 64, 3000); // keeps the worker cycling for about 3 s
+    supersede_elsewhere(store);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2500)); // two idle scans or more
+    require(writes == 0 && rig.program().exports() == 0,
+            "an unrelated removal had unchanged stored sessions written again: " +
+                std::to_string(writes.load()) + " writes, " +
+                std::to_string(rig.program().exports()) + " exports");
+    require(finished(busy), "the request did not finish\n" + rig.dump());
+}
+
+// A store with room for one of two sessions keeps the newer and evicts the older. The older one is
+// not written back: that would evict the newer, which would then be written back, and so on.
+void test_a_session_the_store_evicted_is_not_written_back() {
+    StoreDirectory directory;
+    ContextStore::Options options;
+    options.directory   = directory.path();
+    options.chunk_bytes = 4096;
+    options.max_bytes   = 96 * 1024; // one 64 KiB image and its manifest, not two
+    ContextStore store(options);
+    Rig rig({.chunk = 1024, .lanes = 1, .context_cache = true});
+    std::atomic<int> writes{0};
+    rig.attach_store_writer(
+        store,
+        [&](fake::CheckpointImage&& image) {
+            put_image(store, image);
+            ++writes;
+            return true;
+        },
+        std::chrono::milliseconds(50));
+    put_image(store, rig.program().image_of(1, 4096));
+    restore_stored(rig, store, 1);
+    put_image(store, rig.program().image_of(2, 4096));
+    require(store.stats().evicted_for_space == 1 && store.stats().images == 1,
+            "the second session did not evict the first");
+    restore_stored(rig, store, 2);
+    auto busy = rig.run(9, 64, 3000);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+    require(writes == 0,
+            "a session the store evicted was written back: " + std::to_string(writes.load()) +
+                " writes, " + std::to_string(store.stats().evicted_for_space) + " evictions");
+    require(finished(busy), "the request did not finish\n" + rig.dump());
+}
+
+// The writer's failure reports, as the Engine's writer thread makes them.
+struct FailedWrites {
+    std::mutex mutex;
+    std::uint64_t count = 0;
+    std::vector<std::string> ids;
+    void fail(const std::string& id) {
+        std::lock_guard lock(mutex);
+        ++count;
+        ids.push_back(id);
+    }
+    std::uint64_t failures() {
+        std::lock_guard lock(mutex);
+        return count;
+    }
+    bool lost = false;
+    void lose() {
+        std::lock_guard lock(mutex);
+        ++count;
+        lost = true;
+    }
+    EngineCore<fake::Instance>::FailedStoreWrites take() {
+        std::lock_guard lock(mutex);
+        return {std::exchange(ids, {}), std::exchange(lost, false)};
+    }
+};
+
+// A queued write that failed is written again, even when a removal scan saw its image missing first
+// and took it for one the store let go (the failure report lands after the scan).
+void test_a_failed_write_is_retried_after_a_removal_scan_dropped_it() {
+    StoreDirectory directory;
+    ContextStore::Options options;
+    options.directory   = directory.path();
+    options.chunk_bytes = 4096;
+    ContextStore store(options);
+    Rig rig({.chunk = 1024, .lanes = 1, .context_cache = true});
+    std::atomic<int> writes{0};
+    FailedWrites failed;
+    rig.attach_store_writer(
+        store,
+        [&](fake::CheckpointImage&& image) {
+            put_image(store, image);
+            ++writes;
+            return true;
+        },
+        std::chrono::milliseconds(50), [&] { return failed.failures(); },
+        [&] { return failed.take(); });
+    const auto image = rig.program().image_of(1, 4096);
+    const auto id    = ContextStore::image_id(image.keys.front().digests, 4096, false);
+    put_image(store, image);
+    restore_stored(rig, store, 1);
+    // The write "failed": its image is not in the store. A removal elsewhere is scanned first.
+    require(store.erase(id), "the image could not be erased");
+    supersede_elsewhere(store);
+    // The shutdown flush writes whatever is not settled, with no idle wait or failure back-off.
+    int flushed = 0;
+    const auto flush = [&] {
+        return rig.core().persist_all(
+            [&](fake::CheckpointImage&& written, bool) {
+                put_image(store, written);
+                ++flushed;
+                return true;
+            },
+            Clock::now() + std::chrono::seconds(5));
+    };
+    (void)flush();
+    require(flushed == 0, "a session taken for one the store let go was written");
+    failed.fail(id);
+    (void)flush();
+    require(flushed == 1, "the failed write was not written again: " + std::to_string(flushed) +
+                              " writes");
+    require(store.find(id).has_value(), "the retried write did not store the session");
+}
+
+// When the writer lost some failure reports (more failed than it keeps), every continuation whose
+// image the store does not hold is written again, not trusted as stored.
+void test_lost_failure_reports_retry_every_missing_session() {
+    StoreDirectory directory;
+    ContextStore::Options options;
+    options.directory   = directory.path();
+    options.chunk_bytes = 4096;
+    ContextStore store(options);
+    Rig rig({.chunk = 1024, .lanes = 1, .context_cache = true});
+    FailedWrites failed;
+    rig.attach_store_writer(
+        store, [&](fake::CheckpointImage&& image) { put_image(store, image); return true; },
+        std::chrono::milliseconds(50), [&] { return failed.failures(); },
+        [&] { return failed.take(); });
+    for (const std::uint64_t group : {1, 2}) {
+        put_image(store, rig.program().image_of(group, 4096));
+        restore_stored(rig, store, group);
+    }
+    // Session 1's write "failed" and its report was lost; session 2 is still stored.
+    const auto lost_id =
+        ContextStore::image_id(rig.program().image_of(1, 4096).keys.front().digests, 4096, false);
+    require(store.erase(lost_id), "the image could not be erased");
+    failed.lose();
+    std::vector<std::string> flushed;
+    (void)rig.core().persist_all(
+        [&](fake::CheckpointImage&& written, bool) {
+            flushed.push_back(ContextStore::image_id(written.keys.front().digests,
+                                                     written.keys.front().frontier, false));
+            put_image(store, written);
+            return true;
+        },
+        Clock::now() + std::chrono::seconds(5));
+    require(flushed == std::vector<std::string>{lost_id},
+            "lost failure reports did not have exactly the missing session written again: " +
+                std::to_string(flushed.size()) + " writes");
+}
+
+// An export copies into the buffer the writer hands back (an earlier image's, already mapped),
+// not a fresh one.
+void test_an_export_reuses_the_writers_spare_buffer() {
+    StoreDirectory directory;
+    ContextStore::Options options;
+    options.directory   = directory.path();
+    options.chunk_bytes = 4096;
+    ContextStore store(options);
+    Rig rig({.chunk = 1024, .lanes = 1, .context_cache = true});
+    FailedWrites failed;
+    std::vector<std::uint8_t> spare(1 << 20);
+    const std::uint8_t* const spare_data = spare.data();
+    rig.core().set_context_store({.store         = &store,
+                                  .binding       = "fake-binding",
+                                  .failures      = [&] { return failed.failures(); },
+                                  .failed_writes = [&] { return failed.take(); },
+                                  .export_buffer = [&] { return std::exchange(spare, {}); }});
+    const auto image = rig.program().image_of(1, 4096);
+    const auto id    = ContextStore::image_id(image.keys.front().digests, 4096, false);
+    put_image(store, image);
+    restore_stored(rig, store, 1);
+    require(store.erase(id), "the image could not be erased");
+    failed.fail(id);
+    int flushed = 0;
+    (void)rig.core().persist_all(
+        [&](fake::CheckpointImage&& written, bool) {
+            require(written.bytes.data() == spare_data, "the image was not written into the spare buffer");
+            ++flushed;
+            return true;
+        },
+        Clock::now() + std::chrono::seconds(5));
+    const auto buffers = rig.program().export_buffers();
+    require(flushed == 1 && buffers.size() == 1 && buffers.front() == spare_data,
+            "the export was not given the writer's spare buffer");
+}
+
+// An image of the same id written under another model or configuration does not count as this
+// conversation stored: when this Engine's write of it fails, it is written again.
+void test_a_foreign_image_of_the_same_id_does_not_count_as_stored() {
+    StoreDirectory directory;
+    ContextStore::Options options;
+    options.directory   = directory.path();
+    options.chunk_bytes = 4096;
+    ContextStore store(options);
+    Rig rig({.chunk = 1024, .lanes = 1, .context_cache = true});
+    std::atomic<int> writes{0};
+    FailedWrites failed;
+    rig.attach_store_writer(
+        store,
+        [&](fake::CheckpointImage&& image) {
+            put_image(store, image);
+            ++writes;
+            return true;
+        },
+        std::chrono::milliseconds(50), [&] { return failed.failures(); },
+        [&] { return failed.take(); });
+    const auto image = rig.program().image_of(1, 4096);
+    const auto id    = ContextStore::image_id(image.keys.front().digests, 4096, false);
+    put_image(store, image);
+    restore_stored(rig, store, 1);
+    // Another configuration's image now holds the id, and this Engine's write of it failed.
+    ContextStore::Description foreign;
+    foreign.id      = id;
+    foreign.binding = "another-binding";
+    foreign.tokens  = 4096;
+    foreign.checkpoints.push_back({.frontier = 4096, .digests = image.keys.front().digests});
+    (void)store.put(foreign, image.bytes, std::array{ContextStore::Region{fake::Program::kImageHeaderBytes, 64 * 1024}});
+    failed.fail(id);
+    auto busy = rig.run(9, 64, 4000);
+    require(rig.wait_for([&] { return writes.load() == 1; }, std::chrono::seconds(3)),
+            "a foreign image of the same id counted as the conversation stored: " +
+                std::to_string(writes.load()) + " writes");
+    require(store.find(id) && store.find(id)->binding == "fake-binding",
+            "the retried write did not replace the foreign image");
+    require(finished(busy), "the request did not finish\n" + rig.dump());
+}
 
 // ---- lossy prefill (docs/maintainer/lossy-long-prefill.md) ----------------------------------
 
@@ -1679,6 +2172,25 @@ int main() {
         test_a_fetch_must_fit_the_requests_remaining_deadline);
     run("a stalled listing releases the request at its budget",
         test_a_stalled_listing_releases_the_request_at_its_budget);
+    run("a lookup reads only the request's own manifests",
+        test_a_lookup_reads_only_the_requests_own_manifests);
+    run("a slow download stops at the request's deadline",
+        test_a_slow_download_stops_at_the_requests_deadline);
+    run("a read finished after the deadline is not imported",
+        test_a_read_finished_after_the_deadline_is_not_imported);
+    run("an import that throws fails only the hydration",
+        test_an_import_that_throws_fails_only_the_hydration);
+    run("an unrelated removal does not rewrite stored sessions",
+        test_an_unrelated_removal_does_not_rewrite_stored_sessions);
+    run("a session the store evicted is not written back",
+        test_a_session_the_store_evicted_is_not_written_back);
+    run("a failed write is retried after a removal scan dropped it",
+        test_a_failed_write_is_retried_after_a_removal_scan_dropped_it);
+    run("lost failure reports retry every missing session",
+        test_lost_failure_reports_retry_every_missing_session);
+    run("an export reuses the writer's spare buffer", test_an_export_reuses_the_writers_spare_buffer);
+    run("a foreign image of the same id does not count as stored",
+        test_a_foreign_image_of_the_same_id_does_not_count_as_stored);
     run("LossyTriggersOnlyWhenCold", test_lossy_triggers_only_when_cold);
     run("LossyPromptLengthChangeAccepted", test_lossy_prompt_length_change_accepted);
     run("LossyCancelDuringScout", test_lossy_cancel_during_scout);

@@ -201,7 +201,7 @@ qwen3_5::CheckpointImage export_checkpoint_image(const HostCheckpointStore& stor
                                                  const CheckpointLayout& layout,
                                                  std::span<const qwen3_5::CheckpointHandle> handles,
                                                  const std::optional<qwen3_5::PreparedSessionKey>& session,
-                                                 std::string_view binding) {
+                                                 std::string_view binding, std::vector<std::uint8_t> reuse) {
     std::vector<qwen3_5::CheckpointHandle> points;
     for (const auto handle : handles) {
         if (std::find(points.begin(), points.end(), handle) == points.end()) { points.push_back(handle); }
@@ -254,6 +254,8 @@ qwen3_5::CheckpointImage export_checkpoint_image(const HostCheckpointStore& stor
     }
 
     qwen3_5::CheckpointImage image;
+    image.bytes = std::move(reuse);
+    image.bytes.clear(); // keeps the capacity, and the pages behind it
     ImageWriter writer(image.bytes);
     codec::write_head(writer, kImageVersion, binding);
     write_config(writer, layout);

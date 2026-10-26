@@ -4,7 +4,7 @@
 # pulls the archive and its checksum file back into <repo-dir>/dist/.
 #   ./vast-release-linux.sh [repo-dir]
 # Prerequisites: vast-dev-launch.sh has finished (instance ready, model fetched), and the release
-# commit is checked out and CLEAN in repo-dir -- VERSION bumped and RELEASE_NOTES_X.Y.Z.md committed,
+# commit is checked out and CLEAN in repo-dir -- VERSION bumped and docs/release-notes/RELEASE_NOTES_X.Y.Z.md committed,
 # because the archive is a `git archive` of that exact commit and the packager refuses without them.
 # The build runs detached on the instance and is polled, so a dropped SSH connection costs nothing.
 # Does not destroy the instance: pull everything you need, then ./vast-destroy.sh.
