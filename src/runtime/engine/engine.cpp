@@ -96,6 +96,12 @@ constexpr std::size_t kMaximumPendingStoreWrites = 2;
 // behind idle writes rather than being dropped, because a dropped eviction is a recompute. Host
 // RAM, not pinned memory; it drains at the store's write rate.
 constexpr std::size_t kMaximumPendingEvictionBytes = std::size_t{4} << 30U;
+// The writer keeps the buffer of the last image it wrote for the next export: a fresh one of a
+// session's size is several hundred ms of page faults on the Engine worker (690 ms for 1.6 GB on a
+// Linux RTX 3090 box, against 90 ms to copy into one already mapped). One buffer, at most this
+// large, released once the writer has been idle this long.
+constexpr std::size_t kMaximumSpareExportBytes = std::size_t{8} << 30U;
+constexpr auto kSpareExportBufferIdle          = std::chrono::seconds(30);
 
 // The store keeps up to this share of the volume's free space when no limit is configured.
 constexpr std::uint64_t kAutomaticStoreShareDivisor = 2;
@@ -447,6 +453,7 @@ public:
     std::deque<PendingWrite> pending_writes;
     bool writer_active = false;
     std::string active_write_id; // the write in progress, while writer_active
+    std::vector<std::uint8_t> spare_export_buffer; // see kMaximumSpareExportBytes
     // Ids of queued writes that failed since the core last took them. Bounded: beyond it the
     // oldest go and `failed_write_ids_lost` says so, and the core then retries every continuation
     // whose image the store does not hold.
@@ -523,6 +530,7 @@ private:
                     take_failed_writes(reported.ids, reported.lost);
                     return reported;
                 },
+            .export_buffer = [this] { return take_export_buffer(); },
             .idle_persist =
                 std::chrono::duration_cast<std::chrono::milliseconds>(options.context_store.idle_persist),
             .hydration_budget =
@@ -720,6 +728,22 @@ private:
         failed_write_ids.push_back(std::move(id));
     }
 
+    // The spare buffer for the next export, if the writer holds one.
+    [[nodiscard]] std::vector<std::uint8_t> take_export_buffer() {
+        std::scoped_lock lock(writer_mutex);
+        return std::exchange(spare_export_buffer, {});
+    }
+
+    // Keeps a written image's buffer for the next export when it is the larger of the two and not
+    // too large. Under writer_mutex; whatever it does not keep is freed by the caller's `bytes`.
+    void keep_export_buffer_locked(std::vector<std::uint8_t>& bytes) noexcept {
+        if (bytes.capacity() <= spare_export_buffer.capacity() ||
+            bytes.capacity() > kMaximumSpareExportBytes) {
+            return;
+        }
+        std::swap(spare_export_buffer, bytes);
+    }
+
     // Hands over the failed writes not yet taken, and whether some were lost.
     void take_failed_writes(std::vector<std::string>& ids, bool& lost) {
         std::scoped_lock lock(writer_mutex);
@@ -734,12 +758,13 @@ private:
     bool enqueue_store_write(CheckpointImage&& image, StoreWrite kind) {
         std::unique_lock lock(writer_mutex);
         if (writer_stop) { return false; } // shutting down: the final flush writes it instead
+        // The memory the queue holds: a reused export buffer can be larger than its image.
         std::size_t queued_bytes = 0;
-        for (const auto& pending : pending_writes) { queued_bytes += pending.image.bytes.size(); }
+        for (const auto& pending : pending_writes) { queued_bytes += pending.image.bytes.capacity(); }
         const bool full =
             kind == StoreWrite::Eviction
                 ? !pending_writes.empty() &&
-                      queued_bytes + image.bytes.size() > kMaximumPendingEvictionBytes
+                      queued_bytes + image.bytes.capacity() > kMaximumPendingEvictionBytes
                 : pending_writes.size() >= kMaximumPendingStoreWrites;
         if (full) {
             store_dropped.fetch_add(1, std::memory_order_relaxed);
@@ -757,9 +782,23 @@ private:
     void writer_loop() noexcept {
         for (;;) {
             PendingWrite write;
+            std::vector<std::uint8_t> released; // freed outside the lock
             {
                 std::unique_lock lock(writer_mutex);
-                writer_cv.wait(lock, [&] { return writer_stop || !pending_writes.empty(); });
+                const auto woken = [&] { return writer_stop || !pending_writes.empty(); };
+                // Idle with a spare export buffer: let it go once nothing was written for a while,
+                // so an Engine that stopped writing does not keep a session's worth of memory.
+                while (!woken() && !spare_export_buffer.empty()) {
+                    if (!writer_cv.wait_for(lock, kSpareExportBufferIdle, woken)) {
+                        released = std::exchange(spare_export_buffer, {});
+                    }
+                }
+                if (!woken()) {
+                    lock.unlock();
+                    released = {};
+                    lock.lock();
+                    writer_cv.wait(lock, woken);
+                }
                 if (pending_writes.empty() ||
                     (writer_stop && drain_deadline &&
                      std::chrono::steady_clock::now() >= *drain_deadline)) {
@@ -791,6 +830,7 @@ private:
                     record_failed_write_locked(write.id);
                     store_write_failures.fetch_add(1, std::memory_order_relaxed);
                 }
+                keep_export_buffer_locked(write.image.bytes);
             }
             event.seconds =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();

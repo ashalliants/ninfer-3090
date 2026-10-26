@@ -378,7 +378,8 @@ ParsedImage parse_image(const ProgramImpl& program, std::span<const std::uint8_t
 
 CheckpointImage ProgramImpl::export_checkpoints(std::span<const CheckpointHandle> handles,
                                                 const std::optional<PreparedSessionKey>& session,
-                                                std::string_view binding) const {
+                                                std::string_view binding,
+                                                std::vector<std::uint8_t> buffer) const {
     if (context_transaction_ || pending_transaction_) {
         throw std::logic_error("checkpoints cannot be exported during a context transaction");
     }
@@ -507,6 +508,8 @@ CheckpointImage ProgramImpl::export_checkpoints(std::span<const CheckpointHandle
     }
 
     CheckpointImage image;
+    image.bytes = std::move(buffer);
+    image.bytes.clear(); // keeps the capacity, and the pages behind it
     ImageWriter writer(image.bytes);
     image_codec::write_head(writer, kImageVersion, binding);
     write_config(writer, config);

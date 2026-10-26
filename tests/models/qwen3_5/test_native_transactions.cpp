@@ -1758,6 +1758,22 @@ public:
         const auto from_host = program_.export_checkpoints(originals, std::nullopt, kBinding);
         require(from_host.bytes == from_device.bytes,
                 "Device and Host replicas of one checkpoint exported different bytes");
+        {
+            // Into a reused buffer, larger than the image and full of an earlier image's bytes:
+            // the same image, regions and keys.
+            std::vector<std::uint8_t> reuse(from_host.bytes.size() * 2 + 4096, 0xa5);
+            const auto reused = program_.export_checkpoints(originals, std::nullopt, kBinding,
+                                                            std::move(reuse));
+            require(reused.bytes == from_host.bytes && reused.keys == from_host.keys &&
+                        reused.tokens == from_host.tokens &&
+                        reused.regions.size() == from_host.regions.size(),
+                    "an export into a reused buffer differs from a fresh one");
+            for (std::size_t index = 0; index < reused.regions.size(); ++index) {
+                require(reused.regions[index].offset == from_host.regions[index].offset &&
+                            reused.regions[index].length == from_host.regions[index].length,
+                        "an export into a reused buffer has different regions");
+            }
+        }
 
         qwen::PreparedSessionKey session;
         session.size = 7;

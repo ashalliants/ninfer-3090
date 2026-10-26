@@ -59,7 +59,8 @@ struct CheckpointLayout {
                                                                const CheckpointLayout& layout,
                                                                std::span<const qwen3_5::CheckpointHandle> points,
                                                                const std::optional<qwen3_5::PreparedSessionKey>& session,
-                                                               std::string_view binding);
+                                                               std::string_view binding,
+                                                               std::vector<std::uint8_t> buffer = {});
 
 // The slab bytes an import of `image` takes. Throws std::invalid_argument for an image this layout
 // and binding cannot import.

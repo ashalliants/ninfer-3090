@@ -1044,14 +1044,27 @@ public:
     std::size_t image_payload_bytes                = 64 * 1024;
     [[nodiscard]] CheckpointImage export_checkpoints(std::span<const CheckpointHandle> points,
                                                      const std::optional<CacheSessionKey>&,
-                                                     std::string_view) const {
+                                                     std::string_view,
+                                                     std::vector<std::uint8_t> buffer = {}) const {
         exports_.fetch_add(1, std::memory_order_relaxed);
         const auto* restored = points.empty() ? nullptr : restored_point(points.front());
         if (restored == nullptr) { return {}; }
-        return image_of(restored->group, restored->frontier);
+        {
+            std::lock_guard lock(log_mutex_);
+            export_buffers_.push_back(buffer.capacity() == 0 ? nullptr : buffer.data());
+        }
+        return image_of(restored->group, restored->frontier, std::move(buffer));
     }
-    [[nodiscard]] CheckpointImage image_of(std::uint64_t group, std::uint32_t frontier) const {
+    // The data address of the buffer each export was given (nullptr: none).
+    [[nodiscard]] std::vector<const std::uint8_t*> export_buffers() const {
+        std::lock_guard lock(log_mutex_);
+        return export_buffers_;
+    }
+    [[nodiscard]] CheckpointImage image_of(std::uint64_t group, std::uint32_t frontier,
+                                           std::vector<std::uint8_t> buffer = {}) const {
         CheckpointImage image;
+        image.bytes = std::move(buffer);
+        image.bytes.clear();
         image.bytes.resize(kImageHeaderBytes + image_payload_bytes);
         std::memcpy(image.bytes.data(), &kImageMarker, sizeof kImageMarker);
         std::memcpy(image.bytes.data() + 8, &group, sizeof group);
@@ -1249,6 +1262,7 @@ private:
     // A deque: a restore adds a point while the worker may be reading the others.
     std::deque<RestoredPoint> restored_;
     mutable std::atomic<std::size_t> exports_{0};
+    mutable std::vector<const std::uint8_t*> export_buffers_;
     std::optional<std::uint32_t> scout_lane_;
     double lossy_keep_                   = 0.2;
     bool lossy_supported_                = true;

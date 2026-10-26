@@ -1365,6 +1365,42 @@ void test_lost_failure_reports_retry_every_missing_session() {
                 std::to_string(flushed.size()) + " writes");
 }
 
+// An export copies into the buffer the writer hands back (an earlier image's, already mapped),
+// not a fresh one.
+void test_an_export_reuses_the_writers_spare_buffer() {
+    StoreDirectory directory;
+    ContextStore::Options options;
+    options.directory   = directory.path();
+    options.chunk_bytes = 4096;
+    ContextStore store(options);
+    Rig rig({.chunk = 1024, .lanes = 1, .context_cache = true});
+    FailedWrites failed;
+    std::vector<std::uint8_t> spare(1 << 20);
+    const std::uint8_t* const spare_data = spare.data();
+    rig.core().set_context_store({.store         = &store,
+                                  .binding       = "fake-binding",
+                                  .failures      = [&] { return failed.failures(); },
+                                  .failed_writes = [&] { return failed.take(); },
+                                  .export_buffer = [&] { return std::exchange(spare, {}); }});
+    const auto image = rig.program().image_of(1, 4096);
+    const auto id    = ContextStore::image_id(image.keys.front().digests, 4096, false);
+    put_image(store, image);
+    restore_stored(rig, store, 1);
+    require(store.erase(id), "the image could not be erased");
+    failed.fail(id);
+    int flushed = 0;
+    (void)rig.core().persist_all(
+        [&](fake::CheckpointImage&& written, bool) {
+            require(written.bytes.data() == spare_data, "the image was not written into the spare buffer");
+            ++flushed;
+            return true;
+        },
+        Clock::now() + std::chrono::seconds(5));
+    const auto buffers = rig.program().export_buffers();
+    require(flushed == 1 && buffers.size() == 1 && buffers.front() == spare_data,
+            "the export was not given the writer's spare buffer");
+}
+
 // An image of the same id written under another model or configuration does not count as this
 // conversation stored: when this Engine's write of it fails, it is written again.
 void test_a_foreign_image_of_the_same_id_does_not_count_as_stored() {
@@ -2152,6 +2188,7 @@ int main() {
         test_a_failed_write_is_retried_after_a_removal_scan_dropped_it);
     run("lost failure reports retry every missing session",
         test_lost_failure_reports_retry_every_missing_session);
+    run("an export reuses the writer's spare buffer", test_an_export_reuses_the_writers_spare_buffer);
     run("a foreign image of the same id does not count as stored",
         test_a_foreign_image_of_the_same_id_does_not_count_as_stored);
     run("LossyTriggersOnlyWhenCold", test_lossy_triggers_only_when_cold);
