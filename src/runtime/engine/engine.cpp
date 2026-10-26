@@ -453,6 +453,39 @@ public:
     std::deque<PendingWrite> pending_writes;
     bool writer_active = false;
     std::string active_write_id; // the write in progress, while writer_active
+    std::mutex store_flush_mutex; // one Engine::flush_context_store at a time
+
+    // Engine::flush_context_store. One flush at a time: each turns the core's flush on and off.
+    ContextStoreFlushReport flush_store(std::chrono::milliseconds budget) {
+        if (!store) { throw std::invalid_argument("the context store is off (--context-store)"); }
+        std::scoped_lock flushing(store_flush_mutex);
+        const auto started  = std::chrono::steady_clock::now();
+        const auto deadline = started + budget;
+        const auto puts     = store->stats().puts;
+        ContextStoreFlushReport report;
+        with_generation([&](auto& generation) {
+            generation.set_store_flush(true);
+            struct Off {
+                decltype(generation)& core;
+                ~Off() { core.set_store_flush(false); }
+            } const off{generation};
+            for (;;) {
+                report.unsaved = generation.unsaved_store_sessions();
+                if ((report.unsaved == 0 && store_queue_idle()) ||
+                    std::chrono::steady_clock::now() >= deadline) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        });
+        // Everything written is queued for the bucket by now; send it without its delay.
+        report.uploaded = store->flush_remote(deadline);
+        report.written  = store->stats().puts - puts;
+        report.seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        return report;
+    }
+
     std::vector<std::uint8_t> spare_export_buffer; // see kMaximumSpareExportBytes
     // Ids of queued writes that failed since the core last took them. Bounded: beyond it the
     // oldest go and `failed_write_ids_lost` says so, and the core then retries every continuation
@@ -1126,6 +1159,11 @@ bool Engine::is_available() const {
             }
         },
         impl_->core);
+}
+
+ContextStoreFlushReport Engine::flush_context_store(std::chrono::milliseconds budget) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->flush_store(budget);
 }
 
 ResidencyStatus Engine::suspend(std::optional<bool> auto_resume) {

@@ -684,6 +684,26 @@ The local directory becomes a cache of the bucket.
   the directory keeps working. Shutdown waits for queued uploads up to the remote flush budget (two
   minutes) and then interrupts the transfer in progress, so it never waits out a stalled connection.
 
+#### Flushing before a box goes
+
+`POST /v1/context-store/flush` (optional body `{"budget_seconds": N}`, 1-3600, default 600) writes
+every retained conversation the store does not hold as it is now, then uploads whatever waits for the
+bucket without its delay, while the server keeps serving. Conversations are written one a second
+between steps, as idle writes are, so requests carry on beside it. It answers once nothing is left or
+the budget is spent:
+
+```json
+{"written": 12, "unsaved": 0, "uploaded": true, "seconds": 14.2}
+```
+
+`unsaved` counts conversations still not stored (one in use by a request is not counted until it
+ends) and `uploaded` is false when the uploads did not all finish. It answers 409
+`context_store_off` without `--context-store`. A gateway calls it when it starts draining a box it
+will destroy, or before it moves conversations elsewhere: the next box then finds them in the
+bucket. With that in place a fleet can trade freshness for traffic: a long
+`--context-store-s3-upload-delay-seconds` sends a busy conversation's state once per delay instead
+of after every turn, and the flush sends the rest before the box goes.
+
 
 ### Model suspend
 

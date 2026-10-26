@@ -179,6 +179,11 @@ public:
     ninfer::ResidencyStatus resume();
     [[nodiscard]] ninfer::ResidencyStatus residency() const;
 
+    // See Engine::flush_context_store.
+    ninfer::ContextStoreFlushReport flush_context_store(std::chrono::milliseconds budget) {
+        return engine_->flush_context_store(budget);
+    }
+
     // Requests currently holding ingress capacity (max_concurrency + max_pending_requests).
     [[nodiscard]] std::size_t admitted_requests() const;
 

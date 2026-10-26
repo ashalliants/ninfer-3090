@@ -709,6 +709,30 @@ int exercise_rewrite(const char* artifact, const fs::path& root) {
     return 0;
 }
 
+// A flush (Engine::flush_context_store) writes a conversation idle writes would not, while the
+// Engine keeps serving: with idle writes off, a finished turn is unsaved until the flush.
+int exercise_flush(const char* artifact, const fs::path& root) {
+    ninfer::Engine engine(
+        with_store(store_engine_options(artifact), root / "flush", std::chrono::seconds(0)));
+    (void)engine.generate(engine.prepare(conversation(kShortFirst)), greedy());
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    if (engine.runtime_stats().context_store_writes != 0) {
+        std::cerr << "flush: the session was written with idle writes off\n";
+        return 1;
+    }
+    const auto report = engine.flush_context_store(std::chrono::seconds(60));
+    const auto stats  = engine.runtime_stats();
+    if (report.written != 1 || report.unsaved != 0 || !report.uploaded ||
+        stats.context_store_images != 1) {
+        std::cerr << "flush: written=" << report.written << " unsaved=" << report.unsaved
+                  << " uploaded=" << report.uploaded << " images=" << stats.context_store_images
+                  << '\n';
+        return 1;
+    }
+    std::cout << "flush: wrote 1 session in " << report.seconds << " s\n";
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -774,6 +798,9 @@ int main(int argc, char** argv) {
         }
         if (scenario == "all" || scenario == "bucket") {
             if (exercise_bucket(artifact, root, short_control) != 0) { return 1; }
+        }
+        if (scenario == "all" || scenario == "flush") {
+            if (exercise_flush(artifact, root) != 0) { return 1; }
         }
         if (scenario == "all" || scenario == "rewrite") {
             if (exercise_rewrite(artifact, root) != 0) { return 1; }

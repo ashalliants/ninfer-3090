@@ -514,6 +514,9 @@ void HttpServer::register_routes() {
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_model_suspend(req, res);
                  });
+    server_.Post("/v1/context-store/flush", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_context_store_flush(req, res);
+    });
     server_.Post(R"(/v1/models/([^/]+)/resume)",
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_model_resume(req, res);
@@ -629,6 +632,46 @@ void fail_residency(httplib::Response& res, int status, std::string code, std::s
 }
 
 } // namespace
+
+// Writes every unsaved conversation to the context store and uploads what waits for the bucket,
+// while serving carries on (Engine::flush_context_store), for a gateway draining the box or moving
+// conversations elsewhere. Body: optional {"budget_seconds": 1-3600} (default 600). Answers once
+// it is done or the budget is spent; "unsaved" > 0 or "uploaded": false says what was left.
+void HttpServer::handle_context_store_flush(const httplib::Request& req, httplib::Response& res) {
+    constexpr std::int64_t kDefaultBudgetSeconds = 600;
+    constexpr std::int64_t kMaximumBudgetSeconds = 3600;
+    std::int64_t budget = kDefaultBudgetSeconds;
+    try {
+        const nlohmann::json body =
+            req.body.empty() ? nlohmann::json::object() : nlohmann::json::parse(req.body);
+        if (!body.is_object()) { throw std::invalid_argument("body is not an object"); }
+        for (const auto& [key, value] : body.items()) {
+            if (key != "budget_seconds" || !value.is_number_integer()) {
+                throw std::invalid_argument("unexpected field");
+            }
+            budget = value.get<std::int64_t>();
+        }
+        if (budget < 1 || budget > kMaximumBudgetSeconds) { throw std::invalid_argument("range"); }
+    } catch (const std::exception&) {
+        fail_residency(res, 400, "invalid_request",
+                       "request body must be a JSON object with at most an integer budget_seconds "
+                       "from 1 to 3600");
+        return;
+    }
+    try {
+        const auto report = service_->flush_context_store(std::chrono::seconds(budget));
+        res.set_content(nlohmann::json{{"written", report.written},
+                                       {"unsaved", report.unsaved},
+                                       {"uploaded", report.uploaded},
+                                       {"seconds", report.seconds}}
+                            .dump(),
+                        "application/json");
+    } catch (const std::invalid_argument& error) {
+        fail_residency(res, 409, "context_store_off", error.what());
+    } catch (const std::exception& error) {
+        fail_residency(res, 503, "context_store_unavailable", error.what());
+    }
+}
 
 void HttpServer::handle_model_residency(const httplib::Request& req,
                                         httplib::Response& res) const {

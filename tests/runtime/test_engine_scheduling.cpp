@@ -1330,6 +1330,46 @@ void test_a_failed_write_is_retried_after_a_removal_scan_dropped_it() {
 
 // When the writer lost some failure reports (more failed than it keeps), every continuation whose
 // image the store does not hold is written again, not trusted as stored.
+// A flush writes every unsaved continuation even with idle writes off, and nothing more.
+void test_a_flush_writes_unsaved_sessions_with_idle_writes_off() {
+    StoreDirectory directory;
+    ContextStore::Options options;
+    options.directory   = directory.path();
+    options.chunk_bytes = 4096;
+    ContextStore store(options);
+    Rig rig({.chunk = 1024, .lanes = 1, .context_cache = true});
+    std::atomic<int> writes{0};
+    FailedWrites failed;
+    rig.attach_store_writer(
+        store,
+        [&](fake::CheckpointImage&& image) {
+            put_image(store, image);
+            ++writes;
+            return true;
+        },
+        std::chrono::milliseconds(0), [&] { return failed.failures(); },
+        [&] { return failed.take(); });
+    for (const std::uint64_t group : {1, 2}) {
+        put_image(store, rig.program().image_of(group, 4096));
+        restore_stored(rig, store, group);
+    }
+    // Session 1's write "failed": it is unsaved; session 2 is stored.
+    const auto id =
+        ContextStore::image_id(rig.program().image_of(1, 4096).keys.front().digests, 4096, false);
+    require(store.erase(id), "the image could not be erased");
+    failed.fail(id);
+    require(rig.core().unsaved_store_sessions() == 1, "the failed write did not leave one unsaved");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    require(writes == 0, "a session was written with idle writes off and no flush");
+    rig.core().set_store_flush(true);
+    const bool flushed = rig.wait_for([&] { return rig.core().unsaved_store_sessions() == 0; },
+                                      std::chrono::seconds(5));
+    rig.core().set_store_flush(false);
+    require(flushed && writes == 1 && store.find(id).has_value(),
+            "the flush did not write exactly the unsaved session: " + std::to_string(writes.load()) +
+                " writes");
+}
+
 void test_lost_failure_reports_retry_every_missing_session() {
     StoreDirectory directory;
     ContextStore::Options options;
@@ -2186,6 +2226,8 @@ int main() {
         test_a_session_the_store_evicted_is_not_written_back);
     run("a failed write is retried after a removal scan dropped it",
         test_a_failed_write_is_retried_after_a_removal_scan_dropped_it);
+    run("a flush writes unsaved sessions with idle writes off",
+        test_a_flush_writes_unsaved_sessions_with_idle_writes_off);
     run("lost failure reports retry every missing session",
         test_lost_failure_reports_retry_every_missing_session);
     run("an export reuses the writer's spare buffer", test_an_export_reuses_the_writers_spare_buffer);
