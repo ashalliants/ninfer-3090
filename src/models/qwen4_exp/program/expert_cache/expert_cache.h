@@ -70,9 +70,20 @@ public:
     // admission is always the budgeted one-victim loop, whose victim is the lowest (score, key)
     // resident outside the group that the gate approves: residents it refuses are skipped for the
     // rest of the step, and admission stops when no approved resident scores below the newcomer.
+    // The candidates are min-heaps built once per step (scores do not change within it). With gate
+    // classes (set_gate_classes) a refusal refuses the refused key's whole class for the step: its
+    // heap is no longer consulted and its keys are skipped without a gate call, so a step costs
+    // O(residents) plus O(classes) per victim and at most one gate call per victim and per class.
     void step(std::span<const std::uint32_t> group, Step& out,
               std::size_t admission_budget = static_cast<std::size_t>(-1), const Admissible* admissible = nullptr,
               const Admissible* evictable = nullptr);
+
+    // Gate classes: `classify` maps a key to a class below `count` such that the eviction gate refuses
+    // either every key of a class or none of them for the rest of a step (partial RAM residency: a
+    // layer's experts held only in VRAM, whose layer has no slot to give, versus the rest). A key's
+    // class may change within the step; the gate is asked with its class at that moment.
+    using Classifier = std::function<std::uint32_t(std::uint32_t)>;
+    void set_gate_classes(Classifier classify, std::uint32_t count);
 
     // Promote a non-resident key (for example a staged prefetch whose frame changes role).
     // Returns the victim, or nothing when the pool still has room.
@@ -103,9 +114,16 @@ private:
     void select_victims(std::size_t need, std::span<const std::uint32_t> protect,
                         std::vector<std::uint32_t>& out);
     // The lowest (score, key) resident outside `protect` that `gate` approves and that `newcomer`
-    // outranks; refused residents are remembered in refused_ until the step ends.
+    // outranks, from the step's candidate heap (built on first use); refused ones leave the heap.
     std::optional<std::uint32_t> evictable_victim(std::span<const std::uint32_t> protect, std::uint32_t newcomer,
                                                   const Admissible& gate);
+
+public:
+    // Work counters of the gated victim search (tests bound them): candidate heaps built, gate calls.
+    [[nodiscard]] std::uint64_t gate_heaps() const noexcept { return gate_heaps_; }
+    [[nodiscard]] std::uint64_t gate_calls() const noexcept { return gate_calls_; }
+
+private:
 
     std::uint32_t capacity_;
     std::uint32_t halving_period_;
@@ -125,8 +143,12 @@ private:
     std::vector<std::uint32_t> candidates_;
     std::vector<std::uint32_t> ranked_; // scratch: budgeted admission's candidates, best first
     std::vector<std::uint32_t> victim_; // scratch: one victim at a time
-    std::vector<std::uint8_t> refused_; // per key: refused by the eviction gate this step
-    std::vector<std::uint32_t> refused_keys_;
+    std::vector<std::vector<std::pair<double, std::uint32_t>>> gate_heaps_by_class_; // min-heaps
+    std::vector<std::uint8_t> class_refused_;
+    Classifier classify_;
+    std::uint32_t classes_   = 1;
+    bool gate_heap_built_    = false;
+    std::uint64_t gate_heaps_ = 0, gate_calls_ = 0;
 };
 
 // What a warm start needs (design §19.3.5 S4b): every key's LFRU count, and the resident keys,
@@ -228,6 +250,9 @@ public:
     // Lending or shrinking over such an expert is refused (std::logic_error, nothing changed): they
     // evict without a round to write it back in. Empty: every expert has a host copy (full mode).
     void set_writeback(LfruPolicy::Admissible needs) { writeback_ = std::move(needs); }
+    void set_gate_classes(LfruPolicy::Classifier classify, std::uint32_t count) {
+        policy_.set_gate_classes(std::move(classify), count);
+    }
     void complete_writeback(std::uint32_t frame, std::vector<Command>& out);
     [[nodiscard]] bool writing_back(std::uint32_t frame) const { return frames_.is_demoting(frame); }
     void on_round_done(std::uint64_t round_done, std::vector<Command>& out);

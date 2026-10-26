@@ -131,6 +131,9 @@ ExpertResidency::ExpertResidency(const TextConfig& config, std::vector<const std
         controller_->set_writeback([this](std::uint32_t key) {
             return homes_->frame(key) >= 0 && !homes_->in_ram(key) && !homes_->writing_back(key);
         });
+        // A layer with no slot to give refuses all its VRAM-only experts at once.
+        controller_->set_gate_classes([this](std::uint32_t key) { return homes_->gate_class(key); },
+                                      homes_->gate_classes());
     }
 }
 

@@ -98,8 +98,18 @@ public:
     // a free one not yet reserved, else one reclaimed now from the layer's VRAM resident with a copy
     // that `score` ranks highest (lowest key without one), which then lives only in VRAM. Approved
     // keys are never reclaimed from until clear_reservations, so a key this round evicts keeps its copy.
+    // A layer found with no slot to give is remembered until its slots or residents change, so
+    // further VRAM-only keys of that layer are refused in O(1), without searching it again.
     using Score = std::function<double(ExpertKey)>;
     [[nodiscard]] bool reserve_eviction(ExpertKey key, const Score* score = nullptr);
+    // The gate's classes (expert_cache::LfruPolicy::set_gate_classes): 2 * layer + 1 for a key held
+    // only in VRAM (refused exactly when its layer has no slot to give, which lasts the step), else
+    // 2 * layer (always approved). gate_classes() of them.
+    [[nodiscard]] std::uint32_t gate_class(ExpertKey key) const {
+        const std::uint32_t layer = key / experts_;
+        return 2 * layer + (frame_.at(key) >= 0 && state_[key] == kNone && !leaving_[key] ? 1U : 0U);
+    }
+    [[nodiscard]] std::uint32_t gate_classes() const noexcept { return 2 * layers(); }
     void clear_reservations();
 
     // The key leaves VRAM. With a RAM copy it leaves at once (nothing returned). Without one a
@@ -112,6 +122,8 @@ public:
     // Keys whose RAM copy or slot changed since the last call (placed, written back, reclaimed).
     [[nodiscard]] std::vector<ExpertKey> take_changed();
     [[nodiscard]] std::uint64_t reclaimed() const noexcept { return reclaimed_; }
+    // Searches of a layer for a copy to reclaim (each O(experts)); tests bound them.
+    [[nodiscard]] std::uint64_t reclaim_searches() const noexcept { return searches_; }
 
     // Throws std::logic_error when some key has no valid copy, or a layer holds more slots than it has.
     void check() const;
@@ -133,6 +145,11 @@ private:
     std::vector<std::uint8_t> changed_;
     std::vector<ExpertKey> changed_keys_;
     std::uint64_t reclaimed_ = 0;
+    std::uint64_t searches_  = 0;
+    // Per layer: a generation that changes with its slots or VRAM residents, and the generation at
+    // which it was last found with no slot to give.
+    std::vector<std::uint64_t> generation_, blocked_at_;
+    void touch(std::uint32_t layer) { ++generation_[layer]; }
 };
 
 // One round's moves: the evicted experts that need a write-back first (held only in VRAM), and the

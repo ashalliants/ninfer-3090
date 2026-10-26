@@ -59,6 +59,8 @@ Residency::Residency(std::uint32_t experts, std::span<const std::uint32_t> slots
     reserved_.assign(slots.size(), 0);
     leaving_.assign(keys, 0);
     changed_.assign(keys, 0);
+    generation_.assign(slots.size(), 1);
+    blocked_at_.assign(slots.size(), 0);
 }
 
 std::uint32_t Residency::layer_of(ExpertKey key) const {
@@ -82,6 +84,7 @@ void Residency::place_vram(ExpertKey key, std::uint32_t frame) {
     (void)layer_of(key);
     if (frame_[key] >= 0 || state_[key] != kNone) { throw std::logic_error("partial residency: key placed twice"); }
     frame_[key] = static_cast<std::int32_t>(frame);
+    touch(key / experts_);
 }
 
 std::uint64_t Residency::place_ram(ExpertKey key) {
@@ -92,6 +95,7 @@ std::uint64_t Residency::place_ram(ExpertKey key) {
     }
     state_[key] = kInRam;
     mark(key);
+    touch(layer);
     return ram_offset(key);
 }
 
@@ -100,6 +104,7 @@ void Residency::publish(ExpertKey key, std::uint32_t frame) {
     if (state_[key] == kWritingBack) { throw std::logic_error("partial residency: published before its write-back"); }
     if (state_[key] != kInRam) { throw std::logic_error("partial residency: published without a RAM copy"); }
     frame_[key] = static_cast<std::int32_t>(frame);
+    touch(key / experts_); // a new copy to reclaim
 }
 
 bool Residency::reserve_eviction(ExpertKey key, const Score* score) {
@@ -115,6 +120,8 @@ bool Residency::reserve_eviction(ExpertKey key, const Score* score) {
     if (leaving_[key]) { return true; } // its slot is already reserved
     RamSlots& pool = slots_[layer];
     if (pool.free_slots() <= reserved_[layer]) {
+        if (blocked_at_[layer] == generation_[layer]) { return false; } // nothing changed since the last search
+        ++searches_;
         // Reclaim the copy of the layer's best VRAM resident that keeps its frame this round.
         std::optional<ExpertKey> best;
         double best_score = 0.0;
@@ -127,7 +134,10 @@ bool Residency::reserve_eviction(ExpertKey key, const Score* score) {
                 best_score = s;
             }
         }
-        if (!best) { return false; }
+        if (!best) {
+            blocked_at_[layer] = generation_[layer];
+            return false;
+        }
         pool.release(*best);
         state_[*best] = kNone;
         mark(*best);
@@ -140,8 +150,14 @@ bool Residency::reserve_eviction(ExpertKey key, const Score* score) {
 }
 
 void Residency::clear_reservations() {
-    for (const ExpertKey key : leaving_keys_) { leaving_[key] = 0; }
+    for (const ExpertKey key : leaving_keys_) {
+        if (leaving_[key]) { touch(key / experts_); } // its copy may be reclaimed again
+        leaving_[key] = 0;
+    }
     leaving_keys_.clear();
+    for (std::uint32_t l = 0; l < reserved_.size(); ++l) {
+        if (reserved_[l] != 0) { touch(l); } // reserved slots are free again
+    }
     std::fill(reserved_.begin(), reserved_.end(), 0U);
 }
 
@@ -150,6 +166,7 @@ std::optional<std::uint64_t> Residency::evict(ExpertKey key) {
     if (frame_[key] < 0 || state_[key] == kWritingBack) { return std::nullopt; } // not in VRAM, or leaving already
     if (state_[key] == kInRam) {
         frame_[key] = -1;
+        touch(layer);
         return std::nullopt;
     }
     if (!slots_[layer].acquire(key)) {
@@ -158,6 +175,7 @@ std::optional<std::uint64_t> Residency::evict(ExpertKey key) {
     if (leaving_[key] && reserved_[layer] > 0) { --reserved_[layer]; }
     state_[key] = kWritingBack;
     mark(key);
+    touch(layer);
     return ram_offset(key);
 }
 
@@ -167,6 +185,7 @@ void Residency::complete_writeback(ExpertKey key) {
     state_[key] = kInRam;
     frame_[key] = -1;
     mark(key);
+    touch(key / experts_);
 }
 
 std::vector<ExpertKey> Residency::take_changed() {
