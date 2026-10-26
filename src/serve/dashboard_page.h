@@ -17,7 +17,7 @@ namespace ninfer::serve {
 
 // GET or HEAD /dashboard. The page holds no data, so it is served without the API key (and while
 // the model loads); its script sends the key the user types with every request it makes. The
-// Host and Origin checks still apply.
+// request checks still apply as to every route (on a keyless server, Host and Origin).
 [[nodiscard]] bool is_dashboard_request(std::string_view method, std::string_view path) noexcept;
 
 } // namespace ninfer::serve

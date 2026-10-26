@@ -44,6 +44,22 @@ void validate_draft_context_rows(const EngineOptions& options) {
     }
 }
 
+// --relaxed-drafting P: a threshold in [0, 1], and speculation for it to relax. ninfer-serve
+// refuses the missing backend at parse time too, so a command line fails before any load.
+void validate_relaxed_drafting(const EngineOptions& options) {
+    if (!options.relaxed_drafting) { return; }
+    const float threshold = *options.relaxed_drafting;
+    if (!std::isfinite(threshold) || threshold < 0.0F || threshold > 1.0F) {
+        throw std::invalid_argument("--relaxed-drafting P must be in [0,1]");
+    }
+    if (options.purpose != EnginePurpose::Generation ||
+        options.speculative.backend == SpeculativeBackend::None) {
+        throw std::invalid_argument(
+            "--relaxed-drafting changes which drafts speculative decoding keeps and needs "
+            "--spec mtp, dflash or dflash2");
+    }
+}
+
 } // namespace
 
 void validate_engine_options(const EngineOptions& options) {
@@ -110,18 +126,7 @@ void validate_engine_options(const EngineOptions& options) {
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
-    if (options.relaxed_drafting) {
-        const float threshold = *options.relaxed_drafting;
-        if (!std::isfinite(threshold) || threshold < 0.0F || threshold > 1.0F) {
-            throw std::invalid_argument("--relaxed-drafting P must be in [0,1]");
-        }
-        if (options.purpose != EnginePurpose::Generation ||
-            options.speculative.backend == SpeculativeBackend::None) {
-            throw std::invalid_argument(
-                "--relaxed-drafting changes which drafts speculative decoding keeps and needs "
-                "--spec mtp, dflash or dflash2");
-        }
-    }
+    validate_relaxed_drafting(options);
     validate_draft_context_rows(options);
     if (options.max_pending_requests == 0 || options.pending_timeout_ms == 0) {
         throw std::invalid_argument("Engine pending request capacity and timeout must be nonzero");
@@ -294,18 +299,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
-    if (options.relaxed_drafting) {
-        const float threshold = *options.relaxed_drafting;
-        if (!std::isfinite(threshold) || threshold < 0.0F || threshold > 1.0F) {
-            throw std::invalid_argument("--relaxed-drafting P must be in [0,1]");
-        }
-        if (options.purpose != EnginePurpose::Generation ||
-            options.speculative.backend == SpeculativeBackend::None) {
-            throw std::invalid_argument(
-                "--relaxed-drafting changes which drafts speculative decoding keeps and needs "
-                "--spec mtp, dflash or dflash2");
-        }
-    }
+    validate_relaxed_drafting(options);
     validate_draft_context_rows(options);
 
     if (options.prefill_schedule.stall_budget_ms > kMaximumPrefillStallBudgetMs) {

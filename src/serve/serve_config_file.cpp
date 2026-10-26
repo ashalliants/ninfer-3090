@@ -2,9 +2,11 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cmath>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::serve {
 namespace {
@@ -15,9 +17,20 @@ std::invalid_argument refuse(const std::filesystem::path& path, const std::strin
     return std::invalid_argument(path.string() + ": " + what);
 }
 
-// One value as a command-line word: a string as written, a number as JSON writes it.
+// One value as a command-line word: a string as written, a number as JSON writes it, except that
+// a float with an integral value (1024.0, 1e3) is written as that integer: the integer options
+// refuse "1024.0", and a file read and rewritten by a JSON tool may turn 1024 into it.
 std::string value_word(const Json& value) {
-    return value.is_string() ? value.get<std::string>() : value.dump();
+    if (value.is_string()) { return value.get<std::string>(); }
+    if (value.is_number_float()) {
+        constexpr double kExactIntegers = 9007199254740992.0; // 2^53
+        const double number             = value.get<double>();
+        if (std::isfinite(number) && std::trunc(number) == number &&
+            std::fabs(number) < kExactIntegers) {
+            return std::to_string(static_cast<long long>(number));
+        }
+    }
+    return value.dump();
 }
 
 } // namespace

@@ -274,7 +274,8 @@ int main() {
                         std::string::npos &&
                     page->body.rfind("<!doctype html>", 0) == 0,
                 "dashboard_while_loading: GET /dashboard was not served without the key");
-            const auto rebound = client.Get("/dashboard", httplib::Headers{{"Host", "evil.example:8080"}});
+            const auto rebound =
+                client.Get("/dashboard", httplib::Headers{{"Host", "evil.example:8080"}});
             failures += check(rebound && rebound->status == 200,
                               "dashboard_while_loading: a keyed server ran the Host check");
             const auto metrics = client.Get("/metrics");

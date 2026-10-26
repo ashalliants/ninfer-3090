@@ -248,7 +248,9 @@ std::string serve_usage_text(const char* argv0) {
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
            "       --config FILE reads options from a JSON object of flag names without dashes "
            "(\"max-context\": 65536, \"vision\": true; an array repeats a repeatable flag); the "
-           "command line wins over the file. Not --api-key\n"
+           "command line wins over the file, except that a repeatable flag (--graft, --allowed-host, "
+           "--context-store-peer) keeps the file's entries and adds the command line's. Not "
+           "--api-key\n"
            "       --default-max-tokens fixes the output budget of requests that omit a limit; "
            "unset, such a request may run to the end of its context\n"
            "       --max-output-tokens caps the output budget of every request, including ones "
@@ -306,24 +308,26 @@ std::string serve_usage_text(const char* argv0) {
            "small perplexity cost (docs/performance.md), off by default, and it wants a larger "
            "--prefill-chunk to pay; --no-prefill-cublas-projections keeps the attention and GDN "
            "input projections off that route\n"
-           "       Qwen3.8-Flash-Next (one or two requests at once, --kv-dtype int8): prefix reuse keeps "
+           "       Qwen3.8-Flash-Next (one or two requests at once, --kv-dtype int8; \"the same "
+           "output\" below is what an option is designed to keep, not yet checked on a GPU): prefix "
+           "reuse keeps "
            "checkpoints in pinned RAM (--host-context-mib, default 4096, 0 turns reuse off) or, with "
            "--context-nvme-mib N, in a scratch file of up to N MiB on local disk (removed at exit; "
            "--context-nvme-dir DIR, default beside the model) with --host-context-mib as its RAM "
            "cache (0: disk only); --context-store DIR keeps it across restarts; "
            "--ngram-volume FILE is its n-gram table (default <model>.ngram); --ngram-keepalive-ms N "
            "reads a block from it after N ms of idleness so the drive stays awake (default 40, "
-           "0 turns it off); --expert-state FILE "
+           "0 turns it off, at most 60000); --expert-state FILE "
            "keeps the VRAM expert cache's state across restarts (default <model>.expert-state; "
            "--no-expert-state starts it empty and saves nothing); --default-expert-state FILE is a state "
-           "shipped for a fresh install, read only when the saved one is missing or belongs to another "
-           "artifact (default <model>.expert-state.default); --vram-headroom-mib N is the VRAM "
+           "shipped for a fresh install, read only when the saved one does not load (missing, another "
+           "copy, damaged; default <model>.expert-state.default); --vram-headroom-mib N is the VRAM "
            "the expert cache leaves free for the desktop (default 512 with a display, 256 without); "
            "--ram-headroom-mib N is the RAM left free for Windows once every expert is pinned "
            "(default 2048; startup refuses when it cannot be kept); --expert-cache-mib N caps the "
            "expert cache (for measurement); --shared-expert-stream runs each MoE block's shared "
-           "expert on a high-priority CUDA stream beside the routed experts (the same output, bit for "
-           "bit; off by default); --mtp-constrained keeps MTP speculation (--spec mtp) on for "
+           "expert on a second CUDA stream beside the routed experts (high priority in eager calls "
+           "only; CUDA graphs ignore stream priority; the same output, bit for bit; off by default); --mtp-constrained keeps MTP speculation (--spec mtp) on for "
            "constrained requests (JSON schema, grammar, tool calls), accepting each draft under its "
            "own grammar mask (off by default: they decode without MTP); --mtp-joint-acceptance "
            "(--spec mtp) drafts --draft-tokens each round and verifies the drafts whose joint chance "
@@ -569,19 +573,19 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
     // Flags that only mean something to a router (--sleep-idle-seconds also works on one model).
     std::string router_only_flag;
     for (int i = artifact_given ? 2 : 1; i < argc; ++i) {
-        const std::string_view current = argv[i];
-        if (router_option(current)) {
-            if (current == "--models-max" || current == "--unload-idle-seconds") {
-                router_only_flag = std::string(current);
+        const std::string_view word = argv[i];
+        if (router_option(word)) {
+            if (word == "--models-max" || word == "--unload-idle-seconds") {
+                router_only_flag = std::string(word);
             }
             ++i;
             continue;
         }
-        if (current == "--models-autoload" || current == "--no-models-autoload") {
-            router_only_flag = std::string(current);
+        if (word == "--models-autoload" || word == "--no-models-autoload") {
+            router_only_flag = std::string(word);
             continue;
         }
-        options.model_arguments.emplace_back(current);
+        options.model_arguments.emplace_back(word);
     }
     // A file's flag takes only its own value, never the next key or the command line's next word.
     const auto value_follows = [&](int at) {

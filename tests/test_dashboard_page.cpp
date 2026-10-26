@@ -1,8 +1,9 @@
 // The dashboard ninfer-serve serves at GET /dashboard (serve/dashboard_page.h), host only:
 //   - page_embedded: the page is in the binary, is an HTML document, polls /slots, /metrics and
 //     /v1/load, and names no external URL (it must work offline and fetch nothing elsewhere);
-//   - page_writes_no_markup: the script never parses server data as HTML (no innerHTML,
-//     outerHTML, insertAdjacentHTML or document.write), which is what makes the inline script
+//   - page_writes_no_markup: the script never turns a string into markup or code (no innerHTML,
+//     outerHTML, insertAdjacentHTML, document.write, srcdoc, DOMParser, setHTML, eval, Function,
+//     javascript: URLs, on* attributes or string timers), which is what makes the inline script
 //     safe under the page's Content-Security-Policy;
 //   - content_policy: the policy denies everything by default, lets the page fetch from its own
 //     origin only, and forbids framing;
@@ -42,9 +43,20 @@ void page_embedded() {
 
 void page_writes_no_markup() {
     const std::string_view page = ninfer::serve::dashboard_page();
-    for (const char* sink : {"innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"}) {
-        check(!contains(page, sink), "page_writes_no_markup: no HTML sink in the script");
+    // Every way a script turns a string into markup or code (document.write covers writeln).
+    for (const char* sink : {"innerHTML", "outerHTML", "insertAdjacentHTML", "document.write",
+                             "srcdoc", "DOMParser", "parseFromString", "createContextualFragment",
+                             "setHTML", "eval(", "Function(", "javascript:", "setAttribute('on",
+                             "setAttribute(\"on"}) {
+        if (contains(page, sink)) {
+            std::fprintf(stderr, "FAIL: page_writes_no_markup: the script uses %s\n", sink);
+            ++failures;
+        }
     }
+    // A timer given a string runs it as code; the page passes functions only.
+    check(!contains(page, "setTimeout('") && !contains(page, "setTimeout(\"") &&
+              !contains(page, "setInterval('") && !contains(page, "setInterval(\""),
+          "page_writes_no_markup: a timer given a string of code");
 }
 
 void content_policy() {

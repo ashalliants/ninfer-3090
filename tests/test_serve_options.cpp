@@ -370,7 +370,8 @@ int main() {
                       "Flash-Next flags were not parsed");
     failures += check(make_engine_options(flash).flash_next.expert_cache_bytes == (1024ULL << 20),
                       "Flash-Next options do not reach the Engine");
-    failures += check(defaults.flash_next.default_expert_state_path.empty(), "a default expert state is set by default");
+    failures += check(defaults.flash_next.default_expert_state_path.empty(),
+                      "--default-expert-state holds a path before the flag is given");
     failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--default-expert-state", "K:/d.default"}))
                               .flash_next.default_expert_state_path == "K:/d.default",
                       "--default-expert-state does not reach the Engine");

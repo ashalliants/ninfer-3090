@@ -544,8 +544,8 @@ struct FakeModelServer {
 };
 
 // The router's pre-routing handler runs the Host (keyless only), Origin and Sec-Fetch-Site checks
-// on its public address, ahead of the key, over real HTTP; what a key or --cors lets in also gets through the
-// keyless, CORS-less model behind it (the relay drops Origin and Sec-Fetch-*).
+// on its public address, ahead of the key, over real HTTP; what a key or --cors lets in also gets
+// through the keyless, CORS-less model behind it (the relay drops Host, Origin and Sec-Fetch-*).
 void router_checks_host_and_origin() {
     enum class Access { Open, Keyed, Cors };
     for (const Access access : {Access::Open, Access::Keyed, Access::Cors}) {
@@ -602,7 +602,8 @@ void router_checks_host_and_origin() {
                    page->get_header_value("X-Content-Type-Options") == "nosniff" &&
                    page->body.rfind("<!doctype html>", 0) == 0,
                "the router did not serve the dashboard without a key" + with);
-        const auto rebound_page = client.Get("/dashboard", httplib::Headers{{"Host", "evil.example:8080"}});
+        const auto rebound_page =
+            client.Get("/dashboard", httplib::Headers{{"Host", "evil.example:8080"}});
         expect(rebound_page && rebound_page->status == (access == Access::Keyed ? 200 : 403),
                "the dashboard and the router's Host check disagree" + with);
         if (access == Access::Keyed) {

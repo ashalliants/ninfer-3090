@@ -27,8 +27,9 @@ char lower(char value) {
 }
 
 bool iequal(std::string_view lhs, std::string_view rhs) {
-    return lhs.size() == rhs.size() && std::equal(lhs.begin(), lhs.end(), rhs.begin(),
-                                                  [](char a, char b) { return lower(a) == lower(b); });
+    return lhs.size() == rhs.size() &&
+           std::equal(lhs.begin(), lhs.end(), rhs.begin(),
+                      [](char a, char b) { return lower(a) == lower(b); });
 }
 
 bool is_digit(char value) { return value >= '0' && value <= '9'; }
@@ -39,7 +40,9 @@ bool is_hex(char value) {
 }
 
 std::string_view trim(std::string_view text) {
-    while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) { text.remove_prefix(1); }
+    while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) {
+        text.remove_prefix(1);
+    }
     while (!text.empty() && (text.back() == ' ' || text.back() == '\t')) { text.remove_suffix(1); }
     return text;
 }

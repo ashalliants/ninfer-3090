@@ -157,7 +157,8 @@ To change a profile, edit its file; both launchers pick it up. Keep to what the 
   JSON parser: it splits each line at the colon, commas and spaces and strips the quotes, so a
   value breaking these rules shows wrong or blank in the banner while the server still reads the
   file correctly. A `false` value is refused too: leave the key out.
-- Integers as integers: the server's integer options refuse `1024.0`.
+- Integers as integers. The server reads `1024.0` as `1024`, but the banner would show `1024.0`,
+  and the layout check refuses it.
 - No paths. A relative path in a file is read against the working directory, not the file's own;
   model, store and template paths stay in the launchers.
 - Nothing a launcher may have to leave out. The command line cannot undo a switch the file sets
