@@ -509,10 +509,24 @@ costs the newest pages and the endpoint state, not the whole session. Older imag
 are removed once a newer image of it is stored. Writes are atomic (a temporary name, then a rename),
 every chunk is verified when read, and a session that cannot be read back intact is removed and
 simply re-prefilled by the next request; a damaged store costs cache hits, never a wrong answer.
+(With a bucket, a chunk file that is missing rather than damaged is fetched again. If the fetch
+fails because the bucket cannot be reached, the read is a miss and the session stays offered; if
+the bucket no longer has the chunk either, the session cannot be read from anywhere and is removed,
+counted as `remote` corruption.) A session being read is never evicted
+until the read ends, so a write that makes room meanwhile cannot take the chunks it just fetched.
 
 The store keeps at most `--context-store-max-gib` (default: half the free space of the volume when
 the server starts), removing the least recently used sessions first, and removes sessions unused for
-`--context-store-ttl-hours` (default 168). A store written by a different model, quantization, KV
+`--context-store-ttl-hours` (default 168). The limit counts every file in the directory, including
+those waiting uploads to the bucket still need (see below). Because the volume is shared (with
+another engine, logs, the OS), the store also checks the volume itself: before a write it makes
+sure at least 1 GiB stays free after the new chunks, removing the least recently used sessions
+first if not, and refuses the write (a miss, as for any failed write) with `context store volume is
+full: ... (N short)` when even that cannot make the room. Stores in the same parent directory, as
+the boot script lays out two engines' stores, check and write one at a time, so two engines cannot
+both find room for one session and both write it; stores elsewhere on the volume do not
+coordinate, and neither do downloads from the bucket. A file that cannot be written says why
+(`cannot write ...: No space left on device`). A store written by a different model, quantization, KV
 or recurrent-state configuration, speculative configuration, set of prompt grafts or an older
 engine's image format is ignored and ages out; the start-up log line `context store | N sessions
 were written under another model, configuration or store format` says so. The `ninfer_context_store_*` series (see
@@ -575,7 +589,11 @@ ninfer-serve model.ninfer --port 8001 --devices 1 --context-store /data/store1 -
 - `--context-store-peer DIR` (repeatable) names another engine's directory. Every
   `--context-store-peer-poll-ms` (250) the engine lists the manifests there, and for each session it
   does not hold it **hard-links** the session's chunk files into its own directory (no bytes are
-  copied, the data is on disk once) and registers it like any stored session. A request that would
+  copied, the data is on disk once) and registers it like any stored session. Only sessions the
+  other engine holds the chunks of are considered: those it only registered from the bucket listing
+  or evicted to the bucket are passed over, without counting as failures, until it has fetched them
+  back. A poll that finds the other
+  directory and its own unchanged since the last listing does not list it again. A request that would
   resume from it finds it through the same lookup as its own sessions (see above), reads and
   verifies every chunk, and prices the read with the measured read rate. A peer that has not started
   yet is polled until it appears. Both directories must be on one volume: a link that fails (another
@@ -588,7 +606,8 @@ ninfer-serve model.ninfer --port 8001 --devices 1 --context-store /data/store1 -
   start-up scan cannot tell an imported session from its own, so from then on a use puts back what
   the bucket lacks, as for its own sessions. Sessions older than
   `--context-store-ttl-hours`, or that would not fit in `--context-store-max-gib`, are skipped, and a
-  skipped session is not looked at again until its owner rewrites it.
+  skipped session is not looked at again until its owner rewrites it (one that did not fit is also
+  tried again once this engine has removed something to make room).
 - **A session is visible to the other engine only after its owner has written it**, which is
   `--context-store-idle-seconds` (30 by default) after its last use, or when it is evicted, or at
   shutdown, and a background write is skipped while any request is waiting. With the default, the
@@ -676,9 +695,14 @@ The local directory becomes a cache of the bucket.
   age of its objects restarted (a server-side copy onto itself, no data transferred, at most once a day
   per session), and an object the bucket has lost in the meantime is uploaded again from the directory,
   so something in use does not expire under it. A write is uploaded from a snapshot taken when it was
-  written, with its chunk files kept on disk until the upload ends (at most 16 uploads wait, each
-  newer write of a session replacing its queued upload); a chunk that is not intact on disk stops the
-  upload instead of publishing a session whose data is damaged. A chunk found damaged on disk when a
+  written, with its chunk files kept on disk until the upload ends (each newer write of a session
+  replacing its queued upload). At most 16 uploads wait, and their files count against
+  `--context-store-max-gib`: beyond 16, and whenever the directory is over its limit with nothing
+  left to evict, the oldest waiting uploads are given up
+  (`ninfer_context_store_remote_uploads_dropped_total`) and their sessions are uploaded at their
+  next write; the upload in progress keeps its files until it ends. The directory therefore holds at most the limit plus the newest session and the upload in
+  progress. A chunk that is not intact on disk stops the upload instead of publishing a session
+  whose data is damaged. A chunk found damaged on disk when a
   session is loaded is fetched again from the bucket.
 - An unreachable bucket costs the uploads and the fetches, counted in `ninfer_context_store_remote_*`;
   the directory keeps working. Shutdown waits for queued uploads up to the remote flush budget (two
@@ -921,7 +945,7 @@ server restarts.
 | `ninfer_context_store_remote_manifest_downloads_total`, `_remote_manifest_download_bytes_total` | session manifests a bucket listing downloaded to register sessions other engines wrote (not in the chunk counters above) |
 | `ninfer_context_store_lookups_total`, `_lookup_hits_total`, `_lookup_seconds_total` | bucket lookups for a request that found nothing stored, those after which the store held a session ending on the request's prompt, and the time requests waited for them |
 | `ninfer_context_store_remote_fetch_bytes_per_second` | the rate the store assumes for fetching a session's missing chunks (downloaded, verified and written to the directory together: the wait a fetch adds), learned from fetches; a session whose fetch would not fit in a request's wait is not chosen |
-| `ninfer_context_store_remote_retired_total`, `_remote_uploads_skipped_total` | earlier turns deleted from the bucket once a later one was uploaded, and queued uploads a later write made unnecessary |
+| `ninfer_context_store_remote_retired_total`, `_remote_uploads_skipped_total`, `_remote_uploads_dropped_total` | earlier turns deleted from the bucket once a later one was uploaded, queued uploads a later write made unnecessary, and queued uploads given up to keep the files they hold within the directory's limits (their sessions are uploaded at their next write) |
 
 Histograms expose `_bucket`, `_sum` and `_count`. Metrics have bounded labels; they do not retain
 request IDs or request text. Rates are calculated by the consumer, for example:

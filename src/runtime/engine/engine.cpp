@@ -348,6 +348,7 @@ public:
         out.context_store_remote_manifest_download_bytes = s.remote_manifest_download_bytes;
         out.context_store_remote_retired                 = s.remote_retired;
         out.context_store_remote_uploads_skipped         = s.remote_uploads_skipped;
+        out.context_store_remote_uploads_dropped         = s.remote_uploads_dropped;
         out.context_store_peer_images        = s.peer_images;
         out.context_store_peer_bytes_linked  = s.peer_bytes_linked;
         out.context_store_peer_skipped       = s.peer_skipped;
