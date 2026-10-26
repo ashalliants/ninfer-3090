@@ -273,8 +273,10 @@ public:
     // time, until none is left or `deadline`. True when the bucket holds them all. Images imported
     // from a peer are the peer's to upload. For a flush before the box goes.
     bool upload_unpublished(std::chrono::steady_clock::time_point deadline);
-    // Uploads that may wait at once; beyond it the oldest is given up (each pins its chunk files).
-    static constexpr std::size_t kMaximumQueuedUploads = 16;
+    // Uploads that may wait at once; beyond it the oldest is given up (each pins its chunk files,
+    // which count against max_bytes, so the size limit bounds them too). Room for a busy box's
+    // conversations to wait out a long upload delay (--context-store-s3-upload-delay-seconds).
+    static constexpr std::size_t kMaximumQueuedUploads = 64;
     // With a remote: lists the bucket and registers images other engines left there that this
     // store does not hold. Also done in the background every remote_refresh. Returns the number of
     // images added. Stops reading manifests at `deadline`, waiting for another refresh counted; an
