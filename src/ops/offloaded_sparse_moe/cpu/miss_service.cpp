@@ -117,8 +117,14 @@ struct CpuMissService::Impl {
                 if (count < 0 || count > options.max_jobs) { throw std::runtime_error("CPU miss request has too many jobs"); }
                 for (int j = 0; j < count; ++j) {
                     CpuExpertJob& job = jobs[static_cast<std::size_t>(j)];
+                    // A slot entry is an atomic the owner publishes with a release store (it
+                    // changes entries only between calls, and the device carries the order from
+                    // that store to this request, outside the C++ model); the acquire load makes
+                    // the exchange race-free.
                     job.record = layer.slots != nullptr
-                                     ? layer.slots[r.expert[j]]
+                                     ? std::atomic_ref<const std::uint8_t*>(
+                                           const_cast<const std::uint8_t*&>(layer.slots[r.expert[j]]))
+                                           .load(std::memory_order_acquire)
                                      : layer.records + static_cast<std::uint64_t>(r.expert[j]) * layer.record_stride;
                     if (job.record == nullptr) { throw std::runtime_error("CPU miss request names an expert with no RAM copy"); }
                     job.format = layer.format;
@@ -129,11 +135,13 @@ struct CpuMissService::Impl {
                     }
                 }
                 team.run(std::span<const CpuExpertJob>(jobs.data(), static_cast<std::size_t>(count)));
-                std::atomic_thread_fence(std::memory_order_release);
-                *volatile_done = current;
+                // Counted before the answer: a caller that has seen `done` (its call synchronized)
+                // reads counters that include this request.
                 served.fetch_add(1, std::memory_order_relaxed);
                 experts.fetch_add(static_cast<std::uint64_t>(count), std::memory_order_relaxed);
                 g_process_experts.fetch_add(static_cast<std::uint64_t>(count), std::memory_order_relaxed);
+                std::atomic_thread_fence(std::memory_order_release);
+                *volatile_done = current;
                 last  = std::chrono::steady_clock::now();
                 polls = 0;
             }

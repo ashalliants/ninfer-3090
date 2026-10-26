@@ -433,6 +433,16 @@ int main() {
               "a chunk above 4096 columns leaves its wider calls on the GPU");
         share.prefill_chunk = 512;
         check(q4::plan_cpu_misses(share).prefill_columns == 4096, "a small chunk still serves streamed calls");
+        // Partial RAM residency streams nothing: the channel is sized for the static chunk only.
+        share.partial_ram_residency = true;
+        check(q4::plan_cpu_misses(share).prefill_columns == 512 &&
+                  q4::plan_cpu_misses(share).pinned ==
+                      sizeof(om::MissRequest) + 2ULL * 2560 * 512 + 2ULL * 2560 * 512 * 8 + 64 + 64,
+              "without an expert stream the prefill channel holds the chunk's 512 columns");
+        share.prefill_chunk = 8192;
+        check(q4::plan_cpu_misses(share).prefill_columns == om::kMaxCpuCallColumns,
+              "partial residency: a chunk above 4096 columns still leaves its calls on the GPU");
+        share.partial_ram_residency = false;
         share.prefill_chunk = 1024;
         share.max_context   = 300;
         check(q4::plan_cpu_misses(share).prefill_columns == 300, "the context bounds the chunk");

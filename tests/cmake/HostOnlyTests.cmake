@@ -52,6 +52,7 @@ set(NINFER_HOST_ONLY_TESTS
   ninfer_public_api_test
   ninfer_qwen3_5_ngram_proposer_test
   ninfer_qwen4_exp_constrained_window_test
+  ninfer_qwen4_exp_cpu_error_word_test
   ninfer_qwen4_exp_draft_policy_test
   ninfer_read_only_file_test
   ninfer_regex_choice_oracle_test

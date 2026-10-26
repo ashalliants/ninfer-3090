@@ -108,7 +108,7 @@ ExpertResidency::ExpertResidency(const TextConfig& config, std::vector<const std
         homes_ = std::make_unique<partial::Residency>(experts_, partial->slots, strides_);
         read_  = std::move(partial->read);
         try {
-            ram_pool_ = PinnedHostBuffer(std::max<std::size_t>(1, homes_->pool_bytes()));
+            ram_pool_.emplace(std::max<std::size_t>(1, homes_->pool_bytes()));
         } catch (const std::exception& error) {
             // Windows may refuse to page-lock this much in one process (WDDM): more VRAM frames make
             // the pool smaller.
@@ -119,12 +119,12 @@ ExpertResidency::ExpertResidency(const TextConfig& config, std::vector<const std
                 "--partial-ram-residency");
         }
         void* mapped = nullptr;
-        CUDA_CHECK(cudaHostGetDevicePointer(&mapped, ram_pool_.data(), 0));
+        CUDA_CHECK(cudaHostGetDevicePointer(&mapped, ram_pool_->data(), 0));
         ram_device_   = static_cast<const std::uint8_t*>(mapped);
-        slots_upload_ = PinnedHostBuffer(keys * sizeof(void*));
-        std::memset(slots_upload_.data(), 0, keys * sizeof(void*));
+        slots_upload_.emplace(keys * sizeof(void*));
+        std::memset(slots_upload_->data(), 0, keys * sizeof(void*));
         slots_device_ = DeviceBuffer(keys * sizeof(void*));
-        slots_device_.copy_from_host(slots_upload_.data(), keys * sizeof(void*));
+        slots_device_.copy_from_host(slots_upload_->data(), keys * sizeof(void*));
         slots_cpu_.assign(keys, nullptr);
         written_back_.assign(keys, 0);
         // A victim held only in VRAM is written back before its frame is reused.
@@ -570,7 +570,7 @@ void ExpertResidency::issue_loads(cudaStream_t compute, const std::vector<CacheC
             // Partial RAM residency: the expert's slot (a valid copy, or one a write-back issued
             // earlier on this stream fills first).
             const std::uint8_t* source =
-                homes_ ? static_cast<const std::uint8_t*>(ram_pool_.data()) + homes_->ram_offset(load.key)
+                homes_ ? static_cast<const std::uint8_t*>(ram_pool_->data()) + homes_->ram_offset(load.key)
                        : banks_[layer] + static_cast<std::size_t>(expert) * strides_[layer];
             // A promotion from a slot a write-back filled (the engine gate requires some: their bytes
             // came from a frame, not from the artifact).
@@ -606,26 +606,32 @@ const std::uint8_t* const* ExpertResidency::cpu_slot_table(std::uint32_t layer) 
 }
 
 const std::uint8_t* ExpertResidency::ram_pool() const noexcept {
-    return homes_ ? static_cast<const std::uint8_t*>(ram_pool_.data()) : nullptr;
+    return homes_ ? static_cast<const std::uint8_t*>(ram_pool_->data()) : nullptr;
 }
 
 std::uint64_t ExpertResidency::ram_pool_bytes() const noexcept { return homes_ ? homes_->pool_bytes() : 0; }
 
 void ExpertResidency::refresh_slot_tables() {
-    auto* device = static_cast<const std::uint8_t**>(slots_upload_.data());
+    auto* device = static_cast<const std::uint8_t**>(slots_upload_->data());
     for (const std::uint32_t key : homes_->take_changed()) {
         // Only a valid copy: a slot being written back or reclaimed is never read (its expert reads
         // from its frame).
         const bool valid = homes_->in_ram(key);
         const std::uint64_t at = valid ? homes_->ram_offset(key) : 0;
-        slots_cpu_[key] = valid ? static_cast<const std::uint8_t*>(ram_pool_.data()) + at : nullptr;
-        device[key]     = valid ? ram_device_ + at : nullptr;
+        // The CPU miss service's thread reads this entry (CpuMissService::Layer::slots) when a
+        // request names the expert. The service sees that request only after a call launched
+        // after this store, but that edge runs through the device, not C++, so the entry is an
+        // atomic: a release store here, an acquire load there.
+        std::atomic_ref<const std::uint8_t*>(slots_cpu_[key])
+            .store(valid ? static_cast<const std::uint8_t*>(ram_pool_->data()) + at : nullptr,
+                   std::memory_order_release);
+        device[key] = valid ? ram_device_ + at : nullptr;
         slots_dirty_    = true;
     }
 }
 
 void ExpertResidency::upload_slot_table(cudaStream_t compute) {
-    upload_pinned(slots_device_.p, slots_upload_.data(), slots_device_.bytes, compute);
+    upload_pinned(slots_device_.p, slots_upload_->data(), slots_device_.bytes, compute);
     slots_dirty_ = false;
 }
 
@@ -670,7 +676,7 @@ void ExpertResidency::apply_partial_evictions() {
             throw std::logic_error("expert residency: a write-back's frame is not held");
         }
         const std::uint32_t layer = key / experts_;
-        CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(ram_pool_.data()) + *offset,
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(ram_pool_->data()) + *offset,
                                    base + static_cast<std::size_t>(command.frame) * stride_, strides_[layer],
                                    cudaMemcpyDeviceToHost, copy_stream_));
         batch.moves.emplace_back(key, command.frame);
@@ -789,7 +795,7 @@ std::uint32_t ExpertResidency::place_partial(std::span<const std::uint32_t> vram
     table_dirty_ = true;
     // Every other expert into its layer's RAM slots, runs of consecutive experts in one read (slots
     // are handed out lowest first, so they are adjacent in the pool).
-    auto* pool = static_cast<std::byte*>(ram_pool_.data());
+    auto* pool = static_cast<std::byte*>(ram_pool_->data());
     for (std::uint32_t layer = 0; layer < layers_; ++layer) {
         std::uint32_t run_first = 0, run_count = 0;
         std::uint64_t run_at = 0;

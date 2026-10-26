@@ -15,6 +15,12 @@ ninfer_add_test(ninfer_qwen4_exp_draft_policy_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_draft_policy.cpp"
   LIBRARIES ninfer_core)
 
+# Host only, header only: the CPU miss service's error word (--cpu-verify-misses,
+# --prefill-cpu-share): a code a thrown call left behind does not fail the next healthy call.
+ninfer_add_test(ninfer_qwen4_exp_cpu_error_word_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_cpu_error_word.cpp"
+  LIBRARIES ninfer_core)
+
 # Host only, header only: a constrained MTP verification's window (--mtp-constrained): the
 # positions before the first dead-end grammar mask.
 ninfer_add_test(ninfer_qwen4_exp_constrained_window_test

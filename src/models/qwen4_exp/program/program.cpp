@@ -56,6 +56,7 @@
 #include "models/qwen4_exp/program/checkpoint_image.h"
 #include "models/qwen4_exp/program/context_cache.h"
 #include "models/qwen4_exp/program/constrained_window.h"
+#include "models/qwen4_exp/program/cpu_error_word.h"
 #include "models/qwen4_exp/program/draft_policy.h"
 #include "models/qwen4_exp/program/expert_cache/expert_state.h"
 #include "models/qwen4_exp/program/expert_residency.h"
@@ -1205,6 +1206,7 @@ public:
             throw std::runtime_error("the CPU miss service's error word has no device address");
         }
         cpu_error_device_ = static_cast<std::uint32_t*>(mapped);
+        cpu_error_word_   = CpuErrorWord(static_cast<std::uint32_t*>(cpu_error_->data()));
         cpu_misses_       = std::make_unique<ops::offloaded_moe::CpuMissService>(std::move(layers), o);
     }
 
@@ -1340,6 +1342,13 @@ public:
         }
     }
 
+    // Before launching a call that may hand the CPU miss service jobs (a verification round, or a
+    // prefill or forced-token call handing its share): clears the error word, so a code an earlier
+    // call left when it threw before its check cannot fail this one (CpuErrorWord).
+    void arm_cpu_error(bool prefill) {
+        cpu_error_word_.arm(prefill, [this] { device_.synchronize(); });
+    }
+
     // After a call that may have used the CPU miss service synchronized (`flag` names the option,
     // `call` the call): a layer whose CPU leg timed out wrote layer << 16 | code to the error word and
     // left its CPU outputs unwritten (later layers computed their misses on the GPU), so the call
@@ -1347,10 +1356,8 @@ public:
     // is cleared for the next call.
     void check_cpu_misses(const char* flag, const char* call) {
         if (!cpu_misses_) { return; }
-        auto* word                 = static_cast<volatile std::uint32_t*>(cpu_error_->data());
-        const std::uint32_t failed = *word;
+        const std::uint32_t failed = cpu_error_word_.take();
         if (failed == 0) { return; }
-        *word = 0;
         release_lane();
         const std::string why = cpu_service_failure();
         char code[64];
@@ -1363,8 +1370,7 @@ public:
     // After a prefill or forced-token call: only a call that handed the service its share can have
     // set the word (a verification checks its own round).
     void check_cpu_prefill() {
-        if (!prefill_used_cpu_) { return; }
-        prefill_used_cpu_ = false;
+        if (!cpu_error_word_.prefill_armed()) { return; }
         check_cpu_misses("--prefill-cpu-share", "a prefill call");
     }
 
@@ -3697,8 +3703,12 @@ private:
         // --prefill-cpu-share: the call hands the CPU its share of each layer's misses (a call wider
         // than the prefill channel's columns stays on the GPU). A streamed call first leaves each
         // layer's predicted-cold experts out of the stream (ExpertStream::Share), so they are misses.
-        b.cpu_share        = width <= prefill_cpu_columns_ && prefill_cpu_share_live();
-        prefill_used_cpu_  = b.cpu_share;
+        b.cpu_share = width <= prefill_cpu_columns_ && prefill_cpu_share_live();
+        if (b.cpu_share) {
+            arm_cpu_error(true);
+        } else {
+            cpu_error_word_.skip();
+        }
         if (mtp_chunk_) { b.mtp_chunk = &*mtp_chunk_; }
         b.vision = call_vision_;
         if (!wide) {
@@ -4434,6 +4444,8 @@ private:
         const std::int32_t S  = static_cast<std::int32_t>(L().state_tokens);
         const auto& sp        = plan_.spec;
         const nvtx::ScopedRange range(nvtx::Name::DecodeMtpRound, nvtx::Category::Decode);
+        // --cpu-verify-misses: the round's CPU legs report to a clear error word.
+        arm_cpu_error(false);
         // The columns' tokens: the history's anchor, then the drafts (appended while staging).
         const std::size_t history = L().history.size();
         L().history.insert(L().history.end(), drafts.begin(), drafts.end());
@@ -5240,11 +5252,12 @@ private:
     std::uint32_t* cpu_error_device_ = nullptr;
     bool cpu_verify_off_reported_    = false;
     bool prefill_share_off_reported_ = false;
-    // --prefill-cpu-share: the widest call the prefill channel serves (0: off), whether the last
-    // prefill or forced-token call handed the service its share (check_cpu_prefill), and the LFRU
-    // use counts a streamed call's cold sets are ranked by.
+    // The error word's host side: armed before a call that may hand the service jobs, read after it
+    // (check_cpu_verify, check_cpu_prefill); unbound when off.
+    CpuErrorWord cpu_error_word_;
+    // --prefill-cpu-share: the widest call the prefill channel serves (0: off) and the LFRU use
+    // counts a streamed call's cold sets are ranked by.
     std::int32_t prefill_cpu_columns_ = 0;
-    bool prefill_used_cpu_            = false;
     std::vector<std::uint32_t> stream_counts_;
     // --ngram-flag-wait: the mapped flag and error word (64 bytes apart), their device addresses, the
     // round graphs' wait counter, and the flag's last raised value (the count of round launches).
@@ -5488,11 +5501,15 @@ CpuMissPlan plan_cpu_misses(const ProgramOptions& options) {
     if (prefill) {
         // Every miss may go (Basalt's share has no count cap), in calls of up to the wider of the
         // static chunk and the streamed call (kWideChunk), at most kMaxCpuCallColumns (a wider call
-        // stays on the GPU).
+        // stays on the GPU). Partial RAM residency has no expert stream, so its calls are at most
+        // the static chunk.
+        const std::uint32_t widest =
+            options.partial_ram_residency
+                ? options.prefill_chunk
+                : std::max(options.prefill_chunk, static_cast<std::uint32_t>(detail::kWideChunk));
         p.prefill_jobs    = om::kMaxCpuJobs;
         p.prefill_columns = static_cast<int>(std::min<std::uint32_t>(
-            {std::max(options.prefill_chunk, static_cast<std::uint32_t>(detail::kWideChunk)), options.max_context,
-             static_cast<std::uint32_t>(om::kMaxCpuCallColumns)}));
+            {widest, options.max_context, static_cast<std::uint32_t>(om::kMaxCpuCallColumns)}));
         p.share_num = static_cast<int>(options.prefill_cpu_share_num);
         p.share_den = static_cast<int>(options.prefill_cpu_share_den);
     }

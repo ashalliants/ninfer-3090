@@ -408,7 +408,8 @@ public:
         QType format                = QType::BF16;
         // Partial RAM residency: host [E] addresses of each expert's record (null for one in VRAM,
         // which the GPU never hands the CPU), read in place of `records`; owned by the caller, who
-        // changes entries only while no call is pending. Null: the bank.
+        // changes entries only while no call is pending, each with a release store through
+        // std::atomic_ref (the service loads them with acquire). Null: the bank.
         const std::uint8_t* const* slots = nullptr;
     };
     struct Options {

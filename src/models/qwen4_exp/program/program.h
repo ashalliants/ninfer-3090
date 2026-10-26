@@ -565,8 +565,9 @@ struct NgramFlagPlan {
 // cpu_verify_misses or MTP): verify_jobs experts per call (the service's default 4), calls of up to
 // 1 + mtp_draft_tokens columns, M / pcie_divisor misses left on the GPU. The prefill channel (0
 // without prefill_cpu_share): up to offloaded_moe::kMaxCpuJobs experts per call (every miss may go),
-// calls of up to the wider of the static prefill chunk and a streamed call's 4,096 columns (at most
-// kMaxCpuCallColumns and the context; a wider call stays on the GPU), share_num / share_den of the
+// calls of up to the wider of the static prefill chunk and a streamed call's 4,096 columns (the
+// chunk alone with partial_ram_residency, which streams nothing; at most kMaxCpuCallColumns and the
+// context; a wider call stays on the GPU), share_num / share_den of the
 // misses. `device` is ProgramDevicePlan::cpu_misses (the service's 4-byte request counter); `pinned`
 // its mapped channel (the request, the x columns and the outputs, the done and heartbeat words) and
 // the Program's error word; `pageable` the worker team's buffers. All 0 when neither use is on.
