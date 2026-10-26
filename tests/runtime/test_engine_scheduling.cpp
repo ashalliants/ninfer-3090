@@ -459,6 +459,22 @@ void test_a_short_request_pauses_a_long_prefill_and_it_resumes() {
     require(rig.core().runtime_stats().prefill_yields == 1, "the yield was not counted");
 }
 
+// A Host full of cached history has no room for the long prefill's snapshot. Before #332's
+// follow-up the yield checked only the state image, so it could pause, lose the snapshot and make
+// the long prompt recompute everything; now it does not pause at all.
+void test_no_yield_when_the_snapshot_does_not_fit() {
+    Rig rig({.chunk = 1024, .lanes = 1, .yield_ms = 100});
+    rig.program().set_snapshot_fits(false);
+    Result long_result;
+    start_long_prompt(rig, long_result);
+    auto short_result = rig.run(2, 100, 1);
+    rig.release();
+    require(finished(long_result) && finished(short_result), "a request did not finish\n" + rig.dump());
+    require(rig.count(Event::Kind::PauseStart) == 0,
+            "a prefill yielded although its snapshot had no room\n" + rig.dump());
+    require(rig.core().runtime_stats().prefill_yields == 0, "a yield was counted");
+}
+
 void test_a_long_newcomer_does_not_displace_a_long_prefill() {
     Rig rig({.chunk = 1024, .lanes = 1, .yield_ms = 100});
     Result long_result;
@@ -1653,6 +1669,7 @@ int main() {
         test_a_prompt_that_fits_beside_a_resident_starts_at_once);
     run("the fit answer is not asked without the flag",
         test_the_fit_answer_is_not_asked_without_the_flag);
+    run("no yield when the snapshot does not fit", test_no_yield_when_the_snapshot_does_not_fit);
     run("a long newcomer does not displace a long prefill",
         test_a_long_newcomer_does_not_displace_a_long_prefill);
     run("a prefill with little left is not paused", test_a_prefill_with_little_left_is_not_paused);

@@ -430,6 +430,21 @@ int main() {
         } catch (const std::invalid_argument&) { oversized_yield_rejected = true; }
         failures += check(oversized_yield_rejected, "--yield-long-prefill-ms accepted over an hour");
     }
+    failures += check(defaults.context_cache.host_pause_reserve_bytes == 0,
+                      "the pause snapshot reserve is not off by default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--host-context-mib", "8192",
+                             "--host-pause-reserve-mib", "2048"})
+                              .context_cache.host_pause_reserve_bytes == (std::size_t{2048} << 20),
+                      "--host-pause-reserve-mib did not reach serving options");
+    {
+        bool whole_budget_rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--host-context-mib", "2048",
+                         "--host-pause-reserve-mib", "2048"});
+        } catch (const std::invalid_argument&) { whole_budget_rejected = true; }
+        failures += check(whole_budget_rejected,
+                          "--host-pause-reserve-mib accepted the whole Host context budget");
+    }
     failures += check(defaults.prefill_schedule.decode_share_percent == 0,
                       "the prefill decode share is not off by default");
     failures += check(parse({"ninfer-serve", "model.ninfer", "--prefill-decode-share", "50"})

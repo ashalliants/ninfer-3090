@@ -2480,12 +2480,18 @@ private:
             if (require_snapshot || !end_lossy_scout_for_pause(request)) { return false; }
         }
         bool save_snapshot = false;
-        if (require_snapshot) {
+        if (instance_.program->pause_snapshot_fits(*request->sequence)) {
+            // The snapshot fits the free Host bytes as they are (the pause snapshot reserve
+            // included), so nothing needs evicting.
+            save_snapshot = true;
+        } else if (require_snapshot) {
             // A pause that only serves the queue is not worth evicting other requests' history, so
-            // it saves a snapshot only where the image already fits: nothing is released, revoked or
-            // marked for replay before the answer is known.
-            save_snapshot = instance_.program->pause_host_bytes(*request->sequence).has_value() &&
-                            instance_.program->pause_state_image_unplaced(*request->sequence) == 0;
+            // it saves a snapshot only where it fits: nothing is revoked or marked for replay before
+            // the answer is known. Host copies of pages still on the Device are redundant and are
+            // dropped first; that loses nothing, and a restored request leaves such copies in the
+            // snapshot reserve, where nothing else would clear them.
+            (void)instance_.program->release_redundant_host({}, request->sequence);
+            save_snapshot = instance_.program->pause_snapshot_fits(*request->sequence);
         } else if (const auto bytes = instance_.program->pause_host_bytes(*request->sequence)) {
             const auto usage = instance_.program->physical_usage();
             if (*bytes <= usage.capacity.host_bytes &&

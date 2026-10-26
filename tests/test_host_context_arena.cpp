@@ -151,6 +151,50 @@ void test_placement_scope_counts_once() {
            "outside a placement every miss counts again");
 }
 
+// --host-pause-reserve-mib: the tail of the backing is for pause snapshots only (#332).
+void test_snapshot_reserve() {
+    constexpr std::size_t unit = ninfer::HostContextArena::alignment;
+    ninfer::HostContextArena arena(4 * unit, unit);
+    arena.reserve_for_snapshots(unit + 1); // rounds up to two units
+    expect(arena.snapshot_reserve_bytes() == 2 * unit && arena.general_capacity_bytes() == 2 * unit,
+           "the reserve is whole alignment units at the end of the backing");
+    auto a = arena.allocate(unit);
+    auto b = arena.allocate(unit);
+    expect(a && b && !arena.allocate(unit) && !arena.can_allocate(unit),
+           "cached history cannot allocate into the reserve");
+    expect(arena.shortage_failures() == 1 && arena.geometry_failures() == 0,
+           "a full general part is a shortage, whatever the reserve holds");
+    expect(arena.general_occupied_bytes() == 2 * unit && arena.occupied_bytes() == 2 * unit,
+           "the general part is full");
+    {
+        ninfer::HostContextArena::SnapshotScope snapshot(arena);
+        expect(arena.can_allocate(2 * unit), "a snapshot sees the reserve");
+        auto paused = arena.allocate(2 * unit);
+        expect(paused && arena.occupied_bytes() == 4 * unit &&
+                   arena.general_occupied_bytes() == 2 * unit,
+               "a snapshot in the reserve does not count against the general part");
+        (void)paused->release();
+    }
+    (void)a->release();
+    {
+        ninfer::HostContextArena::SnapshotScope snapshot(arena);
+        auto paused = arena.allocate(unit);
+        expect(paused && arena.general_occupied_bytes() == 2 * unit,
+               "a snapshot takes the general part first and keeps the reserve for the next one");
+    }
+    bool twice = false;
+    try {
+        arena.reserve_for_snapshots(unit);
+    } catch (const std::logic_error&) { twice = true; }
+    expect(twice, "the reserve is set once, before any allocation");
+    bool whole = false;
+    try {
+        ninfer::HostContextArena other(4 * unit, unit);
+        other.reserve_for_snapshots(4 * unit);
+    } catch (const std::invalid_argument&) { whole = true; }
+    expect(whole, "a reserve cannot take the whole backing");
+}
+
 } // namespace
 
 int main() {
@@ -166,6 +210,7 @@ int main() {
         test_fragmentation_and_split();
         test_failures_are_counted_by_cause();
         test_placement_scope_counts_once();
+        test_snapshot_reserve();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

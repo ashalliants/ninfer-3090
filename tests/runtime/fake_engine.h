@@ -399,6 +399,8 @@ struct PhysicalUsageSnapshot {
     std::size_t host_free_extents          = 0;
     std::uint64_t host_geometry_failures   = 0;
     std::uint64_t host_shortage_failures   = 0;
+    std::size_t host_pause_reserve_bytes          = 0;
+    std::size_t host_pause_reserve_occupied_bytes = 0;
 };
 
 // ---- output ----------------------------------------------------------------------------------
@@ -651,6 +653,12 @@ public:
     [[nodiscard]] std::optional<std::size_t> pause_host_bytes(SequenceHandle) const {
         return std::size_t{1} << 20;
     }
+    // Whether a snapshot fits the Host as things stand (default: it does). A test sets it false to
+    // stand for a Host full of cached history.
+    [[nodiscard]] bool pause_snapshot_fits(SequenceHandle) const noexcept {
+        return snapshot_fits_.load(std::memory_order_acquire);
+    }
+    void set_snapshot_fits(bool fits) noexcept { snapshot_fits_.store(fits, std::memory_order_release); }
     [[nodiscard]] std::size_t release_redundant_host(std::span<const CheckpointHandle>,
                                                      std::optional<SequenceHandle> = std::nullopt) {
         return 0;
@@ -1173,6 +1181,7 @@ private:
     std::atomic<bool> fits_{true};
     std::optional<Transaction> transaction_;
     std::uint64_t epoch_ = 0;
+    std::atomic<bool> snapshot_fits_{true};
     std::uint32_t next_snapshot_ = 1;
     std::set<std::uint32_t> snapshots_;
     std::vector<SharedPrefix> shared_;

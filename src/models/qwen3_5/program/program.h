@@ -481,6 +481,10 @@ struct PhysicalUsageSnapshot {
     std::size_t host_free_extents          = 0;
     std::uint64_t host_geometry_failures   = 0;
     std::uint64_t host_shortage_failures   = 0;
+    // The pause snapshot reserve (ContextCacheOptions::host_pause_reserve_bytes) and the bytes in it
+    // now. `occupied`/`capacity` above cover only the rest, which is what the context cache plans with.
+    std::size_t host_pause_reserve_bytes          = 0;
+    std::size_t host_pause_reserve_occupied_bytes = 0;
 };
 
 class Program {
@@ -533,6 +537,10 @@ public:
     // Bytes of state image a pause could not place in one contiguous Host run right now; 0 when it
     // is already on the Host or a run exists.
     [[nodiscard]] std::size_t pause_state_image_unplaced(SequenceHandle sequence) const;
+    // Whether a pause of `sequence` would save its snapshot to the Host as things stand, without
+    // evicting or releasing anything: its bytes fit the free Host bytes (the pause snapshot reserve
+    // included) and its state image has a run.
+    [[nodiscard]] bool pause_snapshot_fits(SequenceHandle sequence) const;
     [[nodiscard]] std::size_t
     release_redundant_host(std::span<const CheckpointHandle> excluded,
                            std::optional<SequenceHandle> pending_backup = std::nullopt);

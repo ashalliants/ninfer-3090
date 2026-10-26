@@ -183,6 +183,9 @@ void validate(const EngineOptions& options) {
     if (options.prefill_schedule.yield_remaining_ms != 0) {
         refuse("does not pause a prefill for the queue: remove --yield-long-prefill-ms");
     }
+    if (options.context_cache.host_pause_reserve_bytes != 0) {
+        refuse("does not pause a request into the Host: remove --host-pause-reserve-mib");
+    }
     if (options.prefill_schedule.layer_slices > 1) {
         refuse("runs its layers in its own routed calls and does not slice them: remove --prefill-layer-slices");
     }
