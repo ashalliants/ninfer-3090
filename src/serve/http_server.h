@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -39,6 +40,13 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 
 [[nodiscard]] bool matches_bearer_credential(std::string_view authorization,
                                              std::string_view api_key) noexcept;
+
+// POST /v1/context-store/flush: the budget a body asks for (empty: the default 600 s); nullopt for
+// anything but a JSON object with at most an integer "budget_seconds" from 1 to 3600.
+[[nodiscard]] std::optional<std::chrono::seconds>
+parse_context_store_flush_body(std::string_view body);
+// Its answer: {"written", "unsaved", "uploaded", "seconds"}.
+[[nodiscard]] std::string context_store_flush_json(const ninfer::ContextStoreFlushReport& report);
 
 class HttpServer {
 public:

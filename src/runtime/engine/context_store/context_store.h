@@ -268,6 +268,13 @@ public:
     // `final_flush`, queued refreshes, prefetches and touches are dropped first so only uploads use
     // the budget.
     bool flush_remote(std::chrono::steady_clock::time_point deadline, bool final_flush = false);
+    // With a remote: uploads every image the directory holds whole that the bucket may lack (one
+    // whose upload is still queued, or was given up when the queue was full), the queue's room at a
+    // time, until none is left or `deadline`. True when the bucket holds them all. Images imported
+    // from a peer are the peer's to upload. For a flush before the box goes.
+    bool upload_unpublished(std::chrono::steady_clock::time_point deadline);
+    // Uploads that may wait at once; beyond it the oldest is given up (each pins its chunk files).
+    static constexpr std::size_t kMaximumQueuedUploads = 16;
     // With a remote: lists the bucket and registers images other engines left there that this
     // store does not hold. Also done in the background every remote_refresh. Returns the number of
     // images added. Stops reading manifests at `deadline`, waiting for another refresh counted; an

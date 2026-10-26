@@ -2,6 +2,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <iostream>
 #include <string>
 
@@ -156,6 +157,26 @@ int main() {
     failures += check(other_result == httplib::Server::HandlerResponse::Unhandled &&
                           other_response.body.empty(),
                       "non-413 response was changed by the payload-limit handler");
+
+    // POST /v1/context-store/flush: its body and its answer.
+    using ninfer::serve::parse_context_store_flush_body;
+    failures += check(parse_context_store_flush_body("") == std::chrono::seconds(600) &&
+                          parse_context_store_flush_body("{}") == std::chrono::seconds(600),
+                      "an empty flush body did not take the default budget");
+    failures += check(parse_context_store_flush_body(R"({"budget_seconds": 90})") ==
+                          std::chrono::seconds(90),
+                      "the flush budget was not read");
+    for (const char* bad : {R"({"budget_seconds": 0})", R"({"budget_seconds": 3601})",
+                            R"({"budget_seconds": 1.5})", R"({"budget_seconds": "60"})",
+                            R"({"budget": 60})", "[]", "not json"}) {
+        failures += check(!parse_context_store_flush_body(bad).has_value(),
+                          "a malformed or out-of-range flush body was accepted");
+    }
+    const Json flushed = Json::parse(ninfer::serve::context_store_flush_json(
+        {.written = 3, .unsaved = 1, .uploaded = false, .seconds = 2.5}));
+    failures += check(flushed == Json{{"written", 3}, {"unsaved", 1}, {"uploaded", false},
+                                      {"seconds", 2.5}},
+                      "the flush answer has the wrong fields");
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

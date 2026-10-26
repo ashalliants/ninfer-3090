@@ -476,6 +476,26 @@ ninfer::ResidencyStatus GenerationService::suspend(std::optional<bool> auto_resu
 
 ninfer::ResidencyStatus GenerationService::resume() { return engine_->resume(); }
 
+ninfer::ContextStoreFlushReport
+GenerationService::flush_context_store(std::chrono::milliseconds budget) {
+    {
+        std::lock_guard admission(request_capacity_->mutex);
+        ++request_capacity_->active;
+    }
+    struct Release {
+        RequestCapacity& capacity;
+        ~Release() {
+            std::lock_guard admission(capacity.mutex);
+            --capacity.active;
+        }
+    } const release{*request_capacity_};
+    const auto residency = engine_->residency();
+    if (residency.enabled && residency.state == ninfer::ModelResidency::Suspended) {
+        (void)engine_->resume();
+    }
+    return engine_->flush_context_store(budget);
+}
+
 ninfer::ResidencyStatus GenerationService::residency() const { return engine_->residency(); }
 
 // --sleep-idle-seconds: gives the model's device memory back once no request has been admitted for

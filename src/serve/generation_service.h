@@ -179,10 +179,10 @@ public:
     ninfer::ResidencyStatus resume();
     [[nodiscard]] ninfer::ResidencyStatus residency() const;
 
-    // See Engine::flush_context_store.
-    ninfer::ContextStoreFlushReport flush_context_store(std::chrono::milliseconds budget) {
-        return engine_->flush_context_store(budget);
-    }
+    // See Engine::flush_context_store. Counts as an admitted request while it runs, so the idle
+    // sleeper and /suspend leave the model resident; a suspended model is resumed first, since
+    // only a running worker writes the sessions.
+    ninfer::ContextStoreFlushReport flush_context_store(std::chrono::milliseconds budget);
 
     // Requests currently holding ingress capacity (max_concurrency + max_pending_requests).
     [[nodiscard]] std::size_t admitted_requests() const;

@@ -479,8 +479,13 @@ public:
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
         });
-        // Everything written is queued for the bucket by now; send it without its delay.
-        report.uploaded = store->flush_remote(deadline);
+        // A write still in progress at the deadline has not reached the bucket's queue: say so.
+        const bool written_out = store_queue_idle();
+        // Every image the bucket may lack goes now: those still waiting out their delay, and any
+        // whose upload was given up when the queue was full.
+        report.uploaded = store->upload_unpublished(deadline) && written_out;
+        // As things stand now: a turn that ended while the uploads ran is not in this flush.
+        with_generation([&](auto& generation) { report.unsaved = generation.unsaved_store_sessions(); });
         report.written  = store->stats().puts - puts;
         report.seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
