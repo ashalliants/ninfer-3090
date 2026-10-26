@@ -77,7 +77,7 @@ ninfer_add_test(ninfer_gpu_telemetry_test
 
 ninfer_add_test(ninfer_http_error_handler_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_error_handler.cpp"
-  LIBRARIES ninfer_serve)
+  LIBRARIES ninfer_serve ninfer_product_logging)
 
 ninfer_add_test(ninfer_http_residency_routes_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_residency_routes.cpp"
@@ -86,6 +86,10 @@ ninfer_add_test(ninfer_http_residency_routes_test
 ninfer_add_test(ninfer_http_security_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_security.cpp"
   LIBRARIES ninfer_serve_security)
+
+ninfer_add_test(ninfer_dashboard_page_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_dashboard_page.cpp"
+  LIBRARIES ninfer_serve_dashboard)
 
 ninfer_add_test(ninfer_http_transport_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_transport.cpp"

@@ -590,6 +590,25 @@ void router_checks_host_and_origin() {
                "a rebinding Host gets 403 from the router" + with);
         expect(get("/health", {{"Host", "192.168.1.5:8080"}}).first == 200,
                "an address Host passes the router" + with);
+        // The router serves the dashboard page itself, without the key, behind the Host check.
+        const auto page = client.Get("/dashboard");
+        expect(page && page->status == 200 &&
+                   page->get_header_value("Content-Type") == "text/html; charset=utf-8" &&
+                   page->get_header_value("Content-Security-Policy").find("default-src 'none'") !=
+                       std::string::npos &&
+                   page->get_header_value("X-Content-Type-Options") == "nosniff" &&
+                   page->body.rfind("<!doctype html>", 0) == 0,
+               "the router did not serve the dashboard without a key" + with);
+        const auto rebound_page = client.Get("/dashboard", httplib::Headers{{"Host", "evil.example:8080"}});
+        expect(rebound_page && rebound_page->status == 403,
+               "the dashboard skipped the router's Host check" + with);
+        if (access == Access::Keyed) {
+            const auto keyless_status = client.Get("/metrics");
+            const auto keyless_post   = client.Post("/dashboard", "", "text/plain");
+            expect(keyless_status && keyless_status->status == 401 && keyless_post &&
+                       keyless_post->status == 401,
+                   "only GET /dashboard skips the router's key");
+        }
         const auto foreign = get("/v1/models", {{"Origin", "http://evil.example"}});
         const auto cross   = get("/v1/models", {{"Sec-Fetch-Site", "cross-site"}});
         // A browser request from another site, relayed to the model.

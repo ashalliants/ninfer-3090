@@ -1,0 +1,453 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NInfer dashboard</title>
+<link rel="icon" href="data:,">
+<!--
+  ninfer-serve's local dashboard (GET /dashboard). One file, embedded in the binary at build time:
+  no external fetches, no libraries. It polls /metrics, /v1/load and /slots on its own origin once
+  a second while the tab is visible and keeps two minutes of history in memory. Server data is
+  written as text nodes and canvas drawing only, never as markup (the page's CSP allows its inline
+  script on that basis; tests/test_dashboard_page.cpp checks it).
+-->
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f4f4f2; --surface: #fcfcfb; --border: #e2e1dc;
+  --text: #0b0b0b; --text-2: #52514e; --muted: #7a7974;
+  --grid: #e8e7e3; --series: #2a78d6; --series-fill: rgba(42, 120, 214, 0.12);
+  --track: #ecebe7;
+  --good: #0ca30c; --warning: #fab219; --critical: #d03b3b;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --bg: #111110; --surface: #1a1a19; --border: #2e2e2b;
+    --text: #f0efec; --text-2: #c3c2b7; --muted: #8f8e86;
+    --grid: #2a2a27; --series: #3987e5; --series-fill: rgba(57, 135, 229, 0.18);
+    --track: #2e2e2b;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 16px 20px 32px; background: var(--bg); color: var(--text);
+  font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; margin-bottom: 16px; }
+h1 { font-size: 18px; margin: 0; font-weight: 600; }
+h1 span { color: var(--text-2); font-weight: 400; }
+h2 { font-size: 13px; font-weight: 600; margin: 0 0 8px; color: var(--text-2); }
+.status { display: flex; align-items: center; gap: 8px; color: var(--text-2); }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); flex: none; }
+.dot.good { background: var(--good); } .dot.warning { background: var(--warning); }
+.dot.critical { background: var(--critical); }
+.key { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+.key input { width: 220px; }
+input, button {
+  font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 8px;
+}
+button { cursor: pointer; }
+.key.needed input { border-color: var(--critical); }
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px; margin-bottom: 16px; }
+.tile, .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; }
+.tile { padding: 10px 12px; }
+.tile .label { color: var(--text-2); font-size: 12px; }
+.tile .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.tile .sub { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.panel { padding: 12px; position: relative; }
+.panel canvas { width: 100%; height: 160px; display: block; }
+.tip {
+  position: absolute; pointer-events: none; background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px; padding: 2px 6px; font-size: 12px;
+  white-space: nowrap; display: none; font-variant-numeric: tabular-nums;
+}
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+th { color: var(--text-2); font-weight: 600; font-size: 12px; }
+td.num, th.num { text-align: right; }
+.bar { height: 6px; border-radius: 3px; background: var(--track); overflow: hidden; margin-top: 3px; min-width: 80px; }
+.bar div { height: 100%; background: var(--series); border-radius: 3px; }
+.muted { color: var(--muted); }
+.queue { margin-top: 10px; color: var(--text-2); }
+.wide { overflow-x: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>NInfer <span id="model"></span></h1>
+  <div class="status"><span class="dot" id="dot"></span><span id="status">Starting</span></div>
+  <div class="key" id="keybox">
+    <input id="key" type="password" autocomplete="off" placeholder="API key (if the server has one)" aria-label="API key">
+    <button id="use-key" type="button">Use key</button>
+    <button id="forget-key" type="button">Forget</button>
+  </div>
+</header>
+
+<section class="tiles" aria-label="Current values">
+  <div class="tile"><div class="label">Decode</div><div class="value" id="t-decode">-</div><div class="sub">tokens/s</div></div>
+  <div class="tile"><div class="label">Prefill</div><div class="value" id="t-prefill">-</div><div class="sub">tokens/s</div></div>
+  <div class="tile"><div class="label">Draft acceptance</div><div class="value" id="t-accept">-</div><div class="sub" id="t-accept-sub">since start</div></div>
+  <div class="tile"><div class="label">Requests</div><div class="value" id="t-requests">-</div><div class="sub" id="t-requests-sub">running / waiting</div></div>
+  <div class="tile"><div class="label">KV pool in use</div><div class="value" id="t-kv">-</div><div class="sub" id="t-kv-sub">incl. retained prefixes</div></div>
+  <div class="tile"><div class="label">GPU power</div><div class="value" id="t-power">-</div><div class="sub" id="t-util">utilization</div></div>
+  <div class="tile"><div class="label">VRAM</div><div class="value" id="t-vram">-</div><div class="sub" id="t-vram-sub">all processes</div></div>
+  <div class="tile"><div class="label">GPU temperature</div><div class="value" id="t-temp">-</div><div class="sub">core</div></div>
+</section>
+
+<section class="charts">
+  <div class="panel"><h2>Decode tokens/s</h2><canvas id="c-decode" role="img" aria-label="Decode tokens per second"></canvas><div class="tip"></div></div>
+  <div class="panel"><h2>Prefill tokens/s</h2><canvas id="c-prefill" role="img" aria-label="Prefill tokens per second"></canvas><div class="tip"></div></div>
+  <div class="panel"><h2>Draft acceptance %</h2><canvas id="c-accept" role="img" aria-label="Draft acceptance percent"></canvas><div class="tip"></div></div>
+  <div class="panel"><h2>GPU power W</h2><canvas id="c-power" role="img" aria-label="GPU power in watts"></canvas><div class="tip"></div></div>
+</section>
+
+<section class="panel">
+  <h2>Lanes</h2>
+  <div class="wide">
+    <table>
+      <thead><tr>
+        <th>Lane</th><th>State</th><th>Request</th><th>Prompt</th><th class="num">Generated</th>
+        <th>Context</th><th class="num">tok/s</th><th class="num">Drafts accepted</th>
+      </tr></thead>
+      <tbody id="lanes"></tbody>
+    </table>
+  </div>
+  <div class="queue" id="queue"></div>
+</section>
+
+<script>
+'use strict';
+const WINDOW_S = 120, POLL_MS = 1000, KEY_STORE = 'ninfer-dashboard-key';
+const $ = (id) => document.getElementById(id);
+const nf1 = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
+const nf0 = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
+
+let apiKey = '';
+try { apiKey = sessionStorage.getItem(KEY_STORE) || ''; } catch (e) { /* storage disabled */ }
+let samples = [];        // {t (ms), decode, prefill, accept, power}; null where unknown
+let previous = null;     // the last /metrics counters and when they were read
+let timer = null, busy = false;
+
+const charts = [
+  { id: 'c-decode', field: 'decode', unit: 'tok/s' },
+  { id: 'c-prefill', field: 'prefill', unit: 'tok/s' },
+  { id: 'c-accept', field: 'accept', unit: '%', max: 100 },
+  { id: 'c-power', field: 'power', unit: 'W' },
+];
+
+// Prometheus text format: "name{labels} value". Unlabelled series are keyed by name; labelled
+// ones by name and label text, which this page does not need.
+function parseMetrics(text) {
+  const out = new Map();
+  for (const line of text.split('\n')) {
+    if (line === '' || line[0] === '#') continue;
+    const m = /^([A-Za-z_:][A-Za-z0-9_:]*)(\{.*\})?\s+(\S+)/.exec(line);
+    if (m) out.set(m[1] + (m[2] || ''), Number(m[3]));
+  }
+  return out;
+}
+
+async function get(path, asJson) {
+  const headers = apiKey ? { Authorization: 'Bearer ' + apiKey } : {};
+  try {
+    const res = await fetch(path, { headers, cache: 'no-store', credentials: 'omit' });
+    const text = await res.text();
+    let body = text;
+    if (asJson || !res.ok) { try { body = JSON.parse(text); } catch (e) { body = asJson ? null : text; } }
+    return { status: res.status, body };
+  } catch (e) {
+    return { status: 0, body: null };
+  }
+}
+
+function setStatus(kind, text) {
+  $('dot').className = 'dot ' + kind;
+  $('status').textContent = text;
+}
+
+function errorText(r) {
+  const msg = r.body && r.body.error && r.body.error.message;
+  return msg ? String(msg) : 'HTTP ' + r.status;
+}
+
+function rate(cur, prev, name, dt) {
+  const a = cur.get(name), b = prev.get(name);
+  if (a === undefined || b === undefined || !(dt > 0) || a < b) return null;
+  return (a - b) / dt;
+}
+
+function show(id, text) { $(id).textContent = text; }
+const orDash = (v, fmt) => (v === null || v === undefined || !isFinite(v) ? '-' : fmt(v));
+const gib = (b) => nf1.format(b / 1073741824) + ' GiB';
+
+function onMetrics(text, now) {
+  const m = parseMetrics(text);
+  let decode = null, prefill = null, accept = null;
+  if (previous) {
+    const dt = (now - previous.t) / 1000;
+    decode = rate(m, previous.m, 'ninfer_decode_tokens_total', dt);
+    prefill = rate(m, previous.m, 'ninfer_prefill_tokens_total', dt);
+    const drafted = rate(m, previous.m, 'ninfer_spec_decode_draft_tokens_total', dt);
+    const accepted = rate(m, previous.m, 'ninfer_spec_decode_accepted_tokens_total', dt);
+    if (drafted > 0 && accepted !== null) accept = 100 * accepted / drafted;
+  }
+  previous = { t: now, m };
+  const power = m.has('ninfer_gpu_power_watts') ? m.get('ninfer_gpu_power_watts') : null;
+  samples.push({ t: now, decode, prefill, accept, power });
+
+  show('t-decode', orDash(decode, nf1.format));
+  show('t-prefill', orDash(prefill, nf0.format));
+  const draftWindow = m.get('ninfer_spec_decode_draft_window');
+  const draftedAll = m.get('ninfer_spec_decode_draft_tokens_total');
+  const acceptedAll = m.get('ninfer_spec_decode_accepted_tokens_total');
+  if (draftWindow === 0) {
+    show('t-accept', 'off'); show('t-accept-sub', 'no draft source');
+  } else {
+    show('t-accept', draftedAll > 0 ? nf1.format(100 * acceptedAll / draftedAll) + '%' : '-');
+    show('t-accept-sub', draftedAll > 0 ? 'since start, ' + nf0.format(draftedAll) + ' drafted' : 'since start');
+  }
+  show('t-power', orDash(power, (v) => nf0.format(v) + ' W'));
+  const util = m.get('ninfer_gpu_utilization_percent');
+  show('t-util', util === undefined ? 'no NVML reading' : nf0.format(util) + '% utilization');
+  const used = m.get('ninfer_gpu_memory_used_bytes'), total = m.get('ninfer_gpu_memory_total_bytes');
+  show('t-vram', orDash(used, gib));
+  show('t-vram-sub', total ? 'of ' + gib(total) + ', all processes' : 'all processes');
+  show('t-temp', orDash(m.get('ninfer_gpu_temperature_celsius'), (v) => nf0.format(v) + ' \u00b0C'));
+}
+
+function onLoad(load) {
+  show('model', load.model ? String(load.model) : '');
+  const req = load.requests || {}, cap = load.capacity || {}, occ = load.occupancy || {};
+  show('t-requests', orDash(req.running, nf0.format) + ' / ' + orDash(req.waiting, nf0.format));
+  show('t-requests-sub', 'running / waiting, ' + orDash(cap.max_concurrency, nf0.format) + ' lanes');
+  if (cap.kv_capacity_tokens > 0) {
+    show('t-kv', nf0.format(100 * occ.device_main_kv_tokens / cap.kv_capacity_tokens) + '%');
+    show('t-kv-sub', nf0.format(occ.device_main_kv_tokens) + ' of ' + nf0.format(cap.kv_capacity_tokens) + ' tokens');
+  }
+  const queue = $('queue');
+  queue.replaceChildren();
+  const waiting = Array.isArray(req.queue) ? req.queue : [];
+  const totalWaiting = req.queue_total || 0;
+  if (totalWaiting === 0) { queue.textContent = 'No requests waiting for a lane.'; return; }
+  const parts = waiting.slice(0, 8).map((w) =>
+    '#' + w.id + ' (' + nf0.format(w.prompt_tokens) + ' tokens, ' + nf1.format(w.waited_s) + ' s)');
+  let text = 'Waiting (' + totalWaiting + '): ' + parts.join(', ');
+  if (totalWaiting > parts.length) text += ', ...';
+  queue.textContent = text;
+}
+
+function cell(row, text, cls) {
+  const td = document.createElement('td');
+  if (cls) td.className = cls;
+  if (text !== undefined) td.textContent = text;
+  row.appendChild(td);
+  return td;
+}
+
+function bar(td, fraction) {
+  const outer = document.createElement('div');
+  outer.className = 'bar';
+  const inner = document.createElement('div');
+  inner.style.width = Math.max(0, Math.min(100, 100 * fraction)).toFixed(1) + '%';
+  outer.appendChild(inner);
+  td.appendChild(outer);
+}
+
+function onSlots(slots) {
+  const body = $('lanes');
+  body.replaceChildren();
+  if (!Array.isArray(slots) || slots.length === 0) {
+    const row = body.insertRow();
+    cell(row, 'No lanes reported.', 'muted').colSpan = 8;
+    return;
+  }
+  for (const s of slots) {
+    const row = body.insertRow();
+    const idle = s.state === 'idle';
+    cell(row, String(s.id));
+    cell(row, String(s.state));
+    cell(row, idle ? '-' : '#' + s.request_id, idle ? 'muted' : '');
+    const prompt = cell(row);
+    if (idle) { prompt.textContent = '-'; prompt.className = 'muted'; } else {
+      let text = nf0.format(s.prompt_done) + ' / ' + nf0.format(s.prompt_tokens);
+      if (s.reused > 0) text += ' (' + nf0.format(s.reused) + ' reused)';
+      prompt.textContent = text;
+      bar(prompt, s.prompt_tokens > 0 ? s.prompt_done / s.prompt_tokens : 0);
+    }
+    cell(row, idle ? '-' : nf0.format(s.generated), 'num' + (idle ? ' muted' : ''));
+    const ctx = cell(row);
+    ctx.textContent = nf0.format(s.n_ctx_used) + ' / ' + nf0.format(s.n_ctx);
+    bar(ctx, s.n_ctx > 0 ? s.n_ctx_used / s.n_ctx : 0);
+    cell(row, s.tokens_per_second > 0 ? nf1.format(s.tokens_per_second) : '-', 'num');
+    cell(row, s.drafted > 0
+      ? nf0.format(s.accepted) + ' / ' + nf0.format(s.drafted) + ' (' + nf0.format(100 * s.accepted / s.drafted) + '%)'
+      : '-', 'num');
+  }
+}
+
+// A round axis maximum: 1, 2 or 5 times a power of ten.
+function niceMax(v) {
+  if (!(v > 0)) return 1;
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  for (const k of [1, 2, 5, 10]) if (v <= k * p) return k * p;
+  return 10 * p;
+}
+
+function draw(chart) {
+  const canvas = $(chart.id);
+  const css = getComputedStyle(document.documentElement);
+  const color = (name) => css.getPropertyValue(name).trim();
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+    canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
+  }
+  const g = canvas.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const left = 44, right = 8, top = 6, bottom = 18;
+  const pw = w - left - right, ph = h - top - bottom;
+  const now = performance.now(), t0 = now - WINDOW_S * 1000;
+  const values = samples.map((s) => s[chart.field]).filter((v) => v !== null && isFinite(v));
+  const max = chart.max || niceMax(Math.max(0, ...values) * 1.1);
+  const x = (t) => left + pw * (t - t0) / (WINDOW_S * 1000);
+  const y = (v) => top + ph * (1 - Math.min(v, max) / max);
+
+  g.font = '11px system-ui, sans-serif';
+  g.fillStyle = color('--muted');
+  g.strokeStyle = color('--grid');
+  g.lineWidth = 1;
+  g.textAlign = 'right'; g.textBaseline = 'middle';
+  for (let i = 0; i <= 4; i++) {
+    const v = max * i / 4, yy = Math.round(y(v)) + 0.5;
+    g.beginPath(); g.moveTo(left, yy); g.lineTo(left + pw, yy); g.stroke();
+    g.fillText(nf1.format(v), left - 6, yy);
+  }
+  g.textAlign = 'center'; g.textBaseline = 'alphabetic';
+  for (const s of [120, 90, 60, 30, 0]) {
+    g.fillText(s === 0 ? 'now' : '-' + s + 's', Math.min(Math.max(x(now - s * 1000), left + 12), left + pw - 12), h - 4);
+  }
+
+  // The line, broken where a value is unknown (no previous sample, polling paused).
+  const runs = [];
+  let run = [];
+  for (const s of samples) {
+    const v = s[chart.field];
+    if (v === null || !isFinite(v) || s.t < t0) { if (run.length) runs.push(run); run = []; continue; }
+    run.push([x(s.t), y(v)]);
+  }
+  if (run.length) runs.push(run);
+  g.lineJoin = 'round'; g.lineCap = 'round';
+  for (const r of runs) {
+    g.beginPath();
+    r.forEach(([px, py], i) => (i ? g.lineTo(px, py) : g.moveTo(px, py)));
+    g.lineTo(r[r.length - 1][0], top + ph); g.lineTo(r[0][0], top + ph); g.closePath();
+    g.fillStyle = color('--series-fill'); g.fill();
+    g.beginPath();
+    r.forEach(([px, py], i) => (i ? g.lineTo(px, py) : g.moveTo(px, py)));
+    g.strokeStyle = color('--series'); g.lineWidth = 2; g.stroke();
+    if (r.length === 1) { g.beginPath(); g.arc(r[0][0], r[0][1], 2, 0, 2 * Math.PI); g.fillStyle = color('--series'); g.fill(); }
+  }
+
+  const last = samples.length ? samples[samples.length - 1][chart.field] : null;
+  canvas.setAttribute('aria-label', canvas.parentNode.querySelector('h2').textContent +
+    ', last two minutes; now ' + orDash(last, nf1.format));
+
+  // Hover: a crosshair at the nearest sample and its value.
+  const tip = canvas.parentNode.querySelector('.tip');
+  if (chart.hoverX === undefined) { tip.style.display = 'none'; return; }
+  let best = null;
+  for (const s of samples) {
+    const v = s[chart.field];
+    if (v === null || !isFinite(v) || s.t < t0) continue;
+    if (!best || Math.abs(x(s.t) - chart.hoverX) < Math.abs(x(best.t) - chart.hoverX)) best = s;
+  }
+  if (!best) { tip.style.display = 'none'; return; }
+  const bx = x(best.t), by = y(best[chart.field]);
+  g.strokeStyle = color('--muted'); g.lineWidth = 1;
+  g.beginPath(); g.moveTo(Math.round(bx) + 0.5, top); g.lineTo(Math.round(bx) + 0.5, top + ph); g.stroke();
+  g.beginPath(); g.arc(bx, by, 4, 0, 2 * Math.PI);
+  g.fillStyle = color('--series'); g.fill();
+  g.strokeStyle = color('--surface'); g.lineWidth = 2; g.stroke();
+  tip.textContent = nf1.format(best[chart.field]) + ' ' + chart.unit + ', ' + nf0.format((now - best.t) / 1000) + ' s ago';
+  tip.style.display = 'block';
+  const tx = canvas.offsetLeft + bx + 10;
+  tip.style.left = Math.min(tx, canvas.offsetLeft + w - tip.offsetWidth) + 'px';
+  tip.style.top = (canvas.offsetTop + Math.max(0, by - 28)) + 'px';
+}
+
+function drawAll() { for (const c of charts) draw(c); }
+
+async function tick() {
+  if (busy) return;
+  busy = true;
+  try {
+    const [metrics, load, slots] = await Promise.all([get('/metrics', false), get('/v1/load', true), get('/slots', true)]);
+    const now = performance.now();
+    samples = samples.filter((s) => s.t >= now - WINDOW_S * 1000);
+    const results = [metrics, load, slots];
+    const failed = results.find((r) => r.status !== 200);
+    $('keybox').classList.toggle('needed', results.some((r) => r.status === 401));
+    if (results.some((r) => r.status === 0)) {
+      setStatus('critical', 'Cannot reach the server');
+    } else if (results.some((r) => r.status === 401)) {
+      setStatus('critical', apiKey ? 'The API key was refused' : 'This server needs its API key');
+    } else if (failed) {
+      setStatus(failed.status === 503 ? 'warning' : 'critical', errorText(failed));
+    } else {
+      setStatus('good', 'Live, updated every second');
+    }
+    if (metrics.status === 200) onMetrics(metrics.body, now); else { previous = null; samples.push({ t: now, decode: null, prefill: null, accept: null, power: null }); }
+    if (load.status === 200 && load.body) onLoad(load.body);
+    if (slots.status === 200) onSlots(slots.body);
+    drawAll();
+  } finally {
+    busy = false;
+  }
+}
+
+function start() {
+  if (timer !== null) return;
+  // Counters across a hidden stretch would average it in; start the rates afresh.
+  previous = null;
+  samples.push({ t: performance.now(), decode: null, prefill: null, accept: null, power: null });
+  tick();
+  timer = setInterval(tick, POLL_MS);
+}
+
+function stop() {
+  if (timer === null) return;
+  clearInterval(timer);
+  timer = null;
+  setStatus('', 'Paused while the tab is hidden');
+}
+
+document.addEventListener('visibilitychange', () => (document.hidden ? stop() : start()));
+window.addEventListener('resize', drawAll);
+for (const chart of charts) {
+  const canvas = $(chart.id);
+  canvas.addEventListener('mousemove', (e) => { chart.hoverX = e.offsetX; draw(chart); });
+  canvas.addEventListener('mouseleave', () => { chart.hoverX = undefined; draw(chart); });
+}
+
+function useKey() {
+  apiKey = $('key').value.trim();
+  $('key').value = '';
+  try { if (apiKey) sessionStorage.setItem(KEY_STORE, apiKey); else sessionStorage.removeItem(KEY_STORE); } catch (e) { /* storage disabled */ }
+  $('key').placeholder = apiKey ? 'Key set for this tab' : 'API key (if the server has one)';
+  tick();
+}
+$('use-key').addEventListener('click', useKey);
+$('key').addEventListener('keydown', (e) => { if (e.key === 'Enter') useKey(); });
+$('forget-key').addEventListener('click', () => { $('key').value = ''; useKey(); });
+if (apiKey) $('key').placeholder = 'Key set for this tab';
+
+if (!document.hidden) start(); else stop();
+drawAll();
+</script>
+</body>
+</html>
