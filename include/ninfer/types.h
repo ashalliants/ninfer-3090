@@ -327,6 +327,18 @@ struct LossyPrefillOptions {
 };
 
 // How a long prefill shares the GPU with lanes that are already generating. Off by default.
+// Which resident request's prefill takes the next prefill turn.
+enum class PrefillOrder : std::uint8_t {
+    // Prefilling lanes take turns in rotation, one step each.
+    Rotate,
+    // Shortest first, with aging: the lane with the earliest prefill deadline goes first, a
+    // request's deadline being when it was submitted plus what its whole prefill costs alone (the
+    // cost model's prediction at admission). A short prompt gets an early deadline and overtakes a
+    // long one; time spent waiting ages a long one, so a prompt submitted later than a long one's
+    // deadline never overtakes it, which bounds how long it can be passed over.
+    Shortest,
+};
+
 struct PrefillScheduleOptions {
     // The Engine runs one prefill step per worker cycle, so a stream that decodes next to a prefill
     // is paused for a whole step (about 1.5 s at --prefill-chunk 4096 on a 3090). A nonzero budget
@@ -364,6 +376,10 @@ struct PrefillScheduleOptions {
     // while the neighbour lasts. A chunk with media, a DFlash backend or a pipeline split runs
     // whole. 0 or 1 (the default) never slices; at most 16.
     std::uint32_t layer_slices = 0;
+    // Two prefills in rotation on one GPU finish no sooner than one after the other (a prefill
+    // step already uses the whole card), so rotation only delays the first to finish. Shortest
+    // runs them one at a time, shortest deadline first; see PrefillOrder. Rotate by default.
+    PrefillOrder order = PrefillOrder::Rotate;
 };
 
 struct ContextCostOptions {

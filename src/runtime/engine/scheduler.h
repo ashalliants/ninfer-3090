@@ -124,6 +124,8 @@ public:
         return membership;
     }
 
+    void set_prefill_order(PrefillOrder order) noexcept { prefill_order_ = order; }
+
     template <class Slots>
     [[nodiscard]] std::optional<std::uint32_t>
     next_prefill(const Slots& slots, std::uint32_t concurrency) const noexcept {
@@ -136,15 +138,21 @@ public:
                 return lane;
             }
         }
+        std::optional<std::uint32_t> chosen;
         for (std::uint32_t offset = 0; offset < concurrency; ++offset) {
             const std::uint32_t lane = (prefill_cursor_ + offset) % concurrency;
             const auto& request      = slots[lane];
-            if (request && (request->is_prefilling() || request->is_replaying()) &&
-                !request->capture_pending) {
-                return lane;
+            if (!request || !(request->is_prefilling() || request->is_replaying()) ||
+                request->capture_pending) {
+                continue;
+            }
+            if (prefill_order_ == PrefillOrder::Rotate) { return lane; }
+            // Earliest deadline first; a tie keeps the rotation's order.
+            if (!chosen || request->prefill_deadline < slots[*chosen]->prefill_deadline) {
+                chosen = lane;
             }
         }
-        return std::nullopt;
+        return chosen;
     }
 
     void prefill_executed(std::uint32_t lane, std::uint32_t concurrency) noexcept {
@@ -271,6 +279,7 @@ public:
     void paused_queue_empty() noexcept { restoration_event_ = false; }
 
 private:
+    PrefillOrder prefill_order_        = PrefillOrder::Rotate;
     std::uint32_t prefill_cursor_      = 0;
     std::uint64_t scan_after_          = 0;
     std::uint64_t admission_scan_head_ = 0;

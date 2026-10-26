@@ -146,6 +146,7 @@ public:
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("Engine core bounds are invalid");
         }
+        scheduler_.set_prefill_order(options.prefill_schedule.order);
         suspend_options_ = options.suspend;
         if (options.suspend.enabled) {
             if constexpr (kInstanceSuspendable) {
@@ -3040,6 +3041,10 @@ private:
                     request->admission.revoked_checkpoints =
                         resources_.source_revocations(request->id);
                     request->admitted_at = binding_started;
+                    request->prefill_deadline =
+                        request->submitted +
+                        std::chrono::duration_cast<Clock::duration>(std::chrono::nanoseconds(
+                            resources_.prefill_ns(source.remaining_work)));
                     request->host_timing.queue_wait_ns =
                         elapsed_ns(request->submitted, *request->admitted_at);
                     request->queue_wait_recorded = true;

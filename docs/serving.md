@@ -2005,6 +2005,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--yield-long-prefill-ms N` | let the request at the head of the queue pause a prefill with at least N ms of work left, when its own prefill costs at most a quarter of that; see [execution behavior](#execution-behavior) | off |
 | `--prefill-decode-share P` | after each prefill step, while another lane decodes, run decode rounds for P percent (0-90) of the step's time before the next step; see [execution behavior](#execution-behavior) | off |
 | `--prefill-layer-slices N` | while another lane decodes, run each text prefill chunk as N slices of layers with that lane's decode round between slices (2-16); see [execution behavior](#execution-behavior) | off |
+| `--prefill-order rotate\|shortest` | which resident prefill runs next: `rotate` takes turns; `shortest` runs the earliest deadline first, a request's deadline being when it was submitted plus its own predicted prefill time, so short prompts overtake long ones and two long ones run one after the other instead of both finishing late; see [execution behavior](#execution-behavior). Not run on a GPU yet | `rotate` |
 | `--lossy-prefill-min-tokens N` | **experimental, opt-in, lossy.** Filter a cold prompt whose part after the product prompt (leading system/developer messages and tools) has more than N tokens: a scout scores it and only the kept blocks are prefilled, so the model never sees the dropped text. Text-only Qwen3.5 dense on one device; never when the conversation itself is cached. See [lossy long-prompt prefill](#lossy-long-prompt-prefill-experimental) | `0` (off) |
 | `--lossy-prefill-keep F` | share of the filtered part kept, (0, 1], at most `--lossy-prefill-skip` | `0.3` |
 | `--lossy-prefill-filter-layer N` | full-attention layer whose attention mass scores the tokens | `7` |
@@ -2317,6 +2318,19 @@ while the prompt took 61 s instead of 56 s (a 500 ms stall budget gets 528 ms at
 a sliced prefill matched the unsliced run token for token in the engine test
 (`sliced_prefill_matches_whole`) and in a served 56K-token prompt with a stream and a short request
 beside it.
+
+`--prefill-order shortest` changes which resident prefill takes each turn. In rotation, two prompts
+prefilling side by side share the card step by step, and since one prefill step already uses the whole
+card, neither finishes sooner than if they had run one after the other: rotation only makes the first
+one late. In the #332 report, two 44K-token prompts sent 10 s apart took 40.1 s and 43.4 s end to end in
+rotation, and 27.6 s and 42.7 s when the second was queued behind the first (by `--admission-fit-check`):
+the first finished 12.5 s sooner and the second no later. With `shortest`, each request gets a prefill deadline when it is admitted: the time it was
+submitted plus what the cost model predicts its prefill takes alone. The prefilling lane with the
+earliest deadline runs; the others wait, holding their lanes and the pages they have. A short prompt has
+an early deadline and overtakes a long one at the next step. Waiting is what ages a long prompt: a
+request submitted after the long one's deadline has a later deadline however short it is, so a stream of
+short requests delays a long one by at most about its own prefill time. A paused and restored request
+keeps its deadline. Decode rounds are unaffected. Off by default (`rotate`).
 
 `--yield-long-prefill-ms N` is for the queue rather than the other streams. A fresh request never
 preempts a resident one, so with every lane busy it waits for the lane's request to finish, which behind
