@@ -1,5 +1,6 @@
 #include "artifact/binder.h"
 
+#include "artifact/companion.h"
 #include "artifact/framing.h"
 #include "artifact/transcode.h"
 
@@ -105,7 +106,33 @@ void Binder::transcode_device(ObjectHandle object, QType target) {
     if (demand.transcode && *demand.transcode != target) {
         throw ArtifactError(tensor.id + ": conflicting transcode targets");
     }
+    if (demand.companion) {
+        throw ArtifactError(tensor.id + ": an object with a companion cannot also be transcoded");
+    }
     demand.transcode = target;
+}
+
+void Binder::companion_device(ObjectHandle object, Companion kind) {
+    const auto& geometry = reader_.geometry(object);
+    const auto& tensor   = reader_.directory().tensor(object);
+    auto& demand         = demands_.at(object.index);
+    if (!demand.device) {
+        throw ArtifactError(tensor.id + ": a companion requires a device placement");
+    }
+    if (demand.host || demand.transcode) {
+        throw ArtifactError(tensor.id +
+                            ": an object with a companion cannot keep Host bytes or be transcoded");
+    }
+    if (demand.companion && *demand.companion != kind) {
+        throw ArtifactError(tensor.id + ": conflicting companions");
+    }
+    if (kind == Companion::TwoBitHeadProxy &&
+        (geometry.format != QType::Q8_G32_FP16 || geometry.layout != QuantLayout::RowSplit ||
+         geometry.shape.size() != 2 || geometry.padded_columns != geometry.shape[1])) {
+        throw ArtifactError(tensor.id + ": a 2-bit head copy needs a row-split Q8_G32 matrix");
+    }
+    (void)companion_bytes(kind, geometry.shape); // checks the shape
+    demand.companion = kind;
 }
 
 void Binder::evict_device(ObjectHandle object, std::uint32_t rank) {
@@ -234,8 +261,17 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
         auto& capacity      = plan.device_capacity_by_rank[rank];
         const auto offset   = align_up(capacity, demand.alignment, "device offset");
         plan.device_objects.push_back(
-            {ObjectHandle{index}, offset, bytes, demand.alignment, demand.transcode, rank});
+            {ObjectHandle{index}, offset, bytes, demand.alignment, demand.transcode, rank, {}});
         capacity = checked_add(offset, bytes, "device capacity");
+        if (demand.companion) {
+            const std::uint64_t alignment = 256;
+            const auto companion_offset   = align_up(capacity, alignment, "companion offset");
+            const auto companion_size     = companion_bytes(
+                *demand.companion, reader_.directory().tensor(ObjectHandle{index}).shape);
+            plan.device_objects.push_back({ObjectHandle{index}, companion_offset, companion_size,
+                                           alignment, std::nullopt, rank, demand.companion});
+            capacity = checked_add(companion_offset, companion_size, "device capacity");
+        }
     };
     std::vector<std::size_t> evictable;
     std::vector<std::size_t> pinned;
@@ -249,6 +285,10 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
                                 ": a pinned object cannot also have device or Host placement");
         }
         if (demand.pinned_order) { pinned.push_back(i); }
+        if (demand.companion && demand.host) {
+            throw ArtifactError(reader_.directory().tensor(ObjectHandle{i}).id +
+                                ": an object with a companion cannot keep Host bytes");
+        }
         if (!demand.device) { continue; }
         if (demand.evict_rank != 0) {
             // The evictable tail exists so a Vision encode window can borrow weight memory on the

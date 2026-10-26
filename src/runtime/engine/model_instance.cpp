@@ -1,4 +1,5 @@
 #include "runtime/engine/model_instance.h"
+#include "artifact/companion.h"
 #include "artifact/reader.h"
 #include "artifact/formats.h"
 #include "core/paged_kv_cache.h"
@@ -542,6 +543,15 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
     auto plan = models::qwen3_5::plan_load(reader, models::load_options(options));
     binding.complete();
+    // --lm-head-two-stage plans its 2-bit head copy in the weight arena: refuse, naming the flag,
+    // when that copy is what keeps the weights from fitting.
+    const std::uint64_t head_copy_bytes = artifact::planned_companion_bytes(plan.materialization());
+    if (head_copy_bytes != 0) {
+        const std::string why = artifact::companion_fit_refusal(
+            "--lm-head-two-stage", plan.materialization().device_capacity(0), head_copy_bytes,
+            free_bytes_by_rank(device).front());
+        if (!why.empty()) { throw std::invalid_argument(why); }
+    }
     artifact::MaterializeOptions materialize_options;
     if (options.suspend.enabled) {
         materialize_options.suspendable      = true;
@@ -593,7 +603,20 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         options.context_cache.auto_host_cache = false;
     }
     const std::uint32_t requested_context = options.max_context;
-    if (options.fit_context_floor != 0) { fit_context_to_device(options, *instance, device); }
+    // A start that runs out of device memory says how much the two-stage head's copy holds.
+    const auto with_head_copy_advice = [&](auto&& step) {
+        try {
+            return step();
+        } catch (const std::invalid_argument& error) {
+            if (head_copy_bytes == 0) { throw; }
+            throw std::invalid_argument(std::string(error.what()) + ". " +
+                                        artifact::companion_memory_advice("--lm-head-two-stage",
+                                                                          head_copy_bytes));
+        }
+    };
+    if (options.fit_context_floor != 0) {
+        with_head_copy_advice([&] { fit_context_to_device(options, *instance, device); });
+    }
     const auto signature = models::qwen3_5::prefill_signature(*instance->model);
     auto context_cost    = resolve_context_machine_cost(
         {.hardware_class =
@@ -602,9 +625,11 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         options.context_cost.preset_path);
     auto planner = models::qwen3_5::make_sequence_planner(instance->parameters, device, options);
     const std::vector<std::size_t> free_by_rank = free_bytes_by_rank(device);
-    auto resolution = resolve_kv_capacity(options.kv_capacity, planner.capacity_curve(),
-                                          free_by_rank.front(),
-                                          std::span<const std::size_t>(free_by_rank).subspan(1));
+    auto resolution = with_head_copy_advice([&] {
+        return resolve_kv_capacity(options.kv_capacity, planner.capacity_curve(),
+                                   free_by_rank.front(),
+                                   std::span<const std::size_t>(free_by_rank).subspan(1));
+    });
     auto sequence   = std::move(planner).finalize(resolution.main_page_groups);
     if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||
         sequence.kv_capacity() != resolution.resolved_tokens ||

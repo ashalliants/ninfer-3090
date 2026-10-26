@@ -1,5 +1,6 @@
 #include "models/qwen3_5/load.h"
 
+#include "artifact/companion.h"
 #include "artifact/reader.h"
 #include "core/dtype.h"
 #include "core/evictable_weight_pool.h"
@@ -196,6 +197,10 @@ std::vector<std::uint32_t> default_stage_layers(const artifact::Reader& reader,
     std::uint64_t head_bytes = parameter_bytes(reader, bindings, weights.token_embedding) +
                                parameter_bytes(reader, bindings, weights.output_head) +
                                parameter_bytes(reader, bindings, weights.final_norm);
+    if (options.lm_head_two_stage) {
+        head_bytes += artifact::companion_bytes(artifact::Companion::TwoBitHeadProxy,
+                                                bindings.at(weights.output_head).reference.shape);
+    }
     if (config.mtp && options.speculative == SpeculativeBackend::Mtp) {
         head_bytes += layer_bytes_total / std::max<std::size_t>(layers.size(), 1);
     }

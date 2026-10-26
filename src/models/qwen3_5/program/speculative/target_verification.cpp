@@ -11,6 +11,9 @@ void target_verify_forward(ExecutionCore& execution, TextContext& card, TargetVe
         throw std::logic_error("speculative target verify has no ReplaySSM record storage");
     }
     card.set_gdn_state_action(GdnStateAction::RecordForReplay, frame.replay_records);
+    // --lm-head-two-stage reads each row's sampling to choose its head: a row's verify columns
+    // are the frame's leading width.
+    card.bind_head_sampling(frame.sampling, frame.ids.ne[0]);
     if (frame.feature_sink != nullptr) {
         card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
                                  frame.valid_columns, frame.kv_table_rows, frame.state_source_slots,
@@ -22,6 +25,7 @@ void target_verify_forward(ExecutionCore& execution, TextContext& card, TargetVe
                                  envelope, frame.target_hidden, frame.target_logits,
                                  frame.target_tokens);
     }
+    card.bind_head_sampling(nullptr, 1);
 }
 
 void target_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,

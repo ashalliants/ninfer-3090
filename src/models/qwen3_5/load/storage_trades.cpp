@@ -1,5 +1,7 @@
 #include "models/qwen3_5/load/bindings.h"
 
+#include "artifact/companion.h"
+
 #include <stdexcept>
 #include <variant>
 
@@ -7,7 +9,8 @@ namespace ninfer::models::qwen3_5::loading {
 
 // Device-memory trades selected at startup. Each stores a Q8 matrix at a narrower group-64 width
 // while the weights load; the artifact is unchanged and the measured quality cost of each is in
-// docs/maintainer/quality-trade-experiments.md.
+// docs/maintainer/quality-trade-experiments.md. --lm-head-two-stage is the opposite trade: it adds
+// a 2-bit copy of the output head beside it.
 void apply_storage_trades(Bindings& bindings, const Config& config, const ModelWeights& weights,
                           const LoadOptions& options) {
     if (options.lm_head_q4 && options.lm_head_q6) {
@@ -27,6 +30,16 @@ void apply_storage_trades(Bindings& bindings, const Config& config, const ModelW
         (void)bindings.transcode(weights.text.output_head,
                                  options.lm_head_q4 ? QType::Q4_G64_FP16 : QType::Q6_G64_FP16,
                                  options.lm_head_q4 ? "--lm-head-q4" : "--lm-head-q6");
+    }
+    if (options.lm_head_two_stage) {
+        // The two-stage head rescores rows from the stored Q8 head, which a narrower head replaces.
+        if (options.lm_head_q4 || options.lm_head_q6) {
+            throw std::invalid_argument(
+                "--lm-head-two-stage rescores rows from the Q8 output head, which --lm-head-q4 and "
+                "--lm-head-q6 replace: use one or the other");
+        }
+        bindings.companion(weights.text.output_head, artifact::Companion::TwoBitHeadProxy,
+                           "--lm-head-two-stage");
     }
     if (options.embedding_q4 || options.embedding_q6) {
         (void)bindings.transcode(weights.text.token_embedding,

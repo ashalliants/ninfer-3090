@@ -44,6 +44,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/rmsnorm_rope/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/rows/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/softmax_attention/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/sparse_moe/sources.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/two_stage_head/sources.cmake")
 
 if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(80|86|89)$")
   get_target_property(ninfer_ops_sources ninfer_ops SOURCES)

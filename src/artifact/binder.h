@@ -54,6 +54,11 @@ public:
     // object must already have a device demand and be a row-split Q8_G32_FP16 tensor, and every
     // consumer must accept the target format; a repeated request must name the same target.
     void transcode_device(ObjectHandle object, QType target);
+    // Places a companion of a device object (artifact/companion.h) right after it in the same
+    // arena. The object must already have a device demand, keep no Host bytes and not be
+    // transcoded; TwoBitHeadProxy needs a row-split Q8_G32_FP16 [N,K] tensor without padded
+    // columns, N % 16 == 0 and K % 128 == 0. A repeated request must name the same kind.
+    void companion_device(ObjectHandle object, Companion kind);
     // Moves a device object into the arena's evictable tail. Ranked objects follow every resident
     // object; ascending rank places the highest rank at the arena end, which an eviction pool
     // borrows first. A repeated request keeps the highest rank.
@@ -81,6 +86,7 @@ private:
         bool host               = false;
         std::uint64_t alignment = 256;
         std::optional<QType> transcode;
+        std::optional<Companion> companion;
         std::uint32_t evict_rank = 0;
         std::optional<std::size_t> device_rank;
         std::optional<std::uint64_t> pinned_order;

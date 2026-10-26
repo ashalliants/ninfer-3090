@@ -24,6 +24,7 @@
 #include "ninfer/ops/sliding_window_attention.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/speculative_round.h"
+#include "ninfer/ops/two_stage_head.h"
 #include <algorithm>
 #include <initializer_list>
 #include <limits>
@@ -440,6 +441,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         }
         if (!plan.causal_scoring) {
             linear_scratch(layout, parameters.text.output_head, first, last);
+            // --lm-head-two-stage: ordinary decode and target verify heads (TextPhase::Verify).
+            if (phase == TextPhase::Verify && parameters.text.output_head_proxy) {
+                const auto& head = parameters.text.output_head;
+                scratch(layout, execution::rotated_workspace_bytes(
+                                    head.hadamard_signs, head.weight.k, last,
+                                    ops::two_stage_head_workspace_capacity_bytes(
+                                        head.weight.n, head.weight.k, last)));
+            }
         }
     };
     const auto mtp_post_mixer = [&](WorkspaceLayoutBuilder& layout, int first, int last) {

@@ -39,6 +39,7 @@
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/silu_mul.h"
 #include "ninfer/ops/softmax_attention.h"
+#include "ninfer/ops/two_stage_head.h"
 
 #include <cuda_runtime.h>
 
@@ -562,6 +563,19 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
     }
 }
 
+void TextContext::project_output_head(const Tensor& hidden, Tensor& logits) {
+    const auto& proxy = parameters_.text.output_head_proxy;
+    if (head_sampling_ == nullptr || !proxy) {
+        project(hidden, *lm_head_, logits, work_, ctx_.stream);
+        return;
+    }
+    auto scope     = work_.scope();
+    const Tensor x = rotated_input(hidden, lm_head_->hadamard_signs, work_, ctx_.stream);
+    ops::two_stage_head(x, lm_head_->weight, *proxy,
+                        dimension(parameters_.model.resources().public_token_count), logits,
+                        {head_sampling_, head_columns_per_config_}, work_, ctx_.stream);
+}
+
 void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens) {
     auto proposal_scope = work_.scope();
     const int T         = hidden.ne[1];
@@ -718,7 +732,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
         ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, hidden, stream);
-        project(hidden, *lm_head_, logits, work_, stream);
+        project_output_head(hidden, logits);
     }
     work_.reset();
 }
@@ -778,7 +792,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_logits = logits.view({dimension(config_.vocab_size), columns});
         Tensor flat_tokens = target_tokens.view({columns});
         ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, flat_hidden, stream);
-        project(flat_hidden, *lm_head_, flat_logits, work_, stream);
+        project_output_head(flat_hidden, flat_logits);
         ops::argmax(flat_logits, flat_tokens,
                     dimension(parameters_.model.resources().public_token_count), stream);
     }

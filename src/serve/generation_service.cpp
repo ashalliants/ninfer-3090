@@ -338,6 +338,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.flash_next               = options.flash_next;
     engine_options.lm_head_q4               = options.lm_head_q4;
     engine_options.lm_head_q6               = options.lm_head_q6;
+    engine_options.lm_head_two_stage        = options.lm_head_two_stage;
     engine_options.embedding_q4             = options.embedding_q4;
     engine_options.embedding_q6             = options.embedding_q6;
     engine_options.mtp_experts_q4           = options.mtp_experts_q4;

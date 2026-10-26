@@ -112,6 +112,15 @@ public:
 
     // Present when the model is split over several devices; see StageRuntime.
     void set_stage_runtime(StageRuntime* runtime) noexcept { stage_runtime_ = runtime; }
+    // --lm-head-two-stage: the device sampling configs of the round this card executes (column c
+    // reads configs[c / columns_per_config]), which lets the ordinary decode and target verify
+    // heads take the two-stage route when the Text head has a 2-bit copy. Null, the default, keeps
+    // the exact head; nothing else reads it.
+    void bind_head_sampling(const ops::SamplingConfig* configs,
+                            std::int32_t columns_per_config) noexcept {
+        head_sampling_             = configs;
+        head_columns_per_config_ = columns_per_config;
+    }
 
     void set_prefill_gpu_timer(CudaEventTimer* timer) noexcept { prefill_gpu_timer_ = timer; }
 
@@ -245,6 +254,9 @@ private:
                            ops::CausalAttentionExecutionEnvelope envelope, bool final_chunk,
                            Tensor* final_hidden, Tensor* logits, Tensor* draft_token);
     void proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens);
+    // The Text output head of an ordinary decode or target verify round: the two-stage head when
+    // a round's sampling is bound and the head has its 2-bit copy, the exact head otherwise.
+    void project_output_head(const Tensor& hidden, Tensor& logits);
 
     struct MultimodalPrefill {
         std::span<const int> token_ids;
@@ -306,6 +318,8 @@ private:
     const std::int32_t* proposal_head_ids_      = nullptr;
     int proposal_head_n_                        = 0;
     const ops::SamplingConfig* sampling_config_ = nullptr;
+    const ops::SamplingConfig* head_sampling_   = nullptr;
+    std::int32_t head_columns_per_config_       = 1;
     const MtpParameters* mtp_                   = nullptr;
     StageRuntime* stage_runtime_                = nullptr;
 };

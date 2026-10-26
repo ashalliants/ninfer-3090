@@ -6,6 +6,7 @@
 #include "models/qwen3_5/weights.h"
 
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -18,6 +19,8 @@ struct PendingWeight {
     artifact::ParameterReference reference;
     std::vector<WeightUse> uses;
     std::vector<std::string> source_objects;
+    // The stored object whose companion the weight is bound with (Bindings::companion).
+    std::optional<artifact::ObjectHandle> companion;
 };
 
 class Bindings {
@@ -40,6 +43,10 @@ public:
     // (see artifact/transcode.h). Returns false, leaving the objects alone, when they already
     // store `target`; throws std::invalid_argument when they are not transcodable Q8.
     bool transcode(WeightId id, QType target, std::string_view option);
+    // Plans a companion (artifact/companion.h) of the one stored object behind a device parameter
+    // and binds it with the weight. Throws std::invalid_argument naming `option` when the
+    // parameter is not one whole row-split Q8_G32 object the companion can be built from.
+    void companion(WeightId id, artifact::Companion kind, std::string_view option);
     // Places every stored object behind a device parameter in the evictable device tail.
     void evict(WeightId id, std::uint32_t rank);
     // Materializes every stored object behind a device parameter on another pipeline rank's
@@ -89,8 +96,8 @@ void bind_dflash2(Bindings& bindings, DraftWeights& weights, const DraftConfig& 
 [[nodiscard]] ProposalWeights bind_proposal(Bindings& bindings, const artifact::Proposal& proposal,
                                             const TextConfig& target, const LoadOptions& options,
                                             std::uint32_t public_tokens);
-// --lm-head-q4/q6, --embedding-q4/q6 and --mtp-experts-q4: validate the combination and request
-// the load-time transcodes on the selected parameters.
+// --lm-head-q4/q6, --embedding-q4/q6, --mtp-experts-q4 and --lm-head-two-stage: validate the
+// combination and request the load-time transcodes and companions on the selected parameters.
 void apply_storage_trades(Bindings& bindings, const Config& config, const ModelWeights& weights,
                           const LoadOptions& options);
 // --vision-residency overlay: rank the device weights an exclusive Vision window may borrow.

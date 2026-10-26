@@ -42,6 +42,8 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache);
         card.set_stage_runtime(state.execution.stages);
+        // --lm-head-two-stage reads each row's sampling to choose its head (one column per row).
+        card.bind_head_sampling(ordinary.sampling, 1);
 
         Tensor tokens             = ordinary.tokens.slice(0, 0, batch_size);
         Tensor cache_positions    = ordinary.cache_positions.slice(0, 0, batch_size);

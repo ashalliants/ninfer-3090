@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/qwen3_5/model.h"
+#include "ninfer/ops/two_stage_head.h"
 #include "ninfer/ops/weight_input.h"
 
 #include <array>
@@ -62,6 +63,8 @@ struct TextParameters {
     // hidden-width sign vector; empty for an ordinary table.
     Tensor token_embedding_signs;
     LinearParameters output_head;
+    // --lm-head-two-stage: the output head's 2-bit copy (ops::two_stage_head); absent otherwise.
+    std::optional<ops::ProxyHead> output_head_proxy;
     Tensor final_norm;
     std::vector<BlockParameters> layers;
     // How many stages the layer loop spans. One is the identity plan and the fast path.

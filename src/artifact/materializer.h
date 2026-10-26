@@ -1,5 +1,6 @@
 #pragma once
 
+#include "artifact/companion.h"
 #include "artifact/schema.h"
 #include "core/arena.h"
 #include "core/device.h"
@@ -28,6 +29,9 @@ struct DevicePlacement {
     // Which pipeline rank's device arena holds the object; `offset` is relative to that arena.
     // Rank 0 is the primary device, and is the only rank a single-device load ever uses.
     std::size_t rank = 0;
+    // Set when this placement holds the object's companion (artifact/companion.h) rather than the
+    // object: `bytes` is the companion's size, built from the object's stored bytes at upload.
+    std::optional<Companion> companion;
 };
 
 // Offset inside the one page-locked Host block (Residency::Pinned).
@@ -79,6 +83,7 @@ struct MaterializationStats {
     std::uint64_t offloaded_device_capacity_bytes = 0;
     std::uint64_t retained_host_bytes   = 0;
     std::uint64_t pinned_bytes          = 0; // page-locked Host block (Residency::Pinned)
+    std::uint64_t companion_bytes       = 0; // companions on the primary device (included above)
     std::uint64_t peak_staging_bytes    = 0;
     std::size_t device_object_count     = 0;
     std::size_t host_object_count       = 0;
@@ -107,6 +112,8 @@ public:
     [[nodiscard]] const WeightParent& host_parent(ObjectHandle handle) const;
     [[nodiscard]] std::span<const std::byte> host_bytes(ObjectHandle handle) const;
     [[nodiscard]] bool has_device(ObjectHandle handle) const noexcept;
+    // The device bytes of the object's companion; throws when it has none.
+    [[nodiscard]] DeviceSpan companion(ObjectHandle handle) const;
     [[nodiscard]] const WeightParent& pinned_parent(ObjectHandle handle) const;
     [[nodiscard]] std::span<const std::byte> pinned_block() const noexcept;
     // Present when the device backing was supplied by an eviction pool.
@@ -147,6 +154,7 @@ private:
         std::optional<WeightParent> device;
         std::optional<WeightParent> pinned;
         std::optional<WeightParent> host;
+        std::optional<DeviceSpan> companion;
         std::vector<std::byte> host_data;
     };
 

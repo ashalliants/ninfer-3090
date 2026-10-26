@@ -123,6 +123,17 @@ ninfer_add_op_test(ninfer_hc_int8_codec_test
 ninfer_add_op_test(ninfer_relaxed_accept_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_relaxed_accept.cpp"
   LIBRARIES ninfer_core)
+# Host-only: the two-stage output head's codec (--lm-head-two-stage): the 2-bit group fit, the
+# copy's layout against an emulated int8 MMA, the activation cast, the approximate score and the
+# column threshold the kernels run, with a top-64 recall report on a synthetic Gaussian head.
+ninfer_add_op_test(ninfer_two_stage_head_codec_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_two_stage_head_codec.cpp"
+  LIBRARIES ninfer_core)
+# The two-stage head on the 27B vocabulary shape: argmax and top-16 agreement with the dense Q8 head
+# at T=1..16 x B=1..8, rescored rows against FP64, the copy's bits, exclusion and the fallback.
+ninfer_add_op_test(ninfer_two_stage_head_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_two_stage_head.cpp"
+  LIBRARIES ninfer_ops ninfer_artifact)
 
 foreach(op IN ITEMS ple projection_fp32 rows)
   ninfer_add_op_test(ninfer_${op}_test

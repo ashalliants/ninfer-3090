@@ -246,6 +246,10 @@ void validate(const EngineOptions& options) {
                "--embedding-q4/q6, --mtp-experts-q4, --mlp-a8-decode, --prefill-cublas, --gdn-state-fp16, "
                "--no-prefill-a8, --no-prefill-cublas-projections)");
     }
+    if (options.lm_head_two_stage) {
+        refuse("its output head is a GGUF block format, not the row-split Q8 head the two-stage head copies: "
+               "remove --lm-head-two-stage");
+    }
 }
 
 } // namespace

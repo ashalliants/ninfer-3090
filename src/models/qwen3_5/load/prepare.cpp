@@ -1,5 +1,7 @@
 #include "models/qwen3_5/load/bindings.h"
 
+#include "artifact/companion.h"
+#include "artifact/formats.h"
 #include "artifact/transcode.h"
 #include "artifact/views.h"
 
@@ -159,14 +161,43 @@ bool Bindings::transcode(WeightId id, QType target, std::string_view option) {
     return requested;
 }
 
+void Bindings::companion(WeightId id, artifact::Companion kind, std::string_view option) {
+    auto& parameter = weights.at(id.index);
+    const auto& parts = parameter.reference.binding.parts;
+    const auto refuse = [&](const std::string& why) {
+        throw std::invalid_argument(std::string(option) + " builds its " +
+                                    std::string(artifact::companion_name(kind)) + " from " +
+                                    parameter.reference.name + ", which " + why);
+    };
+    if (parameter.reference.residency != artifact::Residency::Device) {
+        refuse("is not a device weight");
+    }
+    if (parts.size() != 1) { refuse("is not stored as one object"); }
+    const auto& part     = parts.front();
+    const auto& geometry = binder.reader().geometry(part.object);
+    if (part.begin != 0 || part.end != geometry.elements) {
+        refuse("is part of a larger stored object");
+    }
+    if (geometry.format != QType::Q8_G32_FP16 || geometry.layout != QuantLayout::RowSplit) {
+        refuse("must be stored as a row-split Q8_G32 matrix (this artifact stores it as " +
+               std::string(artifact::format_name(geometry.format)) + ")");
+    }
+    try {
+        binder.companion_device(part.object, kind);
+    } catch (const artifact::ArtifactError& error) { refuse(std::string("cannot take it: ") + error.what()); }
+    parameter.companion = part.object;
+}
+
 std::vector<BoundWeight> resolve_weights(std::vector<PendingWeight>&& pending,
                                          const artifact::MaterializedArtifact& materialized) {
     std::vector<BoundWeight> out;
     out.reserve(pending.size());
     for (auto& item : pending) {
         auto view = artifact::bind_view(item.reference, materialized);
+        const DeviceSpan companion =
+            item.companion ? materialized.companion(*item.companion) : DeviceSpan{};
         out.push_back({std::move(item.reference.name), std::move(item.source_objects),
-                       std::move(view), std::move(item.uses)});
+                       std::move(view), std::move(item.uses), companion});
     }
     return out;
 }

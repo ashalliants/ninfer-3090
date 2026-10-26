@@ -231,7 +231,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--ngram-flag-wait] [--partial-ram-residency] [--ggml-decode-mma] "
            "[--ram-headroom-mib N] [--expert-cache-mib N] [--context-nvme-mib N [--context-nvme-dir DIR]] "
            "[--chat-template FILE] "
-           "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
+           "[--lm-head-draft] [--lm-head-q4|--lm-head-q6|--lm-head-two-stage] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
            "[--gdn-state-fp16] [--progress-anchor-tokens N [--progress-anchors-shared]] [--admission-fit-check] [--admission-affinity] "
            "[--model-suspend [--suspend-snapshot pageable|pinned] "
            "[--suspend-weights artifact|host] [--no-auto-resume] [--sleep-idle-seconds N]] "
@@ -382,6 +382,13 @@ std::string serve_usage_text(const char* argv0) {
            "token ids the requests' own prompts and outputs hold (names, identifiers) that the "
            "reduced draft head lacks, scored from the full output head; drafts only, so output is "
            "unchanged. Needs --spec (not Qwen3.8-Flash-Next, which drafts with its full head)\n"
+           "       --lm-head-two-stage (off by default) scores the vocabulary from a 2-bit copy of "
+           "the Q8 output head (about 400 MB of GPU memory more on the 27B) and rescores from the "
+           "Q8 head every row that could be among the top 64, on decode and verification rounds "
+           "whose sampling reads only the top tokens (no presence/frequency penalty, no grammar); "
+           "other rounds use the exact head. Designed to keep greedy and sampled output unchanged. "
+           "Not with --lm-head-q4/--lm-head-q6, an artifact whose head is not row-split Q8, or "
+           "Qwen3.8-Flash-Next\n"
            "       --no-prefix-reuse disables cross-request history; request pause/replay "
            "resources remain available\n"
            "       --context-store DIR keeps retained sessions on disk so a restart or crash does "
@@ -981,6 +988,8 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             options.lm_head_q4 = true;
         } else if (arg == "--lm-head-q6") {
             options.lm_head_q6 = true;
+        } else if (arg == "--lm-head-two-stage") {
+            options.lm_head_two_stage = true;
         } else if (arg == "--embedding-q4") {
             options.embedding_q4 = true;
         } else if (arg == "--embedding-q6") {
@@ -1152,6 +1161,10 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
     if (options.relaxed_drafting && options.speculative.backend == SpeculativeBackend::None) {
         throw std::invalid_argument("--relaxed-drafting changes which drafts speculative decoding keeps and "
                                     "needs --spec mtp, dflash or dflash2");
+    }
+    if (options.lm_head_two_stage && (options.lm_head_q4 || options.lm_head_q6)) {
+        throw std::invalid_argument("--lm-head-two-stage rescores rows from the Q8 output head, which "
+                                    "--lm-head-q4 and --lm-head-q6 replace: use one or the other");
     }
     if (options.draft_context_rows != 0 && options.speculative.backend == SpeculativeBackend::None) {
         throw std::invalid_argument("--draft-context-rows adds rows to the draft head's proposals and needs "

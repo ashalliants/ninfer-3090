@@ -10,6 +10,10 @@ perplexity change. The [`sm_86` findings](../performance.md#small-t-tensor-core-
 explain why the first two were the next levers: a decode round is bandwidth-bound at C1, and both
 of them buy bytes.
 
+An eighth flag, `--lm-head-two-stage`, buys head bytes the other way: it adds a 2-bit copy of the
+output head and is designed to keep the exact head's output. It is not yet measured; see
+[Two-stage output head](#two-stage-output-head).
+
 C8 was believed to be tensor-rate bound when `--mlp-a8-decode` was built, which is what motivated
 it. Counters since say otherwise -- tensor, L1 and DRAM all sit near 38% at 31% occupancy, so the
 round is latency-bound and operand movement, not MMA rate, is the limit. That is why the int8 route
@@ -341,6 +345,72 @@ than an accident of the schedule. `tools/w4a8_real_weight_probe.cu` measures a p
 what Marlin and the vLLM stacks use -- at 1.2e-2 relative L2 rising to **1.29e-1** as outlier
 channels grow, against 9e-3 to 2.0e-2 for a scale per group of 64. It is about 20% faster and it is
 not worth it here; a single large channel otherwise starves every other channel in the token.
+
+## Two-stage output head
+
+`--lm-head-two-stage` (off by default; `EngineOptions::lm_head_two_stage`) is a speed trade that is
+designed **not** to trade quality. Basalt (8d73a39) scores its draft head's rows from a 2-bit copy
+and rescores a short list exactly (`src/kernels/cuda/head_proxy.cuh`); this is that idea applied to
+the 27B's Text output head on decode and verification rounds, with the short list chosen by a bound
+instead of Basalt's "within 5 of the best". **Not yet measured on a GPU**: the speed, the
+rescored-row counts and the greedy identity are Task 39's to check.
+
+**What it stores.** While the weights load, the materializer builds a companion of the row-split
+Q8 head (`artifact::Companion::TwoBitHeadProxy`, `src/artifact/companion.cpp`) right after it in
+the weight arena: per 32 weights, 2-bit levels and one binary16 scale, laid out for the int8
+`mma.m16n8k32` (`src/ops/two_stage_head/proxy_codec.h`). On the 27B ([248320, 5120]) that is
+303.1 MiB of levels and 75.8 MiB of scales, 378.9 MiB in all, against the head's 1.27 GB. The fit
+is Basalt's: of six steps `amax / 1.5 x (1 - 0.1 t)`, the one whose levels leave the least squared
+error; then the stored scale takes the full least-squares correction `x |w|^2 / <w, w_hat>`, so
+`<w, w_hat'> = |w|^2` (Basalt applies the square root of that, to keep a softmax over the copy
+close; nothing here reads a probability from the copy). The artifact is unchanged; a resume after
+`--model-suspend` rebuilds the copy from it.
+
+**What a round does** (`ops::two_stage_head`, five launches, no host synchronization):
+
+1. cast each column of the (rotated) final hidden to int8 per 32 values;
+2. score all rows from the copy on the int8 tensor cores (about 0.4 GB read instead of 1.27 GB),
+   storing each score rounded up to BF16 and each 16-row block's largest score per column;
+3. per column, the threshold `theta` from the block maxima: binned at 8 per logit below the
+   largest, with `L` the edge of the bin where 64 blocks are reached, `theta = L - 2 x 4 - 3/8`
+   (`threshold_from_block_maxima`; with every row's error within the 4-logit margin, the 64th
+   best exact score is at least `theta + 4`);
+4. rescore from the Q8 head, in FP32 as `linear_rows` does, every row that reaches `theta` in any
+   column, and count the rescored scores at or above `theta + 4`;
+5. rescore every row of a column whose count is under 64. The count makes `theta + 4` a measured
+   lower bound on the 64th best exact score, so the one remaining assumption is that no row below
+   `theta` is under-estimated by more than 4 logits.
+
+**Which rounds take it.** A row whose sampling has a presence or frequency penalty, or a grammar
+mask, may read any vocabulary row, so its columns take the exact head (`theta = -inf`) on the
+device, from the round's own `SamplingConfig`s, inside the captured graph. Every other row's
+sampler reads only its top `kSamplerCandidateCap` = 20 rows: greedy reads the argmax, and a
+sampled row keeps at most 20 candidates before `top_p` and `min_p`, which then work within them
+(`sampling.h`); speculative acceptance builds its target distribution the same way. All of those
+are among the top 64 the head computes exactly, and every row it does not rescore stores a value
+below the 64th best, so the ordering and values the sampler reads are the exact head's.
+`static_assert(kSamplerCandidateCap <= 64)` keeps that true if the sampler grows. Prefill, scoring
+engines, MTP and DFlash proposals keep the exact head.
+
+**What changes numerically.** Rescored rows are FP32 dot products, not the dense head's tensor-core
+bits: they meet the Q8 A16 Linear criterion, as the dense head does, so a near tie may resolve
+differently, as it already does between the head's T-dependent kernels. Rows outside the top hold
+the copy's approximate score; no sampler reads them.
+
+**What it may save.** The synthetic check in `ninfer_two_stage_head_codec_test` (a Gaussian head
+whose scores have a standard deviation of 3) keeps 100% of the exact top 64, but rescored 4,786 of
+8,192 rows per column: with no clear top, the 8.4-logit window below the 64th best holds most of
+the vocabulary, and the head saves nothing. The largest copy error there was 4.9 logits, over the
+margin on 10 of 65,536 scores (none near the top). A real model's logits have a long upper tail
+above a dense bulk, which is where the window pays; how many rows it rescores, and how often a
+column falls back, must be measured on the 27B before this flag is recommended.
+
+**Tests.** `ninfer_two_stage_head_codec_test` (host only: the fit, the layout against an emulated
+int8 MMA, the cast, the score against FP64, the threshold on random and adversarial maxima, the
+recall report) and `ninfer_artifact_companion_plan_test` (host only: the copy is a planned term
+of the weight arena, its refusals and the startup advice); `ninfer_two_stage_head_test` (GPU, on the
+27B shape: argmax and top-16 agreement with the dense head at T = 1..16 by B = 1..8, rescored rows
+against FP64, the copy's bits, exclusion and the fallback).
 
 ## Weight encoding and layout -- `grouped_search` and the 2026-10 27B layout
 

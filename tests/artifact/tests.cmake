@@ -2,6 +2,13 @@ ninfer_add_test(ninfer_artifact_reader_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_reader.cpp"
   LIBRARIES ninfer_artifact)
 
+# Host-only: the device companion --lm-head-two-stage plans beside the output head (its placement,
+# size and refusals) and the startup advice naming the flag.
+ninfer_add_test(ninfer_artifact_companion_plan_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_companion_plan.cpp"
+  LIBRARIES ninfer_artifact)
+ninfer_op_oracle_options(ninfer_artifact_companion_plan_test)
+
 ninfer_add_test(ninfer_artifact_permute_row_split_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_permute_row_split.cpp"
   LIBRARIES ninfer_artifact)

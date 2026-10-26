@@ -813,6 +813,7 @@ std::string format_server_start_json(
              {"cuda_graph", engine_options.use_cuda_graph},
              {"lm_head_q4", engine_options.lm_head_q4},
              {"lm_head_q6", engine_options.lm_head_q6},
+             {"lm_head_two_stage", engine_options.lm_head_two_stage},
              {"embedding_q4", engine_options.embedding_q4},
              {"embedding_q6", engine_options.embedding_q6},
              {"mtp_experts_q4", engine_options.mtp_experts_q4},

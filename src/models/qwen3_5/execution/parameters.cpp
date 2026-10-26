@@ -2,6 +2,7 @@
 #include "models/qwen3_5/execution/rotation.h"
 
 #include "core/weight_view.h"
+#include "ops/two_stage_head/proxy_codec.h"
 
 #include <algorithm>
 #include <initializer_list>
@@ -367,6 +368,18 @@ Parameters::Parameters(const Model& source) : model(source) {
     const auto& w        = model.weights();
     text.token_embedding = native_weight(model.weight(w.text.token_embedding).view);
     text.output_head     = prepare.head(w.text.output_head_use);
+    if (const DeviceSpan copy = model.weight(w.text.output_head).companion; copy.data != nullptr) {
+        const auto& head = text.output_head.weight;
+        if (head.qtype != QType::Q8_G32_FP16 || head.layout != QuantLayout::RowSplit ||
+            copy.bytes != ops::proxy_head::proxy_bytes(head.n, head.k)) {
+            throw std::logic_error("the output head's 2-bit copy does not match the head");
+        }
+        text.output_head_proxy = ops::ProxyHead{
+            .codes  = copy.data,
+            .scales = static_cast<const std::byte*>(copy.data) + ops::proxy_head::proxy_code_bytes(head.n, head.k),
+            .n      = head.n,
+            .k      = head.k};
+    }
     if (text.token_embedding.qtype == QType::T2_G128_FP16) {
         // A ternary checkpoint stores its token table rotated by the same hidden-width signs as
         // every 5120-wide input, the output head's among them; the table has no Use of its own.

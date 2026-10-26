@@ -76,6 +76,7 @@ struct ServeOptions {
     FlashNextOptions flash_next;
     bool lm_head_q4         = false;
     bool lm_head_q6         = false;
+    bool lm_head_two_stage  = false;
     bool embedding_q4       = false;
     bool embedding_q6       = false;
     bool mtp_experts_q4     = false;

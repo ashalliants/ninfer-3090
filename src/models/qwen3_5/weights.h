@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/arena.h"
 #include "core/stage_plan.h"
 #include "core/weight_view.h"
 #include "ninfer/ops/linear.h"
@@ -37,6 +38,8 @@ struct BoundWeight {
     std::vector<std::string> source_objects;
     WeightView view;
     std::vector<WeightUse> uses;
+    // The device companion its stored object carries (artifact/companion.h), or empty.
+    DeviceSpan companion;
 };
 
 // Byte extent inside the pinned Host weight block.

@@ -801,6 +801,24 @@ int main() {
                       "--draft-context-rows without --spec was not refused naming the flag");
     failures += check(kv_help.find("--draft-context-rows") != std::string::npos,
                       "serve help omits --draft-context-rows");
+    // Two-stage output head: off by default, reaches the Engine, refused beside a narrower head.
+    failures += check(!default_engine.lm_head_two_stage, "--lm-head-two-stage is on by default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--lm-head-two-stage"}))
+                          .lm_head_two_stage,
+                      "--lm-head-two-stage did not reach the Engine");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--lm-head-two-stage",
+                                                 "--spec", "mtp", "--draft-tokens", "3"}))
+                          .lm_head_two_stage,
+                      "--lm-head-two-stage with MTP was not accepted");
+    for (const char* narrower : {"--lm-head-q4", "--lm-head-q6"}) {
+        failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--lm-head-two-stage", narrower},
+                                        "--lm-head-two-stage rescores rows from the Q8 output head"),
+                          (std::string("--lm-head-two-stage with ") + narrower +
+                           " was not refused naming the flag")
+                              .c_str());
+    }
+    failures += check(kv_help.find("--lm-head-two-stage") != std::string::npos,
+                      "serve help omits --lm-head-two-stage");
     // 2^44 MiB shifted by 20 bits wraps a uint64_t to 0; it must be refused, not wrapped.
     for (const char* flag : {"--vram-headroom-mib", "--ram-headroom-mib", "--expert-cache-mib"}) {
         failures += check(serve_rejects({"ninfer-serve", "model.ninfer", flag, "17592186044416"}, "out of range"),

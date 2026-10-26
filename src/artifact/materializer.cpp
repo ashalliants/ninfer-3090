@@ -1,6 +1,7 @@
 #include "artifact/materializer.h"
 
 #include "artifact/framing.h"
+#include "artifact/companion.h"
 #include "artifact/transcode.h"
 #include "artifact/reader.h"
 #include "core/startup.h"
@@ -152,7 +153,7 @@ UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePla
             throw ArtifactError("device placement names a rank the plan has no arena for");
         }
         std::byte* const destination = bases[placement.rank] + placement.offset;
-        if (placement.transcode) {
+        if (placement.transcode || placement.companion) {
             transcoded.push_back(&placement);
             continue;
         }
@@ -164,16 +165,21 @@ UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePla
                  destination + segment.destination_offset});
         }
     }
-    // Transcoded objects are read whole, requantized on the host and uploaded synchronously.
-    // They are the vocabulary-sized exceptions a startup option asked for, so bounded extra Host
-    // memory (one object at a time) is acceptable and the direct-I/O pipeline stays unchanged.
+    // Transcoded objects and companions are read whole, encoded on the host and uploaded
+    // synchronously. They are the vocabulary-sized exceptions a startup option asked for, so
+    // bounded extra Host memory (one object at a time) is acceptable and the direct-I/O pipeline
+    // stays unchanged.
     std::uint64_t transcoded_bytes = 0;
     for (const DevicePlacement* placement : transcoded) {
         const auto source = reader.read_object(placement->object);
         totals.read_bytes = checked_add(totals.read_bytes, source.size(), "transcode read bytes");
         std::vector<std::byte> encoded(static_cast<std::size_t>(placement->bytes));
-        transcode_row_split(*placement->transcode,
-                            reader.directory().tensor(placement->object).shape, source, encoded);
+        const auto& shape = reader.directory().tensor(placement->object).shape;
+        if (placement->companion) {
+            build_companion(*placement->companion, shape, source, encoded);
+        } else {
+            transcode_row_split(*placement->transcode, shape, source, encoded);
+        }
         const ScopedRank bound(device, placement->rank);
         check_cuda(cudaMemcpy(bases[placement->rank] + placement->offset, encoded.data(),
                               encoded.size(), cudaMemcpyHostToDevice),
@@ -300,6 +306,13 @@ UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePla
 const WeightParent& MaterializedArtifact::device_parent(ObjectHandle handle) const {
     if (!has_device(handle)) { throw ArtifactError("object has no device weight backing"); }
     return *objects_[handle.index].device;
+}
+
+DeviceSpan MaterializedArtifact::companion(ObjectHandle handle) const {
+    if (handle.index >= objects_.size() || !objects_[handle.index].companion) {
+        throw ArtifactError("object has no device companion");
+    }
+    return *objects_[handle.index].companion;
 }
 
 const WeightParent& MaterializedArtifact::host_parent(ObjectHandle handle) const {
@@ -458,6 +471,32 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     }
     std::vector<std::uint64_t> previous_device_end(rank_count, 0);
     for (const auto& placement : plan.device_objects) {
+        if (placement.companion) {
+            auto& object = out.objects_.at(placement.object.index);
+            if (placement.rank >= rank_count) {
+                throw ArtifactError("device placement names a rank the plan has no arena for");
+            }
+            const auto& arena        = out.arenas_[placement.rank];
+            const auto rank_capacity = plan.device_capacity(placement.rank);
+            if (object.companion || !arena || placement.transcode || object.host ||
+                placement.bytes != companion_bytes(*placement.companion,
+                                                   reader.directory().tensor(placement.object).shape)) {
+                throw ArtifactError("invalid or duplicate companion placement");
+            }
+            if (placement.offset < previous_device_end[placement.rank] || placement.alignment == 0 ||
+                placement.offset % placement.alignment != 0 || placement.offset > rank_capacity ||
+                placement.bytes > rank_capacity - placement.offset) {
+                throw ArtifactError("device offset differs from materialization plan");
+            }
+            previous_device_end[placement.rank] = placement.offset + placement.bytes;
+            object.companion = DeviceSpan{static_cast<std::byte*>(arena->base()) + placement.offset,
+                                          static_cast<std::size_t>(placement.bytes)};
+            if (placement.rank == 0) {
+                out.stats_.companion_bytes =
+                    checked_add(out.stats_.companion_bytes, placement.bytes, "companion bytes");
+            }
+            continue;
+        }
         const auto& stored_geometry = reader.geometry(placement.object);
         const auto geometry =
             placement.transcode

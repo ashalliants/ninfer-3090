@@ -21,6 +21,9 @@ struct LoadOptions {
     bool embedding_q4   = false;
     bool embedding_q6   = false;
     bool mtp_experts_q4 = false;
+    // --lm-head-two-stage: plan the 2-bit copy of the row-split Q8 output head beside it (a
+    // companion device object) for the two-stage head. Generation only.
+    bool lm_head_two_stage = false;
     // Execution selection carried with the instance: admit the integer small-T gate_up route at
     // verify widths (see execution::DenseParameters::verify_gate_up_policy).
     bool mlp_a8_decode = false;
@@ -99,6 +102,8 @@ struct LoadOptions {
             .embedding_q4   = options.embedding_q4,
             .embedding_q6   = options.embedding_q6,
             .mtp_experts_q4 = options.mtp_experts_q4,
+            .lm_head_two_stage =
+                options.lm_head_two_stage && options.purpose == EnginePurpose::Generation,
             .mlp_a8_decode  = options.mlp_a8_decode,
             .prefill_a8     = options.prefill_a8,
             .prefill_cublas = options.prefill_cublas,
