@@ -217,18 +217,23 @@ void require_fp8_metadata(const Weight& table, const Tensor& out) {
     (void)detail::validate_fp8_weight(table, "embedding");
 }
 
-// A ggml_blocks_v1 table: rows of D/256 blocks, codes only (scales live in the blocks).
-void require_ggml_iq4_xs_metadata(const Weight& table, const Tensor& out) {
+// A ggml_blocks_v1 table of 256-value blocks (`name`, `block_bytes` each): rows of D/256 blocks,
+// codes only (scales live in the blocks).
+void require_ggml_metadata(const Weight& table, const Tensor& out, const std::string& name, std::uint64_t block_bytes) {
     require_weight_2d(table);
     if (table.layout != QuantLayout::GgmlBlocks || table.shape[1] != out.ne[0] || out.ne[0] % 256 != 0 ||
         table.qdata == nullptr) {
-        throw std::invalid_argument("embedding: GGML IQ4_XS table must be ggml_blocks_v1 [vocab,d], d % 256 == 0");
+        throw std::invalid_argument("embedding: GGML " + name + " table must be ggml_blocks_v1 [vocab,d], d % 256 == 0");
     }
     const std::uint64_t expected = checked_mul_u64(static_cast<std::uint64_t>(table.shape[0]),
-                                                   static_cast<std::uint64_t>(out.ne[0]) / 256 * 136);
+                                                   static_cast<std::uint64_t>(out.ne[0]) / 256 * block_bytes);
     if (table.payload_bytes != 0 && table.payload_bytes < expected) {
-        throw std::invalid_argument("embedding: GGML IQ4_XS payload is too small");
+        throw std::invalid_argument("embedding: GGML " + name + " payload is too small");
     }
+}
+
+void require_ggml_iq4_xs_metadata(const Weight& table, const Tensor& out) {
+    require_ggml_metadata(table, out, "IQ4_XS", 136);
 }
 
 bool is_empty_T(const Tensor& ids, const Tensor& out) { return ids.ne[0] == 0 || out.ne[1] == 0; }
@@ -287,6 +292,12 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
         if (is_empty_T(ids, out)) { return; }
         require_non_empty_tensors(ids, out);
         detail::embed_gather_ggml_iq4_xs_launch(ids, table, out, stream);
+        break;
+    case QType::GGML_IQ3_S:
+        require_ggml_metadata(table, out, "IQ3_S", 110);
+        if (is_empty_T(ids, out)) { return; }
+        require_non_empty_tensors(ids, out);
+        detail::embed_gather_ggml_iq3_s_launch(ids, table, out, stream);
         break;
     case QType::FP8_E4M3FN_ROW_BF16:
         require_fp8_metadata(table, out);

@@ -69,6 +69,14 @@ HotEmbeddingPlan plan_hot_embedding(std::uint64_t vocab, std::uint64_t hidden, s
     return out;
 }
 
+void require_hot_embedding_format(QType embedding, std::uint32_t hot_rows) {
+    if (hot_rows != 0 && embedding != QType::GGML_IQ4_XS) {
+        throw std::invalid_argument("--hot-embedding-rows needs a GGML IQ4_XS token embedding; this model's is " +
+                                    std::string(embedding == QType::GGML_IQ3_S ? "ggml_iq3_s" : "another format") +
+                                    " (start without --hot-embedding-rows)");
+    }
+}
+
 void plan_pinned_weights(HostMemoryDemand& demand, std::uint64_t pinned_block, const HotEmbeddingPlan& hot) {
     if (pinned_block < hot.table) {
         throw std::logic_error("Qwen3.8-Flash-Next: the pinned block is smaller than the embedding it holds");

@@ -9,9 +9,11 @@
 #include "models/qwen4_exp/model.h"
 
 #include "artifact/binder.h"
+#include "artifact/formats.h"
 #include "artifact/reader.h"
 #include "artifact/views.h"
 #include "models/qwen3_5/vision_config.h"
+#include "models/qwen4_exp/memory_plan.h"
 
 #include <cuda_runtime.h>
 
@@ -319,9 +321,10 @@ TextWeights bind_text(Bindings& b, const TextConfig& c, bool hot_embedding) {
     TextWeights out;
     const std::uint64_t h = c.hidden_size, v = c.vocab_size;
     // --hot-embedding-rows: the whole table in the pinned block (mapped), first, before the banks.
-    out.token_embedding = b.parameter("text/token_embedding", {v, h}, {}, QType::GGML_IQ4_XS,
+    // Their formats are the GGUF's (require_text_formats).
+    out.token_embedding = b.parameter("text/token_embedding", {v, h}, {}, std::nullopt,
                                       hot_embedding ? Residency::Pinned : Residency::Device);
-    out.output_head     = b.parameter("text/output_head", {v, h}, "text/final_hidden", QType::GGML_IQ4_XS);
+    out.output_head     = b.parameter("text/output_head", {v, h}, "text/final_hidden");
     out.final_mixer     = bind_hc(b, c, "text/final_mixer/", false);
     for (std::uint32_t i = 0; i < c.num_hidden_layers; ++i) {
         const std::string prefix = "text/layers/" + std::to_string(i) + "/";
@@ -338,6 +341,30 @@ TextWeights bind_text(Bindings& b, const TextConfig& c, bool hot_embedding) {
         out.layers.push_back(std::move(block));
     }
     return out;
+}
+
+// The stored format of a parameter bound as one parent.
+QType bound_format(const artifact::Reader& reader, const PendingWeight& weight) {
+    const auto& parts = weight.reference.binding.parts;
+    if (parts.size() != 1) { throw ArtifactError(weight.reference.name + ": must be one complete parent"); }
+    return reader.geometry(parts.front().object).format;
+}
+
+// The token embedding and output head formats the forward runs (ops::embedding and projection_fp32's
+// GGML head): the GGUF packs' IQ4_XS or IQ3_S embedding, and IQ4_XS, Q6_K or Q5_K head.
+void require_text_formats(const artifact::Reader& reader, const std::vector<PendingWeight>& pending,
+                          const TextWeights& text, bool hot_embedding) {
+    const QType embedding = bound_format(reader, pending.at(text.token_embedding.index));
+    if (embedding != QType::GGML_IQ4_XS && embedding != QType::GGML_IQ3_S) {
+        throw ArtifactError("text/token_embedding: expected ggml_iq4_xs or ggml_iq3_s rows, got " +
+                            std::string(artifact::format_name(embedding)));
+    }
+    require_hot_embedding_format(embedding, hot_embedding ? 1U : 0U);
+    const QType head = bound_format(reader, pending.at(text.output_head.index));
+    if (head != QType::GGML_IQ4_XS && head != QType::GGML_Q6_K && head != QType::GGML_Q5_K) {
+        throw ArtifactError("text/output_head: expected ggml_iq4_xs, ggml_q6_k or ggml_q5_k, got " +
+                            std::string(artifact::format_name(head)));
+    }
 }
 
 ExpertBank expert_bank(const BoundWeight& weight, const TextConfig& c, bool on_device = false) {
@@ -457,6 +484,7 @@ LoadPlan plan_load(const artifact::Reader& reader, bool mtp, bool vision, bool h
     // After the expert banks: the tower's groups follow them in the pinned block.
     if (vision) { out->vision = bind_vision(bindings, *out->vision_config, out->config); }
     out->pending         = std::move(bindings.weights);
+    require_text_formats(reader, out->pending, out->weights, hot_embedding);
     for (const auto& layer : out->weights.layers) {
         const auto& parts = out->pending.at(layer.moe.experts.index).reference.binding.parts;
         if (parts.size() != 1) { throw ArtifactError("an expert bank must be one complete parent"); }

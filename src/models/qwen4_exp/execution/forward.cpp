@@ -1111,7 +1111,7 @@ Tensor Forward::attention_rows(const AttentionParameters& p, const Tensor& x, st
 // (projection_fp32) where K <= 3072, BF16 Linears for the fusion and attention-output
 // projections; the routed experts are Q2_0 records served by offloaded_sparse_moe's narrow route
 // from the device bank (every expert resident) instead of resident_moe; the draft head is the
-// text model's IQ4_XS head over the public tokens (no proposal head, no draft log-probability).
+// text model's GGML head over the public tokens (no proposal head, no draft log-probability).
 
 namespace {
 

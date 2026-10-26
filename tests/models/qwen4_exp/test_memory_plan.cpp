@@ -442,6 +442,18 @@ void test_hot_embedding_ledgers() {
         refused = std::string(error.what()).find("--hot-embedding-rows") != std::string::npos;
     }
     require(refused, "N above the vocabulary is refused naming --hot-embedding-rows");
+    // The two planes are IQ4_XS rows (embedding_split): an IQ3_S embedding (the GSQ-RCO IQ3_XXS
+    // pack's) is refused with the flag, and accepted without it.
+    refused = false;
+    try {
+        require_hot_embedding_format(ninfer::QType::GGML_IQ3_S, 8192);
+    } catch (const std::invalid_argument& error) {
+        refused = std::string(error.what()).find("--hot-embedding-rows") != std::string::npos &&
+                  std::string(error.what()).find("ggml_iq3_s") != std::string::npos;
+    }
+    require(refused, "an IQ3_S embedding with --hot-embedding-rows is refused naming the flag and the format");
+    require_hot_embedding_format(ninfer::QType::GGML_IQ3_S, 0);
+    require_hot_embedding_format(ninfer::QType::GGML_IQ4_XS, 8192);
 
     // Host: the pinned block holds the banks, and with the option the table too; the ledger plans
     // the table as other_pinned and the rest as the banks.

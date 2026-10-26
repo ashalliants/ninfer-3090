@@ -75,8 +75,8 @@ struct BlockWeights {
 };
 
 struct TextWeights {
-    WeightId token_embedding; // GGML IQ4_XS, device (pinned with --hot-embedding-rows)
-    WeightId output_head;     // GGML IQ4_XS, device
+    WeightId token_embedding; // GGML IQ4_XS or IQ3_S, device (pinned with --hot-embedding-rows)
+    WeightId output_head;     // GGML IQ4_XS, Q6_K or Q5_K, device
     HyperConnectionWeights final_mixer;
     std::vector<BlockWeights> layers;
 };

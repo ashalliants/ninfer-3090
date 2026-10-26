@@ -10,6 +10,7 @@
 // NInfer's own later allocations and a headroom for the display and other programs are left.
 
 #include "core/host_memory.h"
+#include "core/weight.h"
 #include "core/vram_budget.h"
 #include "ninfer/types.h"
 
@@ -89,6 +90,10 @@ struct HotEmbeddingPlan {
 // Refuses (std::invalid_argument naming --hot-embedding-rows) N above the vocabulary, and a hidden
 // size that is not a multiple of 256 when N is nonzero.
 [[nodiscard]] HotEmbeddingPlan plan_hot_embedding(std::uint64_t vocab, std::uint64_t hidden, std::uint32_t hot_rows);
+// The two planes are read by ops::embedding_split, which takes GGML IQ4_XS rows only: refuses
+// (std::invalid_argument naming --hot-embedding-rows) a token embedding in another format when N is
+// nonzero (the GSQ-RCO IQ3_XXS pack's embedding is IQ3_S).
+void require_hot_embedding_format(QType embedding, std::uint32_t hot_rows);
 // The RAM ledger's terms for the load plan's pinned block of `pinned_block` bytes (LoadPlan::pinned_bytes):
 // the hot-embedding table is other_pinned, the rest (the expert banks and, with --vision, the tower)
 // expert_banks.
