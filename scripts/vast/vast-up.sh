@@ -55,8 +55,9 @@ new="$(vastai create instance "$offer" --image vastai/base-image:cuda-12.8.1-aut
   --onstart "$onstart" --label ninfer-release --raw | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["new_contract"])')"
 rm -f "$onstart"
 echo "$new" > "$state_file"
-# From here on any failure destroys the instance: it bills, and the state file would block a retry.
-trap 'rc=$?; if (( rc != 0 )); then echo "vast-up failed: destroying instance $new" >&2; echo y | vastai destroy instance "$new" >&2 || true; rm -f "$state_file"; fi' EXIT
+# From here on any failure destroys the instance: it bills. The state file goes only once the destroy is
+# confirmed; if it fails the file stays, so vast-destroy.sh can retry and a new vast-up.sh refuses to rent.
+trap 'rc=$?; if (( rc != 0 )); then echo "vast-up failed: destroying instance $new" >&2; if echo y | vastai destroy instance "$new" >&2; then rm -f "$state_file"; else echo "Destroy FAILED: instance $new is still billing. Run vast-destroy.sh until it succeeds." >&2; fi; fi' EXIT
 echo "Rented instance $new. Kill switch: ${hours} h. Waiting for it to boot..."
 
 # A host that never leaves "loading" burns money: give up after 8 minutes (destroy and re-run).
