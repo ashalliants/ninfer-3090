@@ -308,6 +308,10 @@ int main() {
     failures += check(parse({"ninfer-serve", "model.ninfer", "--admission-fit-check"})
                           .admission_fit_check,
                       "--admission-fit-check did not reach serving options");
+    failures += check(!defaults.admission_affinity, "the cache-affinity overtake is on by default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--admission-affinity"})
+                          .admission_affinity,
+                      "--admission-affinity did not reach serving options");
     failures += check(!defaults.progress_anchors_shared, "shared progress anchors are on by default");
     failures += check(parse({"ninfer-serve", "model.ninfer", "--progress-anchor-tokens", "4096",
                              "--progress-anchors-shared"})

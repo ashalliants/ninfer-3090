@@ -2230,6 +2230,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-concurrency N` | resident execution lanes; valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--admission-fit-check` | queue a fresh request whose whole prompt cannot fit in the KV pool beside the resident requests, instead of starting it, pausing it when the pool fills and recomputing its history; always admits when nothing is resident (counted by `ninfer_admission_fit_deferrals_total`) | off |
+| `--admission-affinity` | when a lane is free, let a waiting request whose prompt resumes a prefix already held on the GPU (a cached checkpoint it may take over, or one its own session left, with no copy from Host memory) start ahead of older waiters; each waiter can be passed this way at most four times, separately from the ordinary bypass allowance. Only the eight waiters behind the head are considered. Qwen3.5 and Flash-Next; no effect with `--no-prefix-reuse`. Not run on a GPU yet | off |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `600000` |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
 | `--progress-anchor-tokens N` | during a long prefill, keep a private checkpoint every N tokens (a multiple of `--prefill-chunk`; needs prefix reuse; each request keeps its newest four) so a paused request that loses its snapshot replays from the nearest checkpoint instead of from the start. Each checkpoint costs one State image; Qwen3.5-family models only | `0` (off) |
@@ -2506,9 +2507,10 @@ capacity returns HTTP 429 with code `server_overloaded`. The absolute
 waiting, and returns HTTP 503 with code `request_queue_timeout` if admission does not occur in time.
 Once admitted, a request may pause for resource pressure without restarting this initial-admission
 deadline. Fresh requests enter in FIFO order with a bounded bypass allowance when an earlier request
-cannot fit. There is no admission ETA or unbounded overflow queue. A fresh request never preempts a
-resident one, so when every lane is busy a queued request waits out the generations ahead of it, and
-the deadline has to be scaled to the longest response the deployment allows rather than to a
+cannot fit. With `--admission-affinity`, a request that resumes a prefix still held on the GPU may
+also start ahead of an older request that could have started, at most four times per older request.
+There is no admission ETA or unbounded overflow queue. A fresh request never preempts a resident one,
+so when every lane is busy a queued request waits out the generations ahead of it, and the deadline has to be scaled to the longest response the deployment allows rather than to a
 connection timeout: at C1 on an RTX 3090 a single 6,500-token response occupies the engine for about
 106 seconds. The 600,000 ms default admits a queued caller behind roughly ten such responses; lower
 it only to fail fast on purpose.

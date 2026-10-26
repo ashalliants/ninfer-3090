@@ -48,6 +48,7 @@ struct Settings {
     std::chrono::microseconds prefill_sleep{0};
     std::uint32_t layer_slices = 0;
     bool admission_fit_check = false;
+    bool admission_affinity  = false;
     std::uint32_t pending_timeout_ms = 60'000;
     std::uint32_t max_pending        = 8;
 };
@@ -72,6 +73,7 @@ public:
         options.prefill_chunk         = settings.chunk;
         options.context_cache.enabled = false;
         options.admission_fit_check   = settings.admission_fit_check;
+        options.admission_affinity    = settings.admission_affinity;
         options.prefill_schedule      = {.stall_budget_ms      = settings.stall_budget,
                                          .yield_remaining_ms   = settings.yield_ms,
                                          .decode_share_percent = settings.decode_share,
@@ -507,6 +509,27 @@ void test_the_fit_answer_is_not_asked_without_the_flag() {
     require(finished(long_result) && finished(short_result), "a request did not finish\n" + rig.dump());
     require(rig.core().runtime_stats().admission_fit_deferrals == 0,
             "the fit check ran with the flag off");
+}
+
+// --admission-affinity on the real worker loop with nothing held on the device (the fake keeps no
+// checkpoints): asking every waiter whether it is affine leaves admission in FIFO order.
+void test_affinity_without_a_held_prefix_keeps_fifo() {
+    Rig rig({.chunk = 1024, .lanes = 1, .admission_affinity = true});
+    Result long_result;
+    start_long_prompt(rig, long_result);
+    std::vector<Result> results;
+    for (std::uint64_t id = 2; id <= 6; ++id) { results.push_back(rig.run(id, 100, 1)); }
+    rig.release();
+    require(finished(long_result), "the long request did not finish\n" + rig.dump());
+    for (const Result& result : results) {
+        require(finished(result), "a request did not finish\n" + rig.dump());
+    }
+    std::vector<std::uint64_t> binds;
+    for (const Event& event : rig.events()) {
+        if (event.kind == Event::Kind::Bind) { binds.push_back(event.request); }
+    }
+    require(binds == std::vector<std::uint64_t>({1, 2, 3, 4, 5, 6}),
+            "admission left FIFO order with no prefix held on the device\n" + rig.dump());
 }
 
 void test_backlog_gauge_tracks_queued_and_resident_prefill() {
@@ -1095,6 +1118,8 @@ int main() {
     run("a long newcomer does not displace a long prefill",
         test_a_long_newcomer_does_not_displace_a_long_prefill);
     run("a prefill with little left is not paused", test_a_prefill_with_little_left_is_not_paused);
+    run("affinity without a held prefix keeps FIFO",
+        test_affinity_without_a_held_prefix_keeps_fifo);
     run("backlog gauge tracks queued and resident prefill",
         test_backlog_gauge_tracks_queued_and_resident_prefill);
     run("lanes report prefill then decode", test_lanes_report_prefill_then_decode);

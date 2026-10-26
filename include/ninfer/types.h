@@ -543,6 +543,11 @@ struct EngineOptions {
     // instead of starting: it would fill the pool, be paused, and (without a Host snapshot)
     // recompute its history. Off by default; a request is always admitted when none is resident.
     bool admission_fit_check           = false;
+    // Cache-affinity overtake. When on, a waiting request whose prompt resumes a prefix already
+    // held on the device (a reusable checkpoint it may take over or that its session left, with no
+    // Host-to-device copy) may be admitted ahead of older waiters; each waiter can be passed this
+    // way at most four times. Off by default (plain FIFO with the resource bypass allowance).
+    bool admission_affinity            = false;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
     // Zero (off), or a multiple of prefill_chunk: a long prefill leaves a private LongAnchor

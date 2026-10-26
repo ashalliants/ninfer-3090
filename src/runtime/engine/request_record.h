@@ -205,6 +205,12 @@ struct RequestRecord {
     // replay's own pause), so RuntimeStats::lanes reports the pausing lane as prefilling.
     bool paused_while_replaying               = false;
     std::uint32_t admission_bypasses          = 0;
+    // Times a younger waiter resuming a prefix held on the device was admitted ahead of this one
+    // (EngineOptions::admission_affinity; Scheduler::kMaxAffinityOvertakes bounds it).
+    std::uint32_t overtakes                   = 0;
+    // The affinity answer for this waiter, computed once per admission_generation (0: never).
+    std::uint64_t affinity_generation         = 0;
+    bool affine                               = false;
     std::uint64_t admission_generation        = 0;
     bool admission_observed                   = false;
     GenerationAdmissionStats admission;
