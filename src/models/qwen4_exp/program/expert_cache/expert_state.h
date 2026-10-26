@@ -57,7 +57,8 @@ struct ExpertStateRead {
 
 // Where a server reads and writes its expert state. `primary` is the session file (read at start,
 // written at stop and between requests); `fallback` is the shipped default (read only, and only when
-// the primary is missing or belongs to another artifact). All four are empty when the state is off
+// the primary does not load: missing, another artifact or copy, damaged, or another key count).
+// All four are empty when the state is off
 // (`--no-expert-state`): nothing is read, not even the default.
 struct ExpertStateFiles {
     std::filesystem::path primary;
