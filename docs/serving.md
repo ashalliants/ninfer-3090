@@ -268,6 +268,7 @@ and the JSON record carries `vision_overlay`, including `exclusive_windows` and 
 | `GET /v1/load` | serving capacity, current load, and monotonic token counters (see [Load](#load)) |
 | `GET /slots` | each execution lane's state and progress, in llama.cpp's array shape (see [Slots](#slots)) |
 | `GET /metrics` | Prometheus counters, gauges and latency histograms, plus llama.cpp-compatible series (see [Metrics](#metrics)) |
+| `GET /dashboard` | a live dashboard page for a browser, drawn from `/metrics`, `/v1/load` and `/slots` (see [Dashboard](#dashboard)) |
 | `GET /v1/models` | configured OpenAI model alias, effective context limit (`max_model_len`/`context_window`/`context_length`) and input modalities (see [Model discovery](#model-discovery)) |
 | `GET /v1/models/{id}` | lookup of the same model object by its alias |
 | `GET /props` | read-only llama.cpp-style server properties (see [Model discovery](#model-discovery)) |
@@ -356,7 +357,8 @@ release must be built after `VERSION` is set.
 The server binds its port and starts accepting connections before the Engine has loaded weights
 and finished warmup, so a port clash is reported in milliseconds rather than after loading. Every
 route -- including `/health`, `OPTIONS`, and requests that would otherwise be unauthenticated --
-answers `503` with `Retry-After: 2` until warmup completes, in the target's own error shape:
+answers `503` with `Retry-After: 2` until warmup completes, in the target's own error shape (only
+the static [dashboard](#dashboard) page is served meanwhile, and it shows the `503` its polls get):
 
 ```json
 {"error":{"message":"The model is still loading. Retry shortly.","type":"service_unavailable","code":"model_loading"}}
@@ -513,6 +515,42 @@ speculative-decoding fields:
 - Requests waiting for a lane are not slots: `/v1/load` lists them under `requests.queue`.
 - The snapshot can trail the poll by up to one prefill step or decode round, so a long decode round
   or prefill chunk shows as a pause in the counts.
+
+### Dashboard
+
+Open `http://127.0.0.1:8080/dashboard` (your `--host` and `--port`) in a browser for a live view of
+the server. It is one page built into `ninfer-serve`, with nothing fetched from elsewhere, so it
+works offline. Once a second while its tab is visible (it stops polling when the tab is hidden) it
+reads `/metrics`, `/v1/load` and `/slots` from the same server and shows:
+
+- the current decode and prefill tokens/s, and charts of both over the last two minutes, from
+  `ninfer_decode_tokens_total` and `ninfer_prefill_tokens_total` (prefix-cache hits excluded);
+- draft acceptance: a chart of each second's accepted / drafted tokens, and the figure since startup
+  (`off` without a draft source);
+- running and waiting requests, and the share of the Main KV pool in use (retained prefixes
+  included, as in `/v1/load`'s `occupancy`);
+- GPU power (with a chart), utilization, VRAM in use by every process on the card, and core
+  temperature, from the `ninfer_gpu_*` gauges (`-` when NVML gives no reading);
+- one row per lane from `/slots`: its state, request, prompt progress with the reused prefix,
+  generated tokens, context use against `--max-context`, tokens/s and accepted drafts; and below
+  them the requests waiting for a lane, from `/v1/load`'s `requests.queue`.
+
+The history lives in the page, so a reload starts the charts empty. Rates are differences between
+two polls of the counters, and the counters advance at prefill steps and decode rounds, so a second
+can read high or low next to its neighbours.
+
+**The key.** The page itself is served without `--api-key`, since it holds no data, but everything
+it polls needs the key. If the server has one, the page says so: type the key into the field at the
+top and press Enter or **Use key**. The page sends it as `Authorization: Bearer` on its own
+requests and keeps it in the tab's session storage, so it survives a reload of that tab but not
+closing it; **Forget** clears it. The key never appears in the URL. The
+[Host check](#host-and-origin-checks) applies to the page like every route, so open it by a name
+the server answers to; its requests go to its own origin, so they pass the Origin check.
+
+The page is served with a `Content-Security-Policy` that lets it run only its own inline script and
+style and connect only to its own origin, forbids framing it, and with
+`X-Content-Type-Options: nosniff`. Under the [router](#several-models-router) the router serves the
+page itself, and what it polls answers for the model that last served.
 
 ### Context store
 
@@ -883,6 +921,7 @@ The router answers llama.cpp's model API itself:
 
 `GET /health` is 200 while the router runs. `GET /props`, `/metrics`, `/v1/load` and `/slots`
 answer for the model that last served, without waking or loading it (a 503 while it is unloaded).
+The router serves `GET /dashboard` itself, and the page reads those status endpoints.
 Everything else (chat completions, Responses, Messages and the rest) is forwarded to the model it
 names: each model runs the ordinary single-model server on a loopback port of its own, so every
 endpoint, request log and metric works per model unchanged. The router checks `--api-key`, runs the
@@ -2040,8 +2079,9 @@ matched by requests using the same graft.
 ## Authentication and CORS
 
 Pass `--api-key VALUE` to require the same value as an OpenAI bearer token or Anthropic
-`x-api-key` header. `GET /health` and CORS preflight requests remain unauthenticated; `GET /v1/load`
-and `GET /metrics` require the key.
+`x-api-key` header. `GET /health`, the [dashboard](#dashboard) page (`GET /dashboard`, which holds
+no data and sends the key on its own requests) and CORS preflight requests remain unauthenticated;
+`GET /v1/load`, `GET /slots` and `GET /metrics` require the key.
 
 ```bash
 curl http://127.0.0.1:8080/v1/models \

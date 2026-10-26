@@ -2,6 +2,7 @@
 
 #include "product/version/version.h"
 #include "serve/anthropic_messages.h"
+#include "serve/dashboard_page.h"
 #include "serve/http_transport.h"
 #include "serve/openai_common.h"
 #include "serve/props.h"
@@ -186,6 +187,16 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
         write_openai_error(response, error);
     }
     return httplib::Server::HandlerResponse::Handled;
+}
+
+void write_dashboard_page(httplib::Response& response) {
+    response.set_header("Content-Security-Policy", std::string(dashboard_content_security_policy()));
+    response.set_header("X-Content-Type-Options", "nosniff");
+    response.set_header("Referrer-Policy", "no-referrer");
+    // Revalidate, so the page an upgraded server serves is the one its endpoints match.
+    response.set_header("Cache-Control", "no-cache");
+    const std::string_view page = dashboard_page();
+    response.set_content(page.data(), page.size(), "text/html; charset=utf-8");
 }
 
 bool matches_bearer_credential(std::string_view authorization, std::string_view api_key) noexcept {
@@ -443,10 +454,12 @@ void HttpServer::register_routes() {
         if (reject_untrusted_request(host_policy_, options_, req, res)) {
             return httplib::Server::HandlerResponse::Handled;
         }
-        if (!ready_.load(std::memory_order_acquire)) {
+        const bool dashboard = is_dashboard_request(req.method, req.path);
+        if (!ready_.load(std::memory_order_acquire) && !dashboard) {
             // Runs for every route, including /health and OPTIONS, so a caller cannot tell "not
             // ready" apart from "unauthenticated" -- and skips the API-key check below, since a
-            // loading-status response carries nothing worth protecting.
+            // loading-status response carries nothing worth protecting. The dashboard page is
+            // static and served anyway: it then shows this 503 from its own polls.
             ApiError error;
             error.status  = 503;
             error.type    = "service_unavailable";
@@ -462,7 +475,9 @@ void HttpServer::register_routes() {
             }
             return httplib::Server::HandlerResponse::Handled;
         }
-        if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
+        // The dashboard page holds no data; the requests its script makes carry the key.
+        if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS" ||
+            dashboard) {
             return httplib::Server::HandlerResponse::Unhandled;
         }
         // Accept both the OpenAI-style bearer token and the Anthropic-style
@@ -543,6 +558,9 @@ void HttpServer::register_routes() {
                                        {"version", ninfer::product::build_version()}}
                             .dump(),
                         "application/json");
+    });
+    server_.Get("/dashboard", [](const httplib::Request&, httplib::Response& res) {
+        write_dashboard_page(res);
     });
     server_.Get("/v1/load", [this](const httplib::Request& req, httplib::Response& res) {
         handle_load(req, res);

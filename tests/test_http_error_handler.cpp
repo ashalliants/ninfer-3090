@@ -1,8 +1,10 @@
 #include "serve/http_server.h"
 
 #include <nlohmann/json.hpp>
+#include <spdlog/logger.h>
 
 #include <iostream>
+#include <memory>
 #include <string>
 
 namespace {
@@ -233,6 +235,43 @@ int main() {
     failures += check(other_result == httplib::Server::HandlerResponse::Unhandled &&
                           other_response.body.empty(),
                       "non-413 response was changed by the payload-limit handler");
+
+    // dashboard_while_loading: a keyed server still loading its model serves GET /dashboard
+    // without the key (the page holds no data) with its CSP and nosniff headers, keeps the Host
+    // check on it, and still answers every other route, POST /dashboard included, with the
+    // loading 503 -- and, once that is past, the key check.
+    {
+        ServeOptions keyed;
+        keyed.host    = "127.0.0.1";
+        keyed.api_key = "secret";
+        ninfer::serve::HttpServer server(keyed, std::make_shared<spdlog::logger>("dashboard-test"));
+        const int port = server.bind_any_port();
+        failures += check(port > 0, "dashboard_while_loading: could not bind a loopback port");
+        if (port > 0) {
+            server.start_serving_during_startup();
+            httplib::Client client("127.0.0.1", port);
+            client.set_connection_timeout(5, 0);
+            client.set_read_timeout(5, 0);
+            const auto page = client.Get("/dashboard");
+            failures += check(
+                page && page->status == 200 &&
+                    page->get_header_value("Content-Type") == "text/html; charset=utf-8" &&
+                    page->get_header_value("X-Content-Type-Options") == "nosniff" &&
+                    page->get_header_value("Content-Security-Policy").find("default-src 'none'") !=
+                        std::string::npos &&
+                    page->body.rfind("<!doctype html>", 0) == 0,
+                "dashboard_while_loading: GET /dashboard was not served without the key");
+            const auto rebound = client.Get("/dashboard", httplib::Headers{{"Host", "evil.example:8080"}});
+            failures += check(rebound && rebound->status == 403,
+                              "dashboard_while_loading: the Host check did not apply to it");
+            const auto metrics = client.Get("/metrics");
+            const auto posted  = client.Post("/dashboard", "", "text/plain");
+            failures += check(metrics && metrics->status == 503 && posted && posted->status == 503,
+                              "dashboard_while_loading: another route skipped the loading 503");
+            server.stop();
+            (void)server.await_startup_listener();
+        }
+    }
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

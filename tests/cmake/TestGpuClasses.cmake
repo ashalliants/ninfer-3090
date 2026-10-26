@@ -24,6 +24,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_context_cost_test
   ninfer_context_store_binding_test
   ninfer_context_store_test
+  ninfer_dashboard_page_test
   ninfer_device_sync_invalid_test
   ninfer_effective_thinking_budget_test
   ninfer_engine_scheduling_test

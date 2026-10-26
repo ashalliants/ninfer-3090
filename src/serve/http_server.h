@@ -38,6 +38,9 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
                                                               const httplib::Request& request,
                                                               httplib::Response& response);
 
+// The dashboard page (serve/dashboard_page.h) with its Content-Security-Policy and nosniff.
+void write_dashboard_page(httplib::Response& response);
+
 [[nodiscard]] bool matches_bearer_credential(std::string_view authorization,
                                              std::string_view api_key) noexcept;
 

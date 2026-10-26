@@ -1,5 +1,6 @@
 #include "serve/router_server.h"
 
+#include "serve/dashboard_page.h"
 #include "serve/http_server.h"
 #include "serve/http_transport.h"
 #include "product/version/version.h"
@@ -350,7 +351,9 @@ void RouterServer::register_routes() {
         if (reject_untrusted_request(host_policy_, options_, req, res)) {
             return httplib::Server::HandlerResponse::Handled;
         }
-        if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
+        // The dashboard page holds no data; the requests its script makes carry the key.
+        if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS" ||
+            is_dashboard_request(req.method, req.path)) {
             return httplib::Server::HandlerResponse::Unhandled;
         }
         const bool bearer_ok =
@@ -403,6 +406,11 @@ void RouterServer::register_routes() {
                  });
     server_.Get(R"(/v1/models/(.+))", [this](const httplib::Request& req, httplib::Response& res) {
         handle_model(req, res);
+    });
+    // The router serves the dashboard itself; the endpoints it polls are the status endpoints
+    // below, which answer for the model that last served.
+    server_.Get("/dashboard", [](const httplib::Request&, httplib::Response& res) {
+        write_dashboard_page(res);
     });
     // Status endpoints read the model that last served without waking a sleeping one.
     for (const char* path : {"/props", "/metrics", "/v1/load", "/slots"}) {

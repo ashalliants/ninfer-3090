@@ -394,6 +394,8 @@ The server supports:
 - retained conversations survive a restart in a local context store (`--context-store`),
   optionally copied to an S3-compatible bucket ([docs](docs/serving.md#context-store));
 - Prometheus metrics at `GET /metrics` ([docs](docs/serving.md#metrics)) and a read-only `GET /props`;
+- a live dashboard page at `GET /dashboard`: throughput, draft acceptance, lanes and GPU
+  readings ([docs](docs/serving.md#dashboard));
 - prompt-rendered function tools and parsed tool calls (returned to the client, not executed);
 - bounded pending-request admission and JSONL request logs.
 
