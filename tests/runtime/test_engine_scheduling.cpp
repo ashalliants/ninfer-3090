@@ -153,6 +153,16 @@ public:
                                   .remote           = true});
     }
 
+    // Gives the Engine a context store it writes idle conversations to, through `write` (which
+    // stores the image and returns whether it took it). The store must outlive the Rig.
+    void attach_store_writer(ContextStore& store, std::function<bool(fake::CheckpointImage&&)> write,
+                             std::chrono::milliseconds idle) {
+        core_->set_context_store({.store        = &store,
+                                  .binding      = "fake-binding",
+                                  .sink         = std::move(write),
+                                  .idle_persist = idle});
+    }
+
     fake::Program& program() { return *instance_.program; }
     EngineCore<fake::Instance>& core() { return *core_; }
 
@@ -949,6 +959,119 @@ void test_a_stalled_listing_releases_the_request_at_its_budget() {
 }
 
 
+// ---- idle writes ---------------------------------------------------------------------------
+
+// Stores a fake image as the Engine's writer does, under the id the Engine expects.
+void put_image(ContextStore& store, const fake::CheckpointImage& image) {
+    ContextStore::Description description;
+    const auto& key     = image.keys.front();
+    description.id      = ContextStore::image_id(key.digests, key.frontier, false);
+    description.binding = "fake-binding";
+    description.tokens  = image.tokens;
+    description.checkpoints.push_back(
+        {.frontier = key.frontier, .digests = key.digests, .identity_tag = key.identity_tag});
+    std::vector<ContextStore::Region> regions;
+    for (const auto& region : image.regions) { regions.push_back({region.offset, region.length}); }
+    (void)store.put(description, image.bytes, regions);
+}
+
+// Another conversation's second turn, whose image supersedes its first: a removal from the store
+// that has nothing to do with the sessions the Engine holds.
+void supersede_elsewhere(ContextStore& store) {
+    ContextStore::Description first;
+    first.id      = "e1";
+    first.binding = "fake-binding";
+    first.tokens  = 100;
+    first.checkpoints.push_back({.frontier = 100, .digests = {77, 7}, .identity_tag = 0});
+    const std::vector<std::uint8_t> image(64 + 4096, 1);
+    (void)store.put(first, image, std::array{ContextStore::Region{64, 4096}});
+    std::vector<std::array<std::uint64_t, 2>> digests(201, {77, 0});
+    digests[100] = {77, 7};
+    ContextStore::Description second = first;
+    second.id                         = "e2";
+    second.tokens                     = 200;
+    second.checkpoints                = {{.frontier = 200, .digests = {77, 8}, .identity_tag = 0}};
+    second.prefix_digests             = digests;
+    (void)store.put(second, image, std::array{ContextStore::Region{64, 4096}});
+    require(!store.find("e1") && store.stats().superseded == 1, "the second turn did not supersede");
+}
+
+// Restores the image of conversation `group` from the store into the Engine's cache, where it is a
+// retained continuation the store holds as it is.
+void restore_stored(Rig& rig, ContextStore& store, std::uint64_t group) {
+    const auto image = rig.program().image_of(group, 4096);
+    const auto id    = ContextStore::image_id(image.keys.front().digests, 4096, false);
+    const auto bytes = store.load(id);
+    require(bytes.has_value(), "the stored session could not be read");
+    require(rig.core().restore_image(*bytes), "the stored session was not restored");
+}
+
+// The store removing an image of another conversation (here superseded by its next turn, which
+// happens on every turn of every conversation) does not make the Engine write the sessions it
+// holds again: they are unchanged, and the store still holds them.
+void test_an_unrelated_removal_does_not_rewrite_stored_sessions() {
+    StoreDirectory directory;
+    ContextStore::Options options;
+    options.directory   = directory.path();
+    options.chunk_bytes = 4096;
+    ContextStore store(options);
+    Rig rig({.chunk = 1024, .lanes = 1, .context_cache = true});
+    std::atomic<int> writes{0};
+    rig.attach_store_writer(
+        store,
+        [&](fake::CheckpointImage&& image) {
+            put_image(store, image);
+            ++writes;
+            return true;
+        },
+        std::chrono::milliseconds(50));
+    for (const std::uint64_t group : {1, 2}) {
+        put_image(store, rig.program().image_of(group, 4096));
+        restore_stored(rig, store, group);
+    }
+    auto busy = rig.run(9, 64, 3000); // keeps the worker cycling for about 3 s
+    supersede_elsewhere(store);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2500)); // two idle scans or more
+    require(writes == 0 && rig.program().exports() == 0,
+            "an unrelated removal had unchanged stored sessions written again: " +
+                std::to_string(writes.load()) + " writes, " +
+                std::to_string(rig.program().exports()) + " exports");
+    require(finished(busy), "the request did not finish\n" + rig.dump());
+}
+
+// A store with room for one of two sessions keeps the newer and evicts the older. The older one is
+// not written back: that would evict the newer, which would then be written back, and so on.
+void test_a_session_the_store_evicted_is_not_written_back() {
+    StoreDirectory directory;
+    ContextStore::Options options;
+    options.directory   = directory.path();
+    options.chunk_bytes = 4096;
+    options.max_bytes   = 96 * 1024; // one 64 KiB image and its manifest, not two
+    ContextStore store(options);
+    Rig rig({.chunk = 1024, .lanes = 1, .context_cache = true});
+    std::atomic<int> writes{0};
+    rig.attach_store_writer(
+        store,
+        [&](fake::CheckpointImage&& image) {
+            put_image(store, image);
+            ++writes;
+            return true;
+        },
+        std::chrono::milliseconds(50));
+    put_image(store, rig.program().image_of(1, 4096));
+    restore_stored(rig, store, 1);
+    put_image(store, rig.program().image_of(2, 4096));
+    require(store.stats().evicted_for_space == 1 && store.stats().images == 1,
+            "the second session did not evict the first");
+    restore_stored(rig, store, 2);
+    auto busy = rig.run(9, 64, 3000);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+    require(writes == 0,
+            "a session the store evicted was written back: " + std::to_string(writes.load()) +
+                " writes, " + std::to_string(store.stats().evicted_for_space) + " evictions");
+    require(finished(busy), "the request did not finish\n" + rig.dump());
+}
+
 // ---- lossy prefill (docs/maintainer/lossy-long-prefill.md) ----------------------------------
 
 static_assert(EngineCore<fake::Instance>::kLossyCapable,
@@ -1679,6 +1802,10 @@ int main() {
         test_a_fetch_must_fit_the_requests_remaining_deadline);
     run("a stalled listing releases the request at its budget",
         test_a_stalled_listing_releases_the_request_at_its_budget);
+    run("an unrelated removal does not rewrite stored sessions",
+        test_an_unrelated_removal_does_not_rewrite_stored_sessions);
+    run("a session the store evicted is not written back",
+        test_a_session_the_store_evicted_is_not_written_back);
     run("LossyTriggersOnlyWhenCold", test_lossy_triggers_only_when_cold);
     run("LossyPromptLengthChangeAccepted", test_lossy_prompt_length_change_accepted);
     run("LossyCancelDuringScout", test_lossy_cancel_during_scout);

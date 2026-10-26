@@ -433,9 +433,11 @@ public:
     struct PendingWrite {
         CheckpointImage image;
         bool shared = false;
+        std::string id; // the store id the image is written under
     };
     std::deque<PendingWrite> pending_writes;
     bool writer_active = false;
+    std::string active_write_id; // the write in progress, while writer_active
     bool writer_stop   = false;
     std::optional<std::chrono::steady_clock::time_point> drain_deadline;
     std::thread writer;
@@ -498,6 +500,7 @@ private:
                 return enqueue_store_write(std::move(image), StoreWrite::SharedPrefix);
             },
             .ready   =[this] { return store_queue_idle(); },
+            .queued  = [this](const std::string& id) { return store_write_queued(id); },
             .failures = [this] { return store_write_failures.load(std::memory_order_relaxed); },
             .idle_persist =
                 std::chrono::duration_cast<std::chrono::milliseconds>(options.context_store.idle_persist),
@@ -564,17 +567,10 @@ private:
         return text;
     }
 
-    // Lowercase hex of the image's endpoint key: an image of the same endpoint replaces it. A
-    // shared prefix's id ends in an extra digit, so it never replaces a conversation image whose
-    // endpoint happens to fall at the same position.
+    // The image's endpoint key (ContextStore::image_id): an image of the same endpoint replaces it.
     static std::string image_id(const CheckpointImage& image, bool shared) {
         const auto& key = image.keys.front();
-        char text[42];
-        std::snprintf(text, sizeof(text), "%016llx%016llx%08x%s",
-                      static_cast<unsigned long long>(key.digests[0]),
-                      static_cast<unsigned long long>(key.digests[1]),
-                      static_cast<unsigned>(key.frontier), shared ? "5" : "");
-        return text;
+        return runtime::ContextStore::image_id(key.digests, key.frontier, shared);
     }
 
     // Writes one image to the store. On the writer thread, or at shutdown.
@@ -685,6 +681,14 @@ private:
         return pending_writes.empty() && !writer_active;
     }
 
+    // Whether the image `id` is queued for the writer or being written now.
+    [[nodiscard]] bool store_write_queued(const std::string& id) {
+        std::scoped_lock lock(writer_mutex);
+        if (writer_active && active_write_id == id) { return true; }
+        return std::any_of(pending_writes.begin(), pending_writes.end(),
+                           [&](const PendingWrite& pending) { return pending.id == id; });
+    }
+
     // Queues an image for the writer thread. Never blocks: when the queue is full the image is
     // not written now; an idle continuation is tried again later, an evicted one is lost to the
     // store as it would be without write-on-evict.
@@ -703,7 +707,9 @@ private:
             return false;
         }
         if (!writer.joinable()) { writer = std::thread([this] { writer_loop(); }); }
-        pending_writes.push_back({std::move(image), kind == StoreWrite::SharedPrefix});
+        const bool shared = kind == StoreWrite::SharedPrefix;
+        std::string id    = image_id(image, shared);
+        pending_writes.push_back({std::move(image), shared, std::move(id)});
         lock.unlock();
         writer_cv.notify_one();
         return true;
@@ -722,10 +728,11 @@ private:
                 }
                 write = std::move(pending_writes.front());
                 pending_writes.pop_front();
-                writer_active = true;
+                writer_active   = true;
+                active_write_id = write.id;
             }
             ContextStoreWriteEvent event;
-            event.id           = image_id(write.image, write.shared);
+            event.id           = write.id;
             event.tokens       = write.image.tokens;
             event.bytes        = write.image.bytes.size();
             const auto started = std::chrono::steady_clock::now();
@@ -734,17 +741,19 @@ private:
             } catch (const std::exception& error) {
                 event.error = error.what();
             } catch (...) { event.error = "unknown context store write failure"; }
+            {
+                std::scoped_lock lock(writer_mutex);
+                writer_active = false;
+                active_write_id.clear();
+            }
             if (!event.error.empty()) {
                 // The continuation was counted as stored when it was queued; have it written again.
+                // Counted only once the write is no longer queued, so the Engine finds it missing.
                 store_write_failures.fetch_add(1, std::memory_order_relaxed);
             }
             event.seconds =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             notify(event);
-            {
-                std::scoped_lock lock(writer_mutex);
-                writer_active = false;
-            }
         }
     }
 
